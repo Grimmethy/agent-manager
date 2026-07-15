@@ -227,6 +227,7 @@ async function enterProjectTab() {
       <button class="action" id="build-btn">Build Graph</button>
     </div>
     <div id="browser-panel" class="browser-panel" style="display:none"></div>
+    <div id="pipeline-panel" class="worker-card"></div>
     <div id="project-status-area"></div>
   `;
   document.getElementById('project-path-input').addEventListener('change', (e) => {
@@ -241,12 +242,91 @@ async function enterProjectTab() {
   };
   document.getElementById('build-btn').onclick = triggerBuild;
 
+  await refreshPipelineStatus();
   await refreshProjectStatus();
-  projectStatusInterval = setInterval(refreshProjectStatus, 3000);
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
 }
 
 function leaveProjectTab() {
   if (projectStatusInterval) { clearInterval(projectStatusInterval); projectStatusInterval = null; }
+}
+
+async function refreshPipelineStatus() {
+  const panel = document.getElementById('pipeline-panel');
+  if (!panel) return;
+  let status;
+  try {
+    status = await fetchJson('/api/pipeline/status');
+  } catch (e) {
+    panel.innerHTML = `<div class="row"><span>Could not check pipeline status: ${e.message}</span></div>`;
+    return;
+  }
+
+  if (status.running) {
+    panel.innerHTML = `
+      <div class="row">
+        <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong></span>
+        <span class="badge ok">RUNNING</span>
+      </div>
+      <div class="meta"><button class="secondary" id="stop-pipeline-btn" style="margin-top:8px">Stop Pipeline</button></div>
+    `;
+    document.getElementById('stop-pipeline-btn').onclick = stopPipeline;
+  } else if (status.activeRepoRoot) {
+    panel.innerHTML = `
+      <div class="row">
+        <span>Last configured project: <strong>${escapeHtml(status.activeRepoRoot)}</strong></span>
+        <span class="badge idle">NOT RUNNING</span>
+      </div>
+      <div class="meta">Browse to a folder above (or reuse this one) and click Start Pipeline.</div>
+    `;
+  } else {
+    panel.innerHTML = `<div class="row"><span>No project configured yet.</span><span class="badge idle">IDLE</span></div>`;
+  }
+
+  // "Start Pipeline" lives next to the path input itself, not in this panel, since it
+  // acts on whatever's currently in the input -- only show/enable it when nothing is
+  // already running and a path is actually entered.
+  let startBtn = document.getElementById('start-pipeline-btn');
+  if (!startBtn) {
+    startBtn = document.createElement('button');
+    startBtn.id = 'start-pipeline-btn';
+    startBtn.className = 'action';
+    startBtn.textContent = 'Start Pipeline';
+    startBtn.onclick = startPipeline;
+    document.querySelector('.path-row').appendChild(startBtn);
+  }
+  startBtn.disabled = status.running || !projectPath;
+}
+
+async function startPipeline() {
+  if (!projectPath) return;
+  const btn = document.getElementById('start-pipeline-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  try {
+    const res = await fetch('/api/pipeline/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectPath }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.reason || data.description || res.statusText);
+  } catch (e) {
+    alert('Could not start pipeline: ' + e.message);
+  }
+  btn.textContent = 'Start Pipeline';
+  await refreshPipelineStatus();
+}
+
+async function stopPipeline() {
+  const btn = document.getElementById('stop-pipeline-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping...'; }
+  try {
+    await fetch('/api/pipeline/stop', { method: 'POST' });
+  } catch (e) {
+    alert('Could not stop pipeline: ' + e.message);
+  }
+  await refreshPipelineStatus();
 }
 
 async function loadBrowsePanel() {

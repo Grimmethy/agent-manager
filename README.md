@@ -159,12 +159,19 @@ and the one every built-in "real code change" source uses.
 
 ## Launching
 
-**Windows (recommended):** copy `agent-manager.env.example` to `agent-manager.env`, fill
-in `AGENT_MANAGER_REPO_ROOT` (and anything else you need — see Configuration above), then
-run `launch.bat`. It launches all 4 pipeline loops plus the dashboard, each in its own
-visible terminal window (a local-LLM process dying silently in the background is the one
-failure mode you can't see coming) — and skips the dashboard gracefully with a `pip
-install` hint if Flask isn't installed, rather than failing the whole launch.
+**Windows (recommended): no config file needed.** `pip install -r python/requirements.txt`,
+then run `launch.bat` — it starts the dashboard, no project configured yet. Open
+`http://localhost:7420`, go to the **Project** tab, browse to your project's folder, and
+click **Start Pipeline**. That's it: it writes `agent-manager.env` for you and launches all
+4 pipeline loops as real, visible terminal windows (a local-LLM process dying silently in
+the background is the one failure mode you can't see coming) — a **Stop Pipeline** button
+appears once it's running. Re-running `launch.bat` later auto-starts the same project again,
+since it remembers what you picked.
+
+Power users who want non-default settings (`SECOND_BRAIN_DIR`, `AGENT_MANAGER_REGISTER_PATH`,
+etc) can still copy `agent-manager.env.example` to `agent-manager.env` and hand-edit it
+before running `launch.bat` — the Project tab's Start Pipeline only ever sets
+`AGENT_MANAGER_REPO_ROOT`, so anything else you put in that file stays untouched.
 
 **Manual / non-Windows terminal-by-terminal:**
 
