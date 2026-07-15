@@ -81,6 +81,33 @@ Six, at priorities 10/20/40/70/80/90 (30/50/60 left open for yours):
 | `arch_discovery` | 80 | `AGENT_MANAGER_GRAPH_PATH` + `AGENT_MANAGER_COMMUNITY_COVERAGE_PATH` — generates new candidates one graph community at a time |
 | `unused_export` | 90 | `queue/dead-code-flags.json` (produce this with your own scanner) |
 
+## Building the codebase graph (`arch_discovery`'s input)
+
+`arch_discovery` needs a `graph.json` (file nodes grouped into communities, with import
+edges) and a `community-coverage.json` (rotation state) — see `python/`:
+
+```
+pip install -r python/requirements.txt
+python python/build_graph.py          # writes graph.json + community-coverage.json
+python python/visualize_graph.py       # writes an interactive HTML view of the graph, for humans
+```
+
+This is a self-contained, dependency-free (of *this* package) replacement for pointing at
+an external graphify installation — it builds a **file-level** import/require graph
+(JS/TS only, matching `grep_codebase`'s scope) and clusters it with `networkx`'s greedy
+modularity community detection. Community names come from a quick call to the local model
+(`OLLAMA_URL`/`ORNITH_MODEL`) per community, falling back to a shared-directory-prefix
+heuristic if that call fails or times out.
+
+Run it manually, periodically — it is **not** invoked automatically on every task-generation
+tick, matching the `unused_export`/`gis_null_field`-style periodic-scanner pattern the rest
+of this package already uses. **Rebuilding resets `community-coverage.json`'s rotation
+progress** (community boundaries can genuinely shift between rebuilds, and a stale id
+pointing at a different file set would silently corrupt tracking) — re-run only when you
+actually want that reset, not reflexively. Also note: naming calls share the same Ollama
+instance as any running drafting worker, so run this while the pipeline is idle for real
+semantic names instead of directory-prefix fallbacks.
+
 ## Registering a custom task source
 
 ```js
