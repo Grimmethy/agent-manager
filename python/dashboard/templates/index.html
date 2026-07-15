@@ -230,9 +230,11 @@ async function enterProjectTab() {
     <div id="pipeline-panel" class="worker-card"></div>
     <div id="project-status-area"></div>
   `;
+  lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
   document.getElementById('project-path-input').addEventListener('change', (e) => {
     projectPath = e.target.value.trim();
     localStorage.setItem('agentManagerProjectPath', projectPath);
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
     refreshProjectStatus();
   });
   document.getElementById('browse-toggle').onclick = () => {
@@ -358,6 +360,7 @@ async function loadBrowsePanel() {
         projectPath = el.dataset.select;
         localStorage.setItem('agentManagerProjectPath', projectPath);
         document.getElementById('project-path-input').value = projectPath;
+        lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
         browserOpen = false;
         panel.style.display = 'none';
         refreshProjectStatus();
@@ -368,12 +371,23 @@ async function loadBrowsePanel() {
   }
 }
 
+// Set to whatever "key" the currently-rendered #project-status-area content corresponds
+// to -- refreshProjectStatus() is polled every 3s, but overwriting innerHTML unconditionally
+// destroys and recreates the <iframe> even when its src is byte-identical, which restarts
+// pyvis's force-directed layout simulation from scratch every single poll (confirmed live:
+// looked exactly like "the graph keeps rebuilding" even though no build was actually
+// running). Only touch the DOM when what SHOULD be shown has actually changed.
+let lastRenderedStatusKey = null;
+
 async function refreshProjectStatus() {
   const area = document.getElementById('project-status-area');
   const buildBtn = document.getElementById('build-btn');
   if (!area) return;
   if (!projectPath) {
-    area.innerHTML = '<div class="empty">Enter or browse to a project path above to get started.</div>';
+    if (lastRenderedStatusKey !== 'no-path') {
+      area.innerHTML = '<div class="empty">Enter or browse to a project path above to get started.</div>';
+      lastRenderedStatusKey = 'no-path';
+    }
     if (buildBtn) buildBtn.disabled = true;
     return;
   }
@@ -382,20 +396,35 @@ async function refreshProjectStatus() {
   try {
     status = await fetchJson('/api/project/status?path=' + encodeURIComponent(projectPath));
   } catch (e) {
-    area.innerHTML = `<div class="empty">${e.message}</div>`;
+    if (lastRenderedStatusKey !== 'fetch-error') {
+      area.innerHTML = `<div class="empty">${e.message}</div>`;
+      lastRenderedStatusKey = 'fetch-error';
+    }
     return;
   }
 
   if (buildBtn) buildBtn.disabled = status.build.running;
 
-  let html = '';
+  // Building: the log genuinely needs to update every poll, but this branch never
+  // contains an iframe, so unconditional re-render here is harmless.
   if (status.build.running) {
-    html += '<div class="stat-row"><div class="stat"><strong>Building...</strong></div></div>';
-    html += '<div class="build-log">' + status.build.log.map(l => `<div>${escapeHtml(l)}</div>`).join('') + '</div>';
-  } else if (status.build.error) {
-    html += `<div class="stat-row"><div class="stat" style="color:var(--bad)"><strong>Build failed</strong>${escapeHtml(status.build.error)}</div></div>`;
+    area.innerHTML = '<div class="stat-row"><div class="stat"><strong>Building...</strong></div></div>'
+      + '<div class="build-log">' + status.build.log.map(l => `<div>${escapeHtml(l)}</div>`).join('') + '</div>';
+    lastRenderedStatusKey = 'building';
+    return;
+  }
+
+  const key = status.build.error ? ('error:' + status.build.error)
+    : status.graphExists ? ('graph:' + status.builtAt)
+    : 'no-graph';
+  if (key === lastRenderedStatusKey) return;  // nothing actually changed -- leave the iframe alone
+  lastRenderedStatusKey = key;
+
+  let html = '';
+  if (status.build.error) {
+    html = `<div class="stat-row"><div class="stat" style="color:var(--bad)"><strong>Build failed</strong>${escapeHtml(status.build.error)}</div></div>`;
   } else if (status.graphExists) {
-    html += `
+    html = `
       <div class="stat-row">
         <div class="stat"><strong>${status.fileCount}</strong>files</div>
         <div class="stat"><strong>${status.communityCount}</strong>communities</div>
@@ -404,7 +433,7 @@ async function refreshProjectStatus() {
       <iframe class="viz" src="/project/visualization?path=${encodeURIComponent(projectPath)}"></iframe>
     `;
   } else {
-    html += '<div class="empty">No graph built yet for this project -- click Build Graph above.</div>';
+    html = '<div class="empty">No graph built yet for this project -- click Build Graph above.</div>';
   }
   area.innerHTML = html;
 }
