@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>agent-manager dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2e38; --text: #e6e8eb; --muted: #8a90a0;
+    --accent: #5b9dff; --ok: #4caf7d; --warn: #e0a940; --bad: #e0575c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .pipeline-dir { color: var(--muted); font-size: 12px; }
+  .layout { display: flex; }
+  nav { width: 200px; padding: 16px 0; border-right: 1px solid var(--border); min-height: calc(100vh - 53px); }
+  nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
+  nav button:hover { background: var(--panel); }
+  nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
+  nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+  main { flex: 1; padding: 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--border); }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--panel); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: rgba(76,175,125,.15); color: var(--ok); }
+  .badge.warn { background: rgba(224,169,64,.15); color: var(--warn); }
+  .badge.bad { background: rgba(224,87,92,.15); color: var(--bad); }
+  .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
+  .worker-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+  .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
+  .worker-card .id { font-weight: 600; }
+  .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
+  .modal h2 { margin-top: 0; font-size: 15px; }
+  .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
+  .modal .close { float: right; cursor: pointer; color: var(--muted); background: none; border: none; font-size: 18px; }
+  .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agent-manager</h1>
+  <span class="pipeline-dir" id="pipeline-status">loading...</span>
+</header>
+<div class="layout">
+  <nav id="nav"></nav>
+  <main id="main"><div class="empty">Loading...</div></main>
+</div>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" id="modal-content"></div>
+</div>
+
+<script>
+const TABS = [
+  { key: 'workers', label: 'Workers' },
+  { key: 'drafting', label: 'Drafting' },
+  { key: 'pending', label: 'Pending' },
+  { key: 'review', label: 'Review' },
+  { key: 'approved', label: 'Approved' },
+  { key: 'blocked', label: 'Blocked' },
+  { key: 'done', label: 'Done' },
+];
+let activeTab = 'workers';
+let counts = {};
+
+async function fetchJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  return r.json();
+}
+
+function renderNav() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '';
+  for (const tab of TABS) {
+    const btn = document.createElement('button');
+    btn.className = tab.key === activeTab ? 'active' : '';
+    const count = tab.key === 'workers' ? '' : (counts[tab.key] ?? '');
+    btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
+    btn.onclick = () => { activeTab = tab.key; renderNav(); renderMain(); };
+    nav.appendChild(btn);
+  }
+}
+
+function fmtAge(sec) {
+  if (sec == null) return '?';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.round(sec / 60) + 'm';
+  return Math.round(sec / 3600) + 'h';
+}
+
+function statusBadgeClass(status, stale) {
+  if (stale) return 'bad';
+  if (status === 'working' || status === 'checking') return 'ok';
+  if (status === 'idle') return 'idle';
+  return 'warn';
+}
+
+async function renderWorkers() {
+  const instances = await fetchJson('/api/instances');
+  const main = document.getElementById('main');
+  if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
+  main.innerHTML = instances.map(inst => `
+    <div class="worker-card">
+      <div class="row">
+        <span class="id">${inst.instanceId}</span>
+        <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+      </div>
+      <div class="meta">
+        pid ${inst.pid} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId ? ' · working on <strong>' + inst.currentTaskId + '</strong>' + (inst.currentPass ? ' (' + inst.currentPass + ')' : '') : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+async function renderQueueTab(state) {
+  const tasks = await fetchJson('/api/queue/' + state);
+  const main = document.getElementById('main');
+  if (tasks.length === 0) { main.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
+  const rows = tasks.map(t => `
+    <tr class="clickable" data-id="${t.id}" data-state="${state}">
+      <td>${t.id}</td>
+      <td>${t.title || ''}</td>
+      <td>${t.domain || ''}/${t.source || ''}</td>
+      <td>${t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || '')}</td>
+    </tr>
+  `).join('');
+  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.querySelectorAll('tr.clickable').forEach(row => {
+    row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function openDetail(state, id) {
+  const task = await fetchJson(`/api/task/${state}/${encodeURIComponent(id)}`);
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+  html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
+  if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
+  if (task.branch) html += `<div class="field-label">Branch</div><div>${task.branch}</div>`;
+  if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
+  if (task.implementResponse) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+  content.innerHTML = html;
+  backdrop.classList.add('open');
+}
+function closeDetail() { document.getElementById('modal-backdrop').classList.remove('open'); }
+document.getElementById('modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'modal-backdrop') closeDetail(); });
+
+async function renderMain() {
+  try {
+    if (activeTab === 'workers') await renderWorkers();
+    else await renderQueueTab(activeTab);
+  } catch (e) {
+    document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
+  }
+}
+
+async function refresh() {
+  try {
+    counts = await fetchJson('/api/summary');
+    document.getElementById('pipeline-status').textContent = 'connected';
+  } catch (e) {
+    document.getElementById('pipeline-status').textContent = 'disconnected';
+  }
+  renderNav();
+  renderMain();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

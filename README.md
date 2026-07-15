@@ -108,6 +108,22 @@ actually want that reset, not reflexively. Also note: naming calls share the sam
 instance as any running drafting worker, so run this while the pipeline is idle for real
 semantic names instead of directory-prefix fallbacks.
 
+## Dashboard
+
+A read-only monitoring page — no database, reads `queue/*.json` and `instances/*.json`
+directly off disk, same as everything else in this package:
+
+```
+pip install -r python/requirements.txt
+python python/dashboard/app.py
+# open http://localhost:7420
+```
+
+Tabs for each worker/loop's live status (Workers) and every queue stage (Drafting,
+Pending, Review, Approved, Blocked, Done) — click any task row for its full detail
+(plan/implement text, blocked reason, branch). Polls every 5s. `AGENT_MANAGER_DASHBOARD_PORT`
+picks the port (default `7420`).
+
 ## Registering a custom task source
 
 ```js
