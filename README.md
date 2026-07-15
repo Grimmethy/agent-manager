@@ -149,8 +149,14 @@ and the one every built-in "real code change" source uses.
 
 ## Launching
 
-Each script is meant to run in its own visible terminal window (a local-LLM process dying
-silently in the background is the one failure mode you can't see coming):
+**Windows (recommended):** copy `agent-manager.env.example` to `agent-manager.env`, fill
+in `AGENT_MANAGER_REPO_ROOT` (and anything else you need — see Configuration above), then
+run `launch.bat`. It launches all 4 pipeline loops plus the dashboard, each in its own
+visible terminal window (a local-LLM process dying silently in the background is the one
+failure mode you can't see coming) — and skips the dashboard gracefully with a `pip
+install` hint if Flask isn't installed, rather than failing the whole launch.
+
+**Manual / non-Windows terminal-by-terminal:**
 
 ```powershell
 $env:AGENT_MANAGER_REPO_ROOT = 'C:\path\to\your\repo'
