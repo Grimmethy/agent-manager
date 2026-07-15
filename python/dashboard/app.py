@@ -9,15 +9,57 @@ queue/ and instances/ live, same as every other script in this package.
 AGENT_MANAGER_DASHBOARD_PORT (default 7420) picks the port.
 """
 
+import hashlib
 import json
 import os
+import string
+import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, abort
+from flask import Flask, jsonify, render_template, abort, request
+
+# build_graph.py / visualize_graph.py live one directory up (python/), not inside
+# dashboard/ -- added explicitly rather than relying on an installed package, matching
+# this whole project's no-build-step, run-from-source philosophy.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import build_graph  # noqa: E402
+import visualize_graph  # noqa: E402
 
 app = Flask(__name__)
 
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done"]
+
+# Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
+# the live worker/review-runner/apply-runner/queue-watchdog loops are actually pointed at
+# (that's still controlled by agent-manager.env + launch.bat) -- this lets you explore any
+# project's structure without touching, or needing, a running pipeline for it. Each
+# browsed project gets its own cache dir here, keyed by a hash of its absolute path, so
+# multiple projects' graphs can be inspected across sessions without colliding or writing
+# anything into the target project itself.
+PROJECT_CACHE_DIR = Path(__file__).resolve().parent / "project_cache"
+
+# In-memory only -- background-build progress/status for whichever project(s) a build was
+# triggered for THIS server process's lifetime. Deliberately not persisted: a build in
+# progress when the server restarts should just be re-triggered, not resumed.
+_build_state = {}
+_build_lock = threading.Lock()
+
+
+def project_slug(path_str: str) -> str:
+    return hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:16]
+
+
+def project_cache_paths(path_str: str) -> dict:
+    slug = project_slug(path_str)
+    cache_dir = PROJECT_CACHE_DIR / slug
+    return {
+        "dir": cache_dir,
+        "graph": cache_dir / "graph.json",
+        "coverage": cache_dir / "coverage.json",
+        "meta": cache_dir / "meta.json",
+    }
 
 # Same staleness thresholds TaxHarvest's own dashboard route already used: a 'working'
 # instance legitimately takes many minutes between heartbeats (a single model call can run
@@ -170,6 +212,143 @@ def api_summary():
         drafting_count = len(list(drafting_root.rglob("*.json")))
     counts["drafting"] = drafting_count
     return jsonify(counts)
+
+
+@app.route("/api/browse")
+def api_browse():
+    """Lists immediate subdirectories of the given path, for the Project tab's folder
+    browser. No path -> lists drive letters (Windows) as browsing roots. Permission
+    errors on individual entries are skipped, not fatal -- a locked system folder
+    shouldn't break browsing everything else alongside it."""
+    raw_path = request.args.get("path", "").strip()
+
+    if not raw_path:
+        if os.name == "nt":
+            drives = [f"{letter}:\\" for letter in string.ascii_uppercase if Path(f"{letter}:\\").exists()]
+            return jsonify({"path": "", "parent": None, "entries": [{"name": d, "path": d, "isDir": True, "isGitRepo": False} for d in drives]})
+        raw_path = "/"
+
+    path = Path(raw_path)
+    if not path.is_dir():
+        abort(404)
+
+    entries = []
+    try:
+        for child in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                if child.is_dir():
+                    entries.append({
+                        "name": child.name,
+                        "path": str(child),
+                        "isDir": True,
+                        "isGitRepo": (child / ".git").exists(),
+                    })
+            except (PermissionError, OSError):
+                continue
+    except (PermissionError, OSError) as e:
+        abort(403, description=str(e))
+
+    parent = str(path.parent) if path.parent != path else None
+    return jsonify({"path": str(path), "parent": parent, "entries": entries})
+
+
+@app.route("/api/project/status")
+def api_project_status():
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        abort(400, description="path query param is required")
+
+    cache = project_cache_paths(raw_path)
+    meta = read_json_safe(cache["meta"]) or {}
+    with _build_lock:
+        build = dict(_build_state.get(raw_path, {"running": False, "log": [], "error": None}))
+
+    graph_exists = cache["graph"].is_file()
+    community_count = 0
+    file_count = 0
+    if graph_exists:
+        graph_data = read_json_safe(cache["graph"]) or {}
+        file_count = len(graph_data.get("nodes", []))
+        community_count = len({n.get("community") for n in graph_data.get("nodes", [])})
+
+    return jsonify({
+        "path": raw_path,
+        "graphExists": graph_exists,
+        "builtAt": meta.get("builtAt"),
+        "fileCount": file_count,
+        "communityCount": community_count,
+        "build": build,
+    })
+
+
+def _run_build(path_str: str, grep_dirs: list[str]):
+    log_lines = []
+
+    def progress(msg):
+        log_lines.append(msg)
+        with _build_lock:
+            _build_state[path_str]["log"] = list(log_lines)
+
+    try:
+        ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
+        result = build_graph.build_graph_data(Path(path_str), grep_dirs, ollama_url, ornith_model, progress=progress)
+
+        cache = project_cache_paths(path_str)
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        cache["graph"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
+        cache["coverage"].write_text(json.dumps(result["coverage"], indent=2), encoding="utf-8")
+        cache["meta"].write_text(json.dumps({
+            "path": path_str,
+            "grepDirs": grep_dirs,
+            "builtAt": datetime.now(timezone.utc).isoformat(),
+        }, indent=2), encoding="utf-8")
+
+        with _build_lock:
+            _build_state[path_str]["running"] = False
+    except Exception as e:
+        with _build_lock:
+            _build_state[path_str]["running"] = False
+            _build_state[path_str]["error"] = str(e)
+
+
+@app.route("/api/project/build", methods=["POST"])
+def api_project_build():
+    body = request.get_json(silent=True) or {}
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        abort(400, description="path is required")
+    if not Path(raw_path).is_dir():
+        abort(404, description="path does not exist")
+
+    grep_dirs = body.get("grepDirs") or ["src", "frontend/src", "backend/src"]
+    grep_dirs = [d for d in grep_dirs if (Path(raw_path) / d).is_dir()]
+    if not grep_dirs:
+        abort(400, description="none of the given grepDirs exist under this path -- pass an explicit grepDirs list")
+
+    with _build_lock:
+        if _build_state.get(raw_path, {}).get("running"):
+            return jsonify({"started": False, "reason": "a build is already running for this path"})
+        _build_state[raw_path] = {"running": True, "log": [], "error": None}
+
+    thread = threading.Thread(target=_run_build, args=(raw_path, grep_dirs), daemon=True)
+    thread.start()
+    return jsonify({"started": True, "grepDirs": grep_dirs})
+
+
+@app.route("/project/visualization")
+def project_visualization():
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        abort(400)
+    cache = project_cache_paths(raw_path)
+    if not cache["graph"].is_file():
+        return "<p style='font-family:sans-serif;padding:20px'>No graph built yet for this project.</p>", 404
+
+    graph_data = json.loads(cache["graph"].read_text(encoding="utf-8"))
+    coverage_data = read_json_safe(cache["coverage"])
+    html = visualize_graph.render_html(graph_data, coverage_data)
+    return html
 
 
 if __name__ == "__main__":

@@ -124,6 +124,16 @@ Pending, Review, Approved, Blocked, Done) — click any task row for its full de
 (plan/implement text, blocked reason, branch). Polls every 5s. `AGENT_MANAGER_DASHBOARD_PORT`
 picks the port (default `7420`).
 
+**Project tab**: browse the filesystem (drive letters → folders, `.git` roots flagged) to
+pick any codebase, click **Build Graph** to run `build_graph.py` against it in the
+background, and see the resulting interactive graph rendered inline once it's done. This
+is **decoupled from whichever project the live pipeline is actually running against** —
+that's still controlled by `agent-manager.env`/`launch.bat` — so you can explore any
+project's structure from the dashboard without needing a pipeline running for it at all.
+Each browsed project gets its own cache under `python/dashboard/project_cache/` (git-
+ignored), keyed by its path, so multiple projects' graphs persist across dashboard
+restarts without colliding.
+
 ## Registering a custom task source
 
 ```js

@@ -33,16 +33,14 @@ def get_config():
     return {"graph_path": graph_path, "coverage_path": coverage_path}
 
 
-def main():
-    cfg = get_config()
-    if not cfg["graph_path"].is_file():
-        raise SystemExit(f"{cfg['graph_path']} does not exist -- run build_graph.py first.")
-
-    graph_data = json.loads(cfg["graph_path"].read_text(encoding="utf-8"))
+def render_html(graph_data: dict, coverage_data: dict | None = None) -> str:
+    """Reusable core: builds the pyvis network and returns its HTML source as a string --
+    the CLI entry point writes this to a file; the dashboard's Project tab serves it
+    directly in an iframe, generated fresh from whatever graph is currently cached for the
+    browsed project, no separate 'run visualize_graph.py' step required."""
     names_by_id = {}
-    if cfg["coverage_path"].is_file():
-        coverage = json.loads(cfg["coverage_path"].read_text(encoding="utf-8"))
-        names_by_id = {c["id"]: c["name"] for c in coverage.get("communities", [])}
+    if coverage_data:
+        names_by_id = {c["id"]: c["name"] for c in coverage_data.get("communities", [])}
 
     net = Network(height="900px", width="100%", bgcolor="#1a1a1a", font_color="#eeeeee", notebook=False)
     net.barnes_hut(gravity=-3000, spring_length=120)
@@ -58,8 +56,22 @@ def main():
         if link["source"] in node_ids and link["target"] in node_ids:
             net.add_edge(link["source"], link["target"])
 
+    return net.generate_html(notebook=False)
+
+
+def main():
+    cfg = get_config()
+    if not cfg["graph_path"].is_file():
+        raise SystemExit(f"{cfg['graph_path']} does not exist -- run build_graph.py first.")
+
+    graph_data = json.loads(cfg["graph_path"].read_text(encoding="utf-8"))
+    coverage_data = None
+    if cfg["coverage_path"].is_file():
+        coverage_data = json.loads(cfg["coverage_path"].read_text(encoding="utf-8"))
+
+    html = render_html(graph_data, coverage_data)
     output_path = Path(sys.argv[1]) if len(sys.argv) > 1 else cfg["graph_path"].parent / "graph-visualization.html"
-    net.write_html(str(output_path), notebook=False)
+    output_path.write_text(html, encoding="utf-8")
     print(f"Wrote {output_path} -- open it in a browser.")
 
 

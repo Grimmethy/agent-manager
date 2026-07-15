@@ -170,24 +170,32 @@ def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) 
         return None
 
 
-def main():
-    cfg = get_config()
-    print(f"Scanning {', '.join(cfg['grep_dirs'])} under {cfg['repo_root']} ...")
+def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, ornith_model: str, progress=print) -> dict:
+    """Reusable core: everything main() does EXCEPT deciding where to write the result --
+    the CLI entry point and the dashboard's on-demand build both call this, writing to
+    their own paths (the pipeline's configured graph/coverage paths for the CLI; a
+    per-project cache dir, decoupled from any live pipeline, for the dashboard). `progress`
+    is a callable taking one string, swappable for a non-print sink (e.g. a status list a
+    background thread appends to, for the dashboard's poll endpoint to read).
 
-    graph = build_import_graph(cfg["repo_root"], cfg["grep_dirs"])
-    print(f"Found {graph.number_of_nodes()} files, {graph.number_of_edges()} import edges.")
+    Returns {"graph": {"nodes": [...], "links": [...]}, "coverage": {"communities": [...]}}.
+    """
+    progress(f"Scanning {', '.join(grep_dirs)} under {repo_root} ...")
+
+    graph = build_import_graph(repo_root, grep_dirs)
+    progress(f"Found {graph.number_of_nodes()} files, {graph.number_of_edges()} import edges.")
 
     isolated = [n for n in graph.nodes if graph.degree(n) == 0]
     graph.remove_nodes_from(isolated)
-    print(f"Dropped {len(isolated)} isolated files (no internal import edges).")
+    progress(f"Dropped {len(isolated)} isolated files (no internal import edges).")
 
     if graph.number_of_nodes() == 0:
-        print("No connected files found -- nothing to cluster. Exiting without writing output.")
-        return
+        progress("No connected files found -- nothing to cluster.")
+        return {"graph": {"nodes": [], "links": []}, "coverage": {"communities": []}}
 
     communities = list(greedy_modularity_communities(graph))
     communities.sort(key=len, reverse=True)
-    print(f"Found {len(communities)} communities.")
+    progress(f"Found {len(communities)} communities.")
 
     nodes = []
     links = []
@@ -198,8 +206,8 @@ def main():
         for f in member_files:
             nodes.append({"id": f, "community": community_id, "source_file": f})
 
-        print(f"  community {community_id}: {len(member_files)} files -- naming...")
-        name = name_community_ornith(member_files, cfg["ollama_url"], cfg["ornith_model"])
+        progress(f"  community {community_id}: {len(member_files)} files -- naming...")
+        name = name_community_ornith(member_files, ollama_url, ornith_model)
         if not name:
             name = name_community_heuristic(member_files)
         coverage_communities.append({
@@ -212,15 +220,23 @@ def main():
     for a, b in graph.edges:
         links.append({"source": a, "target": b})
 
+    return {
+        "graph": {"nodes": nodes, "links": links},
+        "coverage": {"communities": coverage_communities},
+    }
+
+
+def main():
+    cfg = get_config()
+    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"])
+
     cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
-    cfg["graph_path"].write_text(json.dumps({"nodes": nodes, "links": links}, indent=2), encoding="utf-8")
+    cfg["graph_path"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
     print(f"Wrote {cfg['graph_path']}")
 
     cfg["coverage_path"].parent.mkdir(parents=True, exist_ok=True)
-    cfg["coverage_path"].write_text(
-        json.dumps({"communities": coverage_communities}, indent=2), encoding="utf-8"
-    )
-    print(f"Wrote {cfg['coverage_path']} ({len(coverage_communities)} communities, rotation state reset)")
+    cfg["coverage_path"].write_text(json.dumps(result["coverage"], indent=2), encoding="utf-8")
+    print(f"Wrote {cfg['coverage_path']} ({len(result['coverage']['communities'])} communities, rotation state reset)")
 
 
 if __name__ == "__main__":

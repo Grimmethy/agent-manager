@@ -1,3 +1,6 @@
 node_modules/
 *.log
 agent-manager.env
+python/dashboard/project_cache/
+__pycache__/
+*.pyc

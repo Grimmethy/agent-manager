@@ -42,6 +42,22 @@
   .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
   .modal .close { float: right; cursor: pointer; color: var(--muted); background: none; border: none; font-size: 18px; }
   .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
+  .path-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .path-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; }
+  button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.action:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
+  .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
+  .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+  .browser-entry:hover { background: var(--bg); }
+  .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
+  .stat-row { display: flex; gap: 24px; margin: 14px 0; }
+  .stat { color: var(--muted); font-size: 12px; }
+  .stat strong { color: var(--text); font-size: 16px; display: block; }
+  .build-log { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
+  .build-log div { color: var(--muted); }
+  iframe.viz { width: 100%; height: 75vh; border: 1px solid var(--border); border-radius: 8px; margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -60,6 +76,7 @@
 
 <script>
 const TABS = [
+  { key: 'project', label: 'Project' },
   { key: 'workers', label: 'Workers' },
   { key: 'drafting', label: 'Drafting' },
   { key: 'pending', label: 'Pending' },
@@ -68,8 +85,16 @@ const TABS = [
   { key: 'blocked', label: 'Blocked' },
   { key: 'done', label: 'Done' },
 ];
-let activeTab = 'workers';
+let activeTab = 'project';
 let counts = {};
+
+// Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
+// every other tab, since re-rendering over a user's in-progress folder navigation every
+// 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
+let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
+let browsePath = '';
+let browserOpen = false;
+let projectStatusInterval = null;
 
 async function fetchJson(url) {
   const r = await fetch(url);
@@ -85,7 +110,12 @@ function renderNav() {
     btn.className = tab.key === activeTab ? 'active' : '';
     const count = tab.key === 'workers' ? '' : (counts[tab.key] ?? '');
     btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
-    btn.onclick = () => { activeTab = tab.key; renderNav(); renderMain(); };
+    btn.onclick = () => {
+      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
+      activeTab = tab.key;
+      renderNav();
+      if (tab.key === 'project') enterProjectTab(); else renderMain();
+    };
     nav.appendChild(btn);
   }
 }
@@ -178,10 +208,149 @@ async function refresh() {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
   renderNav();
-  renderMain();
+  // Project tab manages its own rendering (enterProjectTab/leaveProjectTab) so a user's
+  // in-progress folder browsing isn't wiped out by this generic 5s cycle -- only the nav
+  // badge counts above still update while it's open.
+  if (activeTab !== 'project') renderMain();
 }
 
-refresh();
+// --- Project tab --------------------------------------------------------------------
+
+function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+
+async function enterProjectTab() {
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div class="path-row">
+      <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}">
+      <button class="secondary" id="browse-toggle">Browse...</button>
+      <button class="action" id="build-btn">Build Graph</button>
+    </div>
+    <div id="browser-panel" class="browser-panel" style="display:none"></div>
+    <div id="project-status-area"></div>
+  `;
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    projectPath = e.target.value.trim();
+    localStorage.setItem('agentManagerProjectPath', projectPath);
+    refreshProjectStatus();
+  });
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('build-btn').onclick = triggerBuild;
+
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(refreshProjectStatus, 3000);
+}
+
+function leaveProjectTab() {
+  if (projectStatusInterval) { clearInterval(projectStatusInterval); projectStatusInterval = null; }
+}
+
+async function loadBrowsePanel() {
+  const panel = document.getElementById('browser-panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const data = await fetchJson('/api/browse?path=' + encodeURIComponent(browsePath));
+    let html = `<div class="browser-crumb">${data.path || 'Drives'}</div>`;
+    if (data.parent) {
+      html += `<div class="browser-entry" data-nav="${escapeAttr(data.parent)}"><span>.. (up)</span></div>`;
+    }
+    if (data.path) {
+      html += `<div class="browser-entry" data-select="${escapeAttr(data.path)}" style="border-top:1px solid var(--border);margin-top:4px;padding-top:8px">
+        <span><strong>Use this folder</strong></span><span>&rarr;</span></div>`;
+    }
+    for (const entry of data.entries) {
+      html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}">
+        <span>${escapeHtml(entry.name)}</span>
+        ${entry.isGitRepo ? '<span class="git-badge">git</span>' : ''}
+      </div>`;
+    }
+    panel.innerHTML = html;
+    panel.querySelectorAll('[data-nav]').forEach(el => {
+      el.onclick = () => { browsePath = el.dataset.nav; loadBrowsePanel(); };
+    });
+    panel.querySelectorAll('[data-select]').forEach(el => {
+      el.onclick = () => {
+        projectPath = el.dataset.select;
+        localStorage.setItem('agentManagerProjectPath', projectPath);
+        document.getElementById('project-path-input').value = projectPath;
+        browserOpen = false;
+        panel.style.display = 'none';
+        refreshProjectStatus();
+      };
+    });
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not browse this path: ${e.message}</div>`;
+  }
+}
+
+async function refreshProjectStatus() {
+  const area = document.getElementById('project-status-area');
+  const buildBtn = document.getElementById('build-btn');
+  if (!area) return;
+  if (!projectPath) {
+    area.innerHTML = '<div class="empty">Enter or browse to a project path above to get started.</div>';
+    if (buildBtn) buildBtn.disabled = true;
+    return;
+  }
+
+  let status;
+  try {
+    status = await fetchJson('/api/project/status?path=' + encodeURIComponent(projectPath));
+  } catch (e) {
+    area.innerHTML = `<div class="empty">${e.message}</div>`;
+    return;
+  }
+
+  if (buildBtn) buildBtn.disabled = status.build.running;
+
+  let html = '';
+  if (status.build.running) {
+    html += '<div class="stat-row"><div class="stat"><strong>Building...</strong></div></div>';
+    html += '<div class="build-log">' + status.build.log.map(l => `<div>${escapeHtml(l)}</div>`).join('') + '</div>';
+  } else if (status.build.error) {
+    html += `<div class="stat-row"><div class="stat" style="color:var(--bad)"><strong>Build failed</strong>${escapeHtml(status.build.error)}</div></div>`;
+  } else if (status.graphExists) {
+    html += `
+      <div class="stat-row">
+        <div class="stat"><strong>${status.fileCount}</strong>files</div>
+        <div class="stat"><strong>${status.communityCount}</strong>communities</div>
+        <div class="stat"><strong>${status.builtAt ? new Date(status.builtAt).toLocaleString() : '?'}</strong>last built</div>
+      </div>
+      <iframe class="viz" src="/project/visualization?path=${encodeURIComponent(projectPath)}"></iframe>
+    `;
+  } else {
+    html += '<div class="empty">No graph built yet for this project -- click Build Graph above.</div>';
+  }
+  area.innerHTML = html;
+}
+
+async function triggerBuild() {
+  if (!projectPath) return;
+  const buildBtn = document.getElementById('build-btn');
+  buildBtn.disabled = true;
+  try {
+    const res = await fetch('/api/project/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectPath }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.description || res.statusText);
+    await refreshProjectStatus();
+  } catch (e) {
+    const area = document.getElementById('project-status-area');
+    area.innerHTML = `<div class="empty">Could not start build: ${e.message}</div>`;
+    buildBtn.disabled = false;
+  }
+}
+
+refresh();  // always -- populates counts + renders nav regardless of which tab is active
+if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);
 </script>
 </body>
