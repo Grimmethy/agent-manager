@@ -32,6 +32,12 @@ function getConfig() {
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || path.join(repoRoot, 'graphify-out', 'graph.json');
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
+  // The domain this package's own code-repo-facing built-in sources (trouble_log,
+  // arch_review, arch_discovery) stamp onto the tasks they generate -- must match a real
+  // key in the consumer's domainsPath file. 'adhoc' and 'secondbrain' are NOT covered by
+  // this: those two are a fixed contract (see resolveSourceName in prompts.js/apply-task.js/
+  // get-grounding-source.js), not configurable, since their whole identity IS their domain.
+  const defaultDomain = process.env.AGENT_MANAGER_DEFAULT_DOMAIN || 'default';
 
   // Side-effect require: the consumer's own file that calls registerTaskSource/
   // updateTaskSource for every task source it wants (both fully local ones and ones built
@@ -44,6 +50,7 @@ function getConfig() {
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, communityCoveragePath, graphPath, domainsPath,
+    defaultDomain,
   };
 }
 

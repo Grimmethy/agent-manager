@@ -280,16 +280,19 @@ while ($true) {
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'plan'
     $planSw = [System.Diagnostics.Stopwatch]::StartNew()
     $planPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'plan'
-    # arch_discovery's plan pass gets a real, narrow, read-only codebase-search tool
-    # (grep_codebase via ornith-tool-client.js's /api/chat tool-calling loop) instead of
-    # the plain single-shot /api/generate call every other source uses -- ornith-client.js
-    # only ever hits /api/generate, which has no structured tool support at all. Every
-    # other source's plan pass is byte-for-byte unchanged.
-    if ($task.source -eq 'arch_discovery') {
-        $planResult = Invoke-OrnithToolClient -Prompt $planPrompt -MaxTurns 5
-    } else {
-        $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
-    }
+    # arch_discovery's plan pass was wired to try a real, narrow, read-only codebase-search
+    # tool (grep_codebase via ornith-tool-client.js's /api/chat tool-calling loop) instead
+    # of the plain single-shot /api/generate call every other source uses. DISABLED
+    # 2026-07-15: confirmed live that Ollama's /api/chat + tools hangs indefinitely on this
+    # model/hardware (a standalone test with a trivial prompt never returned in 30 minutes),
+    # and a real arch_discovery task through Invoke-OrnithToolClient stalled the whole
+    # worker for 13+ minutes with no progress even AFTER the Node-side kill-switch file was
+    # already in place -- the degrade-to-plain-call path did not actually unstick it. Rather
+    # than keep debugging a known-broken feature live against the production queue, this
+    # reverts arch_discovery to the same plain call every other source already uses, byte-
+    # for-byte. Do not re-enable Invoke-OrnithToolClient here until the underlying hang is
+    # root-caused and fixed in isolation, off the live queue.
+    $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
     $planSw.Stop()
     # Invoke-OrnithToolClient's result shape is { response, toolCallLog, turnsUsed,
     # toolsDisabled } -- no .thinking or .degenerate fields, unlike Invoke-OrnithClient's

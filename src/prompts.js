@@ -330,6 +330,12 @@ module.exports = { buildPlanPrompt, buildImplementPrompt, truncate, buildCritiqu
 
 if (require.main === module) {
   const fs = require('fs');
+  // Loads the consumer's own registration file (project-specific sources like this
+  // pipeline's state_targets/field_map_gap) -- without this, buildPlanPrompt/
+  // buildImplementPrompt would throw "no prompt template" for any non-built-in source,
+  // since this CLI process starts fresh per task with only the 6 built-ins registered.
+  const { ensureRegistered } = require('./config.js');
+  ensureRegistered();
   const [, , taskPath, pass, planTextPath, implementTextPath, critiqueTextPath] = process.argv;
   const task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
 

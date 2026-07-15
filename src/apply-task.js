@@ -19,6 +19,11 @@ const { getRegisteredSource } = require('./task-source-registry.js');
 const { applySecondBrainNote } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
 
+// Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
+// consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
+// some of these built-ins (e.g. attaching a custom `apply` to arch_discovery), which
+// throws if the base entry isn't registered yet. Order matters.
+require('./task-sources.js');
 ensureRegistered();
 
 // adhoc/secondbrain are keyed by domain (their task.source fields don't match the registry

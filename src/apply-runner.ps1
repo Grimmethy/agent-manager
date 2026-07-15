@@ -47,7 +47,7 @@ function Get-WorkDir {
     param([string]$Domain)
     $cfg = Get-DomainConfig -Domain $Domain
     switch ($cfg.workDirKind) {
-        'repoRoot' { return $RepoRoot }
+        { $_ -in @('repoRoot', 'taxharvestRoot') } { return $RepoRoot }  # 'taxharvestRoot' accepted as an alias -- pre-extraction consumer configs may still use it
         'secondBrainDir' { return $SecondBrainDir }
         default { throw ('Unknown workDirKind: {0}' -f $cfg.workDirKind) }
     }

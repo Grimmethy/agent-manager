@@ -110,7 +110,7 @@ function nextAdhocTask() {
 const MAX_TROUBLE_LOG_TASK_CHARS = 4000;
 
 function nextTroubleLogTask() {
-  const { troubleLogPath } = getConfig();
+  const { troubleLogPath, defaultDomain } = getConfig();
   const text = readIfExists(troubleLogPath);
   if (!text) return null;
 
@@ -161,7 +161,7 @@ function nextTroubleLogTask() {
 
     return {
       id: taskId,
-      domain: 'taxharvest',
+      domain: defaultDomain,
       source: 'trouble_log',
       title: `${ticketId} · ${titleText}`,
       promptContext: {
@@ -222,7 +222,7 @@ function nextSecondBrainTask() {
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
 function nextArchReviewTask() {
-  const { archReviewCandidatesPath } = getConfig();
+  const { archReviewCandidatesPath, defaultDomain } = getConfig();
   const text = readIfExists(archReviewCandidatesPath);
   if (!text) return null;
 
@@ -276,7 +276,7 @@ function nextArchReviewTask() {
 
     return {
       id: taskId,
-      domain: 'taxharvest',
+      domain: defaultDomain,
       source: 'arch_review',
       title: `${candidateId} · ${titleText}`,
       promptContext: {
@@ -300,7 +300,7 @@ function nextArchReviewTask() {
 const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 60000;
 
 function nextArchDiscoveryTask() {
-  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath } = getConfig();
+  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, defaultDomain } = getConfig();
   const coverageText = readIfExists(communityCoveragePath);
   if (!coverageText) return null;
 
@@ -366,7 +366,7 @@ function nextArchDiscoveryTask() {
 
   return {
     id: 'arch-discovery-community-' + chosen.id,
-    domain: 'taxharvest',
+    domain: defaultDomain,
     source: 'arch_discovery',
     title: 'Architecture discovery: ' + chosen.name,
     promptContext: {
@@ -385,7 +385,7 @@ function nextArchDiscoveryTask() {
 // not a bare tool verdict). Lower priority than even the architecture backlog: this is
 // pure speculative cleanup.
 function nextUnusedExportTask() {
-  const { pipelineDir } = getConfig();
+  const { pipelineDir, defaultDomain } = getConfig();
   const flagsPath = path.join(pipelineDir, 'queue', 'dead-code-flags.json');
   let entries;
   try {
@@ -404,7 +404,7 @@ function nextUnusedExportTask() {
 
     return {
       id: taskId,
-      domain: 'taxharvest',
+      domain: defaultDomain,
       source: 'deadcode_triage',
       title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
       promptContext: {
@@ -455,3 +455,46 @@ module.exports = {
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextArchReviewTask, nextArchDiscoveryTask, nextUnusedExportTask,
 };
+
+// CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
+// and nothing is already sitting in pending/. Safe to call on every worker tick.
+//
+// ensureRegistered() is called HERE, inside the CLI block, deliberately AFTER
+// module.exports above rather than at module-load time: the consumer's registration file
+// (AGENT_MANAGER_REGISTER_PATH) commonly imports taskIdExistsInQueue back FROM this same
+// file (see README.md's example) -- calling ensureRegistered() any earlier would hand that
+// require() an incomplete module.exports (Node's circular-require behavior) before
+// taskIdExistsInQueue is actually defined on it.
+if (require.main === module) {
+  const { ensureRegistered } = require('./config.js');
+  ensureRegistered();
+
+  const { pipelineDir } = getConfig();
+  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const alreadyPending = fs.existsSync(pendingDir)
+    && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json'));
+
+  // An already-queued lower-priority task must never block a NEW adhoc task from
+  // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception
+  // only fires when adhoc/ actually has something waiting, so the normal throttle (don't
+  // pile up unbounded pending/ entries from the background sources) still applies to
+  // everything else.
+  const hasAdhocWaiting = fs.existsSync(adhocDir)
+    && fs.readdirSync(adhocDir).some((f) => f.endsWith('.json'));
+
+  if (alreadyPending && !hasAdhocWaiting) {
+    console.log('pending/ already has work queued, not adding another task');
+  } else {
+    const task = getNextTask();
+    if (!task) {
+      console.log('no eligible task found (all registered sources exhausted or malformed)');
+    } else {
+      const file = writeTask(task);
+      console.log(`queued: ${file}`);
+      if (task.domain === 'adhoc') {
+        try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}
+      }
+    }
+  }
+}

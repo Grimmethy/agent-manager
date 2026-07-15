@@ -12,6 +12,10 @@ const fs = require('fs');
 const { getRegisteredSource } = require('./task-source-registry.js');
 const { ensureRegistered } = require('./config.js');
 
+// Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
+// consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
+// some of these built-ins, which throws if the base entry isn't registered yet.
+require('./task-sources.js');
 ensureRegistered();
 
 function resolveSourceName(task) {
