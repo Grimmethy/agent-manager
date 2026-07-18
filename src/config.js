@@ -24,6 +24,15 @@ function getConfig() {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  // Where unused-export-scan.js looks. scanDirs = dirs whose files are scanned for
+  // (CommonJS) export definitions; searchDirs = dirs walked for call sites of each export.
+  // Both are repoRoot-relative and default to grepAllowedDirs (the same code roots the grep
+  // tool is scoped to), so a consumer that already sets AGENT_MANAGER_GREP_DIRS gets sane
+  // behavior for free; override independently only when scan- and search-scope must differ.
+  const splitDirs = (v) => v.split(',').map((s) => s.trim()).filter(Boolean);
+  const unusedScanDirs = splitDirs(process.env.AGENT_MANAGER_UNUSED_SCAN_DIRS || grepAllowedDirs.join(','));
+  const unusedSearchDirs = splitDirs(process.env.AGENT_MANAGER_UNUSED_SEARCH_DIRS || grepAllowedDirs.join(','));
+
   // Sensible-default, overridable paths for the built-in task sources that read/write a
   // project doc file. Defaults match this pipeline's own original layout; a consumer with
   // a different docs-folder convention overrides via env var.
@@ -48,7 +57,7 @@ function getConfig() {
   const registerPath = process.env.AGENT_MANAGER_REGISTER_PATH;
 
   return {
-    repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, registerPath,
+    repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     defaultDomain,
   };
