@@ -45,6 +45,23 @@ function clearRegistry() {
 }
 
 /**
+ * Resolves which registry entry a task belongs to. Most sources register under the exact
+ * same name as task.source, but two of this package's built-ins do not: adhoc tasks carry
+ * domain: 'adhoc', source: 'manual'; secondbrain tasks carry domain: 'secondbrain', source:
+ * 'inbox'. A consumer with its own non-matching source (e.g. this pipeline's own
+ * unused_export, whose task.source is 'deadcode_triage') extends this by wrapping its own
+ * call sites rather than this function needing to know every consumer's naming quirks.
+ * @param {object} task - The task record.
+ * @returns {string} The registry name to look up.
+ */
+function resolveSourceName(task) {
+  if (task.domain === 'adhoc') return 'adhoc';
+  if (task.domain === 'secondbrain') return 'secondbrain';
+  if (task.source === 'deadcode_triage') return 'unused_export';
+  return task.source;
+}
+
+/**
  * Merge additional fields into an ALREADY-registered source (e.g. attaching
  * buildPlanPrompt/buildImplementPrompt/apply/groundingFields after the initial
  * { priority, next } registration). Inverse safety check of registerTaskSource: that
@@ -59,4 +76,4 @@ function updateTaskSource(name, partialConfig) {
   Object.assign(registry[name], partialConfig);
 }
 
-module.exports = { registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource };
+module.exports = { registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName };

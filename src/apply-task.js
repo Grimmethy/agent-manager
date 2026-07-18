@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
-const { getRegisteredSource } = require('./task-source-registry.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { applySecondBrainNote } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
 
@@ -25,18 +25,6 @@ const { applyGroupB } = require('./apply-group-b.js');
 // throws if the base entry isn't registered yet. Order matters.
 require('./task-sources.js');
 ensureRegistered();
-
-// adhoc/secondbrain are keyed by domain (their task.source fields don't match the registry
-// name); a source can also carry a `sourceKey` override for cases like unused_export whose
-// own task.source is a different literal string than its registry name -- the consumer's
-// registration file decides this mapping via resolveSourceName if it needs one beyond the
-// two built-in domain cases below.
-function resolveSourceName(task) {
-  if (task.domain === 'adhoc') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (task.source === 'deadcode_triage') return 'unused_export';
-  return task.source;
-}
 
 const GIT_ENV = {
   ...process.env,

@@ -44,8 +44,8 @@ function getConfig() {
   // The domain this package's own code-repo-facing built-in sources (trouble_log,
   // arch_review, arch_discovery) stamp onto the tasks they generate -- must match a real
   // key in the consumer's domainsPath file. 'adhoc' and 'secondbrain' are NOT covered by
-  // this: those two are a fixed contract (see resolveSourceName in prompts.js/apply-task.js/
-  // get-grounding-source.js), not configurable, since their whole identity IS their domain.
+  // this: those two are a fixed contract (see resolveSourceName in task-source-registry.js),
+  // not configurable, since their whole identity IS their domain.
   const defaultDomain = process.env.AGENT_MANAGER_DEFAULT_DOMAIN || 'default';
 
   // Side-effect require: the consumer's own file that calls registerTaskSource/

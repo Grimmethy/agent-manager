@@ -9,7 +9,7 @@
 // Writes the assembled grounding text to stdout, or nothing if there's nothing to ground.
 
 const fs = require('fs');
-const { getRegisteredSource } = require('./task-source-registry.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { ensureRegistered } = require('./config.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -17,13 +17,6 @@ const { ensureRegistered } = require('./config.js');
 // some of these built-ins, which throws if the base entry isn't registered yet.
 require('./task-sources.js');
 ensureRegistered();
-
-function resolveSourceName(task) {
-  if (task.domain === 'adhoc') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (task.source === 'deadcode_triage') return 'unused_export';
-  return task.source;
-}
 
 function main() {
   const taskPath = process.argv[2];

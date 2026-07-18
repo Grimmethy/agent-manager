@@ -10,27 +10,12 @@
 // task-source-registry.js) -- a registered source supplies its own buildPlanPrompt/
 // buildImplementPrompt. require('./task-sources.js') below is loaded purely for its side
 // effect of populating the registry with this package's 6 built-in sources.
-const { getRegisteredSource, updateTaskSource } = require('./task-source-registry.js');
+const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
 require('./task-sources.js');
 
 function truncate(str, max) {
   if (!str) return '';
   return str.length > max ? `${str.slice(0, max)}\n...[truncated]` : str;
-}
-
-// Resolves which registry entry applies to a given task. Most sources register under the
-// exact same name as task.source, but two of this package's built-ins do not:
-// - adhoc tasks carry domain: 'adhoc', source: 'manual'.
-// - secondbrain tasks carry domain: 'secondbrain', source: 'inbox'.
-// A consumer with its own non-matching source (e.g. this pipeline's own unused_export,
-// whose task.source is 'deadcode_triage') extends this by wrapping buildPlanPrompt/
-// buildImplementPrompt itself rather than this file needing to know every consumer's
-// naming quirks.
-function resolveSourceName(task) {
-  if (task.domain === 'adhoc') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (task.source === 'deadcode_triage') return 'unused_export';
-  return task.source;
 }
 
 // Shared by every "real code change" source (arch_review, trouble_log, adhoc/manual): the
