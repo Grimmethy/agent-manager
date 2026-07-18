@@ -32,7 +32,15 @@ import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
 
 MATCH_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
-EXCLUDE_DIRS = {"node_modules", ".git", "queue"}
+EXCLUDE_DIRS = {
+    "node_modules", ".git", "queue",
+    # Only matters when walk_source_files falls back to scanning the whole repo_root
+    # (empty grep_dirs) -- a targeted grep_dirs list is already scoped to real source,
+    # so these never come up in that path.
+    "dist", "build", "out", "target", "vendor", ".next", ".turbo", ".parcel-cache",
+    ".venv", "venv", "__pycache__", ".cache", ".pytest_cache", "coverage",
+    ".idea", ".vscode", "tmp", "temp",
+}
 
 IMPORT_RE = re.compile(
     r"""(?:require\(\s*['"]([^'"]+)['"]\s*\))"""
@@ -65,9 +73,13 @@ def get_config():
 
 
 def walk_source_files(repo_root: Path, grep_dirs: list[str]) -> list[Path]:
+    # Empty grep_dirs means "no specific source dirs given" -- scan the whole repo_root
+    # instead of the frontend/src,backend/src guess, relying on the wider EXCLUDE_DIRS
+    # list above to skip build output/vendor/cache noise a targeted grep_dirs list would
+    # never have included in the first place.
+    roots = [repo_root] if not grep_dirs else [repo_root / d for d in grep_dirs]
     files = []
-    for rel_dir in grep_dirs:
-        root = repo_root / rel_dir
+    for root in roots:
         if not root.exists():
             continue
         for dirpath, dirnames, filenames in os.walk(root):
@@ -180,7 +192,8 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
 
     Returns {"graph": {"nodes": [...], "links": [...]}, "coverage": {"communities": [...]}}.
     """
-    progress(f"Scanning {', '.join(grep_dirs)} under {repo_root} ...")
+    scope = ', '.join(grep_dirs) if grep_dirs else "entire tree"
+    progress(f"Scanning {scope} under {repo_root} ...")
 
     graph = build_import_graph(repo_root, grep_dirs)
     progress(f"Found {graph.number_of_nodes()} files, {graph.number_of_edges()} import edges.")

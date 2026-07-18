@@ -30,11 +30,18 @@
   .badge.warn { background: rgba(224,169,64,.15); color: var(--warn); }
   .badge.bad { background: rgba(224,87,92,.15); color: var(--bad); }
   .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
+  .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+  .stale-timer { color: var(--bad); font-size: 11px; font-variant-numeric: tabular-nums; }
   .worker-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  tr.top-row td:first-child { border-left: 2px solid var(--ok); }
+  .bar-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 2px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
   .modal-backdrop.open { display: flex; }
   .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
@@ -57,7 +64,7 @@
   .stat strong { color: var(--text); font-size: 16px; display: block; }
   .build-log { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
   .build-log div { color: var(--muted); }
-  iframe.viz { width: 100%; height: 75vh; border: 1px solid var(--border); border-radius: 8px; margin-top: 16px; }
+  iframe.viz { width: 100%; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 8px; margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -78,6 +85,7 @@
 const TABS = [
   { key: 'project', label: 'Project' },
   { key: 'workers', label: 'Workers' },
+  { key: 'models', label: 'Models' },
   { key: 'drafting', label: 'Drafting' },
   { key: 'pending', label: 'Pending' },
   { key: 'review', label: 'Review' },
@@ -92,6 +100,7 @@ let counts = {};
 // every other tab, since re-rendering over a user's in-progress folder navigation every
 // 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
+let grepDirs = localStorage.getItem('agentManagerGrepDirs') || '';
 let browsePath = '';
 let browserOpen = false;
 let projectStatusInterval = null;
@@ -108,7 +117,7 @@ function renderNav() {
   for (const tab of TABS) {
     const btn = document.createElement('button');
     btn.className = tab.key === activeTab ? 'active' : '';
-    const count = tab.key === 'workers' ? '' : (counts[tab.key] ?? '');
+    const count = (tab.key === 'workers' || tab.key === 'models') ? '' : (counts[tab.key] ?? '');
     btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
     btn.onclick = () => {
       if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
@@ -137,12 +146,16 @@ function statusBadgeClass(status, stale) {
 async function renderWorkers() {
   const instances = await fetchJson('/api/instances');
   const main = document.getElementById('main');
+  instancesForTimers = instances;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
   main.innerHTML = instances.map(inst => `
     <div class="worker-card">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
-        <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+        <div class="badge-col">
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+        </div>
       </div>
       <div class="meta">
         pid ${inst.pid} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
@@ -150,6 +163,108 @@ async function renderWorkers() {
       </div>
     </div>
   `).join('');
+  updateStaleTimers();
+}
+
+// Raw instance list from the last /api/instances fetch, kept around so the 1s ticking
+// timer below can recompute stale duration client-side without re-polling every second.
+let instancesForTimers = [];
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+// Ticks every second independent of the 5s /api/instances poll, so "stale for" reads as a
+// live counter instead of jumping in 5s increments. Computed purely from lastHeartbeat +
+// staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
+function updateStaleTimers() {
+  for (const inst of instancesForTimers) {
+    if (!inst.stale) continue;
+    const el = document.getElementById('stale-timer-' + inst.instanceId);
+    if (!el) continue;
+    const staleSinceMs = new Date(inst.lastHeartbeat).getTime() + inst.staleThresholdSeconds * 1000;
+    el.textContent = 'Stale for ' + fmtDuration((Date.now() - staleSinceMs) / 1000);
+  }
+}
+setInterval(updateStaleTimers, 1000);
+
+function fmtPct(x) { return x == null ? '-' : Math.round(x * 100) + '%'; }
+function fmtNum(x, digits) { return x == null ? '-' : Number(x).toFixed(digits); }
+
+// Sort state lives outside the function so it survives the 5s poll re-rendering the
+// whole table from scratch each time (same rebuild-from-fetch pattern renderQueueTab uses).
+let modelsSortKey = 'approveRate';
+let modelsSortDir = 'desc';
+
+const MODELS_COLUMNS = [
+  { key: 'model', label: 'Model', sortable: false },
+  { key: 'callCount', label: 'Calls', sortable: true },
+  { key: 'approveRate', label: 'Approve Rate', sortable: true, bar: 'ok' },
+  { key: 'avgTokensPerSec', label: 'Avg Tok/s', sortable: true, bar: 'accent' },
+  { key: 'minTokensPerSec', label: 'Low Tok/s', sortable: true },
+  { key: 'maxTokensPerSec', label: 'High Tok/s', sortable: true },
+  { key: 'avgLatencyMs', label: 'Avg Latency (ms)', sortable: true },
+  { key: 'degenerateCount', label: 'Degenerate', sortable: true },
+  { key: 'errorCount', label: 'Errors', sortable: true },
+];
+
+function renderBarCell(value, max, colorVar, fmt) {
+  const label = fmt(value);
+  if (value == null || !max) return label;
+  const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  return `<div>${label}</div><div class="bar-track"><div class="bar-fill" style="width:${pct.toFixed(1)}%; background:var(--${colorVar})"></div></div>`;
+}
+
+async function renderModelsTab() {
+  const models = await fetchJson('/api/models');
+  const main = document.getElementById('main');
+  if (models.length === 0) { main.innerHTML = '<div class="empty">No model-call stats yet -- set ORNITH_AB_MODELS to compare candidates on the implement pass.</div>'; return; }
+
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0));
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0));
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+    </tr>
+  `).join('');
+
+  main.innerHTML = `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
 }
 
 async function renderQueueTab(state) {
@@ -194,6 +309,7 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => { if 
 async function renderMain() {
   try {
     if (activeTab === 'workers') await renderWorkers();
+    else if (activeTab === 'models') await renderModelsTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
@@ -221,14 +337,19 @@ function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
 async function enterProjectTab() {
   const main = document.getElementById('main');
   main.innerHTML = `
-    <div class="path-row">
-      <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}">
-      <button class="secondary" id="browse-toggle">Browse...</button>
-      <button class="action" id="build-btn">Build Graph</button>
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}">
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
     </div>
-    <div id="browser-panel" class="browser-panel" style="display:none"></div>
-    <div id="pipeline-panel" class="worker-card"></div>
-    <div id="project-status-area"></div>
   `;
   lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
   document.getElementById('project-path-input').addEventListener('change', (e) => {
@@ -242,6 +363,10 @@ async function enterProjectTab() {
     document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
     if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
   };
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
   document.getElementById('build-btn').onclick = triggerBuild;
 
   await refreshPipelineStatus();
@@ -394,7 +519,7 @@ async function refreshProjectStatus() {
 
   let status;
   try {
-    status = await fetchJson('/api/project/status?path=' + encodeURIComponent(projectPath));
+    status = await fetchJson('/api/project/status?path=' + encodeURIComponent(projectPath) + '&grepDirs=' + encodeURIComponent(grepDirs));
   } catch (e) {
     if (lastRenderedStatusKey !== 'fetch-error') {
       area.innerHTML = `<div class="empty">${e.message}</div>`;
@@ -430,7 +555,7 @@ async function refreshProjectStatus() {
         <div class="stat"><strong>${status.communityCount}</strong>communities</div>
         <div class="stat"><strong>${status.builtAt ? new Date(status.builtAt).toLocaleString() : '?'}</strong>last built</div>
       </div>
-      <iframe class="viz" src="/project/visualization?path=${encodeURIComponent(projectPath)}"></iframe>
+      <iframe class="viz" src="/project/visualization?path=${encodeURIComponent(projectPath)}&grepDirs=${encodeURIComponent(grepDirs)}"></iframe>
     `;
   } else {
     html = '<div class="empty">No graph built yet for this project -- click Build Graph above.</div>';
@@ -443,10 +568,13 @@ async function triggerBuild() {
   const buildBtn = document.getElementById('build-btn');
   buildBtn.disabled = true;
   try {
+    const body = { path: projectPath };
+    const dirs = grepDirs.split(',').map(d => d.trim()).filter(Boolean);
+    if (dirs.length) body.grepDirs = dirs;
     const res = await fetch('/api/project/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.description || res.statusText);
@@ -461,6 +589,22 @@ async function triggerBuild() {
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);
+
+// The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever
+// space main's own flex-column layout gives it), but a box change caused by the OUTER
+// page's layout doesn't reliably fire a 'resize' event -- or wake vis-network's own
+// autoResize -- inside the iframe's own window (confirmed: neither fired in testing).
+// The top-level window always gets a real resize event, so push the new size into the
+// iframe's network directly from here instead of relying on the iframe to notice on its
+// own.
+window.addEventListener('resize', () => {
+  const iframe = document.querySelector('iframe.viz');
+  const net = iframe && iframe.contentWindow && iframe.contentWindow.network;
+  if (!net) return;
+  const rect = iframe.getBoundingClientRect();
+  net.setSize(rect.width + 'px', rect.height + 'px');
+  net.redraw();
+});
 </script>
 </body>
 </html>

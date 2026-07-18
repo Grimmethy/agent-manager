@@ -54,6 +54,8 @@ convention the underlying model client already used. Set these before launching 
 | `AGENT_MANAGER_COMPARE_URL_BASE` | no | e.g. `https://github.com/you/repo/compare/main...` — appended with the pushed branch name in log output. |
 | `OLLAMA_URL` | no (default `http://localhost:11434`) | |
 | `ORNITH_MODEL` | no (default `ornith:9b`) | Ollama model tag. |
+| `ORNITH_AB_MODELS` | no (default unset -- A/B off) | Comma-separated candidate model tags for a same-stage A/B test of the worker's implement pass. A task deterministically hashes to one candidate (stable across redraft), so the same task always compares the same model. Only safe on a single worker instance -- Ollama keeps one model tier resident, so distinct candidate lists across concurrent instances would thrash the model cache the same way mixing `ORNITH_MODEL` tiers across instances would. |
+| `AGENT_MANAGER_MODEL_STATS_DB_PATH` | no (default `<pipelineDir>/model-stats.db`) | SQLite DB tracking per-model-call outcome/performance/stability stats (see the dashboard's Models tab). The one deliberate exception to this package's no-database-required design -- per-model comparisons need to survive past individual tasks leaving the queue. |
 | `REVIEW_PROVIDER` | no (default `ornith`) | Set to `claude` to use `claude -p` for a combined review+apply call instead. |
 
 ## Domains
@@ -130,9 +132,15 @@ background, and see the resulting interactive graph rendered inline once it's do
 is **decoupled from whichever project the live pipeline is actually running against** —
 that's still controlled by `agent-manager.env`/`launch.bat` — so you can explore any
 project's structure from the dashboard without needing a pipeline running for it at all.
-Each browsed project gets its own cache under `python/dashboard/project_cache/` (git-
-ignored), keyed by its path, so multiple projects' graphs persist across dashboard
-restarts without colliding.
+Each browsed project's graph, layout, and node positions are cached inside that project
+itself, under `.agent-manager-cache/<slug>/` (`<slug>` is `default`, or a short hash of
+the `grepDirs` you scanned with if you gave any -- so browsing the same project with
+different `grepDirs` gets its own independent cache instead of one overwriting the
+other). Living inside the project means the same cached layout is available no matter
+which agent-manager install or machine browses it -- add `.agent-manager-cache/` to that
+project's own `.gitignore` if you don't want it tracked. (Caches from before this cache
+moved inside the project, under `python/dashboard/project_cache/`, are migrated
+automatically the first time each project loads.)
 
 ## Registering a custom task source
 

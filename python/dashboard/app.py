@@ -12,6 +12,8 @@ AGENT_MANAGER_DASHBOARD_PORT (default 7420) picks the port.
 import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import string
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, abort, request
+from werkzeug.exceptions import HTTPException
 
 # build_graph.py / visualize_graph.py live one directory up (python/), not inside
 # dashboard/ -- added explicitly rather than relying on an installed package, matching
@@ -29,6 +32,16 @@ import build_graph  # noqa: E402
 import visualize_graph  # noqa: E402
 
 app = Flask(__name__)
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    # Every route here is called by the dashboard's fetch()-based JS, which always does
+    # res.json() on the response. Flask's default abort() page is HTML, so without this
+    # handler a 400/404/etc surfaces to the user as "Unexpected token '<'" instead of
+    # the actual description passed to abort().
+    return jsonify(description=e.description), e.code
+
 
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done"]
 
@@ -40,10 +53,14 @@ SRC_DIR = PACKAGE_ROOT / "src"
 # Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
 # the live worker/review-runner/apply-runner/queue-watchdog loops are actually pointed at
 # (that's still controlled by agent-manager.env + launch.bat) -- this lets you explore any
-# project's structure without touching, or needing, a running pipeline for it. Each
-# browsed project gets its own cache dir here, keyed by a hash of its absolute path, so
-# multiple projects' graphs can be inspected across sessions without colliding or writing
-# anything into the target project itself.
+# project's structure without touching, or needing, a running pipeline for it.
+#
+# The cache itself lives INSIDE the browsed project (`.agent-manager-cache/<slug>/`), not
+# here -- so the same layout (including manual community drags) is available no matter
+# which agent-manager install/machine browses that project, not just this one. This is
+# the *old* (pre-2026-07-18) location: kept around purely as a migration source and a
+# write-failure fallback (see _migrate_legacy_cache_if_needed and the mkdir try/except at
+# each write site) -- never written to directly for a project going forward.
 PROJECT_CACHE_DIR = Path(__file__).resolve().parent / "project_cache"
 
 # In-memory only -- background-build progress/status for whichever project(s) a build was
@@ -54,18 +71,63 @@ _build_lock = threading.Lock()
 
 
 def project_slug(path_str: str) -> str:
+    """Old (pre-2026-07-18) hashing scheme -- only used now to locate a legacy cache to
+    migrate from, since the cache is no longer keyed by path (it lives inside that exact
+    path now, so there's nothing left to disambiguate at that level)."""
     return hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:16]
 
 
-def project_cache_paths(path_str: str) -> dict:
-    slug = project_slug(path_str)
-    cache_dir = PROJECT_CACHE_DIR / slug
+def _grepdirs_slug(grep_dirs: list[str]) -> str:
+    """'default' for the common no-grepDirs case (readable, not an opaque hash) --
+    otherwise a short hash of the sorted list, so browsing the same project with
+    different grepDirs gets separate cache entries instead of silently overwriting one
+    with the other (a real collision in the old path-only-keyed scheme)."""
+    if not grep_dirs:
+        return "default"
+    key = ",".join(sorted(grep_dirs))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _cache_paths_for_dir(cache_dir: Path) -> dict:
     return {
         "dir": cache_dir,
         "graph": cache_dir / "graph.json",
         "coverage": cache_dir / "coverage.json",
         "meta": cache_dir / "meta.json",
+        "positions": cache_dir / "positions.json",
     }
+
+
+def project_cache_paths(path_str: str, grep_dirs: list[str] | None = None) -> dict:
+    return _cache_paths_for_dir(Path(path_str) / ".agent-manager-cache" / _grepdirs_slug(grep_dirs or []))
+
+
+def _fallback_cache_paths(path_str: str, grep_dirs: list[str] | None = None) -> dict:
+    """Used only when writing into the project itself fails (read-only mount,
+    permissions) -- the old dashboard-side location as a last resort so a build/save
+    doesn't just fail outright."""
+    return _cache_paths_for_dir(PROJECT_CACHE_DIR / project_slug(path_str) / _grepdirs_slug(grep_dirs or []))
+
+
+def _migrate_legacy_cache_if_needed(path_str: str, cache: dict) -> None:
+    """One-time, best-effort copy from the old dashboard-side cache (keyed by path only,
+    no grepDirs distinction) into the new project-local location. No-ops once the new
+    location already has a graph (whether from migration or a fresh build), so this is
+    cheap to call on every read. Copies, never moves -- the old cache is left alone in
+    case something goes wrong partway through."""
+    if cache["graph"].is_file():
+        return
+    legacy_dir = PROJECT_CACHE_DIR / project_slug(path_str)
+    if not legacy_dir.is_dir():
+        return
+    try:
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        for key in ("graph", "coverage", "meta", "positions"):
+            legacy_file = legacy_dir / cache[key].name
+            if legacy_file.is_file():
+                shutil.copy2(legacy_file, cache[key])
+    except OSError:
+        pass  # best-effort -- a failed migration just means one more fresh layout run
 
 # Same staleness thresholds TaxHarvest's own dashboard route already used: a 'working'
 # instance legitimately takes many minutes between heartbeats (a single model call can run
@@ -145,6 +207,14 @@ def instances_dir() -> Path | None:
     return (d / "instances") if d else None
 
 
+def model_stats_db_path() -> Path | None:
+    override = os.environ.get("AGENT_MANAGER_MODEL_STATS_DB_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "model-stats.db") if d else None
+
+
 def read_json_safe(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -203,8 +273,61 @@ def api_instances():
                 **data,
                 "heartbeatAgeSeconds": round(age) if age is not None else None,
                 "stale": age is not None and age > threshold,
+                "staleThresholdSeconds": threshold,
             })
     results.sort(key=lambda r: r.get("instanceId") or "")
+    return jsonify(results)
+
+
+@app.route("/api/models")
+def api_models():
+    """Aggregate per-model stats for the implement-pass A/B test (see model-stats-db.js).
+    Outcome and performance are joined in one query -- a fast-but-always-rejected model
+    must not look like a winner in a raw tok/s-only view."""
+    db_path = model_stats_db_path()
+    if not db_path or not db_path.is_file():
+        return jsonify([])
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("""
+            SELECT model,
+                   COUNT(*) AS call_count,
+                   SUM(CASE WHEN outcome = 'approved' THEN 1 ELSE 0 END) AS approved,
+                   SUM(CASE WHEN outcome IN ('rejected', 'blocked_apply') THEN 1 ELSE 0 END) AS rejected,
+                   AVG(latency_ms) AS avg_latency_ms,
+                   AVG(CASE WHEN eval_count IS NOT NULL AND eval_duration_ns > 0
+                            THEN eval_count * 1.0 / (eval_duration_ns / 1e9) END) AS avg_tokens_per_sec,
+                   MIN(CASE WHEN eval_count IS NOT NULL AND eval_duration_ns > 0
+                            THEN eval_count * 1.0 / (eval_duration_ns / 1e9) END) AS min_tokens_per_sec,
+                   MAX(CASE WHEN eval_count IS NOT NULL AND eval_duration_ns > 0
+                            THEN eval_count * 1.0 / (eval_duration_ns / 1e9) END) AS max_tokens_per_sec,
+                   SUM(CASE WHEN degenerate IS NOT NULL THEN 1 ELSE 0 END) AS degenerate_count,
+                   SUM(CASE WHEN call_error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
+            FROM model_calls
+            WHERE stage = 'implement'
+            GROUP BY model
+            ORDER BY model
+        """).fetchall()
+    finally:
+        conn.close()
+
+    results = []
+    for model, call_count, approved, rejected, avg_latency_ms, avg_tok_s, min_tok_s, max_tok_s, degenerate_count, error_count in rows:
+        decided = (approved or 0) + (rejected or 0)
+        results.append({
+            "model": model,
+            "callCount": call_count,
+            "approved": approved or 0,
+            "rejected": rejected or 0,
+            "approveRate": (approved / decided) if decided else None,
+            "avgLatencyMs": avg_latency_ms,
+            "avgTokensPerSec": avg_tok_s,
+            "minTokensPerSec": min_tok_s,
+            "maxTokensPerSec": max_tok_s,
+            "degenerateCount": degenerate_count or 0,
+            "errorCount": error_count or 0,
+        })
     return jsonify(results)
 
 
@@ -324,13 +447,22 @@ def api_browse():
     return jsonify({"path": str(path), "parent": parent, "entries": entries})
 
 
+def _grep_dirs_from_query() -> list[str]:
+    """Matches the frontend's comma-separated grepDirs input convention -- the same
+    string already sent to /api/project/build, now also needed by the read/write routes
+    below so they resolve the same per-grepDirs cache slot a build wrote to."""
+    raw = request.args.get("grepDirs", "").strip()
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
 @app.route("/api/project/status")
 def api_project_status():
     raw_path = request.args.get("path", "").strip()
     if not raw_path:
         abort(400, description="path query param is required")
 
-    cache = project_cache_paths(raw_path)
+    cache = project_cache_paths(raw_path, _grep_dirs_from_query())
+    _migrate_legacy_cache_if_needed(raw_path, cache)
     meta = read_json_safe(cache["meta"]) or {}
     with _build_lock:
         build = dict(_build_state.get(raw_path, {"running": False, "log": [], "error": None}))
@@ -366,10 +498,20 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
         result = build_graph.build_graph_data(Path(path_str), grep_dirs, ollama_url, ornith_model, progress=progress)
 
-        cache = project_cache_paths(path_str)
-        cache["dir"].mkdir(parents=True, exist_ok=True)
+        cache = project_cache_paths(path_str, grep_dirs)
+        try:
+            cache["dir"].mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Read-only mount, permissions, etc -- fall back to the old dashboard-side
+            # location rather than losing the build entirely.
+            cache = _fallback_cache_paths(path_str, grep_dirs)
+            cache["dir"].mkdir(parents=True, exist_ok=True)
         cache["graph"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
         cache["coverage"].write_text(json.dumps(result["coverage"], indent=2), encoding="utf-8")
+        # A rebuild can change the node set/communities, so any previously cached layout
+        # is stale by construction -- the next visualization load does one fresh physics
+        # pass and re-captures, same as the very first build.
+        cache["positions"].unlink(missing_ok=True)
         cache["meta"].write_text(json.dumps({
             "path": path_str,
             "grepDirs": grep_dirs,
@@ -393,10 +535,18 @@ def api_project_build():
     if not Path(raw_path).is_dir():
         abort(404, description="path does not exist")
 
-    grep_dirs = body.get("grepDirs") or ["src", "frontend/src", "backend/src"]
-    grep_dirs = [d for d in grep_dirs if (Path(raw_path) / d).is_dir()]
-    if not grep_dirs:
-        abort(400, description="none of the given grepDirs exist under this path -- pass an explicit grepDirs list")
+    raw_grep_dirs = body.get("grepDirs")
+    if raw_grep_dirs:
+        # Explicit grepDirs is a deliberate scope -- honor it, but fail loudly if none of
+        # the given dirs actually exist rather than silently falling back to a full scan.
+        grep_dirs = [d for d in raw_grep_dirs if (Path(raw_path) / d).is_dir()]
+        if not grep_dirs:
+            abort(400, description="none of the given grepDirs exist under this path")
+    else:
+        # No grepDirs given -- scan the whole path rather than guessing at a
+        # frontend/src,backend/src layout that may not exist. build_graph.py's wider
+        # EXCLUDE_DIRS list keeps this from picking up build output/vendor/cache noise.
+        grep_dirs = []
 
     with _build_lock:
         if _build_state.get(raw_path, {}).get("running"):
@@ -413,14 +563,51 @@ def project_visualization():
     raw_path = request.args.get("path", "").strip()
     if not raw_path:
         abort(400)
-    cache = project_cache_paths(raw_path)
+    grep_dirs = _grep_dirs_from_query()
+    cache = project_cache_paths(raw_path, grep_dirs)
+    _migrate_legacy_cache_if_needed(raw_path, cache)
     if not cache["graph"].is_file():
         return "<p style='font-family:sans-serif;padding:20px'>No graph built yet for this project.</p>", 404
 
     graph_data = json.loads(cache["graph"].read_text(encoding="utf-8"))
     coverage_data = read_json_safe(cache["coverage"])
-    html = visualize_graph.render_html(graph_data, coverage_data)
+    positions_data = read_json_safe(cache["positions"])
+    html = visualize_graph.render_html(graph_data, coverage_data, positions=positions_data, project_path=raw_path, grep_dirs=grep_dirs)
     return html
+
+
+@app.route("/project/positions", methods=["POST"])
+def api_project_positions():
+    """Best-effort layout cache write from the visualization iframe's own capture script
+    (see visualize_graph.CAPTURE_SCRIPT_TEMPLATE / COMMUNITY_DRAG_SCRIPT_TEMPLATE) --
+    same-origin, server-generated page posting back to its own dashboard, not external
+    user input.
+
+    Merges into the existing file rather than overwriting wholesale: the community-drag
+    feature intentionally posts only the moved community's node positions (a small
+    fraction of the graph), not the full network.getPositions() -- browsers cap
+    keepalive fetch bodies at ~64KB, and a large graph's full position payload can exceed
+    that (a real graph in this project measured 271KB), causing the save to silently fail
+    with no timing race needed at all. An overwrite semantics here would also have wiped
+    out every other node's cached position whenever only one community's subset was
+    posted."""
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        abort(400, description="path query param is required")
+    positions = request.get_json(silent=True)
+    if positions is None:
+        abort(400, description="request body must be JSON")
+    grep_dirs = _grep_dirs_from_query()
+    cache = project_cache_paths(raw_path, grep_dirs)
+    try:
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cache = _fallback_cache_paths(raw_path, grep_dirs)
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+    existing = read_json_safe(cache["positions"]) or {}
+    existing.update(positions)
+    cache["positions"].write_text(json.dumps(existing), encoding="utf-8")
+    return jsonify({"saved": True})
 
 
 def _pipeline_running() -> bool:
