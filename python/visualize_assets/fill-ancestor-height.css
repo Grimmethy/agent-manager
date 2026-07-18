@@ -1,0 +1,8 @@
+/* pyvis's #mynetwork gets height:100% (see visualize_graph.py's Network(...) call), but a
+   percentage height only resolves if every ancestor in the chain has a real height too --
+   html/body default to auto, and pyvis's own .card wrapper has none either. overflow:hidden
+   on html/body removes the page-level scrollbar entirely (vis-network's own pan-by-drag is
+   the only way to navigate a graph bigger than the visible area now, not a second,
+   redundant scrollbar on top of it). */
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+.card { height: 100%; }
