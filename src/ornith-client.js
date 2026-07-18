@@ -8,6 +8,8 @@
 // (these have been observed to self-heal), and a majority-vote helper for judgment
 // calls that are otherwise an invisible coin flip at default temperature.
 
+const { postJson } = require('./ollama-http.js');
+
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL = process.env.ORNITH_MODEL || 'ornith';
 // Without this, Ollama falls back to its own default unload window between calls --
@@ -57,51 +59,17 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
 
-  return postJson(`${OLLAMA_URL}/api/generate`, body);
+  return postJson(`${OLLAMA_URL}/api/generate`, body, REQUEST_TIMEOUT_MS);
 }
 
-// Raw http.request instead of fetch: with stream:false Ollama only answers once the
-// whole generation is done, and fetch/undici's built-in header/body timeouts (~5 min)
-// are too short to always let a real call finish, so this uses its own socket timeout
-// instead. 4 minutes is a deliberate overtime-fail line, not a safety margin around the
-// worst call ever seen (5.3 min as of 2026-07-18, well above this) -- a call running
-// this long is treated as a basic requirement violation in its own right, regardless of
-// whether it might eventually succeed. A timeout here crashes the worker process (no
-// per-iteration try/catch in ornith-worker.ps1's main loop), which makes
-// queue-watchdog.ps1's existing dead-process check (PID gone) fire on its next poll,
-// instead of waiting on a heartbeat-staleness check that never triggers while the PID
-// is still alive.
+// 4 minutes is a deliberate overtime-fail line, not a safety margin around the worst call
+// ever seen (5.3 min as of 2026-07-18, well above this) -- a call running this long is
+// treated as a basic requirement violation in its own right, regardless of whether it
+// might eventually succeed. A timeout here crashes the worker process (no per-iteration
+// try/catch in ornith-worker.ps1's main loop), which makes queue-watchdog.ps1's existing
+// dead-process check (PID gone) fire on its next poll, instead of waiting on a
+// heartbeat-staleness check that never triggers while the PID is still alive.
 const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
-
-function postJson(urlString, bodyObj) {
-  const http = require('http');
-  const url = new URL(urlString);
-  const payload = JSON.stringify(bodyObj);
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: url.hostname,
-      port: url.port || 80,
-      path: url.pathname,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      timeout: REQUEST_TIMEOUT_MS,
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`));
-          return;
-        }
-        try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Ollama returned unparseable JSON: ${e.message}`)); }
-      });
-    });
-    req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${REQUEST_TIMEOUT_MS}ms`)); });
-    req.on('error', reject);
-    req.write(payload);
-    req.end();
-  });
-}
 
 // Calls Ornith once, retrying up to maxRetries times if the degenerate-output detector
 // fires — per the doc, degeneracy is usually a transient inference-state glitch that

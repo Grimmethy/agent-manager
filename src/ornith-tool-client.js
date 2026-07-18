@@ -10,43 +10,15 @@ const path = require('path');
 const fs = require('fs');
 const { grepCodebase } = require('./grep-codebase-tool.js');
 const { getConfig } = require('./config.js');
+const { postJson } = require('./ollama-http.js');
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL = process.env.ORNITH_MODEL || 'ornith';
 
-// Same raw http.request pattern as ornith-client.js's postJson -- fetch/undici's ~5-minute
-// timeout is too short for this hardware's real generation times.
+// Longer than ornith-client.js's REQUEST_TIMEOUT_MS: applies per /api/chat call, but a
+// tool-calling turn (model call + a real grep_codebase invocation) can run longer than a
+// single plain generation call does.
 const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 1_800_000;
-
-function postJson(urlString, bodyObj) {
-  const http = require('http');
-  const url = new URL(urlString);
-  const payload = JSON.stringify(bodyObj);
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: url.hostname,
-      port: url.port || 80,
-      path: url.pathname,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      timeout: REQUEST_TIMEOUT_MS,
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`));
-          return;
-        }
-        try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Ollama returned unparseable JSON: ${e.message}`)); }
-      });
-    });
-    req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${REQUEST_TIMEOUT_MS}ms`)); });
-    req.on('error', reject);
-    req.write(payload);
-    req.end();
-  });
-}
 
 const TOOLS = [
   {
@@ -87,7 +59,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5 }) {
       messages,
       tools: TOOLS,
       stream: false,
-    });
+    }, REQUEST_TIMEOUT_MS);
 
     const message = res.message || {};
     lastMessage = message;
