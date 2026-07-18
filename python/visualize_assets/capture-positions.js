@@ -9,7 +9,7 @@
 // reveal of a still-settling graph.
 if (typeof network !== 'undefined' && network) {
   var hideOverlay = function() { var el = document.getElementById('stabilizing-overlay'); if (el) el.style.display = 'none'; };
-  network.once('stabilizationIterationsDone', function() {
+  var onStabilized = function() {
     hideOverlay();
     network.setOptions({ physics: { enabled: false } });
     var positions = network.getPositions();
@@ -21,6 +21,15 @@ if (typeof network !== 'undefined' && network) {
     // cap keepalive request bodies (~64KB in Chrome) -- large graphs may still lose the
     // race, but this fixes the common case with no added complexity.
     fetch('/project/positions?path=__ENCODED_PATH__&grepDirs=__ENCODED_GREP_DIRS__', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(positions), keepalive: true });
-  });
+  };
+  // A trivially small/simple graph can finish its internal stabilization synchronously,
+  // before this script even attaches its listener -- 'stabilizationIterationsDone' would
+  // have already fired by then, so a bare .once() here could silently never capture
+  // anything. Check the current state directly rather than assuming the event is ahead.
+  if (network.physics.stabilized) {
+    onStabilized();
+  } else {
+    network.once('stabilizationIterationsDone', onStabilized);
+  }
   setTimeout(hideOverlay, 20000);
 }

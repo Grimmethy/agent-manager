@@ -79,10 +79,11 @@ def _seed_positions_by_community(nodes: list[dict]) -> dict[int, tuple[float, fl
     return positions
 
 
-# These four correspond 1:1 to files in visualize_assets/ -- see _read_asset above.
+# These correspond 1:1 to files in visualize_assets/ -- see _read_asset above.
 STABILIZING_OVERLAY_HTML = _read_asset("stabilizing-overlay.html")
 FILL_ANCESTOR_HEIGHT_CSS = f"<style>{_read_asset('fill-ancestor-height.css')}</style>"
 COMMUNITY_DRAG_TOGGLE_HTML = _read_asset("community-drag-toggle.html")
+CROSSING_CHECK_BADGE_HTML = _read_asset("crossing-check-badge.html")
 
 
 def render_html(graph_data: dict, coverage_data: dict | None = None, positions: dict | None = None, project_path: str | None = None, grep_dirs: list[str] | None = None) -> str:
@@ -187,6 +188,12 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
             .replace("__ENCODED_GREP_DIRS__", encoded_grep_dirs)
         )
         html = html.replace("</body>", f"<script>{autosave_script}</script>" + "</body>", 1)
+
+    # No placeholders to substitute -- purely client-side (network/nodes/edges are already
+    # in scope), doesn't need project_path/grepDirs, so unlike the blocks above this runs
+    # unconditionally (a CLI-rendered file with no project_path still benefits from it).
+    crossing_script = _read_asset("crossing-check.js")
+    html = html.replace("</body>", CROSSING_CHECK_BADGE_HTML + f"<script>{crossing_script}</script>" + "</body>", 1)
 
     return html
 
