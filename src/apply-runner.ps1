@@ -25,6 +25,8 @@ $ReviewLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live L
 $TempDir = Join-Path $env:TEMP 'apply-runner'
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
+. (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
+
 # Applies tasks already APPROVED in review-runner.ps1 (queue/approved/). Ornith has no tool
 # access in this pipeline, so it can only produce a verdict -- this script is the one place
 # that actually executes an approved task: git branch/commit/push for repoRoot-domain
@@ -53,44 +55,11 @@ function Get-WorkDir {
     }
 }
 
-function Read-TaskJson { param([string]$Path) return [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json }
-function Write-TaskJson { param([string]$Path, $TaskObj) [System.IO.File]::WriteAllText($Path, ($TaskObj | ConvertTo-Json -Depth 20)) }
-
 $startedAt = (Get-Date).ToString('o')
 
 function Write-Heartbeat {
     param([string]$Status, [string]$TaskId = $null)
-    $hb = @{
-        instanceId    = 'apply-runner'
-        pid           = $PID
-        model         = 'claude-code-cli'
-        status        = $Status
-        currentTaskId = $TaskId
-        currentPass   = $null
-        lastHeartbeat = (Get-Date).ToString('o')
-        startedAt     = $startedAt
-    }
-    $hbPath = Join-Path $InstancesDir 'apply-runner.json'
-    [System.IO.File]::WriteAllText($hbPath, ($hb | ConvertTo-Json -Depth 5))
-}
-
-function Invoke-TaskDb {
-    param([string]$Event, [string]$TaskPath, [string]$ExtraJson = $null)
-    try {
-        $dbScript = Join-Path $PipelineDir 'agent-task-db.js'
-        if (-not (Test-Path $dbScript)) { return }
-        if ($ExtraJson) {
-            $escaped = $ExtraJson -replace '"', '\"'
-            node $dbScript $Event $TaskPath $escaped | Out-Null
-        } else {
-            node $dbScript $Event $TaskPath | Out-Null
-        }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host ('task-db {0} exited {1} (non-fatal)' -f $Event, $LASTEXITCODE) -ForegroundColor DarkYellow
-        }
-    } catch {
-        Write-Host ('task-db {0} failed (non-fatal): {1}' -f $Event, $_.Exception.Message) -ForegroundColor DarkYellow
-    }
+    Write-HeartbeatFile -InstanceId 'apply-runner' -Status $Status -Model 'claude-code-cli' -TaskId $TaskId -StartedAt $startedAt
 }
 
 # The drafting model cannot reliably assign a collision-free AC-NNN id -- a manual
@@ -257,6 +226,7 @@ function Invoke-ApplyPass {
         Write-TaskJson $blockedPath $task
         Remove-Item $next.FullName -Force
         Invoke-TaskDb 'blocked' $blockedPath (@{ applyDurationMs = $applySw.ElapsedMilliseconds; reason = [string]$applyFailReason } | ConvertTo-Json -Compress)
+        Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'blocked_apply'; outcomeStage = 'apply'; outcomeReason = [string]$applyFailReason }
         Add-ApplyLogEntry -TaskId $task.id -Title $task.title -Result 'APPLY-FAILED' -Detail $applyFailReason
         Write-Host ('Apply failed (not crashing the loop): {0} ({1})' -f $task.id, $applyFailReason) -ForegroundColor Red
         return 'blocked'

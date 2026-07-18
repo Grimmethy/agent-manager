@@ -13,6 +13,8 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir 'approved') | Out-Null
 
+. (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
+
 # Review provider is swappable, not hardcoded -- defaults to Ornith (free, local) so this
 # loop no longer scales token spend with task volume. `claude` remains available for cases
 # that need real judgment quality; set REVIEW_PROVIDER=claude to use it.
@@ -96,49 +98,11 @@ function Get-WorkDir {
 # done/ or blocked/, so a crash mid-review is safe -- the file is picked up again on
 # restart.
 
-function Read-TaskJson { param([string]$Path) return [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json }
-function Write-TaskJson { param([string]$Path, $TaskObj) [System.IO.File]::WriteAllText($Path, ($TaskObj | ConvertTo-Json -Depth 20)) }
-
 $startedAt = (Get-Date).ToString('o')
 
 function Write-Heartbeat {
     param([string]$Status, [string]$TaskId = $null)
-    $hb = @{
-        instanceId    = 'review-runner'
-        pid           = $PID
-        model         = 'claude-code-cli'
-        status        = $Status
-        currentTaskId = $TaskId
-        currentPass   = $null
-        lastHeartbeat = (Get-Date).ToString('o')
-        startedAt     = $startedAt
-    }
-    $hbPath = Join-Path $InstancesDir 'review-runner.json'
-    [System.IO.File]::WriteAllText($hbPath, ($hb | ConvertTo-Json -Depth 5))
-}
-
-# Best-effort DB mirror (a CONSUMER-owned script, e.g. agent-task-db.js) -- must never
-# crash the loop, and is a no-op if the consumer doesn't have one.
-function Invoke-TaskDb {
-    param([string]$Event, [string]$TaskPath, [string]$ExtraJson = $null)
-    try {
-        $dbScript = Join-Path $PipelineDir 'agent-task-db.js'
-        if (-not (Test-Path $dbScript)) { return }
-        if ($ExtraJson) {
-            # PS 5.1 strips unescaped double quotes when passing args to a native exe --
-            # verified live: {"a":"b"} arrives as {a:b} and JSON.parse fails. Pre-escape.
-            $escaped = $ExtraJson -replace '"', '\"'
-            node $dbScript $Event $TaskPath $escaped | Out-Null
-        } else {
-            node $dbScript $Event $TaskPath | Out-Null
-        }
-        if ($LASTEXITCODE -ne 0) {
-            # Native non-zero exit does not throw in PowerShell -- surface it explicitly.
-            Write-Host ('task-db {0} exited {1} (non-fatal)' -f $Event, $LASTEXITCODE) -ForegroundColor DarkYellow
-        }
-    } catch {
-        Write-Host ('task-db {0} failed (non-fatal): {1}' -f $Event, $_.Exception.Message) -ForegroundColor DarkYellow
-    }
+    Write-HeartbeatFile -InstanceId 'review-runner' -Status $Status -Model 'claude-code-cli' -TaskId $TaskId -StartedAt $startedAt
 }
 
 function Add-ReviewLogEntry {
@@ -484,6 +448,7 @@ function Invoke-ReviewPass {
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
             Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'INCONCLUSIVE' -Detail $reason
             Write-Host ('Ornith review inconclusive: {0} ({1})' -f $task.id, $voteSummary) -ForegroundColor Yellow
             return 'blocked'
@@ -500,6 +465,7 @@ function Invoke-ReviewPass {
             Write-TaskJson $approvedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'ornith' } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'approved'; outcomeStage = 'review'; outcomeReason = $null }
             Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'APPROVED' -Detail $detail
             Write-Host ('Approved by Ornith ({0}): {1} -- queued for apply-runner' -f $voteSummary, $task.id) -ForegroundColor Cyan
             return 'approved'
@@ -514,6 +480,7 @@ function Invoke-ReviewPass {
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
             Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'REJECTED' -Detail ('{0} ({1})' -f $reason, $voteSummary)
             Write-Host ('Rejected by Ornith ({0}): {1} ({2})' -f $voteSummary, $task.id, $reason) -ForegroundColor Yellow
             return 'blocked'

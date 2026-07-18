@@ -4,6 +4,16 @@
   "description": "Unattended Plan -> Draft -> Review -> Apply pipeline for delegating coding/documentation tasks to a local LLM, with a deterministic (no-LLM) apply step and a plugin registry for task sources.",
   "license": "MIT",
   "main": "src/task-source-registry.js",
-  "files": ["src", "ps1", "LICENSE", "README.md"],
-  "engines": { "node": ">=18" }
+  "files": [
+    "src",
+    "ps1",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
+  }
 }

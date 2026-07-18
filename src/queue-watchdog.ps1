@@ -9,7 +9,11 @@ $InstancesDir = Join-Path $PipelineDir 'instances'
 $SecondBrainDir = if ($env:SECOND_BRAIN_DIR) { $env:SECOND_BRAIN_DIR } else { $null }
 $ReviewLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log.md' } else { Join-Path $env:TEMP 'agent-manager-live-log.md' }
 $CommunityCoveragePath = if ($env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH) { $env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH } else { Join-Path $PipelineDir 'community-coverage.json' }
+$TempDir = Join-Path $env:TEMP 'queue-watchdog'
 New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
+New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+
+. (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
 
 # Two jobs, deliberately in ONE script -- "is this task actually stuck" answered in one
 # place:
@@ -28,8 +32,16 @@ New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 # try/catch'd per-item, so one bad heartbeat file or one bad blocked-task file never stops
 # the rest of a pass, and the outer loop itself never dies from an unhandled exception.
 
-$CheckIntervalSeconds = 180  # generous relative to observed single-pass durations
-$StaleHeartbeatSeconds = 480  # 8 min -- longer than any real review/apply pass observed
+# Tightened 2026-07-18 alongside ornith-client.js's 4-min REQUEST_TIMEOUT_MS: no single
+# Ornith call should run longer than that anymore (it either finishes or crashes the
+# worker), so 8 min of "recently updated, fine" tolerance was pure added latency on top of
+# an already-crashed process, not real caution. StaleHeartbeatSeconds keeps a modest margin
+# above the 4-min call ceiling rather than matching it exactly, since review/apply passes
+# route through this same instances/ heartbeat mechanism and aren't all bounded by that
+# same client-side timeout. CheckIntervalSeconds is cheap regardless of value -- a handful
+# of small JSON file reads plus Get-Process calls, no GPU/disk contention with Ornith.
+$CheckIntervalSeconds = 10
+$StaleHeartbeatSeconds = 300  # 5 min -- comfortably above the 4-min per-call ceiling
 $MaxOrnithRejectRetries = 2
 
 # instanceId prefix -> how to restart it. 'worker-' matches any worker-N via -like. Every
@@ -42,16 +54,7 @@ $RESTART_MAP = @(
 
 function Write-Heartbeat {
     param([string]$Status)
-    $hb = @{
-        instanceId    = 'queue-watchdog'
-        pid           = $PID
-        model         = $null
-        status        = $Status
-        currentTaskId = $null
-        currentPass   = $null
-        lastHeartbeat = (Get-Date).ToString('o')
-    }
-    [System.IO.File]::WriteAllText((Join-Path $InstancesDir 'queue-watchdog.json'), ($hb | ConvertTo-Json -Depth 5))
+    Write-HeartbeatFile -InstanceId 'queue-watchdog' -Status $Status
 }
 
 function Add-WatchdogLogEntry {
@@ -153,6 +156,8 @@ function Invoke-RejectRetryCheck {
 
             $task | Add-Member -NotePropertyName 'ornithRejectCount' -NotePropertyValue ($retryCount + 1) -Force
             $task | Add-Member -NotePropertyName 'priorRejectionFeedback' -NotePropertyValue $priorFeedback -Force
+
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'requeued'; outcomeStage = 'watchdog'; outcomeReason = [string]$task.blockedReason }
 
             $newPath = Join-Path $pendingDir $file.Name
             [System.IO.File]::WriteAllText($newPath, ($task | ConvertTo-Json -Depth 20))

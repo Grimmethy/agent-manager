@@ -10,6 +10,13 @@
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL = process.env.ORNITH_MODEL || 'ornith';
+// Without this, Ollama falls back to its own default unload window between calls --
+// observed live 2026-07-18 paying a ~38-40s cold-load penalty on the very next call
+// whenever a gap (between passes, or between tasks) outlasted it. Free to set generously
+// since nothing else is competing for the model slot on this box (OLLAMA_MAX_LOADED_MODELS
+// effectively 1 already, per ornith-worker.ps1's own comment on why concurrent instances
+// must share one model tier).
+const KEEP_ALIVE = process.env.ORNITH_KEEP_ALIVE || '30m';
 
 function detectDegenerate(text) {
   if (!text || text.trim().length === 0) return 'empty';
@@ -36,11 +43,11 @@ function detectDegenerate(text) {
   return null;
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192, numPredict = 1200, repeatPenalty, format }) {
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192, numPredict = 1200, repeatPenalty, format, model }) {
   const options = { num_ctx: numCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
 
-  const body = { model: MODEL, prompt, think, stream: false, options };
+  const body = { model: model || MODEL, prompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
   // Grammar-constrained decoding. When `format` is set ("json", or a full JSON-schema object),
   // Ollama restricts the sampler to tokens valid for that grammar, so a malformed or
   // markdown-fenced response is *unrepresentable* rather than merely discouraged in the prompt.
@@ -54,11 +61,17 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192
 }
 
 // Raw http.request instead of fetch: with stream:false Ollama only answers once the
-// whole generation is done, and a large num_predict on this hardware legitimately takes
-// longer than fetch/undici's built-in ~5-minute header/body timeouts — observed live
-// 2026-07-10 as a bare "fetch failed" on an 8192-token draft. Same 30-minute-timeout
-// pattern Docs/agents/ornith-delegation.md already mandates for ornith-chat.js's postJson.
-const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 1_800_000;
+// whole generation is done, and fetch/undici's built-in header/body timeouts (~5 min)
+// are too short to always let a real call finish, so this uses its own socket timeout
+// instead. 4 minutes is a deliberate overtime-fail line, not a safety margin around the
+// worst call ever seen (5.3 min as of 2026-07-18, well above this) -- a call running
+// this long is treated as a basic requirement violation in its own right, regardless of
+// whether it might eventually succeed. A timeout here crashes the worker process (no
+// per-iteration try/catch in ornith-worker.ps1's main loop), which makes
+// queue-watchdog.ps1's existing dead-process check (PID gone) fire on its next poll,
+// instead of waiting on a heartbeat-staleness check that never triggers while the PID
+// is still alive.
+const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
 
 function postJson(urlString, bodyObj) {
   const http = require('http');

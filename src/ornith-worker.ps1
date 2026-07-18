@@ -32,10 +32,19 @@ $LiveLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log
 $InstancesDir = Join-Path $PipelineDir 'instances'
 New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 
+. (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
+
 # All concurrent instances should normally use the SAME model tier -- Ollama keeps only
 # one tier resident on typical hardware (OLLAMA_MAX_LOADED_MODELS effectively 1), so
 # mixing model tiers across instances causes swap-load thrashing, not parallelism.
 $env:ORNITH_MODEL = $Model
+
+# Same-stage A/B candidates for the implement pass only (see Select-AbModel below). Unset
+# or single-entry -- the default -- means every implement call uses $Model, byte-identical
+# to before this existed. Only safe on a single worker instance, same reason as above:
+# running distinct candidate lists across concurrent instances would thrash the model
+# cache the same way mixed model tiers would.
+$AbCandidates = if ($env:ORNITH_AB_MODELS) { $env:ORNITH_AB_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { @() }
 
 # Per-instance drafting subfolder: the claim mechanism. Move-Item into it is atomic on
 # the same volume, so two workers can never hold the same task file.
@@ -47,30 +56,30 @@ $startedAt = (Get-Date).ToString('o')
 
 function Write-Heartbeat {
     param([string]$Status, [string]$TaskId = $null, [string]$Pass = $null)
-    $heartbeatObj = @{
-        instanceId    = $InstanceId
-        pid           = $PID
-        model         = $Model
-        status        = $Status
-        currentTaskId = $(if ($TaskId) { $TaskId } else { $null })
-        currentPass   = $(if ($Pass) { $Pass } else { $null })
-        lastHeartbeat = (Get-Date).ToString('o')
-        startedAt     = $startedAt
-    }
-    $hbPath = Join-Path $InstancesDir ($InstanceId + '.json')
-    [System.IO.File]::WriteAllText($hbPath, ($heartbeatObj | ConvertTo-Json -Depth 10))
+    Write-HeartbeatFile -InstanceId $InstanceId -Status $Status -Model $Model -TaskId $TaskId -Pass $Pass -StartedAt $startedAt
 }
 
 function Invoke-OrnithClient {
-    param([string]$Prompt, [bool]$Think = $true, [double]$Temperature = 0.4, [int]$NumPredict = 1400, [string]$Format = $null)
+    param([string]$Prompt, [bool]$Think = $true, [double]$Temperature = 0.4, [int]$NumPredict = 1400, [string]$Format = $null, [string]$ModelOverride = $null)
     $reqPath = Join-Path $TempDir ('req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; think = $Think; temperature = $Temperature; numPredict = $NumPredict }
     if ($Format) { $reqObj | Add-Member -NotePropertyName 'format' -NotePropertyValue $Format }
+    if ($ModelOverride) { $reqObj | Add-Member -NotePropertyName 'model' -NotePropertyValue $ModelOverride }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     $rawLines = & node $clientPath $reqPath
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
+}
+
+# Deterministic hash of task.id -> same task always compares the same A/B candidate across
+# its whole redraft lifecycle (a watchdog reject-retry keeps testing the same model, which
+# is the correct comparison unit), with no persistent counter file needed.
+function Select-AbModel {
+    param([string]$TaskId, [string[]]$Candidates)
+    if (-not $Candidates -or $Candidates.Count -le 1) { return $null }
+    $hash = [System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($TaskId))
+    return $Candidates[[BitConverter]::ToUInt32($hash, 0) % $Candidates.Count]
 }
 
 function Invoke-OrnithToolClient {
@@ -93,33 +102,6 @@ function Get-PromptText {
         $lines = & node $promptsPath $TaskPath $Pass
     }
     return ($lines -join "`n")
-}
-
-# Best-effort DB mirror -- a CONSUMER-owned script (e.g. agent-task-db.js), not part of
-# this package, living in the consumer's own pipeline dir alongside its queue/instances
-# data. The filesystem queue is the working state; a DB row (if the consumer has one) is
-# only a durable record a dashboard might read -- so a missing script or a DB failure
-# must NEVER block or crash the queue loop.
-function Invoke-TaskDb {
-    param([string]$Event, [string]$TaskPath, [string]$ExtraJson = $null)
-    try {
-        $dbScript = Join-Path $PipelineDir 'agent-task-db.js'
-        if (-not (Test-Path $dbScript)) { return }
-        if ($ExtraJson) {
-            # PS 5.1 strips unescaped double quotes when passing args to a native exe --
-            # verified live: {"a":"b"} arrives as {a:b} and JSON.parse fails. Pre-escape.
-            $escaped = $ExtraJson -replace '"', '\"'
-            node $dbScript $Event $TaskPath $escaped | Out-Null
-        } else {
-            node $dbScript $Event $TaskPath | Out-Null
-        }
-        if ($LASTEXITCODE -ne 0) {
-            # Native non-zero exit does not throw in PowerShell -- surface it explicitly.
-            Write-Host ('task-db {0} exited {1} (non-fatal)' -f $Event, $LASTEXITCODE) -ForegroundColor DarkYellow
-        }
-    } catch {
-        Write-Host ('task-db {0} failed (non-fatal): {1}' -f $Event, $_.Exception.Message) -ForegroundColor DarkYellow
-    }
 }
 
 function Add-LiveLogEntry {
@@ -146,22 +128,18 @@ function Add-LiveLogEntry {
     Add-Content -Path $LiveLogPath -Value $entry -Encoding utf8
 }
 
-function Read-TaskJson {
-    param([string]$Path)
-    return [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
-}
-
-function Write-TaskJson {
-    param([string]$Path, $TaskObj)
-    [System.IO.File]::WriteAllText($Path, ($TaskObj | ConvertTo-Json -Depth 20))
-}
-
 # --- Crash-resume scan (startup, before the main loop) --------------------------------
 # Some machines hard-crash for real (WHEA errors etc), so orphaned claims MUST be
 # recovered: any drafting subfolder whose owning instance is dead gets its task files
 # moved back to pending/. A claim is left alone ONLY while its heartbeat pid is a
-# running process, or for the 30-minute grace window after its last heartbeat (the
-# PID-reuse / restart-race hedge).
+# running process, or for the grace window after its last heartbeat (the PID-reuse /
+# restart-race hedge). Tightened from 30 min to 10 min on 2026-07-18: with restarts now
+# happening every few minutes (Ollama wedges, queue-watchdog's own faster recovery), a
+# 30-min window meant every single orphaned claim got deferred past the NEXT restart
+# too, piling up unrecovered indefinitely -- 11 stuck drafts, zero ever reaching review.
+# 10 min still comfortably covers a genuine restart race (queue-watchdog's own
+# StaleHeartbeatSeconds is 5 min) without silently accumulating orphans across restarts
+# that happen faster than the grace window itself.
 try {
     $draftingRoot = Join-Path $QueueDir 'drafting'
     if (Test-Path $draftingRoot) {
@@ -185,7 +163,7 @@ try {
                     # it the grace window before stealing. Unparseable timestamp = stale.
                     $lastHb = $null
                     try { $lastHb = [datetime]::Parse($lastHbStr) } catch { $lastHb = $null }
-                    if ($lastHb -and ((Get-Date) - $lastHb).TotalMinutes -le 30) {
+                    if ($lastHb -and ((Get-Date) - $lastHb).TotalMinutes -le 10) {
                         continue
                     }
 
@@ -343,12 +321,13 @@ while ($true) {
     # the reasoning trace. Everything else's implement pass is prose/code -> leave it
     # unconstrained + thinking on.
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'implement'
+    $abModel = Select-AbModel -TaskId $task.id -Candidates $AbCandidates
     $implSw = [System.Diagnostics.Stopwatch]::StartNew()
     $implPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'implement' -PlanTextPath $planTextPath
     if ($task.source -in @('trouble_log', 'arch_review') -or $task.domain -eq 'adhoc') {
-        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json'
+        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json' -ModelOverride $abModel
     } else {
-        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400
+        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400 -ModelOverride $abModel
     }
     $implSw.Stop()
     Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Implement' -Thinking $implResult.thinking -Response $implResult.response -Degenerate $implResult.degenerate
@@ -356,6 +335,24 @@ while ($true) {
     $task | Add-Member -NotePropertyName 'planResponse' -NotePropertyValue $planResult.response -Force
     $task | Add-Member -NotePropertyName 'implementResponse' -NotePropertyValue $implResult.response -Force
     $task | Add-Member -NotePropertyName 'draftedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+
+    $abCallId = [guid]::NewGuid().ToString()
+    $task | Add-Member -NotePropertyName 'abCallId' -NotePropertyValue $abCallId -Force
+    Invoke-ModelStatsDb 'record-call' @{
+        callId = $abCallId
+        taskId = $task.id
+        stage = 'implement'
+        model = $(if ($abModel) { $abModel } else { $Model })
+        candidates = ($AbCandidates -join ',')
+        startedAt = (Get-Date).ToString('o')
+        latencyMs = $implSw.ElapsedMilliseconds
+        evalDurationNs = $implResult.eval_duration
+        promptEvalCount = $implResult.prompt_eval_count
+        evalCount = $implResult.eval_count
+        attempts = $implResult.attempts
+        degenerate = $implResult.degenerate
+        callError = $null
+    }
 
     if ($implResult.degenerate) {
         $reason = 'Implement pass degenerate: {0}' -f $implResult.degenerate
