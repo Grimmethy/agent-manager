@@ -155,7 +155,7 @@ function Invoke-ReviewPass {
         $domainCfg = Get-DomainConfig -Domain $task.domain
     } catch {
         $reason = $_.Exception.Message
-        $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+        Set-TaskBlockedStage -Task $task -Reason $reason
         $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
         Write-TaskJson $blockedPath $task
         Remove-Item $next.FullName -Force
@@ -309,7 +309,7 @@ function Invoke-ReviewPass {
         $reviewSw.Stop()
 
         if ($reviewFailed) {
-            $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reviewFailReason -Force
+            Set-TaskBlockedStage -Task $task -Reason $reviewFailReason
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
@@ -359,7 +359,7 @@ function Invoke-ReviewPass {
             return 'done'
         } else {
             $reason = if ($outputText -match 'RESULT:\s*BLOCKED:\s*(.+)') { $matches[1] } else { ($outputText -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1) }
-            $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+            Set-TaskBlockedStage -Task $task -Reason $reason
             $task | Add-Member -NotePropertyName 'rawClaudeOutput' -NotePropertyValue $outputText -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
@@ -419,7 +419,7 @@ function Invoke-ReviewPass {
 
         if ($reviewFailed -or -not $voteResult) {
             $reason = if ($reviewFailReason) { $reviewFailReason } else { 'Ornith majority-vote call returned nothing' }
-            $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+            Set-TaskBlockedStage -Task $task -Reason $reason
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
@@ -436,14 +436,9 @@ function Invoke-ReviewPass {
             # reach minAgreeing. Treated as REJECT, not APPROVE: an unclear signal must
             # never default to letting a task through.
             $reason = 'Ornith review inconclusive, no confident majority ({0})' -f $voteSummary
-            $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+            Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith' -Force
             $task | Add-Member -NotePropertyName 'ornithVotes' -NotePropertyValue $voteResult.votes -Force
-            # blockedStage tags WHICH stage produced this block -- queue-watchdog.ps1's
-            # reject-retry-requeue must only fire on a genuine review-stage rejection,
-            # never on an apply-stage failure that happens to still carry ornithVotes from
-            # an earlier, unrelated successful review.
-            $task | Add-Member -NotePropertyName 'blockedStage' -NotePropertyValue 'review' -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
@@ -472,10 +467,9 @@ function Invoke-ReviewPass {
         } else {
             $sampleVote = ($voteResult.votes | Where-Object { $_.verdict -eq 'REJECT' } | Select-Object -First 1)
             $reason = if ($sampleVote -and $sampleVote.response -match 'REJECT:\s*(.+)') { $matches[1] } else { 'REJECT ({0})' -f $voteSummary }
-            $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+            Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith' -Force
             $task | Add-Member -NotePropertyName 'ornithVotes' -NotePropertyValue $voteResult.votes -Force
-            $task | Add-Member -NotePropertyName 'blockedStage' -NotePropertyValue 'review' -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force

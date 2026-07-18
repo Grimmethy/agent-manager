@@ -110,16 +110,11 @@ function Invoke-RejectRetryCheck {
     foreach ($file in $files) {
         try {
             $task = Get-Content $file.FullName -Raw | ConvertFrom-Json
-            # Only a task explicitly tagged blockedStage='review' by review-runner.ps1
-            # qualifies -- NOT merely "has ornithVotes". A task can be genuinely approved
-            # by review (ornithVotes present, real APPROVE majority), then fail later at
-            # apply time (e.g. a git-checkout collision unrelated to the draft's quality)
-            # -- that apply-stage block still carries the earlier ornithVotes, so checking
-            # for their mere presence alone would blindly retry an apply-time failure as if
-            # redrafting could fix it (it can't; redrafting never touches the thing that
-            # actually failed). blockedStage is set exactly once per block-write, by
-            # whichever stage (review vs. apply) actually produced it.
-            if ($task.blockedStage -ne 'review') { continue }
+            # Test-ReviewRejection (agent-manager-common.ps1) owns the invariant: only a
+            # genuine review-stage rejection is eligible for reject-retry-requeue, never an
+            # apply-stage failure that happens to still carry ornithVotes from an earlier,
+            # unrelated successful review (redrafting can't fix that).
+            if (-not (Test-ReviewRejection -Task $task)) { continue }
 
             $retryCount = if ($task.ornithRejectCount) { [int]$task.ornithRejectCount } else { 0 }
             if ($retryCount -ge $MaxOrnithRejectRetries) {

@@ -288,7 +288,7 @@ while ($true) {
 
     if ($planDegenerate) {
         $reason = 'Plan pass degenerate: {0}' -f $planDegenerate
-        $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+        Set-TaskBlockedStage -Task $task -Reason $reason
         $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
         Write-TaskJson $blockedPath $task
         Remove-Item $draftingPath -Force
@@ -356,7 +356,7 @@ while ($true) {
 
     if ($implResult.degenerate) {
         $reason = 'Implement pass degenerate: {0}' -f $implResult.degenerate
-        $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $reason -Force
+        Set-TaskBlockedStage -Task $task -Reason $reason
         $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
         Write-TaskJson $blockedPath $task
         Remove-Item $draftingPath -Force

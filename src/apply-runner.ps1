@@ -215,13 +215,7 @@ function Invoke-ApplyPass {
     }
 
     if ($applyFailed) {
-        $task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue ('apply failed: {0}' -f $applyFailReason) -Force
-        # blockedStage='apply' -- see review-runner.ps1's matching comment. This task may
-        # still carry ornithVotes from an earlier successful review; that must NOT make
-        # queue-watchdog.ps1 treat an apply-time failure (e.g. a git-checkout collision
-        # with something else in the working tree) as a review rejection eligible for
-        # blind retry -- redrafting can never fix a working-tree collision.
-        $task | Add-Member -NotePropertyName 'blockedStage' -NotePropertyValue 'apply' -Force
+        Set-TaskBlockedStage -Task $task -Reason ('apply failed: {0}' -f $applyFailReason) -Stage 'apply'
         $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
         Write-TaskJson $blockedPath $task
         Remove-Item $next.FullName -Force

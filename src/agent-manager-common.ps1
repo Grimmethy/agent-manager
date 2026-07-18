@@ -71,6 +71,23 @@ function Write-TaskJson {
 # identical everywhere. Each script keeps its OWN thin Write-Heartbeat wrapper (a
 # different identity: instanceId, model, whether a currentPass concept even applies) so
 # no existing call site anywhere had to change; only the file-write plumbing moved here.
+# The one invariant this owns: a task written to blocked/ with blockedStage='review' is a
+# genuine review-stage rejection eligible for queue-watchdog's reject-retry-requeue --
+# never merely "has ornithVotes" (an apply-stage failure can still carry votes from an
+# earlier, unrelated successful review). Previously this rule was independently re-derived
+# and re-explained in a comment in review-runner.ps1, apply-runner.ps1, and
+# queue-watchdog.ps1 instead of being enforced in one place.
+function Set-TaskBlockedStage {
+    param($Task, [string]$Reason, [string]$Stage = $null)
+    $Task | Add-Member -NotePropertyName 'blockedReason' -NotePropertyValue $Reason -Force
+    if ($Stage) { $Task | Add-Member -NotePropertyName 'blockedStage' -NotePropertyValue $Stage -Force }
+}
+
+function Test-ReviewRejection {
+    param($Task)
+    return $Task.blockedStage -eq 'review'
+}
+
 function Write-HeartbeatFile {
     param(
         [string]$InstanceId,
