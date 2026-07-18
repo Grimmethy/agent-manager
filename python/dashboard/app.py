@@ -109,6 +109,23 @@ def _fallback_cache_paths(path_str: str, grep_dirs: list[str] | None = None) -> 
     return _cache_paths_for_dir(PROJECT_CACHE_DIR / project_slug(path_str) / _grepdirs_slug(grep_dirs or []))
 
 
+def resolve_writable_cache(path_str: str, grep_dirs: list[str] | None = None) -> dict:
+    """The one place both write sites (_run_build, api_project_positions) go through,
+    instead of each inlining its own copy of the same mkdir-try/except/fallback dance.
+    Returns project_cache_paths(...) with its directory already created, falling back to
+    the old dashboard-side location (creating THAT instead) if the project-local one
+    can't be created (read-only mount, permissions) -- a build/save doesn't just fail
+    outright on a read-only project."""
+    cache = project_cache_paths(path_str, grep_dirs)
+    try:
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        return cache
+    except OSError:
+        cache = _fallback_cache_paths(path_str, grep_dirs)
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        return cache
+
+
 def _migrate_legacy_cache_if_needed(path_str: str, cache: dict) -> None:
     """One-time, best-effort copy from the old dashboard-side cache (keyed by path only,
     no grepDirs distinction) into the new project-local location. No-ops once the new
@@ -498,14 +515,7 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
         result = build_graph.build_graph_data(Path(path_str), grep_dirs, ollama_url, ornith_model, progress=progress)
 
-        cache = project_cache_paths(path_str, grep_dirs)
-        try:
-            cache["dir"].mkdir(parents=True, exist_ok=True)
-        except OSError:
-            # Read-only mount, permissions, etc -- fall back to the old dashboard-side
-            # location rather than losing the build entirely.
-            cache = _fallback_cache_paths(path_str, grep_dirs)
-            cache["dir"].mkdir(parents=True, exist_ok=True)
+        cache = resolve_writable_cache(path_str, grep_dirs)
         cache["graph"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
         cache["coverage"].write_text(json.dumps(result["coverage"], indent=2), encoding="utf-8")
         # A rebuild can change the node set/communities, so any previously cached layout
@@ -579,7 +589,7 @@ def project_visualization():
 @app.route("/project/positions", methods=["POST"])
 def api_project_positions():
     """Best-effort layout cache write from the visualization iframe's own capture script
-    (see visualize_graph.CAPTURE_SCRIPT_TEMPLATE / COMMUNITY_DRAG_SCRIPT_TEMPLATE) --
+    (see python/visualize_assets/capture-positions.js / community-drag.js) --
     same-origin, server-generated page posting back to its own dashboard, not external
     user input.
 
@@ -598,12 +608,7 @@ def api_project_positions():
     if positions is None:
         abort(400, description="request body must be JSON")
     grep_dirs = _grep_dirs_from_query()
-    cache = project_cache_paths(raw_path, grep_dirs)
-    try:
-        cache["dir"].mkdir(parents=True, exist_ok=True)
-    except OSError:
-        cache = _fallback_cache_paths(raw_path, grep_dirs)
-        cache["dir"].mkdir(parents=True, exist_ok=True)
+    cache = resolve_writable_cache(raw_path, grep_dirs)
     existing = read_json_safe(cache["positions"]) or {}
     existing.update(positions)
     cache["positions"].write_text(json.dumps(existing), encoding="utf-8")
