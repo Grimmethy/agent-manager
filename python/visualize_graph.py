@@ -91,15 +91,20 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     directly in an iframe, generated fresh from whatever graph is currently cached for the
     browsed project, no separate 'run visualize_graph.py' step required.
 
-    `positions` (node id -> {x, y}, as captured by capture-positions.js from a previous
-    render) starts every node already at its previously-settled spot instead of scattered
-    randomly, so the graph paints looking finished immediately instead of resimulating from
-    scratch on every iframe load -- physics stays ON, though, so it's still a live,
-    interactive graph (drag a node and its neighbors respond), not a frozen image; nothing
-    visibly moves on load since it's already at equilibrium. Without cached `positions`,
-    the layout runs for real (seeded by community, not fully random -- see
-    _seed_positions_by_community), and the resulting HTML captures its own settled
-    positions back to the server so the NEXT render has them."""
+    `positions` (node id -> {x, y}, as captured by capture-positions.js/
+    autosave-positions.js from a previous render) starts every node already at its
+    previously-settled spot instead of scattered randomly, so the graph paints looking
+    finished immediately instead of resimulating from scratch on every iframe load --
+    physics stays ON, though, so it's still a live, interactive graph (drag a node and its
+    neighbors respond), not a frozen image; nothing visibly moves on load since it's
+    already at equilibrium. Without cached `positions`, the layout runs for real (seeded
+    by community, not fully random -- see _seed_positions_by_community), and the
+    resulting HTML captures its own settled positions back to the server so the NEXT
+    render has them. autosave-positions.js additionally re-saves the FULL current
+    position set every 60s on every render (cached or not), so a node with no
+    individually-dragged position still eventually gets its physics-settled spot
+    persisted, instead of only ever falling back to the community-ring seed layout
+    forever once any one position exists in the cache."""
     names_by_id = {}
     if coverage_data:
         names_by_id = {c["id"]: c["name"] for c in coverage_data.get("communities", [])}
@@ -123,7 +128,11 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     # own energy-threshold check; this just caps the worst case.
     net.options.physics.stabilization.iterations = 200
 
-    seed_positions = None if positions else _seed_positions_by_community(graph_data["nodes"])
+    # Always computed, even when `positions` is present -- `positions` can be PARTIAL (a
+    # community-drag save only ever writes the dragged community's subset, not a full
+    # capture), so any node missing from it still needs a real fallback instead of
+    # crashing on a None lookup.
+    seed_positions = _seed_positions_by_community(graph_data["nodes"])
 
     for node in graph_data["nodes"]:
         community_id = node["community"]
@@ -156,7 +165,10 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
             .replace("__ENCODED_PATH__", quote(project_path, safe=""))
             .replace("__ENCODED_GREP_DIRS__", encoded_grep_dirs)
         )
-        html = html.replace("</body>", STABILIZING_OVERLAY_HTML + f"<script>{script}</script>" + "</body>")
+        # count=1: defense in depth -- an injected script's own comment text mentioning
+        # the closing body tag literally must never get mistaken for a second insertion
+        # point by a later call in this chain (this exact bug happened once already).
+        html = html.replace("</body>", STABILIZING_OVERLAY_HTML + f"<script>{script}</script>" + "</body>", 1)
 
     if project_path:
         community_groups = {cid: [n["id"] for n in members] for cid, members in _group_by_community(graph_data["nodes"]).items()}
@@ -166,7 +178,15 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
             .replace("__ENCODED_GREP_DIRS__", encoded_grep_dirs)
             .replace("__COMMUNITY_GROUPS_JSON__", json.dumps(community_groups))
         )
-        html = html.replace("</body>", COMMUNITY_DRAG_TOGGLE_HTML + f"<script>{drag_script}</script>" + "</body>")
+        html = html.replace("</body>", COMMUNITY_DRAG_TOGGLE_HTML + f"<script>{drag_script}</script>" + "</body>", 1)
+
+    if project_path:
+        autosave_script = (
+            _read_asset("autosave-positions.js")
+            .replace("__ENCODED_PATH__", quote(project_path, safe=""))
+            .replace("__ENCODED_GREP_DIRS__", encoded_grep_dirs)
+        )
+        html = html.replace("</body>", f"<script>{autosave_script}</script>" + "</body>", 1)
 
     return html
 

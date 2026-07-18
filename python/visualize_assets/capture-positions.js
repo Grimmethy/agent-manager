@@ -1,4 +1,4 @@
-// Injected right before </body> only when rendering WITHOUT cached positions (a fresh
+// Injected right before the closing body tag only when rendering WITHOUT cached positions (a fresh
 // layout run) -- shows a loading overlay so the physics simulation resolves off-screen
 // instead of visibly on it, then captures the settled coordinates exactly once and
 // persists them server-side so every subsequent render can skip the simulation entirely.

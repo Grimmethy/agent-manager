@@ -1,4 +1,4 @@
-// Injected before </body> in BOTH render branches (unlike capture-positions.js, which is
+// Injected before the closing body tag in BOTH render branches (unlike capture-positions.js, which is
 // uncached-only) -- dragging should work whether the page loaded fresh or from cache.
 // Opt-in via a checkbox: unchecked leaves vis-network's normal single-node drag completely
 // untouched; checked snapshots the dragged node's whole community and reapplies its delta
