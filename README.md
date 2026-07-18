@@ -192,6 +192,13 @@ powershell -File .\src\apply-runner.ps1
 powershell -File .\src\queue-watchdog.ps1
 ```
 
+## Testing
+
+`npm test` runs the (currently small, growing) unit test suite via Node's built-in test
+runner -- no extra dependency. Coverage starts with `apply-task.js`'s git sequencing (the
+single place that actually mutates the consumer's real git repo), exercised against
+`git-runner.js`'s fake adapter rather than a real repo/child_process.
+
 ## License
 
 MIT — see `LICENSE`.

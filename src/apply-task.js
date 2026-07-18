@@ -13,11 +13,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { applySecondBrainNote } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
+const { createRealGitRunner } = require('./git-runner.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -26,17 +26,6 @@ const { applyGroupB } = require('./apply-group-b.js');
 require('./task-sources.js');
 ensureRegistered();
 
-const GIT_ENV = {
-  ...process.env,
-  GIT_TERMINAL_PROMPT: '0',
-  GCM_INTERACTIVE: 'never',
-};
-const GIT_TIMEOUT_MS = 60_000;
-
-function runGit(args, repoRoot) {
-  return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
-}
-
 function writeArtifact(task, repoRoot, pipelineDir) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
@@ -44,6 +33,92 @@ function writeArtifact(task, repoRoot, pipelineDir) {
     return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
   }
   return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
+}
+
+/**
+ * The actual apply logic, independent of the CLI/stdout wrapper below -- exported so tests
+ * can call it directly with a fake git runner and a throwaway repoRoot/pipelineDir,
+ * instead of exercising a real git repo or shelling out to a child process.
+ * @param {object} task - The parsed task record.
+ * @param {object} config
+ * @param {string} config.repoRoot
+ * @param {string} config.pipelineDir
+ * @param {string} [config.secondBrainDir]
+ * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
+ * @returns {{succeeded: boolean, branch?: string, doneMarker?: string, reason?: string}}
+ */
+function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, gitRunner = createRealGitRunner(repoRoot) }) {
+  try {
+    if (task.domain === 'secondbrain') {
+      const result = applySecondBrainNote({
+        implementResponse: task.implementResponse,
+        notePath: task.promptContext.notePath,
+        secondBrainDir,
+      });
+      return { succeeded: true, doneMarker: result.marker };
+    }
+
+    // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
+    // then write the artifact, so the change lands on the new branch, never on main.
+    gitRunner.fetchMain();
+    gitRunner.resetToMain();
+
+    const branchName = `agent/${task.id}`;
+    gitRunner.createBranch(branchName);
+
+    let artifact;
+    try {
+      artifact = writeArtifact(task, repoRoot, pipelineDir);
+    } catch (writeErr) {
+      try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
+      return { succeeded: false, reason: writeErr.message };
+    }
+
+    if (artifact && artifact.skipped) {
+      gitRunner.checkoutMain();
+      gitRunner.deleteBranch(branchName);
+      return { succeeded: true, doneMarker: artifact.reason };
+    }
+
+    // Group A functions return { file: '...' } (one artifact); Group B returns
+    // { files: [...] } (one or more). Normalize to an array so both shapes stage
+    // correctly regardless of which path produced the artifact.
+    const filesToAdd = artifact.files || [artifact.file];
+    gitRunner.add(filesToAdd);
+
+    const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
+    const commitMessage = [
+      task.title,
+      '',
+      `Task: ${task.id} (${task.domain}/${task.source})`,
+      '',
+      'Co-Authored-By: Ornith <noreply@ornith.local>',
+    ].join('\n');
+    fs.writeFileSync(msgPath, commitMessage);
+    try {
+      gitRunner.commit(msgPath);
+    } finally {
+      fs.unlinkSync(msgPath);
+    }
+
+    // A push failure here means the commit already succeeded -- a local branch with a
+    // real, un-pushed commit would otherwise be left behind silently, and no caller could
+    // tell this apart from a clean success (apply-runner.ps1 treats any non-throwing exit
+    // as authoritative). Roll back specifically on push failure, distinct from the
+    // write-failure cleanup above, so the failure is reported instead of orphaned.
+    try {
+      gitRunner.push(branchName);
+    } catch (pushErr) {
+      try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
+      return { succeeded: false, reason: `push failed after commit succeeded (rolled back): ${pushErr.message}` };
+    }
+    gitRunner.checkoutMain();
+
+    return { succeeded: true, branch: branchName };
+  } catch (e) {
+    const reason = e.stderr ? e.stderr.toString() : e.message;
+    return { succeeded: false, reason };
+  }
 }
 
 function main() {
@@ -63,71 +138,12 @@ function main() {
     return;
   }
 
-  try {
-    if (task.domain === 'secondbrain') {
-      const result = applySecondBrainNote({
-        implementResponse: task.implementResponse,
-        notePath: task.promptContext.notePath,
-        secondBrainDir,
-      });
-      process.stdout.write(JSON.stringify({ succeeded: true, doneMarker: result.marker }));
-      return;
-    }
-
-    // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
-    // then write the artifact, so the change lands on the new branch, never on main.
-    runGit(['fetch', 'origin', 'main'], repoRoot);
-    runGit(['checkout', 'main'], repoRoot);
-    runGit(['reset', '--hard', 'origin/main'], repoRoot);
-
-    const branchName = `agent/${task.id}`;
-    runGit(['checkout', '-b', branchName], repoRoot);
-
-    let artifact;
-    try {
-      artifact = writeArtifact(task, repoRoot, pipelineDir);
-    } catch (writeErr) {
-      try { runGit(['checkout', 'main'], repoRoot); runGit(['branch', '-D', branchName], repoRoot); } catch (_) { /* best-effort cleanup */ }
-      process.stdout.write(JSON.stringify({ succeeded: false, reason: writeErr.message }));
-      return;
-    }
-
-    if (artifact && artifact.skipped) {
-      runGit(['checkout', 'main'], repoRoot);
-      runGit(['branch', '-D', branchName], repoRoot);
-      process.stdout.write(JSON.stringify({ succeeded: true, doneMarker: artifact.reason }));
-      return;
-    }
-
-    // Group A functions return { file: '...' } (one artifact); Group B returns
-    // { files: [...] } (one or more). Normalize to an array so both shapes stage
-    // correctly regardless of which path produced the artifact.
-    const filesToAdd = artifact.files || [artifact.file];
-    runGit(['add', ...filesToAdd], repoRoot);
-
-    const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
-    const commitMessage = [
-      task.title,
-      '',
-      `Task: ${task.id} (${task.domain}/${task.source})`,
-      '',
-      'Co-Authored-By: Ornith <noreply@ornith.local>',
-    ].join('\n');
-    fs.writeFileSync(msgPath, commitMessage);
-    try {
-      runGit(['commit', '-F', msgPath], repoRoot);
-    } finally {
-      fs.unlinkSync(msgPath);
-    }
-
-    runGit(['push', '-u', 'origin', branchName], repoRoot);
-    runGit(['checkout', 'main'], repoRoot);
-
-    process.stdout.write(JSON.stringify({ succeeded: true, branch: branchName }));
-  } catch (e) {
-    const reason = e.stderr ? e.stderr.toString() : e.message;
-    process.stdout.write(JSON.stringify({ succeeded: false, reason }));
-  }
+  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir });
+  process.stdout.write(JSON.stringify(result));
 }
 
-main();
+module.exports = { applyTask };
+
+if (require.main === module) {
+  main();
+}

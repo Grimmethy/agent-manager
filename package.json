@@ -13,6 +13,9 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "test": "node --test src/*.test.js"
+  },
   "dependencies": {
     "better-sqlite3": "^12.11.1"
   }
