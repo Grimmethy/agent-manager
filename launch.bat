@@ -52,6 +52,9 @@ if %ERRORLEVEL%==0 (
     if !ERRORLEVEL!==0 (
         start "Dashboard" cmd /k python "%SCRIPT_DIR%python\dashboard\app.py"
         echo Dashboard starting -- http://localhost:%AGENT_MANAGER_DASHBOARD_PORT%
+        rem Give Flask a couple seconds to start listening before opening the browser.
+        rem Runs in its own cmd so it doesn't block this script or the final pause.
+        start "" cmd /c "ping -n 3 127.0.0.1 >nul & start http://localhost:%AGENT_MANAGER_DASHBOARD_PORT%"
     ) else (
         echo Cannot start dashboard: flask/networkx/pyvis not all installed for this python. Run: pip install -r "%SCRIPT_DIR%python\requirements.txt"
     )
