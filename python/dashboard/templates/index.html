@@ -335,6 +335,22 @@ async function refresh() {
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
 
 async function enterProjectTab() {
+  // Sync the path input from the server's actual active project on every tab entry, before
+  // rendering it. Without this, the input only ever reflected localStorage -- if the active
+  // project changed via any OTHER route (hand-editing agent-manager.env, another browser tab,
+  // launch.bat) the input would silently keep showing a stale path while "Last configured
+  // project" below it correctly showed the truth. Since Start Pipeline acts on the input's
+  // value, not on activeRepoRoot, that mismatch could launch a pipeline against the wrong
+  // project with no warning. Only overrides on tab entry, not on the 3s poll thereafter, so a
+  // deliberate browse-a-different-project session isn't fought by this sync mid-use.
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== projectPath) {
+      projectPath = status.activeRepoRoot;
+      localStorage.setItem('agentManagerProjectPath', projectPath);
+    }
+  } catch (e) { /* dashboard's own status check failed -- fall back to whatever's cached */ }
+
   const main = document.getElementById('main');
   main.innerHTML = `
     <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
