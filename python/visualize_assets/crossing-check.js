@@ -73,10 +73,32 @@ if (typeof network !== 'undefined' && network) {
     if (badge) badge.textContent = text;
   }
 
-  function resortCrossingNodes() {
+  // Persisted across reloads via localStorage (same-origin iframe shares the dashboard's
+  // own storage) -- Autosort is a viewing preference, not per-project data, so one global
+  // toggle is the right scope. Defaults to the checkbox's own HTML `checked` attribute
+  // (ON) the first time, before anything's ever been saved.
+  var AUTOSORT_STORAGE_KEY = 'agent-manager-autosort-enabled';
+  var autosortToggle = document.getElementById('autosort-toggle');
+  if (autosortToggle) {
+    var storedAutosort = localStorage.getItem(AUTOSORT_STORAGE_KEY);
+    if (storedAutosort !== null) autosortToggle.checked = storedAutosort === 'true';
+  }
+
+  function isAutosortEnabled() {
+    return autosortToggle ? autosortToggle.checked : true;
+  }
+
+  // The crossing COUNT is always shown -- that's the "can we see how many lines cross"
+  // ask, unconditional. Autosort only gates whether it goes on to actually fix/unfix
+  // nodes and re-stabilize the crossing-involved subset.
+  function checkAndMaybeResort() {
     var result = findCrossings();
     if (result.crossingCount === 0) {
       setBadge('No edge crossings found.');
+      return;
+    }
+    if (!isAutosortEnabled()) {
+      setBadge(result.crossingCount + ' edge crossing(s) found. (Autosort off -- not resorting.)');
       return;
     }
     setBadge(result.crossingCount + ' edge crossing(s) found -- resorting ' + result.crossingNodeIds.length + ' node(s)...');
@@ -100,13 +122,22 @@ if (typeof network !== 'undefined' && network) {
     });
   }
 
+  if (autosortToggle) {
+    autosortToggle.addEventListener('change', function() {
+      localStorage.setItem(AUTOSORT_STORAGE_KEY, autosortToggle.checked ? 'true' : 'false');
+      // Re-run immediately on toggle -- flipping it ON should try resorting right away
+      // with the current layout, not wait for the next full page load.
+      checkAndMaybeResort();
+    });
+  }
+
   // A cached (already-equilibrium) load can finish its internal stabilization before this
   // script even attaches its listener -- 'stabilizationIterationsDone' has already fired
-  // by then, so a bare .once() here would silently never call resortCrossingNodes at all.
+  // by then, so a bare .once() here would silently never call checkAndMaybeResort at all.
   // Check the current state directly instead of assuming the event is still ahead of us.
   if (network.physics.stabilized) {
-    resortCrossingNodes();
+    checkAndMaybeResort();
   } else {
-    network.once('stabilizationIterationsDone', resortCrossingNodes);
+    network.once('stabilizationIterationsDone', checkAndMaybeResort);
   }
 }
