@@ -105,8 +105,25 @@ let browsePath = '';
 let browserOpen = false;
 let projectStatusInterval = null;
 
+// 8s timeout on every dashboard fetch. Without this, a request in flight during a server
+// restart (or any other network hiccup) can hang indefinitely rather than reject -- and
+// since enterProjectTab() awaits this before rendering anything, a single hung request
+// left the whole Project tab looking normal but with no working click handlers (found live
+// 2026-07-19, right after adding that pre-render status check). Every existing call site
+// already wraps fetchJson in a try/catch, so a clean timeout error is handled the same way
+// a network error already was -- this only changes "hangs forever" to "fails after 8s".
 async function fetchJson(url) {
-  const r = await fetch(url);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  let r;
+  try {
+    r = await fetch(url, { signal: controller.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after 8s');
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (!r.ok) throw new Error(url + ' -> ' + r.status);
   return r.json();
 }
