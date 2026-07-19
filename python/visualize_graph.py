@@ -79,6 +79,88 @@ def _seed_positions_by_community(nodes: list[dict]) -> dict[int, tuple[float, fl
     return positions
 
 
+def _build_adjacency(nodes: list[dict], links: list[dict]) -> dict[str, set]:
+    node_ids = {n["id"] for n in nodes}
+    adjacency: dict[str, set] = {nid: set() for nid in node_ids}
+    for link in links:
+        s, t = link["source"], link["target"]
+        if s in node_ids and t in node_ids and s != t:
+            adjacency[s].add(t)
+            adjacency[t].add(s)
+    return adjacency
+
+
+# A node whose edges go EXCLUSIVELY to one (or exactly two) high-degree "hub" node(s) --
+# the classic shape where many files each import only from one or two shared modules and
+# nothing else -- gets arranged deterministically (star around one hub, or a spindle
+# between two) instead of leaving generic physics to stumble into (or fail to find) that
+# same crossing-free arrangement on its own.
+HUB_DEGREE_THRESHOLD = 4
+MIN_STAR_CLUSTER_SIZE = 3
+
+
+def _detect_star_clusters(nodes: list[dict], links: list[dict]) -> dict:
+    """Returns {"single": {hub_id: [leaf_ids]}, "dual": {(hub1_id, hub2_id): [leaf_ids]}}
+    -- dual keys are a sorted 2-tuple. A leaf's edges must go EXCLUSIVELY to the hub(s) in
+    its group (degree 1 for single, exactly 2 for dual), and every hub must itself have
+    degree >= HUB_DEGREE_THRESHOLD (a node with only 1-2 total connections isn't a "hub"
+    just because ITS one neighbor happens to also have few connections). Groups smaller
+    than MIN_STAR_CLUSTER_SIZE are dropped -- a lone leaf isn't a "shape" worth specially
+    arranging over just letting normal seeding place it."""
+    adjacency = _build_adjacency(nodes, links)
+    degree = {nid: len(neighbors) for nid, neighbors in adjacency.items()}
+
+    single: dict[str, list[str]] = {}
+    dual: dict[tuple[str, str], list[str]] = {}
+
+    for nid, neighbors in adjacency.items():
+        if len(neighbors) == 1:
+            hub = next(iter(neighbors))
+            if degree.get(hub, 0) >= HUB_DEGREE_THRESHOLD:
+                single.setdefault(hub, []).append(nid)
+        elif len(neighbors) == 2:
+            h1, h2 = sorted(neighbors)
+            if degree.get(h1, 0) >= HUB_DEGREE_THRESHOLD and degree.get(h2, 0) >= HUB_DEGREE_THRESHOLD:
+                dual.setdefault((h1, h2), []).append(nid)
+
+    single = {hub: leaves for hub, leaves in single.items() if len(leaves) >= MIN_STAR_CLUSTER_SIZE}
+    dual = {pair: leaves for pair, leaves in dual.items() if len(leaves) >= MIN_STAR_CLUSTER_SIZE}
+    return {"single": single, "dual": dual}
+
+
+def _position_single_hub_star(hub_pos: tuple[float, float], leaf_ids: list[str], radius: float = 140) -> dict[str, tuple[float, float]]:
+    """Evenly-spaced circle around the hub -- a star topology (every edge connects to the
+    SAME one center) can never self-cross regardless of ordering, so no ordering logic is
+    needed beyond even angular spacing."""
+    hx, hy = hub_pos
+    n = len(leaf_ids)
+    positions = {}
+    for i, leaf_id in enumerate(leaf_ids):
+        angle = 2 * math.pi * i / n if n else 0
+        positions[leaf_id] = (hx + radius * math.cos(angle), hy + radius * math.sin(angle))
+    return positions
+
+
+def _position_dual_hub_leaves(hub1_pos: tuple[float, float], hub2_pos: tuple[float, float], leaf_ids: list[str], spacing: float = 50, push: float = 90) -> dict[str, tuple[float, float]]:
+    """Every leaf plus the two hubs forms a triangle (H1-leaf-H2); stacking all leaves on
+    the SAME perpendicular ray from the H1-H2 midpoint, at increasing distance, nests
+    each leaf's triangle inside the next one's -- like concentric arcs sharing the same
+    two base points. Nested triangles sharing a base never cross (an earlier attempt that
+    instead spread leaves SIDEWAYS along the hub axis was verified, empirically, to
+    produce real crossings between outer leaves' opposite-hub edges -- this replaced it)."""
+    h1x, h1y = hub1_pos
+    h2x, h2y = hub2_pos
+    mx, my = (h1x + h2x) / 2, (h1y + h2y) / 2
+    dx, dy = h2x - h1x, h2y - h1y
+    length = math.hypot(dx, dy) or 1.0
+    perp_x, perp_y = -dy / length, dx / length
+    positions = {}
+    for i, leaf_id in enumerate(leaf_ids):
+        dist = push + i * spacing
+        positions[leaf_id] = (mx + perp_x * dist, my + perp_y * dist)
+    return positions
+
+
 # These correspond 1:1 to files in visualize_assets/ -- see _read_asset above.
 STABILIZING_OVERLAY_HTML = _read_asset("stabilizing-overlay.html")
 FILL_ANCESTOR_HEIGHT_CSS = f"<style>{_read_asset('fill-ancestor-height.css')}</style>"
@@ -136,20 +218,52 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     # crashing on a None lookup.
     seed_positions = _seed_positions_by_community(graph_data["nodes"])
 
+    # Two passes: hub/anchor nodes need a REAL, already-resolved position before a star
+    # leaf's position can be computed relative to it. Star clusters are detected from the
+    # graph's actual topology (not affected by caching), so this runs on every render --
+    # it's meant to be a standard, structural part of the layout, not a one-time seed.
+    star_clusters = _detect_star_clusters(graph_data["nodes"], graph_data["links"])
+    star_leaf_ids: set = set()
+    for leaves in star_clusters["single"].values():
+        star_leaf_ids.update(leaves)
+    for leaves in star_clusters["dual"].values():
+        star_leaf_ids.update(leaves)
+
+    resolved: dict[str, tuple[float, float]] = {}
     for node in graph_data["nodes"]:
+        nid = node["id"]
+        if nid in star_leaf_ids:
+            continue  # resolved in the second pass, relative to its hub(s)
+        pos = positions.get(str(nid)) if positions else None
+        resolved[nid] = (pos["x"], pos["y"]) if pos else seed_positions[nid]
+
+    for hub, leaves in star_clusters["single"].items():
+        if hub not in resolved:
+            continue  # hub itself somehow missing from this graph's node list -- skip
+        resolved.update(_position_single_hub_star(resolved[hub], leaves))
+    for (h1, h2), leaves in star_clusters["dual"].items():
+        if h1 not in resolved or h2 not in resolved:
+            continue
+        resolved.update(_position_dual_hub_leaves(resolved[h1], resolved[h2], leaves))
+
+    for node in graph_data["nodes"]:
+        nid = node["id"]
         community_id = node["community"]
         color = PALETTE[community_id % len(PALETTE)]
         title = f"{node['source_file']}\nCommunity: {names_by_id.get(community_id, community_id)}"
-        pos = positions.get(str(node["id"])) if positions else None
-        if pos:
+        x, y = resolved[nid]
+        if nid in star_leaf_ids:
+            # Fixed in place -- a star/spindle arrangement is crossing-free BY
+            # CONSTRUCTION only as long as it isn't perturbed afterward by physics or the
+            # crossing-check's own resort pass (crossing-check.js excludes these ids from
+            # ever being unfixed). Manual dragging still overrides fixed, same as any node.
+            net.add_node(nid, label=Path(node["source_file"]).name, title=title, color=color, group=community_id, x=x, y=y, fixed=True)
+        else:
             # physics stays ON here (unlike the first, uncached render) -- these
             # coordinates are already at equilibrium, so leaving physics on doesn't cost a
             # visible resettle, but it does keep the graph interactive: drag a node and its
             # neighbors respond, instead of every node being frozen in place permanently.
-            net.add_node(node["id"], label=Path(node["source_file"]).name, title=title, color=color, group=community_id, x=pos["x"], y=pos["y"])
-        else:
-            seed_x, seed_y = seed_positions[node["id"]]
-            net.add_node(node["id"], label=Path(node["source_file"]).name, title=title, color=color, group=community_id, x=seed_x, y=seed_y)
+            net.add_node(nid, label=Path(node["source_file"]).name, title=title, color=color, group=community_id, x=x, y=y)
 
     node_ids = {n["id"] for n in graph_data["nodes"]}
     for link in graph_data["links"]:
@@ -190,10 +304,15 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
         )
         html = html.replace("</body>", f"<script>{autosave_script}</script>" + "</body>", 1)
 
-    # No placeholders to substitute -- purely client-side (network/nodes/edges are already
-    # in scope), doesn't need project_path/grepDirs, so unlike the blocks above this runs
-    # unconditionally (a CLI-rendered file with no project_path still benefits from it).
-    crossing_script = _read_asset("crossing-check.js")
+    # No project_path/grepDirs placeholders needed -- purely client-side (network/nodes/
+    # edges are already in scope) -- so unlike the blocks above this runs unconditionally
+    # (a CLI-rendered file with no project_path still benefits from it). STAR_LEAF_IDS
+    # tells it which nodes are structurally fixed by the star/spindle layout above, so it
+    # never unfixes them even if one happens to touch a flagged crossing.
+    crossing_script = (
+        _read_asset("crossing-check.js")
+        .replace("__STAR_LEAF_IDS_JSON__", json.dumps(sorted(star_leaf_ids)))
+    )
     html = html.replace(
         "</body>",
         AUTOSORT_TOGGLE_HTML + CROSSING_CHECK_BADGE_HTML + f"<script>{crossing_script}</script>" + "</body>",
