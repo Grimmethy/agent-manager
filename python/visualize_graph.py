@@ -95,8 +95,15 @@ def _build_adjacency(nodes: list[dict], links: list[dict]) -> dict[str, set]:
 # nothing else -- gets arranged deterministically (star around one hub, or a spindle
 # between two) instead of leaving generic physics to stumble into (or fail to find) that
 # same crossing-free arrangement on its own.
-HUB_DEGREE_THRESHOLD = 4
-MIN_STAR_CLUSTER_SIZE = 3
+#
+# Tuned up from an initial (4, 3) after that pair turned out to match ~24% of a real
+# 2482-node/4761-edge project's nodes -- every common "many files import one shared
+# utils.ts" pattern qualified, not just the rare, large, genuinely notable hub shape this
+# feature is meant for (a hub with dozens of EXCLUSIVE importers, like the screenshot this
+# was built from). (10, 6) is still a guess, not empirically tuned against a large corpus
+# -- adjust here if it's still over- or under-firing on real projects.
+HUB_DEGREE_THRESHOLD = 10
+MIN_STAR_CLUSTER_SIZE = 6
 
 
 def _detect_star_clusters(nodes: list[dict], links: list[dict]) -> dict:
@@ -229,22 +236,39 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     for leaves in star_clusters["dual"].values():
         star_leaf_ids.update(leaves)
 
+    # A star leaf that ALREADY has a real cached position (physics-settled or manually
+    # dragged there previously) keeps it -- this is a real fix for a real regression: on a
+    # 2482-node project, ~24% of nodes matched the (looser, since-tightened) original
+    # thresholds, and every one of them had its already-good, previously-settled position
+    # unconditionally discarded in favor of a freshly-computed star/spindle spot, on EVERY
+    # render. The star/spindle formula should only ever apply to a leaf that's never been
+    # positioned before, not override years of accumulated good layout every single load.
+    freshly_star_positioned: set = set()
+
     resolved: dict[str, tuple[float, float]] = {}
     for node in graph_data["nodes"]:
         nid = node["id"]
-        if nid in star_leaf_ids:
-            continue  # resolved in the second pass, relative to its hub(s)
         pos = positions.get(str(nid)) if positions else None
+        if nid in star_leaf_ids and not pos:
+            continue  # no existing position -- resolved fresh in the second pass below
         resolved[nid] = (pos["x"], pos["y"]) if pos else seed_positions[nid]
 
     for hub, leaves in star_clusters["single"].items():
         if hub not in resolved:
             continue  # hub itself somehow missing from this graph's node list -- skip
-        resolved.update(_position_single_hub_star(resolved[hub], leaves))
+        new_leaves = [leaf for leaf in leaves if leaf not in resolved]
+        if not new_leaves:
+            continue
+        resolved.update(_position_single_hub_star(resolved[hub], new_leaves))
+        freshly_star_positioned.update(new_leaves)
     for (h1, h2), leaves in star_clusters["dual"].items():
         if h1 not in resolved or h2 not in resolved:
             continue
-        resolved.update(_position_dual_hub_leaves(resolved[h1], resolved[h2], leaves))
+        new_leaves = [leaf for leaf in leaves if leaf not in resolved]
+        if not new_leaves:
+            continue
+        resolved.update(_position_dual_hub_leaves(resolved[h1], resolved[h2], new_leaves))
+        freshly_star_positioned.update(new_leaves)
 
     for node in graph_data["nodes"]:
         nid = node["id"]
@@ -252,11 +276,13 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
         color = PALETTE[community_id % len(PALETTE)]
         title = f"{node['source_file']}\nCommunity: {names_by_id.get(community_id, community_id)}"
         x, y = resolved[nid]
-        if nid in star_leaf_ids:
+        if nid in freshly_star_positioned:
             # Fixed in place -- a star/spindle arrangement is crossing-free BY
             # CONSTRUCTION only as long as it isn't perturbed afterward by physics or the
             # crossing-check's own resort pass (crossing-check.js excludes these ids from
             # ever being unfixed). Manual dragging still overrides fixed, same as any node.
+            # A star leaf that instead kept its own pre-existing position (see above) is
+            # NOT force-fixed here -- it stays a normal, freely-interactive node.
             net.add_node(nid, label=Path(node["source_file"]).name, title=title, color=color, group=community_id, x=x, y=y, fixed=True)
         else:
             # physics stays ON here (unlike the first, uncached render) -- these
@@ -308,10 +334,13 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     # edges are already in scope) -- so unlike the blocks above this runs unconditionally
     # (a CLI-rendered file with no project_path still benefits from it). STAR_LEAF_IDS
     # tells it which nodes are structurally fixed by the star/spindle layout above, so it
-    # never unfixes them even if one happens to touch a flagged crossing.
+    # never unfixes them even if one happens to touch a flagged crossing -- deliberately
+    # freshly_star_positioned, not the full star_leaf_ids: a leaf that kept its own
+    # pre-existing position (see above) was never fixed=True, so it's a normal,
+    # freely-movable node like any other as far as the hill-climb is concerned.
     crossing_script = (
         _read_asset("crossing-check.js")
-        .replace("__STAR_LEAF_IDS_JSON__", json.dumps(sorted(star_leaf_ids)))
+        .replace("__STAR_LEAF_IDS_JSON__", json.dumps(sorted(freshly_star_positioned)))
     )
     html = html.replace(
         "</body>",

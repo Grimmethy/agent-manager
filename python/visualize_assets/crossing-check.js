@@ -104,8 +104,8 @@ if (typeof network !== 'undefined' && network) {
   // would create (or merely not reduce) a crossing is always rejected, never merely
   // discouraged. This is a hard local-search constraint, not a soft physics bias, since
   // plain force-directed physics has no notion of "crossing" to bias against at all.
-  var CANDIDATE_RADII = [40, 80, 140, 220, 320];
-  var ANGLE_STEPS = 12;
+  var CANDIDATE_RADII = [40, 80, 140, 220];
+  var ANGLE_STEPS = 8;
 
   function tryImproveNode(nodeId, positions) {
     var origPos = positions[nodeId];
@@ -133,23 +133,40 @@ if (typeof network !== 'undefined' && network) {
   // never moved) until a full pass makes no further improvement, or MAX_ROUNDS is hit --
   // a bound against pathological cases where nodes could otherwise keep nudging each
   // other back and forth indefinitely.
+  //
+  // TIME_BUDGET_MS is the real safety net, though, not MAX_ROUNDS: this ran into a real
+  // browser-freezing bug on a 2482-node/4761-edge project (hundreds of crossing-involved
+  // nodes x dozens of candidates x O(degree*E) per candidate reached into the billions of
+  // operations, with no yield point). JS is single-threaded, so the only way to GUARANTEE
+  // this can't lock up the tab regardless of graph size is a wall-clock cutoff checked
+  // between nodes -- this bounds total blocking time to roughly TIME_BUDGET_MS plus at
+  // most one node's worth of overshoot, whatever the graph's actual size turns out to be.
   var MAX_ROUNDS = 6;
+  var TIME_BUDGET_MS = 4000;
 
   function hillClimbCrossings(nodeIds) {
     var positions = network.getPositions();
     var movable = nodeIds.filter(function(id) { return !starLeafSet[id]; });
-    for (var round = 0; round < MAX_ROUNDS; round++) {
+    var startTime = performance.now();
+    var timedOut = false;
+    for (var round = 0; round < MAX_ROUNDS && !timedOut; round++) {
       var anyImproved = false;
-      movable.forEach(function(nodeId) {
+      for (var i = 0; i < movable.length; i++) {
+        if (performance.now() - startTime > TIME_BUDGET_MS) {
+          timedOut = true;
+          break;
+        }
+        var nodeId = movable[i];
         var result = tryImproveNode(nodeId, positions);
         if (result.improved) {
           positions[nodeId] = result.pos;
           network.moveNode(nodeId, result.pos.x, result.pos.y);
           anyImproved = true;
         }
-      });
+      }
       if (!anyImproved) break;
     }
+    return timedOut;
   }
 
   function setBadge(text) {
@@ -188,10 +205,11 @@ if (typeof network !== 'undefined' && network) {
     }
     setBadge(before.crossingCount + ' edge crossing(s) found -- resorting ' + before.crossingNodeIds.length + ' node(s)...');
 
-    hillClimbCrossings(before.crossingNodeIds);
+    var timedOut = hillClimbCrossings(before.crossingNodeIds);
 
     var after = findCrossings(network.getPositions());
-    setBadge(before.crossingCount + ' -> ' + after.crossingCount + ' edge crossing(s) after resorting.');
+    var suffix = timedOut ? ' (stopped early -- time budget reached, graph may be large)' : '';
+    setBadge(before.crossingCount + ' -> ' + after.crossingCount + ' edge crossing(s) after resorting.' + suffix);
   }
 
   if (autosortToggle) {
