@@ -132,14 +132,28 @@ function Add-LiveLogEntry {
 # Some machines hard-crash for real (WHEA errors etc), so orphaned claims MUST be
 # recovered: any drafting subfolder whose owning instance is dead gets its task files
 # moved back to pending/. A claim is left alone ONLY while its heartbeat pid is a
-# running process, or for the grace window after its last heartbeat (the PID-reuse /
-# restart-race hedge). Tightened from 30 min to 10 min on 2026-07-18: with restarts now
-# happening every few minutes (Ollama wedges, queue-watchdog's own faster recovery), a
-# 30-min window meant every single orphaned claim got deferred past the NEXT restart
-# too, piling up unrecovered indefinitely -- 11 stuck drafts, zero ever reaching review.
-# 10 min still comfortably covers a genuine restart race (queue-watchdog's own
-# StaleHeartbeatSeconds is 5 min) without silently accumulating orphans across restarts
-# that happen faster than the grace window itself.
+# running process (checked first, above -- that's the real "still working" signal and
+# has no time limit), or for a short grace window after its last heartbeat once the PID
+# is confirmed gone.
+#
+# That grace window is NOT about how long a legitimate Ornith call can run (a call
+# timing out doesn't put us here at all -- ornith-client.js's own 4-min REQUEST_TIMEOUT_MS
+# crashes the worker script, and Get-Process above already found the PID missing by the
+# time this runs). It exists purely for the startup race: THIS scan runs when a worker
+# is starting, and a just-restarted sibling could be mid-launch and not yet have written
+# its first heartbeat under its own new PID. That race resolves in seconds (Start-Process
+# is near-instant), not minutes.
+#
+# Previously 30 min, tightened to 10 min on 2026-07-18 (reasoning: comfortably above
+# queue-watchdog's 5-min staleness threshold) -- but that reasoning conflated "how long
+# until queue-watchdog notices a wedge" with "how long the startup race actually lasts."
+# A confirmed-dead PID (Get-Process already said so) sitting on a fresh-looking heartbeat
+# for 10 min is not an active race, it's exactly the stuck-drafting-claim backlog this
+# scan exists to prevent -- reproduced live 2026-07-19 when a worker crashed on a call
+# that exceeded 4 min and its claim sat unrecoverable for the full 10-min window before
+# the next restart could pick it up. Tightened to 1 min: comfortably covers real process
+# startup time without leaving a confirmed-dead claim orphaned for minutes.
+$OrphanGraceMinutes = 1
 try {
     $draftingRoot = Join-Path $QueueDir 'drafting'
     if (Test-Path $draftingRoot) {
@@ -163,7 +177,7 @@ try {
                     # it the grace window before stealing. Unparseable timestamp = stale.
                     $lastHb = $null
                     try { $lastHb = [datetime]::Parse($lastHbStr) } catch { $lastHb = $null }
-                    if ($lastHb -and ((Get-Date) - $lastHb).TotalMinutes -le 10) {
+                    if ($lastHb -and ((Get-Date) - $lastHb).TotalMinutes -le $OrphanGraceMinutes) {
                         continue
                     }
 
