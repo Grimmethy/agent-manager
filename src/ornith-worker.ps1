@@ -276,6 +276,17 @@ while ($true) {
         continue
     }
 
+    # Per-task error isolation (2026-07-19, the real fix behind candidate AC-015's correct
+    # diagnosis): before this try existed, ANY uncaught error in the pass sequence below --
+    # most commonly ornith-client.js's 4-min REQUEST_TIMEOUT_MS surfacing as a thrown
+    # exception under $ErrorActionPreference='Stop' -- killed the ENTIRE worker process.
+    # That one mechanism drove every crash loop of the 2026-07-19 incident: process death
+    # -> -NoExit zombie shell -> watchdog restart -> full task redo -> same wall. A failed
+    # call is a TASK outcome, not a process outcome: the catch at the bottom of this loop
+    # dispositions the task (retry via pending, or blocked after 3 failures) and the loop
+    # lives on. Body deliberately not re-indented -- see the paired catch below.
+    try {
+
     $task = Read-TaskJson $draftingPath
 
     Write-Host ('Drafting: {0}' -f $task.title) -ForegroundColor Green
@@ -492,4 +503,46 @@ while ($true) {
     Invoke-TaskDb 'ready-for-review' $reviewPath
 
     Write-Heartbeat -Status 'idle'
+
+    } catch {
+        # Paired with the `try` at the top of this claim's processing (see comment there).
+        # Disposition the failed task instead of dying: retry via pending/ up to 3 total
+        # attempts, then blocked/ with stage 'call-failure' (NOT 'review' -- must never be
+        # picked up by queue-watchdog's reject-retry, which only re-queues genuine
+        # review-stage rejections).
+        $errMsg = $_.Exception.Message
+        Write-Host ('Task failed with an unhandled error -- worker survives: {0}' -f $errMsg) -ForegroundColor Red
+        try {
+            if (Test-Path $draftingPath) {
+                $failedTask = $null
+                try { $failedTask = Read-TaskJson $draftingPath } catch { }
+                if ($failedTask) {
+                    $crashCount = 1
+                    if ($failedTask.PSObject.Properties['callFailureCount']) { $crashCount = [int]$failedTask.callFailureCount + 1 }
+                    $failedTask | Add-Member -NotePropertyName 'callFailureCount' -NotePropertyValue $crashCount -Force
+                    if ($crashCount -ge 3) {
+                        Set-TaskBlockedStage -Task $failedTask -Reason ('call failure x{0}, latest: {1}' -f $crashCount, $errMsg) -Stage 'call-failure'
+                        $destPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+                        Write-TaskJson $destPath $failedTask
+                        Write-Host ('Blocked after {0} call failures: {1}' -f $crashCount, $failedTask.id) -ForegroundColor Yellow
+                        Invoke-TaskDb 'blocked' $destPath (@{ reason = $errMsg } | ConvertTo-Json -Compress)
+                    } else {
+                        $destPath = Join-Path (Join-Path $QueueDir 'pending') $next.Name
+                        Write-TaskJson $destPath $failedTask
+                        Write-Host ('Returned to pending for attempt {0}/3: {1}' -f ($crashCount + 1), $failedTask.id) -ForegroundColor Yellow
+                    }
+                } else {
+                    # Task JSON unreadable -- park the raw file in blocked/ rather than lose it.
+                    Move-Item $draftingPath (Join-Path (Join-Path $QueueDir 'blocked') $next.Name) -Force -ErrorAction SilentlyContinue
+                }
+                if (Test-Path $draftingPath) { Remove-Item $draftingPath -Force -ErrorAction SilentlyContinue }
+            }
+        } catch {
+            Write-Host ('Cleanup after task failure also failed (loop continues anyway): {0}' -f $_.Exception.Message) -ForegroundColor Red
+        }
+        Write-Heartbeat -Status 'idle'
+        # Brief pause so a hard-down Ollama doesn't spin this loop through back-to-back
+        # 4-minute timeout cycles at maximum churn.
+        Start-Sleep -Seconds 5
+    }
 }
