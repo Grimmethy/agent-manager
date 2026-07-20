@@ -68,6 +68,19 @@ $MaxOrnithRejectRetries = 2
 # checks can be re-tuned independently later without re-deriving which is which.
 $WorkerZombieThresholdSeconds = 300  # 5 min -- same margin as $StaleHeartbeatSeconds, see above
 
+# Restart cooldown: THE duplicate-instance factory, found live 2026-07-19 (two worker-1
+# processes spawned exactly 10s apart -- one $CheckIntervalSeconds). After Start-Process,
+# the heartbeat file still holds the DEAD process's pid and stale lastHeartbeat until the
+# replacement finishes starting up (node task-sources run, crash-resume scan) and writes
+# its first heartbeat under its own pid. Every 10s pass in that window re-sees "stale +
+# pid gone" and spawns ANOTHER replacement. The cooldown makes a restart decision sticky:
+# once this watchdog restarts an instance, it will not restart that same instanceId again
+# until the cooldown elapses, no matter what the (still-stale) heartbeat file says. 120s
+# comfortably covers real startup time while staying well under the 5-min ceiling -- a
+# replacement that STILL hasn't heartbeat after 120s is genuinely broken and eligible again.
+$RestartCooldownSeconds = 120
+$script:LastRestartAt = @{}
+
 # instanceId prefix -> how to restart it. 'worker-' matches any worker-N via -like. Every
 # restart target here is a PACKAGE script (lives in $PackageSrcDir), not consumer code.
 $RESTART_MAP = @(
@@ -111,6 +124,12 @@ function Invoke-DeadProcessCheck {
 
             if ($pidAlive -and -not $isZombie) { continue }  # still alive, just a slow single call (or a non-worker instance, which keeps the strict PID-gate)
 
+            # Restart-cooldown gate (see $RestartCooldownSeconds above): a replacement we
+            # already launched may not have written its first heartbeat yet -- the file
+            # still describing the dead predecessor is NOT evidence the replacement failed.
+            $lastRestart = $script:LastRestartAt[$hb.instanceId]
+            if ($lastRestart -and ((Get-Date) - $lastRestart).TotalSeconds -lt $RestartCooldownSeconds) { continue }
+
             # Either the PID is confirmed gone, or (workers only) the heartbeat is stale well
             # past $WorkerZombieThresholdSeconds despite a lingering PID -- a -NoExit zombie.
             $restart = $RESTART_MAP | Where-Object { $hb.instanceId -like "*$($_.Match)*" } | Select-Object -First 1
@@ -132,12 +151,88 @@ function Invoke-DeadProcessCheck {
             if ($restart.Args -contains '-InstanceId') { $argList += @('-InstanceId', $hb.instanceId) }
 
             Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal
+            $script:LastRestartAt[$hb.instanceId] = Get-Date
             $reason = if ($isZombie) { 'zombie: pid lingered but heartbeat stale' } else { 'process confirmed gone' }
             Write-Host ('Watchdog: restarted {0} (was pid {1}, {2}, {3}s)' -f $hb.instanceId, $hb.pid, $reason, [int]$ageSeconds) -ForegroundColor Cyan
             Add-WatchdogLogEntry -Result 'RESTARTED' -Detail ('{0} (was pid {1}) had a stale heartbeat ({2}s) -- {3}. Restarted via {4}.' -f $hb.instanceId, $hb.pid, [int]$ageSeconds, $reason, $restart.Script)
         } catch {
             Write-Host ('Watchdog: error checking {0}: {1}' -f $hbFile.Name, $_.Exception.Message) -ForegroundColor Red
         }
+    }
+}
+
+# Stray-process reaper (added 2026-07-19, operator request after a full night of process
+# accumulation compounding into GPU pressure and repeated Ollama wedges -- see
+# docs/pipeline-incident-2026-07-19.md). Runs every watchdog pass. Two targets, both
+# identified by evidence this pipeline itself created, never by name alone:
+#
+#   1. Duplicate pipeline shells: powershell.exe whose CommandLine names one of THIS
+#      package's four scripts by full path, but whose pid is NOT the current heartbeat
+#      owner for that instanceId. A bare/interactive powershell.exe (the operator's own
+#      terminals) never matches the script-path test and is never touched. A non-owner
+#      that still has a live node.exe child is mid-call -- reported, left alone; it either
+#      finishes and exits or crashes and becomes reapable next pass.
+#   2. Orphaned llama-server.exe: one whose parent pid is not a LIVE ollama.exe. Ollama is
+#      the only thing that ever spawns llama-server, so a dead/mismatched parent means a
+#      VRAM squatter from a killed server -- the #1 manual cleanup of the incident night,
+#      and safe to kill unconditionally: it cannot be doing legitimate work for a server
+#      that no longer exists.
+function Invoke-StrayProcessReap {
+    $scriptNames = @('ornith-worker.ps1', 'review-runner.ps1', 'apply-runner.ps1', 'queue-watchdog.ps1')
+    $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    $psProcs = $allProcs | Where-Object { $_.Name -eq 'powershell.exe' -and $_.CommandLine }
+
+    foreach ($scriptName in $scriptNames) {
+        $fullScriptPath = Join-Path $PackageSrcDir $scriptName
+        # Deliberately NOT named $matches -- that would shadow PowerShell's automatic
+        # $Matches variable, which the -match operator below overwrites mid-loop.
+        $candidates = $psProcs | Where-Object { $_.CommandLine -match [regex]::Escape($fullScriptPath) -and $_.ProcessId -ne $PID }
+        foreach ($proc in $candidates) {
+            try {
+                # Resolve which instanceId this process claims to be: workers carry it as
+                # an -InstanceId argument; the three singleton scripts ARE their instanceId.
+                $instanceId = if ($proc.CommandLine -match '-InstanceId\s+(\S+)') { $Matches[1] } else { [System.IO.Path]::GetFileNameWithoutExtension($scriptName) }
+                $hbPath = Join-Path $InstancesDir ($instanceId + '.json')
+                $ownerPid = $null
+                if (Test-Path $hbPath) {
+                    try { $ownerPid = (Get-Content $hbPath -Raw | ConvertFrom-Json).pid } catch { }
+                }
+                if ($proc.ProcessId -eq $ownerPid) { continue }  # the legitimate instance
+
+                # Startup grace: a process this watchdog (or an operator) JUST launched is
+                # not yet the heartbeat owner -- the file still names its dead predecessor
+                # until the newcomer's first heartbeat write. Reaping in that window kills
+                # the legitimate replacement (happened live on this function's very first
+                # pass, 2026-07-19 20:43: restarted review-runner at :27, reaped it seconds
+                # later). A genuine stray is by definition OLD -- it lost ownership passes
+                # ago -- so age is a safe discriminator. Reuses $RestartCooldownSeconds:
+                # the same "how long can a legitimate startup take" question.
+                if ((New-TimeSpan -Start $proc.CreationDate -End (Get-Date)).TotalSeconds -lt $RestartCooldownSeconds) {
+                    continue
+                }
+
+                $nodeChild = $allProcs | Where-Object { $_.ParentProcessId -eq $proc.ProcessId -and $_.Name -eq 'node.exe' } | Select-Object -First 1
+                if ($nodeChild) {
+                    Write-Host ('Reaper: {0} pid {1} is a non-owner duplicate but has a live node child -- leaving alone this pass.' -f $instanceId, $proc.ProcessId) -ForegroundColor DarkYellow
+                    continue
+                }
+
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+                Write-Host ('Reaper: stopped stray {0} shell pid {1} (owner is {2}).' -f $instanceId, $proc.ProcessId, $ownerPid) -ForegroundColor Cyan
+                Add-WatchdogLogEntry -Result 'REAPED' -Detail ('Stray {0} shell (pid {1}) stopped: not the heartbeat owner (owner pid {2}), no live node child.' -f $instanceId, $proc.ProcessId, $ownerPid)
+            } catch {
+                Write-Host ('Reaper: error checking pid {0}: {1}' -f $proc.ProcessId, $_.Exception.Message) -ForegroundColor Red
+            }
+        }
+    }
+
+    $liveOllamaPids = @($allProcs | Where-Object { $_.Name -eq 'ollama.exe' } | ForEach-Object { $_.ProcessId })
+    $llamaServers = $allProcs | Where-Object { $_.Name -eq 'llama-server.exe' }
+    foreach ($ls in $llamaServers) {
+        if ($liveOllamaPids -contains $ls.ParentProcessId) { continue }
+        Stop-Process -Id $ls.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host ('Reaper: stopped orphaned llama-server.exe pid {0} (parent {1} is not a live ollama.exe) -- was squatting VRAM.' -f $ls.ProcessId, $ls.ParentProcessId) -ForegroundColor Cyan
+        Add-WatchdogLogEntry -Result 'REAPED' -Detail ('Orphaned llama-server.exe (pid {0}, dead parent {1}) stopped -- VRAM squatter.' -f $ls.ProcessId, $ls.ParentProcessId)
     }
 }
 
@@ -208,6 +303,7 @@ while ($true) {
     Write-Heartbeat -Status 'checking'
     try {
         Invoke-DeadProcessCheck
+        Invoke-StrayProcessReap
         Invoke-RejectRetryCheck
     } catch {
         Write-Host ('Watchdog pass failed (not crashing the loop): {0}' -f $_.Exception.Message) -ForegroundColor Red
