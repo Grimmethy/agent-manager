@@ -378,6 +378,46 @@ function nextArchDiscoveryTask() {
   };
 }
 
+// --- Source: project_search — proposes external open-source leads for the active project
+// (priority 85, between arch_discovery's 80 and unused_export's 90) ----------------------
+//
+// See ADR-0018 and docs/project-search-pipeline.md for the full design. Discovery-only:
+// unlike arch_discovery -> arch_review, there is deliberately NO consumer source that
+// promotes a finding into a fulfillment task -- a human decides what happens to a lead.
+// Pure background/exploratory filler, no hard cadence throttle (matches every other
+// source's fallback-chain behavior): it only fires once every higher-priority source has
+// nothing to offer. A fresh task is generated each time it's this source's turn -- there is
+// no time-based dedup by design (see the grill session this was designed in); dedup against
+// already-known leads happens via the INDEX.md content embedded below, read by Ornith
+// itself when proposing queries and synthesizing findings.
+function nextProjectSearchTask() {
+  const { repoRoot, projectSearchIndexPath, defaultDomain } = getConfig();
+  const projectTag = path.basename(repoRoot);
+
+  const contextDoc = readIfExists(path.join(repoRoot, 'CONTEXT.md'));
+  const claudeDoc = readIfExists(path.join(repoRoot, 'CLAUDE.md'));
+  const projectDocs = [contextDoc, claudeDoc].filter(Boolean).join('\n\n---\n\n');
+  if (!projectDocs) return null; // nothing to reason about this project's needs from -- skip rather than search blind
+
+  const indexText = readIfExists(projectSearchIndexPath) || '';
+  const knownUrls = [...indexText.matchAll(/https?:\/\/\S+/g)].map((m) => m[0].replace(/[)\]]+$/, ''));
+
+  const id = `project-search-${slugifyForId(projectTag)}-${Date.now()}`;
+  if (taskIdExistsInQueue(id)) return null;
+
+  return {
+    id,
+    domain: 'project_search',
+    source: 'project_search',
+    title: `Search for open-source leads relevant to ${projectTag}`,
+    promptContext: {
+      projectTag,
+      projectDocs,
+      knownUrls,
+    },
+  };
+}
+
 // --- Source: queue/dead-code-flags.json, absolute lowest priority (priority 90) ---------
 //
 // A separate scanner script flags exported symbols with low real call-site counts (call
@@ -424,6 +464,7 @@ registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
 registerTaskSource('arch_review', { priority: 70, next: nextArchReviewTask });
 registerTaskSource('arch_discovery', { priority: 80, next: nextArchDiscoveryTask });
+registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask });
 registerTaskSource('unused_export', { priority: 90, next: nextUnusedExportTask });
 
 function getNextTask() {
@@ -453,7 +494,7 @@ function writeTask(task) {
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
-  nextArchReviewTask, nextArchDiscoveryTask, nextUnusedExportTask,
+  nextArchReviewTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

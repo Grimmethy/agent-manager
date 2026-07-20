@@ -11,15 +11,32 @@
 // Raw http.request instead of fetch: with stream:false Ollama only answers once the whole
 // generation is done, and fetch/undici's built-in header/body timeouts are too short to
 // always let a real call finish, so this uses its own socket timeout instead.
+//
+// FORMALIZED CEILING (2026-07-19): no timeoutMs passed to postJson, and no worker-liveness
+// threshold anywhere in this pipeline (queue-watchdog.ps1's $StaleHeartbeatSeconds /
+// $WorkerZombieThresholdSeconds), should exceed 5 minutes (300_000ms / 300s). This was
+// learned the hard way, twice, the same night: ornith-tool-client.js originally used a
+// 30-minute timeout on the theory that a slower call class deserved more room, and that
+// theory was actively harmful -- it let a genuinely hung call block a worker for 13+
+// minutes with nothing catching it, and is a direct reason that whole call path is
+// currently disabled. Separately, a first attempt at a worker-zombie-restart threshold used
+// 15 minutes "to be safe," and got corrected down to 5 after the operator pointed out that
+// repeated-failure downtime compounds fast and a bigger margin doesn't buy any real safety
+// once you actually check what's bounding legitimate call duration (see
+// docs/pipeline-incident-2026-07-19.md). If a future timeout genuinely needs to exceed 5
+// minutes, that is itself a signal to question the design generating it, not just the
+// number -- do not silently raise these values to "fix" a false-positive without revisiting
+// this reasoning first.
 
 const http = require('http');
 
 /**
  * @param {string} urlString - Full URL to POST to.
  * @param {object} bodyObj - JSON body.
- * @param {number} timeoutMs - Socket timeout; each caller picks its own (ornith-client.js's
- *   single-generation calls vs. ornith-tool-client.js's multi-turn tool loop need very
- *   different overtime-fail lines).
+ * @param {number} timeoutMs - Socket timeout. Both current callers pass 240_000 (4 min,
+ *   under the 5-min ceiling documented above) via their own REQUEST_TIMEOUT_MS constants --
+ *   kept as separate named constants per caller rather than one shared value here, so each
+ *   call site's reasoning stays visible next to it.
  */
 function postJson(urlString, bodyObj, timeoutMs) {
   const url = new URL(urlString);

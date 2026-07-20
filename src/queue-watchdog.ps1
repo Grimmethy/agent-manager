@@ -44,6 +44,30 @@ $CheckIntervalSeconds = 10
 $StaleHeartbeatSeconds = 300  # 5 min -- comfortably above the 4-min per-call ceiling
 $MaxOrnithRejectRetries = 2
 
+# Worker-only escape hatch for the "-NoExit zombie" failure mode: a worker crashes mid-call
+# (ornith-client.js's 4-min REQUEST_TIMEOUT_MS fires, the uncaught error terminates the
+# script), but -NoExit keeps the PowerShell HOST process alive at an idle prompt after the
+# script inside it dies. Test-ProcessAlive sees that lingering shell and returns true
+# forever, so a worker that is provably dead by heartbeat never gets restarted -- reproduced
+# live twice 2026-07-19, required a manual kill+restart both times (see
+# docs/pipeline-incident-2026-07-19.md).
+#
+# Scoped to workers ONLY, not review-runner/apply-runner: those route through
+# claude-code-cli, which has no equivalent bounded per-call timeout the way Ornith calls do,
+# so a genuinely slow (not hung) review/apply pass is plausible and this script has no
+# evidence tonight of either ever actually hanging. Applying the same aggressive treatment
+# there risks killing real, still-in-progress work for no confirmed benefit.
+#
+# Matches $StaleHeartbeatSeconds exactly, not a larger "extra safety margin" value --
+# tightened from an initial 15 min per operator feedback 2026-07-19: repeated crash-loop
+# downtime compounds fast, and a bigger margin here doesn't actually buy any real safety.
+# Nothing legitimate can leave a worker's heartbeat stale past the 4-min REQUEST_TIMEOUT_MS
+# ceiling without either finishing (heartbeat resets at the next pass) or crashing outright
+# (caught by the PID-confirmed-dead path above, using this same 300s margin already). A
+# separate named constant is kept anyway, not inlined as $StaleHeartbeatSeconds, so the two
+# checks can be re-tuned independently later without re-deriving which is which.
+$WorkerZombieThresholdSeconds = 300  # 5 min -- same margin as $StaleHeartbeatSeconds, see above
+
 # instanceId prefix -> how to restart it. 'worker-' matches any worker-N via -like. Every
 # restart target here is a PACKAGE script (lives in $PackageSrcDir), not consumer code.
 $RESTART_MAP = @(
@@ -80,9 +104,15 @@ function Invoke-DeadProcessCheck {
 
             $ageSeconds = ((Get-Date) - [datetime]$hb.lastHeartbeat).TotalSeconds
             if ($ageSeconds -lt $StaleHeartbeatSeconds) { continue }  # recently updated, fine
-            if (Test-ProcessAlive -ProcessId $hb.pid) { continue }    # still alive, just a slow single call
 
-            # Stale heartbeat AND the PID it names isn't running -- this process is dead.
+            $pidAlive = Test-ProcessAlive -ProcessId $hb.pid
+            $isWorker = $hb.instanceId -like 'worker-*'
+            $isZombie = $pidAlive -and $isWorker -and ($ageSeconds -ge $WorkerZombieThresholdSeconds)
+
+            if ($pidAlive -and -not $isZombie) { continue }  # still alive, just a slow single call (or a non-worker instance, which keeps the strict PID-gate)
+
+            # Either the PID is confirmed gone, or (workers only) the heartbeat is stale well
+            # past $WorkerZombieThresholdSeconds despite a lingering PID -- a -NoExit zombie.
             $restart = $RESTART_MAP | Where-Object { $hb.instanceId -like "*$($_.Match)*" } | Select-Object -First 1
             if (-not $restart) {
                 Write-Host ('Watchdog: {0} looks dead (stale {1}s, pid {2} gone) but no restart rule matches -- flagging only.' -f $hb.instanceId, [int]$ageSeconds, $hb.pid) -ForegroundColor Red
@@ -90,13 +120,21 @@ function Invoke-DeadProcessCheck {
                 continue
             }
 
+            # A zombie's own PID is still real and running (that's the whole problem) -- kill
+            # the lingering -NoExit shell before restarting, or it keeps squatting the drafting
+            # claim/heartbeat file identity indefinitely alongside the fresh replacement.
+            if ($isZombie) {
+                Stop-Process -Id $hb.pid -Force -ErrorAction SilentlyContinue
+            }
+
             $scriptPath = Join-Path $PackageSrcDir $restart.Script
             $argList = @('-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
             if ($restart.Args -contains '-InstanceId') { $argList += @('-InstanceId', $hb.instanceId) }
 
             Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal
-            Write-Host ('Watchdog: restarted {0} (was pid {1}, dead {2}s)' -f $hb.instanceId, $hb.pid, [int]$ageSeconds) -ForegroundColor Cyan
-            Add-WatchdogLogEntry -Result 'RESTARTED' -Detail ('{0} (was pid {1}) had a stale heartbeat ({2}s) and the process was confirmed gone. Restarted via {3}.' -f $hb.instanceId, $hb.pid, [int]$ageSeconds, $restart.Script)
+            $reason = if ($isZombie) { 'zombie: pid lingered but heartbeat stale' } else { 'process confirmed gone' }
+            Write-Host ('Watchdog: restarted {0} (was pid {1}, {2}, {3}s)' -f $hb.instanceId, $hb.pid, $reason, [int]$ageSeconds) -ForegroundColor Cyan
+            Add-WatchdogLogEntry -Result 'RESTARTED' -Detail ('{0} (was pid {1}) had a stale heartbeat ({2}s) -- {3}. Restarted via {4}.' -f $hb.instanceId, $hb.pid, [int]$ageSeconds, $reason, $restart.Script)
         } catch {
             Write-Host ('Watchdog: error checking {0}: {1}' -f $hbFile.Name, $_.Exception.Message) -ForegroundColor Red
         }

@@ -15,10 +15,18 @@ const { postJson } = require('./ollama-http.js');
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL = process.env.ORNITH_MODEL || 'ornith';
 
-// Longer than ornith-client.js's REQUEST_TIMEOUT_MS: applies per /api/chat call, but a
-// tool-calling turn (model call + a real grep_codebase invocation) can run longer than a
-// single plain generation call does.
-const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 1_800_000;
+// Matches ornith-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
+// reasoning that a tool-calling turn can legitimately run longer than a plain generation
+// call. That reasoning turned out to be actively harmful, not just generous: this exact
+// path is why Invoke-OrnithToolClient is disabled in ornith-worker.ps1 (see that file's
+// comment) -- a real call through here stalled a worker for 13+ minutes with no progress,
+// and a 30-min ceiling meant nothing would have caught it for a very long time if the
+// disable hadn't happened first. 5 minutes is the formalized ceiling for every Ornith-call-
+// or liveness-related timeout in this pipeline as of 2026-07-19 (see
+// docs/pipeline-incident-2026-07-19.md and queue-watchdog.ps1's $WorkerZombieThresholdSeconds)
+// -- repeated-failure downtime compounds fast, and no legitimate call needs longer than
+// this. Do not raise this again "to be safe" without revisiting that reasoning first.
+const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
 
 const TOOLS = [
   {

@@ -41,6 +41,12 @@ function getConfig() {
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || path.join(repoRoot, 'graphify-out', 'graph.json');
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
+  // project_search's apply target lives OUTSIDE any single project's repo root by design
+  // (see ADR-0018) -- a cross-project lead ledger, not something scoped to repoRoot the way
+  // every other path above is. No repoRoot-relative default makes sense here; the fallback
+  // below matches this operator's actual UsefulProjectIndex location as of 2026-07-19.
+  const projectSearchIndexPath = process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH
+    || path.join(path.dirname(repoRoot), 'UsefulProjectIndex', 'INDEX.md');
   // The domain this package's own code-repo-facing built-in sources (trouble_log,
   // arch_review, arch_discovery) stamp onto the tasks they generate -- must match a real
   // key in the consumer's domainsPath file. 'adhoc' and 'secondbrain' are NOT covered by
@@ -59,6 +65,7 @@ function getConfig() {
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, communityCoveragePath, graphPath, domainsPath,
+    projectSearchIndexPath,
     defaultDomain,
   };
 }

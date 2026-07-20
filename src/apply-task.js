@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 
@@ -44,10 +44,11 @@ function writeArtifact(task, repoRoot, pipelineDir) {
  * @param {string} config.repoRoot
  * @param {string} config.pipelineDir
  * @param {string} [config.secondBrainDir]
+ * @param {string} [config.projectSearchIndexPath]
  * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
  * @returns {{succeeded: boolean, branch?: string, doneMarker?: string, reason?: string}}
  */
-function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, gitRunner = createRealGitRunner(repoRoot) }) {
+function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, gitRunner = createRealGitRunner(repoRoot) }) {
   try {
     if (task.domain === 'secondbrain') {
       const result = applySecondBrainNote({
@@ -56,6 +57,18 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, gitRunner = cr
         secondBrainDir,
       });
       return { succeeded: true, doneMarker: result.marker };
+    }
+
+    // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's
+    // repo root by design (see ADR-0018) -- a non-git write, same shape as the secondbrain
+    // path above, not the git-branch-diff flow below.
+    if (task.domain === 'project_search') {
+      const result = applyProjectSearchFindings({
+        implementResponse: task.implementResponse,
+        indexPath: projectSearchIndexPath,
+      });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: `${result.findingCount} finding(s) (${result.strongCount} strong) appended to ${result.file}` };
     }
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
@@ -128,7 +141,7 @@ function main() {
     return;
   }
 
-  const { repoRoot, pipelineDir, secondBrainDir } = getConfig();
+  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath } = getConfig();
 
   let task;
   try {
@@ -138,7 +151,7 @@ function main() {
     return;
   }
 
-  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir });
+  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath });
   process.stdout.write(JSON.stringify(result));
 }
 

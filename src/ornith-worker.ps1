@@ -259,7 +259,20 @@ while ($true) {
     try {
         Move-Item $next.FullName $draftingPath -Force -ErrorAction Stop
     } catch {
+        # Reproduced live 2026-07-19: with no backoff here, a losing instance re-hits this
+        # same race every loop iteration with zero delay -- a visible rapid-fire console
+        # spam loop burning CPU for no reason until manually killed. 3s is deliberately
+        # well under the 60s no-work sleep above (losing a race means there IS work, so
+        # retrying should be faster than the idle poll) but not zero.
+        #
+        # This backoff is a hygiene fix for the SYMPTOM, not a fix for the underlying
+        # cause: normal operation should never have two instances sharing one InstanceId
+        # racing over the same claim in the first place (queue-watchdog.ps1's automatic
+        # restart racing a manual restart is the mechanism observed live -- see
+        # docs/pipeline-incident-2026-07-19.md). A lock/registry so only one process per
+        # InstanceId can exist is the real fix for that; out of scope here.
         Write-Host ('Another instance claimed: {0}' -f $next.Name) -ForegroundColor DarkGray
+        Start-Sleep -Seconds 3
         continue
     }
 
@@ -314,6 +327,37 @@ while ($true) {
 
     if ($task.source -eq 'arch_discovery') {
         $task | Add-Member -NotePropertyName 'toolCallLog' -NotePropertyValue $planResult.toolCallLog -Force
+    }
+
+    # project_search's plan pass proposes search queries (text in/out -- Ornith has no
+    # network access); the HARNESS runs them here, between plan and implement, and hands
+    # real results to the implement pass. See ADR-0018 / docs/project-search-pipeline.md.
+    # Must write the updated task back to $draftingPath before Get-PromptText's implement
+    # call below, since prompts.js's CLI entry point re-reads the task fresh from disk on
+    # every invocation rather than taking it as an in-memory argument.
+    if ($task.source -eq 'project_search') {
+        $queries = [regex]::Matches($planResult.response, '(?m)^QUERY:\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Where-Object { $_ }
+        $searchResults = @()
+        if ($queries.Count -gt 0) {
+            $queriesPath = Join-Path $TempDir ('project-search-queries-{0}.json' -f $task.id)
+            [System.IO.File]::WriteAllText($queriesPath, (@{ queries = $queries } | ConvertTo-Json))
+            try {
+                $fetchScript = Join-Path $PackageSrcDir 'project-search-fetch.js'
+                $rawResults = & node $fetchScript $queriesPath
+                $parsed = ($rawResults -join "`n") | ConvertFrom-Json
+                # ConvertFrom-Json on a real JSON array normally stays an array, but a
+                # single-element result isn't guaranteed to -- force it back to an array so
+                # downstream .Count/.length checks (both here and in prompts.js) don't
+                # silently misbehave on exactly one result.
+                $searchResults = @($parsed)
+            } catch {
+                Write-Host ('project-search-fetch failed (non-fatal, implement proceeds with no results): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+            } finally {
+                Remove-Item $queriesPath -ErrorAction SilentlyContinue
+            }
+        }
+        $task.promptContext | Add-Member -NotePropertyName 'searchResults' -NotePropertyValue $searchResults -Force
+        Write-TaskJson $draftingPath $task
     }
 
     Invoke-TaskDb 'plan-done' $draftingPath (@{ planDurationMs = $planSw.ElapsedMilliseconds; planAttempts = $(if ($planResult.attempts) { $planResult.attempts } else { 1 }) } | ConvertTo-Json -Compress)

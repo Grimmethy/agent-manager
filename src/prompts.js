@@ -154,6 +154,38 @@ function unusedExportPlanPrompt(task) {
   ].join('\n');
 }
 
+// project_search's plan pass has a different JOB than every other source's plan pass: it
+// doesn't plan a change, it proposes SEARCH QUERIES for the harness to execute against
+// GitHub/Hugging Face between plan and implement (see ornith-worker.ps1's project_search
+// branch and project-search-fetch.js). Ornith has no internet access, so this is the one
+// place its judgment actually adds value in this source's pipeline -- picking good queries
+// from project context is a reasoning task, not something worth hardcoding as keyword
+// extraction (see ADR-0018).
+function projectSearchPlanPrompt(task) {
+  const ctx = task.promptContext;
+  const knownList = ctx.knownUrls && ctx.knownUrls.length > 0
+    ? ctx.knownUrls.map((u) => `- ${u}`).join('\n')
+    : '(none logged yet)';
+  return [
+    `You are looking for open-source projects (GitHub repos, Hugging Face models/datasets) that could inform or feed into the project "${ctx.projectTag}".`,
+    '',
+    'PROJECT CONTEXT (its own CONTEXT.md and/or CLAUDE.md, verbatim):',
+    ctx.projectDocs,
+    '',
+    'Leads ALREADY LOGGED (do not propose queries aimed at re-finding these specific things):',
+    knownList,
+    '',
+    'Propose 1 to 3 SHORT SEARCH QUERIES (a few words each, like you would type into a search box) ' +
+      'that could surface genuinely useful external projects for this specific project -- not generic ' +
+      'terms, and not just an echo of dependency names already in use. Think about what real gap or ' +
+      'recurring need this project has, based on the context above.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
 // ---- Per-source implement-prompt builders (unused_export has no dedicated implement
 // branch -- it falls through to the generic fallback, so it intentionally gets NO
 // buildImplementPrompt registered below) ----
@@ -204,6 +236,41 @@ function archDiscoveryImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+function projectSearchImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const resultsText = ctx.searchResults && ctx.searchResults.length > 0
+    ? ctx.searchResults.map((r) => {
+      if (r.error) return `(query "${r.query}", ${r.source}: search failed -- ${r.error})`;
+      return `- [${r.source}] ${r.name} -- ${r.description || '(no description)'} (${r.stat || ''}) -- ${r.url} (found via query "${r.query}")`;
+    }).join('\n')
+    : '(no results -- the searches returned nothing usable)';
+  return [
+    `Earlier you proposed search queries for project "${ctx.projectTag}":`,
+    '',
+    planText,
+    '',
+    'The harness ran those queries against GitHub and Hugging Face. Real results:',
+    '',
+    resultsText,
+    '',
+    'Now write 0 to N findings from the REAL results above -- do not invent a project that is not ' +
+      'listed. It is fine and expected to write nothing if none of the results are genuinely useful. ' +
+      'For each finding you keep, rate it Strong or Weak: Strong means specifically, concretely useful ' +
+      'to this project (say how); Weak means plausibly related but not clearly actionable.',
+    '',
+    'Each finding MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### PROJECT: name',
+    'Source: github OR huggingface',
+    'URL: the real url from the results above',
+    'Description: one or two sentences',
+    'Relevant to: ' + ctx.projectTag + ' -- specific reason',
+    'Strength: Strong OR Weak',
+    'Query: the query that found it (Strong findings only)',
+    'Rationale: what specifically this could feed into (Strong findings only)',
+  ].join('\n');
+}
+
 function troubleLogImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   return [
@@ -251,6 +318,7 @@ updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, b
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
+updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 
