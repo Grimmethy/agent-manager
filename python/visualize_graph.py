@@ -207,7 +207,11 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     # that. Requires FILL_ANCESTOR_HEIGHT_CSS below -- percentage heights only resolve if
     # every ancestor (html, body, the .card wrapper pyvis generates) has a real height too.
     net = Network(height="100%", width="100%", bgcolor="#1a1a1a", font_color="#eeeeee", notebook=False)
-    net.barnes_hut(gravity=-3000, spring_length=120)
+    # forceAtlas2Based over barnesHut: linear (not quadratic) repulsion and mass scaled by
+    # node degree, which is what actually separates hub-heavy communities on a dense
+    # dependency graph instead of just pushing everything apart uniformly. Still built on
+    # vis-network's own Barnes-Hut approximation under the hood, so cost stays O(n log n).
+    net.force_atlas_2based(gravity=-150, central_gravity=0.008, spring_length=220, spring_strength=0.05, damping=0.4)
     # Dynamic edge smoothing gives each edge an invisible support node that takes part in
     # the physics simulation (pyvis's own docs) -- real per-step compute, not just a
     # rendering cost, and disabling it is exactly what those docs recommend once a graph

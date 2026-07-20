@@ -104,6 +104,24 @@ function Write-HeartbeatFile {
         [string]$Pass = $null,
         [string]$StartedAt = $null
     )
+    $hbPath = Join-Path $InstancesDir ($InstanceId + '.json')
+
+    # stateSince: when this instance last CHANGED state (the status/pass/task tuple), as
+    # opposed to lastHeartbeat (when it last wrote anything). Powers the dashboard's
+    # "how long in current state" runtime tracker. A stateless per-call writer can only
+    # know whether this write is a transition by reading its own previous file back --
+    # same-state rewrites preserve the original transition timestamp; any change (or a
+    # missing/unreadable previous file, e.g. first write after a restart) resets it to now.
+    $stateKey = '{0}|{1}|{2}' -f $Status, $Pass, $TaskId
+    $stateSince = (Get-Date).ToString('o')
+    try {
+        if (Test-Path $hbPath) {
+            $prev = [System.IO.File]::ReadAllText($hbPath) | ConvertFrom-Json
+            $prevKey = '{0}|{1}|{2}' -f $prev.status, $prev.currentPass, $prev.currentTaskId
+            if ($prevKey -eq $stateKey -and $prev.stateSince -and $prev.pid -eq $PID) { $stateSince = $prev.stateSince }
+        }
+    } catch { }
+
     $hb = @{
         instanceId    = $InstanceId
         pid           = $PID
@@ -112,8 +130,8 @@ function Write-HeartbeatFile {
         currentTaskId = $TaskId
         currentPass   = $Pass
         lastHeartbeat = (Get-Date).ToString('o')
+        stateSince    = $stateSince
     }
     if ($StartedAt) { $hb.startedAt = $StartedAt }
-    $hbPath = Join-Path $InstancesDir ($InstanceId + '.json')
     [System.IO.File]::WriteAllText($hbPath, ($hb | ConvertTo-Json -Depth 10))
 }
