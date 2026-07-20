@@ -64,6 +64,13 @@ function Read-TaskJson {
 
 function Write-TaskJson {
     param([string]$Path, $TaskObj)
+    # WriteAllText does NOT create missing parent directories. Found live 2026-07-19:
+    # queue/review/ had never been created in this deployment, so every task that
+    # completed its full pass sequence died on this exact line while handing its
+    # finished draft to review -- invisible as a process crash until per-task error
+    # isolation finally surfaced the exception text. Ensure the parent here, once,
+    # for every queue-state writer.
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     [System.IO.File]::WriteAllText($Path, ($TaskObj | ConvertTo-Json -Depth 20))
 }
 
