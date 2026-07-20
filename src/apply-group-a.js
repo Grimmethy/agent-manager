@@ -97,4 +97,93 @@ function applyProjectSearchFindings({ implementResponse, indexPath }) {
   return { file: indexPath, findingCount: findings.length, strongCount: strongSubsections.length };
 }
 
-module.exports = { applySecondBrainNote, applyProjectSearchFindings, parseProjectSearchFindings };
+// Parses deep_dive's implement-pass output (see prompts.js's deepDiveImplementPrompt for
+// the exact "### ITEM: title" format this must match) -- see ADR-0019 /
+// docs/deep-dive-pipeline.md. Unlike project_search's Strong/Weak split, every item here
+// (including Ignore-rated ones) gets written -- an honest "nothing useful here, and why"
+// is a valid, auditable outcome, not something to omit.
+function parseDeepDiveItems(implementResponse) {
+  const text = (implementResponse || '').trim();
+  if (!text) return [];
+  const blocks = text.split(/(?=^### ITEM: )/m).map((b) => b.trim()).filter(Boolean);
+  const field = (block, name) => {
+    const m = block.match(new RegExp(`^${name}:\\s*(.+)$`, 'mi'));
+    return m ? m[1].trim() : '';
+  };
+  return blocks
+    .map((block) => {
+      const titleMatch = block.match(/^### ITEM:\s*(.+)$/m);
+      if (!titleMatch) return null;
+      return {
+        title: titleMatch[1].trim(),
+        community: field(block, 'Community'),
+        files: field(block, 'Files'),
+        rating: field(block, 'Rating'),
+        rationale: field(block, 'Rationale'),
+      };
+    })
+    .filter((it) => it && it.title && it.rationale);
+}
+
+// Appends one community's action items to UsefulProjectIndex/analysis/<project-slug>.md
+// (created with a header on first write) and stamps lastReviewedAt/actionItemCount on the
+// matching community entry in deep-dive-coverage.json. Both are plain, non-git writes --
+// unlike arch_discovery's candidate append (which lands inside repoRoot and goes through a
+// real git branch/commit/push), deep_dive's target lives outside any project's repo root,
+// same shape as project_search's INDEX.md write.
+function applyDeepDiveFindings({ implementResponse, task, analysisDir, coveragePath }) {
+  const items = parseDeepDiveItems(implementResponse);
+  const { projectSlug, projectName, communityId, communityName } = task.promptContext;
+
+  // Stamp the tracker regardless of whether there were any items -- a reviewed-but-empty
+  // community is a real, distinguishable outcome (see docs/deep-dive-pipeline.md), not the
+  // same as "never got to it."
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(coveragePath) ? fs.readFileSync(coveragePath, 'utf8') : '{"projects":{}}');
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+  const proj = coverage.projects[projectSlug];
+  if (proj && Array.isArray(proj.communities)) {
+    const community = proj.communities.find((c) => c.id === communityId);
+    if (community) {
+      community.lastReviewedAt = new Date().toISOString();
+      community.actionItemCount = items.length;
+    }
+  }
+  fs.mkdirSync(path.dirname(coveragePath), { recursive: true });
+  fs.writeFileSync(coveragePath, JSON.stringify(coverage, null, 2));
+
+  if (items.length === 0) {
+    return { skipped: true, reason: `community "${communityName}" reviewed, no action items produced` };
+  }
+
+  const analysisPath = path.join(analysisDir, `${projectSlug}.md`);
+  let analysisText = fs.existsSync(analysisPath)
+    ? fs.readFileSync(analysisPath, 'utf8')
+    : `# ${projectName} — Deep Dive\n`;
+
+  const sections = items.map((it) => {
+    const lines = [`## ${it.title}`, '', `**Community:** ${it.community || communityName}`, `**Rating:** ${it.rating || '(unrated)'}`];
+    if (it.files) lines.push(`**Files:** ${it.files}`);
+    lines.push('', it.rationale);
+    return lines.join('\n');
+  });
+
+  analysisText += '\n' + sections.join('\n\n') + '\n';
+
+  fs.mkdirSync(analysisDir, { recursive: true });
+  fs.writeFileSync(analysisPath, analysisText);
+
+  return { file: analysisPath, itemCount: items.length };
+}
+
+module.exports = {
+  applySecondBrainNote,
+  applyProjectSearchFindings,
+  parseProjectSearchFindings,
+  applyDeepDiveFindings,
+  parseDeepDiveItems,
+};

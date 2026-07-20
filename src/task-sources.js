@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
 
@@ -418,6 +419,171 @@ function nextProjectSearchTask() {
   };
 }
 
+// --- Source: deep_dive — dissects Strong-rated project_search leads into action items
+// (priority 82, between arch_discovery's 80 and project_search's 85) --------------------
+//
+// See ADR-0019 and docs/deep-dive-pipeline.md for the full design. Deliberately placed
+// BEFORE project_search (its own generator): draining the backlog of un-dissected Strong
+// leads takes priority over finding more of them.
+//
+const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 60000;
+
+// Cross-references INDEX.md's table rows against its '## Notes' '### Name' subsections --
+// only a Strong-rated finding gets a subsection there (see apply-group-a.js's
+// applyProjectSearchFindings), so a table row with a matching heading is Strong; one
+// without is Weak. There is no per-row Strength column in the rendered table itself, so
+// this cross-reference is the only way to recover which leads are Strong after the fact.
+function parseStrongLeadsFromIndex(indexText) {
+  if (!indexText) return [];
+  const notesIdx = indexText.indexOf('## Notes');
+  const notesText = notesIdx === -1 ? '' : indexText.slice(notesIdx);
+  const strongNames = new Set([...notesText.matchAll(/^### (.+)$/gm)].map((m) => m[1].trim()));
+
+  const rows = [...indexText.matchAll(/\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|/g)];
+  const seen = new Set();
+  const leads = [];
+  for (const [, rawName, rawUrl] of rows) {
+    const name = rawName.trim();
+    if (!strongNames.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    leads.push({ name, url: rawUrl.trim() });
+  }
+  return leads;
+}
+
+// Lazy onboarding for one newly-Strong lead: clone it (shallow -- only current history is
+// needed for reading, not the project's own git log) and run build_graph.py against the
+// clone with --no-model-naming (see ADR-0019: naming a community here is a free heuristic,
+// never a spent Ornith round-trip) and --target-dir so this repo's own graphify-out/
+// graph.json is never touched. Both the clone and the graph-build are slow/blocking --
+// deliberately done here, inline in the normal ornith-worker.ps1 tick, and NOT in
+// queue-watchdog.ps1's tight poll loop (see docs/deep-dive-pipeline.md's "Clone management"
+// section for why).
+function onboardDeepDiveProject(lead, clonesDir) {
+  const slug = slugifyForId(lead.name);
+  const clonePath = path.join(clonesDir, slug);
+  if (!fs.existsSync(clonePath)) {
+    fs.mkdirSync(clonesDir, { recursive: true });
+    execSync(`git clone --depth 1 "${lead.url}" "${clonePath}"`, { stdio: 'pipe' });
+  }
+
+  const graphOutPath = path.join(clonePath, '.deep-dive-graph.json');
+  if (!fs.existsSync(graphOutPath)) {
+    const buildGraphScript = path.join(__dirname, '..', 'python', 'build_graph.py');
+    execSync(`python "${buildGraphScript}" --target-dir "${clonePath}" --output "${graphOutPath}" --no-model-naming`, { stdio: 'pipe' });
+  }
+
+  const graphData = JSON.parse(readIfExists(graphOutPath) || '{"nodes":[],"links":[],"communities":[]}');
+  return {
+    slug,
+    clonePath,
+    communities: (graphData.communities || []).map((c) => ({ id: c.id, name: c.name, lastReviewedAt: null, actionItemCount: null })),
+  };
+}
+
+function nextDeepDiveTask() {
+  const { projectSearchIndexPath, deepDiveCoveragePath, deepDiveClonesDir } = getConfig();
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+
+  const strongLeads = parseStrongLeadsFromIndex(readIfExists(projectSearchIndexPath));
+  let coverageChanged = false;
+  for (const lead of strongLeads) {
+    const slug = slugifyForId(lead.name);
+    if (coverage.projects[slug]) continue; // already onboarded (or a prior onboarding attempt failed and will retry below)
+    try {
+      const onboarded = onboardDeepDiveProject(lead, deepDiveClonesDir);
+      coverage.projects[slug] = {
+        sourceUrl: lead.url,
+        clonePath: onboarded.clonePath,
+        clonedAt: new Date().toISOString(),
+        communities: onboarded.communities,
+      };
+      coverageChanged = true;
+    } catch (e) {
+      // Clone/graph-build failures (bad URL, network, python not on PATH, etc.) must never
+      // crash the worker loop -- log and skip this lead for this tick; since it's still
+      // absent from coverage.projects, it's retried automatically next tick.
+      console.error(`deep_dive: failed to onboard "${lead.name}": ${e.message}`);
+    }
+  }
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(deepDiveCoveragePath), { recursive: true });
+    fs.writeFileSync(deepDiveCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+
+  // Flatten every tracked project's communities and pick the oldest/null lastReviewedAt
+  // first -- same rule nextArchDiscoveryTask() uses, just flattened across multiple
+  // projects instead of one repo (see docs/deep-dive-pipeline.md).
+  const candidates = [];
+  for (const [slug, proj] of Object.entries(coverage.projects)) {
+    for (const community of proj.communities || []) {
+      candidates.push({ slug, proj, community });
+    }
+  }
+  candidates.sort((a, b) => {
+    const at = a.community.lastReviewedAt ? Date.parse(a.community.lastReviewedAt) : -Infinity;
+    const bt = b.community.lastReviewedAt ? Date.parse(b.community.lastReviewedAt) : -Infinity;
+    return at - bt;
+  });
+
+  const chosen = candidates.find((c) => !taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`));
+  if (!chosen) return null; // every known community already has an in-flight or terminal task
+
+  const { slug, proj, community } = chosen;
+  const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
+  const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
+  const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
+  if (memberNodes.length === 0) return null;
+
+  // Same degree-by-file, budget-capped file selection as nextArchDiscoveryTask() -- see
+  // ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // the identical convention rather than inventing a second one.
+  const degreeByNodeId = {};
+  for (const link of graphData.links || []) {
+    degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
+    degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
+  }
+  const degreeByFile = {};
+  for (const node of memberNodes) {
+    if (!node.source_file) continue;
+    degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
+  }
+  const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+
+  const files = [];
+  let budgetUsed = 0;
+  for (const [sourceFile, degree] of rankedFiles) {
+    const content = readIfExists(path.join(proj.clonePath, sourceFile));
+    if (content == null) continue;
+    if (budgetUsed + content.length > DEEP_DIVE_CONTEXT_BUDGET_CHARS) break;
+    files.push({ path: sourceFile, degree, content });
+    budgetUsed += content.length;
+  }
+
+  const lead = strongLeads.find((l) => slugifyForId(l.name) === slug);
+
+  return {
+    id: `deep-dive-${slug}-${community.id}`,
+    domain: 'deep_dive',
+    source: 'deep_dive',
+    title: `Deep dive: ${lead ? lead.name : slug} — ${community.name}`,
+    promptContext: {
+      projectSlug: slug,
+      projectName: lead ? lead.name : slug,
+      communityId: community.id,
+      communityName: community.name,
+      files,
+    },
+  };
+}
+
 // --- Source: queue/dead-code-flags.json, absolute lowest priority (priority 90) ---------
 //
 // A separate scanner script flags exported symbols with low real call-site counts (call
@@ -464,6 +630,7 @@ registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
 registerTaskSource('arch_review', { priority: 70, next: nextArchReviewTask });
 registerTaskSource('arch_discovery', { priority: 80, next: nextArchDiscoveryTask });
+registerTaskSource('deep_dive', { priority: 82, next: nextDeepDiveTask });
 registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask });
 registerTaskSource('unused_export', { priority: 90, next: nextUnusedExportTask });
 

@@ -224,6 +224,35 @@ def instances_dir() -> Path | None:
     return (d / "instances") if d else None
 
 
+def deep_dive_coverage_path() -> Path | None:
+    override = os.environ.get("AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "deep-dive-coverage.json") if d else None
+
+
+def project_search_index_path() -> Path | None:
+    """Same default derivation src/config.js uses (a sibling UsefulProjectIndex directory
+    next to the active project's repo root) -- kept in sync by hand since this dashboard
+    is Python, not Node, and can't require() that file directly."""
+    override = os.environ.get("AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH")
+    if override:
+        return Path(override)
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        return None
+    return Path(repo_root).parent / "UsefulProjectIndex" / "INDEX.md"
+
+
+def deep_dive_analysis_dir() -> Path | None:
+    override = os.environ.get("AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR")
+    if override:
+        return Path(override)
+    idx = project_search_index_path()
+    return (idx.parent / "analysis") if idx else None
+
+
 def model_stats_db_path() -> Path | None:
     override = os.environ.get("AGENT_MANAGER_MODEL_STATS_DB_PATH")
     if override:
@@ -286,9 +315,22 @@ def api_instances():
             except (ValueError, KeyError):
                 age = None
             threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
+            # stateSince is written by Write-HeartbeatFile on every state transition
+            # (status/pass/task change); age it server-side so the first paint is right
+            # even before the client's 1s ticker takes over.
+            state_age = None
+            if data.get("stateSince"):
+                try:
+                    since = datetime.fromisoformat(data["stateSince"].replace("Z", "+00:00"))
+                    if since.tzinfo is None:
+                        since = since.replace(tzinfo=timezone.utc)
+                    state_age = (datetime.now(timezone.utc) - since).total_seconds()
+                except ValueError:
+                    state_age = None
             results.append({
                 **data,
                 "heartbeatAgeSeconds": round(age) if age is not None else None,
+                "stateAgeSeconds": round(state_age) if state_age is not None else None,
                 "stale": age is not None and age > threshold,
                 "staleThresholdSeconds": threshold,
             })
@@ -424,6 +466,61 @@ def api_summary():
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
     return jsonify(counts)
+
+
+@app.route("/api/deep-dive/projects")
+def api_deep_dive_projects():
+    """List tab for deep_dive (ADR-0019): every project-search lead that's been cloned
+    and community-graphed so far, with a quick reviewed/total + action-item count so the
+    list itself shows progress without opening each one."""
+    cov_path = deep_dive_coverage_path()
+    coverage = (read_json_safe(cov_path) if cov_path else None) or {}
+    projects = coverage.get("projects", {})
+
+    results = []
+    for slug, proj in projects.items():
+        communities = proj.get("communities") or []
+        reviewed = sum(1 for c in communities if c.get("lastReviewedAt"))
+        total_items = sum((c.get("actionItemCount") or 0) for c in communities if c.get("actionItemCount") is not None)
+        results.append({
+            "slug": slug,
+            "sourceUrl": proj.get("sourceUrl"),
+            "clonedAt": proj.get("clonedAt"),
+            "communityCount": len(communities),
+            "reviewedCount": reviewed,
+            "totalActionItems": total_items,
+        })
+    results.sort(key=lambda r: r["slug"])
+    return jsonify(results)
+
+
+@app.route("/api/deep-dive/projects/<slug>")
+def api_deep_dive_project_detail(slug):
+    """Detail view: per-community review progress plus the actual write-up
+    (UsefulProjectIndex/analysis/<slug>.md) apply-group-a.js's applyDeepDiveFindings
+    appended -- this IS "what our workers picked from that repo," rendered as-is rather
+    than re-parsed, since the markdown itself is already the operator-facing artifact."""
+    cov_path = deep_dive_coverage_path()
+    coverage = (read_json_safe(cov_path) if cov_path else None) or {}
+    proj = coverage.get("projects", {}).get(slug)
+    if not proj:
+        abort(404)
+
+    analysis_dir = deep_dive_analysis_dir()
+    analysis_text = None
+    if analysis_dir:
+        analysis_path = analysis_dir / f"{slug}.md"
+        if analysis_path.is_file():
+            analysis_text = analysis_path.read_text(encoding="utf-8")
+
+    return jsonify({
+        "slug": slug,
+        "sourceUrl": proj.get("sourceUrl"),
+        "clonePath": proj.get("clonePath"),
+        "clonedAt": proj.get("clonedAt"),
+        "communities": proj.get("communities") or [],
+        "analysisMarkdown": analysis_text,
+    })
 
 
 @app.route("/api/browse")

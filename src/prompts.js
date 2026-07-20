@@ -236,6 +236,50 @@ function archDiscoveryImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// deep_dive (ADR-0019) reuses arch_discovery's pre-fetched-community-context shape (see
+// nextDeepDiveTask() in task-sources.js) but asks a different question: not "is this code
+// architecturally sound" but "what here is worth taking for agent-manager itself." Modeled
+// directly on archDiscoveryPlanPrompt/archDiscoveryImplementPrompt above -- same pre-fetch
+// constraint (no live exploration), different judgment and output contract.
+function deepDivePlanPrompt(task) {
+  const ctx = task.promptContext;
+  const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
+  const fileContents = ctx.files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+  return [
+    `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, Ornith-based workers, majority-vote review gates).`,
+    '',
+    `COMMUNITY: ${ctx.communityName} (id ${ctx.communityId}, from ${ctx.projectName})`,
+    '',
+    'Files in this community, most-connected first (full content included below):',
+    fileList || '(none)',
+    '',
+    fileContents || '(no file content available)',
+    '',
+    'Write a numbered PLAN (no code) identifying 0 to N specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager\'s own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.',
+  ].join('\n');
+}
+
+function deepDiveImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  return [
+    'Earlier you wrote this PLAN for one community of an external project:',
+    '',
+    planText,
+    '',
+    'Now write ONLY the final item write-up(s) your plan identified -- 0 to N of them. If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show.',
+    '',
+    'Each item MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### ITEM: short title',
+    `Community: ${ctx.communityName}`,
+    'Files: the specific file path(s) this references',
+    'Rating: Use / Adapt / Ignore',
+    'Rationale: what this is, and specifically how it applies (or does not) to agent-manager',
+    '',
+    'Rating means: Use = take it close to as-is; Adapt = the idea is good but agent-manager\'s own context differs enough that it needs real rework; Ignore = considered and does not apply -- state the concrete reason, do not just omit it. An Ignore item with a real reason is exactly as valid an outcome as a Use/Adapt item -- never skip writing one just because the verdict is negative.',
+  ].join('\n');
+}
+
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -319,6 +363,7 @@ updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
+updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 

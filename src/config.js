@@ -47,6 +47,17 @@ function getConfig() {
   // below matches this operator's actual UsefulProjectIndex location as of 2026-07-19.
   const projectSearchIndexPath = process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH
     || path.join(path.dirname(repoRoot), 'UsefulProjectIndex', 'INDEX.md');
+  // deep_dive (ADR-0019) is project_search's consumer -- its clones, per-project analysis
+  // docs, and coverage tracker all live alongside INDEX.md by default (same
+  // UsefulProjectIndex directory), derived from projectSearchIndexPath rather than a
+  // separate repoRoot-relative default, since none of this is scoped to any one project's
+  // repo any more than INDEX.md itself is.
+  const deepDiveCoveragePath = process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH
+    || path.join(pipelineDir, 'deep-dive-coverage.json');
+  const deepDiveClonesDir = process.env.AGENT_MANAGER_DEEP_DIVE_CLONES_DIR
+    || path.join(path.dirname(projectSearchIndexPath), 'clones');
+  const deepDiveAnalysisDir = process.env.AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR
+    || path.join(path.dirname(projectSearchIndexPath), 'analysis');
   // The domain this package's own code-repo-facing built-in sources (trouble_log,
   // arch_review, arch_discovery) stamp onto the tasks they generate -- must match a real
   // key in the consumer's domainsPath file. 'adhoc' and 'secondbrain' are NOT covered by
@@ -66,6 +77,7 @@ function getConfig() {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
+    deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir,
     defaultDomain,
   };
 }

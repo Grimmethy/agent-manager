@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 
@@ -45,10 +45,12 @@ function writeArtifact(task, repoRoot, pipelineDir) {
  * @param {string} config.pipelineDir
  * @param {string} [config.secondBrainDir]
  * @param {string} [config.projectSearchIndexPath]
+ * @param {string} [config.deepDiveAnalysisDir]
+ * @param {string} [config.deepDiveCoveragePath]
  * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
  * @returns {{succeeded: boolean, branch?: string, doneMarker?: string, reason?: string}}
  */
-function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, gitRunner = createRealGitRunner(repoRoot) }) {
+function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, gitRunner = createRealGitRunner(repoRoot) }) {
   try {
     if (task.domain === 'secondbrain') {
       const result = applySecondBrainNote({
@@ -69,6 +71,19 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       });
       if (result.skipped) return { succeeded: true, doneMarker: result.reason };
       return { succeeded: true, doneMarker: `${result.findingCount} finding(s) (${result.strongCount} strong) appended to ${result.file}` };
+    }
+
+    // deep_dive's target (UsefulProjectIndex/analysis/<project>.md) lives outside any
+    // project's repo root too, same non-git shape as project_search above -- see ADR-0019.
+    if (task.domain === 'deep_dive') {
+      const result = applyDeepDiveFindings({
+        implementResponse: task.implementResponse,
+        task,
+        analysisDir: deepDiveAnalysisDir,
+        coveragePath: deepDiveCoveragePath,
+      });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: `${result.itemCount} action item(s) appended to ${result.file}` };
     }
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
@@ -141,7 +156,7 @@ function main() {
     return;
   }
 
-  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath } = getConfig();
+  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath } = getConfig();
 
   let task;
   try {
@@ -151,7 +166,7 @@ function main() {
     return;
   }
 
-  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath });
+  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath });
   process.stdout.write(JSON.stringify(result));
 }
 

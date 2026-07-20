@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """Stripped-down, self-contained replacement for the graphify dependency arch_discovery
 used to require. Walks the configured source directories, extracts a file-level import/
-require graph (JS/TS scope, matching grep-codebase-tool.js's own extension list), runs
-community detection, and writes graph.json in the exact {nodes, links} shape
-task-sources.js's nextArchDiscoveryTask() already consumes -- no changes needed there.
+require graph (JS/TS + Python, see below), runs community detection, and writes graph.json
+in the exact {nodes, links} shape task-sources.js's nextArchDiscoveryTask() already
+consumes -- no changes needed there.
 
 This is a periodic, manually-run scanner (same pattern as unused-export-scan.js /
 gis-probe.js), NOT run automatically on every task-generation tick -- the resulting
 graph.json and community-coverage.json are the cache.
 
 Usage: python build_graph.py
-Reads the same env vars as the rest of the package (AGENT_MANAGER_REPO_ROOT,
-AGENT_MANAGER_GREP_DIRS, AGENT_MANAGER_GRAPH_PATH, AGENT_MANAGER_COMMUNITY_COVERAGE_PATH,
-OLLAMA_URL, ORNITH_MODEL) -- no separate config mechanism.
+       python build_graph.py --target-dir <path> --output <graph.json path> [--no-model-naming]
+Without --target-dir, reads the same env vars as the rest of the package
+(AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_GREP_DIRS, AGENT_MANAGER_GRAPH_PATH,
+AGENT_MANAGER_COMMUNITY_COVERAGE_PATH, OLLAMA_URL, ORNITH_MODEL) -- no separate config
+mechanism. --target-dir/--output let deep_dive (see docs/deep-dive-pipeline.md) point this
+at an arbitrary cloned external repo without disturbing this repo's own
+graphify-out/graph.json -- grep_dirs is forced to "scan the whole target dir" in that mode
+since an external clone has no known frontend/src,backend/src convention. --no-model-naming
+skips the Ornith community-naming call entirely (deep_dive's own design deliberately never
+spends a model round-trip on naming -- see ADR-0019 -- unlike arch_discovery's default,
+which tries Ornith first and falls back to the heuristic below only on failure).
 
 IMPORTANT: rebuilding resets community-coverage.json's rotation progress (lastReviewedAt/
 lastCandidateCount). Community boundaries can genuinely shift between rebuilds, and a
@@ -21,6 +29,7 @@ tracking -- worse than an honest fresh start. Re-run this only when you actually
 reset (e.g. after a large refactor), not on every tick.
 """
 
+import argparse
 import json
 import os
 import re
@@ -31,7 +40,9 @@ from pathlib import Path
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
 
-MATCH_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+PY_EXTENSIONS = {".py"}
+MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS
 EXCLUDE_DIRS = {
     "node_modules", ".git", "queue",
     # Only matters when walk_source_files falls back to scanning the whole repo_root
@@ -46,6 +57,18 @@ IMPORT_RE = re.compile(
     r"""(?:require\(\s*['"]([^'"]+)['"]\s*\))"""
     r"""|(?:import\s+(?:[\w*{}\s,]+\s+from\s+)?['"]([^'"]+)['"])"""
     r"""|(?:export\s+[\w*{}\s,]*\s+from\s+['"]([^'"]+)['"])"""
+)
+
+# Best-effort only (see docs/deep-dive-pipeline.md's "Python import support" section) --
+# this graph is a reading-order aid for deep_dive, not a correctness-critical artifact, so
+# missed dynamic imports / conditional imports / star-imports-from-__init__ re-exports are
+# an accepted gap, same tolerance already given to the JS/TS regex above. Two forms only:
+# "import a.b.c" and "from a.b.c import x, y" (the "from . import x" / "from .foo import y"
+# relative forms are handled by resolve_python_import below via the leading-dot count).
+IMPORT_RE_PY = re.compile(
+    r"""^\s*import\s+([\w.]+)"""
+    r"""|^\s*from\s+(\.*[\w.]*)\s+import\s"""
+    , re.MULTILINE,
 )
 
 
@@ -97,8 +120,45 @@ def resolve_import(from_file: Path, spec: str, repo_root: Path) -> Path | None:
     if not spec.startswith("."):
         return None
     candidate = (from_file.parent / spec).resolve()
-    tried = [candidate] + [candidate.with_suffix(ext) for ext in MATCH_EXTENSIONS]
-    tried += [candidate / f"index{ext}" for ext in MATCH_EXTENSIONS]
+    tried = [candidate] + [candidate.with_suffix(ext) for ext in JS_EXTENSIONS]
+    tried += [candidate / f"index{ext}" for ext in JS_EXTENSIONS]
+    for path in tried:
+        if path.is_file():
+            try:
+                return path.resolve()
+            except OSError:
+                return None
+    return None
+
+
+def resolve_python_import(from_file: Path, spec: str, repo_root: Path) -> Path | None:
+    """Best-effort Python resolution (see IMPORT_RE_PY's own comment for what's explicitly
+    NOT handled). Two shapes:
+
+    - Relative ('from . import x', 'from .foo import y', 'from ..pkg.sub import z'): walk
+      up one directory per leading dot past the current file's own directory, then descend
+      into whatever non-dot module path remains.
+    - Absolute-looking ('import a.b.c', 'from a.b.c import x'): tried relative to repo_root
+      first (the common case for an in-repo package import), matching how a bare JS package
+      name is correctly ignored above -- a spec that doesn't resolve to a real file in this
+      repo is just an external dependency (stdlib or third-party), not a graph edge.
+    """
+    if spec.startswith("."):
+        dots = len(spec) - len(spec.lstrip("."))
+        remainder = spec[dots:]
+        base = from_file.parent
+        # One dot ('.') means "this package" (from_file's own directory); each additional
+        # dot climbs one more level, mirroring Python's own relative-import semantics.
+        for _ in range(dots - 1):
+            base = base.parent
+        parts = remainder.split(".") if remainder else []
+        candidate = base.joinpath(*parts) if parts else base
+    else:
+        parts = spec.split(".")
+        candidate = repo_root.joinpath(*parts)
+
+    tried = [candidate.with_suffix(ext) for ext in PY_EXTENSIONS]
+    tried += [candidate / "__init__.py"]
     for path in tried:
         if path.is_file():
             try:
@@ -122,15 +182,28 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
         except OSError:
             continue
         rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
-        for match in IMPORT_RE.finditer(text):
-            spec = match.group(1) or match.group(2) or match.group(3)
-            if not spec:
-                continue
-            target = resolve_import(f, spec, repo_root)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    graph.add_edge(rel_from, rel_to)
+        is_python = f.suffix in PY_EXTENSIONS
+
+        if is_python:
+            for match in IMPORT_RE_PY.finditer(text):
+                spec = match.group(1) or match.group(2)
+                if not spec:
+                    continue
+                target = resolve_python_import(f, spec, repo_root)
+                if target and target in file_set:
+                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                    if rel_to != rel_from:
+                        graph.add_edge(rel_from, rel_to)
+        else:
+            for match in IMPORT_RE.finditer(text):
+                spec = match.group(1) or match.group(2) or match.group(3)
+                if not spec:
+                    continue
+                target = resolve_import(f, spec, repo_root)
+                if target and target in file_set:
+                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                    if rel_to != rel_from:
+                        graph.add_edge(rel_from, rel_to)
 
     return graph
 
@@ -182,13 +255,18 @@ def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) 
         return None
 
 
-def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, ornith_model: str, progress=print) -> dict:
+def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, ornith_model: str, progress=print, use_model_naming: bool = True) -> dict:
     """Reusable core: everything main() does EXCEPT deciding where to write the result --
     the CLI entry point and the dashboard's on-demand build both call this, writing to
     their own paths (the pipeline's configured graph/coverage paths for the CLI; a
     per-project cache dir, decoupled from any live pipeline, for the dashboard). `progress`
     is a callable taking one string, swappable for a non-print sink (e.g. a status list a
     background thread appends to, for the dashboard's poll endpoint to read).
+
+    use_model_naming=False skips name_community_ornith entirely and goes straight to the
+    heuristic -- deep_dive's own design deliberately never spends a model round-trip on
+    naming communities in an external, unfamiliar repo (see ADR-0019), unlike
+    arch_discovery's default of trying Ornith first.
 
     Returns {"graph": {"nodes": [...], "links": [...]}, "coverage": {"communities": [...]}}.
     """
@@ -220,7 +298,7 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
             nodes.append({"id": f, "community": community_id, "source_file": f})
 
         progress(f"  community {community_id}: {len(member_files)} files -- naming...")
-        name = name_community_ornith(member_files, ollama_url, ornith_model)
+        name = name_community_ornith(member_files, ollama_url, ornith_model) if use_model_naming else None
         if not name:
             name = name_community_heuristic(member_files)
         coverage_communities.append({
@@ -240,6 +318,30 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target-dir", help="Scan this directory instead of AGENT_MANAGER_REPO_ROOT (whole tree, no grep_dirs scoping -- for deep_dive's cloned external repos, which have no known frontend/src,backend/src convention).")
+    parser.add_argument("--output", help="Write the graph JSON here instead of AGENT_MANAGER_GRAPH_PATH. With --target-dir and no --output, defaults to <target-dir>/.deep-dive-graph.json. No coverage-tracker file is written in --target-dir mode -- deep_dive uses its own deep-dive-coverage.json, populated by task-sources.js, not this script.")
+    parser.add_argument("--no-model-naming", action="store_true", help="Skip the Ornith community-naming call, go straight to the directory-prefix heuristic (deep_dive's default -- see ADR-0019).")
+    args = parser.parse_args()
+
+    if args.target_dir:
+        target_dir = Path(args.target_dir)
+        output_path = Path(args.output) if args.output else target_dir / ".deep-dive-graph.json"
+        ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
+
+        result = build_graph_data(target_dir, [], ollama_url, ornith_model, use_model_naming=not args.no_model_naming)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # deep_dive wants nodes+links AND the community name list together (it has no
+        # separate community-coverage.json-style tracker to cross-reference against, unlike
+        # arch_discovery) -- write both under one file instead of graph.json's nodes/links-only
+        # shape.
+        combined = {"nodes": result["graph"]["nodes"], "links": result["graph"]["links"], "communities": result["coverage"]["communities"]}
+        output_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+        print(f"Wrote {output_path} ({len(result['coverage']['communities'])} communities)")
+        return
+
     cfg = get_config()
     result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"])
 

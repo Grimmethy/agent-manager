@@ -32,6 +32,7 @@
   .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
   .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
   .stale-timer { color: var(--bad); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .state-timer { color: var(--muted, #8b949e); font-size: 11px; font-variant-numeric: tabular-nums; }
   .worker-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
@@ -86,15 +87,23 @@ const TABS = [
   { key: 'project', label: 'Project' },
   { key: 'workers', label: 'Workers' },
   { key: 'models', label: 'Models' },
-  { key: 'drafting', label: 'Drafting' },
-  { key: 'pending', label: 'Pending' },
-  { key: 'review', label: 'Review' },
-  { key: 'approved', label: 'Approved' },
-  { key: 'blocked', label: 'Blocked' },
-  { key: 'done', label: 'Done' },
+  { key: 'joblist', label: 'Job List' },
+  { key: 'deepdive', label: 'Scouted Repos' },
+  { group: 'Job Status', children: [
+    { key: 'drafting', label: 'Drafting' },
+    { key: 'pending', label: 'Pending' },
+    { key: 'review', label: 'Review' },
+    { key: 'approved', label: 'Approved' },
+    { key: 'blocked', label: 'Blocked' },
+    { key: 'done', label: 'Done' },
+  ] },
 ];
 let activeTab = 'project';
 let counts = {};
+
+function isGroupExpanded(groupName) {
+  return localStorage.getItem('agentManagerNavGroup_' + groupName) !== 'collapsed';
+}
 
 // Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
 // every other tab, since re-rendering over a user's in-progress folder navigation every
@@ -128,21 +137,40 @@ async function fetchJson(url) {
   return r.json();
 }
 
+function renderTabButton(tab, indent) {
+  const btn = document.createElement('button');
+  btn.className = tab.key === activeTab ? 'active' : '';
+  if (indent) btn.style.paddingLeft = '36px';
+  const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
+  btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
+  btn.onclick = () => {
+    if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
+    activeTab = tab.key;
+    renderNav();
+    if (tab.key === 'project') enterProjectTab(); else renderMain();
+  };
+  return btn;
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
   for (const tab of TABS) {
-    const btn = document.createElement('button');
-    btn.className = tab.key === activeTab ? 'active' : '';
-    const count = (tab.key === 'workers' || tab.key === 'models') ? '' : (counts[tab.key] ?? '');
-    btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
-    btn.onclick = () => {
-      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
-      activeTab = tab.key;
-      renderNav();
-      if (tab.key === 'project') enterProjectTab(); else renderMain();
-    };
-    nav.appendChild(btn);
+    if (tab.group) {
+      const expanded = isGroupExpanded(tab.group);
+      const header = document.createElement('button');
+      header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
+      header.onclick = () => {
+        localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
+        renderNav();
+      };
+      nav.appendChild(header);
+      if (expanded) {
+        for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+      }
+    } else {
+      nav.appendChild(renderTabButton(tab, false));
+    }
   }
 }
 
@@ -163,6 +191,8 @@ function statusBadgeClass(status, stale) {
 async function renderWorkers() {
   const instances = await fetchJson('/api/instances');
   const main = document.getElementById('main');
+  const fetchedAt = Date.now();
+  instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
   instancesForTimers = instances;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
   main.innerHTML = instances.map(inst => `
@@ -172,6 +202,7 @@ async function renderWorkers() {
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
         </div>
       </div>
       <div class="meta">
@@ -199,6 +230,14 @@ function fmtDuration(sec) {
 // staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
 function updateStaleTimers() {
   for (const inst of instancesForTimers) {
+    // State-runtime tracker: ticks for every instance that reports stateSince. Anchored
+    // to the server-computed stateAgeSeconds at fetch time rather than parsing stateSince
+    // locally, so a client/server clock skew can't distort the reading.
+    const st = document.getElementById('state-timer-' + inst.instanceId);
+    if (st && inst.stateAgeSeconds != null) {
+      const elapsed = inst.stateAgeSeconds + (Date.now() - inst._fetchedAtMs) / 1000;
+      st.textContent = 'in this state ' + fmtDuration(elapsed);
+    }
     if (!inst.stale) continue;
     const el = document.getElementById('stale-timer-' + inst.instanceId);
     if (!el) continue;
@@ -323,10 +362,91 @@ async function openDetail(state, id) {
 function closeDetail() { document.getElementById('modal-backdrop').classList.remove('open'); }
 document.getElementById('modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'modal-backdrop') closeDetail(); });
 
+// Static reference data, not fetched from the server -- mirrors the task sources this
+// package's own src/task-sources.js registers (priority order documented there). A
+// consumer project can register additional sources at priority 30/50/60; this encyclopedia
+// only documents what ships with agent-manager itself.
+const JOB_TYPES = [
+  { source: 'manual', domain: 'adhoc', priority: 10, description: 'Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.' },
+  { source: 'trouble_log', domain: '(project default)', priority: 20, description: "Entries in the project's trouble-log doc flagged ready-for-agent (🤖 marker)." },
+  { source: 'inbox', domain: 'secondbrain', priority: 40, description: 'Oldest unprocessed note in a SecondBrain-style Inbox/ folder.' },
+  { source: 'arch_review', domain: '(project default)', priority: 70, description: 'Strong-rated architecture candidates awaiting a fulfillment task.' },
+  { source: 'arch_discovery', domain: '(project default)', priority: 80, description: 'Generates new architecture candidates for one graphify community at a time.' },
+  { source: 'project_search', domain: 'project_search', priority: 85, description: 'Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment.' },
+  { source: 'deadcode_triage', domain: '(project default)', priority: 90, description: 'Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive.' },
+];
+
+function renderJobListTab() {
+  const main = document.getElementById('main');
+  const rows = JOB_TYPES.slice().sort((a, b) => a.priority - b.priority).map(j => `
+    <tr>
+      <td>${j.priority}</td>
+      <td>${j.source}</td>
+      <td>${j.domain}</td>
+      <td>${escapeHtml(j.description)}</td>
+    </tr>
+  `).join('');
+  main.innerHTML = `<table><thead><tr><th>Priority</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Scouted Repos tab (deep_dive, ADR-0019): list of every project_search Strong lead
+// that's been cloned + community-graphed, click through to see what our workers picked
+// out of it -- deep-dive-coverage.json's per-community progress plus the actual
+// analysis/<slug>.md write-up apply-group-a.js's applyDeepDiveFindings appended.
+async function renderDeepDiveTab() {
+  const projects = await fetchJson('/api/deep-dive/projects');
+  const main = document.getElementById('main');
+  if (projects.length === 0) {
+    main.innerHTML = '<div class="empty">No repos scouted yet -- project_search hasn\'t landed a Strong lead for deep_dive to pick up.</div>';
+    return;
+  }
+  const rows = projects.map(p => `
+    <tr class="clickable" data-slug="${escapeAttr(p.slug)}">
+      <td>${escapeHtml(p.slug)}</td>
+      <td>${p.sourceUrl ? `<a href="${escapeAttr(p.sourceUrl)}" target="_blank" onclick="event.stopPropagation()">${escapeHtml(p.sourceUrl)}</a>` : ''}</td>
+      <td>${p.reviewedCount} / ${p.communityCount}</td>
+      <td>${p.totalActionItems}</td>
+      <td>${p.clonedAt ? new Date(p.clonedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  main.innerHTML = `<table><thead><tr><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.querySelectorAll('tr.clickable').forEach(row => {
+    row.onclick = () => openDeepDiveDetail(row.dataset.slug);
+  });
+}
+
+async function openDeepDiveDetail(slug) {
+  const detail = await fetchJson('/api/deep-dive/projects/' + encodeURIComponent(slug));
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(detail.slug)}</h2>`;
+  if (detail.sourceUrl) html += `<div><a href="${escapeAttr(detail.sourceUrl)}" target="_blank">${escapeHtml(detail.sourceUrl)}</a></div>`;
+
+  const communityRows = (detail.communities || []).map(c => `
+    <tr>
+      <td>${escapeHtml(c.name || '')}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : 'not yet reviewed'}</td>
+      <td>${c.actionItemCount ?? '-'}</td>
+    </tr>
+  `).join('');
+  html += `<div class="field-label">Communities (${(detail.communities || []).length})</div>`;
+  html += `<table><thead><tr><th>Name</th><th>Reviewed</th><th>Action Items</th></tr></thead><tbody>${communityRows}</tbody></table>`;
+
+  html += `<div class="field-label">Ideas picked from this repo</div>`;
+  html += detail.analysisMarkdown
+    ? `<pre>${escapeHtml(detail.analysisMarkdown)}</pre>`
+    : `<div class="empty">Nothing written up yet -- no community from this repo has cleared review.</div>`;
+
+  content.innerHTML = html;
+  backdrop.classList.add('open');
+}
+
 async function renderMain() {
   try {
     if (activeTab === 'workers') await renderWorkers();
     else if (activeTab === 'models') await renderModelsTab();
+    else if (activeTab === 'joblist') renderJobListTab();
+    else if (activeTab === 'deepdive') await renderDeepDiveTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
