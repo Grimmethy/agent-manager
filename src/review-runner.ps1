@@ -398,6 +398,21 @@ function Invoke-ReviewPass {
             # legitimate negative result and burning retries on communities that are simply
             # fine.
             $verdictLines.Add('This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).')
+        } elseif ($task.source -eq 'project_search') {
+            # Same false-rejection pattern as arch_discovery above, reproduced live: the
+            # implement prompt (projectSearchImplementPrompt in prompts.js) explicitly tells
+            # the drafter it's correct to report zero findings when none of the real fetched
+            # GitHub/HuggingFace results are genuinely useful, but the reviewer had no matching
+            # allowance and kept REJECTing an honest "No findings" as "fabricated"/"unhelpful"
+            # -- burning retries on drafts that did nothing wrong.
+            $verdictLines.Add('This is a project-search task: the drafter was told it is correct to report zero findings when none of the real, harness-fetched GitHub/HuggingFace search results were genuinely useful -- do not reject a draft merely for reporting no findings. Only reject an empty result if the draft invents a project/URL not present in the actual search results given to it, or if the search results plainly did contain something usable that the draft ignored.')
+        } elseif ($task.source -eq 'deep_dive') {
+            # Same false-rejection shape as the two carve-outs above, but inverted: the risk
+            # here is not an honest "nothing found" getting rejected -- it's an item asserting
+            # a Use/Adapt verdict grounded in something not actually present in the pre-fetched
+            # community file content (the exact failure mode project_search demonstrated live
+            # this session -- Ornith inventing detail not present in real fetched data).
+            $verdictLines.Add('This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.')
         }
         $verdictLines.Add('Respond with EXACTLY one of these two forms, nothing else:')
         $verdictLines.Add('APPROVE')
@@ -485,12 +500,24 @@ function Invoke-ReviewPass {
 # --- Main loop: drain fast while there's work, back off when idle or rate-limited ------
 while ($true) {
     Write-Heartbeat -Status 'checking'
-    $result = Invoke-ReviewPass
+    # Invoke-ReviewPass must never be allowed to throw out of this loop -- see the matching
+    # comment in apply-runner.ps1's main loop for why: an uncaught exception here used to
+    # kill the whole process while -NoExit kept the shell window open looking alive (PID
+    # present, responding) but never heartbeating again, and queue-watchdog.ps1
+    # deliberately does not restart review-runner/apply-runner on that zombie pattern.
+    $result = 'error'
+    try {
+        $result = Invoke-ReviewPass
+    } catch {
+        Write-Host ('Pass crashed (not crashing the loop): {0}' -f $_.Exception.Message) -ForegroundColor Red
+        Add-ReviewLogEntry -TaskId '-' -Title '-' -Result 'PASS-CRASHED' -Detail $_.Exception.Message
+    }
     Write-Heartbeat -Status 'idle'
     switch ($result) {
         'budget'   { Write-Host 'Budget gate: sleeping 10 min.' -ForegroundColor DarkGray; Start-Sleep -Seconds 600 }
         'idle'     { Write-Host 'Queue empty: sleeping 2 min.' -ForegroundColor DarkGray; Start-Sleep -Seconds 120 }
         'approved' { Write-Host 'Pass finished (approved, awaiting apply-runner): sleeping 15s to drain backlog.' -ForegroundColor DarkGray; Start-Sleep -Seconds 15 }
+        'error'    { Write-Host 'Pass crashed: sleeping 30s before retry.' -ForegroundColor DarkGray; Start-Sleep -Seconds 30 }
         default    { Write-Host 'Pass finished: sleeping 15s to drain backlog.' -ForegroundColor DarkGray; Start-Sleep -Seconds 15 }
     }
 }

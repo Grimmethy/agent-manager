@@ -147,7 +147,11 @@ function Invoke-DeadProcessCheck {
             }
 
             $scriptPath = Join-Path $PackageSrcDir $restart.Script
-            $argList = @('-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+            # -NoExit: same rationale as launch.bat's own launches -- if the replacement
+            # throws early (or crashes again shortly after), the window stays open showing
+            # the actual PowerShell error instead of flash-closing, so a second crash is
+            # just as diagnosable as the first manual launch was.
+            $argList = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
             if ($restart.Args -contains '-InstanceId') { $argList += @('-InstanceId', $hb.instanceId) }
 
             Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal

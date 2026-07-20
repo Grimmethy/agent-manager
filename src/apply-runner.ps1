@@ -261,11 +261,26 @@ function Invoke-ApplyPass {
 
 while ($true) {
     Write-Heartbeat -Status 'checking'
-    $result = Invoke-ApplyPass
+    # Invoke-ApplyPass must never be allowed to throw out of this loop -- an unhandled
+    # exception here (e.g. a bad budget-monitor.js response, an unknown task domain) used
+    # to kill the whole process while -NoExit kept the empty shell window open, looking
+    # alive (PID present, responding) but never heartbeating again. queue-watchdog.ps1
+    # deliberately does not restart apply-runner/review-runner on a stale-heartbeat-but-
+    # alive-PID zombie (see its own comment), so the crash had no automatic recovery.
+    # Catching it here, at the source, means it can never become that zombie in the first
+    # place -- log it and keep looping instead.
+    $result = 'error'
+    try {
+        $result = Invoke-ApplyPass
+    } catch {
+        Write-Host ('Pass crashed (not crashing the loop): {0}' -f $_.Exception.Message) -ForegroundColor Red
+        Add-ApplyLogEntry -TaskId '-' -Title '-' -Result 'PASS-CRASHED' -Detail $_.Exception.Message
+    }
     Write-Heartbeat -Status 'idle'
     switch ($result) {
         'budget' { Write-Host 'Budget gate: sleeping 10 min.' -ForegroundColor DarkGray; Start-Sleep -Seconds 600 }
         'idle'   { Write-Host 'Queue empty: sleeping 2 min.' -ForegroundColor DarkGray; Start-Sleep -Seconds 120 }
+        'error'  { Write-Host 'Pass crashed: sleeping 30s before retry.' -ForegroundColor DarkGray; Start-Sleep -Seconds 30 }
         default  { Write-Host 'Pass finished: sleeping 15s to drain backlog.' -ForegroundColor DarkGray; Start-Sleep -Seconds 15 }
     }
 }
