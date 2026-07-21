@@ -518,6 +518,39 @@ while ($true) {
     }
     Invoke-TaskDb 'draft-done' $draftingPath (@{ critiqueOutcome = $task.critiqueOutcome; revisionApplied = $(if ($task.PSObject.Properties['revisionApplied']) { $task.revisionApplied } else { $null }) } | ConvertTo-Json -Compress)
 
+    # arch_discovery-specific structural sanity check, run AFTER critique/revision (so it
+    # sees the final, possibly-revised implementResponse) and BEFORE review. Reproduced
+    # live 2026-07-21: a Revision pass, asked to fix a critiqued draft, produced fluent
+    # English refusing to verify the draft ("I cannot verify this draft...") instead of
+    # either fixing it or outputting nothing -- coherent prose, not gibberish/empty/
+    # repeated-character, so detectDegenerate() (ornith-client.js) never catches it. That
+    # exact response then won a 2/3 APPROVE review vote and would have landed in the real
+    # architecture-candidates doc. Reuses parseArchDiscoveryCandidates (the SAME parser
+    # apply-group-a.js's real apply step uses) via arch-discovery-structcheck.js, so
+    # "does this look like a real candidate" is answered identically wherever it's asked --
+    # a second, drifted copy of this logic would just recreate the exact bug class this
+    # whole session has been about. See arch-discovery-structcheck.js's own header comment
+    # for the full incident.
+    if ($task.source -eq 'arch_discovery' -and -not [string]::IsNullOrWhiteSpace($task.implementResponse)) {
+        $structCheckTextPath = Join-Path $TempDir ('arch-discovery-structcheck-{0}.txt' -f $task.id)
+        [System.IO.File]::WriteAllText($structCheckTextPath, $task.implementResponse)
+        $structCheckRaw = & node (Join-Path $PackageSrcDir 'arch-discovery-structcheck.js') $structCheckTextPath
+        Remove-Item $structCheckTextPath -ErrorAction SilentlyContinue
+        $structCheck = ($structCheckRaw -join "`n") | ConvertFrom-Json
+
+        if (-not $structCheck.ok) {
+            $reason = 'Structural check failed (arch_discovery): {0}' -f $structCheck.reason
+            Set-TaskBlockedStage -Task $task -Reason $reason
+            $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+            Write-TaskJson $blockedPath $task
+            Remove-Item $draftingPath -Force
+            Write-Host ('Blocked (structural check failed): {0}' -f $task.id) -ForegroundColor Yellow
+            Invoke-TaskDb 'blocked' $blockedPath (@{ reason = $reason } | ConvertTo-Json -Compress)
+            Write-Heartbeat -Status 'idle'
+            continue
+        }
+    }
+
     $reviewPath = Join-Path (Join-Path $QueueDir 'review') $next.Name
     Write-TaskJson $reviewPath $task
     Remove-Item $draftingPath -Force
