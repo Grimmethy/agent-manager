@@ -406,7 +406,20 @@ while ($true) {
     # GitHub/Hugging Face) -- same two-call shape as project_search immediately above,
     # searching a different target. See ADR-0020 / docs/arch-import-pipeline.md.
     if ($task.source -eq 'arch_import') {
-        $importQueries = [regex]::Matches($planResult.response, '(?m)^QUERY:\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Where-Object { $_ }
+        # @() forces array-ness even when the plan proposes exactly ONE query (a valid,
+        # explicitly-allowed shape per archImportPlanPrompt's "1 to 3" instruction) -- without
+        # it, PowerShell's pipeline auto-collapses a single match to a plain scalar String.
+        # ConvertTo-Json then serializes `queries` as a JSON STRING, not an array; arch-import-
+        # fetch.js's `for (const query of queries)` iterates a STRING CHARACTER BY CHARACTER,
+        # feeding grepCodebase() single letters like "p"/"i" as "queries". A single-letter
+        # literal-substring match hits nearly every line, exploding into a huge, meaningless
+        # hit set (reproduced live 2026-07-21: arch-import-autogen-microsoft-1's plan proposed
+        # ONE query, "pipeline configuration module", and got 232 hits back tagged
+        # query:"p"/"i"/etc against one arbitrary file -- garbage noise, not a real match).
+        # Same PowerShell array-collapse gotcha already fixed on the OUTPUT side of
+        # project_search's ConvertFrom-Json a few lines above ($searchResults = @($parsed));
+        # this is the identical bug on the INPUT side of the analogous arch_import branch.
+        $importQueries = @([regex]::Matches($planResult.response, '(?m)^QUERY:\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Where-Object { $_ })
         $harnessHits = @()
         $harnessFiles = @()
         if ($importQueries.Count -gt 0) {
