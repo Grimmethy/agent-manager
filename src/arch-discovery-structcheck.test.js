@@ -19,6 +19,15 @@ test('checkStructure passes an empty response (valid -- means no friction found)
   assert.equal(checkStructure('   \n  ').ok, true);
 });
 
+test('checkStructure passes a bare quote-literal response, not a structural failure', () => {
+  // Reproduced live 2026-07-21: 4 of 6 real arch_import "structural check failed" blocks
+  // were the model correctly following "output the empty string" by writing the literal
+  // two characters `""` -- this must be treated the same as a truly empty response, not
+  // flagged as "zero AC-NNN headings found."
+  assert.equal(checkStructure('""').ok, true);
+  assert.equal(checkStructure("''").ok, true);
+});
+
 test('checkStructure passes a well-formed single candidate', () => {
   const result = checkStructure(candidateBlock());
   assert.equal(result.ok, true);

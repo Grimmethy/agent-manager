@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -28,6 +28,27 @@ function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong'
 test('parseArchDiscoveryCandidates returns [] for an empty implement response', () => {
   assert.deepEqual(parseArchDiscoveryCandidates(''), []);
   assert.deepEqual(parseArchDiscoveryCandidates('   \n  '), []);
+});
+
+test('isEffectivelyEmptyResponse treats a bare quote-literal as empty (real Ornith output, not hypothetical)', () => {
+  // Reproduced live 2026-07-21: 4 of 6 real arch_import blocks were the model correctly
+  // following "output the empty string" by writing the literal two characters `""`
+  // instead of a truly empty response -- .trim() alone doesn't catch this.
+  assert.equal(isEffectivelyEmptyResponse('""'), true);
+  assert.equal(isEffectivelyEmptyResponse("''"), true);
+  assert.equal(isEffectivelyEmptyResponse('  ""  '), true);
+  assert.equal(isEffectivelyEmptyResponse(''), true);
+  assert.equal(isEffectivelyEmptyResponse('   '), true);
+});
+
+test('isEffectivelyEmptyResponse does not false-positive on real content that happens to contain quotes', () => {
+  assert.equal(isEffectivelyEmptyResponse('### AC-1 · "Quoted Title"'), false);
+  assert.equal(isEffectivelyEmptyResponse('"partial'), false);
+});
+
+test('parseArchDiscoveryCandidates returns [] for a bare quote-literal response, not a parse failure', () => {
+  assert.deepEqual(parseArchDiscoveryCandidates('""'), []);
+  assert.deepEqual(parseArchDiscoveryCandidates("''"), []);
 });
 
 test('parseArchDiscoveryCandidates parses a single candidate block', () => {

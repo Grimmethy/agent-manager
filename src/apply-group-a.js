@@ -222,9 +222,23 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
 // nextArchReviewTask()'s own strict reader (task-sources.js) untouched and correct --
 // normalize inconsistency at this one boundary instead of loosening every downstream
 // consumer to match Ornith's inconsistency.
+// A response that's just a JSON-style empty-string LITERAL (`""` or `''`, two characters)
+// is Ornith representing "intentionally nothing" the same way `""` reads in code -- not
+// gibberish, not a malformed candidate. Confirmed live 2026-07-21: 4 of 6 arch_import
+// "structural check failed" blocks were exactly this, the model correctly following the
+// implement prompt's "output the empty string and nothing else" instruction, just typing
+// out the literal representation instead of a truly empty string. `.trim()` alone doesn't
+// catch this (quote characters aren't whitespace) -- exported so
+// arch-discovery-structcheck.js's own emptiness check uses the identical rule, not a
+// second copy that could drift.
+function isEffectivelyEmptyResponse(text) {
+  const t = (text || '').trim();
+  return t === '' || t === '""' || t === "''";
+}
+
 function parseArchDiscoveryCandidates(implementResponse) {
   const text = (implementResponse || '').trim();
-  if (!text) return [];
+  if (isEffectivelyEmptyResponse(text)) return [];
   const blocks = text.split(/(?=^### AC-\d+)/m).map((b) => b.trim()).filter(Boolean);
   return blocks
     .map((block) => {
@@ -344,4 +358,5 @@ module.exports = {
   applyArchDiscoveryCandidates,
   parseArchDiscoveryCandidates,
   applyArchImportCandidate,
+  isEffectivelyEmptyResponse,
 };

@@ -23,13 +23,18 @@
 // apply step would just recreate the exact bug class this whole session has been about.
 
 const fs = require('fs');
-const { parseArchDiscoveryCandidates } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, isEffectivelyEmptyResponse } = require('./apply-group-a.js');
 
 const REQUIRED_SECTIONS = ['Problem:', 'Solution:', 'Benefits:'];
 
 function checkStructure(implementResponse) {
   const text = (implementResponse || '').trim();
-  if (!text) return { ok: true, reason: 'empty response -- valid outcome, means no real friction found' };
+  // isEffectivelyEmptyResponse also catches a bare `""`/`''` -- confirmed live
+  // 2026-07-21: 4 of 6 real arch_import "structural check failed" blocks were exactly
+  // this, Ornith correctly following "output the empty string" by typing its literal
+  // representation instead of a truly empty response. Without this, a CORRECTLY-followed
+  // instruction was being reported as a structural failure.
+  if (isEffectivelyEmptyResponse(text)) return { ok: true, reason: 'empty response -- valid outcome, means no real friction found' };
 
   const candidates = parseArchDiscoveryCandidates(text);
   if (candidates.length === 0) {
