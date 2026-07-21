@@ -10,6 +10,7 @@ $SecondBrainDir = if ($env:SECOND_BRAIN_DIR) { $env:SECOND_BRAIN_DIR } else { $n
 $ReviewLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log.md' } else { Join-Path $env:TEMP 'agent-manager-live-log.md' }
 $CommunityCoveragePath = if ($env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH) { $env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH } else { Join-Path $PipelineDir 'community-coverage.json' }
 $ImportCoveragePath = if ($env:AGENT_MANAGER_IMPORT_COVERAGE_PATH) { $env:AGENT_MANAGER_IMPORT_COVERAGE_PATH } else { Join-Path $PipelineDir 'import-coverage.json' }
+$DeepDiveCoveragePath = if ($env:AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH) { $env:AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH } else { Join-Path $PipelineDir 'deep-dive-coverage.json' }
 $TempDir = Join-Path $env:TEMP 'queue-watchdog'
 New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
@@ -303,6 +304,37 @@ function Invoke-RejectRetryCheck {
                             }
                         } catch {
                             Write-Host ('Watchdog: failed to stamp import-coverage.json (non-fatal): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+                        }
+                    }
+                }
+                # Same fix, same reasoning, deep_dive's own coverage tracker -- this branch
+                # was missing entirely (only arch_discovery/arch_import were ever wired up
+                # above), so a community that exhausted its review-stage retries stayed
+                # eligible for nextDeepDiveTask() to re-select forever once its blocked task
+                # was archived (deep-dive-coverage.json's per-project communities[].lastReviewedAt
+                # never got touched by anything on the rejection path -- nextDeepDiveTask()
+                # sorts null-lastReviewedAt first, so it would just redraft the same doomed
+                # community every tick). Found overnight monitoring 2026-07-21:
+                # deep-dive-autogen-microsoft-7 hit ornithRejectCount=2 (exhausted) with its
+                # community-7 entry in deep-dive-coverage.json still lastReviewedAt:null.
+                # Schema differs from community-coverage.json's flat array -- deep_dive
+                # nests communities under coverage.projects.<projectSlug>.communities[].
+                if ($task.source -eq 'deep_dive' -and $task.promptContext -and $task.promptContext.projectSlug -and $null -ne $task.promptContext.communityId) {
+                    if (Test-Path $DeepDiveCoveragePath) {
+                        try {
+                            $ddCoverage = Get-Content $DeepDiveCoveragePath -Raw | ConvertFrom-Json
+                            $ddProj = $ddCoverage.projects.($task.promptContext.projectSlug)
+                            if ($ddProj -and $ddProj.communities) {
+                                $ddEntry = $ddProj.communities | Where-Object { $_.id -eq [int]$task.promptContext.communityId } | Select-Object -First 1
+                                if ($ddEntry -and -not $ddEntry.lastReviewedAt) {
+                                    $ddEntry.lastReviewedAt = (Get-Date).ToString('o')
+                                    $ddEntry.actionItemCount = -1  # sentinel: exhausted retries, never a real action-item count
+                                    [System.IO.File]::WriteAllText($DeepDiveCoveragePath, ($ddCoverage | ConvertTo-Json -Depth 20))
+                                    Write-Host ('Watchdog: deep_dive community {0}/{1} exhausted retries -- stamped lastReviewedAt so rotation moves on.' -f $task.promptContext.projectSlug, $task.promptContext.communityId) -ForegroundColor DarkCyan
+                                }
+                            }
+                        } catch {
+                            Write-Host ('Watchdog: failed to stamp deep-dive-coverage.json (non-fatal): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
                         }
                     }
                 }
