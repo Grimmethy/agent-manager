@@ -8,7 +8,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { checkStructure } = require('./arch-discovery-structcheck.js');
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+const { checkStructure, recordArchDiscoveryStructFailure, recordArchImportStructFailure } = require('./arch-discovery-structcheck.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', files = 'a.js' } = {}) {
   return [`### ${id} · ${title}`, 'Strength: Strong', `Files: ${files}`, '', 'Problem:\nx\n\nSolution:\ny\n\nBenefits:\nz'].join('\n');
@@ -101,4 +104,89 @@ test('checkStructure catches the real community-2 response (the actual incident,
   const result = checkStructure(REAL_COMMUNITY_2_RESPONSE);
   assert.equal(result.ok, false);
   assert.match(result.reason, /missing a required/);
+});
+
+// --- Exhaustion tracking: a structural-check failure never accumulates toward
+// queue-watchdog.ps1's own review-rejection exhaustion stamp (Test-ReviewRejection only
+// recognizes blockedStage:'review'), so without this a community/item that always fails
+// structurally gets re-selected by the rotation FOREVER. Confirmed live 2026-07-21:
+// arch-discovery-community-0 hit the exact same structural failure 3 times in under an
+// hour with lastReviewedAt never advancing. ---
+
+function makeCommunityCoverage(dir, communities) {
+  const p = path.join(dir, 'community-coverage.json');
+  fs.writeFileSync(p, JSON.stringify({ communities }));
+  return p;
+}
+
+function makeImportCoverage(dir, items) {
+  const p = path.join(dir, 'import-coverage.json');
+  fs.writeFileSync(p, JSON.stringify({ items }));
+  return p;
+}
+
+test('recordArchDiscoveryStructFailure increments the count but does not stamp lastReviewedAt below the threshold', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structcheck-test-'));
+  const p = makeCommunityCoverage(dir, [{ id: 0, name: 'src', lastReviewedAt: '2026-01-01T00:00:00.000Z', lastCandidateCount: 1 }]);
+
+  const r1 = recordArchDiscoveryStructFailure(p, 0);
+  assert.equal(r1.failCount, 1);
+  assert.equal(r1.exhausted, false);
+
+  const r2 = recordArchDiscoveryStructFailure(p, 0);
+  assert.equal(r2.failCount, 2);
+  assert.equal(r2.exhausted, false);
+
+  const coverage = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(coverage.communities[0].lastReviewedAt, '2026-01-01T00:00:00.000Z', 'must not touch a real prior lastReviewedAt before exhaustion');
+});
+
+test('recordArchDiscoveryStructFailure stamps lastReviewedAt once the threshold is reached, breaking the infinite re-pick loop', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structcheck-test-'));
+  const p = makeCommunityCoverage(dir, [{ id: 0, name: 'src', lastReviewedAt: null, lastCandidateCount: null }]);
+
+  recordArchDiscoveryStructFailure(p, 0);
+  recordArchDiscoveryStructFailure(p, 0);
+  const r3 = recordArchDiscoveryStructFailure(p, 0);
+
+  assert.equal(r3.failCount, 3);
+  assert.equal(r3.exhausted, true);
+
+  const coverage = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.ok(coverage.communities[0].lastReviewedAt, 'lastReviewedAt should now be stamped so nextArchDiscoveryTask stops re-picking this community');
+  assert.equal(coverage.communities[0].lastCandidateCount, -1);
+});
+
+test('recordArchDiscoveryStructFailure does not overwrite a real lastReviewedAt from an earlier genuine success', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structcheck-test-'));
+  const realTimestamp = '2026-07-15T12:00:00.000Z';
+  const p = makeCommunityCoverage(dir, [{ id: 0, name: 'src', lastReviewedAt: realTimestamp, lastCandidateCount: 2 }]);
+
+  recordArchDiscoveryStructFailure(p, 0);
+  recordArchDiscoveryStructFailure(p, 0);
+  recordArchDiscoveryStructFailure(p, 0);
+
+  const coverage = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(coverage.communities[0].lastReviewedAt, realTimestamp, 'a real success timestamp must never be clobbered by exhaustion bookkeeping');
+});
+
+test('recordArchImportStructFailure stamps promotedAt/candidateId:null once exhausted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structcheck-test-'));
+  const p = makeImportCoverage(dir, { 'crewai-14': { promotedAt: null, candidateId: null, projectSlug: 'crewai' } });
+
+  recordArchImportStructFailure(p, 'crewai-14');
+  recordArchImportStructFailure(p, 'crewai-14');
+  const r3 = recordArchImportStructFailure(p, 'crewai-14');
+
+  assert.equal(r3.exhausted, true);
+  const coverage = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.ok(coverage.items['crewai-14'].promotedAt);
+  assert.equal(coverage.items['crewai-14'].candidateId, null);
+});
+
+test('recordArchDiscoveryStructFailure is a no-op (not a crash) when the community id is unknown', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structcheck-test-'));
+  const p = makeCommunityCoverage(dir, [{ id: 0, name: 'src', lastReviewedAt: null }]);
+  const result = recordArchDiscoveryStructFailure(p, 99);
+  assert.deepEqual(result, { exhausted: false, failCount: 0 });
 });

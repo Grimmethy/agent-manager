@@ -52,10 +52,93 @@ function checkStructure(implementResponse) {
   return { ok: true };
 }
 
-if (require.main === module) {
-  const textPath = process.argv[2];
-  const implementResponse = fs.readFileSync(textPath, 'utf8');
-  process.stdout.write(JSON.stringify(checkStructure(implementResponse)));
+// Matches queue-watchdog.ps1's own $MaxOrnithRejectRetries=2 (a total of 3 failures
+// before giving up) -- same tolerance, different failure axis.
+const MAX_STRUCT_FAILURES = 3;
+
+// A structural-check failure never accumulates toward queue-watchdog.ps1's own
+// exhausted-retry stamp: Test-ReviewRejection only recognizes blockedStage:'review', and a
+// structural block leaves blockedStage unset entirely (it fires INSIDE ornith-worker.ps1,
+// before the task ever reaches review). Without this, a community/item that always fails
+// structurally -- never once reaching review -- gets re-selected by nextArchDiscoveryTask()/
+// nextArchImportTask() FOREVER, since their own "oldest lastReviewedAt"/"not yet promoted"
+// picks never advance. Confirmed live 2026-07-21: arch-discovery-community-0 hit the exact
+// same structural failure 3 times in under an hour; its lastReviewedAt hadn't moved since
+// the previous day.
+//
+// Mirrors the exhaustion-stamp CONVENTION already established twice in this codebase
+// (queue-watchdog.ps1's own arch_discovery exhausted-retry stamp; applyArchImportCandidate's
+// candidateId:null-on-skip) rather than inventing a new one: a real, negative "tried,
+// never worked, move on" outcome, distinct from both "never tried" and a real success.
+function recordArchDiscoveryStructFailure(communityCoveragePath, communityId) {
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(communityCoveragePath, 'utf8'));
+  } catch {
+    return { exhausted: false, failCount: 0 };
+  }
+  if (!coverage || !Array.isArray(coverage.communities)) return { exhausted: false, failCount: 0 };
+
+  const entry = coverage.communities.find((c) => c.id === communityId);
+  if (!entry) return { exhausted: false, failCount: 0 };
+
+  entry.structCheckFailCount = (entry.structCheckFailCount || 0) + 1;
+  const exhausted = entry.structCheckFailCount >= MAX_STRUCT_FAILURES;
+  if (exhausted && !entry.lastReviewedAt) {
+    entry.lastReviewedAt = new Date().toISOString();
+    entry.lastCandidateCount = -1; // same sentinel queue-watchdog.ps1 already uses for "exhausted, no real candidate count"
+  }
+
+  fs.writeFileSync(communityCoveragePath, JSON.stringify(coverage, null, 2));
+  return { exhausted, failCount: entry.structCheckFailCount };
 }
 
-module.exports = { checkStructure };
+// Same shape of fix as recordArchDiscoveryStructFailure, for arch_import's per-item
+// import-coverage.json instead of arch_discovery's per-community community-coverage.json.
+function recordArchImportStructFailure(importCoveragePath, itemId) {
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(importCoveragePath, 'utf8'));
+  } catch {
+    return { exhausted: false, failCount: 0 };
+  }
+  if (!coverage || !coverage.items || !coverage.items[itemId]) return { exhausted: false, failCount: 0 };
+
+  const entry = coverage.items[itemId];
+  entry.structCheckFailCount = (entry.structCheckFailCount || 0) + 1;
+  const exhausted = entry.structCheckFailCount >= MAX_STRUCT_FAILURES;
+  if (exhausted && !entry.promotedAt) {
+    entry.promotedAt = new Date().toISOString();
+    entry.candidateId = null; // same sentinel applyArchImportCandidate already uses for "considered, no candidate came of it"
+  }
+
+  fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+  return { exhausted, failCount: entry.structCheckFailCount };
+}
+
+// CLI: node arch-discovery-structcheck.js <textPath> [source] [communityId|itemId]
+// The two extra args are optional -- when omitted (or when checkStructure passes), only
+// the structural check itself runs, same as before. When given AND the check fails, the
+// matching exhaustion tracker also runs, and 'exhausted'/'failCount' are included in the
+// JSON response. Resolves communityCoveragePath/importCoveragePath itself via
+// getConfig() (same pattern arch-import-fetch.js already uses) rather than requiring the
+// caller (ornith-worker.ps1) to know about this package's own config paths -- it doesn't
+// have them in scope today, and shouldn't need to just to pass one through.
+if (require.main === module) {
+  const [, , textPath, source, idArg] = process.argv;
+  const implementResponse = fs.readFileSync(textPath, 'utf8');
+  const result = checkStructure(implementResponse);
+
+  if (!result.ok && source && idArg) {
+    const { getConfig } = require('./config.js');
+    if (source === 'arch_discovery') {
+      Object.assign(result, recordArchDiscoveryStructFailure(getConfig().communityCoveragePath, Number(idArg)));
+    } else if (source === 'arch_import') {
+      Object.assign(result, recordArchImportStructFailure(getConfig().importCoveragePath, idArg));
+    }
+  }
+
+  process.stdout.write(JSON.stringify(result));
+}
+
+module.exports = { checkStructure, recordArchDiscoveryStructFailure, recordArchImportStructFailure };

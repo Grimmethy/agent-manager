@@ -593,12 +593,26 @@ while ($true) {
     if (($task.source -eq 'arch_discovery' -or $task.source -eq 'arch_import') -and -not [string]::IsNullOrWhiteSpace($task.implementResponse)) {
         $structCheckTextPath = Join-Path $TempDir ('arch-discovery-structcheck-{0}.txt' -f $task.id)
         [System.IO.File]::WriteAllText($structCheckTextPath, $task.implementResponse)
-        $structCheckRaw = & node (Join-Path $PackageSrcDir 'arch-discovery-structcheck.js') $structCheckTextPath
+        # The extra args (source, community/item id) let a FAILED check also record
+        # exhaustion bookkeeping against community-coverage.json/import-coverage.json --
+        # see arch-discovery-structcheck.js's recordArchDiscoveryStructFailure /
+        # recordArchImportStructFailure for why this exists: a structural block never
+        # accumulates toward queue-watchdog.ps1's own review-rejection exhaustion stamp
+        # (blockedStage is left unset here, and Test-ReviewRejection only recognizes
+        # blockedStage:'review'), so without this a community/item that always fails
+        # structurally gets re-selected by the rotation FOREVER. Reproduced live 2026-07-21:
+        # arch-discovery-community-0 hit the exact same structural failure 3 times in under
+        # an hour, its lastReviewedAt frozen since the previous day.
+        $structCheckId = if ($task.source -eq 'arch_discovery') { $task.promptContext.communityId } else { $task.promptContext.itemId }
+        $structCheckArgs = @($structCheckTextPath)
+        if ($null -ne $structCheckId) { $structCheckArgs += @($task.source, [string]$structCheckId) }
+        $structCheckRaw = & node (Join-Path $PackageSrcDir 'arch-discovery-structcheck.js') @structCheckArgs
         Remove-Item $structCheckTextPath -ErrorAction SilentlyContinue
         $structCheck = ($structCheckRaw -join "`n") | ConvertFrom-Json
 
         if (-not $structCheck.ok) {
-            $reason = 'Structural check failed ({0}): {1}' -f $task.source, $structCheck.reason
+            $exhaustedNote = if ($structCheck.exhausted) { ' -- community/item now marked exhausted, rotation will move on' } else { '' }
+            $reason = 'Structural check failed ({0}): {1}{2}' -f $task.source, $structCheck.reason, $exhaustedNote
             Set-TaskBlockedStage -Task $task -Reason $reason
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
