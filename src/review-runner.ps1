@@ -441,6 +441,19 @@ function Invoke-ReviewPass {
         $verdictLines.Add('The fact-check above is deterministic and authoritative for file existence -- it already checked the real filesystem. A claimed path listed with "exists": true is CONFIRMED real; do not express doubt about it or re-litigate whether it exists. Only "exists": false (a missing-file flag) is evidence toward fabrication.')
         $verdictLines.Add('')
         $verdictLines.Add('Judge whether this draft is correct, narrowly scoped, and safe to apply as-is. Reject if it is fabricated, over-broad, or the fact-check flags a real problem.')
+        # Reproduced live 2026-07-21: an arch_discovery draft consisting mainly of the
+        # drafter second-guessing its OWN claim ("I cannot verify this draft against the
+        # provided inputs...", "I cannot confirm whether X actually solves a real
+        # problem...") won a 2/3 APPROVE vote. Neither generic REJECT criterion above
+        # (fabricated / over-broad / fact-check flag) cleanly covers this: the draft
+        # doesn't invent false facts, it just never actually attempts the task -- so
+        # nothing in the existing guidance told a voter to reject it, and "APPROVE" needs
+        # zero justification per the response-format instruction below while "REJECT"
+        # requires a reason, which structurally biases a shallow pass toward approving.
+        # Applies to every source sharing this verdict prompt, not just arch_discovery --
+        # the same "coherent hedging instead of a real answer" shape can happen anywhere
+        # Ornith is asked to produce free-text content.
+        $verdictLines.Add('Also REJECT if the draft is not actually an attempt at the requested output -- e.g. it consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") instead of the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine."')
         if ($task.source -eq 'arch_discovery') {
             # A draft that correctly found ZERO real friction was once rejected as
             # "vacuous... not useful" -- the generic judgment line above reads naturally as
