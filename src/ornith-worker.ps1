@@ -324,6 +324,28 @@ while ($true) {
     }
     Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Plan' -Thinking $planThinking -Response $planResult.response -Degenerate $planDegenerate
 
+    # 'empty' specifically (not repeated-character/repetition-loop/non-ascii-gibberish) is
+    # this model's documented thinking-budget-exhaustion failure mode: the hidden `thinking`
+    # trace burns the entire num_predict allotment and leaves zero tokens for the actual
+    # answer -- a real, silent empty response, not a transient glitch that a same-config
+    # retry would fix (ornith-client.js's call() already retried 3x with thinking on before
+    # returning here). See docs/ornith-delegation.md's own hard-won conclusion: "thinking
+    # off -- don't just raise num_predict and hope it finishes." Retrying once WITHOUT
+    # thinking frees the whole budget for the answer instead, before giving up and blocking.
+    if ($planDegenerate -eq 'empty') {
+        Write-Host ('Plan empty with thinking on, retrying without thinking: {0}' -f $task.id) -ForegroundColor DarkYellow
+        $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $false -Temperature 0.4 -NumPredict 1400
+        $planThinking = if ($null -ne $planResult.thinking) { $planResult.thinking } else { '' }
+        $planDegenerate = if ($null -ne $planResult.degenerate) {
+            $planResult.degenerate
+        } elseif ([string]::IsNullOrWhiteSpace($planResult.response)) {
+            'empty'
+        } else {
+            $null
+        }
+        Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Plan (no-think retry)' -Thinking $planThinking -Response $planResult.response -Degenerate $planDegenerate
+    }
+
     if ($planDegenerate) {
         $reason = 'Plan pass degenerate: {0}' -f $planDegenerate
         Set-TaskBlockedStage -Task $task -Reason $reason
