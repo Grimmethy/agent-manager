@@ -74,7 +74,14 @@ if (require.main === module) {
     process.exit(1);
   }
   const { queries } = JSON.parse(fs.readFileSync(queriesPath, 'utf8'));
-  console.log(JSON.stringify(fetchForQueries(queries || [])));
+  // A caller that hands a bare string (e.g. a PowerShell pipeline that silently collapsed a
+  // single-match array to a scalar before serializing) must never reach fetchForQueries's
+  // `for (const query of queries)` as-is -- iterating a STRING iterates its CHARACTERS, each
+  // treated as its own "query" (see ornith-worker.ps1's matching fix, 2026-07-21, for the
+  // real incident this reproduces). Normalize defensively at this boundary instead of
+  // trusting every future caller to get the array-wrapping right upstream.
+  const normalizedQueries = Array.isArray(queries) ? queries : (queries ? [queries] : []);
+  console.log(JSON.stringify(fetchForQueries(normalizedQueries)));
 }
 
 module.exports = { fetchForQueries };
