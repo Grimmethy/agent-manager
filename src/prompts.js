@@ -469,6 +469,20 @@ function buildImplementPrompt(task, planText) {
 // Independent second-opinion pass: a fresh model call reviews the drafter's own Implement
 // output before it ever reaches the review queue. Catches issues earlier and cheaper than
 // waiting for the review pass.
+// 40000, not the old 3000: deep_dive/arch_discovery/arch_import already cap real file
+// content at a 24000-char budget (DEEP_DIVE_CONTEXT_BUDGET_CHARS / ARCH_DISCOVERY_CONTEXT_
+// BUDGET_CHARS in task-sources.js) before it ever reaches a prompt, and hand that FULL,
+// untruncated content to plan/implement. This function re-serializes the whole
+// promptContext (not just file content) and used to truncate it at 3000 -- 8x smaller than
+// what the drafting stages already saw -- guaranteeing critique's own view was cut off
+// mid-file for nearly any real community. Reproduced live 2026-07-21
+// (deep-dive-autogen-microsoft-7/-20): critique saw a truncated source, concluded it
+// "cannot verify" the plan's claims, flagged that as an issue, and the resulting revision
+// pass produced hedging/refusal text citing that same truncation -- text review then
+// correctly rejects for being unverifiable meta-commentary, but the actual defect was this
+// prompt handing critique less context than the draft itself was written from. 40000 gives
+// headroom above the 24000-char budget for JSON-escaping overhead and non-file metadata
+// while still bounding domains (adhoc, etc.) with unbounded promptContext shapes.
 function buildCritiquePrompt(task, planText, implementText) {
   return [
     'IMPORTANT: You did NOT write this draft. Treat every claim in it as unverified — do not defer to it just because it reads confidently.',
@@ -476,7 +490,7 @@ function buildCritiquePrompt(task, planText, implementText) {
     `TASK: ${task.title}`,
     `DOMAIN/SOURCE: ${task.domain}/${task.source}`,
     '',
-    truncate(JSON.stringify(task.promptContext), 3000),
+    truncate(JSON.stringify(task.promptContext), 40000),
     '',
     '=== PLAN ===',
     planText,
