@@ -146,6 +146,16 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
   }
   if (!coverage.projects) coverage.projects = {};
   const proj = coverage.projects[projectSlug];
+  // Every item gets a stable, sequential ID at write time (Ignore items too, for the same
+  // audit-trail reason arch_discovery's AC-NNN ids are never reused) -- ADR-0020's
+  // arch_import consumes these to promote a specific item without re-promoting it later.
+  if (proj) {
+    if (typeof proj.nextItemId !== 'number') proj.nextItemId = 1;
+    for (const it of items) {
+      it.stableId = `${projectSlug}-${proj.nextItemId}`;
+      proj.nextItemId += 1;
+    }
+  }
   if (proj && Array.isArray(proj.communities)) {
     const community = proj.communities.find((c) => c.id === communityId);
     if (community) {
@@ -166,7 +176,15 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
     : `# ${projectName} — Deep Dive\n`;
 
   const sections = items.map((it) => {
-    const lines = [`## ${it.title}`, '', `**Community:** ${it.community || communityName}`, `**Rating:** ${it.rating || '(unrated)'}`];
+    // "(community #N)" suffix disambiguates communities sharing the same directory-based
+    // name (build_graph.py's naming heuristic reuses the same top-level-dir name across
+    // multiple distinct communities routinely -- e.g. several unrelated "src/components"
+    // communities in one repo) -- the dashboard's Scouted Repos detail view (app.py) parses
+    // this suffix to filter items by the exact community a user clicked, not just by name.
+    const communityLabel = `${it.community || communityName} (community #${communityId})`;
+    const lines = [`## ${it.title}`, ''];
+    if (it.stableId) lines.push(`**ID:** ${it.stableId}`);
+    lines.push(`**Community:** ${communityLabel}`, `**Rating:** ${it.rating || '(unrated)'}`);
     if (it.files) lines.push(`**Files:** ${it.files}`);
     lines.push('', it.rationale);
     return lines.join('\n');

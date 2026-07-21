@@ -255,7 +255,9 @@ function deepDivePlanPrompt(task) {
     '',
     fileContents || '(no file content available)',
     '',
-    'Write a numbered PLAN (no code) identifying 0 to N specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager\'s own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.',
+    'Write a numbered PLAN (no code) identifying 0 to 5 specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager\'s own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). Pick the 5 MOST worth flagging if more genuinely qualify -- do not pad the count. It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.',
+    '',
+    'When you cite a file, copy its path EXACTLY as it appears in the "Files in this community" list above (e.g. if the list shows "python/packages/autogen-ext/src/foo/_bar.py", cite that whole string, not a shortened guess like "src/foo/_bar.py") -- a downstream fact-check resolves your citation against the real repo, and a shortened or paraphrased path resolves to nothing and reads as fabrication even when the underlying claim is accurate.',
   ].join('\n');
 }
 
@@ -266,13 +268,13 @@ function deepDiveImplementPrompt(task, planText) {
     '',
     planText,
     '',
-    'Now write ONLY the final item write-up(s) your plan identified -- 0 to N of them. If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show.',
+    'Now write ONLY the final item write-up(s) your plan identified -- 0 to 5 of them (same cap as the plan). If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show. Keep each Rationale to 2-3 sentences -- a revision pass rewriting all items at once has a fixed token budget, and a long response here can get cut off mid-item, silently losing content that was actually fine.',
     '',
     'Each item MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
     '',
     '### ITEM: short title',
     `Community: ${ctx.communityName}`,
-    'Files: the specific file path(s) this references',
+    'Files: the specific file path(s) this references -- copy each path EXACTLY as shown in the "Files in this community" list from your plan input (full path, e.g. "python/packages/autogen-ext/src/foo/_bar.py"), never shortened or paraphrased',
     'Rating: Use / Adapt / Ignore',
     'Rationale: what this is, and specifically how it applies (or does not) to agent-manager',
     '',

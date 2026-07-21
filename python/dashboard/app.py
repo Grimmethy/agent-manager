@@ -12,6 +12,7 @@ AGENT_MANAGER_DASHBOARD_PORT (default 7420) picks the port.
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import string
@@ -451,6 +452,32 @@ def api_task_detail(state, task_id):
     return jsonify(data)
 
 
+@app.route("/api/task-anywhere/<task_id>")
+def api_task_anywhere(task_id):
+    """Workers tab click-through: an instance's currentTaskId doesn't say which queue
+    state to look in (a worker's is in drafting/, review-runner's is in review/,
+    apply-runner's is in approved/) -- rather than hardcode that mapping (fragile if a
+    new instance type is added later), just search drafting first (the common case for
+    an actively 'working' instance), then every other state in order."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for candidate in drafting_root.rglob(f"{task_id}.json"):
+            data = read_json_safe(candidate)
+            if data:
+                return jsonify({**data, "_foundState": "drafting"})
+
+    for state in QUEUE_STATES:
+        data = read_json_safe(qdir / state / f"{task_id}.json")
+        if data:
+            return jsonify({**data, "_foundState": state})
+
+    abort(404, description=f"task {task_id} not found in any queue state")
+
+
 @app.route("/api/summary")
 def api_summary():
     qdir = queue_dir()
@@ -489,9 +516,70 @@ def api_deep_dive_projects():
             "communityCount": len(communities),
             "reviewedCount": reviewed,
             "totalActionItems": total_items,
+            "hotlist": bool(proj.get("hotlist")),
         })
-    results.sort(key=lambda r: r["slug"])
+    # Hotlisted projects first (matches nextDeepDiveTask()'s own priority ordering in
+    # task-sources.js -- see the hotlist sort there), alphabetical within each tier.
+    results.sort(key=lambda r: (not r["hotlist"], r["slug"]))
     return jsonify(results)
+
+
+@app.route("/api/deep-dive/projects/<slug>/hotlist", methods=["POST"])
+def api_deep_dive_set_hotlist(slug):
+    """Toggles a project onto/off the research priority list -- nextDeepDiveTask() reads
+    this same field to draft every hotlisted project's remaining communities before any
+    non-hotlisted one, regardless of how long they've been waiting in the normal
+    oldest-first rotation (see task-sources.js)."""
+    body = request.get_json(silent=True) or {}
+    hotlist = bool(body.get("hotlist"))
+
+    cov_path = deep_dive_coverage_path()
+    if not cov_path:
+        abort(404)
+    coverage = read_json_safe(cov_path) or {"projects": {}}
+    proj = coverage.get("projects", {}).get(slug)
+    if not proj:
+        abort(404, description=f"unknown project: {slug}")
+
+    proj["hotlist"] = hotlist
+    cov_path.write_text(json.dumps(coverage, indent=2), encoding="utf-8")
+    return jsonify({"slug": slug, "hotlist": hotlist})
+
+
+_DEEP_DIVE_ITEM_RE = re.compile(
+    r"^## (?P<title>.+?)\s*\n\n"
+    r"\*\*Community:\*\* (?P<community>.+?)\s*\n"
+    r"\*\*Rating:\*\* (?P<rating>.+?)\s*\n"
+    r"(?:\*\*Files:\*\* (?P<files>.+?)\s*\n)?"
+    r"\n(?P<rationale>.*?)(?=\n## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_COMMUNITY_ID_SUFFIX_RE = re.compile(r"^(?P<name>.*?)\s*\(community #(?P<id>\d+)\)\s*$")
+
+
+def parse_deep_dive_analysis(analysis_text: str) -> list[dict]:
+    """Splits analysis.md (apply-group-a.js's applyDeepDiveFindings own output format) into
+    structured items so the dashboard can filter by the exact community a user clicked,
+    rather than showing the whole file as one undifferentiated block. Items written before
+    the "(community #N)" tagging was added (see apply-group-a.js) have communityId: null --
+    the frontend falls back to matching those by community name alone, which is ambiguous
+    when multiple communities share the same directory-based name but is still better than
+    nothing for pre-existing entries."""
+    items = []
+    for m in _DEEP_DIVE_ITEM_RE.finditer(analysis_text or ""):
+        community_raw = m.group("community").strip()
+        id_match = _COMMUNITY_ID_SUFFIX_RE.match(community_raw)
+        community_name = id_match.group("name") if id_match else community_raw
+        community_id = int(id_match.group("id")) if id_match else None
+        items.append({
+            "title": m.group("title").strip(),
+            "community": community_name,
+            "communityId": community_id,
+            "rating": m.group("rating").strip(),
+            "files": (m.group("files") or "").strip() or None,
+            "rationale": m.group("rationale").strip(),
+        })
+    return items
 
 
 @app.route("/api/deep-dive/projects/<slug>")
@@ -518,8 +606,10 @@ def api_deep_dive_project_detail(slug):
         "sourceUrl": proj.get("sourceUrl"),
         "clonePath": proj.get("clonePath"),
         "clonedAt": proj.get("clonedAt"),
+        "hotlist": bool(proj.get("hotlist")),
         "communities": proj.get("communities") or [],
         "analysisMarkdown": analysis_text,
+        "items": parse_deep_dive_analysis(analysis_text) if analysis_text else [],
     })
 
 

@@ -38,6 +38,7 @@ function getConfig() {
   // a different docs-folder convention overrides via env var.
   const troubleLogPath = process.env.AGENT_MANAGER_TROUBLE_LOG_PATH || path.join(repoRoot, 'Docs', 'TROUBLE_LOG.md');
   const archReviewCandidatesPath = process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_REVIEW_CANDIDATES.md');
+  const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || path.join(repoRoot, 'graphify-out', 'graph.json');
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
@@ -54,6 +55,8 @@ function getConfig() {
   // repo any more than INDEX.md itself is.
   const deepDiveCoveragePath = process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH
     || path.join(pipelineDir, 'deep-dive-coverage.json');
+  const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
+    || path.join(pipelineDir, 'import-coverage.json');
   const deepDiveClonesDir = process.env.AGENT_MANAGER_DEEP_DIVE_CLONES_DIR
     || path.join(path.dirname(projectSearchIndexPath), 'clones');
   const deepDiveAnalysisDir = process.env.AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR
@@ -75,9 +78,9 @@ function getConfig() {
 
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
-    troubleLogPath, archReviewCandidatesPath, communityCoveragePath, graphPath, domainsPath,
+    troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
-    deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir,
+    deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath,
     defaultDomain,
   };
 }

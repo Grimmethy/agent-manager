@@ -196,7 +196,7 @@ async function renderWorkers() {
   instancesForTimers = instances;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
   main.innerHTML = instances.map(inst => `
-    <div class="worker-card">
+    <div class="worker-card ${inst.currentTaskId ? 'clickable' : ''}" ${inst.currentTaskId ? `data-task-id="${escapeAttr(inst.currentTaskId)}"` : ''}>
       <div class="row">
         <span class="id">${inst.instanceId}</span>
         <div class="badge-col">
@@ -211,6 +211,9 @@ async function renderWorkers() {
       </div>
     </div>
   `).join('');
+  main.querySelectorAll('.worker-card[data-task-id]').forEach((card) => {
+    card.onclick = () => openTaskAnywhere(card.dataset.taskId);
+  });
   updateStaleTimers();
 }
 
@@ -345,11 +348,11 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function openDetail(state, id) {
-  const task = await fetchJson(`/api/task/${state}/${encodeURIComponent(id)}`);
+function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+  if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
   html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
   if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
@@ -359,7 +362,28 @@ async function openDetail(state, id) {
   content.innerHTML = html;
   backdrop.classList.add('open');
 }
-function closeDetail() { document.getElementById('modal-backdrop').classList.remove('open'); }
+
+async function openDetail(state, id) {
+  const task = await fetchJson(`/api/task/${state}/${encodeURIComponent(id)}`);
+  renderTaskDetailModal(task);
+}
+
+// Workers tab click-through: an instance's currentTaskId doesn't say which queue state
+// to look in (worker=drafting, review-runner=review, apply-runner=approved) -- the
+// backend searches for us (see /api/task-anywhere) instead of guessing here.
+async function openTaskAnywhere(taskId) {
+  try {
+    const task = await fetchJson(`/api/task-anywhere/${encodeURIComponent(taskId)}`);
+    renderTaskDetailModal(task);
+  } catch (e) {
+    alert('Could not load task details: ' + e.message);
+  }
+}
+
+function closeDetail() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+  deepDiveDetailCache = null; // force a fresh fetch next time any project's modal opens
+}
 document.getElementById('modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'modal-backdrop') closeDetail(); });
 
 // Static reference data, not fetched from the server -- mirrors the task sources this
@@ -401,7 +425,8 @@ async function renderDeepDiveTab() {
     return;
   }
   const rows = projects.map(p => `
-    <tr class="clickable" data-slug="${escapeAttr(p.slug)}">
+    <tr class="clickable ${p.hotlist ? 'top-row' : ''}" data-slug="${escapeAttr(p.slug)}">
+      <td onclick="event.stopPropagation()"><input type="checkbox" class="hotlist-toggle" data-slug="${escapeAttr(p.slug)}" ${p.hotlist ? 'checked' : ''} title="Move this repo to the top of the research priority list"></td>
       <td>${escapeHtml(p.slug)}</td>
       <td>${p.sourceUrl ? `<a href="${escapeAttr(p.sourceUrl)}" target="_blank" onclick="event.stopPropagation()">${escapeHtml(p.sourceUrl)}</a>` : ''}</td>
       <td>${p.reviewedCount} / ${p.communityCount}</td>
@@ -409,36 +434,139 @@ async function renderDeepDiveTab() {
       <td>${p.clonedAt ? new Date(p.clonedAt).toLocaleString() : ''}</td>
     </tr>
   `).join('');
-  main.innerHTML = `<table><thead><tr><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = `<table><thead><tr><th>Hot</th><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDeepDiveDetail(row.dataset.slug);
   });
+  main.querySelectorAll('.hotlist-toggle').forEach(cb => {
+    cb.onclick = (e) => e.stopPropagation();
+    cb.onchange = () => toggleHotlist(cb.dataset.slug, cb.checked);
+  });
 }
 
-async function openDeepDiveDetail(slug) {
-  const detail = await fetchJson('/api/deep-dive/projects/' + encodeURIComponent(slug));
+// Checking the box calls /api/deep-dive/projects/<slug>/hotlist, which flips a field on
+// that project's deep-dive-coverage.json entry -- nextDeepDiveTask() (task-sources.js)
+// reads the same field and drafts every remaining community in a hotlisted project ahead
+// of the normal oldest-first rotation, regardless of how long other projects have been
+// waiting. Re-renders the whole tab afterward so the row re-sorts to the top immediately
+// rather than waiting for the next 5s poll.
+async function toggleHotlist(slug, hotlist) {
+  try {
+    await fetch('/api/deep-dive/projects/' + encodeURIComponent(slug) + '/hotlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hotlist }),
+    });
+  } catch (e) {
+    alert('Could not update hotlist: ' + e.message);
+  }
+  if (activeTab === 'deepdive') await renderDeepDiveTab();
+}
+
+// Cache of the last-opened project's detail response, so selecting a community can
+// re-render just the items list (client-side filter) without a re-fetch.
+let deepDiveDetailCache = null;
+
+// Items written before apply-group-a.js started tagging "(community #N)" have
+// communityId: null -- fall back to matching by name for those (ambiguous when multiple
+// communities share a directory-based name, but still better than showing nothing).
+function itemsForCommunity(items, community) {
+  return items.filter((it) => (
+    community.id != null && it.communityId != null
+      ? it.communityId === community.id
+      : it.community === community.name
+  ));
+}
+
+function renderDeepDiveItems(items) {
+  if (items.length === 0) return '<div class="empty">No action items for this selection.</div>';
+  return items.map((it) => `
+    <div class="worker-card">
+      <div class="row">
+        <span class="id">${escapeHtml(it.title)}</span>
+        <span class="badge ${it.rating === 'Use' ? 'ok' : it.rating === 'Adapt' ? 'warn' : 'idle'}">${escapeHtml(it.rating || '')}</span>
+      </div>
+      <div class="meta">${escapeHtml(it.community || '')}${it.files ? ' · ' + escapeHtml(it.files) : ''}</div>
+      <div style="margin-top:8px">${escapeHtml(it.rationale || '')}</div>
+    </div>
+  `).join('');
+}
+
+// Selected community's items render as an extra table row directly beneath the clicked
+// row (an inline expansion), not in a separate section after the whole table -- clicking
+// a community and then having to scroll past every other row to see its items (the
+// original design) was confusing. Clicking an already-expanded row collapses it back.
+function renderDeepDiveCommunityRows(detail, selectedIdx, items) {
+  const rows = [];
+  (detail.communities || []).forEach((c, i) => {
+    const hasItems = (c.actionItemCount || 0) > 0;
+    rows.push(`
+      <tr class="${hasItems ? 'clickable' : ''} ${selectedIdx === i ? 'top-row' : ''}" data-community-idx="${i}">
+        <td>${escapeHtml(c.name || '')}</td>
+        <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : 'not yet reviewed'}</td>
+        <td>${c.actionItemCount ?? '-'}</td>
+      </tr>
+    `);
+    if (selectedIdx === i) {
+      const shown = itemsForCommunity(items, { id: i, name: c.name });
+      rows.push(`
+        <tr>
+          <td colspan="3" style="padding:0">
+            <div style="padding:12px 4px 16px">
+              <div class="field-label" style="margin-top:0">Ideas from "${escapeHtml(c.name)}" <a href="#" id="dd-collapse" style="margin-left:8px;font-weight:normal">(collapse)</a></div>
+              ${renderDeepDiveItems(shown)}
+            </div>
+          </td>
+        </tr>
+      `);
+    }
+  });
+  return rows.join('');
+}
+
+function renderDeepDiveDetailBody(detail, selectedIdx) {
+  const items = detail.items || [];
+  let html = `<div class="field-label">Communities (${(detail.communities || []).length}) -- click one with action items to see them inline</div>`;
+  html += `<table><thead><tr><th>Name</th><th>Reviewed</th><th>Action Items</th></tr></thead><tbody>${renderDeepDiveCommunityRows(detail, selectedIdx, items)}</tbody></table>`;
+
+  if (selectedIdx == null) {
+    html += `<div class="field-label">All ideas picked from this repo</div>`;
+    html += items.length === 0
+      ? '<div class="empty">Nothing written up yet -- no community from this repo has cleared review.</div>'
+      : renderDeepDiveItems(items);
+  }
+  return html;
+}
+
+function wireDeepDiveDetailHandlers(slug, selectedIdx) {
+  document.querySelectorAll('#modal-content tr.clickable[data-community-idx]').forEach((row) => {
+    const idx = Number(row.dataset.communityIdx);
+    // Clicking the already-expanded row collapses it back rather than re-expanding it.
+    row.onclick = () => openDeepDiveDetail(slug, idx === selectedIdx ? null : idx);
+  });
+  const collapse = document.getElementById('dd-collapse');
+  if (collapse) collapse.onclick = (e) => { e.preventDefault(); openDeepDiveDetail(slug, null); };
+}
+
+async function openDeepDiveDetail(slug, selectedIdx = null) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
+
+  // Re-opening the same project (selecting a different community) reuses the cached
+  // fetch instead of re-fetching -- the underlying data can't have changed within one
+  // modal session, and re-fetch would also flicker the "which row is highlighted" state.
+  const detail = (deepDiveDetailCache && deepDiveDetailCache.slug === slug)
+    ? deepDiveDetailCache
+    : await fetchJson('/api/deep-dive/projects/' + encodeURIComponent(slug));
+  deepDiveDetailCache = detail;
+
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(detail.slug)}</h2>`;
   if (detail.sourceUrl) html += `<div><a href="${escapeAttr(detail.sourceUrl)}" target="_blank">${escapeHtml(detail.sourceUrl)}</a></div>`;
-
-  const communityRows = (detail.communities || []).map(c => `
-    <tr>
-      <td>${escapeHtml(c.name || '')}</td>
-      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : 'not yet reviewed'}</td>
-      <td>${c.actionItemCount ?? '-'}</td>
-    </tr>
-  `).join('');
-  html += `<div class="field-label">Communities (${(detail.communities || []).length})</div>`;
-  html += `<table><thead><tr><th>Name</th><th>Reviewed</th><th>Action Items</th></tr></thead><tbody>${communityRows}</tbody></table>`;
-
-  html += `<div class="field-label">Ideas picked from this repo</div>`;
-  html += detail.analysisMarkdown
-    ? `<pre>${escapeHtml(detail.analysisMarkdown)}</pre>`
-    : `<div class="empty">Nothing written up yet -- no community from this repo has cleared review.</div>`;
+  html += renderDeepDiveDetailBody(detail, selectedIdx);
 
   content.innerHTML = html;
   backdrop.classList.add('open');
+  wireDeepDiveDetailHandlers(slug, selectedIdx);
 }
 
 async function renderMain() {

@@ -6,6 +6,7 @@ $RepoRoot = $env:AGENT_MANAGER_REPO_ROOT
 $PipelineDir = if ($env:AGENT_MANAGER_PIPELINE_DIR) { $env:AGENT_MANAGER_PIPELINE_DIR } else { $RepoRoot }
 $QueueDir = Join-Path $PipelineDir 'queue'
 $SecondBrainDir = if ($env:SECOND_BRAIN_DIR) { $env:SECOND_BRAIN_DIR } else { $null }
+$DeepDiveCoveragePath = if ($env:AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH) { $env:AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH } else { Join-Path $PipelineDir 'deep-dive-coverage.json' }
 $TempDir = Join-Path $env:TEMP 'ornith-review-runner'
 $ReviewLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log.md' } else { Join-Path $TempDir 'live-log.md' }
 $InstancesDir = Join-Path $PipelineDir 'instances'
@@ -28,6 +29,31 @@ New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir 'approved') | Out
 # (apply-runner.ps1) does the actual git/file work for approved tasks.
 $ReviewProvider = if ($env:REVIEW_PROVIDER) { $env:REVIEW_PROVIDER } else { 'ornith' }
 $OrnithModel = if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
+
+# Best-effort stagger against worker-*.json's own Ornith/GPU usage -- confirmed live
+# 2026-07-20: a review majority-vote call overlapping a worker's active Ornith call
+# correlated with degenerate ("no confident majority", 1/3 real votes) results twice in
+# one night, consistent with contention on the single 8GB-VRAM Ollama instance both
+# processes share. This is a soft, code-only backoff -- it never touches Ollama's own
+# server config (no restart risk, unlike the OLLAMA_NUM_PARALLEL experiment earlier
+# tonight that caused a real outage) and it gives up after a few short waits rather than
+# blocking review indefinitely if a worker's "working" status is itself stale/stuck.
+function Wait-ForOrnithAvailability {
+    param([int]$MaxWaitAttempts = 3, [int]$WaitSeconds = 5)
+    for ($i = 0; $i -lt $MaxWaitAttempts; $i++) {
+        $busy = $false
+        foreach ($wf in (Get-ChildItem $InstancesDir -Filter 'worker-*.json' -ErrorAction SilentlyContinue)) {
+            try {
+                $w = Get-Content $wf.FullName -Raw | ConvertFrom-Json
+                if ($w.status -ne 'working') { continue }
+                if (((Get-Date) - [datetime]$w.lastHeartbeat).TotalSeconds -lt 10) { $busy = $true; break }
+            } catch { }
+        }
+        if (-not $busy) { return }
+        Write-Host ('Review: a worker looks actively mid-call -- staggering {0}s to reduce GPU contention.' -f $WaitSeconds) -ForegroundColor DarkGray
+        Start-Sleep -Seconds $WaitSeconds
+    }
+}
 
 function Invoke-OrnithClient {
     param([string]$Prompt, [bool]$Think = $true, [double]$Temperature = 0.3, [int]$NumPredict = 1200)
@@ -174,6 +200,24 @@ function Invoke-ReviewPass {
     $draftPath = Join-Path $TempDir ('draft-{0}.txt' -f $task.id)
     [System.IO.File]::WriteAllText($draftPath, $task.implementResponse)
     $repoRootForCheck = Get-WorkDir -Domain $task.domain
+
+    # deep_dive's real "repo root" for fact-checking is the CLONED external project, not
+    # $RepoRoot (agent-manager itself, task-domains.json's placeholder workDirKind for this
+    # domain) -- using $RepoRoot here meant fact-checker.js's missing-file check reported
+    # EVERY referenced file as missing (they're all under the clone, never under
+    # agent-manager's own repo), which then reads to the Ornith reviewer as wholesale
+    # fabrication. Reproduced live: a genuinely well-grounded AutoGen deep-dive draft got
+    # rejected 3/3 for exactly this reason. Look up the real clone path from
+    # deep-dive-coverage.json by the task's own promptContext.projectSlug instead.
+    if ($task.source -eq 'deep_dive' -and (Test-Path $DeepDiveCoveragePath)) {
+        try {
+            $ddCoverage = Get-Content $DeepDiveCoveragePath -Raw | ConvertFrom-Json
+            $ddProj = $ddCoverage.projects.($task.promptContext.projectSlug)
+            if ($ddProj -and $ddProj.clonePath) { $repoRootForCheck = $ddProj.clonePath }
+        } catch {
+            Write-Host ('Could not resolve deep_dive clone path for fact-check (falling back to repoRoot): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+    }
 
     # Build the "grounding source" -- the material the model was actually handed for this
     # task -- so fact-checker.js's grounded-value tier can flag any URL/GIS-field in the
@@ -388,6 +432,14 @@ function Invoke-ReviewPass {
         $verdictLines.Add('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---')
         $verdictLines.Add(($factCheck | ConvertTo-Json -Depth 10))
         $verdictLines.Add('')
+        # Reproduced live 2026-07-20: a reviewer rejected a deep_dive item as unverifiable
+        # ("I cannot confirm whether X exists") even though the fact-check above showed
+        # exists:true with zero flags for that exact path -- the model expressed doubt about
+        # something the deterministic check had already confirmed, instead of using it. The
+        # fact-check is the one part of this pipeline that actually touched the real
+        # filesystem; the model's own uncertainty is not evidence against it.
+        $verdictLines.Add('The fact-check above is deterministic and authoritative for file existence -- it already checked the real filesystem. A claimed path listed with "exists": true is CONFIRMED real; do not express doubt about it or re-litigate whether it exists. Only "exists": false (a missing-file flag) is evidence toward fabrication.')
+        $verdictLines.Add('')
         $verdictLines.Add('Judge whether this draft is correct, narrowly scoped, and safe to apply as-is. Reject if it is fabricated, over-broad, or the fact-check flags a real problem.')
         if ($task.source -eq 'arch_discovery') {
             # A draft that correctly found ZERO real friction was once rejected as
@@ -423,6 +475,7 @@ function Invoke-ReviewPass {
         $reviewFailReason = $null
         $voteResult = $null
         try {
+            Wait-ForOrnithAvailability
             # 3 votes, requires 2 agreeing real votes, temperature 0.2.
             $voteResult = Invoke-OrnithMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 2 -Temperature 0.2
         } catch {

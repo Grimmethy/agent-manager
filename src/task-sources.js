@@ -520,14 +520,19 @@ function nextDeepDiveTask() {
 
   // Flatten every tracked project's communities and pick the oldest/null lastReviewedAt
   // first -- same rule nextArchDiscoveryTask() uses, just flattened across multiple
-  // projects instead of one repo (see docs/deep-dive-pipeline.md).
+  // projects instead of one repo (see docs/deep-dive-pipeline.md). Hotlisted projects
+  // (dashboard's Scouted Repos checkbox, toggled via /api/deep-dive/projects/<slug>/hotlist)
+  // win the tiebreak first, ahead of the normal oldest-first rule -- every remaining
+  // community in a hotlisted project drafts before any community in a non-hotlisted one,
+  // regardless of how long that other project has been waiting in rotation.
   const candidates = [];
   for (const [slug, proj] of Object.entries(coverage.projects)) {
     for (const community of proj.communities || []) {
-      candidates.push({ slug, proj, community });
+      candidates.push({ slug, proj, community, hotlist: !!proj.hotlist });
     }
   }
   candidates.sort((a, b) => {
+    if (a.hotlist !== b.hotlist) return a.hotlist ? -1 : 1;
     const at = a.community.lastReviewedAt ? Date.parse(a.community.lastReviewedAt) : -Infinity;
     const bt = b.community.lastReviewedAt ? Date.parse(b.community.lastReviewedAt) : -Infinity;
     return at - bt;
@@ -630,6 +635,22 @@ registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
 registerTaskSource('arch_review', { priority: 70, next: nextArchReviewTask });
 registerTaskSource('arch_discovery', { priority: 80, next: nextArchDiscoveryTask });
+
+// --- Source: arch_import -- STUB for now (ADR-0020, deferred to a later task: real
+// item-scanning/promotion logic). Reads importCoveragePath if present and returns null
+// unconditionally -- safe to register now without any risky logic yet, same shape as
+// deep_dive's own initial stub. ---
+function nextArchImportTask() {
+  const { importCoveragePath } = getConfig();
+  try {
+    JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    // Malformed tracker -- nothing to do yet regardless.
+  }
+  return null;
+}
+registerTaskSource('arch_import', { priority: 81, next: nextArchImportTask });
+
 registerTaskSource('deep_dive', { priority: 82, next: nextDeepDiveTask });
 registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask });
 registerTaskSource('unused_export', { priority: 90, next: nextUnusedExportTask });
