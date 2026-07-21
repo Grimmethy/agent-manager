@@ -450,11 +450,31 @@ while ($true) {
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'implement'
     $abModel = Select-AbModel -TaskId $task.id -Candidates $AbCandidates
     $implSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $implPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'implement' -PlanTextPath $planTextPath
-    if ($task.source -in @('trouble_log', 'arch_review') -or $task.domain -eq 'adhoc') {
-        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json' -ModelOverride $abModel
+
+    # arch_import deterministic short-circuit: skip the implement call entirely when the
+    # harness found NOTHING to ground a candidate in. Confirmed live 2026-07-21 across the
+    # first ~14 real arch_import drafts: grep-codebase-tool.js does literal substring
+    # matching, so a zero-hit harness result is the COMMON case here, not an edge case
+    # (10/14) -- and archImportImplementPrompt's explicit "output the empty string if
+    # nothing groundable was found" instruction was only reliably followed about 40% of
+    # the time; the rest fabricated a candidate anyway (a hallucinated Python config
+    # module, raw JSX, etc.) despite zero real files to ground it in. The structural check
+    # (arch-discovery-structcheck.js) already catches every one of those before they reach
+    # review, so nothing bad was ever going to ship -- but repeatedly trusting an
+    # instruction this model demonstrably won't reliably follow, when the correct answer
+    # is already deterministically knowable from the harness result alone, wastes a real
+    # GPU call and a real block for an outcome that was never in doubt.
+    $skipImplement = $task.source -eq 'arch_import' -and $task.promptContext.harnessHits.Count -eq 0 -and $task.promptContext.harnessFiles.Count -eq 0
+    if ($skipImplement) {
+        Write-Host ('arch_import: harness found nothing groundable, skipping implement call: {0}' -f $task.id) -ForegroundColor DarkGray
+        $implResult = [PSCustomObject]@{ response = ''; thinking = ''; degenerate = $null; attempts = 0 }
     } else {
-        $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400 -ModelOverride $abModel
+        $implPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'implement' -PlanTextPath $planTextPath
+        if ($task.source -in @('trouble_log', 'arch_review') -or $task.domain -eq 'adhoc') {
+            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json' -ModelOverride $abModel
+        } else {
+            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400 -ModelOverride $abModel
+        }
     }
     $implSw.Stop()
     Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Implement' -Thinking $implResult.thinking -Response $implResult.response -Degenerate $implResult.degenerate
