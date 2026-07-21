@@ -431,6 +431,44 @@ function Invoke-ReviewPass {
             return 'blocked'
         }
     } else {
+        # Deterministic auto-approve for a genuinely EMPTY implementResponse, for the four
+        # sources whose own implement prompts explicitly instruct "output the empty string
+        # if there's nothing real to report" (arch_discovery/project_search/deep_dive/
+        # arch_import). Reproduced live 2026-07-21, twice in the same night, with two
+        # different prompt-wording attempts to fix it via instruction alone: the reviewer
+        # model cannot reliably tell "genuinely empty, a valid documented outcome" apart
+        # from "coherent hedging prose standing in for a real answer" -- both intuitively
+        # read as "didn't really answer" to a shallow pass, and a source-specific carve-out
+        # explicitly permitting empty kept losing to the generic hedging-rejection rule
+        # regardless of how the wording was arranged. Whether a response is empty is not a
+        # judgment call at all -- it's already deterministically knowable, so asking the
+        # model to weigh in (and spending 3 real votes doing it) was never buying anything
+        # but reliability risk. Same philosophy as ornith-worker.ps1's own arch_import
+        # implement short-circuit: don't ask a model to judge something code already knows.
+        # Trimmed comparison against '""'/"''" too, not just IsNullOrWhiteSpace -- mirrors
+        # apply-group-a.js's isEffectivelyEmptyResponse() exactly (same real-world quirk:
+        # Ornith sometimes writes the literal two-character JSON-style empty-string
+        # representation instead of a truly empty response). Keeping this one definition
+        # of "empty" consistent across the pipeline instead of drifting per call site.
+        $emptyApprovalSources = @('arch_discovery', 'project_search', 'deep_dive', 'arch_import')
+        $trimmedImplResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
+        $isEffectivelyEmpty = ($trimmedImplResponse -eq '') -or ($trimmedImplResponse -eq '""') -or ($trimmedImplResponse -eq "''")
+        if (($task.source -in $emptyApprovalSources) -and $isEffectivelyEmpty) {
+            $detail = 'Auto-approved: implementResponse is genuinely empty, a documented valid outcome for {0} (no Ornith vote spent -- this is deterministic, not a judgment call)' -f $task.source
+            $task | Add-Member -NotePropertyName 'reviewedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-approve' -Force
+            $task | Add-Member -NotePropertyName 'ornithVerdict' -NotePropertyValue $detail -Force
+            $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $next.Name
+            Write-TaskJson $approvedPath $task
+            Remove-Item $next.FullName -Force
+            $reviewSw.Stop()
+            Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'deterministic-empty-approve' } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'approved'; outcomeStage = 'review'; outcomeReason = $null }
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'APPROVED' -Detail $detail
+            Write-Host ('Auto-approved (empty, deterministic): {0} -- queued for apply-runner' -f $task.id) -ForegroundColor Cyan
+            return 'approved'
+        }
+
         # --- Ornith path: verdict ONLY. Ornith has no tool access via ornith-client.js --
         # it cannot git-push or write files, so an APPROVE verdict moves the task to
         # queue/approved/ for apply-runner.ps1 to actually execute, rather than to done/. ---
@@ -470,7 +508,20 @@ function Invoke-ReviewPass {
         # Applies to every source sharing this verdict prompt, not just arch_discovery --
         # the same "coherent hedging instead of a real answer" shape can happen anywhere
         # Ornith is asked to produce free-text content.
-        $verdictLines.Add('Also REJECT if the draft is not actually an attempt at the requested output -- e.g. it consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") instead of the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine."')
+        # Reproduced live 2026-07-21, the SAME night this rule shipped: it collided with
+        # the arch_import/arch_discovery/project_search/deep_dive "empty is a valid,
+        # deliberate outcome" carve-outs below. A GENUINELY EMPTY implementResponse (the
+        # model correctly following its own "output the empty string if nothing found"
+        # instruction) got REJECTed by all 3 votes citing THIS rule -- "no implementation
+        # code... it is empty" -- even though the source-specific carve-out below
+        # explicitly says an empty result is fine for that exact reason. This rule was
+        # written for a DIFFERENT failure shape: coherent hedging PROSE standing in for a
+        # real answer ("I cannot verify this draft...") -- not a truly empty string, which
+        # several sources are explicitly told to produce on purpose. The distinction must
+        # be explicit, not left for the model to infer, since "empty" and "hedging instead
+        # of answering" both intuitively read as "didn't really answer" under a shallow
+        # pass.
+        $verdictLines.Add('Also REJECT if the draft consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") standing in for the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine." IMPORTANT EXCEPTION: this rule is about hedging PROSE, not about a genuinely EMPTY response (zero characters, or effectively so) -- several task types below are explicitly instructed to output nothing when there is nothing real to report, and that is NOT the same failure as writing evasive text instead of answering. If the draft is truly empty, judge it ONLY by the source-specific rule below (if any); do not reject an empty draft under this rule merely for containing no implementation.')
         if ($task.source -eq 'arch_discovery') {
             # A draft that correctly found ZERO real friction was once rejected as
             # "vacuous... not useful" -- the generic judgment line above reads naturally as
