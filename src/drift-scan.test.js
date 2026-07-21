@@ -128,6 +128,35 @@ test('checkPair errors when the value regex matches the block but extracts nothi
   assert.match(result.error, /extracted zero values/);
 });
 
+test('checkPair extracts priorities from a markdown table (README.md pattern), not just a JS array', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(
+    repoRoot,
+    STATIC_REL,
+    [
+      '## Built-in task sources',
+      '',
+      '| Source | Priority | Reads |',
+      '|---|---|---|',
+      '| `adhoc` | 10 | ... |',
+      '| `arch_import` | 81 | ... |',
+      '',
+      '## Building the codebase graph',
+      '',
+    ].join('\n')
+  );
+  writeFixture(repoRoot, SOURCE_REL, "registerTaskSource('adhoc', { priority: 10, next: fn });\nregisterTaskSource('arch_import', { priority: 81, next: fn });\nregisterTaskSource('deep_dive', { priority: 82, next: fn });\n");
+
+  const result = checkPair(repoRoot, pair({
+    staticStartMarker: '| Source | Priority | Reads |',
+    staticEndMarker: '## Building the codebase graph',
+    staticValueRegex: /\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|/g,
+  }));
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.missingFromStatic, ['82']);
+  assert.deepEqual(result.staleInStatic, []);
+});
+
 test('checkPair is not confused by an unrelated top-level array sharing the end marker text', () => {
   const repoRoot = makeTempRepo();
   writeFixture(

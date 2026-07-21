@@ -52,6 +52,19 @@ const PAIRS = [
     sourceFile: 'src/task-sources.js',
     sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(\d+)/g,
   },
+  {
+    // Found the same day as the Job List bug, same root cause: README.md's own
+    // "Built-in task sources" table is hand-maintained prose, not generated, and had
+    // silently rotted to "Six" sources when nine were actually registered (missing
+    // arch_import, deep_dive, and project_search entirely).
+    label: 'README.md Built-in task sources table vs task-sources.js registry',
+    staticFile: 'README.md',
+    staticStartMarker: '| Source | Priority | Reads |',
+    staticEndMarker: '## Building the codebase graph',
+    staticValueRegex: /\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|/g,
+    sourceFile: 'src/task-sources.js',
+    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(\d+)/g,
+  },
 ];
 
 function checkPair(repoRoot, pair) {
