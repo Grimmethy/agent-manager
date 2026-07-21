@@ -200,6 +200,17 @@ function Invoke-ApplyPass {
         [System.IO.File]::WriteAllText($tempTaskPath, ($task | ConvertTo-Json -Depth 20))
         $applyTaskScript = Join-Path $PackageSrcDir 'apply-task.js'
         $rawLines = & node $applyTaskScript $tempTaskPath
+        # A hard crash (OOM, killed process, uncaught exception outside apply-task.js's own
+        # try/catch) can leave stdout empty with no exception thrown here -- ConvertFrom-Json
+        # on empty input then just returns $null, which previously fell through to the
+        # maximally generic 'apply-task.js produced no usable result' with zero diagnostic
+        # value (confirmed live 2026-07-21: two real blocked tasks with that exact reason,
+        # both of which turned out to succeed cleanly on a manual replay under normal load --
+        # a transient resource-contention casualty, not a code bug, but undiagnosable as it
+        # stood). Checking the exit code surfaces whatever WAS captured instead.
+        if ($LASTEXITCODE -ne 0) {
+            throw ('apply-task.js exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+        }
         $result = ($rawLines -join "`n") | ConvertFrom-Json
     } catch {
         $result = [PSCustomObject]@{ succeeded = $false; reason = $_.Exception.Message }
