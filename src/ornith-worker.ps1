@@ -67,7 +67,7 @@ function Invoke-OrnithClient {
     if ($ModelOverride) { $reqObj | Add-Member -NotePropertyName 'model' -NotePropertyValue $ModelOverride }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
-    $rawLines = & node $clientPath $reqPath
+    $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
     # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on failure
     # (console.error + process.exit(1)) -- the stdout-only capture above silently drops
     # that message. Without this, a real crash here would fall through to
@@ -97,7 +97,7 @@ function Invoke-OrnithToolClient {
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; maxTurns = $MaxTurns }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-tool-client.js'
-    $rawLines = & node $clientPath $reqPath
+    $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
 }

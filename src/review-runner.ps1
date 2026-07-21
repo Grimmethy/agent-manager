@@ -62,7 +62,7 @@ function Invoke-OrnithClient {
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
-        $rawLines = & node $clientPath $reqPath
+        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
         # See Invoke-OrnithMajorityVote's matching comment below -- same silent-failure
         # shape, same fix: ornith-client.js's CLI writes errors to stderr (dropped by the
         # stdout-only capture above) and exits 1, so without this a real crash here just
@@ -90,7 +90,7 @@ function Invoke-OrnithMajorityVote {
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
-        $rawLines = & node $clientPath $reqPath
+        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
         # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on
         # failure (console.error + process.exit(1)) -- stdout capture above silently drops
         # that message, so a real crash here surfaced as the generic, undiagnosable
