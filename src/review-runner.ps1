@@ -487,6 +487,25 @@ function Invoke-ReviewPass {
         $verdictLines.Add('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---')
         $verdictLines.Add(($factCheck | ConvertTo-Json -Depth 10))
         $verdictLines.Add('')
+        # Every domain-specific carve-out below (deep_dive/arch_discovery/project_search/
+        # arch_import) tells the reviewer to check claims against "the given community file
+        # content above" or "the real fetched search results above" -- but until now, that
+        # content was NEVER actually added to this prompt. $groundingText (built above purely
+        # to feed fact-checker.js's deterministic value-check) is the exact real material
+        # those instructions assume is present. Reproduced live 2026-07-21
+        # (deep-dive-autogen-microsoft-31): all 3 votes correctly noted "the fact-check only
+        # confirmed file existence, not the specific method/behavior claims" and rejected a
+        # draft whose claims were, in fact, 100% accurate against the real _mem0.py content --
+        # content the reviewer was never shown, despite promptContext.files containing it in
+        # full. The reviewer wasn't wrong given what it saw; what it saw was incomplete. Capped
+        # at 40000 chars, matching prompts.js's buildCritiquePrompt fix (2026-07-21) for the
+        # same reason: deep_dive/arch_discovery already budget real file content at 24000
+        # chars upstream, so 40000 gives headroom without unbounding a pathological case.
+        if ($groundingText) {
+            $verdictLines.Add('--- Real grounding source (the material the drafter was actually given -- use this to verify SPECIFIC claims, not just the fact-check above) ---')
+            $verdictLines.Add($(if ($groundingText.Length -gt 40000) { $groundingText.Substring(0, 40000) + "`n...[truncated]" } else { $groundingText }))
+            $verdictLines.Add('')
+        }
         # Reproduced live 2026-07-20: a reviewer rejected a deep_dive item as unverifiable
         # ("I cannot confirm whether X exists") even though the fact-check above showed
         # exists:true with zero flags for that exact path -- the model expressed doubt about
