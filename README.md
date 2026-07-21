@@ -23,7 +23,11 @@ Four always-on processes, each in its own terminal:
 - **`review-runner.ps1`** — a majority-vote model call judges each draft APPROVE/REJECT.
   APPROVE moves the task to `queue/approved/`; nothing is written or pushed yet.
 - **`apply-runner.ps1`** — the only process with real file-write/git capability. Executes
-  an approved task deterministically (see `apply-group-a.js`/`apply-group-b.js`).
+  an approved task deterministically (see `apply-group-a.js`/`apply-group-b.js`). Its
+  git-branch-diff path resets the working tree onto `origin/<default-branch>` before
+  branching (`git-runner.js`'s `resetToMain()`) — auto-stashes any uncommitted work first
+  (`git stash push -u`) rather than destroying it, since `AGENT_MANAGER_REPO_ROOT` can be
+  (and for this package's own dev loop, is) a directory also being edited live.
 - **`queue-watchdog.ps1`** — dead-process detection (restarts a crashed loop) and
   reject-retry-requeue (a genuinely rejected draft gets one bounded redraft attempt).
 

@@ -56,7 +56,24 @@ function createRealGitRunner(repoRoot) {
   }
   return {
     fetchMain: () => run(['fetch', 'origin', mainBranch]),
-    resetToMain: () => { run(['checkout', mainBranch]); run(['reset', '--hard', `origin/${mainBranch}`]); },
+    // Auto-stash before the hard reset instead of silently destroying uncommitted work --
+    // this exact `git reset --hard` wiped real, unrecoverable work TWICE in one session
+    // (see docs/pipeline-incident-2026-07-19.md and its 2026-07-21 repeat) because this
+    // repo is sometimes edited live in the same working tree the pipeline operates on.
+    // `-u` includes untracked files. Stashing when there's nothing to stash is a harmless
+    // no-op (git prints "No local changes to save", exits 0) -- no separate status check
+    // needed. A stash failure (e.g. an in-progress merge/rebase) must not silently fall
+    // through to the destructive reset below, so it's re-thrown with context rather than
+    // swallowed.
+    resetToMain: () => {
+      try {
+        run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+      } catch (e) {
+        throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+      }
+      run(['checkout', mainBranch]);
+      run(['reset', '--hard', `origin/${mainBranch}`]);
+    },
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
     deleteBranch: (name) => run(['branch', '-D', name]),
@@ -95,4 +112,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch };
