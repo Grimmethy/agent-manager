@@ -15,5 +15,6 @@ model-stats.db
 community-coverage.json
 task-domains.json
 deep-dive-coverage.json
+import-coverage.json
 dashboard.pid
 .claude/

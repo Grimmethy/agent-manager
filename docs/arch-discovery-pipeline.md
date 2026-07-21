@@ -116,8 +116,8 @@ context for one community: {files}". Critique/revision passes reuse the existing
 
 ## task-domains.json + apply-runner.ps1
 
-Add an `arch_discovery` entry (or reuse `taxharvest`'s `workDirKind` if the doc-append
-happens inside the normal TaxHarvest working directory — it does, `ARCH_REVIEW_CANDIDATES.md`
+Add an `arch_discovery` entry (or reuse an existing `workDirKind` alias if the doc-append
+happens inside the normal consumer-project working directory — it does, `ARCH_REVIEW_CANDIDATES.md`
 lives in `Docs/`). `successCheck` needs a new kind (e.g. `'candidates-appended'`) since this
 isn't a git operation and isn't the existing `'done-marker'` SecondBrain shape either — it's
 "append text to a doc + write a JSON field," closer to a hybrid. `apply-runner.ps1` needs a

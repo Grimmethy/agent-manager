@@ -147,7 +147,7 @@ def _migrate_legacy_cache_if_needed(path_str: str, cache: dict) -> None:
     except OSError:
         pass  # best-effort -- a failed migration just means one more fresh layout run
 
-# Same staleness thresholds TaxHarvest's own dashboard route already used: a 'working'
+# Same staleness thresholds an earlier version of this dashboard already used: a 'working'
 # instance legitimately takes many minutes between heartbeats (a single model call can run
 # long), so it gets a generous threshold; anything else stale after 3 minutes means the
 # instance stopped progressing.

@@ -90,8 +90,8 @@ redoes the entire plan→implement→critique sequence from scratch and can hit 
 wall again.
 
 **Fix used tonight:** after confirming a task has failed 5+ times with the same
-signature (check `D:\Users\Grimmethy\Temp\agent-manager-live-log.md` — or wherever
-`$env:TEMP\agent-manager-live-log.md` resolves for whoever's running this — for repeated
+signature (check `$env:TEMP\agent-manager-live-log.md` — wherever
+that resolves for whoever's running this — for repeated
 `WATCHDOG -- [RESTARTED]` entries naming the same task), manually move it to
 `queue/blocked/` with a clear `blockedReason` explaining the pattern, and set
 `blockedStage` to anything **other than `"review"`** — `queue-watchdog.ps1`'s

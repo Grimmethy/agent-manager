@@ -450,8 +450,8 @@ working live**, not just a design document.
 `TOOL_IMPLS`/`TOOL_SCHEMAS`/chat-loop shape, not a hypothetical) and asked for a plan to add
 `read_file`/`list_dir`. It correctly reasoned through `path.normalize`/`path.resolve`, stat-based
 size caps, and Windows case-insensitivity — **but its boundary check was a real security bug**:
-`resolved.startsWith(sandboxRoot)` alone would wrongly admit a sibling directory (`TaxHarvest-evil`
-passes a naive `startsWith('.../TaxHarvest')` check). It also under-specified resolving against
+`resolved.startsWith(sandboxRoot)` alone would wrongly admit a sibling directory (`consumer-evil`
+passes a naive `startsWith('.../consumer')` check). It also under-specified resolving against
 `process.cwd()` instead of the fixed sandbox root. Both caught and corrected before any code was
 written — exactly the "architecture-review step cannot be skipped" lesson from earlier in this doc,
 this time on Ornith's own proposed infrastructure rather than a county adapter.
@@ -466,15 +466,15 @@ not fact-availability, is the binding constraint on Ornith's code-gen (see "Gene
 sensitivity" above) — here every fact was already given in the failed compound attempt too.
 
 **Apply pass (Claude):** wrote the reviewed code into `ornith-agent-test.js` — `const fs`/`const
-path` added to requires, `SANDBOX_ROOT = path.resolve(__dirname, '..')` (the whole TaxHarvest
-project root — Docs/, GOAL.md, CLAUDE.md, backend/counties/ sibling examples), `isPathSafe`,
+path` added to requires, `SANDBOX_ROOT = path.resolve(__dirname, '..')` (the whole consumer
+project root — Docs/, GOAL.md, CLAUDE.md, domain-specific sibling examples), `isPathSafe`,
 `toolReadFile`, `toolListDir`, and the two new `TOOL_SCHEMAS`/`TOOL_IMPLS` entries. Deliberately
 no `write_file` yet, per the read-only-first recommendation.
 
 **Verification, in order of increasing confidence:**
 1. Unit-style smoke test of the applied logic against the real directory tree: real file read
    succeeded, a `../../../Windows/System32/...` traversal was rejected, and — the specific bug
-   caught above — a `../TaxHarvest-evil-sibling/secret.txt` sibling-prefix escape was correctly
+   caught above — a `../consumer-evil-sibling/secret.txt` sibling-prefix escape was correctly
    rejected too. Directory-as-file, nonexistent-file, and nonexistent-dir cases all returned the
    right typed errors.
 2. **Live end-to-end test through the real Ollama tool-calling endpoint** (no DB/Prisma
@@ -636,7 +636,7 @@ as if derived, when nothing in the prompt supported that specific ratio.
 Earlier the same day this doc briefly recommended `ornith:35b` as standard, reasoning that
 35B's better output quality was worth the CPU/mmap-bound slowness (RX 580/Polaris was believed
 to have no ROCm or Vulkan path in this Ollama build, confirmed 2026-07-05). **That hardware
-assumption was wrong, or was fixed same-day** — Grimmethy got Vulkan working, and Ollama
+assumption was wrong, or was fixed same-day** — Vulkan support got sorted out, and Ollama
 0.31.1 auto-detects the RX 580 8GB over Vulkan with zero extra env vars on Claude's end
 (`Vulkan0 : Radeon RX 580 Series (8192 MiB)`, confirmed in `%LOCALAPPDATA%\Ollama\server.log`)
 and fully offloads all 33/33 layers of the 9B model to it. **`ornith:9b` is now the default
@@ -741,7 +741,7 @@ trusting it.**
   Run all concurrent instances on the SAME model tier (single-resident Ollama).
 - `backend/agent-pipeline/review-runner.ps1` — now an always-on loop (15s/2min/10min
   sleeps by outcome), NOT a Task-Scheduler repeater. The old 15-min
-  `TaxHarvest-OrnithReviewRunner` scheduled task is obsolete: repoint it to launch the loop
+  `ConsumerProj-OrnithReviewRunner` scheduled task is obsolete: repoint it to launch the loop
   at logon, or launch manually. As of 2026-07-12, its review provider is swappable
   (`REVIEW_PROVIDER=ornith|claude`, defaults to `ornith`) — see the dated entry below for
   why an Ornith-approved task does not push/apply anything by itself.
@@ -762,12 +762,12 @@ trusting it.**
   counties missing baseline field_map coverage). All four exhausted = idle is correct;
   no synthetic work.
 
-## Update 2026-07-12: task-domains.json — the crash that killed review-runner on any non-taxharvest task
+## Update 2026-07-12: task-domains.json — the crash that killed review-runner on any non-consumer task
 
 **Root cause, confirmed live:** `review-runner.ps1` picked its git working directory with
-a bare `if ($task.domain -eq 'taxharvest') { $TaxHarvestRoot } else { $SecondBrainDir }`.
+a bare `if ($task.domain -eq 'consumer') { $ConsumerRepoRoot } else { $SecondBrainDir }`.
 `queue-adhoc-task.js` hardcoded every ad-hoc task to `domain: 'adhoc'` (never
-`'taxharvest'`), and `task-sources.js`'s `nextSecondBrainTask()` — a real, currently-enabled
+`'consumer'`), and `task-sources.js`'s `nextSecondBrainTask()` — a real, currently-enabled
 source, not dead code — writes `domain: 'secondbrain'`. Both fell into the `else` branch and
 `Push-Location`'d into `$SecondBrainDir` (`F:\SecondBrain`, an Obsidian vault, **not a git
 repository**). The very next line ran `git branch -a`, which failed with `fatal: not a git
@@ -783,13 +783,13 @@ valid task domains, shared across both languages that touch it:
 
 ```json
 {
-  "taxharvest": { "workDirKind": "taxharvestRoot", "successCheck": "git-branch-diff" },
+  "consumer": { "workDirKind": "consumerRoot", "successCheck": "git-branch-diff" },
   "secondbrain": { "workDirKind": "secondBrainDir", "successCheck": "done-marker" }
 }
 ```
 
 - `queue-adhoc-task.js` gained a `--domain` flag, validated against this file's keys,
-  **defaulting to `'taxharvest'`** when omitted (the common case — ad-hoc requests are
+  **defaulting to `'consumer'`** when omitted (the common case — ad-hoc requests are
   almost always about this repo, not the SecondBrain vault). `'adhoc'` was never a real
   domain; it no longer exists as a value this CLI writes.
 - `review-runner.ps1` reads the same file (`Get-DomainConfig`/`Get-WorkDir`) and dispatches
@@ -810,13 +810,13 @@ valid task domains, shared across both languages that touch it:
 `domain: 'adhoc'` will now cleanly block with `"Unknown task domain: adhoc"` instead of
 crashing the loop — `'adhoc'` isn't a valid domain and never should have been. That's
 correct, not a regression: those specific legacy items need manual re-triage (re-submit with
-the new CLI, which will now default them correctly to `taxharvest`), but the pipeline no
+the new CLI, which will now default them correctly to `consumer`), but the pipeline no
 longer dies because of them.
 
 **Verified before landing:** `[System.Management.Automation.Language.Parser]::ParseFile`
 clean on the edited `review-runner.ps1`; `node --check` clean on `queue-adhoc-task.js`; the
 new `Get-DomainConfig`/`Get-WorkDir` functions isolated and run standalone against
-`taxharvest`, `secondbrain`, and the old `adhoc` value (confirmed it now throws a clean,
+`consumer`, `secondbrain`, and the old `adhoc` value (confirmed it now throws a clean,
 catchable error instead of reaching the git call at all). Not yet verified end-to-end through
 a live `claude -p` review pass — that needs review-runner actually restarted against the real
 queue, which spends real tokens and can push branches to origin, so it's queued as a
@@ -887,7 +887,7 @@ nothing) and re-running the script synchronously to capture the real error:
 
 ```
 Reviewing: E2E pipeline test: explain checksums
-Unknown task domain: adhoc (valid: secondbrain, taxharvest)
+Unknown task domain: adhoc (valid: secondbrain, consumer)
 ```
 
 **Root cause:** the task-domains fix wrapped the git/claude/ornith calls inside each
@@ -1092,7 +1092,7 @@ a real 2/3 `APPROVE` majority) — **that read was wrong**, caught on closer ins
 being reported as fact.
 
 **Root cause: all of the same night's Candidate 1-7 edits were made directly inside
-`_merge-dashboard-worktree/TaxHarvest` — the exact directory `$TaxHarvestRoot` points at for
+`_merge-dashboard-worktree/consumer-project` — the exact directory `$ConsumerRepoRoot` points at for
 every git operation `review-runner.ps1`/`apply-runner.ps1` perform.** This is precisely the
 hazard `project_ornith_agent_pipeline_resumed`'s memory already warned about avoiding
 ("NEVER point automation at the live session's own working tree"), and it was violated by

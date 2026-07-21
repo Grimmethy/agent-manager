@@ -7,7 +7,7 @@
 // re-exports, factory patterns, etc. all look "unused" to naive grep but aren't) -- the
 // triage task needs the actual call sites to judge; this script only gathers them.
 //
-// Generalized out of TaxHarvest: repoRoot and the scan/search dirs come from config.js
+// Generalized out of an earlier single-project version: repoRoot and the scan/search dirs come from config.js
 // (AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_UNUSED_SCAN_DIRS / _SEARCH_DIRS, both defaulting
 // to AGENT_MANAGER_GREP_DIRS), not hardcoded. Output goes to the same file the built-in
 // `unused_export` task source reads: <pipelineDir>/queue/dead-code-flags.json.

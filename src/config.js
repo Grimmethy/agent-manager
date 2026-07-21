@@ -1,7 +1,7 @@
 'use strict';
 
 // Single source of truth for every env-var-driven setting this package reads. A consumer
-// project (e.g. TaxHarvest) sets these in its own environment/launcher before invoking any
+// project sets these in its own environment/launcher before invoking any
 // script in this package -- there is no per-project config FILE the package loads itself,
 // matching the env-var style already established by ornith-client.js's OLLAMA_URL/
 // ORNITH_MODEL and review-runner.ps1's SECOND_BRAIN_DIR, rather than inventing a second
@@ -73,7 +73,7 @@ function getConfig() {
   // from this package's exported prompt-builder/apply helpers). Every CLI entry point in
   // this package that needs a populated registry (get-grounding-source.js, apply-task.js,
   // task-sources.js's getNextTask) requires it via this single hook instead of each
-  // hardcoding a sibling file name -- the old TaxHarvest-only pattern this replaces.
+  // hardcoding a sibling file name -- the old single-consumer-only pattern this replaces.
   const registerPath = process.env.AGENT_MANAGER_REGISTER_PATH;
 
   return {
