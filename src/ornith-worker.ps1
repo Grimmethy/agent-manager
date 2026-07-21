@@ -523,6 +523,20 @@ while ($true) {
     $implTextPath = Join-Path $TempDir ('impl-{0}.txt' -f $task.id)
     [System.IO.File]::WriteAllText($implTextPath, $implResult.response)
 
+    # Skip critique/revision entirely when the implement call itself was already
+    # deterministically skipped ($skipImplement, arch_import's zero-harness-grounding
+    # short-circuit above). Reproduced live 2026-07-21, the very first night this fix ran:
+    # critique doesn't know an empty implementResponse here is an INTENTIONAL, correct
+    # "nothing to write" outcome rather than a failure -- it just sees a blank draft and
+    # (reasonably, from its own perspective) flags it as needing revision. The revision
+    # pass then gets asked to fix a draft it was never given ("ORIGINAL IMPLEMENT DRAFT"
+    # is empty) and produces confused meta-commentary asking for the missing draft --
+    # which the structural check then correctly catches, but only after wasting two more
+    # real Ornith calls turning a deliberately-correct empty response into garbage. If
+    # there's genuinely nothing to write, there's nothing to critique either.
+    if ($skipImplement) {
+        $task | Add-Member -NotePropertyName 'critiqueOutcome' -NotePropertyValue 'skipped-no-grounding' -Force
+    } else {
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'critique'
 
     $critiquePromptLines = & node (Join-Path $PackageSrcDir 'prompts.js') $draftingPath 'critique' $planTextPath $implTextPath
@@ -562,6 +576,7 @@ while ($true) {
             # Revision was degenerate -- bounded to one attempt, leave original draft intact.
             $task | Add-Member -NotePropertyName 'revisionApplied' -NotePropertyValue $false -Force
         }
+    }
     }
 
     # Cleanup and DB mirror run unconditionally for all three critique outcomes -- not just
