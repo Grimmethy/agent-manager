@@ -57,6 +57,48 @@ function Invoke-ModelStatsDb {
     }
 }
 
+# Adapted from MeisnerDan/mission-control's scrubCredentials (scripts/daemon/security.ts)
+# -- flagged by Grimmethy (2026-07-21) as a project worth learning from for this pipeline.
+# That project spawns real API-key-holding agents and scrubs their stdout before logging;
+# this pipeline doesn't hold API keys the same way (Ornith is a local Ollama call), but it
+# DOES routinely embed raw third-party content verbatim into task text that then gets
+# logged: deep_dive clones arbitrary external GitHub repos and embeds their real file
+# content in prompts; project_search/arch_import embed real GitHub/HuggingFace search
+# results. Every one of these external sources can legitimately contain a real leaked
+# credential (an accidentally-committed .env, a hardcoded test key in a README, etc.) --
+# and until this fix, ornith-worker.ps1/review-runner.ps1/queue-watchdog.ps1 all wrote
+# planResponse/implementResponse/critique/review reasoning straight to a shared markdown
+# log (Ornith Live Log.md, which can live in a synced SecondBrain vault) with zero
+# scrubbing. This is a defense-in-depth net for THAT path specifically -- it does not touch
+# what gets embedded in prompts sent to Ornith itself, only what this pipeline writes to
+# its own log files afterward.
+$script:CredentialLogPatterns = @(
+    '\b(sk|key|ak|api[_-]?key)[_-][\w-]{20,}\b',
+    'Bearer\s+[\w\-.~+/]+=*',
+    '\b[A-Za-z0-9+/]{40,}={0,2}\b',
+    '\bAKIA[A-Z0-9]{16}\b',
+    'password\s*[:=]\s*\S+',
+    '[\w.+-]+@[\w-]+\.[\w.]+:[\S]+',
+    '\bgh[ps]_[A-Za-z0-9_]{36,}\b',
+    '\bnpm_[A-Za-z0-9]{36,}\b',
+    '\bxox[bpas]-[\w-]{10,}\b',
+    '\b[sr]k_(live|test)_[A-Za-z0-9]{20,}\b',
+    '\bsk-ant-[\w-]{20,}\b',
+    '-----BEGIN\s+(RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
+    '\b(postgres|mysql|mongodb(\+srv)?|redis)://[^\s]+',
+    '\btoken\s*[:=]\s*[\w\-.~+/]{20,}'
+)
+
+function Protect-LogSecrets {
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $result = $Text
+    foreach ($pattern in $script:CredentialLogPatterns) {
+        $result = [regex]::Replace($result, $pattern, '[REDACTED]', 'IgnoreCase')
+    }
+    return $result
+}
+
 function Read-TaskJson {
     param([string]$Path)
     return [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json

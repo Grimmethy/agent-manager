@@ -156,7 +156,7 @@ function Add-ReviewLogEntry {
     $lines.Add(('## {0} -- {1} REVIEW -- {2} [{3}]' -f $stamp, $Provider.ToUpper(), $TaskId, $Result))
     $lines.Add(('**Task:** {0}' -f $Title))
     $lines.Add('')
-    $lines.Add($Detail)
+    $lines.Add((Protect-LogSecrets $Detail))
     New-Item -ItemType Directory -Force -Path (Split-Path $ReviewLogPath) | Out-Null
     Add-Content -Path $ReviewLogPath -Value ([string]::Join("`n", $lines)) -Encoding utf8
 }

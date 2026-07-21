@@ -99,7 +99,7 @@ function Write-Heartbeat {
 function Add-WatchdogLogEntry {
     param([string]$Result, [string]$Detail)
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $lines = @('', ('## {0} -- WATCHDOG -- [{1}]' -f $stamp, $Result), '', $Detail)
+    $lines = @('', ('## {0} -- WATCHDOG -- [{1}]' -f $stamp, $Result), '', (Protect-LogSecrets $Detail))
     New-Item -ItemType Directory -Force -Path (Split-Path $ReviewLogPath) | Out-Null
     Add-Content -Path $ReviewLogPath -Value ([string]::Join("`n", $lines)) -Encoding utf8
 }
