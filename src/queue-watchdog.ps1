@@ -9,6 +9,7 @@ $InstancesDir = Join-Path $PipelineDir 'instances'
 $SecondBrainDir = if ($env:SECOND_BRAIN_DIR) { $env:SECOND_BRAIN_DIR } else { $null }
 $ReviewLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log.md' } else { Join-Path $env:TEMP 'agent-manager-live-log.md' }
 $CommunityCoveragePath = if ($env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH) { $env:AGENT_MANAGER_COMMUNITY_COVERAGE_PATH } else { Join-Path $PipelineDir 'community-coverage.json' }
+$ImportCoveragePath = if ($env:AGENT_MANAGER_IMPORT_COVERAGE_PATH) { $env:AGENT_MANAGER_IMPORT_COVERAGE_PATH } else { Join-Path $PipelineDir 'import-coverage.json' }
 $TempDir = Join-Path $env:TEMP 'queue-watchdog'
 New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
@@ -277,6 +278,31 @@ function Invoke-RejectRetryCheck {
                             }
                         } catch {
                             Write-Host ('Watchdog: failed to stamp community-coverage.json (non-fatal): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+                        }
+                    }
+                }
+                # Same fix, same reasoning, arch_import's own coverage tracker -- this
+                # branch was missing entirely when arch_import was built (only
+                # arch_discovery was ever wired up above), so an item that exhausted its
+                # review-stage retries stayed eligible for nextArchImportTask() to
+                # re-select FOREVER, since import-coverage.json's promotedAt never got
+                # touched by anything on the rejection path. Found overnight monitoring
+                # 2026-07-21: three real arch_import items (autogen-microsoft-2/6/7) had
+                # already hit ornithRejectCount=2 (exhausted) with promotedAt still null.
+                if ($task.source -eq 'arch_import' -and $task.promptContext -and $task.promptContext.itemId) {
+                    if (Test-Path $ImportCoveragePath) {
+                        try {
+                            $importCoverage = Get-Content $ImportCoveragePath -Raw | ConvertFrom-Json
+                            $itemId = [string]$task.promptContext.itemId
+                            $itemEntry = $importCoverage.items.$itemId
+                            if ($itemEntry -and -not $itemEntry.promotedAt) {
+                                $itemEntry.promotedAt = (Get-Date).ToString('o')
+                                $itemEntry.candidateId = $null  # sentinel: exhausted retries, no real candidate came of it
+                                [System.IO.File]::WriteAllText($ImportCoveragePath, ($importCoverage | ConvertTo-Json -Depth 10))
+                                Write-Host ('Watchdog: arch_import item {0} exhausted retries -- stamped promotedAt so rotation moves on.' -f $itemId) -ForegroundColor DarkCyan
+                            }
+                        } catch {
+                            Write-Host ('Watchdog: failed to stamp import-coverage.json (non-fatal): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
                         }
                     }
                 }
