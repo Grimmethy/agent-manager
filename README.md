@@ -126,12 +126,18 @@ Pending, Review, Approved, Blocked, Done) — click any task row for its full de
 (plan/implement text, blocked reason, branch). Polls every 5s. `AGENT_MANAGER_DASHBOARD_PORT`
 picks the port (default `7420`).
 
-**Project tab**: browse the filesystem (drive letters → folders, `.git` roots flagged) to
-pick any codebase, click **Build Graph** to run `build_graph.py` against it in the
-background, and see the resulting interactive graph rendered inline once it's done. This
-is **decoupled from whichever project the live pipeline is actually running against** —
-that's still controlled by `agent-manager.env`/`launch.bat` — so you can explore any
-project's structure from the dashboard without needing a pipeline running for it at all.
+### Tabs
+
+**Project**
+
+![Project tab](docs/images/tab-project.png)
+
+Pick and inspect any codebase, independent of whichever project the live pipeline is
+actually pointed at. Browse the filesystem, click **Build Graph** to run `build_graph.py`
+against it, and get the resulting file-level import graph rendered inline (drag nodes,
+toggle **Drag entire community** / **Autosort**). Also shows the live pipeline's own
+running/stopped status and a **Start Pipeline** / **Stop Pipeline** control.
+
 Each browsed project's graph, layout, and node positions are cached inside that project
 itself, under `.agent-manager-cache/<slug>/` (`<slug>` is `default`, or a short hash of
 the `grepDirs` you scanned with if you gave any -- so browsing the same project with
@@ -141,6 +147,50 @@ which agent-manager install or machine browses it -- add `.agent-manager-cache/`
 project's own `.gitignore` if you don't want it tracked. (Caches from before this cache
 moved inside the project, under `python/dashboard/project_cache/`, are migrated
 automatically the first time each project loads.)
+
+**Workers**
+
+![Workers tab](docs/images/tab-workers.png)
+
+One card per always-on process (`ornith-worker`, `review-runner`, `apply-runner`,
+`queue-watchdog`), read straight from their `instances/*.json` heartbeat files: pid, model,
+last-heartbeat age, current status (idle/working/checking/stale), and — while a worker is
+drafting — which task and pass (plan/implement/critique) it's actually working on. Click a
+`working` card to jump straight to that task's detail, wherever it currently sits in the
+queue.
+
+**Models**
+
+![Models tab](docs/images/tab-models.png)
+
+Per-model call statistics from `model-stats.db`: call count, approve rate, token
+throughput (avg/low/high tok/s), average latency, and counts of degenerate/errored
+responses. This is how an `ORNITH_AB_MODELS` comparison (or just tracking one model's
+stability over time) gets judged — not vibes.
+
+**Job List**
+
+![Job List tab](docs/images/tab-joblist.png)
+
+Every registered task source (built-in and custom), its priority, the domain it stamps on
+generated tasks, and a one-line description of what it does — the same priority ordering
+`task-sources.js` walks when picking the next task to draft.
+
+**Scouted Repos**
+
+![Scouted Repos tab](docs/images/tab-deepdive.png)
+
+The `deep_dive` pipeline's per-project rotation state (ADR-0019): every external repo
+`project_search` has surfaced, how many of its import-graph communities have been reviewed,
+how many actionable items came out of that review, and when it was cloned. Check **Hot** to
+hotlist a project — hotlisted projects' communities always win the next `deep_dive` pick
+over the plain oldest-reviewed-first rule. Click a row to see that project's communities and
+drill into the Use/Adapt/Ignore-rated items an inline-expanded review produced for each one.
+
+**Job Status** (Drafting / Pending / Review / Approved / Blocked / Done)
+
+The six queue-stage tabs mirror `queue/*/` directly off disk — one row per task, click any
+row for its full detail (plan/implement text, blocked reason, pushed branch).
 
 ## Registering a custom task source
 
