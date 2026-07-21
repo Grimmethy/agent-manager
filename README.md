@@ -249,6 +249,17 @@ runner -- no extra dependency. Coverage starts with `apply-task.js`'s git sequen
 single place that actually mutates the consumer's real git repo), exercised against
 `git-runner.js`'s fake adapter rather than a real repo/child_process.
 
+## Drift scan
+
+Some UI surfaces (currently: the dashboard's Job List tab) are hand-maintained text
+mirroring a live registry elsewhere in the code, instead of being generated from it --
+exactly the kind of thing that silently rots as the registry changes underneath it (found
+live 2026-07-20: two newly-registered task sources were invisible in the tab for days).
+`npm run drift-scan` is a deterministic, non-LLM set-difference check for exactly that --
+no judgment calls, just "does every registered priority have a matching row." Run it
+manually/periodically, same as `build_graph.py`; findings are written to
+`<pipelineDir>/queue/drift-flags.json`, non-zero exit on any drift.
+
 ## License
 
 MIT — see `LICENSE`.
