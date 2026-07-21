@@ -63,6 +63,13 @@ function Invoke-OrnithClient {
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
         $rawLines = & node $clientPath $reqPath
+        # See Invoke-OrnithMajorityVote's matching comment below -- same silent-failure
+        # shape, same fix: ornith-client.js's CLI writes errors to stderr (dropped by the
+        # stdout-only capture above) and exits 1, so without this a real crash here just
+        # surfaced as an undiagnosable empty/null result.
+        if ($LASTEXITCODE -ne 0) {
+            throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+        }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
     }
@@ -84,6 +91,16 @@ function Invoke-OrnithMajorityVote {
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
         $rawLines = & node $clientPath $reqPath
+        # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on
+        # failure (console.error + process.exit(1)) -- stdout capture above silently drops
+        # that message, so a real crash here surfaced as the generic, undiagnosable
+        # "Ornith majority-vote call returned nothing" (found live 2026-07-21, a review
+        # task blocked with zero information about what actually went wrong). Checking the
+        # exit code and throwing with whatever WAS captured turns that into a real,
+        # actionable blockedReason instead.
+        if ($LASTEXITCODE -ne 0) {
+            throw ('ornith-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+        }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
     }

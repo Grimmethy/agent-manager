@@ -68,6 +68,15 @@ function Invoke-OrnithClient {
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     $rawLines = & node $clientPath $reqPath
+    # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on failure
+    # (console.error + process.exit(1)) -- the stdout-only capture above silently drops
+    # that message. Without this, a real crash here would fall through to
+    # ConvertFrom-Json on empty/partial input below with no indication of the actual
+    # cause -- same silent-failure shape found live 2026-07-21 in review-runner.ps1's
+    # matching functions, fixed there for the same reason.
+    if ($LASTEXITCODE -ne 0) {
+        throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+    }
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
 }

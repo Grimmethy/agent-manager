@@ -428,7 +428,15 @@ function nextProjectSearchTask() {
 // BEFORE project_search (its own generator): draining the backlog of un-dissected Strong
 // leads takes priority over finding more of them.
 //
-const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 60000;
+// Was 60000 (~15K tokens) -- confirmed live 2026-07-21 this was nearly double
+// ornith-client.js's num_ctx=8192 default, which deep_dive's plan/implement calls never
+// override. A community anywhere near the old ceiling had literally no room left in the
+// context window for a response, regardless of thinking mode -- the no-think retry
+// fallback (ornith-worker.ps1) helps the THINKING-budget-exhaustion failure mode, but
+// can't rescue a prompt that overflows num_ctx outright before any output is generated.
+// 24000 chars (~6K tokens) leaves headroom for the prompt template/instructions plus
+// num_predict=1400's response reservation within the 8192 budget.
+const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 24000;
 
 // Cross-references INDEX.md's table rows against its '## Notes' '### Name' subsections --
 // only a Strong-rated finding gets a subsection there (see apply-group-a.js's
