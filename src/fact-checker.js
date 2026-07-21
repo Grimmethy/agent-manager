@@ -25,19 +25,80 @@ function extractFilePaths(text) {
   return [...new Set(matches)];
 }
 
-function resolveAgainstRepo(repoRoot, candidatePath) {
+// Same skip-list unused-export-scan.js already uses for its own directory walk --
+// deliberately not walking into these regardless of repo size.
+// '.claude' skipped too -- confirmed live 2026-07-21: a stray leftover git worktree at
+// .claude/worktrees/<name>/ (not created by this fix, pre-existing debris) contains
+// duplicate copies of real source files, which otherwise makes an unambiguous match
+// falsely look ambiguous (2 matches: the real file + its worktree copy) and blocks a
+// resolution that should have succeeded cleanly.
+const WALK_SKIP_DIRS = new Set(['node_modules', '.git', '.claude', 'queue', 'instances', 'dist', 'build', 'coverage', '.next', 'target', 'vendor']);
+
+// Bounded recursive search for a file matching `basename` anywhere under `root`. Only
+// used as a last-resort fallback (see resolveAgainstRepo below) -- deep_dive tasks review
+// a CLONED external repo with an arbitrary, unknowable-in-advance layout, so no fixed
+// extraRoots list can generalize the way it can for this package's own repo. Stops at
+// maxResults finds; resolveAgainstRepo treats anything other than exactly one match as
+// unresolved (0 = genuinely doesn't exist; >1 = ambiguous, don't guess which one).
+function findByBasename(root, basename, maxResults = 2) {
+  const found = [];
+  function walk(dir) {
+    if (found.length >= maxResults) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (found.length >= maxResults) return;
+      if (entry.isDirectory()) {
+        if (WALK_SKIP_DIRS.has(entry.name)) continue;
+        walk(path.join(dir, entry.name));
+      } else if (entry.isFile() && entry.name === basename) {
+        found.push(path.join(dir, entry.name));
+      }
+    }
+  }
+  walk(root);
+  return found;
+}
+
+// extraRoots: repoRoot-relative dirs to ALSO try prefixing the claimed path with, for
+// when a draft writes a bare filename dropped of its real leading directory (e.g. "Files:
+// ornith-client.js" instead of "src/ornith-client.js" -- confirmed live 2026-07-21: this
+// repo's own arch_discovery drafts do exactly this routinely). Previously hardcoded to
+// 'backend'/'backend/python_services' -- a DIFFERENT consumer project's layout baked into
+// this package's own code, not generalized. This repo's real files live under 'src/',
+// which was never tried, so EVERY bare-filename claim against a src/ file false-negatived
+// as "missing" and got misreported to review as fabrication. Now sourced from
+// getConfig().grepAllowedDirs (the same "consumer configures where real code lives"
+// config every other path-scoped tool in this package already uses), not hardcoded.
+//
+// Falls back to findByBasename() when the direct joins above all miss -- confirmed live
+// the SAME session, same root cause, different flavor: a deep_dive draft reviewing a
+// CLONED external repo wrote "Files: SummaryCard.tsx" when the real file is nested three
+// directories deep (desktop/src/components/ExecutionReport/SummaryCard.tsx). No fixed
+// extraRoots list can be known in advance for an arbitrary external repo's layout, so this
+// tier searches for it instead -- but only trusts a single, unambiguous match.
+function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
   const normalized = candidatePath.replace(/\\/g, '/').replace(/^\.?\//, '');
-  const tryRoots = [repoRoot, path.join(repoRoot, 'backend'), path.join(repoRoot, 'backend', 'python_services')];
+  const tryRoots = [repoRoot, ...extraRoots.map((r) => path.join(repoRoot, r))];
   for (const root of tryRoots) {
     const full = path.join(root, normalized);
     if (fs.existsSync(full)) return full;
   }
+
+  const basename = path.basename(normalized);
+  const matches = findByBasename(repoRoot, basename);
+  if (matches.length === 1) return matches[0];
+
   return null;
 }
 
-function checkFilePaths(text, repoRoot) {
+function checkFilePaths(text, repoRoot, extraRoots = []) {
   return extractFilePaths(text).map((claimedPath) => {
-    const resolved = resolveAgainstRepo(repoRoot, claimedPath);
+    const resolved = resolveAgainstRepo(repoRoot, claimedPath, extraRoots);
     return { claimedPath, exists: !!resolved, resolvedPath: resolved };
   });
 }
@@ -52,9 +113,9 @@ function extractClaimedRelationships(text) {
   return out;
 }
 
-function checkRelationships(text, repoRoot) {
+function checkRelationships(text, repoRoot, extraRoots = []) {
   return extractClaimedRelationships(text).map((rel) => {
-    const resolvedFrom = /\.[a-z]+$/i.test(rel.from) ? resolveAgainstRepo(repoRoot, rel.from) : null;
+    const resolvedFrom = /\.[a-z]+$/i.test(rel.from) ? resolveAgainstRepo(repoRoot, rel.from, extraRoots) : null;
     if (!resolvedFrom) {
       return { ...rel, checked: false, reason: 'claimed source is not a resolvable file path' };
     }
@@ -151,9 +212,9 @@ function checkGroundedValues(draftText, sourceText) {
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
 // draft is correct. `sourceText` (optional) is the material Ornith was actually given for
 // this task; when provided, the grounded-value check runs against it.
-function checkDraft(draftText, repoRoot, sourceText) {
-  const fileChecks = checkFilePaths(draftText, repoRoot);
-  const relationshipChecks = checkRelationships(draftText, repoRoot);
+function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
+  const fileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
+  const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText);
 
@@ -182,6 +243,8 @@ module.exports = {
   checkGroundedValues,
   extractFilePaths,
   extractClaimedRelationships,
+  resolveAgainstRepo,
+  findByBasename,
 };
 
 if (require.main === module) {
@@ -192,5 +255,16 @@ if (require.main === module) {
   }
   const draftText = fs.readFileSync(draftPath, 'utf8');
   const sourceText = sourcePath && fs.existsSync(sourcePath) ? fs.readFileSync(sourcePath, 'utf8') : undefined;
-  console.log(JSON.stringify(checkDraft(draftText, repoRoot, sourceText), null, 2));
+  // Best-effort: grepAllowedDirs comes from AGENT_MANAGER_REPO_ROOT's config, which should
+  // always be set when this runs as part of the real pipeline (review-runner.ps1 requires
+  // it already) -- but this script is also useful as a standalone CLI against an arbitrary
+  // repoRoot, so a missing/misconfigured env var degrades to the old repoRoot-only
+  // behavior instead of crashing the fact-check (and, transitively, the whole review pass).
+  let extraRoots = [];
+  try {
+    extraRoots = require('./config.js').getConfig().grepAllowedDirs;
+  } catch {
+    /* no AGENT_MANAGER_REPO_ROOT in this context -- fall back to repoRoot-only resolution */
+  }
+  console.log(JSON.stringify(checkDraft(draftText, repoRoot, sourceText, extraRoots), null, 2));
 }
