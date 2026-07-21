@@ -202,10 +202,15 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
   return { file: analysisPath, itemCount: items.length };
 }
 
-// Parses arch_discovery's implement-pass output (see prompts.js's archDiscoveryImplementPrompt
-// for the exact "### AC-NNN · Title" format this must match) into candidate objects, one
-// per "### AC-" heading. Deliberately does NOT trust the AC-NNN number Ornith picked --
-// applyArchDiscoveryCandidates re-derives it below instead (see that function's comment).
+// Parses arch_discovery's AND arch_import's implement-pass output (see prompts.js's
+// archDiscoveryImplementPrompt / archImportImplementPrompt for the exact
+// "### AC-NNN · Title" format both must match) into candidate objects, one per "### AC-"
+// heading. arch_import's blocks additionally carry a "Source:" line (provenance back to
+// the external project + deep_dive item this was promoted from) -- optional here since
+// arch_discovery's own candidates never have one; harmless to look for either way, same
+// as Strength:/Files: already being optional-with-fallback below. Deliberately does NOT
+// trust the AC-NNN number Ornith picked -- applyArchDiscoveryCandidates re-derives it
+// below instead (see that function's comment).
 //
 // Lenient on the AC-NNN/title separator specifically: replaying the two real
 // arch_discovery tasks that failed apply live (2026-07-21) showed Ornith reliably drops
@@ -227,15 +232,17 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const titleMatch = headingLine.match(/AC-\d+\s*(?:[·:—-]\s*)?(.+)/);
       if (!titleMatch) return null;
       const strengthMatch = block.match(/^Strength:\s*(.+)$/m);
+      const sourceMatch = block.match(/^Source:\s*(.+)$/m);
       const filesMatch = block.match(/^Files:\s*(.+)$/m);
-      // Body is everything after the Files: line (or after the heading, if Files: is
-      // somehow absent) -- the Problem/Solution/Benefits paragraphs, kept verbatim.
-      const bodyAnchor = filesMatch ? filesMatch[0] : headingLine;
+      // Body is everything after the LAST metadata line present (Files:, else Source:,
+      // else the heading) -- the Problem/Solution/Benefits paragraphs, kept verbatim.
+      const bodyAnchor = filesMatch ? filesMatch[0] : sourceMatch ? sourceMatch[0] : headingLine;
       const anchorIdx = block.indexOf(bodyAnchor);
       const body = block.slice(anchorIdx + bodyAnchor.length).trim();
       return {
         title: titleMatch[1].trim(),
         strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
+        source: sourceMatch ? sourceMatch[1].trim() : '',
         files: filesMatch ? filesMatch[1].trim() : '',
         body,
       };
@@ -268,18 +275,19 @@ function nextAvailableCandidateId(existingText) {
 // dropped as "already in queue"). Assigned sequentially against the text as it grows
 // within this same call, so multiple candidates in one implementResponse never collide
 // with each other either.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath }) {
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates' }) {
   const candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
 
-  let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : '# Architecture Review Candidates\n';
+  let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
   const candidateIds = [];
   for (const c of candidates) {
     const id = `AC-${nextAvailableCandidateId(text)}`;
     const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+    if (c.source) lines.push(`Source: ${c.source}`);
     if (c.files) lines.push(`Files: ${c.files}`);
     lines.push('', c.body);
     text += '\n' + lines.join('\n') + '\n';
@@ -292,6 +300,41 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath }) {
   return { file: candidatesPath, candidateCount: candidates.length, candidateIds };
 }
 
+// arch_import's apply step (ADR-0020): wraps applyArchDiscoveryCandidates (same
+// markdown-candidate append it already does for arch_discovery, since the format is
+// byte-compatible modulo the Source: line) with the one extra thing arch_import needs
+// that arch_discovery doesn't -- stamping import-coverage.json's item entry as promoted,
+// same "mark the source state so it's never re-offered" convention
+// applyDeepDiveFindings already uses for deep-dive-coverage.json.
+function applyArchImportCandidate({ implementResponse, candidatesPath, importCoveragePath, task }) {
+  const { itemId, sourceProject } = task.promptContext;
+
+  const result = applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle: '# Architecture Import Candidates' });
+
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+  coverage.items[itemId] = {
+    promotedAt: new Date().toISOString(),
+    // null, not omitted, when skipped -- an explicit "considered, no candidate came of
+    // it" is a real, distinguishable outcome from "never looked at," same reasoning
+    // deep_dive already applies to Ignore-rated items getting a stableId at all.
+    candidateId: result.skipped ? null : result.candidateIds[0],
+    projectSlug: sourceProject,
+  };
+  fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
+  fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+
+  // Same shape applyArchDiscoveryCandidates already returns ({skipped,reason} or
+  // {file,candidateCount,candidateIds}) -- apply-task.js's generic writeArtifact() flow
+  // already knows how to handle both, no extra wrapping needed here.
+  return result;
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
@@ -300,4 +343,5 @@ module.exports = {
   parseDeepDiveItems,
   applyArchDiscoveryCandidates,
   parseArchDiscoveryCandidates,
+  applyArchImportCandidate,
 };

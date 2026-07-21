@@ -4,8 +4,8 @@
 // access, so every task JSON written here is self-contained: it embeds the actual file
 // text a prompt will need, rather than a path the model could never read on its own.
 //
-// This package ships 9 generic, project-agnostic sources at priorities
-// 10/20/40/70/80/81/82/85/90. Priorities 30/50/60 are deliberately left open -- a consumer
+// This package ships 10 generic, project-agnostic sources at priorities
+// 10/20/40/70/71/80/81/82/85/90. Priorities 30/50/60 are deliberately left open -- a consumer
 // project registers its own domain-specific sources there via registerTaskSource (see
 // README.md), so the combined priority order reads as one coherent backlog without
 // renumbering anything.
@@ -15,7 +15,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
-const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyArchImportCandidate } = require('./apply-group-a.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -224,9 +224,17 @@ function nextSecondBrainTask() {
 // arch_discovery below. Only Strong-rated candidates are eligible for auto-queue.
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
-function nextArchReviewTask() {
-  const { archReviewCandidatesPath, defaultDomain } = getConfig();
-  const text = readIfExists(archReviewCandidatesPath);
+// Shared by arch_review (candidatesPath=archReviewCandidatesPath) and arch_import_review
+// (candidatesPath=archImportCandidatesPath) -- both consume an identically-shaped
+// "### AC-NNN · Title / Strength: ... / Files: ..." candidates doc and turn the oldest
+// Strong one into a real fulfillment task, differing only in WHICH doc and what `source`
+// gets stamped on the resulting task. Was nextArchReviewTask() until ADR-0020's
+// arch_import_review needed the exact same logic against a second doc -- parameterized
+// instead of copy-pasting a second near-identical function that would inevitably drift
+// (see this whole session's running theme of exactly that happening elsewhere).
+function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+  const { defaultDomain } = getConfig();
+  const text = readIfExists(candidatesPath);
   if (!text) return null;
 
   const sections = [];
@@ -265,7 +273,7 @@ function nextArchReviewTask() {
 
     if (section.length > MAX_ARCH_REVIEW_TASK_CHARS) continue;
 
-    const taskId = 'arch-review-' + candidateId.toLowerCase();
+    const taskId = sourceName.replace(/_/g, '-') + '-' + candidateId.toLowerCase();
     if (taskIdExistsInQueue(taskId)) continue;
 
     const titleMatch = headingLine.match(/AC-\d+\s*·\s*(.+)/);
@@ -280,7 +288,7 @@ function nextArchReviewTask() {
     return {
       id: taskId,
       domain: defaultDomain,
-      source: 'arch_review',
+      source: sourceName,
       title: `${candidateId} · ${titleText}`,
       promptContext: {
         candidateId,
@@ -300,7 +308,11 @@ function nextArchReviewTask() {
 // once there's nothing left to consume, so this never piles up junk faster than arch_review
 // can drain it. The model has no filesystem access, so every real file this needs is read
 // here and embedded verbatim into promptContext.
-const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 60000;
+// Was 60000, same bug and same fix as DEEP_DIVE_CONTEXT_BUDGET_CHARS below (see its
+// comment) -- nearly double ornith-client.js's num_ctx=8192 default, which arch_discovery's
+// plan call never overrides. Hadn't yet triggered a live degenerate-empty failure the way
+// deep_dive's did, but the same overflow risk existed regardless.
+const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 24000;
 
 function nextArchDiscoveryTask() {
   const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, defaultDomain } = getConfig();
@@ -643,7 +655,19 @@ function nextUnusedExportTask() {
 registerTaskSource('adhoc', { priority: 10, next: nextAdhocTask });
 registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
-registerTaskSource('arch_review', { priority: 70, next: nextArchReviewTask });
+registerTaskSource('arch_review', {
+  priority: 70,
+  next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
+});
+// arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
+// against arch_import's own candidates doc instead of arch_discovery's. Priority 71 --
+// immediately after arch_review (70), before arch_discovery (80) -- every stage's own
+// consumer outranks its own generator, and outranks the stage that feeds it; see
+// docs/arch-import-pipeline.md for the full priority-ladder reasoning.
+registerTaskSource('arch_import_review', {
+  priority: 71,
+  next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
+});
 // apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
 // markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
 // JSON -- without this, apply-task.js's writeArtifact() falls through to the generic Group
@@ -658,20 +682,122 @@ registerTaskSource('arch_discovery', {
   },
 });
 
-// --- Source: arch_import -- STUB for now (ADR-0020, deferred to a later task: real
-// item-scanning/promotion logic). Reads importCoveragePath if present and returns null
-// unconditionally -- safe to register now without any risky logic yet, same shape as
-// deep_dive's own initial stub. ---
+// --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
+// agent-manager-grounded architecture candidate (priority 81, ADR-0020,
+// docs/arch-import-pipeline.md). Deliberately placed AFTER arch_import_review (71, its
+// own consumer) and BEFORE deep_dive (82, its own generator) -- same "drain before
+// generate, outrank your own generator" principle every stage in this ladder follows.
+//
+// Scans every UsefulProjectIndex/analysis/<project>.md for **ID:**-tagged items (stamped
+// by applyDeepDiveFindings at write time) not yet a key in import-coverage.json, adds
+// them with promotedAt: null, then picks the oldest not-yet-promoted Use/Adapt item not
+// already in-flight. Ignore-rated items are never import candidates -- deep_dive's own
+// "honest nothing found" outcome has nothing to promote. Items with no **ID:** at all
+// (written before that stamping existed) are deliberately never considered -- same
+// "pre-existing entries are ambiguous, not retroactively fixed" precedent
+// docs/deep-dive-pipeline.md already sets for community-name matching.
 function nextArchImportTask() {
-  const { importCoveragePath } = getConfig();
+  const { deepDiveAnalysisDir, importCoveragePath, defaultDomain } = getConfig();
+
+  let entries;
   try {
-    JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+    entries = fs.readdirSync(deepDiveAnalysisDir, { withFileTypes: true });
   } catch {
-    // Malformed tracker -- nothing to do yet regardless.
+    return null; // no analysis dir yet -- nothing to promote
   }
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
+  } catch {
+    coverage = { items: {} };
+  }
+  if (!coverage.items) coverage.items = {};
+
+  let coverageChanged = false;
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+    const projectSlug = entry.name.replace(/\.md$/, '');
+    const text = readIfExists(path.join(deepDiveAnalysisDir, entry.name));
+    if (!text) continue;
+
+    // Split on H2 ("## ") item headings -- drop index 0, which is the "# <project> —
+    // Deep Dive" H1 header line applyDeepDiveFindings writes on first create, not a real
+    // item block.
+    const blocks = text.split(/(?=^## )/m).slice(1);
+    for (const block of blocks) {
+      const idMatch = block.match(/^\*\*ID:\*\*\s*(\S+)/m);
+      if (!idMatch) continue;
+      const itemId = idMatch[1];
+
+      if (!(itemId in coverage.items)) {
+        coverage.items[itemId] = { promotedAt: null, candidateId: null, projectSlug };
+        coverageChanged = true;
+      }
+      if (coverage.items[itemId].promotedAt) continue; // already promoted
+
+      const ratingMatch = block.match(/^\*\*Rating:\*\*\s*(\S+)/m);
+      const rating = ratingMatch ? ratingMatch[1] : '';
+      if (rating !== 'Use' && rating !== 'Adapt') continue;
+
+      const titleMatch = block.match(/^##\s*(.+)$/m);
+      const filesMatch = block.match(/^\*\*Files:\*\*\s*(.+)$/m);
+      const rationaleAnchor = filesMatch ? filesMatch[0] : idMatch[0];
+      const rationale = block.slice(block.indexOf(rationaleAnchor) + rationaleAnchor.length).trim();
+
+      candidates.push({
+        itemId,
+        projectSlug,
+        title: titleMatch ? titleMatch[1].trim() : itemId,
+        rating,
+        files: filesMatch ? filesMatch[1].trim() : '',
+        rationale,
+      });
+    }
+  }
+
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
+    fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+
+  // No timestamp is stamped on an item itself (only on promotion), and itemId's numeric
+  // suffix is only meaningfully ordered WITHIN one project (each has its own independent
+  // counter) -- sorting by itemId string is just for a stable, reproducible pick across
+  // repeated calls, not a claim of real chronological ordering across projects.
+  candidates.sort((a, b) => a.itemId.localeCompare(b.itemId));
+
+  for (const c of candidates) {
+    const taskId = 'arch-import-' + c.itemId;
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: 'arch_import',
+      title: `Arch import: ${c.title} (from ${c.projectSlug})`,
+      promptContext: {
+        itemId: c.itemId,
+        sourceProject: c.projectSlug,
+        itemTitle: c.title,
+        rating: c.rating,
+        itemFiles: c.files,
+        itemRationale: c.rationale,
+      },
+    };
+  }
+
   return null;
 }
-registerTaskSource('arch_import', { priority: 81, next: nextArchImportTask });
+registerTaskSource('arch_import', {
+  priority: 81,
+  next: nextArchImportTask,
+  apply: ({ implementResponse, task }) => {
+    const { archImportCandidatesPath, importCoveragePath } = getConfig();
+    return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
+  },
+});
 
 registerTaskSource('deep_dive', { priority: 82, next: nextDeepDiveTask });
 registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask });
@@ -704,7 +830,8 @@ function writeTask(task) {
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
-  nextArchReviewTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
+  nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
+  nextArchImportTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

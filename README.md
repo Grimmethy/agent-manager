@@ -76,7 +76,7 @@ convention the underlying model client already used. Set these before launching 
 
 ## Built-in task sources
 
-Nine, at priorities 10/20/40/70/80/81/82/85/90 (30/50/60 left open for yours):
+Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
 
 | Source | Priority | Reads |
 |---|---|---|
@@ -84,8 +84,9 @@ Nine, at priorities 10/20/40/70/80/81/82/85/90 (30/50/60 left open for yours):
 | `trouble_log` | 20 | `AGENT_MANAGER_TROUBLE_LOG_PATH`, entries flagged 🤖 |
 | `secondbrain` | 40 | `SECOND_BRAIN_DIR/Inbox/*.md` |
 | `arch_review` | 70 | `AGENT_MANAGER_ARCH_CANDIDATES_PATH`, entries rated Strong |
+| `arch_import_review` | 71 | `AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH` (ADR-0020) — same fulfillment logic as `arch_review`, against `arch_import`'s own candidates doc |
 | `arch_discovery` | 80 | `AGENT_MANAGER_GRAPH_PATH` + `AGENT_MANAGER_COMMUNITY_COVERAGE_PATH` — generates new candidates one graph community at a time |
-| `arch_import` | 81 | `AGENT_MANAGER_IMPORT_COVERAGE_PATH` (ADR-0020) — promotes reviewed `deep_dive` findings into architecture-import candidates. Registered but not yet generating tasks (stub). |
+| `arch_import` | 81 | `AGENT_MANAGER_IMPORT_COVERAGE_PATH` + deep_dive's analysis docs (ADR-0020) — promotes a reviewed `deep_dive` Use/Adapt finding into a real, agent-manager-grounded import candidate |
 | `deep_dive` | 82 | Reviews one import-graph community at a time from a `project_search` Strong lead's cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019) |
 | `project_search` | 85 | Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment (ADR-0018) |
 | `unused_export` | 90 | `queue/dead-code-flags.json` (produce this with your own scanner) |

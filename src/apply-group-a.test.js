@@ -18,8 +18,11 @@ const path = require('path');
 const fs = require('fs');
 const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates } = require('./apply-group-a.js');
 
-function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
-  return [`### ${id} · ${title}`, `Strength: ${strength}`, `Files: ${files}`, '', body].join('\n');
+function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
+  const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
+  if (source) lines.push(`Source: ${source}`);
+  lines.push(`Files: ${files}`, '', body);
+  return lines.join('\n');
 }
 
 test('parseArchDiscoveryCandidates returns [] for an empty implement response', () => {
@@ -34,6 +37,18 @@ test('parseArchDiscoveryCandidates parses a single candidate block', () => {
   assert.equal(parsed[0].strength, 'Strong');
   assert.equal(parsed[0].files, 'src/foo.js');
   assert.match(parsed[0].body, /Problem:/);
+});
+
+test('parseArchDiscoveryCandidates captures an optional Source: line (arch_import\'s format)', () => {
+  const parsed = parseArchDiscoveryCandidates(candidateBlock({ source: 'crewai — "Per-project settings store"' }));
+  assert.equal(parsed[0].source, 'crewai — "Per-project settings store"');
+  assert.match(parsed[0].body, /Problem:/);
+  assert.doesNotMatch(parsed[0].body, /Source:/, 'Source: line must not leak into the body');
+});
+
+test('parseArchDiscoveryCandidates leaves source empty when absent (arch_discovery\'s format)', () => {
+  const parsed = parseArchDiscoveryCandidates(candidateBlock());
+  assert.equal(parsed[0].source, '');
 });
 
 test('parseArchDiscoveryCandidates parses multiple candidates from one response', () => {
@@ -76,6 +91,27 @@ test('applyArchDiscoveryCandidates creates the doc on first write', () => {
   const text = fs.readFileSync(candidatesPath, 'utf8');
   assert.match(text, /### AC-1 · New Thing/);
   assert.match(text, /Strength: Strong/);
+});
+
+test('applyArchDiscoveryCandidates writes the Source: line through when present (arch_import)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_IMPORT_CANDIDATES.md');
+  applyArchDiscoveryCandidates({
+    implementResponse: candidateBlock({ title: 'Imported Thing', source: 'crewai — "Per-project settings"' }),
+    candidatesPath,
+    docTitle: '# Architecture Import Candidates',
+  });
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.match(text, /^# Architecture Import Candidates/);
+  assert.match(text, /Source: crewai — "Per-project settings"/);
+});
+
+test('applyArchDiscoveryCandidates omits the Source: line entirely when absent (arch_discovery)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_REVIEW_CANDIDATES.md');
+  applyArchDiscoveryCandidates({ implementResponse: candidateBlock({ title: 'Internal Thing' }), candidatesPath });
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.doesNotMatch(text, /Source:/);
 });
 
 test('applyArchDiscoveryCandidates re-derives the AC-NNN id instead of trusting Ornith\'s, avoiding a collision', () => {

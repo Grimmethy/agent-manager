@@ -5,8 +5,14 @@ Design reached via `/grill-me` on 2026-07-20; decision recorded in
 update it as the pattern changes, same convention as `docs/arch-discovery-pipeline.md`,
 `docs/project-search-pipeline.md`, and `docs/deep-dive-pipeline.md`.
 
-**Status as of 2026-07-20: designed, not built.** Nothing below exists in the codebase
-yet. This is the spec the implementation should match.
+**Status as of 2026-07-21: built.** Implemented per the spec below: `nextArchImportTask()`
+and `nextCandidateFulfillmentTask()` (task-sources.js), the harness-fetch branch
+(ornith-worker.ps1), `archImportPlanPrompt`/`archImportImplementPrompt`
+(prompts.js), and `applyArchImportCandidate` (apply-group-a.js). Verified via a full
+synthetic round-trip test plus a manual dry run against a real deep_dive item (real plan
+pass, real harness-fetch, real implement pass) -- not yet watched all the way through a
+live `arch_import_review` fulfillment branch, which will happen organically as the live
+pipeline processes real items.
 
 ## Purpose
 

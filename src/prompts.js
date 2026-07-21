@@ -9,7 +9,7 @@
 // Per-source prompt-building logic lives in the task-source registry (see
 // task-source-registry.js) -- a registered source supplies its own buildPlanPrompt/
 // buildImplementPrompt. require('./task-sources.js') below is loaded purely for its side
-// effect of populating the registry with this package's 6 built-in sources.
+// effect of populating the registry with this package's 10 built-in sources.
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
 require('./task-sources.js');
 
@@ -282,6 +282,78 @@ function deepDiveImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// arch_import (ADR-0020, docs/arch-import-pipeline.md): closes the loop project_search
+// and deep_dive started. deep_dive already rated this item Use/Adapt against a real
+// external project's files; arch_import's job is narrower -- find out where in
+// agent-manager's OWN code this idea would actually land, then draft a real,
+// agent-manager-grounded candidate. Same two-call shape as project_search (plan proposes
+// search terms Ornith itself can't run, the harness runs them, implement gets real
+// results) but searching agent-manager's own repo instead of GitHub/Hugging Face -- see
+// ornith-worker.ps1's arch_import branch and arch-import-fetch.js.
+function archImportPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    `You are looking at ONE finding a previous deep-dive pass already made about an external project ("${ctx.sourceProject}"), rated ${ctx.rating} for agent-manager:`,
+    '',
+    `TITLE: ${ctx.itemTitle}`,
+    `SOURCE FILES (in ${ctx.sourceProject}): ${ctx.itemFiles || '(none given)'}`,
+    `RATIONALE: ${ctx.itemRationale}`,
+    '',
+    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find WHERE in agent-manager\'s own codebase this idea would actually apply -- e.g. an existing config module it could extend, or a pattern it would replace or sit alongside. Think about what agent-manager concept this maps to, not just keywords from the finding above.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function archImportImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in agent-manager\'s own code)';
+  const filesText = files.length > 0
+    ? files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')
+    : '(no file content fetched)';
+  return [
+    `Earlier you proposed search terms to find where this deep-dive finding applies in agent-manager's own code:`,
+    '',
+    planText,
+    '',
+    `ORIGINAL FINDING (from ${ctx.sourceProject}, rated ${ctx.rating}): ${ctx.itemTitle} -- ${ctx.itemRationale}`,
+    '',
+    'The harness ran those searches against agent-manager\'s OWN repo. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'Now write ONE architecture-import candidate grounded in the REAL agent-manager files above -- name real files the search actually found, not guessed or invented ones. If the searches found nothing that makes this finding concretely applicable to agent-manager\'s real code, output the empty string and nothing else; do not force a candidate onto files that do not actually fit.',
+    '',
+    'The candidate MUST use exactly this format (this must match the parser exactly or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Title',
+    'Strength: Strong',
+    `Source: ${ctx.sourceProject} — "${ctx.itemTitle}"`,
+    'Files: comma, separated, agent-manager, file, paths (from the real matches above)',
+    '',
+    'Problem:',
+    'A paragraph describing the friction in agent-manager\'s own code, grounded in the real files above.',
+    '',
+    'Solution:',
+    'A paragraph describing the fix, informed by (but adapted for agent-manager, not copied verbatim from) the original finding.',
+    '',
+    'Benefits:',
+    'A paragraph describing what improves.',
+    '',
+    '(Strength may instead be "Worth exploring" or "Speculative" if you are less confident.) Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.',
+  ].join('\n');
+}
+
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -360,12 +432,19 @@ function genericFallbackImplementPrompt(task, planText) {
 
 updateTaskSource('trouble_log', { buildPlanPrompt: troubleLogPlanPrompt, buildImplementPrompt: troubleLogImplementPrompt });
 updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+// arch_import_review (ADR-0020): a real code-change fulfillment task, structurally
+// identical to arch_review's (same promptContext shape from nextCandidateFulfillmentTask
+// -- candidateId/title/body/files) -- reuses the exact same builders rather than a
+// duplicate copy that would just drift, same reasoning as
+// nextCandidateFulfillmentTask() itself being parameterized instead of copy-pasted.
+updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
+updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 

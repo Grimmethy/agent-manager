@@ -402,6 +402,33 @@ while ($true) {
         Write-TaskJson $draftingPath $task
     }
 
+    # arch_import's plan pass proposes search terms for agent-manager's OWN repo (not
+    # GitHub/Hugging Face) -- same two-call shape as project_search immediately above,
+    # searching a different target. See ADR-0020 / docs/arch-import-pipeline.md.
+    if ($task.source -eq 'arch_import') {
+        $importQueries = [regex]::Matches($planResult.response, '(?m)^QUERY:\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Where-Object { $_ }
+        $harnessHits = @()
+        $harnessFiles = @()
+        if ($importQueries.Count -gt 0) {
+            $importQueriesPath = Join-Path $TempDir ('arch-import-queries-{0}.json' -f $task.id)
+            [System.IO.File]::WriteAllText($importQueriesPath, (@{ queries = $importQueries } | ConvertTo-Json))
+            try {
+                $importFetchScript = Join-Path $PackageSrcDir 'arch-import-fetch.js'
+                $rawImportResults = & node $importFetchScript $importQueriesPath
+                $parsedImportResults = ($rawImportResults -join "`n") | ConvertFrom-Json
+                if ($parsedImportResults.hits) { $harnessHits = @($parsedImportResults.hits) }
+                if ($parsedImportResults.files) { $harnessFiles = @($parsedImportResults.files) }
+            } catch {
+                Write-Host ('arch-import-fetch failed (non-fatal, implement proceeds with no results): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+            } finally {
+                Remove-Item $importQueriesPath -ErrorAction SilentlyContinue
+            }
+        }
+        $task.promptContext | Add-Member -NotePropertyName 'harnessHits' -NotePropertyValue $harnessHits -Force
+        $task.promptContext | Add-Member -NotePropertyName 'harnessFiles' -NotePropertyValue $harnessFiles -Force
+        Write-TaskJson $draftingPath $task
+    }
+
     Invoke-TaskDb 'plan-done' $draftingPath (@{ planDurationMs = $planSw.ElapsedMilliseconds; planAttempts = $(if ($planResult.attempts) { $planResult.attempts } else { 1 }) } | ConvertTo-Json -Compress)
 
     $planTextPath = Join-Path $TempDir ('plan-{0}.txt' -f $task.id)
@@ -527,20 +554,23 @@ while ($true) {
     }
     Invoke-TaskDb 'draft-done' $draftingPath (@{ critiqueOutcome = $task.critiqueOutcome; revisionApplied = $(if ($task.PSObject.Properties['revisionApplied']) { $task.revisionApplied } else { $null }) } | ConvertTo-Json -Compress)
 
-    # arch_discovery-specific structural sanity check, run AFTER critique/revision (so it
-    # sees the final, possibly-revised implementResponse) and BEFORE review. Reproduced
-    # live 2026-07-21: a Revision pass, asked to fix a critiqued draft, produced fluent
-    # English refusing to verify the draft ("I cannot verify this draft...") instead of
-    # either fixing it or outputting nothing -- coherent prose, not gibberish/empty/
-    # repeated-character, so detectDegenerate() (ornith-client.js) never catches it. That
-    # exact response then won a 2/3 APPROVE review vote and would have landed in the real
-    # architecture-candidates doc. Reuses parseArchDiscoveryCandidates (the SAME parser
-    # apply-group-a.js's real apply step uses) via arch-discovery-structcheck.js, so
-    # "does this look like a real candidate" is answered identically wherever it's asked --
-    # a second, drifted copy of this logic would just recreate the exact bug class this
-    # whole session has been about. See arch-discovery-structcheck.js's own header comment
-    # for the full incident.
-    if ($task.source -eq 'arch_discovery' -and -not [string]::IsNullOrWhiteSpace($task.implementResponse)) {
+    # Structural sanity check for both markdown-candidate sources (arch_discovery AND
+    # arch_import -- arch_import's implement output is the exact same "### AC-NNN · Title
+    # / Strength / Files / Problem/Solution/Benefits" shape, just with an extra Source:
+    # line), run AFTER critique/revision (so it sees the final, possibly-revised
+    # implementResponse) and BEFORE review. Reproduced live 2026-07-21 on arch_discovery: a
+    # Revision pass, asked to fix a critiqued draft, produced fluent English refusing to
+    # verify the draft ("I cannot verify this draft...") instead of either fixing it or
+    # outputting nothing -- coherent prose, not gibberish/empty/repeated-character, so
+    # detectDegenerate() (ornith-client.js) never catches it. That exact response then won
+    # a 2/3 APPROVE review vote and would have landed in the real candidates doc. Reuses
+    # parseArchDiscoveryCandidates (the SAME parser apply-group-a.js's real apply step
+    # uses for BOTH sources) via arch-discovery-structcheck.js, so "does this look like a
+    # real candidate" is answered identically wherever it's asked -- a second, drifted
+    # copy of this logic would just recreate the exact bug class this whole session has
+    # been about. See arch-discovery-structcheck.js's own header comment for the full
+    # incident.
+    if (($task.source -eq 'arch_discovery' -or $task.source -eq 'arch_import') -and -not [string]::IsNullOrWhiteSpace($task.implementResponse)) {
         $structCheckTextPath = Join-Path $TempDir ('arch-discovery-structcheck-{0}.txt' -f $task.id)
         [System.IO.File]::WriteAllText($structCheckTextPath, $task.implementResponse)
         $structCheckRaw = & node (Join-Path $PackageSrcDir 'arch-discovery-structcheck.js') $structCheckTextPath
@@ -548,7 +578,7 @@ while ($true) {
         $structCheck = ($structCheckRaw -join "`n") | ConvertFrom-Json
 
         if (-not $structCheck.ok) {
-            $reason = 'Structural check failed (arch_discovery): {0}' -f $structCheck.reason
+            $reason = 'Structural check failed ({0}): {1}' -f $task.source, $structCheck.reason
             Set-TaskBlockedStage -Task $task -Reason $reason
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task

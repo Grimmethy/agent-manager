@@ -495,6 +495,13 @@ function Invoke-ReviewPass {
             # community file content (the exact failure mode project_search demonstrated live
             # this session -- Ornith inventing detail not present in real fetched data).
             $verdictLines.Add('This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.')
+        } elseif ($task.source -eq 'arch_import') {
+            # Same false-rejection pattern as arch_discovery/project_search above:
+            # archImportImplementPrompt (prompts.js) explicitly tells the drafter to output
+            # nothing if the harness's own agent-manager-repo search didn't find real files
+            # this deep-dive finding concretely applies to. Also carries arch_discovery's own
+            # zero-friction allowance forward, since the shape of the risk is identical.
+            $verdictLines.Add('This is an architecture-import task (an idea from an external project, being checked against agent-manager''s own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.')
         }
         $verdictLines.Add('Respond with EXACTLY one of these two forms, nothing else:')
         $verdictLines.Add('APPROVE')
