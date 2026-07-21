@@ -4,16 +4,18 @@
 // access, so every task JSON written here is self-contained: it embeds the actual file
 // text a prompt will need, rather than a path the model could never read on its own.
 //
-// This package ships 6 generic, project-agnostic sources at priorities 10/20/40/70/80/90.
-// Priorities 30/50/60 are deliberately left open -- a consumer project registers its own
-// domain-specific sources there via registerTaskSource (see README.md), so the combined
-// priority order reads as one coherent backlog without renumbering anything.
+// This package ships 9 generic, project-agnostic sources at priorities
+// 10/20/40/70/80/81/82/85/90. Priorities 30/50/60 are deliberately left open -- a consumer
+// project registers its own domain-specific sources there via registerTaskSource (see
+// README.md), so the combined priority order reads as one coherent backlog without
+// renumbering anything.
 
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
+const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -634,7 +636,19 @@ registerTaskSource('adhoc', { priority: 10, next: nextAdhocTask });
 registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
 registerTaskSource('arch_review', { priority: 70, next: nextArchReviewTask });
-registerTaskSource('arch_discovery', { priority: 80, next: nextArchDiscoveryTask });
+// apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
+// markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
+// JSON -- without this, apply-task.js's writeArtifact() falls through to the generic Group
+// B JSON parser and every approved arch_discovery task fails apply 100% of the time (found
+// live 2026-07-21, see apply-group-a.js's applyArchDiscoveryCandidates for the full story).
+registerTaskSource('arch_discovery', {
+  priority: 80,
+  next: nextArchDiscoveryTask,
+  apply: ({ implementResponse }) => {
+    const { archReviewCandidatesPath } = getConfig();
+    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
+  },
+});
 
 // --- Source: arch_import -- STUB for now (ADR-0020, deferred to a later task: real
 // item-scanning/promotion logic). Reads importCoveragePath if present and returns null

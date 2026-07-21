@@ -6,10 +6,14 @@
 // -- see apply-task.js, which calls this after a task has already been reviewed and approved.
 //
 // Only the fully generic writer lives here. Project-specific Group A writers (e.g. a
-// county-index-file writer, a markdown-candidate-appender) belong in the CONSUMING
-// project's own registration file and get wired in via updateTaskSource(name, { apply })
-// exactly like this package's own arch_review/trouble_log/adhoc sources use the Group B
-// default -- see README.md "Registering a custom apply function".
+// county-index-file writer) belong in the CONSUMING project's own registration file and
+// get wired in via updateTaskSource(name, { apply }) exactly like this package's own
+// arch_review/trouble_log/adhoc sources use the Group B default -- see README.md
+// "Registering a custom apply function". arch_discovery's candidate-appender, deep_dive's
+// findings-appender, and project_search's index-appender are NOT examples of that: all
+// three are built in below, same as this file's other writers -- arch_discovery previously
+// had no apply registered at all (an oversight, not a deliberate boundary; every approved
+// arch_discovery task failed apply 100% of the time as a result, found live 2026-07-21).
 
 const fs = require('fs');
 const path = require('path');
@@ -198,10 +202,102 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
   return { file: analysisPath, itemCount: items.length };
 }
 
+// Parses arch_discovery's implement-pass output (see prompts.js's archDiscoveryImplementPrompt
+// for the exact "### AC-NNN · Title" format this must match) into candidate objects, one
+// per "### AC-" heading. Deliberately does NOT trust the AC-NNN number Ornith picked --
+// applyArchDiscoveryCandidates re-derives it below instead (see that function's comment).
+//
+// Lenient on the AC-NNN/title separator specifically: replaying the two real
+// arch_discovery tasks that failed apply live (2026-07-21) showed Ornith reliably drops
+// the "·" the prompt asks for ("### AC-042 Extract Git..." with a plain space, not
+// "### AC-042 · Extract Git...") -- a strict match here would have silently produced ZERO
+// candidates from real-world output, not an error, which is worse (looks like a clean "no
+// friction found" run instead of a parse failure). Accepting a few common separators (or
+// none) on READ, while still always WRITING the canonical "· " format below, keeps
+// nextArchReviewTask()'s own strict reader (task-sources.js) untouched and correct --
+// normalize inconsistency at this one boundary instead of loosening every downstream
+// consumer to match Ornith's inconsistency.
+function parseArchDiscoveryCandidates(implementResponse) {
+  const text = (implementResponse || '').trim();
+  if (!text) return [];
+  const blocks = text.split(/(?=^### AC-\d+)/m).map((b) => b.trim()).filter(Boolean);
+  return blocks
+    .map((block) => {
+      const headingLine = block.split('\n')[0];
+      const titleMatch = headingLine.match(/AC-\d+\s*(?:[·:—-]\s*)?(.+)/);
+      if (!titleMatch) return null;
+      const strengthMatch = block.match(/^Strength:\s*(.+)$/m);
+      const filesMatch = block.match(/^Files:\s*(.+)$/m);
+      // Body is everything after the Files: line (or after the heading, if Files: is
+      // somehow absent) -- the Problem/Solution/Benefits paragraphs, kept verbatim.
+      const bodyAnchor = filesMatch ? filesMatch[0] : headingLine;
+      const anchorIdx = block.indexOf(bodyAnchor);
+      const body = block.slice(anchorIdx + bodyAnchor.length).trim();
+      return {
+        title: titleMatch[1].trim(),
+        strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
+        files: filesMatch ? filesMatch[1].trim() : '',
+        body,
+      };
+    })
+    .filter((c) => c && c.title && c.body);
+}
+
+function nextAvailableCandidateId(existingText) {
+  let max = 0;
+  for (const m of (existingText || '').matchAll(/AC-(\d+)/g)) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max + 1;
+}
+
+// Appends one community's candidate write-up(s) to the project's architecture-candidates
+// doc (AGENT_MANAGER_ARCH_CANDIDATES_PATH), which nextArchReviewTask() (task-sources.js)
+// re-parses later looking for "### AC-NNN · Title" / "Strength: Strong" / "Files: ..." --
+// these two functions' expectations of the format must stay in sync.
+//
+// Re-derives each candidate's AC-NNN id from the doc's own current max, instead of
+// trusting the id Ornith wrote in its markdown. archDiscoveryImplementPrompt only asks it
+// to avoid colliding with IDs visible in its OWN plan-time context (one community's worth
+// of "candidates already proposed for other communities"), which is a real, observed
+// collision source, not hypothetical: two communities drafted around the same time, or a
+// plan run before an earlier same-day candidate had actually landed in the doc yet. A
+// collision here would silently corrupt arch_review's downstream `AC-\d+`-keyed dedup
+// (two different candidates both claiming `arch-review-ac-042` -- the second is silently
+// dropped as "already in queue"). Assigned sequentially against the text as it grows
+// within this same call, so multiple candidates in one implementResponse never collide
+// with each other either.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath }) {
+  const candidates = parseArchDiscoveryCandidates(implementResponse);
+  if (candidates.length === 0) {
+    return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
+  }
+
+  let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : '# Architecture Review Candidates\n';
+
+  const candidateIds = [];
+  for (const c of candidates) {
+    const id = `AC-${nextAvailableCandidateId(text)}`;
+    const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+    if (c.files) lines.push(`Files: ${c.files}`);
+    lines.push('', c.body);
+    text += '\n' + lines.join('\n') + '\n';
+    candidateIds.push(id);
+  }
+
+  fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
+  fs.writeFileSync(candidatesPath, text);
+
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds };
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
   parseProjectSearchFindings,
   applyDeepDiveFindings,
   parseDeepDiveItems,
+  applyArchDiscoveryCandidates,
+  parseArchDiscoveryCandidates,
 };
