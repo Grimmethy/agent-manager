@@ -809,13 +809,26 @@ def api_second_brain_browse():
     try:
         for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
             try:
+                is_dir = child.is_dir()
+                # Population count: direct children only (files + subfolders), not a deep
+                # recursive total -- matches what a folder's own name badge should mean
+                # ("what's immediately in here"), and stays cheap even on a large vault.
+                # None (not 0) on a permission error so the frontend can tell "empty" apart
+                # from "couldn't read it" rather than silently showing a wrong zero.
+                count = None
+                if is_dir:
+                    try:
+                        count = sum(1 for _ in child.iterdir())
+                    except (PermissionError, OSError):
+                        count = None
                 # .as_posix(), not str() -- these paths round-trip through JSON to the
                 # frontend, which splits on '/' (see the "jump to file" handler in
                 # index.html). str() on Windows would emit '\\', silently breaking that.
                 entries.append({
                     "name": child.name,
                     "path": child.relative_to(root).as_posix(),
-                    "isDir": child.is_dir(),
+                    "isDir": is_dir,
+                    "count": count,
                 })
             except (PermissionError, OSError):
                 continue

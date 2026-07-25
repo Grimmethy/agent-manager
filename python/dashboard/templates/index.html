@@ -62,6 +62,7 @@
   .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
   .browser-entry:hover { background: var(--bg); }
   .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
+  .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .stat-row { display: flex; gap: 24px; margin: 14px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
@@ -1346,7 +1347,10 @@ async function loadSecondBrainBrowser() {
   }
   for (const entry of data.entries) {
     if (entry.isDir) {
-      html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span></div>`;
+      // Population count: direct children only (files + subfolders) -- null means the
+      // folder couldn't be read (permissions), distinct from a genuinely empty "0".
+      const countLabel = entry.count === null ? '?' : entry.count;
+      html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span><span class="entry-count">${countLabel}</span></div>`;
     } else {
       const active = entry.path === brainDumpSelectedFile ? ' active' : '';
       html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span></div>`;
