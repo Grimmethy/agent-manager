@@ -3,6 +3,7 @@ param(
     [string]$Model = $(if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' })
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'load-env.ps1')
 
 # Two distinct locations, not one: PackageSrcDir is where THIS script and its sibling
 # .js files (ornith-client.js, prompts.js, task-sources.js, ...) live -- fixed, wherever
@@ -306,6 +307,38 @@ while ($true) {
 
     Write-Host ('Drafting: {0}' -f $task.title) -ForegroundColor Green
     Invoke-TaskDb 'claimed' $draftingPath (@{ instanceId = $InstanceId; model = $Model } | ConvertTo-Json -Compress)
+
+    # Pre-drafted task escape hatch: when the caller (a human, or an orchestrating agent
+    # acting as architect) already knows the exact implementResponse and sets
+    # preDrafted:true, skip Ornith's plan/implement/critique-revise passes entirely instead
+    # of asking it to (re)generate what's already known. Added 2026-07-25 after Ornith
+    # mangled a 2-line, fully-specified find/replace -- it paraphrased and truncated the
+    # verbatim source it was given instead of copying it, on a task where there was nothing
+    # left to figure out. Generation is where that failure mode lives; judging an
+    # already-written diff is a comparatively reliable task, so this still routes through
+    # review-runner's normal critique -- it only skips the drafting calls, not the safety
+    # net. Requires a non-empty implementResponse (an empty pre-drafted task would just
+    # rubber-stamp nothing into review).
+    $isPreDrafted = $task.PSObject.Properties['preDrafted'] -and $task.preDrafted -and
+        -not [string]::IsNullOrWhiteSpace($task.implementResponse)
+
+    if ($isPreDrafted) {
+        if (-not $task.PSObject.Properties['planResponse'] -or [string]::IsNullOrWhiteSpace($task.planResponse)) {
+            $task | Add-Member -NotePropertyName 'planResponse' -NotePropertyValue 'Pre-drafted task: the exact implementResponse below was specified directly by the caller, not produced by a plan+implement pass.' -Force
+        }
+        $task | Add-Member -NotePropertyName 'draftedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+        $task | Add-Member -NotePropertyName 'critiqueOutcome' -NotePropertyValue 'skipped-pre-drafted' -Force
+        Invoke-TaskDb 'draft-done' $draftingPath (@{ critiqueOutcome = 'skipped-pre-drafted' } | ConvertTo-Json -Compress)
+
+        $reviewPath = Join-Path (Join-Path $QueueDir 'review') $next.Name
+        Write-TaskJson $reviewPath $task
+        Remove-Item $draftingPath -Force
+        Write-Host ('Ready for review (pre-drafted, no Ornith generation): {0}' -f $task.id) -ForegroundColor Cyan
+        Invoke-TaskDb 'ready-for-review' $reviewPath
+
+        Write-Heartbeat -Status 'idle'
+        continue
+    }
 
     # --- Plan pass ---
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'plan'

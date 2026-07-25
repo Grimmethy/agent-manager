@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'load-env.ps1')
 # Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
 $PackageSrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AGENT_MANAGER_REPO_ROOT) { throw 'AGENT_MANAGER_REPO_ROOT env var is required.' }
@@ -149,14 +150,26 @@ function Invoke-DeadProcessCheck {
             }
 
             $scriptPath = Join-Path $PackageSrcDir $restart.Script
-            # -NoExit: same rationale as launch.bat's own launches -- if the replacement
-            # throws early (or crashes again shortly after), the window stays open showing
-            # the actual PowerShell error instead of flash-closing, so a second crash is
-            # just as diagnosable as the first manual launch was.
-            $argList = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
             if ($restart.Args -contains '-InstanceId') { $argList += @('-InstanceId', $hb.instanceId) }
 
-            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal
+            # Was '-NoExit' + '-WindowStyle Normal' with no output redirection -- a visible
+            # console window was the only diagnostic surface, which only works if a human is
+            # physically watching the screen. Silent for unattended/overnight runs and for
+            # anyone (or any agent) monitoring via runs/*.log: every watchdog-triggered
+            # restart orphaned the worker's output into an unwatched window, freezing the log
+            # file at whatever it last wrote pre-restart even though the process was alive
+            # and working. Redirecting to the same runs/<instanceId>.log/.err.log path the
+            # original launch used restores that visibility -- overwrites pre-restart
+            # history in that file (Start-Process has no append mode), but the RESTARTED
+            # event itself is still preserved separately via Add-WatchdogLogEntry below.
+            $runsDir = Join-Path $PipelineDir 'runs'
+            New-Item -ItemType Directory -Force -Path $runsDir | Out-Null
+            $stdOutLog = Join-Path $runsDir ('{0}.log' -f $hb.instanceId)
+            $stdErrLog = Join-Path $runsDir ('{0}.err.log' -f $hb.instanceId)
+
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden `
+                -RedirectStandardOutput $stdOutLog -RedirectStandardError $stdErrLog
             $script:LastRestartAt[$hb.instanceId] = Get-Date
             $reason = if ($isZombie) { 'zombie: pid lingered but heartbeat stale' } else { 'process confirmed gone' }
             Write-Host ('Watchdog: restarted {0} (was pid {1}, {2}, {3}s)' -f $hb.instanceId, $hb.pid, $reason, [int]$ageSeconds) -ForegroundColor Cyan

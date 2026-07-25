@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'load-env.ps1')
 # Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
 $PackageSrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AGENT_MANAGER_REPO_ROOT) { throw 'AGENT_MANAGER_REPO_ROOT env var is required.' }

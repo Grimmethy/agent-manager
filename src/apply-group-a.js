@@ -376,6 +376,7 @@ function parseBrainDumpSortResult(implementResponse) {
     tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
     actionable: !!parsed.actionable,
     rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
+    belongsToProject: parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null,
   };
 }
 
@@ -385,6 +386,32 @@ function parseBrainDumpSortResult(implementResponse) {
 // non-git write -- brain-dump.json lives in pipelineDir, the note lives under
 // secondBrainDir, neither inside repoRoot -- same reasoning as applySecondBrainNote/
 // applyProjectSearchFindings/applyDeepDiveFindings above.
+// Registered projects (projects.json, at the package root -- one level up from src/), used
+// by the belongsToProject routing below. Best-effort: a missing/corrupt registry just
+// means no project can match, same convention as task-sources.js's readProjectLabels.
+function readProjectRegistry() {
+  const registryPath = path.join(__dirname, '..', 'projects.json');
+  try {
+    const list = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+// Classifies one Brain Dump entry (captured by the dashboard's Brain Dump tab / POST
+// /api/brain-dump/capture). Two outcomes: (1) belongsToProject matches a registered
+// project AND actionable is true -- queue a real adhoc implementation task in THAT
+// project's own queue/adhoc/, mark the entry 'actioned' (not 'sorted'), and drop a short
+// cross-reference note in the second brain for an audit trail (added 2026-07-25: every
+// actionable entry previously only ever got filed as a passive note, however concrete --
+// see the "Job List priority" brain-dump entry that separately went through the manual
+// adhoc button, landed in the WRONG project's queue, and blocked on an unrelated
+// domain-config error, invisibly, because nothing here ever routed it correctly in the
+// first place). (2) Otherwise: original behavior unchanged -- append a dated line to the
+// chosen note, mark 'sorted'. A non-git write either way -- brain-dump.json lives in
+// pipelineDir, the note lives under secondBrainDir, neither inside repoRoot -- same
+// reasoning as applySecondBrainNote/applyProjectSearchFindings/applyDeepDiveFindings above.
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir }) {
   const { brainDumpEntryId, rawText } = task.promptContext;
 
@@ -414,6 +441,59 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   }
   if (!secondBrainDir) {
     return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const matchedProject = result.actionable && result.belongsToProject
+    ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
+    : null;
+
+  if (matchedProject) {
+    const validDomains = (() => {
+      try {
+        return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
+      } catch {
+        return [];
+      }
+    })();
+
+    if (validDomains.includes('adhoc')) {
+      const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+      const adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      fs.mkdirSync(adhocDir, { recursive: true });
+      const adhocTask = {
+        id: queuedId,
+        domain: 'adhoc',
+        source: 'brain_dump',
+        title: rawText.slice(0, 120),
+        promptContext: { rawText, brainDumpEntryId },
+      };
+      fs.writeFileSync(path.join(adhocDir, `${queuedId}.json`), JSON.stringify(adhocTask, null, 2));
+
+      // Cross-reference note -- an audit trail, not the record of truth (brain-dump.json's
+      // queuedTaskId/queuedAt is that): confirms this entry was routed as real work, not
+      // silently dropped, findable the same way every other filed note is.
+      const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      const stamp = new Date().toISOString().slice(0, 10);
+      const line = `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}** -- ${rawText}\n`;
+      if (fs.existsSync(fullPath)) {
+        fs.appendFileSync(fullPath, line);
+      } else {
+        const title = path.basename(result.secondBrainPath, path.extname(result.secondBrainPath));
+        fs.writeFileSync(fullPath, `# ${title}\n${line}`);
+      }
+
+      entry.status = 'actioned';
+      entry.queuedTaskId = queuedId;
+      entry.queuedAt = new Date().toISOString();
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+
+      return { file: fullPath, category: result.category, queuedTaskId: queuedId, queuedProject: matchedProject.label };
+    }
+    // Falls through to the plain-note path below if the matched project has no 'adhoc'
+    // domain registered -- same non-fatal-skip convention as everything else here, rather
+    // than blocking the whole task over a config gap in a DIFFERENT project.
   }
 
   const fullPath = path.join(secondBrainDir, result.secondBrainPath);

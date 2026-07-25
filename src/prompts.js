@@ -131,7 +131,10 @@ function brainDumpSortPlanPrompt(task) {
     'Existing top-level folders/files already in the second brain (reuse one of these when the note fits, rather than inventing a new top-level folder for a single note):',
     structureText,
     '',
-    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, and (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create).',
+    'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
+    ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
+    '',
+    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), and (5) if this describes a concrete feature/bug for one of the tracked code projects listed above, name which one -- otherwise say none apply.',
   ].join('\n');
 }
 
@@ -447,7 +450,8 @@ function brainDumpSortImplementPrompt(task, planText) {
     '  "secondBrainPath": "relative/path/from/your/plan/above.md",',
     '  "tags": ["short", "lowercase", "keywords"],',
     '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
-    '  "rationale": "one sentence explaining the category and destination"',
+    '  "rationale": "one sentence explaining the category and destination",',
+    '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects"',
     '}',
     '',
     'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown.',

@@ -94,13 +94,27 @@ function nextAdhocTask() {
     const id = parsed.id.trim();
     if (taskIdExistsInQueue(id)) continue;
 
-    return {
+    const task = {
       id,
       domain: 'adhoc',
       source: 'manual',
       title: parsed.title ?? `Adhoc task: ${id}`,
       promptContext: parsed.promptContext,
     };
+    // Pre-drafted escape hatch (see ornith-worker.ps1's isPreDrafted branch, added
+    // 2026-07-25): a caller who already knows the exact implementResponse can set
+    // preDrafted:true on the queue/adhoc/ file to skip Ornith's generation passes
+    // entirely. Without carrying these two fields through here, that file's own
+    // preDrafted/implementResponse were silently dropped the moment nextAdhocTask()
+    // rebuilt the task object -- confirmed live 2026-07-25: a pre-drafted task still
+    // went through a full plan pass because this function reconstructed a fresh object
+    // from only the 4 fields above instead of passing the rest through.
+    if (parsed.preDrafted) {
+      task.preDrafted = true;
+      task.implementResponse = parsed.implementResponse;
+      if (parsed.planResponse) task.planResponse = parsed.planResponse;
+    }
+    return task;
   }
 
   return null;
@@ -689,6 +703,20 @@ function listSecondBrainTopLevel(secondBrainDir) {
     .sort();
 }
 
+// Registered projects (projects.json, at the package root -- one level up from src/), used
+// so brain_dump_sort can tell Ornith which tracked codebases exist. Best-effort: a
+// missing/corrupt registry just yields an empty list, same convention as
+// listSecondBrainTopLevel above -- this is context for the model, not a hard dependency.
+function readProjectLabels() {
+  const registryPath = path.join(__dirname, '..', 'projects.json');
+  try {
+    const list = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    return Array.isArray(list) ? list.map((p) => p.label).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
 function nextBrainDumpSortTask() {
   const { brainDumpPath, secondBrainDir } = getConfig();
   if (!brainDumpPath) return null;
@@ -717,6 +745,7 @@ function nextBrainDumpSortTask() {
       brainDumpEntryId: chosen.id,
       rawText: chosen.rawText,
       existingStructure: listSecondBrainTopLevel(secondBrainDir),
+      projectLabels: readProjectLabels(),
     },
   };
 }
