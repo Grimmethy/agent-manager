@@ -63,6 +63,7 @@
   .browser-entry:hover { background: var(--bg); }
   .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
   .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .browser-entry .set-active-project { font-size: 11px; padding: 3px 9px; }
   .stat-row { display: flex; gap: 24px; margin: 14px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
@@ -1109,7 +1110,10 @@ function renderBrainDumpShell() {
         <div id="bd-entries"><div class="empty">Loading...</div></div>
       </div>
       <div>
-        <div class="field-label">Second Brain</div>
+        <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
+          <span>Second Brain</span>
+          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 10px;">Sync GitHub Projects</button>
+        </div>
         <div class="browser-panel" id="bd-browser" style="max-height:220px"><div class="empty">Loading...</div></div>
         <div id="bd-file-panel"></div>
       </div>
@@ -1137,6 +1141,24 @@ function renderBrainDumpShell() {
   };
   document.getElementById('bd-capture-btn').onclick = submit;
   input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+
+  document.getElementById('bd-sync-github-btn').onclick = async (e) => {
+    const btn = e.target;
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = 'Syncing...';
+    try {
+      const resp = await fetch('/api/second-brain/sync-github-projects', { method: 'POST' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const result = await resp.json();
+      await loadSecondBrainBrowser();
+      alert(`Synced ${result.synced} GitHub project(s)` + (result.created.length ? ` -- created ${result.created.length} new note(s): ${result.created.join(', ')}` : ' -- all already referenced.'));
+    } catch (err) {
+      alert('Could not sync GitHub projects: ' + err.message);
+    }
+    btn.disabled = false;
+    btn.textContent = original;
+  };
 
   loadSecondBrainBrowser();
 }
@@ -1353,7 +1375,17 @@ async function loadSecondBrainBrowser() {
       html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span><span class="entry-count">${countLabel}</span></div>`;
     } else {
       const active = entry.path === brainDumpSelectedFile ? ' active' : '';
-      html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span></div>`;
+      // Notes linked to a real GitHub repo (via /api/second-brain/sync-github-projects)
+      // get a one-click way to make that repo the pipeline's active project, or a badge
+      // if it already is -- the actual ask: buttons in Second Brain that set a project
+      // active, so every GitHub project is reachable AND actionable from here.
+      let projectControl = '';
+      if (entry.repoPath) {
+        projectControl = entry.isActiveProject
+          ? `<span class="badge ok" title="${escapeAttr(entry.repoPath)}">Active Project</span>`
+          : `<button type="button" class="secondary set-active-project" data-repo-path="${escapeAttr(entry.repoPath)}" title="Stop the current pipeline and start it against ${escapeAttr(entry.repoPath)}">Set Active</button>`;
+      }
+      html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span>${projectControl}</div>`;
     }
   }
   panel.innerHTML = html;
@@ -1363,6 +1395,32 @@ async function loadSecondBrainBrowser() {
       brainDumpBrowsePath = el.dataset.nav;
       localStorage.setItem('agentManagerBrainDumpBrowsePath', brainDumpBrowsePath);
       loadSecondBrainBrowser();
+    };
+  });
+  panel.querySelectorAll('.set-active-project').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
+      const repoPath = btn.dataset.repoPath;
+      if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Switching...';
+      try {
+        await fetch('/api/pipeline/stop', { method: 'POST' });
+        const resp = await fetch('/api/pipeline/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.description || ('HTTP ' + resp.status));
+        }
+        await loadSecondBrainBrowser();
+      } catch (err) {
+        alert('Could not switch active project: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Set Active';
+      }
     };
   });
   panel.querySelectorAll('[data-file]').forEach((el) => {

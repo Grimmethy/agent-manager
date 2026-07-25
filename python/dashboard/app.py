@@ -354,6 +354,59 @@ def second_brain_dir() -> Path | None:
     return Path(v) if v else None
 
 
+# GitHub projects root: PACKAGE_ROOT (this file's own install location) is always
+# F:\GitHub\agent-manager (or equivalent), one level under the user's real GitHub folder,
+# regardless of which OTHER project is currently active -- unlike deriving it from
+# get_active_repo_root(), which can point anywhere (e.g. TaxHarvest lives nested under
+# F:\GitHub\TaxHarvest-GrimmethyLocal\, not directly under F:\GitHub).
+GITHUB_PROJECTS_ROOT = PACKAGE_ROOT.parent
+
+
+def discover_github_repos() -> list[dict]:
+    """Every immediate subdirectory of GITHUB_PROJECTS_ROOT that looks like a git repo
+    (has a .git dir or worktree-link file). Best-effort: an unreadable root just yields
+    an empty list rather than a 500."""
+    try:
+        candidates = sorted(GITHUB_PROJECTS_ROOT.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    repos = []
+    for child in candidates:
+        try:
+            if child.is_dir() and (child / ".git").exists():
+                repos.append({"name": child.name, "path": str(child)})
+        except OSError:
+            continue
+    return repos
+
+
+def second_brain_project_links_path() -> Path | None:
+    """Lives inside the second brain vault itself (not the pipeline dir) -- this index is
+    metadata ABOUT the vault's own notes, so it travels with the vault rather than with
+    whichever project's pipeline happens to be active."""
+    root = second_brain_dir()
+    return (root / ".agent-manager-project-links.json") if root else None
+
+
+def read_project_links() -> dict:
+    """Maps a second-brain note's path (relative to SECOND_BRAIN_DIR, forward slashes) to
+    the absolute repo path it represents -- built by /api/second-brain/sync-github-projects,
+    consulted by /api/second-brain/browse so the frontend can offer a "Set as Active
+    Project" button on the right file without re-reading every note's content on every
+    browse call."""
+    p = second_brain_project_links_path()
+    if not p:
+        return {}
+    return read_json_safe(p) or {}
+
+
+def write_project_links(links: dict):
+    p = second_brain_project_links_path()
+    if not p:
+        return
+    p.write_text(json.dumps(links, indent=2), encoding="utf-8")
+
+
 def brain_dump_path() -> Path | None:
     override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH")
     if override:
@@ -805,6 +858,9 @@ def api_second_brain_browse():
     if not target.is_dir():
         abort(404)
 
+    project_links = read_project_links()
+    active_repo_root = get_active_repo_root()
+
     entries = []
     try:
         for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
@@ -824,11 +880,15 @@ def api_second_brain_browse():
                 # .as_posix(), not str() -- these paths round-trip through JSON to the
                 # frontend, which splits on '/' (see the "jump to file" handler in
                 # index.html). str() on Windows would emit '\\', silently breaking that.
+                rel_path = child.relative_to(root).as_posix()
+                repo_path = project_links.get(rel_path)
                 entries.append({
                     "name": child.name,
-                    "path": child.relative_to(root).as_posix(),
+                    "path": rel_path,
                     "isDir": is_dir,
                     "count": count,
+                    "repoPath": repo_path,
+                    "isActiveProject": bool(repo_path) and bool(active_repo_root) and Path(repo_path) == Path(active_repo_root),
                 })
             except (PermissionError, OSError):
                 continue
@@ -842,6 +902,39 @@ def api_second_brain_browse():
     # root". Normalizing here keeps "up" from root's immediate children correct.
     parent = None if target == root else ("" if target.parent == root else target.parent.relative_to(root).as_posix())
     return jsonify({"path": rel, "parent": parent, "entries": entries, "configured": True})
+
+
+@app.route("/api/second-brain/sync-github-projects", methods=["POST"])
+def api_second_brain_sync_github_projects():
+    """Ensures every git repo directly under GITHUB_PROJECTS_ROOT has a reference note
+    under Projects/GitHub/ in the second brain, so every GitHub project is navigable from
+    there (the actual ask: "All github projects should be referenced in Second Brain").
+    Idempotent and non-destructive -- only CREATES a note when one doesn't already exist
+    at that path; never overwrites something already there, so any personal notes/edits
+    a user has since added to a repo's note are never touched by re-running this."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+
+    repos = discover_github_repos()
+    projects_dir = root / "Projects" / "GitHub"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+
+    links = read_project_links()
+    created = []
+    for repo in repos:
+        note_rel = f"Projects/GitHub/{repo['name']}.md"
+        note_path = root / note_rel
+        if not note_path.exists():
+            note_path.write_text(
+                f"# {repo['name']}\n\n**Repo path:** `{repo['path']}`\n",
+                encoding="utf-8",
+            )
+            created.append(repo["name"])
+        links[note_rel] = repo["path"]
+
+    write_project_links(links)
+    return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
 
 
 @app.route("/api/second-brain/file")
