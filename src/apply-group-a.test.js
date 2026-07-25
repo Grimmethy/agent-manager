@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -208,4 +208,148 @@ test('a Strong candidate written by applyArchDiscoveryCandidates is correctly pi
     if (prevPipelineDir === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prevPipelineDir;
     if (prevCandidatesPath === undefined) delete process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH; else process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH = prevCandidatesPath;
   }
+});
+
+// --- brain_dump_sort's parser + applier ------------------------------------------------
+
+function brainDumpEntry(overrides = {}) {
+  return { id: 'bd-1', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'Buy milk', status: 'captured', ...overrides };
+}
+
+function writeBrainDump(dir, entries) {
+  const brainDumpPath = path.join(dir, 'brain-dump.json');
+  fs.writeFileSync(brainDumpPath, JSON.stringify({ entries }, null, 2));
+  return brainDumpPath;
+}
+
+test('parseBrainDumpSortResult parses a well-formed classification object', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({
+    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
+  }));
+  assert.deepEqual(result, {
+    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
+  });
+});
+
+test('parseBrainDumpSortResult strips a leading slash from secondBrainPath', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({ category: 'idea', secondBrainPath: '/Ideas/x.md' }));
+  assert.equal(result.secondBrainPath, 'Ideas/x.md');
+});
+
+test('parseBrainDumpSortResult defaults tags/actionable/rationale when absent', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' }));
+  assert.deepEqual(result.tags, []);
+  assert.equal(result.actionable, false);
+  assert.equal(result.rationale, '');
+});
+
+test('parseBrainDumpSortResult returns null for unparseable JSON', () => {
+  assert.equal(parseBrainDumpSortResult('not json'), null);
+  assert.equal(parseBrainDumpSortResult(''), null);
+});
+
+test('parseBrainDumpSortResult returns null when category or secondBrainPath is missing', () => {
+  assert.equal(parseBrainDumpSortResult(JSON.stringify({ secondBrainPath: 'x.md' })), null);
+  assert.equal(parseBrainDumpSortResult(JSON.stringify({ category: 'idea' })), null);
+});
+
+test('parseBrainDumpSortResult returns null for a JSON array (not the expected object shape)', () => {
+  assert.equal(parseBrainDumpSortResult('[1,2,3]'), null);
+});
+
+test('applyBrainDumpSort files the entry, appends a dated line, and marks it sorted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'a grocery run',
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.category, 'task');
+  assert.equal(result.file, path.join(secondBrainDir, 'Errands', 'shopping.md'));
+
+  const noteText = fs.readFileSync(result.file, 'utf8');
+  assert.match(noteText, /Buy milk/);
+  assert.match(noteText, /groceries/);
+
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'sorted');
+  assert.equal(entries[0].sort.category, 'task');
+  assert.equal(entries[0].sort.secondBrainPath, 'Errands/shopping.md');
+  assert.ok(entries[0].sortedAt);
+});
+
+test('applyBrainDumpSort appends to an EXISTING note instead of overwriting it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(path.join(secondBrainDir, 'Errands'), { recursive: true });
+  fs.writeFileSync(path.join(secondBrainDir, 'Errands', 'shopping.md'), '# Shopping\n\n- existing item\n');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'Errands', 'shopping.md'), 'utf8');
+  assert.match(noteText, /existing item/); // original content preserved
+  assert.match(noteText, /Buy milk/); // new line appended
+});
+
+test('applyBrainDumpSort skips (does not throw, does not mark sorted) when the implement response is malformed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const result = applyBrainDumpSort({ implementResponse: 'not json', task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, true);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'captured'); // left untouched for retry
+  assert.equal(entries[0].sort, undefined);
+});
+
+test('applyBrainDumpSort skips cleanly when the entry no longer exists (deleted since the task was drafted)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, []); // entry already gone
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no longer exists/);
+});
+
+test('applyBrainDumpSort refuses to apply a stale classification when the entry was edited since drafting', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'NEW edited text' })]);
+
+  // Task was drafted against the OLD text, before the dashboard's edit endpoint changed it.
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'OLD original text' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /changed since this task was drafted/);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'captured');
+});
+
+test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: null });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /SECOND_BRAIN_DIR/);
 });

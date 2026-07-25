@@ -57,6 +57,11 @@ function getConfig() {
     || path.join(pipelineDir, 'deep-dive-coverage.json');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
+  // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
+  // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
+  // both languages on purpose; there is no other link between them.
+  const brainDumpPath = process.env.AGENT_MANAGER_BRAIN_DUMP_PATH
+    || path.join(pipelineDir, 'brain-dump.json');
   const deepDiveClonesDir = process.env.AGENT_MANAGER_DEEP_DIVE_CLONES_DIR
     || path.join(path.dirname(projectSearchIndexPath), 'clones');
   const deepDiveAnalysisDir = process.env.AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR
@@ -76,12 +81,22 @@ function getConfig() {
   // hardcoding a sibling file name -- the old single-consumer-only pattern this replaces.
   const registerPath = process.env.AGENT_MANAGER_REGISTER_PATH;
 
+  // Optional allowlist restricting getNextTask() (task-sources.js) to specific source
+  // names -- e.g. the dashboard's "Project Search" run mode sets this to just
+  // ["project_search"] so that source (priority 85, the lowest of the 10 built-ins) is
+  // guaranteed to actually get picked, rather than starving behind arch_discovery/
+  // arch_review/etc whenever they have pending work. Empty/unset means no restriction,
+  // matching every existing consumer's behavior unchanged.
+  const rawSourceAllowlist = process.env.AGENT_MANAGER_TASK_SOURCES || '';
+  const taskSourceAllowlist = rawSourceAllowlist.split(',').map((s) => s.trim()).filter(Boolean);
+
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath,
-    defaultDomain,
+    brainDumpPath,
+    defaultDomain, taskSourceAllowlist,
   };
 }
 

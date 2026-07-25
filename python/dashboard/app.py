@@ -51,6 +51,49 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_FILE_PATH = PACKAGE_ROOT / "agent-manager.env"
 SRC_DIR = PACKAGE_ROOT / "src"
 
+# Project tab's "previously loaded projects" dropdown/search-list. Separate from
+# agent-manager.env (which only ever holds the CURRENT project) -- this is a small,
+# append-only-ish history so the Project tab can offer past paths without you re-typing
+# or re-browsing them every time. Recorded whenever a path is actually used for something
+# real (Start Pipeline or Build Graph), not on every keystroke/browse.
+PROJECT_HISTORY_PATH = PACKAGE_ROOT / "project-history.json"
+MAX_PROJECT_HISTORY = 25
+
+
+def read_project_history() -> list:
+    """Most-recently-used first. Corrupt/missing file -> empty list, never a 500 --
+    this is a convenience list, not state anything else depends on."""
+    if not PROJECT_HISTORY_PATH.is_file():
+        return []
+    try:
+        data = json.loads(PROJECT_HISTORY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def record_project_used(path: str):
+    """Moves `path` to the front if already present (so re-using a project bumps it back
+    to most-recent, rather than accumulating duplicate stale entries), otherwise inserts
+    it, then truncates to MAX_PROJECT_HISTORY. Best-effort -- a write failure here should
+    never break the actual Start Pipeline / Build Graph action it's attached to.
+
+    Confirmed live (2026-07-22): the same TaxHarvest path got stored twice -- once with
+    backslashes (typed/browsed via the UI, Windows-native) and once with forward slashes
+    (this session's own API calls) -- because the old dedup compared raw strings. Both
+    forms mean the identical directory; normalize with os.path.normpath before comparing
+    or storing, so they collapse into one entry instead of silently accumulating
+    look-alike duplicates."""
+    try:
+        normalized = os.path.normpath(path)
+        history = read_project_history()
+        history = [p for p in history if os.path.normpath(p) != normalized]
+        history.insert(0, normalized)
+        history = history[:MAX_PROJECT_HISTORY]
+        PROJECT_HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
 # Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
 # the live worker/review-runner/apply-runner/queue-watchdog loops are actually pointed at
 # (that's still controlled by agent-manager.env + launch.bat) -- this lets you explore any
@@ -262,11 +305,56 @@ def model_stats_db_path() -> Path | None:
     return (d / "model-stats.db") if d else None
 
 
+def second_brain_dir() -> Path | None:
+    """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
+    kept in sync by hand since this dashboard is Python, not Node."""
+    v = os.environ.get("SECOND_BRAIN_DIR")
+    return Path(v) if v else None
+
+
+def brain_dump_path() -> Path | None:
+    override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "brain-dump.json") if d else None
+
+
 def read_json_safe(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+# Matches a `.` + at least 7 digits and captures the first 6 -- PowerShell's `Get-Date
+# -Format 'o'` (used for every heartbeat/stateSince timestamp the *.ps1 scripts write)
+# emits 7-digit fractional seconds (100ns ticks), e.g. "...33.6859854-06:00". Python's own
+# datetime.fromisoformat only accepts EXACTLY 3 or 6 fractional digits before 3.11 -- this
+# machine's dashboard runs under Python 3.10 (PowerShell's `python` resolves to a
+# different, older interpreter than other shells here), so every such timestamp raised
+# ValueError, silently caught by each call site's `except (ValueError, KeyError)`, and
+# _pipeline_running() always returned False regardless of the real pipeline state.
+# Confirmed live (2026-07-22): datetime.fromisoformat('...6859854-06:00') raises
+# "Invalid isoformat string" under 3.10.11, parses fine under 3.12. Truncating to 6
+# digits here makes this correct on any Python 3.x runtime, not just 3.11+.
+_EXCESS_FRACTIONAL_SECONDS_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def parse_hb_timestamp(ts: str):
+    """Parses a PowerShell-emitted ISO timestamp into a tz-aware UTC datetime, or None on
+    any failure. Centralizes the Z-replacement + fractional-seconds-truncation + naive-to-
+    UTC handling that was previously duplicated (inconsistently) at three call sites."""
+    if not ts:
+        return None
+    normalized = _EXCESS_FRACTIONAL_SECONDS_RE.sub(r"\1", ts.replace("Z", "+00:00"))
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def task_summary(data: dict, filename: str) -> dict:
@@ -299,8 +387,6 @@ def index():
 
 @app.route("/api/instances")
 def api_instances():
-    from datetime import datetime, timezone
-
     results = []
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
@@ -308,26 +394,17 @@ def api_instances():
             data = read_json_safe(f)
             if not data or not data.get("instanceId") or not data.get("lastHeartbeat"):
                 continue
-            try:
-                last_hb = datetime.fromisoformat(data["lastHeartbeat"].replace("Z", "+00:00"))
-                if last_hb.tzinfo is None:
-                    last_hb = last_hb.replace(tzinfo=timezone.utc)
-                age = (datetime.now(timezone.utc) - last_hb).total_seconds()
-            except (ValueError, KeyError):
-                age = None
+            last_hb = parse_hb_timestamp(data["lastHeartbeat"])
+            age = (datetime.now(timezone.utc) - last_hb).total_seconds() if last_hb else None
             threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
             # stateSince is written by Write-HeartbeatFile on every state transition
             # (status/pass/task change); age it server-side so the first paint is right
             # even before the client's 1s ticker takes over.
             state_age = None
             if data.get("stateSince"):
-                try:
-                    since = datetime.fromisoformat(data["stateSince"].replace("Z", "+00:00"))
-                    if since.tzinfo is None:
-                        since = since.replace(tzinfo=timezone.utc)
+                since = parse_hb_timestamp(data["stateSince"])
+                if since:
                     state_age = (datetime.now(timezone.utc) - since).total_seconds()
-                except ValueError:
-                    state_age = None
             results.append({
                 **data,
                 "heartbeatAgeSeconds": round(age) if age is not None else None,
@@ -483,6 +560,7 @@ def api_summary():
     qdir = queue_dir()
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
+    counts["brain-dump"] = sum(1 for e in read_brain_dump_entries() if e.get("status") != "actioned")
     if not qdir:
         return jsonify(counts)
 
@@ -493,6 +571,232 @@ def api_summary():
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
     return jsonify(counts)
+
+
+def read_brain_dump_entries() -> list:
+    path = brain_dump_path()
+    if not path:
+        return []
+    data = read_json_safe(path)
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def write_brain_dump_entries(entries: list):
+    path = brain_dump_path()
+    if not path:
+        abort(500, description="no active project configured")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"entries": entries}, indent=2), encoding="utf-8")
+
+
+def slugify_for_id(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "entry"
+
+
+def default_task_domain() -> str:
+    """Mirrors queue-adhoc-task.js's validDomains[0] fallback -- review-runner.ps1's
+    Get-DomainConfig lookup requires the task's domain to be a real key in
+    task-domains.json (not just any string), so this must pick an ACTUAL key from that
+    file, not assume 'default' is present."""
+    d = get_pipeline_dir()
+    if d:
+        domains = read_json_safe(d / "task-domains.json")
+        if isinstance(domains, dict) and domains:
+            return next(iter(domains.keys()))
+    return "default"
+
+
+@app.route("/api/brain-dump")
+def api_brain_dump():
+    """Brain Dump tab's left pane. Defaults to everything not yet actioned (captured +
+    sorted) -- the working queue a human actually needs to see. ?status=<value> narrows to
+    one status, ?status=all returns the full history."""
+    entries = read_brain_dump_entries()
+    status_filter = request.args.get("status", "").strip()
+    if status_filter and status_filter != "all":
+        entries = [e for e in entries if e.get("status") == status_filter]
+    elif not status_filter:
+        entries = [e for e in entries if e.get("status") != "actioned"]
+    entries = sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
+    return jsonify(entries)
+
+
+@app.route("/api/brain-dump/capture", methods=["POST"])
+def api_brain_dump_capture():
+    """Dumb, synchronous append -- no LLM in the write path, same philosophy as
+    queue-adhoc-task.js's manual task injection. The brain_dump_sort Ornith worker source
+    picks unsorted ("captured") entries up from here asynchronously."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        abort(400, description="text is required")
+
+    path = brain_dump_path()
+    if not path:
+        abort(500, description="no active project configured")
+
+    data = read_json_safe(path)
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        data = {"entries": []}
+
+    entry_id = f"bd-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{slugify_for_id(text)}"
+    entry = {
+        "id": entry_id,
+        "capturedAt": datetime.now(timezone.utc).isoformat(),
+        "rawText": text,
+        "status": "captured",
+    }
+    data["entries"].append(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify(entry)
+
+
+@app.route("/api/brain-dump/<entry_id>", methods=["PUT"])
+def api_brain_dump_edit(entry_id):
+    """Edits an entry's raw text. If it had already been sorted, the sort result is tied
+    to the OLD text -- keeping it around would show a category/destination that no longer
+    reflects what's actually captured, so an edit resets the entry back to 'captured' and
+    drops the stale sort, same as a fresh capture. brain_dump_sort picks it up again from
+    there."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        abort(400, description="text is required")
+
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+
+    if entry.get("rawText") != text and entry.get("status") == "sorted":
+        entry["status"] = "captured"
+        entry.pop("sort", None)
+    entry["rawText"] = text
+    entry["editedAt"] = datetime.now(timezone.utc).isoformat()
+
+    write_brain_dump_entries(entries)
+    return jsonify(entry)
+
+
+@app.route("/api/brain-dump/<entry_id>", methods=["DELETE"])
+def api_brain_dump_delete(entry_id):
+    entries = read_brain_dump_entries()
+    remaining = [e for e in entries if e.get("id") != entry_id]
+    if len(remaining) == len(entries):
+        abort(404)
+    write_brain_dump_entries(remaining)
+    return jsonify({"deleted": entry_id})
+
+
+@app.route("/api/brain-dump/<entry_id>/prioritize", methods=["POST"])
+def api_brain_dump_prioritize(entry_id):
+    """'Process this now' button: injects the entry straight into queue/adhoc/, the SAME
+    preempt-everything lane queue-adhoc-task.js already uses (nextAdhocTask() in
+    task-sources.js is checked before every deterministic source, including whatever
+    brain_dump_sort/brain_dump_action end up being). Deliberately bypasses the sort stage
+    rather than waiting on it -- this button means "a human wants this handled right now,"
+    not "queue it for eventual triage."""
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+
+    task_id = f"adhoc-brain-dump-{slugify_for_id(entry['rawText'])}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    record = {
+        "id": task_id,
+        "domain": default_task_domain(),
+        "source": "manual",
+        "title": entry["rawText"][:120],
+        "promptContext": {
+            "rawText": entry["rawText"],
+            "brainDumpEntryId": entry["id"],
+            "sort": entry.get("sort"),
+        },
+    }
+    adhoc_dir = pipeline_dir / "queue" / "adhoc"
+    adhoc_dir.mkdir(parents=True, exist_ok=True)
+    (adhoc_dir / f"{task_id}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    entry["queuedTaskId"] = task_id
+    entry["queuedAt"] = datetime.now(timezone.utc).isoformat()
+    write_brain_dump_entries(entries)
+    return jsonify(entry)
+
+
+def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
+    """Resolves raw_path against root, rejecting anything that escapes it (../ traversal,
+    an absolute path elsewhere, a symlink pointing out). Unlike /api/browse (which
+    intentionally allows roaming the whole filesystem, for the Project tab's repo picker),
+    this only ever exposes one directory tree -- personal notes, not arbitrary disk
+    contents -- so the jail is load-bearing, not optional."""
+    candidate = (root / raw_path).resolve() if raw_path else root
+    if candidate != root and root not in candidate.parents:
+        abort(403, description="path escapes SECOND_BRAIN_DIR")
+    return candidate
+
+
+@app.route("/api/second-brain/browse")
+def api_second_brain_browse():
+    root = second_brain_dir()
+    if not root:
+        return jsonify({"path": "", "parent": None, "entries": [], "configured": False})
+    root = root.resolve()
+
+    raw_path = request.args.get("path", "").strip()
+    target = _resolve_under_second_brain(root, raw_path)
+    if not target.is_dir():
+        abort(404)
+
+    entries = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            try:
+                # .as_posix(), not str() -- these paths round-trip through JSON to the
+                # frontend, which splits on '/' (see the "jump to file" handler in
+                # index.html). str() on Windows would emit '\\', silently breaking that.
+                entries.append({
+                    "name": child.name,
+                    "path": child.relative_to(root).as_posix(),
+                    "isDir": child.is_dir(),
+                })
+            except (PermissionError, OSError):
+                continue
+    except (PermissionError, OSError) as e:
+        abort(403, description=str(e))
+
+    rel = "" if target == root else target.relative_to(root).as_posix()
+    # target.parent.relative_to(root).as_posix() would give "." for a one-level-deep
+    # directory (its parent IS root) -- Path('.').as_posix() is '.', not '', which would
+    # round-trip back through the jail check as a non-empty raw_path instead of "go to
+    # root". Normalizing here keeps "up" from root's immediate children correct.
+    parent = None if target == root else ("" if target.parent == root else target.parent.relative_to(root).as_posix())
+    return jsonify({"path": rel, "parent": parent, "entries": entries, "configured": True})
+
+
+@app.route("/api/second-brain/file")
+def api_second_brain_file():
+    root = second_brain_dir()
+    if not root:
+        abort(500, description="SECOND_BRAIN_DIR is not configured")
+    root = root.resolve()
+
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        abort(400, description="path is required")
+    target = _resolve_under_second_brain(root, raw_path)
+    if not target.is_file():
+        abort(404)
+    try:
+        content = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        abort(400, description=f"could not read file as text: {e}")
+    return jsonify({"path": raw_path, "content": content})
 
 
 @app.route("/api/deep-dive/projects")
@@ -659,6 +963,15 @@ def _grep_dirs_from_query() -> list[str]:
     return [d.strip() for d in raw.split(",") if d.strip()]
 
 
+@app.route("/api/projects/history")
+def api_projects_history():
+    """Backs the Project tab's dropdown/search of previously-loaded projects. Paths that
+    no longer exist on disk are still returned (a project on an unplugged drive, or one
+    you're about to reconnect, is still worth remembering) -- filtering happens client-
+    side if wanted, this endpoint is just the raw history."""
+    return jsonify({"projects": read_project_history()})
+
+
 @app.route("/api/project/status")
 def api_project_status():
     raw_path = request.args.get("path", "").strip()
@@ -731,6 +1044,7 @@ def api_project_build():
         abort(400, description="path is required")
     if not Path(raw_path).is_dir():
         abort(404, description="path does not exist")
+    record_project_used(raw_path)
 
     raw_grep_dirs = body.get("grepDirs")
     if raw_grep_dirs:
@@ -813,73 +1127,177 @@ def _pipeline_running() -> bool:
     data = read_json_safe(worker_hb)
     if not data or not data.get("lastHeartbeat"):
         return False
-    try:
-        last_hb = datetime.fromisoformat(data["lastHeartbeat"].replace("Z", "+00:00"))
-        if last_hb.tzinfo is None:
-            last_hb = last_hb.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - last_hb).total_seconds()
-    except (ValueError, KeyError):
+    last_hb = parse_hb_timestamp(data["lastHeartbeat"])
+    if not last_hb:
         return False
+    age = (datetime.now(timezone.utc) - last_hb).total_seconds()
     threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
     return age <= threshold
 
 
 @app.route("/api/pipeline/status")
 def api_pipeline_status():
+    env = read_env_file(ENV_FILE_PATH)
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
         "running": _pipeline_running(),
+        # Which job types actually run is no longer a bundled "mode" -- see /api/job-types.
+        # includeApply/skipPush are the two run-specific safety toggles that used to be
+        # implied by mode; they're per-repoRoot and persisted the same way REPO_ROOT is.
+        "includeApply": env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true",
+        "skipPush": env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true",
     })
 
 
-@app.route("/api/pipeline/start", methods=["POST"])
-def api_pipeline_start():
-    """The Project tab's "make it automatic" entry point: writes the chosen path into
-    agent-manager.env (creating the file if it doesn't exist yet -- no more required
-    manual copy-the-example-file step) and spawns the 4 loops as real, visible console
-    windows, same as launch.bat's own `start powershell.exe -NoExit ...` pattern, just
-    triggered by a click instead of a batch file."""
-    if _pipeline_running():
-        return jsonify({"started": False, "reason": "a pipeline is already running -- stop it first"}), 409
+# Kept in sync by hand with src/task-sources.js's registerTaskSource() calls, same
+# "Python duplicates Node's knowledge" convention already used for SECOND_BRAIN_DIR above.
+# This is the canonical name list both the Job List tab's isActive checkboxes and
+# /api/pipeline/start's task-domain healing draw from -- there is no mode bundling these
+# into fixed sets anymore (removed 2026-07-23 at Grimmethy's request: job-type activity is
+# a top-level, cross-project setting, the same "sits above any single active project"
+# reasoning as AGENT_MANAGER_BRAIN_DUMP_PATH).
+TASK_SOURCE_CATALOG = [
+    "adhoc", "trouble_log", "secondbrain", "brain_dump_sort", "arch_review",
+    "arch_import_review", "arch_discovery", "arch_import", "deep_dive",
+    "project_search", "unused_export",
+]
 
+# Exempt from any allowlist restriction regardless of stored state -- task-sources.js's
+# getNextTask() hardcodes this same exemption ('adhoc': fixed contract per README,
+# "preempts every deterministic source"; 'brain_dump_sort': always-on background source,
+# confirmed live 2026-07-23 it was silently getting gated out by Project Search mode's
+# allowlist before that fix). Presenting either as toggleable in the UI would be a lie.
+ALWAYS_ACTIVE_SOURCES = {"adhoc", "brain_dump_sort"}
+
+
+def read_active_job_types() -> set:
+    """AGENT_MANAGER_TASK_SOURCES unset/empty means unrestricted (every source active) --
+    same semantics src/task-sources.js's getNextTask() already implements."""
+    raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_TASK_SOURCES", "")
+    listed = {s.strip() for s in raw.split(",") if s.strip()}
+    if not listed:
+        return set(TASK_SOURCE_CATALOG)
+    return listed | ALWAYS_ACTIVE_SOURCES
+
+# workDirKind/successCheck values that satisfy review-runner.ps1's unconditional
+# Get-DomainConfig lookup for each domain that apply-task.js already special-cases as a
+# non-git write. Neither field is actually consulted for these domains on the real
+# (ornith-provider, apply-runner) path -- successCheck only matters for the 'claude'
+# REVIEW_PROVIDER branch, which nothing here uses -- so any valid placeholder works; kept
+# identical to "default" for simplicity rather than inventing a new value with no
+# behavioral difference.
+_DOMAIN_DEFAULTS_TO_ENSURE = {
+    "project_search": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+    "deep_dive": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+    "brain_dump_sort": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+}
+
+# brain_dump_sort is always in read_active_job_types()'s result (see ALWAYS_ACTIVE_SOURCES
+# above), so this list is redundant in the normal call path -- kept as a belt-and-suspenders
+# floor in case some future call site ever passes a hand-built task_sources list that forgot
+# it, since the failure mode ("Unknown task domain") is silent and easy to miss.
+_ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort"]
+
+
+def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
+    """Confirmed live (2026-07-22, mission-control and TaxHarvest): review-runner.ps1 calls
+    Get-DomainConfig for EVERY task's domain unconditionally (fact-checker.js's working-
+    directory lookup, shared by both the ornith and claude review providers) -- not just
+    git-based domains. A task-domains.json with only "default" blocks every project_search
+    (and, by the same mechanism, every deep_dive) task immediately with "Unknown task
+    domain: ...", even though apply-task.js already special-cases both domains correctly
+    (no git involved for either). Rather than requiring every consumer project to know to
+    pre-add these entries themselves, add whichever of them this run's task_sources
+    actually uses -- additively, never overwriting an existing entry or any other key --
+    so this doesn't have to be rediscovered per-project."""
+    relevant = [s for s in {*task_sources, *_ALWAYS_ENSURE_DOMAINS} if s in _DOMAIN_DEFAULTS_TO_ENSURE]
+    if not relevant:
+        return
+
+    domains_path_str = child_env.get("AGENT_MANAGER_DOMAINS_PATH")
+    if domains_path_str:
+        domains_path = Path(domains_path_str)
+    else:
+        pipeline_dir = child_env.get("AGENT_MANAGER_PIPELINE_DIR") or raw_path
+        domains_path = Path(pipeline_dir) / "task-domains.json"
+
+    domains = read_json_safe(domains_path) or {}
+    if not isinstance(domains, dict):
+        return
+    changed = False
+    for source in relevant:
+        if source not in domains:
+            domains[source] = _DOMAIN_DEFAULTS_TO_ENSURE[source]
+            changed = True
+    if not changed:
+        return
+    try:
+        domains_path.parent.mkdir(parents=True, exist_ok=True)
+        domains_path.write_text(json.dumps(domains, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+@app.route("/api/job-types")
+def api_job_types():
+    """Job List tab's isActive checkboxes: one row per src/task-sources.js registered
+    source, independent of whichever project is currently active -- same "sits above any
+    single project" reasoning as Brain Dump. Backed entirely by AGENT_MANAGER_TASK_SOURCES
+    in agent-manager.env, the same allowlist src/task-sources.js's getNextTask() already
+    reads; this is just a UI over that one persisted value."""
+    active = read_active_job_types()
+    return jsonify([
+        {"name": name, "active": name in active, "alwaysActive": name in ALWAYS_ACTIVE_SOURCES}
+        for name in TASK_SOURCE_CATALOG
+    ])
+
+
+@app.route("/api/job-types/toggle", methods=["POST"])
+def api_job_types_toggle():
     body = request.get_json(silent=True) or {}
-    raw_path = (body.get("path") or "").strip()
-    if not raw_path:
-        abort(400, description="path is required")
-    if not Path(raw_path).is_dir():
-        abort(404, description="path does not exist")
+    name = (body.get("name") or "").strip()
+    active = bool(body.get("active"))
+    if name not in TASK_SOURCE_CATALOG:
+        abort(400, description=f"unknown job type '{name}'")
+    if name in ALWAYS_ACTIVE_SOURCES:
+        abort(400, description=f"'{name}' is always active and cannot be toggled off")
 
-    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
+    current = read_active_job_types()
+    if active:
+        current.add(name)
+    else:
+        current.discard(name)
 
-    env_overrides = read_env_file(ENV_FILE_PATH)
-    env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
-    child_env = {**os.environ, **env_overrides}
+    # Collapse back to "unrestricted" (empty string) when every source ends up active --
+    # an explicit list naming all of TASK_SOURCE_CATALOG means exactly the same thing as
+    # no list at all, and staying in that tidy round-trip avoids the allowlist silently
+    # drifting out of sync if TASK_SOURCE_CATALOG ever gains a new entry later.
+    if current == set(TASK_SOURCE_CATALOG):
+        new_value = ""
+    else:
+        new_value = ",".join(sorted(current - ALWAYS_ACTIVE_SOURCES))
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_SOURCES", new_value)
 
-    if os.name != "nt":
-        return jsonify({"started": False, "reason": "process auto-start is only implemented for Windows -- use launch.bat manually"}), 501
+    # Take effect immediately, not just on the run's next manual restart -- the whole
+    # point of moving this into a live checkbox instead of a config file edit is that
+    # flipping it actually changes what the running pipeline does. Filesystem-queue-based
+    # crash-resume (ornith-worker.ps1's orphaned-claim recovery) already makes this safe.
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
 
-    creationflags = subprocess.CREATE_NEW_CONSOLE
-    scripts = [
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "ornith-worker.ps1"), "-InstanceId", "worker-1"], "Ornith Worker 1"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Ornith Review Runner"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
-    ]
-    for args, _label in scripts:
-        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
-
-    return jsonify({"started": True, "repoRoot": raw_path})
+    return jsonify({"name": name, "active": active, "restarted": restarted})
 
 
-@app.route("/api/pipeline/stop", methods=["POST"])
-def api_pipeline_stop():
+def _stop_pipeline() -> list:
     """Kills whatever the current instances/*.json heartbeats say is running, by PID --
     same trust model queue-watchdog.ps1's own dead-process check already uses. Does NOT
     touch anything if nothing looks like it's running, so this is safe to call even when
-    unsure."""
+    unsure. Shared by /api/pipeline/stop and _restart_pipeline()."""
     inst_dir = instances_dir()
     if not inst_dir or not inst_dir.is_dir():
-        return jsonify({"stopped": []})
+        return []
 
     stopped = []
     for f in inst_dir.glob("*.json"):
@@ -891,7 +1309,98 @@ def api_pipeline_stop():
             stopped.append(data.get("instanceId", str(data["pid"])))
         except (OSError, subprocess.SubprocessError):
             continue
-    return jsonify({"stopped": stopped})
+        finally:
+            # Confirmed live (2026-07-22): without this, _pipeline_running()'s worker-1
+            # heartbeat check kept reporting the pipeline as running for up to
+            # WORKING_STALE_SECONDS (20 min) after a real, successful stop -- the killed
+            # process's last-written heartbeat file just sat there looking recent, and
+            # /api/pipeline/start's "already running" guard blocked a genuine restart the
+            # whole time. Remove the heartbeat regardless of whether taskkill itself
+            # reported success (the process may have already been dead) -- either way,
+            # this instance should no longer read as live.
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    return stopped
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    record_project_used(raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_INCLUDE_APPLY", "true" if include_apply else "false")
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_SKIP_PUSH", "true" if skip_push else "false")
+
+    env_overrides = read_env_file(ENV_FILE_PATH)
+    env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
+    child_env = {**os.environ, **env_overrides}
+
+    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
+
+    if os.name != "nt":
+        return {"started": False, "reason": "process auto-start is only implemented for Windows -- use launch.bat manually"}
+
+    creationflags = subprocess.CREATE_NEW_CONSOLE
+    scripts = [
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "ornith-worker.ps1"), "-InstanceId", "worker-1"], "Ornith Worker 1"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Ornith Review Runner"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
+    ]
+    if include_apply:
+        scripts.insert(2, (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"))
+
+    for args, _label in scripts:
+        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
+
+    return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+
+
+def _restart_pipeline():
+    """Stop, then start again against whatever's currently persisted in agent-manager.env
+    (repoRoot + includeApply/skipPush) -- used when a Job List toggle needs to take effect
+    on an already-running pipeline immediately, not just on the next manual restart."""
+    env = read_env_file(ENV_FILE_PATH)
+    raw_path = env.get("AGENT_MANAGER_REPO_ROOT", "")
+    if not raw_path or not Path(raw_path).is_dir():
+        return
+    _stop_pipeline()
+    include_apply = env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true"
+    skip_push = env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true"
+    _start_pipeline(raw_path, include_apply, skip_push)
+
+
+@app.route("/api/pipeline/start", methods=["POST"])
+def api_pipeline_start():
+    """The Project tab's entry point. includeApply controls whether apply-runner.ps1 runs
+    at all (False = nothing can touch the target repo's files or git history, the safest
+    setting); skipPush controls whether apply-runner is allowed to push approved commits
+    to the remote once it does run. Which job TYPES run is no longer chosen here -- see
+    /api/job-types, a top-level setting independent of which project this starts against."""
+    if _pipeline_running():
+        return jsonify({"started": False, "reason": "a pipeline is already running -- stop it first"}), 409
+
+    body = request.get_json(silent=True) or {}
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        abort(400, description="path is required")
+    if not Path(raw_path).is_dir():
+        abort(404, description="path does not exist")
+
+    include_apply = bool(body.get("includeApply", False))
+    skip_push = bool(body.get("skipPush", True))
+
+    result = _start_pipeline(raw_path, include_apply, skip_push)
+    status_code = 200 if result.get("started") else 501
+    return jsonify(result), status_code
+
+
+@app.route("/api/pipeline/stop", methods=["POST"])
+def api_pipeline_stop():
+    return jsonify({"stopped": _stop_pipeline()})
 
 
 if __name__ == "__main__":

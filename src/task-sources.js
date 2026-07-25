@@ -652,9 +652,85 @@ function nextUnusedExportTask() {
   return null;
 }
 
+// --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
+// (priority 42, right after secondbrain's 40) -----------------------------------------
+//
+// Entries are written by the dashboard's Brain Dump tab (POST /api/brain-dump/capture),
+// not by this pipeline -- this source only ever reads brainDumpPath, never writes it
+// (the actual classification write happens in apply-group-a.js's applyBrainDumpSort,
+// AFTER review approval, same "nothing is committed until review passes" rule every
+// other source here follows). domain and source are both 'brain_dump_sort' (matching
+// project_search/deep_dive's own domain===source convention) so the dashboard's
+// _ensure_task_domains helper (python/dashboard/app.py) can key task-domains.json by
+// this one name unambiguously.
+//
+// Priority 41 is deliberately left open, immediately ahead of this source, for a future
+// brain_dump_action consumer that promotes a sorted+actionable entry into a real
+// fulfillment task -- same "the consumer outranks its own generator" ordering
+// arch_review/arch_discovery and deep_dive/project_search already establish. Not built
+// yet; scoped out of this change.
+//
+// Top-level secondBrainDir listing (names only, not content -- same reason arch_discovery
+// only embeds the specific files a plan needs, not a whole repo) is embedded so the
+// implement pass can reuse an existing folder ("Projects/", "Reference/", ...) instead of
+// inventing a new one for every entry, which would defeat the point of a second brain.
+// Best-effort: an unreadable/missing secondBrainDir just yields an empty list, never fatal.
+function listSecondBrainTopLevel(secondBrainDir) {
+  if (!secondBrainDir) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(secondBrainDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => !e.name.startsWith('.'))
+    .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+    .sort();
+}
+
+function nextBrainDumpSortTask() {
+  const { brainDumpPath, secondBrainDir } = getConfig();
+  if (!brainDumpPath) return null;
+  const raw = readIfExists(brainDumpPath);
+  if (!raw) return null;
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  const chosen = entries.find((e) => e && e.status === 'captured');
+  if (!chosen) return null;
+
+  const taskId = 'brain-dump-sort-' + chosen.id;
+  if (taskIdExistsInQueue(taskId)) return null;
+
+  return {
+    id: taskId,
+    domain: 'brain_dump_sort',
+    source: 'brain_dump_sort',
+    title: `Sort brain dump entry: ${chosen.rawText.slice(0, 80)}`,
+    promptContext: {
+      brainDumpEntryId: chosen.id,
+      rawText: chosen.rawText,
+      existingStructure: listSecondBrainTopLevel(secondBrainDir),
+    },
+  };
+}
+
 registerTaskSource('adhoc', { priority: 10, next: nextAdhocTask });
 registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
+// No `apply` key here, unlike arch_discovery/arch_import above -- writeArtifact() (called
+// from apply-task.js) is only reached for domains that AREN'T one of the non-git special
+// cases (secondbrain/project_search/deep_dive/brain_dump_sort) hardcoded in applyTask()
+// itself. An `apply` registered here would be dead code: applyTask() intercepts
+// domain==='brain_dump_sort' before writeArtifact() is ever called. See apply-task.js's
+// applyBrainDumpSort branch instead.
+registerTaskSource('brain_dump_sort', { priority: 42, next: nextBrainDumpSortTask });
 registerTaskSource('arch_review', {
   priority: 70,
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
@@ -804,7 +880,18 @@ registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask
 registerTaskSource('unused_export', { priority: 90, next: nextUnusedExportTask });
 
 function getNextTask() {
+  const { taskSourceAllowlist } = getConfig();
+  const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
   for (const source of getRegisteredSources()) {
+    // 'adhoc' is a fixed contract (README: "preempts every deterministic source") --
+    // an allowlist restricting this run to e.g. just project_search should still let an
+    // explicitly human-queued adhoc task through, not silently swallow it. 'brain_dump_sort'
+    // is documented (see app.py's _ALWAYS_ENSURE_DOMAINS) as an always-on background source,
+    // independent of whichever project's pipeline mode is active -- a mode-scoped allowlist
+    // like Project Search's [project_search, deep_dive] should never be able to silently
+    // pause it, since Brain Dump is meant to sit above any single active project.
+    const alwaysAllowed = source.name === 'adhoc' || source.name === 'brain_dump_sort';
+    if (restricted && !alwaysAllowed && !taskSourceAllowlist.includes(source.name)) continue;
     if (typeof source.next !== 'function') continue;
     const task = source.next();
     if (task) return task;
@@ -831,7 +918,7 @@ module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
-  nextArchImportTask,
+  nextArchImportTask, nextBrainDumpSortTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

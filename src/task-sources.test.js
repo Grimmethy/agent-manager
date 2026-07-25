@@ -161,3 +161,163 @@ test('full round-trip: nextArchImportTask -> applyArchImportCandidate -> arch_im
   assert.equal(fulfillmentTask.promptContext.candidateId, 'AC-1');
   assert.deepEqual(fulfillmentTask.promptContext.files, ['src/config.js']);
 });
+
+// --- AGENT_MANAGER_TASK_SOURCES allowlist (getNextTask) --------------------------------
+// Backs the dashboard's "Project Search" run mode: project_search is priority 85 (lowest
+// of the 10 built-ins), so without a way to suppress higher-priority sources it would
+// rarely fire while e.g. arch_discovery has pending work. Tested against fake registered
+// sources rather than the real built-ins -- the allowlist filter in getNextTask() is
+// generic over source NAME, it doesn't need real arch_discovery/project_search fixtures
+// to verify.
+test('getNextTask allowlist: unset means unrestricted (existing behavior)', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-allowlist-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry(); // wipe the real built-ins task-sources.js just registered at require time
+  registerTaskSource('high_priority_source', { priority: 20, next: () => ({ id: 'hp-1', source: 'high_priority_source' }) });
+  registerTaskSource('low_priority_source', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_source' }) });
+
+  const task = getNextTask();
+  assert.equal(task.source, 'high_priority_source');
+});
+
+test('getNextTask allowlist: restricts to the named source, skipping higher-priority ones', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-allowlist-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  process.env.AGENT_MANAGER_TASK_SOURCES = 'low_priority_source';
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  registerTaskSource('high_priority_source', { priority: 20, next: () => ({ id: 'hp-1', source: 'high_priority_source' }) });
+  registerTaskSource('low_priority_source', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_source' }) });
+
+  const task = getNextTask();
+  assert.equal(task.source, 'low_priority_source', 'should skip a higher-priority source not in the allowlist');
+
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+});
+
+test('getNextTask allowlist: adhoc always preempts, even when restricted to a different source', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-allowlist-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  process.env.AGENT_MANAGER_TASK_SOURCES = 'low_priority_source';
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  registerTaskSource('adhoc', { priority: 10, next: () => ({ id: 'adhoc-1', source: 'adhoc' }) });
+  registerTaskSource('low_priority_source', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_source' }) });
+
+  const task = getNextTask();
+  assert.equal(task.source, 'adhoc', 'adhoc must preempt regardless of the allowlist');
+
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+});
+
+test('getNextTask allowlist: brain_dump_sort always preempts, even when restricted to a different source', () => {
+  // Brain Dump sits above any single project's active pipeline mode (e.g. Project
+  // Search's [project_search, deep_dive] allowlist) -- a mode-scoped restriction must
+  // never be able to silently pause the sorter.
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-allowlist-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  process.env.AGENT_MANAGER_TASK_SOURCES = 'project_search';
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  registerTaskSource('brain_dump_sort', { priority: 42, next: () => ({ id: 'bds-1', source: 'brain_dump_sort' }) });
+  registerTaskSource('project_search', { priority: 85, next: () => ({ id: 'ps-1', source: 'project_search' }) });
+
+  const task = getNextTask();
+  assert.equal(task.source, 'brain_dump_sort', 'brain_dump_sort must preempt regardless of the allowlist');
+
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+});
+
+// --- nextBrainDumpSortTask --------------------------------------------------------------
+
+function makeBrainDumpFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-brain-dump-test-'));
+  process.env.AGENT_MANAGER_BRAIN_DUMP_PATH = path.join(dir, 'brain-dump.json');
+  process.env.SECOND_BRAIN_DIR = path.join(dir, 'secondbrain');
+  return dir;
+}
+
+test('nextBrainDumpSortTask returns null when brain-dump.json does not exist', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  assert.equal(nextBrainDumpSortTask(), null);
+});
+
+test('nextBrainDumpSortTask returns null when there are no "captured" entries', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'sorted' }, { id: 'bd-2', rawText: 'y', status: 'actioned' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  assert.equal(nextBrainDumpSortTask(), null);
+});
+
+test('nextBrainDumpSortTask picks the oldest "captured" entry and builds correct promptContext', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [
+      { id: 'bd-1', rawText: 'first captured', status: 'sorted' },
+      { id: 'bd-2', rawText: 'second captured', status: 'captured' },
+      { id: 'bd-3', rawText: 'third captured', status: 'captured' },
+    ],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+
+  assert.equal(task.id, 'brain-dump-sort-bd-2');
+  assert.equal(task.domain, 'brain_dump_sort');
+  assert.equal(task.source, 'brain_dump_sort');
+  assert.equal(task.promptContext.brainDumpEntryId, 'bd-2');
+  assert.equal(task.promptContext.rawText, 'second captured');
+});
+
+test('nextBrainDumpSortTask embeds the existing secondBrainDir top-level structure', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'secondbrain', 'Projects'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'secondbrain', 'README.md'), '# hi');
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+  assert.deepEqual(task.promptContext.existingStructure, ['Projects/', 'README.md']);
+});
+
+test('nextBrainDumpSortTask returns an empty structure list (not a crash) when SECOND_BRAIN_DIR is unset or missing', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  delete process.env.SECOND_BRAIN_DIR;
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+  assert.deepEqual(task.promptContext.existingStructure, []);
+});
+
+test('nextBrainDumpSortTask skips an entry already sitting in the queue', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+
+  const pendingDir = path.join(dir, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, 'brain-dump-sort-bd-1.json'), '{}');
+
+  assert.equal(nextBrainDumpSortTask(), null);
+});

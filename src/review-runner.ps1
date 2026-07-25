@@ -62,11 +62,13 @@ function Invoke-OrnithClient {
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
-        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
-        # See Invoke-OrnithMajorityVote's matching comment below -- same silent-failure
-        # shape, same fix: ornith-client.js's CLI writes errors to stderr (dropped by the
-        # stdout-only capture above) and exits 1, so without this a real crash here just
-        # surfaced as an undiagnosable empty/null result.
+        # 2>&1 actually merges stderr into the captured array -- confirmed empirically
+        # that without it, `& node ...` in PowerShell captures stdout only, so
+        # ornith-client.js's console.error(...)-then-exit(1) failure text never reached
+        # $rawLines (nor therefore the throw below) despite this comment previously
+        # claiming otherwise. See ornith-worker.ps1's Invoke-OrnithClient for the same fix
+        # and the concrete blocked-task example (arch-discovery-community-3) that exposed it.
+        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
             throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
@@ -90,14 +92,12 @@ function Invoke-OrnithMajorityVote {
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
-        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
-        # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on
-        # failure (console.error + process.exit(1)) -- stdout capture above silently drops
-        # that message, so a real crash here surfaced as the generic, undiagnosable
-        # "Ornith majority-vote call returned nothing" (found live 2026-07-21, a review
-        # task blocked with zero information about what actually went wrong). Checking the
-        # exit code and throwing with whatever WAS captured turns that into a real,
-        # actionable blockedReason instead.
+        # 2>&1 is the actual fix, not the exit-code check alone -- without it, `& node ...`
+        # captures stdout only, so ornith-client.js's console.error(...)-then-exit(1)
+        # failure text never reaches $rawLines, and the throw below reports it as empty
+        # (confirmed empirically; see ornith-worker.ps1's Invoke-OrnithClient for the
+        # concrete blocked-task example that exposed this same gap here too).
+        $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
             throw ('ornith-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }

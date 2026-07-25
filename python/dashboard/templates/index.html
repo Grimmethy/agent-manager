@@ -66,6 +66,17 @@
   .build-log { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
   .build-log div { color: var(--muted); }
   iframe.viz { width: 100%; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 8px; margin-top: 16px; }
+  .split-pane { display: flex; gap: 16px; align-items: flex-start; }
+  .split-pane > div { flex: 1; min-width: 0; }
+  .capture-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .capture-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  .bd-entry { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .bd-entry .text { font-size: 13px; }
+  .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
+  .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
+  .browser-entry.active { background: var(--bg); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -89,6 +100,7 @@ const TABS = [
   { key: 'models', label: 'Models' },
   { key: 'joblist', label: 'Job List' },
   { key: 'deepdive', label: 'Scouted Repos' },
+  { key: 'brain-dump', label: 'Brain Dump' },
   { group: 'Job Status', children: [
     { key: 'drafting', label: 'Drafting' },
     { key: 'pending', label: 'Pending' },
@@ -110,9 +122,75 @@ function isGroupExpanded(groupName) {
 // 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
 let grepDirs = localStorage.getItem('agentManagerGrepDirs') || '';
+// Removed 2026-07-23 at Grimmethy's request: which job TYPES run is no longer a bundled
+// "mode" choice here -- see the Job List tab's isActive checkboxes, a top-level setting
+// independent of which project this starts against. What's left here is the two
+// safety-critical toggles mode used to imply: whether apply-runner runs at all, and
+// whether it's allowed to push. Both default to the SAFEST setting (off) rather than
+// mirroring the backend's own permissive fallback -- a fresh browser with no prior choice
+// should have to opt INTO write access, not fall into it silently.
+let includeApply = localStorage.getItem('agentManagerIncludeApply') === 'true';
+let skipPush = localStorage.getItem('agentManagerSkipPush') !== 'false'; // default true (don't push)
 let browsePath = '';
 let browserOpen = false;
+let historyOpen = false;
 let projectStatusInterval = null;
+let projectHistory = [];
+
+// Brain Dump tab state -- same "own render lifecycle, not the generic 5s cycle" reasoning
+// as the Project tab above: re-rendering from scratch every 5s would wipe a half-typed
+// capture note and reset the second-brain folder browser back to its root every tick.
+let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
+let brainDumpSelectedFile = null;
+let brainDumpEntriesInterval = null;
+
+// Retrofits #project-path-input into a searchable dropdown of previously-loaded
+// projects via a native <datalist> -- typing filters/suggests past paths, picking one
+// fills the input, and the existing 'change' handler (below) fires exactly as it already
+// does for manual typing or the Browse panel, no other wiring needed.
+async function loadProjectHistory() {
+  try {
+    const data = await fetchJson('/api/projects/history');
+    projectHistory = data.projects || [];
+  } catch (e) {
+    projectHistory = [];
+  }
+  const list = document.getElementById('project-history-list');
+  if (list) list.innerHTML = projectHistory.map((p) => `<option value="${escapeAttr(p)}">`).join('');
+}
+
+// Explicit "show me everything" affordance, separate from the datalist above.
+// Confirmed live (2026-07-22): Chrome's native datalist popup filters suggestions to
+// substring-matches of whatever's currently TYPED in the input -- with a different
+// project's path already filled in, every unrelated history entry (e.g. mission-control
+// while TaxHarvest is showing) silently disappears from the native popup even though
+// it's still correctly in the DOM. That's real browser behavior, not fixable by fixing
+// the data -- this panel (same interaction pattern as the Browse... folder panel) lists
+// every history entry unconditionally, regardless of the input's current value.
+function renderHistoryPanel() {
+  const panel = document.getElementById('history-panel');
+  if (!panel) return;
+  if (projectHistory.length === 0) {
+    panel.innerHTML = `<div class="empty">No projects loaded yet.</div>`;
+    return;
+  }
+  panel.innerHTML = projectHistory.map((p) => `
+    <div class="browser-entry" data-select="${escapeAttr(p)}">
+      <span>${escapeHtml(p)}</span><span>&rarr;</span>
+    </div>
+  `).join('');
+  panel.querySelectorAll('[data-select]').forEach((el) => {
+    el.onclick = () => {
+      projectPath = el.dataset.select;
+      localStorage.setItem('agentManagerProjectPath', projectPath);
+      document.getElementById('project-path-input').value = projectPath;
+      lastRenderedStatusKey = null;
+      historyOpen = false;
+      panel.style.display = 'none';
+      refreshProjectStatus();
+    };
+  });
+}
 
 // 8s timeout on every dashboard fetch. Without this, a request in flight during a server
 // restart (or any other network hiccup) can hang indefinitely rather than reject -- and
@@ -145,9 +223,12 @@ function renderTabButton(tab, indent) {
   btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
   btn.onclick = () => {
     if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
+    if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
     activeTab = tab.key;
     renderNav();
-    if (tab.key === 'project') enterProjectTab(); else renderMain();
+    if (tab.key === 'project') enterProjectTab();
+    else if (tab.key === 'brain-dump') enterBrainDumpTab();
+    else renderMain();
   };
   return btn;
 }
@@ -390,30 +471,72 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => { if 
 // package's own src/task-sources.js registers (priority order documented there). A
 // consumer project can register additional sources at priority 30/50/60; this encyclopedia
 // only documents what ships with agent-manager itself.
+// source values must exactly match src/task-sources.js's registerTaskSource() names --
+// that's what AGENT_MANAGER_TASK_SOURCES (the isActive checkboxes below) actually lists.
+// Confirmed live (2026-07-23): this table had drifted from the real registry -- missing
+// brain_dump_sort entirely, and 'deadcode_triage' didn't match the real 'unused_export'
+// name, which would have made that row's checkbox a silent no-op. Fixed alongside adding
+// isActive, since the mismatch is exactly the kind of bug this feature would otherwise hide.
 const JOB_TYPES = [
-  { source: 'manual', domain: 'adhoc', priority: 10, description: 'Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.' },
+  { source: 'adhoc', domain: 'adhoc', priority: 10, description: 'Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.' },
   { source: 'trouble_log', domain: '(project default)', priority: 20, description: "Entries in the project's trouble-log doc flagged ready-for-agent (🤖 marker)." },
-  { source: 'inbox', domain: 'secondbrain', priority: 40, description: 'Oldest unprocessed note in a SecondBrain-style Inbox/ folder.' },
+  { source: 'secondbrain', domain: 'secondbrain', priority: 40, description: 'Oldest unprocessed note in a SecondBrain-style Inbox/ folder.' },
+  { source: 'brain_dump_sort', domain: 'brain_dump_sort', priority: 42, description: 'Sorts a captured Brain Dump entry into a second-brain destination and marks it filed. Always active -- sits above any single project, see the Brain Dump tab.' },
   { source: 'arch_review', domain: '(project default)', priority: 70, description: 'Strong-rated architecture candidates awaiting a fulfillment task.' },
   { source: 'arch_import_review', domain: '(project default)', priority: 71, description: 'Strong-rated architecture-IMPORT candidates (from arch_import) awaiting a fulfillment task -- same logic as arch_review, parameterized, against a separate doc.' },
   { source: 'arch_discovery', domain: '(project default)', priority: 80, description: 'Generates new architecture candidates for one graphify community at a time.' },
   { source: 'arch_import', domain: '(project default)', priority: 81, description: 'Promotes a reviewed deep_dive Use/Adapt finding into a real, agent-manager-grounded architecture-import candidate (ADR-0020): proposes search terms, a harness greps agent-manager\'s own repo, then drafts a candidate grounded in the real matches.' },
   { source: 'deep_dive', domain: 'deep_dive', priority: 82, description: 'Reviews one import-graph community at a time from a project_search Strong lead\'s cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019). See the Scouted Repos tab.' },
   { source: 'project_search', domain: 'project_search', priority: 85, description: 'Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment.' },
-  { source: 'deadcode_triage', domain: '(project default)', priority: 90, description: 'Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive.' },
+  { source: 'unused_export', domain: '(project default)', priority: 90, description: 'Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive.' },
 ];
 
-function renderJobListTab() {
+async function renderJobListTab() {
   const main = document.getElementById('main');
-  const rows = JOB_TYPES.slice().sort((a, b) => a.priority - b.priority).map(j => `
+  let jobTypes;
+  try {
+    jobTypes = await fetchJson('/api/job-types');
+  } catch (e) {
+    jobTypes = null;
+  }
+  const activeByName = {};
+  const alwaysActiveByName = {};
+  (jobTypes || []).forEach((j) => { activeByName[j.name] = j.active; alwaysActiveByName[j.name] = j.alwaysActive; });
+
+  const rows = JOB_TYPES.slice().sort((a, b) => a.priority - b.priority).map(j => {
+    const alwaysActive = !!alwaysActiveByName[j.source];
+    const isActive = jobTypes ? (activeByName[j.source] ?? true) : true;
+    const checkbox = jobTypes
+      ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.source)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
+      : `<span class="meta">?</span>`;
+    return `
     <tr>
+      <td>${checkbox}</td>
       <td>${j.priority}</td>
       <td>${j.source}</td>
       <td>${j.domain}</td>
       <td>${escapeHtml(j.description)}</td>
     </tr>
-  `).join('');
-  main.innerHTML = `<table><thead><tr><th>Priority</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+  `;
+  }).join('');
+  main.innerHTML = `<table><thead><tr><th>Active</th><th>Priority</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  main.querySelectorAll('.job-type-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        await fetch('/api/job-types/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.source, active: cb.checked }),
+        });
+      } catch (e) {
+        alert('Could not update job type: ' + e.message);
+        cb.checked = !cb.checked;
+      }
+      cb.disabled = false;
+    };
+  });
 }
 
 // Scouted Repos tab (deep_dive, ADR-0019): list of every project_search Strong lead
@@ -576,7 +699,7 @@ async function renderMain() {
   try {
     if (activeTab === 'workers') await renderWorkers();
     else if (activeTab === 'models') await renderModelsTab();
-    else if (activeTab === 'joblist') renderJobListTab();
+    else if (activeTab === 'joblist') await renderJobListTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
@@ -592,10 +715,10 @@ async function refresh() {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
   renderNav();
-  // Project tab manages its own rendering (enterProjectTab/leaveProjectTab) so a user's
-  // in-progress folder browsing isn't wiped out by this generic 5s cycle -- only the nav
-  // badge counts above still update while it's open.
-  if (activeTab !== 'project') renderMain();
+  // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
+  // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
+  // this generic 5s cycle -- only the nav badge counts above still update while open.
+  if (activeTab !== 'project' && activeTab !== 'brain-dump') renderMain();
 }
 
 // --- Project tab --------------------------------------------------------------------
@@ -617,18 +740,43 @@ async function enterProjectTab() {
       projectPath = status.activeRepoRoot;
       localStorage.setItem('agentManagerProjectPath', projectPath);
     }
+    // Same reasoning as the path sync above: reflect whatever's actually configured
+    // server-side (env file / another tab / launch.bat) rather than only ever showing
+    // this browser's last local choice.
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
   } catch (e) { /* dashboard's own status check failed -- fall back to whatever's cached */ }
 
   const main = document.getElementById('main');
   main.innerHTML = `
     <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
       <div class="path-row">
-        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}">
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
         <button class="secondary" id="browse-toggle">Browse...</button>
         <button class="action" id="build-btn">Build Graph</button>
       </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
       <div class="path-row">
         <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}">
+          <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Push approved commits to remote
+        </label>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab.</span>
       </div>
       <div id="browser-panel" class="browser-panel" style="display:none"></div>
       <div id="pipeline-panel" class="worker-card"></div>
@@ -642,10 +790,27 @@ async function enterProjectTab() {
     lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
     refreshProjectStatus();
   });
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
   document.getElementById('browse-toggle').onclick = () => {
     browserOpen = !browserOpen;
     document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
     if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
   };
   document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
     grepDirs = e.target.value.trim();
@@ -653,6 +818,7 @@ async function enterProjectTab() {
   });
   document.getElementById('build-btn').onclick = triggerBuild;
 
+  await loadProjectHistory();
   await refreshPipelineStatus();
   await refreshProjectStatus();
   projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
@@ -674,9 +840,10 @@ async function refreshPipelineStatus() {
   }
 
   if (status.running) {
+    const applyLabel = status.includeApply ? (status.skipPush ? 'Apply Runner on, no push' : 'Apply Runner on, pushing') : 'Apply Runner off';
     panel.innerHTML = `
       <div class="row">
-        <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong></span>
+        <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong> (${escapeHtml(applyLabel)})</span>
         <span class="badge ok">RUNNING</span>
       </div>
       <div class="meta"><button class="secondary" id="stop-pipeline-btn" style="margin-top:8px">Stop Pipeline</button></div>
@@ -718,7 +885,7 @@ async function startPipeline() {
     const res = await fetch('/api/pipeline/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath }),
+      body: JSON.stringify({ path: projectPath, includeApply, skipPush }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.reason || data.description || res.statusText);
@@ -726,6 +893,7 @@ async function startPipeline() {
     alert('Could not start pipeline: ' + e.message);
   }
   btn.textContent = 'Start Pipeline';
+  await loadProjectHistory();
   await refreshPipelineStatus();
 }
 
@@ -862,12 +1030,298 @@ async function triggerBuild() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.description || res.statusText);
+    await loadProjectHistory();
     await refreshProjectStatus();
   } catch (e) {
     const area = document.getElementById('project-status-area');
     area.innerHTML = `<div class="empty">Could not start build: ${e.message}</div>`;
     buildBtn.disabled = false;
   }
+}
+
+// --- Brain Dump tab -------------------------------------------------------------------
+
+function renderBrainDumpShell() {
+  document.getElementById('main').innerHTML = `
+    <div class="capture-row">
+      <input id="bd-capture-input" placeholder="Brain dump -- capture anything" autocomplete="off">
+      <button class="action" id="bd-capture-btn">Capture</button>
+    </div>
+    <div class="split-pane">
+      <div>
+        <div class="field-label">Unprocessed</div>
+        <div id="bd-entries"><div class="empty">Loading...</div></div>
+      </div>
+      <div>
+        <div class="field-label">Second Brain</div>
+        <div class="browser-panel" id="bd-browser" style="max-height:220px"><div class="empty">Loading...</div></div>
+        <div id="bd-file-panel"></div>
+      </div>
+    </div>
+  `;
+
+  const input = document.getElementById('bd-capture-input');
+  const submit = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    const btn = document.getElementById('bd-capture-btn');
+    btn.disabled = true;
+    try {
+      await fetch('/api/brain-dump/capture', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      input.value = '';
+      await refreshBrainDumpEntries(true);
+    } catch (e) {
+      alert('Could not capture: ' + e.message);
+    }
+    btn.disabled = false;
+  };
+  document.getElementById('bd-capture-btn').onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+
+  loadSecondBrainBrowser();
+}
+
+// Only one entry can be under edit at a time -- tracked globally (not per-render local
+// state) so refreshBrainDumpEntries knows to render that one card as an editable input
+// instead of static text, and so the periodic poll (see enterBrainDumpTab) can skip
+// rebuilding the list entirely while it's set, same reasoning as brainDumpBrowsePath.
+let brainDumpEditingId = null;
+
+function renderBrainDumpEditCard(entry) {
+  return `
+    <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      <div class="capture-row" style="margin-bottom:0">
+        <input data-edit-input="${escapeAttr(entry.id)}" value="${escapeAttr(entry.rawText)}">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span></span>
+        <span>
+          <button class="action" data-save="${escapeAttr(entry.id)}">Save</button>
+          <button class="secondary" data-cancel-edit="${escapeAttr(entry.id)}">Cancel</button>
+        </span>
+      </div>
+    </div>
+  `;
+}
+
+function wireBrainDumpCardHandlers(el) {
+  el.querySelectorAll('[data-jump]').forEach((a) => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const filePath = a.dataset.jump;
+      const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+      brainDumpBrowsePath = dir;
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', brainDumpBrowsePath);
+      loadSecondBrainBrowser().then(() => loadSecondBrainFile(filePath));
+    };
+  });
+
+  el.querySelectorAll('[data-prioritize]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Queuing...';
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        await refreshBrainDumpEntries(true);
+      } catch (e) {
+        alert('Could not queue: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = 'Process now';
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-delete]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm('Delete this brain dump entry?')) return;
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.delete), { method: 'DELETE' });
+        await refreshBrainDumpEntries(true);
+      } catch (e) {
+        alert('Could not delete: ' + e.message);
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-edit]').forEach((btn) => {
+    btn.onclick = () => {
+      brainDumpEditingId = btn.dataset.edit;
+      refreshBrainDumpEntries(true).then(() => {
+        const input = el.querySelector(`[data-edit-input="${CSS.escape(brainDumpEditingId)}"]`);
+        if (input) { input.focus(); input.select(); }
+      });
+    };
+  });
+
+  el.querySelectorAll('[data-cancel-edit]').forEach((btn) => {
+    btn.onclick = () => {
+      brainDumpEditingId = null;
+      refreshBrainDumpEntries(true);
+    };
+  });
+
+  el.querySelectorAll('[data-save]').forEach((btn) => {
+    btn.onclick = async () => {
+      const id = btn.dataset.save;
+      const input = el.querySelector(`[data-edit-input="${CSS.escape(id)}"]`);
+      const text = input.value.trim();
+      if (!text) return;
+      btn.disabled = true;
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(id), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        brainDumpEditingId = null;
+        await refreshBrainDumpEntries(true);
+      } catch (e) {
+        alert('Could not save: ' + e.message);
+        btn.disabled = false;
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-edit-input]').forEach((input) => {
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') el.querySelector(`[data-save="${CSS.escape(input.dataset.editInput)}"]`).click();
+      if (e.key === 'Escape') el.querySelector(`[data-cancel-edit="${CSS.escape(input.dataset.editInput)}"]`).click();
+    };
+  });
+}
+
+// force=true bypasses the "don't clobber an in-progress edit" guard -- used after an
+// action (save/cancel/delete/prioritize) that just resolved that edit itself, as opposed
+// to the periodic 5s poll (enterBrainDumpTab), which must respect it.
+async function refreshBrainDumpEntries(force = false) {
+  if (brainDumpEditingId && !force) return;
+  const el = document.getElementById('bd-entries');
+  if (!el) return;
+  let entries;
+  try {
+    entries = await fetchJson('/api/brain-dump');
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load: ${e.message}</div>`;
+    return;
+  }
+
+  if (entries.length === 0) {
+    el.innerHTML = '<div class="empty">Nothing captured yet.</div>';
+    return;
+  }
+
+  el.innerHTML = entries.map((entry) => (
+    entry.id === brainDumpEditingId ? renderBrainDumpEditCard(entry) : renderBrainDumpCard(entry)
+  )).join('');
+
+  wireBrainDumpCardHandlers(el);
+}
+
+function renderBrainDumpCard(entry) {
+  const sort = entry.sort;
+  const statusBadge = entry.status === 'sorted'
+    ? '<span class="badge ok">sorted</span>'
+    : '<span class="badge idle">captured</span>';
+  const queuedBadge = entry.queuedTaskId ? '<span class="badge warn">queued</span>' : '';
+  const jump = sort && sort.secondBrainPath
+    ? `<a class="jump" data-jump="${escapeAttr(sort.secondBrainPath)}" href="#">open &rarr;</a>`
+    : '';
+  const meta = sort
+    ? `${escapeHtml(sort.category || '')}${sort.tags && sort.tags.length ? ' &middot; ' + escapeHtml(sort.tags.join(', ')) : ''}`
+    : new Date(entry.capturedAt).toLocaleString();
+  return `
+    <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      <div class="row">
+        <span class="text">${escapeHtml(entry.rawText)}</span>
+        ${statusBadge}
+      </div>
+      <div class="row meta">
+        <span>${meta}</span>
+        ${jump}
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span>${queuedBadge}</span>
+        <span>
+          <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
+          <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
+          <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
+        </span>
+      </div>
+    </div>
+  `;
+}
+
+async function loadSecondBrainBrowser() {
+  const panel = document.getElementById('bd-browser');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  let data;
+  try {
+    data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+    return;
+  }
+
+  if (!data.configured) {
+    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
+    return;
+  }
+
+  let html = `<div class="browser-crumb">${data.path ? escapeHtml(data.path) : '(root)'}</div>`;
+  if (data.parent !== null) {
+    html += `<div class="browser-entry" data-nav="${escapeAttr(data.parent)}"><span>.. (up)</span></div>`;
+  }
+  for (const entry of data.entries) {
+    if (entry.isDir) {
+      html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span></div>`;
+    } else {
+      const active = entry.path === brainDumpSelectedFile ? ' active' : '';
+      html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span></div>`;
+    }
+  }
+  panel.innerHTML = html;
+
+  panel.querySelectorAll('[data-nav]').forEach((el) => {
+    el.onclick = () => {
+      brainDumpBrowsePath = el.dataset.nav;
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', brainDumpBrowsePath);
+      loadSecondBrainBrowser();
+    };
+  });
+  panel.querySelectorAll('[data-file]').forEach((el) => {
+    el.onclick = () => loadSecondBrainFile(el.dataset.file);
+  });
+}
+
+async function loadSecondBrainFile(filePath) {
+  brainDumpSelectedFile = filePath;
+  const panel = document.getElementById('bd-file-panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div>`;
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
+  }
+  document.querySelectorAll('#bd-browser .browser-entry[data-file]').forEach((el) => {
+    el.classList.toggle('active', el.dataset.file === filePath);
+  });
+}
+
+async function enterBrainDumpTab() {
+  renderBrainDumpShell();
+  await refreshBrainDumpEntries();
+  brainDumpEntriesInterval = setInterval(refreshBrainDumpEntries, 5000);
+}
+
+function leaveBrainDumpTab() {
+  if (brainDumpEntriesInterval) { clearInterval(brainDumpEntriesInterval); brainDumpEntriesInterval = null; }
 }
 
 refresh();  // always -- populates counts + renders nav regardless of which tab is active

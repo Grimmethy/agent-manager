@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort } = require('./apply-group-a.js');
 const { applyGroupB } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 
@@ -47,10 +47,14 @@ function writeArtifact(task, repoRoot, pipelineDir) {
  * @param {string} [config.projectSearchIndexPath]
  * @param {string} [config.deepDiveAnalysisDir]
  * @param {string} [config.deepDiveCoveragePath]
+ * @param {string} [config.brainDumpPath]
  * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
- * @returns {{succeeded: boolean, branch?: string, doneMarker?: string, reason?: string}}
+ * @param {boolean} [config.skipPush] - "Implement" mode: commit locally on the new branch
+ *   but don't push. Stays checked out on the branch (rather than returning to main) so the
+ *   local working tree actually reflects the applied change for inspection.
+ * @returns {{succeeded: boolean, branch?: string, pushed?: boolean, doneMarker?: string, reason?: string}}
  */
-function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, gitRunner = createRealGitRunner(repoRoot) }) {
+function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
   try {
     if (task.domain === 'secondbrain') {
       const result = applySecondBrainNote({
@@ -59,6 +63,20 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         secondBrainDir,
       });
       return { succeeded: true, doneMarker: result.marker };
+    }
+
+    // brain_dump_sort's targets (brainDumpPath + a note under secondBrainDir) are both
+    // outside repoRoot, same non-git shape as the three domains above -- see
+    // apply-group-a.js's applyBrainDumpSort.
+    if (task.domain === 'brain_dump_sort') {
+      const result = applyBrainDumpSort({
+        implementResponse: task.implementResponse,
+        task,
+        brainDumpPath,
+        secondBrainDir,
+      });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: `filed under "${result.category}" -> ${result.file}` };
     }
 
     // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's
@@ -129,6 +147,14 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       fs.unlinkSync(msgPath);
     }
 
+    // "Implement" mode: commit locally and stop there. Deliberately does NOT roll back or
+    // delete the branch on any later failure path the way the push branch below does --
+    // there's nothing after this to fail, and the whole point is to leave the applied
+    // branch/commit in place, checked out, for local inspection.
+    if (skipPush) {
+      return { succeeded: true, branch: branchName, pushed: false };
+    }
+
     // A push failure here means the commit already succeeded -- a local branch with a
     // real, un-pushed commit would otherwise be left behind silently, and no caller could
     // tell this apart from a clean success (apply-runner.ps1 treats any non-throwing exit
@@ -142,7 +168,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     }
     gitRunner.checkoutMain();
 
-    return { succeeded: true, branch: branchName };
+    return { succeeded: true, branch: branchName, pushed: true };
   } catch (e) {
     const reason = e.stderr ? e.stderr.toString() : e.message;
     return { succeeded: false, reason };
@@ -156,7 +182,7 @@ function main() {
     return;
   }
 
-  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath } = getConfig();
+  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
 
   let task;
   try {
@@ -166,7 +192,11 @@ function main() {
     return;
   }
 
-  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath });
+  // "Implement" mode, set by the dashboard's Project tab (or by hand) when a run should
+  // commit locally without pushing -- see applyTask's skipPush param.
+  const skipPush = process.env.AGENT_MANAGER_APPLY_SKIP_PUSH === 'true';
+
+  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush });
   process.stdout.write(JSON.stringify(result));
 }
 

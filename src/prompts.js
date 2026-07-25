@@ -118,6 +118,23 @@ function secondbrainPlanPrompt(task) {
   ].join('\n');
 }
 
+function brainDumpSortPlanPrompt(task) {
+  const ctx = task.promptContext;
+  const structureText = ctx.existingStructure && ctx.existingStructure.length > 0
+    ? ctx.existingStructure.join('\n')
+    : '(second brain is empty so far -- you are choosing the first structure)';
+  return [
+    'You are triaging one short note someone just jotted down, deciding where it belongs in their personal "second brain" note vault.',
+    '',
+    `NOTE: ${ctx.rawText}`,
+    '',
+    'Existing top-level folders/files already in the second brain (reuse one of these when the note fits, rather than inventing a new top-level folder for a single note):',
+    structureText,
+    '',
+    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, and (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create).',
+  ].join('\n');
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -410,6 +427,33 @@ function adhocImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// Distinct from groupBJsonInstructions above -- that shape is a file-change directive
+// (create/edit/delete); this is a classification record, consumed by
+// apply-group-a.js's applyBrainDumpSort (which appends rawText into secondBrainPath and
+// marks the entry sorted), not applied to any repo file.
+function brainDumpSortImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  return [
+    'Earlier you triaged this note:',
+    '',
+    planText,
+    '',
+    `NOTE: ${ctx.rawText}`,
+    '',
+    'Now output ONLY a single JSON object describing your final classification -- nothing else, no explanation before or after, no markdown code fences. It must have exactly these fields:',
+    '',
+    '{',
+    '  "category": "task | reference | idea | journal | question (pick the closest fit)",',
+    '  "secondBrainPath": "relative/path/from/your/plan/above.md",',
+    '  "tags": ["short", "lowercase", "keywords"],',
+    '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
+    '  "rationale": "one sentence explaining the category and destination"',
+    '}',
+    '',
+    'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown.',
+  ].join('\n');
+}
+
 // ---- Generic fallback (used when no registry entry matches, or a matched entry has no
 // buildPlanPrompt/buildImplementPrompt of its own) ----
 
@@ -440,6 +484,7 @@ updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildIm
 updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
+updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });

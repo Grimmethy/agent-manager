@@ -349,6 +349,101 @@ function applyArchImportCandidate({ implementResponse, candidatesPath, importCov
   return result;
 }
 
+// Parses brain_dump_sort's implement-pass output -- a single JSON object, not markdown
+// (see prompts.js's brainDumpSortImplementPrompt for the exact schema this must match).
+// Returns null on anything unparseable or missing a required field, rather than throwing
+// -- applyBrainDumpSort treats null as "leave the entry as captured, retry next tick,"
+// same non-fatal-skip convention every other Group A parser here uses for malformed
+// output.
+function parseBrainDumpSortResult(implementResponse) {
+  const text = (implementResponse || '').trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!parsed.category || !parsed.secondBrainPath) return null;
+  return {
+    category: String(parsed.category).trim(),
+    // Strip a leading slash -- path.join(secondBrainDir, '/Projects/foo.md') still resolves
+    // relative to secondBrainDir on Node/POSIX, but on some platforms an absolute-looking
+    // second segment can behave surprisingly; normalizing here removes the ambiguity rather
+    // than relying on path.join's platform-specific handling.
+    secondBrainPath: String(parsed.secondBrainPath).replace(/^[/\\]+/, '').trim(),
+    tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
+    actionable: !!parsed.actionable,
+    rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
+  };
+}
+
+// Classifies one Brain Dump entry (captured by the dashboard's Brain Dump tab / POST
+// /api/brain-dump/capture) into a second-brain destination, appending a dated line to the
+// chosen note (creating it if new) and marking the entry 'sorted' in brainDumpPath. A
+// non-git write -- brain-dump.json lives in pipelineDir, the note lives under
+// secondBrainDir, neither inside repoRoot -- same reasoning as applySecondBrainNote/
+// applyProjectSearchFindings/applyDeepDiveFindings above.
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+
+  let data;
+  try {
+    data = JSON.parse(fs.existsSync(brainDumpPath) ? fs.readFileSync(brainDumpPath, 'utf8') : '{"entries":[]}');
+  } catch {
+    data = { entries: [] };
+  }
+  if (!Array.isArray(data.entries)) data.entries = [];
+
+  const entry = data.entries.find((e) => e && e.id === brainDumpEntryId);
+  if (!entry) {
+    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+  }
+  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
+  // a text change) or otherwise changed since this task was drafted -- classifying stale
+  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
+  // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.status !== 'captured' || entry.rawText !== rawText) {
+    return { skipped: true, reason: 'brain-dump entry changed since this task was drafted -- not applying a stale classification' };
+  }
+
+  const result = parseBrainDumpSortResult(implementResponse);
+  if (!result) {
+    return { skipped: true, reason: 'implement pass did not return a valid classification -- entry left as captured for retry' };
+  }
+  if (!secondBrainDir) {
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const stamp = new Date().toISOString().slice(0, 10);
+  const tagsSuffix = result.tags.length ? ` _(${result.tags.join(', ')})_` : '';
+  const line = `\n- **${stamp}** ${rawText}${tagsSuffix}\n`;
+  if (fs.existsSync(fullPath)) {
+    fs.appendFileSync(fullPath, line);
+  } else {
+    const title = path.basename(result.secondBrainPath, path.extname(result.secondBrainPath));
+    fs.writeFileSync(fullPath, `# ${title}\n${line}`);
+  }
+
+  entry.status = 'sorted';
+  entry.sort = {
+    category: result.category,
+    secondBrainPath: result.secondBrainPath,
+    tags: result.tags,
+    actionable: result.actionable,
+    rationale: result.rationale,
+  };
+  entry.sortedAt = new Date().toISOString();
+
+  fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+  fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+
+  return { file: fullPath, category: result.category };
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
@@ -359,4 +454,6 @@ module.exports = {
   parseArchDiscoveryCandidates,
   applyArchImportCandidate,
   isEffectivelyEmptyResponse,
+  applyBrainDumpSort,
+  parseBrainDumpSortResult,
 };

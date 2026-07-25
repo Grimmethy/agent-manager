@@ -62,6 +62,23 @@ test('happy path: fetch/reset/branch/add/commit/push/checkout in order, succeeds
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 });
 
+test('skipPush ("Implement" mode): commits locally, never calls push or checkoutMain', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, skipPush: true });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.branch, 'agent/test-task-1');
+  assert.equal(result.pushed, false);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit']);
+});
+
+test('happy path (push enabled) reports pushed: true', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.pushed, true);
+});
+
 test('push failure after a successful commit rolls back instead of leaving an orphaned branch', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'push', failMessage: 'remote: permission denied' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
@@ -99,4 +116,63 @@ test('a fetchMain failure surfaces as a failure with no branch created', () => {
   assert.match(result.reason, /network unreachable/);
   const names = gitRunner.calls.map((c) => c.name);
   assert.deepEqual(names, ['fetchMain']);
+});
+
+// --- domain: 'brain_dump_sort' -- must skip git entirely (non-git write), same as
+// secondbrain/project_search/deep_dive above it in applyTask() -----------------------
+
+test('domain brain_dump_sort never touches git -- writes the note and marks the entry sorted instead', () => {
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-brain-dump-test-'));
+  const brainDumpPath = path.join(scratchDir, 'brain-dump.json');
+  const secondBrainDir = path.join(scratchDir, 'secondbrain');
+  fs.writeFileSync(brainDumpPath, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'Buy milk', status: 'captured' }],
+  }));
+
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'brain_dump_sort',
+    source: 'brain_dump_sort',
+    promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' },
+    implementResponse: JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md', tags: [], actionable: true, rationale: 'r' }),
+  });
+
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(gitRunner.calls.length, 0, 'a non-git domain must never call the git runner');
+
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'sorted');
+  assert.ok(fs.existsSync(path.join(secondBrainDir, 'Errands', 'shopping.md')));
+
+  fs.rmSync(scratchDir, { recursive: true, force: true });
+});
+
+test('domain brain_dump_sort reports skipped-but-succeeded when the classification is malformed', () => {
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-brain-dump-test-'));
+  const brainDumpPath = path.join(scratchDir, 'brain-dump.json');
+  const secondBrainDir = path.join(scratchDir, 'secondbrain');
+  fs.writeFileSync(brainDumpPath, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'Buy milk', status: 'captured' }],
+  }));
+
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'brain_dump_sort',
+    source: 'brain_dump_sort',
+    promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' },
+    implementResponse: 'not json',
+  });
+
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
+
+  // Malformed model output is a task outcome, not an apply FAILURE -- same convention
+  // project_search/deep_dive's own "no findings" skip already uses just above.
+  assert.equal(result.succeeded, true);
+  assert.equal(gitRunner.calls.length, 0);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'captured');
+
+  fs.rmSync(scratchDir, { recursive: true, force: true });
 });

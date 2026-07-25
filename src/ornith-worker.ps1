@@ -67,13 +67,19 @@ function Invoke-OrnithClient {
     if ($ModelOverride) { $reqObj | Add-Member -NotePropertyName 'model' -NotePropertyValue $ModelOverride }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
-    $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
-    # ornith-client.js's CLI entry point writes its error to stderr and exits 1 on failure
-    # (console.error + process.exit(1)) -- the stdout-only capture above silently drops
-    # that message. Without this, a real crash here would fall through to
-    # ConvertFrom-Json on empty/partial input below with no indication of the actual
-    # cause -- same silent-failure shape found live 2026-07-21 in review-runner.ps1's
-    # matching functions, fixed there for the same reason.
+    # 2>&1 is load-bearing, not cosmetic: without it, `& node ...` in PowerShell only ever
+    # captures stdout into $rawLines -- stderr goes straight to the console/host and is
+    # NEVER present in the captured variable, confirmed empirically (a `console.error(...);
+    # process.exit(1)` child produced a completely empty captured array without 2>&1, and
+    # the real message with it). This is exactly why arch-discovery-community-3 blocked
+    # with the undiagnosable reason "call exited 1: " (nothing after the colon) --
+    # ornith-client.js's CLI entry writes its actual error via console.error (stderr) then
+    # process.exit(1), and that text was silently discarded before reaching this throw.
+    # NOTE: an earlier version of this comment claimed review-runner.ps1's matching
+    # functions already had this fixed -- checked directly, they do not; they have the
+    # identical gap. Fixed there too, see review-runner.ps1's Invoke-OrnithClient /
+    # Invoke-OrnithMajorityVote.
+    $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
     if ($LASTEXITCODE -ne 0) {
         throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
     }
@@ -483,7 +489,13 @@ while ($true) {
         $implResult = [PSCustomObject]@{ response = ''; thinking = ''; degenerate = $null; attempts = 0 }
     } else {
         $implPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'implement' -PlanTextPath $planTextPath
-        if ($task.source -in @('trouble_log', 'arch_review') -or $task.domain -eq 'adhoc') {
+        # brain_dump_sort added here (2026-07-22): its implement pass outputs a single JSON
+        # classification object (see prompts.js's brainDumpSortImplementPrompt), not prose --
+        # same "constrained decoding needs Think=$false on this model class" reasoning as
+        # trouble_log/arch_review/adhoc's Group B JSON above (think=$true + format:json can
+        # return an EMPTY response on this model; think=$false + format:json returns clean
+        # parseable JSON).
+        if ($task.source -in @('trouble_log', 'arch_review', 'brain_dump_sort') -or $task.domain -eq 'adhoc') {
             $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json' -ModelOverride $abModel
         } else {
             $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400 -ModelOverride $abModel
