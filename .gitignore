@@ -20,4 +20,5 @@ dashboard.pid
 .claude/
 brain-dump.json
 project-history.json
+projects.json
 runs/

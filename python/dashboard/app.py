@@ -94,6 +94,43 @@ def record_project_used(path: str):
     except OSError:
         pass
 
+
+PROJECT_REGISTRY_PATH = PACKAGE_ROOT / "projects.json"
+
+
+def read_project_registry() -> list:
+    """List of {repoRoot, pipelineDir, domainsPath, label} for every project ever started
+    via the Project tab -- project-history.json only stores a bare repo path, which isn't
+    enough to locate a non-active project's queue/task-domains.json later. Corrupt/missing
+    file -> empty list, never a 500."""
+    if not PROJECT_REGISTRY_PATH.is_file():
+        return []
+    try:
+        data = json.loads(PROJECT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_path: str):
+    """Upserts one entry keyed by normalized repoRoot (moves it to the front if already
+    present, same normalize-before-compare reasoning as record_project_used, so a
+    backslash vs forward-slash path for the same directory collapses to one entry).
+    Best-effort -- a write failure here must never break Start Pipeline."""
+    try:
+        normalized_root = os.path.normpath(repo_root)
+        entries = read_project_registry()
+        entries = [e for e in entries if os.path.normpath(e.get("repoRoot", "")) != normalized_root]
+        entries.insert(0, {
+            "repoRoot": normalized_root,
+            "pipelineDir": os.path.normpath(pipeline_dir),
+            "domainsPath": os.path.normpath(domains_path),
+            "label": Path(normalized_root).name,
+        })
+        PROJECT_REGISTRY_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
 # Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
 # the live worker/review-runner/apply-runner/queue-watchdog loops are actually pointed at
 # (that's still controlled by agent-manager.env + launch.bat) -- this lets you explore any
