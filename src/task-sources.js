@@ -963,7 +963,7 @@ if (require.main === module) {
   const { ensureRegistered } = require('./config.js');
   ensureRegistered();
 
-  const { pipelineDir } = getConfig();
+  const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   const alreadyPending = fs.existsSync(pendingDir)
@@ -977,7 +977,25 @@ if (require.main === module) {
   const hasAdhocWaiting = fs.existsSync(adhocDir)
     && fs.readdirSync(adhocDir).some((f) => f.endsWith('.json'));
 
-  if (alreadyPending && !hasAdhocWaiting) {
+  // Same exception, same reasoning, for brain_dump_sort (priority 42): confirmed live
+  // 2026-07-25 that a sustained background backlog (e.g. the deep_dive rotation across
+  // many communities) starves brain_dump_sort indefinitely even though it outranks
+  // deep_dive on the priority ladder -- the throttle above never lets getNextTask() run
+  // at all while pending/ is non-empty, so priority never gets a chance to matter. Unlike
+  // adhoc/deep_dive/project_search, brain_dump_sort's arrival rate is bounded by how often
+  // a human actually captures a note, so letting it through here can't create the
+  // unbounded-pileup problem this throttle exists to prevent.
+  const hasBrainDumpWaiting = (() => {
+    if (!brainDumpPath) return false;
+    try {
+      const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured');
+    } catch {
+      return false;
+    }
+  })();
+
+  if (alreadyPending && !hasAdhocWaiting && !hasBrainDumpWaiting) {
     console.log('pending/ already has work queued, not adding another task');
   } else {
     const task = getNextTask();
