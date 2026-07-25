@@ -18,3 +18,6 @@ deep-dive-coverage.json
 import-coverage.json
 dashboard.pid
 .claude/
+brain-dump.json
+project-history.json
+runs/
