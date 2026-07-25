@@ -1387,6 +1387,14 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
 
     _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
 
+    # Same pipelineDir/domainsPath resolution _ensure_task_domains just used above --
+    # recorded here so a later brain-dump routing decision can locate THIS project's
+    # queue even after a different project becomes active (project-history.json alone
+    # only ever stored the bare repoRoot).
+    pipeline_dir_for_registry = child_env.get("AGENT_MANAGER_PIPELINE_DIR") or raw_path
+    domains_path_for_registry = child_env.get("AGENT_MANAGER_DOMAINS_PATH") or str(Path(pipeline_dir_for_registry) / "task-domains.json")
+    record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
+
     if os.name != "nt":
         return {"started": False, "reason": "process auto-start is only implemented for Windows -- use launch.bat manually"}
 
