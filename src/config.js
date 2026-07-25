@@ -90,13 +90,26 @@ function getConfig() {
   const rawSourceAllowlist = process.env.AGENT_MANAGER_TASK_SOURCES || '';
   const taskSourceAllowlist = rawSourceAllowlist.split(',').map((s) => s.trim()).filter(Boolean);
 
+  // Optional per-source priority overrides -- lets the dashboard's Job List tab make a
+  // source's claim-order priority live-editable without a code change. Format:
+  // "name:number,name:number", e.g. "deep_dive:60,project_search:65". A source not listed
+  // here keeps whatever default its own registerTaskSource(name, {priority}) call passes.
+  // Read fresh by every `node task-sources.js` invocation (a new process each worker
+  // tick), so an edit here takes effect on the very next tick -- no pipeline restart.
+  const rawPriorities = process.env.AGENT_MANAGER_TASK_PRIORITIES || '';
+  const taskPriorityOverrides = {};
+  rawPriorities.split(',').forEach((pair) => {
+    const [name, num] = pair.split(':').map((s) => s.trim());
+    if (name && num && !Number.isNaN(Number(num))) taskPriorityOverrides[name] = Number(num);
+  });
+
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath,
     brainDumpPath,
-    defaultDomain, taskSourceAllowlist,
+    defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
   };
 }
 
