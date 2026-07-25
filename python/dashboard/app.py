@@ -769,6 +769,7 @@ def api_brain_dump_prioritize(entry_id):
     adhoc_dir.mkdir(parents=True, exist_ok=True)
     (adhoc_dir / f"{task_id}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
+    entry["status"] = "actioned"
     entry["queuedTaskId"] = task_id
     entry["queuedAt"] = datetime.now(timezone.utc).isoformat()
     write_brain_dump_entries(entries)
