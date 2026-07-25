@@ -595,14 +595,23 @@ def slugify_for_id(text: str) -> str:
 
 
 def default_task_domain() -> str:
-    """Mirrors queue-adhoc-task.js's validDomains[0] fallback -- review-runner.ps1's
-    Get-DomainConfig lookup requires the task's domain to be a real key in
-    task-domains.json (not just any string), so this must pick an ACTUAL key from that
-    file, not assume 'default' is present."""
+    """review-runner.ps1's Get-DomainConfig lookup requires the task's domain to be a
+    real key in task-domains.json (not just any string), so this must pick an ACTUAL
+    key from that file. Tries a small ordered list of generic-domain-name candidates
+    first ('default', then 'adhoc') and returns the first one that's actually present --
+    picking whatever happens to be the FIRST key in the dict, with no regard for whether
+    it's a sane generic default, is what queued two real tasks with domain='adhoc' into a
+    project whose task-domains.json didn't even list 'adhoc', permanently blocking them
+    with "Unknown task domain: adhoc". Only falls back to that old first-key behavior if
+    neither preferred candidate is present, so a project with neither still gets *some*
+    valid domain instead of crashing."""
     d = get_pipeline_dir()
     if d:
         domains = read_json_safe(d / "task-domains.json")
         if isinstance(domains, dict) and domains:
+            for candidate in ("default", "adhoc"):
+                if candidate in domains:
+                    return candidate
             return next(iter(domains.keys()))
     return "default"
 
