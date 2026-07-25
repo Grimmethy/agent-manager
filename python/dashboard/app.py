@@ -33,6 +33,11 @@ import build_graph  # noqa: E402
 import visualize_graph  # noqa: E402
 
 app = Flask(__name__)
+# Re-reads templates/index.html per-request instead of caching it at first load -- the
+# dashboard's own templates/index.html edits went unseen for hours tonight because nothing
+# here ever restarted the process. Independent of the reloader below (this one's Jinja2's
+# own cache, not Werkzeug's process-restart-on-.py-change).
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 
 @app.errorhandler(HTTPException)
@@ -1526,4 +1531,14 @@ if __name__ == "__main__":
     active = get_active_repo_root()
     print(f"Dashboard reading pipeline dir: {get_pipeline_dir() if active else '(none configured yet -- use the Project tab)'}")
     print(f"Open http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # use_reloader=True alone (Werkzeug watches app.py's directory, restarts the whole
+    # process on change) WITHOUT debug=True -- confirmed live 2026-07-25: a dashboard
+    # process left running all night served stale API endpoints for hours after multiple
+    # rounds of app.py edits, since nothing ever restarted it. Deliberately NOT full
+    # debug=True: that also enables Werkzeug's interactive debugger, which lets anyone who
+    # can reach this port execute arbitrary Python from an error page's traceback --
+    # unnecessary risk for a hot-reload need that use_reloader alone already covers.
+    # Pipeline state (_pipeline_running() etc.) is read fresh from instances/*.json on
+    # every call, never held in Python memory across requests, so a reloader-triggered
+    # restart can't lose track of anything.
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=True)
