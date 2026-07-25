@@ -57,6 +57,8 @@
   button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
+  .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
+  .browser-crumb .crumb-link:hover { text-decoration: underline; }
   .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
   .browser-entry:hover { background: var(--bg); }
   .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
@@ -1325,7 +1327,20 @@ async function loadSecondBrainBrowser() {
     return;
   }
 
-  let html = `<div class="browser-crumb">${data.path ? escapeHtml(data.path) : '(root)'}</div>`;
+  // A plain path-as-text crumb here previously gave no way back to the root except
+  // clicking "up" once per level -- easy to end up parked deep in a small folder (e.g.
+  // Decisions/, 2 files) after a "jump to file" link, with no obvious cue you're not
+  // looking at the whole second brain. Every segment (including "Second Brain" itself)
+  // is now a clickable jump-to-that-level link, reusing the same [data-nav] wiring the
+  // existing browser-entry rows already use below (attribute selector, not class-scoped).
+  const crumbSegments = data.path ? data.path.split('/') : [];
+  let crumbHtml = `<span class="crumb-link" data-nav="">Second Brain</span>`;
+  let acc = '';
+  for (const seg of crumbSegments) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    crumbHtml += ` / <span class="crumb-link" data-nav="${escapeAttr(acc)}">${escapeHtml(seg)}</span>`;
+  }
+  let html = `<div class="browser-crumb">${crumbHtml}</div>`;
   if (data.parent !== null) {
     html += `<div class="browser-entry" data-nav="${escapeAttr(data.parent)}"><span>.. (up)</span></div>`;
   }
