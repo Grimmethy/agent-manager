@@ -228,7 +228,15 @@ test('parseBrainDumpSortResult parses a well-formed classification object', () =
   }));
   assert.deepEqual(result, {
     category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
+    belongsToProject: null,
   });
+});
+
+test('parseBrainDumpSortResult parses a belongsToProject value when present', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: 'agent-manager',
+  }));
+  assert.equal(result.belongsToProject, 'agent-manager');
 });
 
 test('parseBrainDumpSortResult strips a leading slash from secondBrainPath', () => {
