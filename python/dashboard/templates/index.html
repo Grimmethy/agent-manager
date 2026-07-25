@@ -63,7 +63,7 @@
   .browser-entry:hover { background: var(--bg); }
   .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
   .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .browser-entry .set-active-project { font-size: 11px; padding: 3px 9px; }
+  .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 11px; padding: 3px 9px; }
   .stat-row { display: flex; gap: 24px; margin: 14px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
@@ -1384,6 +1384,11 @@ async function loadSecondBrainBrowser() {
         projectControl = entry.isActiveProject
           ? `<span class="badge ok" title="${escapeAttr(entry.repoPath)}">Active Project</span>`
           : `<button type="button" class="secondary set-active-project" data-repo-path="${escapeAttr(entry.repoPath)}" title="Stop the current pipeline and start it against ${escapeAttr(entry.repoPath)}">Set Active</button>`;
+      } else if (entry.name.toLowerCase().endsWith('.md') && !entry.name.startsWith('_')) {
+        // Project-starter notes (not yet linked to any repo, and not a _template.md-style
+        // scaffold) get a way to actually become a project -- the ask: "turn these project
+        // starters into actual projects" via a button next to the note.
+        projectControl = `<button type="button" class="secondary create-github-project" data-note-path="${escapeAttr(entry.path)}" title="Create a new git repo seeded from this note's content">Create GitHub Project</button>`;
       }
       html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span>${projectControl}</div>`;
     }
@@ -1420,6 +1425,30 @@ async function loadSecondBrainBrowser() {
         alert('Could not switch active project: ' + err.message);
         btn.disabled = false;
         btn.textContent = 'Set Active';
+      }
+    };
+  });
+  panel.querySelectorAll('.create-github-project').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
+      const notePath = btn.dataset.notePath;
+      if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Creating...';
+      try {
+        const resp = await fetch('/api/second-brain/create-github-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ notePath }),
+        });
+        const result = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+        await loadSecondBrainBrowser();
+        alert(`Created ${result.projectName} at ${result.repoPath}`);
+      } catch (err) {
+        alert('Could not create GitHub project: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Create GitHub Project';
       }
     };
   });

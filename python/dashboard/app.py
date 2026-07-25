@@ -937,6 +937,73 @@ def api_second_brain_sync_github_projects():
     return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
 
 
+def _slugify_project_name(stem: str) -> str:
+    """Note filename (no .md) -> filesystem/repo-friendly name: spaces to hyphens, strip
+    anything that isn't alphanumeric/hyphen/underscore. Deliberately NOT lowercased --
+    the real GitHub folders already mix casing (TaxHarvest-GrimmethyLocal, SGCElementals),
+    so forcing one convention here would look inconsistent next to them."""
+    name = stem.replace(" ", "-")
+    name = re.sub(r"[^A-Za-z0-9_-]", "", name)
+    return name.strip("-_") or "untitled-project"
+
+
+@app.route("/api/second-brain/create-github-project", methods=["POST"])
+def api_second_brain_create_github_project():
+    """Turns a Second Brain "project starter" note into a real GitHub project: a new repo
+    directory under GITHUB_PROJECTS_ROOT, git-initialized, seeded with a README carrying
+    the note's own content over as the starting point. Then links the note to that new
+    repo the same way sync-github-projects links a discovered one, so it immediately gets
+    the browse view's "Set Active"/"Active Project" treatment -- the actual ask: "turn
+    these project starters into actual projects" via a button next to the note."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    root = root.resolve()
+
+    body = request.get_json(silent=True) or {}
+    note_rel = (body.get("notePath") or "").strip()
+    if not note_rel:
+        abort(400, description="notePath is required")
+    note_path = _resolve_under_second_brain(root, note_rel)
+    if not note_path.is_file():
+        abort(404, description="note not found")
+
+    links = read_project_links()
+    if note_rel in links:
+        abort(409, description=f"this note is already linked to {links[note_rel]}")
+
+    project_name = _slugify_project_name(note_path.stem)
+    repo_path = GITHUB_PROJECTS_ROOT / project_name
+    if repo_path.exists():
+        abort(409, description=f"{repo_path} already exists -- pick a different note name or remove it first")
+
+    note_content = note_path.read_text(encoding="utf-8")
+
+    try:
+        repo_path.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, check=True, timeout=15)
+        (repo_path / "README.md").write_text(note_content, encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(repo_path), capture_output=True, check=True, timeout=15)
+        subprocess.run(
+            ["git", "commit", "-m", f"Initial commit -- seeded from Second Brain note {note_rel}"],
+            cwd=str(repo_path), capture_output=True, check=True, timeout=15,
+        )
+    except subprocess.CalledProcessError as e:
+        # Best-effort cleanup on failure -- don't leave a half-initialized repo directory
+        # behind that would then block a retry via the "already exists" check above.
+        shutil.rmtree(repo_path, ignore_errors=True)
+        detail = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        abort(500, description=f"git setup failed: {detail or e}")
+    except OSError as e:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        abort(500, description=str(e))
+
+    links[note_rel] = str(repo_path)
+    write_project_links(links)
+
+    return jsonify({"created": True, "repoPath": str(repo_path), "projectName": project_name})
+
+
 @app.route("/api/second-brain/file")
 def api_second_brain_file():
     root = second_brain_dir()
