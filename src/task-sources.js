@@ -750,18 +750,25 @@ function nextBrainDumpSortTask() {
   };
 }
 
-registerTaskSource('adhoc', { priority: 10, next: nextAdhocTask });
-registerTaskSource('trouble_log', { priority: 20, next: nextTroubleLogTask });
-registerTaskSource('secondbrain', { priority: 40, next: nextSecondBrainTask });
+// Per-source priority override (Job List tab, AGENT_MANAGER_TASK_PRIORITIES via
+// config.js's taskPriorityOverrides) -- falls back to `def` when a source has no
+// override. Read once here since every registerTaskSource() call below runs at module
+// load time, same as any other config value this file already reads via getConfig().
+const { taskPriorityOverrides } = getConfig();
+const taskPriority = (name, def) => taskPriorityOverrides[name] ?? def;
+
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask });
+registerTaskSource('trouble_log', { priority: taskPriority('trouble_log', 20), next: nextTroubleLogTask });
+registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), next: nextSecondBrainTask });
 // No `apply` key here, unlike arch_discovery/arch_import above -- writeArtifact() (called
 // from apply-task.js) is only reached for domains that AREN'T one of the non-git special
 // cases (secondbrain/project_search/deep_dive/brain_dump_sort) hardcoded in applyTask()
 // itself. An `apply` registered here would be dead code: applyTask() intercepts
 // domain==='brain_dump_sort' before writeArtifact() is ever called. See apply-task.js's
 // applyBrainDumpSort branch instead.
-registerTaskSource('brain_dump_sort', { priority: 42, next: nextBrainDumpSortTask });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask });
 registerTaskSource('arch_review', {
-  priority: 70,
+  priority: taskPriority('arch_review', 70),
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
 });
 // arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
@@ -770,7 +777,7 @@ registerTaskSource('arch_review', {
 // consumer outranks its own generator, and outranks the stage that feeds it; see
 // docs/arch-import-pipeline.md for the full priority-ladder reasoning.
 registerTaskSource('arch_import_review', {
-  priority: 71,
+  priority: taskPriority('arch_import_review', 71),
   next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
 });
 // apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
@@ -779,7 +786,7 @@ registerTaskSource('arch_import_review', {
 // B JSON parser and every approved arch_discovery task fails apply 100% of the time (found
 // live 2026-07-21, see apply-group-a.js's applyArchDiscoveryCandidates for the full story).
 registerTaskSource('arch_discovery', {
-  priority: 80,
+  priority: taskPriority('arch_discovery', 80),
   next: nextArchDiscoveryTask,
   apply: ({ implementResponse }) => {
     const { archReviewCandidatesPath } = getConfig();
@@ -896,7 +903,7 @@ function nextArchImportTask() {
   return null;
 }
 registerTaskSource('arch_import', {
-  priority: 81,
+  priority: taskPriority('arch_import', 81),
   next: nextArchImportTask,
   apply: ({ implementResponse, task }) => {
     const { archImportCandidatesPath, importCoveragePath } = getConfig();
@@ -904,9 +911,9 @@ registerTaskSource('arch_import', {
   },
 });
 
-registerTaskSource('deep_dive', { priority: 82, next: nextDeepDiveTask });
-registerTaskSource('project_search', { priority: 85, next: nextProjectSearchTask });
-registerTaskSource('unused_export', { priority: 90, next: nextUnusedExportTask });
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask });
+registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask });
 
 function getNextTask() {
   const { taskSourceAllowlist } = getConfig();
