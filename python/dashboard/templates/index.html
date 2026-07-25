@@ -501,18 +501,39 @@ async function renderJobListTab() {
   }
   const activeByName = {};
   const alwaysActiveByName = {};
-  (jobTypes || []).forEach((j) => { activeByName[j.name] = j.active; alwaysActiveByName[j.name] = j.alwaysActive; });
+  const priorityByName = {};
+  (jobTypes || []).forEach((j) => {
+    activeByName[j.name] = j.active;
+    alwaysActiveByName[j.name] = j.alwaysActive;
+    priorityByName[j.name] = j.priority;
+  });
 
-  const rows = JOB_TYPES.slice().sort((a, b) => a.priority - b.priority).map(j => {
+  // Sort by the EFFECTIVE priority (server override if any, else JOB_TYPES' static
+  // default) -- not the bare static default -- so an edit actually reorders the table.
+  const rows = JOB_TYPES.slice()
+    .map((j) => ({ ...j, priority: priorityByName[j.source] ?? j.priority }))
+    .sort((a, b) => a.priority - b.priority)
+    .map(j => {
     const alwaysActive = !!alwaysActiveByName[j.source];
     const isActive = jobTypes ? (activeByName[j.source] ?? true) : true;
     const checkbox = jobTypes
       ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.source)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
       : `<span class="meta">?</span>`;
+    // Priority cell: click-to-type input plus +-1 arrow buttons, per the Brain Dump
+    // request ("a click to input text ... as well as an up1/down1 set of arrow buttons").
+    // Disabled entirely when /api/job-types failed to load, same convention the checkbox
+    // already uses for that case.
+    const priorityCell = jobTypes
+      ? `<div class="priority-edit">`
+        + `<button type="button" class="priority-down" data-source="${escapeAttr(j.source)}" title="Decrease priority by 1">&#9660;</button>`
+        + `<input type="number" class="priority-input" data-source="${escapeAttr(j.source)}" value="${j.priority}">`
+        + `<button type="button" class="priority-up" data-source="${escapeAttr(j.source)}" title="Increase priority by 1">&#9650;</button>`
+        + `</div>`
+      : `<span class="meta">${j.priority}</span>`;
     return `
     <tr>
       <td>${checkbox}</td>
-      <td>${j.priority}</td>
+      <td>${priorityCell}</td>
       <td>${j.source}</td>
       <td>${j.domain}</td>
       <td>${escapeHtml(j.description)}</td>
@@ -535,6 +556,45 @@ async function renderJobListTab() {
         cb.checked = !cb.checked;
       }
       cb.disabled = false;
+    };
+  });
+
+  // Submits a new priority for `source`, re-rendering the (now possibly re-sorted) tab
+  // on success -- reverting the input's displayed value on failure rather than leaving
+  // it showing an unsaved edit.
+  const submitPriority = async (source, newPriority, revertTo) => {
+    const controls = main.querySelectorAll(`[data-source="${CSS.escape(source)}"]`);
+    controls.forEach((el) => { el.disabled = true; });
+    try {
+      await fetch('/api/job-types/priority', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: source, priority: newPriority }),
+      });
+      await renderJobListTab();
+    } catch (e) {
+      alert('Could not update priority: ' + e.message);
+      controls.forEach((el) => { el.disabled = false; });
+      const input = main.querySelector(`input.priority-input[data-source="${CSS.escape(source)}"]`);
+      if (input) input.value = revertTo;
+    }
+  };
+
+  main.querySelectorAll('.priority-input').forEach((input) => {
+    const commit = () => {
+      const parsed = parseInt(input.value, 10);
+      const original = priorityByName[input.dataset.source];
+      if (Number.isNaN(parsed) || parsed === original) { input.value = original; return; }
+      submitPriority(input.dataset.source, parsed, original);
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+  });
+  main.querySelectorAll('.priority-up, .priority-down').forEach((btn) => {
+    btn.onclick = () => {
+      const original = priorityByName[btn.dataset.source];
+      const delta = btn.classList.contains('priority-up') ? 1 : -1;
+      submitPriority(btn.dataset.source, original + delta, original);
     };
   });
 }

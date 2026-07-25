@@ -752,10 +752,22 @@ function nextBrainDumpSortTask() {
 
 // Per-source priority override (Job List tab, AGENT_MANAGER_TASK_PRIORITIES via
 // config.js's taskPriorityOverrides) -- falls back to `def` when a source has no
-// override. Read once here since every registerTaskSource() call below runs at module
-// load time, same as any other config value this file already reads via getConfig().
-const { taskPriorityOverrides } = getConfig();
-const taskPriority = (name, def) => taskPriorityOverrides[name] ?? def;
+// override. Every registerTaskSource() call below runs at module load time, so this
+// calls getConfig() there too -- but unlike every other getConfig() call in this file
+// (all inside functions, called only once a task is actually being processed), this one
+// fires the moment task-sources.js is REQUIRED at all. getConfig() throws when
+// AGENT_MANAGER_REPO_ROOT isn't set, which broke prompts.test.js (imports prompts.js ->
+// task-sources.js with no env var set, same as several other test/tooling entry points
+// that only ever wanted the module's exports, not a live pipeline). Falling back to `def`
+// on that throw keeps this a nice-to-have override, not a new hard requirement to even
+// import this file.
+function taskPriority(name, def) {
+  try {
+    return getConfig().taskPriorityOverrides[name] ?? def;
+  } catch {
+    return def;
+  }
+}
 
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask });
 registerTaskSource('trouble_log', { priority: taskPriority('trouble_log', 20), next: nextTroubleLogTask });
