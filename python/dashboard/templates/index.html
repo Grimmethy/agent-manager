@@ -77,6 +77,8 @@
   .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
+  .priority-input { width: 60px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .priority-input:focus { outline: 1px solid var(--accent); }
 </style>
 </head>
 <body>
@@ -519,16 +521,14 @@ async function renderJobListTab() {
     const checkbox = jobTypes
       ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.source)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
       : `<span class="meta">?</span>`;
-    // Priority cell: click-to-type input plus +-1 arrow buttons, per the Brain Dump
-    // request ("a click to input text ... as well as an up1/down1 set of arrow buttons").
-    // Disabled entirely when /api/job-types failed to load, same convention the checkbox
-    // already uses for that case.
+    // Priority cell: click-to-type input, relying on the browser's own native number-input
+    // spinner for the "up1/down1" arrows the Brain Dump request asked for -- a separate
+    // pair of custom buttons above/below the input (the original implementation) was
+    // redundant with that native control and looked like a duplicate widget. Disabled
+    // entirely when /api/job-types failed to load, same convention the checkbox already
+    // uses for that case.
     const priorityCell = jobTypes
-      ? `<div class="priority-edit">`
-        + `<button type="button" class="priority-down" data-source="${escapeAttr(j.source)}" title="Decrease priority by 1">&#9660;</button>`
-        + `<input type="number" class="priority-input" data-source="${escapeAttr(j.source)}" value="${j.priority}">`
-        + `<button type="button" class="priority-up" data-source="${escapeAttr(j.source)}" title="Increase priority by 1">&#9650;</button>`
-        + `</div>`
+      ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.source)}" value="${j.priority}">`
       : `<span class="meta">${j.priority}</span>`;
     return `
     <tr>
@@ -589,13 +589,6 @@ async function renderJobListTab() {
     };
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
-  });
-  main.querySelectorAll('.priority-up, .priority-down').forEach((btn) => {
-    btn.onclick = () => {
-      const original = priorityByName[btn.dataset.source];
-      const delta = btn.classList.contains('priority-up') ? 1 : -1;
-      submitPriority(btn.dataset.source, original + delta, original);
-    };
   });
 }
 
