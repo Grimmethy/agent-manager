@@ -1225,6 +1225,35 @@ def read_active_job_types() -> set:
         return set(TASK_SOURCE_CATALOG)
     return listed | ALWAYS_ACTIVE_SOURCES
 
+# Mirrors the priority values templates/index.html's JOB_TYPES constant documents (which
+# itself mirrors src/task-sources.js's registerTaskSource() calls) -- the default a
+# source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no override for it.
+TASK_SOURCE_DEFAULT_PRIORITIES = {
+    "adhoc": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
+    "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "arch_import": 81,
+    "deep_dive": 82, "project_search": 85, "unused_export": 90,
+}
+
+
+def read_task_priorities() -> dict:
+    """Job List tab's editable Priority column. AGENT_MANAGER_TASK_PRIORITIES holds only
+    the overrides (\"name:number,name:number\"), same sparse-override shape src/config.js's
+    taskPriorityOverrides parses on the Node side -- a source not listed here just keeps
+    its TASK_SOURCE_DEFAULT_PRIORITIES value."""
+    raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_TASK_PRIORITIES", "")
+    overrides = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        name, _, num = pair.partition(":")
+        name = name.strip()
+        try:
+            overrides[name] = int(num.strip())
+        except ValueError:
+            continue
+    return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_PRIORITIES.items()}
+
+
 # workDirKind/successCheck values that satisfy review-runner.ps1's unconditional
 # Get-DomainConfig lookup for each domain that apply-task.js already special-cases as a
 # non-git write. Neither field is actually consulted for these domains on the real
@@ -1292,8 +1321,14 @@ def api_job_types():
     in agent-manager.env, the same allowlist src/task-sources.js's getNextTask() already
     reads; this is just a UI over that one persisted value."""
     active = read_active_job_types()
+    priorities = read_task_priorities()
     return jsonify([
-        {"name": name, "active": name in active, "alwaysActive": name in ALWAYS_ACTIVE_SOURCES}
+        {
+            "name": name,
+            "active": name in active,
+            "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
+            "priority": priorities.get(name, TASK_SOURCE_DEFAULT_PRIORITIES.get(name)),
+        }
         for name in TASK_SOURCE_CATALOG
     ])
 
@@ -1334,6 +1369,34 @@ def api_job_types_toggle():
         restarted = True
 
     return jsonify({"name": name, "active": active, "restarted": restarted})
+
+
+@app.route("/api/job-types/priority", methods=["POST"])
+def api_job_types_priority():
+    """Job List tab's editable Priority column (click-to-type or +-1 arrow buttons).
+    Mirrors api_job_types_toggle()'s exact shape -- persists to AGENT_MANAGER_TASK_PRIORITIES
+    in agent-manager.env, which src/config.js's taskPriorityOverrides reads fresh on every
+    `node task-sources.js` invocation (a new process each worker tick), so an edit here
+    takes effect on the very next tick with no pipeline restart needed."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if name not in TASK_SOURCE_CATALOG:
+        abort(400, description=f"unknown job type '{name}'")
+    try:
+        priority = int(body.get("priority"))
+    except (TypeError, ValueError):
+        abort(400, description="priority must be an integer")
+
+    priorities = read_task_priorities()
+    priorities[name] = priority
+
+    # Collapse back to "no overrides" (empty string) when every source ends up at its own
+    # default -- same tidy-round-trip reasoning as api_job_types_toggle()'s allowlist collapse.
+    non_default = {n: p for n, p in priorities.items() if p != TASK_SOURCE_DEFAULT_PRIORITIES.get(n)}
+    new_value = ",".join(f"{n}:{p}" for n, p in sorted(non_default.items()))
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_PRIORITIES", new_value)
+
+    return jsonify({"name": name, "priority": priority})
 
 
 def _stop_pipeline() -> list:
