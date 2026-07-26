@@ -1,3 +1,10 @@
+param(
+    # Manual single-task apply (dashboard's per-task Apply button, three-tier approval
+    # mode, 2026-07-26): when set, runs Invoke-ApplyPass ONCE against exactly this task id
+    # (bypassing the automatic loop's approval-mode filtering entirely -- a human explicitly
+    # chose this task) and exits, instead of entering the normal continuous while loop.
+    [string]$TaskId = $null
+)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
 # Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
@@ -137,6 +144,8 @@ function Add-ApplyLogEntry {
 }
 
 function Invoke-ApplyPass {
+    param([string]$OnlyTaskId = $null)
+
     $budgetScript = Join-Path $PipelineDir 'budget-monitor.js'
     if (Test-Path $budgetScript) {
         Write-Host 'apply-runner: checking budget...' -ForegroundColor Cyan
@@ -149,10 +158,47 @@ function Invoke-ApplyPass {
     }
 
     $approvedDir = Join-Path $QueueDir 'approved'
-    $next = Get-ChildItem $approvedDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object CreationTime | Select-Object -First 1
-    if (-not $next) {
-        Write-Host 'Nothing in approved/. Nothing to do.' -ForegroundColor DarkGray
-        return 'idle'
+
+    if ($OnlyTaskId) {
+        # Manual single-task apply -- a human explicitly chose this one via the dashboard's
+        # per-task Apply button, so approval-mode filtering below does not apply here.
+        $next = Get-Item (Join-Path $approvedDir "$OnlyTaskId.json") -ErrorAction SilentlyContinue
+        if (-not $next) {
+            Write-Host ("Task '{0}' not found in approved/." -f $OnlyTaskId) -ForegroundColor Red
+            return 'not-found'
+        }
+    } else {
+        # Three-tier approval mode (harnss pattern, adapted 2026-07-26): the automatic loop
+        # only ever auto-claims 'auto'-tier tasks now, not everything in approved/
+        # indiscriminately (the old behavior -- a single global on/off toggle with no
+        # per-source granularity at all). 'prompt'/'approve'-tier tasks are deliberately
+        # left in approved/ for a human to apply manually (via the -TaskId path above);
+        # the only difference between those two tiers is dashboard visibility, never
+        # whether apply-runner's own automatic loop will touch them (it never will).
+        $approvalModesJson = node (Join-Path $PackageSrcDir 'task-sources.js') --approval-modes 2>$null
+        $approvalModes = $null
+        try { $approvalModes = $approvalModesJson | ConvertFrom-Json } catch { }
+
+        $next = Get-ChildItem $approvedDir -Filter '*.json' -ErrorAction SilentlyContinue |
+            Sort-Object CreationTime |
+            Where-Object {
+                $candidateTask = Read-TaskJson $_.FullName
+                # Mirrors task-source-registry.js's resolveSourceName() -- same mapping
+                # ornith-worker.ps1's own claim-order block already hand-duplicates for the
+                # identical reason (no cheap way to round-trip through JS per candidate).
+                $name = $candidateTask.source
+                if ($candidateTask.domain -eq 'adhoc') { $name = 'adhoc' }
+                elseif ($candidateTask.domain -eq 'secondbrain') { $name = 'secondbrain' }
+                elseif ($candidateTask.source -eq 'deadcode_triage') { $name = 'unused_export' }
+                $mode = 'auto'
+                if ($approvalModes -and $approvalModes.PSObject.Properties[$name]) { $mode = $approvalModes.$name }
+                $mode -eq 'auto'
+            } |
+            Select-Object -First 1
+        if (-not $next) {
+            Write-Host 'Nothing in approved/ eligible for auto-apply. Nothing to do.' -ForegroundColor DarkGray
+            return 'idle'
+        }
     }
 
     $task = Read-TaskJson $next.FullName
@@ -269,6 +315,20 @@ function Invoke-ApplyPass {
         Write-Host ('Done: {0}. Marker written at {1}' -f $task.id, $successDetail) -ForegroundColor Cyan
         return 'done'
     }
+}
+
+if ($TaskId) {
+    # One-shot manual apply mode: the dashboard's POST /api/task/approved/<id>/apply
+    # endpoint shells out to this script with -TaskId, waits for it to exit, and reports
+    # the result -- no continuous loop, no heartbeat file (this isn't a long-running
+    # instance the dashboard/Workers tab tracks). A crash here should surface as a real
+    # error to the human who explicitly clicked Apply, not be silently swallowed the way
+    # the automatic loop below deliberately swallows one to protect its own uptime.
+    $result = Invoke-ApplyPass -OnlyTaskId $TaskId
+    Write-Host ('One-shot apply result: {0}' -f $result)
+    if ($result -eq 'not-found') { exit 2 }
+    if ($result -eq 'error' -or $result -eq 'budget') { exit 1 }
+    exit 0
 }
 
 while ($true) {
