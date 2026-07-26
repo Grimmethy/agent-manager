@@ -1189,6 +1189,20 @@ if (require.main === module) {
     return;
   }
 
+  // `node task-sources.js --approval-modes` prints {name: mode} for every registered
+  // source -- the resolved three-tier approval mode (config.js's approvalModeOverrides,
+  // falling back to defaultApprovalMode), consumed by apply-runner.ps1 so its automatic
+  // loop only ever auto-claims 'auto'-tier approved tasks. Same split as --priority-map.
+  if (process.argv.includes('--approval-modes')) {
+    const { approvalModeOverrides, defaultApprovalMode } = getConfig();
+    const map = {};
+    for (const source of getRegisteredSources()) {
+      map[source.name] = approvalModeOverrides[source.name] || defaultApprovalMode;
+    }
+    console.log(JSON.stringify(map));
+    return;
+  }
+
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
