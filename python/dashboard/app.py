@@ -565,11 +565,18 @@ def api_models():
 
 @app.route("/api/queue/<state>")
 def api_queue_state(state):
+    """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
+    "long task lists take a while to load"): optional ?limit=N&offset=M page the result --
+    file METADATA is sorted first (cheap, no content read) and only the requested slice
+    ever gets read_json_safe'd, so a 200+-item done/ folder no longer means reading and
+    JSON-parsing every single file on every 5s poll, just the page actually being shown."""
     qdir = queue_dir()
     if not qdir:
-        return jsonify([])
+        return jsonify({"items": [], "total": 0})
 
     if state == "drafting":
+        # Never paginated -- an in-flight claim count is always small (bounded by worker
+        # count), nothing like done/'s unbounded historical backlog.
         entries = []
         drafting_root = qdir / "drafting"
         if drafting_root.is_dir():
@@ -586,18 +593,26 @@ def api_queue_state(state):
                 data = read_json_safe(f)
                 if data:
                     entries.append(task_summary(data, f.stem))
-        return jsonify(entries)
+        return jsonify({"items": entries, "total": len(entries)})
 
     if state not in QUEUE_STATES:
         abort(404)
+
+    limit = request.args.get("limit", type=int)
+    offset = request.args.get("offset", default=0, type=int)
+
     entries = []
+    total = 0
     state_dir = qdir / state
     if state_dir.is_dir():
-        for f in sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        total = len(files)
+        page = files[offset:offset + limit] if limit is not None else files[offset:]
+        for f in page:
             data = read_json_safe(f)
             if data:
                 entries.append(task_summary(data, f.stem))
-    return jsonify(entries)
+    return jsonify({"items": entries, "total": total})
 
 
 @app.route("/api/task/<state>/<task_id>")

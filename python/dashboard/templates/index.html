@@ -462,8 +462,37 @@ async function postTaskAction(state, id, action, confirmMessage) {
   }
 }
 
+// Incremental loading (2026-07-26, Grimmethy: "long task lists take a while to load,
+// we should do incremental loading, 10 at a time, expanding as the user scrolls to the
+// bottom"). queueLoadedCount/queueHasMore persist per-state across the generic 5s
+// refresh() poll and across tab switches (switching away and back keeps your scroll
+// depth) -- only a full page reload resets them to the first page.
+const QUEUE_PAGE_SIZE = 10;
+const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'done'];
+const queueLoadedCount = {};
+const queueHasMore = {};
+let queueLoadInFlight = false;
+
+window.addEventListener('scroll', () => {
+  if (!QUEUE_STATE_TABS.includes(activeTab)) return;
+  if (!queueHasMore[activeTab] || queueLoadInFlight) return;
+  if (window.innerHeight + window.scrollY < document.body.offsetHeight - 200) return;
+  queueLoadedCount[activeTab] = (queueLoadedCount[activeTab] || QUEUE_PAGE_SIZE) + QUEUE_PAGE_SIZE;
+  renderQueueTab(activeTab);
+});
+
 async function renderQueueTab(state) {
-  const tasks = await fetchJson('/api/queue/' + state);
+  if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
+  queueLoadInFlight = true;
+  let tasks, total;
+  try {
+    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0`);
+    tasks = resp.items;
+    total = resp.total;
+  } finally {
+    queueLoadInFlight = false;
+  }
+  queueHasMore[state] = queueLoadedCount[state] < total;
   const main = document.getElementById('main');
   if (tasks.length === 0) { main.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
   const showArchiveRequeue = state === 'blocked' || state === 'done';
@@ -498,7 +527,8 @@ async function renderQueueTab(state) {
   `;
   }).join('');
   const actionHeader = (showArchiveRequeue || showApply) ? '<th>Actions</th>' : '';
-  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>`;
+  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`;
+  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
   });
