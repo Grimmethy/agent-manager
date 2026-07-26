@@ -982,6 +982,20 @@ if (require.main === module) {
   const { ensureRegistered } = require('./config.js');
   ensureRegistered();
 
+  // `node task-sources.js --priority-map` prints {name: priority} for every registered
+  // source and exits without touching pending/adhoc. Consumed by ornith-worker.ps1 so the
+  // worker's claim order (which task in pending/ to pick up next) uses the SAME priority
+  // ladder as generation order, instead of the old binary manual-vs-everything-else rank
+  // that let a large pre-existing backlog starve a newer, higher-priority task indefinitely
+  // (confirmed live 2026-07-25: a fresh brain_dump_sort task sat behind a 28-deep deep_dive
+  // backlog despite outranking it on priority, because claim order never consulted priority).
+  if (process.argv.includes('--priority-map')) {
+    const map = {};
+    for (const source of getRegisteredSources()) map[source.name] = source.priority;
+    console.log(JSON.stringify(map));
+    return;
+  }
+
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');

@@ -243,18 +243,38 @@ while ($true) {
         Invoke-TaskDb 'created' $pendingFile.FullName
     }
 
-    # Claim order must respect task priority, not just file age: an adhoc (source:'manual')
-    # task queued AFTER a lower-priority background task was already generated must still
-    # be claimed first -- otherwise "adhoc preempts everything" only held at generation
-    # time, not at claim time, and a task sitting in pending/ could starve a newer adhoc
-    # task for its entire drafting pass. Rank by source first (manual=0, everything
-    # else=1), oldest CreationTime as the tiebreaker within a tier.
+    # Claim order must respect task priority, not just file age: a task queued AFTER a
+    # lower-priority background task was already generated must still be claimed first --
+    # otherwise the priority ladder (task-sources.js, editable via the dashboard's Job
+    # List tab) only holds at GENERATION time, not at claim time, and a large pre-existing
+    # backlog in pending/ can starve a newer, higher-priority task indefinitely. Confirmed
+    # live 2026-07-25: a fresh brain_dump_sort task (priority 42) sat behind a 28-deep
+    # deep_dive backlog (priority 82) because the old rank was only ever 0 (manual) vs 1
+    # (everything else) -- brain_dump_sort and deep_dive shared the same tier-1 bucket and
+    # fell back to oldest-CreationTime-first, which always favored the pre-existing backlog.
+    # Rank is now the SAME numeric priority task-sources.js uses to pick which source
+    # generates next (via `--priority-map`), so claim order and generation order agree;
+    # oldest CreationTime is still the tiebreaker within equal priority.
+    $priorityMapJson = node (Join-Path $PackageSrcDir 'task-sources.js') --priority-map 2>$null
+    $priorityMap = $null
+    try { $priorityMap = $priorityMapJson | ConvertFrom-Json } catch { }
+
     $next = Get-ChildItem $pendingDir -Filter '*.json' -ErrorAction SilentlyContinue |
         ForEach-Object {
-            $rank = 1
+            $rank = 999
             try {
-                $src = (Get-Content $_.FullName -Raw | ConvertFrom-Json).source
-                if ($src -eq 'manual') { $rank = 0 }
+                $task = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                # Mirrors task-source-registry.js's resolveSourceName(): most sources
+                # register under the exact same name as task.source, but adhoc/secondbrain
+                # key off task.domain instead, and unused_export's task.source is the
+                # legacy 'deadcode_triage' name.
+                $name = $task.source
+                if ($task.domain -eq 'adhoc') { $name = 'adhoc' }
+                elseif ($task.domain -eq 'secondbrain') { $name = 'secondbrain' }
+                elseif ($task.source -eq 'deadcode_triage') { $name = 'unused_export' }
+                if ($priorityMap -and $priorityMap.PSObject.Properties[$name]) {
+                    $rank = $priorityMap.$name
+                }
             } catch { }
             [PSCustomObject]@{ File = $_; Rank = $rank; CreationTime = $_.CreationTime }
         } |
