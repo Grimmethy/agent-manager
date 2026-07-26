@@ -1547,6 +1547,38 @@ def read_task_priorities() -> dict:
     return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_PRIORITIES.items()}
 
 
+VALID_APPROVAL_MODES = ("auto", "prompt", "approve")
+
+
+def _default_approval_mode() -> str:
+    """Mirrors src/config.js's defaultApprovalMode: derived from the existing
+    AGENT_MANAGER_INCLUDE_APPLY global toggle, so an unconfigured source keeps today's
+    exact behavior (auto-apply when the toggle is on, wait for a manual apply when off)."""
+    return "auto" if read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true" else "approve"
+
+
+def read_approval_modes() -> dict:
+    """Job List tab's editable Approval Mode column (three-tier approval mode,
+    2026-07-26). AGENT_MANAGER_APPROVAL_MODES holds only the overrides
+    ("name:mode,name:mode"), same sparse-override shape src/config.js's
+    approvalModeOverrides parses -- a source not listed here falls back to the single
+    global default derived from AGENT_MANAGER_INCLUDE_APPLY, not a per-source default the
+    way priorities has (there is no meaningful "this source's own baseline approval mode"
+    the way there's a meaningful baseline priority ladder position)."""
+    raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_APPROVAL_MODES", "")
+    overrides = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        name, _, mode = pair.partition(":")
+        name = name.strip()
+        mode = mode.strip()
+        if mode in VALID_APPROVAL_MODES:
+            overrides[name] = mode
+    default = _default_approval_mode()
+    return {name: overrides.get(name, default) for name in TASK_SOURCE_CATALOG}
+
+
 # workDirKind/successCheck values that satisfy review-runner.ps1's unconditional
 # Get-DomainConfig lookup for each domain that apply-task.js already special-cases as a
 # non-git write. Neither field is actually consulted for these domains on the real
@@ -1615,12 +1647,14 @@ def api_job_types():
     reads; this is just a UI over that one persisted value."""
     active = read_active_job_types()
     priorities = read_task_priorities()
+    approval_modes = read_approval_modes()
     return jsonify([
         {
             "name": name,
             "active": name in active,
             "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
             "priority": priorities.get(name, TASK_SOURCE_DEFAULT_PRIORITIES.get(name)),
+            "approvalMode": approval_modes.get(name),
         }
         for name in TASK_SOURCE_CATALOG
     ])
@@ -1690,6 +1724,35 @@ def api_job_types_priority():
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_PRIORITIES", new_value)
 
     return jsonify({"name": name, "priority": priority})
+
+
+@app.route("/api/job-types/approval-mode", methods=["POST"])
+def api_job_types_approval_mode():
+    """Job List tab's editable Approval Mode column (auto/prompt/approve). Mirrors
+    api_job_types_priority()'s exact shape -- persists to AGENT_MANAGER_APPROVAL_MODES in
+    agent-manager.env, which src/config.js's approvalModeOverrides reads fresh on every
+    `node task-sources.js` invocation, so apply-runner.ps1's next automatic-loop tick
+    (via --approval-modes) picks up the change with no pipeline restart needed."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    mode = (body.get("mode") or "").strip()
+    if name not in TASK_SOURCE_CATALOG:
+        abort(400, description=f"unknown job type '{name}'")
+    if mode not in VALID_APPROVAL_MODES:
+        abort(400, description=f"mode must be one of {VALID_APPROVAL_MODES}")
+
+    modes = read_approval_modes()
+    modes[name] = mode
+
+    # Collapse back to "no overrides" (empty string) when every source ends up at the
+    # current global default -- same tidy-round-trip reasoning as the priority/allowlist
+    # collapses above.
+    default = _default_approval_mode()
+    non_default = {n: m for n, m in modes.items() if m != default}
+    new_value = ",".join(f"{n}:{m}" for n, m in sorted(non_default.items()))
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPROVAL_MODES", new_value)
+
+    return jsonify({"name": name, "approvalMode": mode})
 
 
 def _stop_pipeline() -> list:
