@@ -154,11 +154,34 @@ function adhocPlanPrompt(task) {
   ].join('\n');
 }
 
+// Prompt assembly: stable (identity/rules) block first, volatile (per-task) block last --
+// agent-engine's prompt-assembler.ts pattern (project idea shortlist, 2026-07-26),
+// adapted here. Putting ALL static instructional text in one contiguous leading block,
+// with every dynamic per-task value strictly after it, maximizes the shared prefix across
+// repeated calls of the same task type -- a caching-aware backend (Ollama keeps a
+// KV-cache keyed on matching leading tokens) can reuse that prefix's computation instead
+// of reprocessing identical instructions from scratch on every single call. The old
+// convention interleaved static instructions before AND after the dynamic block (e.g.
+// "Write a numbered PLAN..." used to come after the file/rule details), which broke
+// prefix-sharing the moment any dynamic content appeared -- nothing after that point
+// could ever match a prior call's tokens exactly, no matter how similar the instructions
+// were. Not yet applied to every prompt builder in this file -- rolled out first to the
+// two "judgment call" plan prompts below as the initial adoption of the pattern.
+function assemblePrompt(stableLines, volatileLines) {
+  return [...stableLines, '', ...volatileLines].join('\n');
+}
+
 function unusedExportPlanPrompt(task) {
   const ctx = task.promptContext;
-  return [
-    'This is a judgment call, NOT a code-change task. Determine whether `symbol` (defined in `definedIn`) is genuinely dead code or a false positive.',
-    '',
+  const stable = [
+    'This is a judgment call, NOT a code-change task. Determine whether the flagged symbol (defined in the given file, both shown below) is genuinely dead code or a false positive.',
+    'Write a numbered PLAN that is actually a REASONED VERDICT:',
+    '- "genuinely dead, safe to remove"',
+    '- "keep — here\'s why the low call-site count is a false positive (e.g. barrel/re-export pattern the grep can\'t see)"',
+    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
+    'Do not default to removing without engaging with architectural patterns like factory/strategy where duplicate-looking names are correct by design.',
+  ];
+  const volatile = [
     `Symbol: ${ctx.symbol}`,
     `Defined in: ${ctx.definedIn}`,
     '',
@@ -167,13 +190,8 @@ function unusedExportPlanPrompt(task) {
     '',
     'NOTE (verbatim from task source):',
     ctx.note || '',
-    '',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuinely dead, safe to remove"',
-    '- "keep — here\'s why the low call-site count is a false positive (e.g. barrel/re-export pattern the grep can\'t see)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
-    'Do not default to removing without engaging with architectural patterns like factory/strategy where duplicate-looking names are correct by design.',
-  ].join('\n');
+  ];
+  return assemblePrompt(stable, volatile);
 }
 
 // observability_review's plan pass (project idea "OpenTelemetry-Observability-Idea",
@@ -183,9 +201,15 @@ function unusedExportPlanPrompt(task) {
 // confirm or reject, not an assumed-true fact.
 function observabilityReviewPlanPrompt(task) {
   const ctx = task.promptContext;
-  return [
-    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing. Determine whether it is a GENUINE issue or a false positive.',
-    '',
+  const stable = [
+    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing (rule/project/file/snippet given below). Determine whether it is a GENUINE issue or a false positive.',
+    'Write a numbered PLAN that is actually a REASONED VERDICT:',
+    '- "genuine issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
+    '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
+    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
+    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
+  ];
+  const volatile = [
     `Rule flagged: ${ctx.rule}`,
     `Project: ${ctx.projectSlug}`,
     ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
@@ -193,13 +217,8 @@ function observabilityReviewPlanPrompt(task) {
     '',
     'SURROUNDING SOURCE (if available):',
     ctx.snippet || '(no snippet available for this finding)',
-    '',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuine issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
-    '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
-    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
-  ].join('\n');
+  ];
+  return assemblePrompt(stable, volatile);
 }
 
 // observability_review's implement pass (fix, 2026-07-26): this source registered ONLY a
