@@ -1,0 +1,15 @@
+# Dependency for python/dspy_brain_dump_sort_pilot.py only -- deliberately separate from
+# requirements.txt (the dashboard's own dependencies), since DSPy is a real, heavy
+# dependency (pulls in litellm, openai, tiktoken, tokenizers, huggingface-hub, etc.) that
+# the dashboard itself does not need to run.
+#
+# Install note (2026-07-26): a plain `pip install dspy` failed on this machine --
+# tiktoken tried to build from source and needed a working Rust/Cargo toolchain that
+# wasn't fully set up. `pip install dspy --only-binary=:all:` forced prebuilt wheels for
+# every dependency and succeeded. If reinstalling, use that form.
+#
+# Installed into the shared base environment, not an isolated venv -- this bumped
+# cachetools to 7.x, which google-auth/streamlit (unrelated tools in that same
+# environment) want capped below 6.0. Worth a dedicated venv if this pilot graduates
+# beyond a one-off comparison script.
+dspy>=3.2.1
