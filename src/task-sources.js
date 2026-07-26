@@ -839,11 +839,20 @@ function nextBrainDumpSortTask() {
     return null;
   }
   const entries = Array.isArray(data.entries) ? data.entries : [];
-  const chosen = entries.find((e) => e && e.status === 'captured');
+  // Was entries.find(...) + a single taskIdExistsInQueue check that returned null the
+  // instant the OLDEST captured entry already had a task in queue -- if that oldest one
+  // ever landed in blocked/ (3 failed attempts) or done/, this returned null forever,
+  // silently starving every NEWER captured entry behind it even though none of them had
+  // ever been attempted. Confirmed live 2026-07-26: 7 captured entries existed, the
+  // oldest (bd-1784964943302) was blocked, and zero brain_dump_sort tasks had reached
+  // pending/ at all -- the claim-order priority fix from earlier that same day had
+  // nothing to act on, because generation itself had stopped dead. Same "skip an
+  // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
+  // use for their own oldest-first selection.
+  const chosen = entries.find((e) => e && e.status === 'captured' && !taskIdExistsInQueue('brain-dump-sort-' + e.id));
   if (!chosen) return null;
 
   const taskId = 'brain-dump-sort-' + chosen.id;
-  if (taskIdExistsInQueue(taskId)) return null;
 
   return {
     id: taskId,

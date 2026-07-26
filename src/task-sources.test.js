@@ -322,6 +322,26 @@ test('nextBrainDumpSortTask skips an entry already sitting in the queue', () => 
   assert.equal(nextBrainDumpSortTask(), null);
 });
 
+test('nextBrainDumpSortTask offers the next-oldest captured entry when the oldest already has a task in queue (not null)', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [
+      { id: 'bd-1', rawText: 'oldest, already blocked', status: 'captured' },
+      { id: 'bd-2', rawText: 'newer, never attempted', status: 'captured' },
+    ],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, 'brain-dump-sort-bd-1.json'), '{}');
+
+  const task = nextBrainDumpSortTask();
+  assert.ok(task, 'expected the next-oldest captured entry, not null');
+  assert.equal(task.id, 'brain-dump-sort-bd-2');
+  assert.equal(task.promptContext.brainDumpEntryId, 'bd-2');
+});
+
 function makeObservabilityFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
