@@ -695,6 +695,49 @@ def api_task_requeue(state, task_id):
     return jsonify({"id": task_id, "requeued": True})
 
 
+@app.route("/api/task/approved/<task_id>/apply", methods=["POST"])
+def api_task_apply(task_id):
+    """Manual per-task apply (three-tier approval mode, 2026-07-26): the missing piece that
+    makes 'prompt'/'approve'-tier tasks actually usable one at a time, instead of only via
+    the all-or-nothing AGENT_MANAGER_INCLUDE_APPLY global toggle. Shells out to
+    apply-runner.ps1 -TaskId <id> (a one-shot invocation mode that bypasses the automatic
+    loop's approval-mode filtering entirely, since a human explicitly clicked Apply) and
+    waits for it to finish -- a real git branch/commit/push can take a while, hence the
+    generous timeout, and this is deliberately synchronous (no async job tracking) since
+    the dashboard button needs a direct success/failure answer to show the user."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    approved_path = qdir / "approved" / f"{task_id}.json"
+    if not approved_path.is_file():
+        abort(404, description=f"'{task_id}' not found in approved/")
+
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(400, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+
+    env_overrides = read_env_file(ENV_FILE_PATH)
+    env_overrides["AGENT_MANAGER_REPO_ROOT"] = repo_root
+    child_env = {**os.environ, **env_overrides}
+
+    script_path = SRC_DIR / "apply-runner.ps1"
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), "-TaskId", task_id],
+            capture_output=True, text=True, timeout=300, env=child_env, cwd=str(PACKAGE_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 -TaskId did not finish within 300s (still may complete -- check the Done/Blocked tabs)"}), 504
+
+    output_tail = (result.stdout or "")[-4000:]
+    if result.returncode == 2:
+        return jsonify({"id": task_id, "applied": False, "reason": f"'{task_id}' was not found in approved/ by apply-runner.ps1 (raced with the automatic loop?)"}), 404
+    if result.returncode != 0:
+        return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 exited non-zero", "output": output_tail}), 500
+
+    return jsonify({"id": task_id, "applied": True, "output": output_tail})
+
+
 @app.route("/api/task-anywhere/<task_id>")
 def api_task_anywhere(task_id):
     """Workers tab click-through: an instance's currentTaskId doesn't say which queue
