@@ -442,21 +442,74 @@ async function renderModelsTab() {
   });
 }
 
+// Manual archive/requeue (Job Status > Blocked/Done tabs) and manual apply (Approved tab,
+// three-tier approval mode, 2026-07-26) -- per-row action buttons on renderQueueTab's
+// generic table, the same POST-then-rerender-then-alert-on-failure pattern the second
+// brain's set-active-project/create-github-project buttons already use. event.stopPropagation()
+// is load-bearing: the row's own onclick (openDetail) must not also fire when a button
+// inside that row is clicked.
+async function postTaskAction(state, id, action, confirmMessage) {
+  if (confirmMessage && !confirm(confirmMessage)) return;
+  try {
+    const res = await fetch(`/api/task/${state}/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.description || `${res.status}`);
+    }
+    await renderQueueTab(state);
+  } catch (e) {
+    alert(`Could not ${action} '${id}': ` + e.message);
+  }
+}
+
 async function renderQueueTab(state) {
   const tasks = await fetchJson('/api/queue/' + state);
   const main = document.getElementById('main');
   if (tasks.length === 0) { main.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
-  const rows = tasks.map(t => `
+  const showArchiveRequeue = state === 'blocked' || state === 'done';
+  const showApply = state === 'approved';
+
+  // 'prompt'-tier tasks get an active badge here instead of a plain row -- the whole
+  // point of that tier vs 'approve' is not sitting unnoticed (see /api/job-types'
+  // approvalMode field). Best-effort: a failed fetch just means no badges render, same
+  // "degrade gracefully" convention JOB_TYPES' own jobTypes-null fallback already uses.
+  let approvalModeBySource = {};
+  if (showApply) {
+    try {
+      const jobTypes = await fetchJson('/api/job-types');
+      jobTypes.forEach((j) => { approvalModeBySource[j.name] = j.approvalMode; });
+    } catch (e) { /* badges just won't render */ }
+  }
+
+  const rows = tasks.map(t => {
+    const isPrompt = showApply && approvalModeBySource[t.source] === 'prompt';
+    return `
     <tr class="clickable" data-id="${t.id}" data-state="${state}">
       <td>${t.id}</td>
-      <td>${t.title || ''}</td>
+      <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
       <td>${t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || '')}</td>
+      ${showArchiveRequeue ? `<td>
+        <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
+        <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
+      </td>` : ''}
+      ${showApply ? `<td><button type="button" class="secondary task-apply-btn" data-id="${escapeAttr(t.id)}">Apply</button></td>` : ''}
     </tr>
-  `).join('');
-  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+  `;
+  }).join('');
+  const actionHeader = (showArchiveRequeue || showApply) ? '<th>Actions</th>' : '';
+  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
+  });
+  main.querySelectorAll('.task-archive-btn').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'archive', `Archive '${btn.dataset.id}'? This frees up its underlying item for reconsideration but does not apply anything.`); };
+  });
+  main.querySelectorAll('.task-requeue-btn').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'requeue', `Requeue '${btn.dataset.id}' for a fresh draft? This resets its retry history.`); };
+  });
+  main.querySelectorAll('.task-apply-btn').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'apply', `Apply '${btn.dataset.id}' now? This runs the real git branch/commit/push (or vault-note write) for this one task.`); };
   });
 }
 
@@ -538,10 +591,12 @@ async function renderJobListTab() {
   const activeByName = {};
   const alwaysActiveByName = {};
   const priorityByName = {};
+  const approvalModeByName = {};
   (jobTypes || []).forEach((j) => {
     activeByName[j.name] = j.active;
     alwaysActiveByName[j.name] = j.alwaysActive;
     priorityByName[j.name] = j.priority;
+    approvalModeByName[j.name] = j.approvalMode;
   });
 
   // Sort by the EFFECTIVE priority (server override if any, else JOB_TYPES' static
@@ -564,17 +619,30 @@ async function renderJobListTab() {
     const priorityCell = jobTypes
       ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.source)}" value="${j.priority}">`
       : `<span class="meta">${j.priority}</span>`;
+    // Approval mode (three-tier approval mode, 2026-07-26): a plain native <select> --
+    // there's no custom-dropdown component anywhere in this dashboard, and a 3-option
+    // enum is exactly what a native select is for. 'auto' applies automatically once
+    // Ornith approves; 'approve'/'prompt' both wait for a manual Apply click on the
+    // Approved tab -- 'prompt' only differs in getting an active badge there instead of
+    // a plain count, never in whether this automatic loop touches it.
+    const approvalMode = approvalModeByName[j.source] ?? 'auto';
+    const approvalModeCell = jobTypes
+      ? `<select class="approval-mode-select" data-source="${escapeAttr(j.source)}">
+          ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${approvalMode}</span>`;
     return `
     <tr>
       <td>${checkbox}</td>
       <td>${priorityCell}</td>
+      <td>${approvalModeCell}</td>
       <td>${j.source}</td>
       <td>${j.domain}</td>
       <td>${escapeHtml(j.description)}</td>
     </tr>
   `;
   }).join('');
-  main.innerHTML = `<table><thead><tr><th>Active</th><th>Priority</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
 
   main.querySelectorAll('.job-type-toggle').forEach((cb) => {
     cb.onchange = async () => {
@@ -623,6 +691,26 @@ async function renderJobListTab() {
     };
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+  });
+
+  main.querySelectorAll('.approval-mode-select').forEach((select) => {
+    select.onchange = async () => {
+      const source = select.dataset.source;
+      const original = approvalModeByName[source];
+      const mode = select.value;
+      select.disabled = true;
+      try {
+        await fetch('/api/job-types/approval-mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: source, mode }),
+        });
+      } catch (e) {
+        alert('Could not update approval mode: ' + e.message);
+        select.value = original;
+      }
+      select.disabled = false;
+    };
   });
 }
 
