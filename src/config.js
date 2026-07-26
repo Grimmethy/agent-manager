@@ -55,6 +55,12 @@ function getConfig() {
   // repo any more than INDEX.md itself is.
   const deepDiveCoveragePath = process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH
     || path.join(pipelineDir, 'deep-dive-coverage.json');
+  // observability_review (project idea "OpenTelemetry-Observability-Idea", 2026-07-26)
+  // rides on deep_dive's already-cloned projects (deepDiveCoveragePath) rather than
+  // cloning its own copies -- this just tracks which of THOSE projects have already been
+  // scanned by observability-scan.js, so a project is scanned exactly once, not every tick.
+  const observabilityCoveragePath = process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH
+    || path.join(pipelineDir, 'observability-coverage.json');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
@@ -107,7 +113,7 @@ function getConfig() {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
-    deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath,
+    deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
   };

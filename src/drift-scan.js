@@ -50,7 +50,13 @@ const PAIRS = [
     staticEndMarker: '];',
     staticValueRegex: /priority:\s*(\d+)/g,
     sourceFile: 'src/task-sources.js',
-    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(\d+)/g,
+    // Matches both a bare literal (priority: 80) and the taskPriority()-wrapped form
+    // (priority: taskPriority('name', 80)) the per-source override feature introduced --
+    // the bare form stopped appearing anywhere once every registerTaskSource() call was
+    // migrated to taskPriority(), which silently broke this regex (confirmed live
+    // 2026-07-26: both PAIRS below reported "extracted zero values" against real,
+    // unmodified task-sources.js).
+    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(?:taskPriority\([^,]+,\s*)?(\d+)/g,
   },
   {
     // Found the same day as the Job List bug, same root cause: README.md's own
@@ -63,7 +69,7 @@ const PAIRS = [
     staticEndMarker: '## Building the codebase graph',
     staticValueRegex: /\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|/g,
     sourceFile: 'src/task-sources.js',
-    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(\d+)/g,
+    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(?:taskPriority\([^,]+,\s*)?(\d+)/g,
   },
 ];
 

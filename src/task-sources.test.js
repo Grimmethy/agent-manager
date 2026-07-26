@@ -321,3 +321,88 @@ test('nextBrainDumpSortTask skips an entry already sitting in the queue', () => 
 
   assert.equal(nextBrainDumpSortTask(), null);
 });
+
+function makeObservabilityFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
+  process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH = path.join(dir, 'observability-coverage.json');
+  return dir;
+}
+
+// Real clone dir a fixture deep-dive-coverage.json points at, containing one file with
+// a genuine silent-catch-block finding -- exercises observability-scan.js for real
+// (no mocking), same "test the real scanner behavior, not a stub" approach the rest of
+// this suite uses for its other file-based sources.
+function writeOnboardedProject(dir, slug) {
+  const clonePath = path.join(dir, 'clones', slug);
+  fs.mkdirSync(clonePath, { recursive: true });
+  fs.writeFileSync(path.join(clonePath, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
+  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify({
+    projects: { [slug]: { sourceUrl: `https://example.com/${slug}`, clonePath, clonedAt: new Date(0).toISOString(), communities: [] } },
+  }));
+  return clonePath;
+}
+
+test('nextObservabilityReviewTask returns null when deep-dive-coverage.json does not exist', () => {
+  const dir = makeObservabilityFixtureRepo();
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+  assert.equal(nextObservabilityReviewTask(), null);
+});
+
+test('nextObservabilityReviewTask scans a newly-onboarded project and returns a triage task for the first finding', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeOnboardedProject(dir, 'demo-project');
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+
+  const task = nextObservabilityReviewTask();
+  assert.ok(task);
+  assert.equal(task.source, 'observability_review');
+  assert.equal(task.promptContext.rule, 'silent-catch-block');
+  assert.equal(task.promptContext.projectSlug, 'demo-project');
+  assert.equal(task.promptContext.file, 'worker.js');
+  assert.match(task.promptContext.snippet, /risky\(\)/);
+
+  const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, 'utf8'));
+  assert.ok(coverage.projects['demo-project'].scannedAt);
+
+  const flags = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'observability-flags.json'), 'utf8'));
+  assert.equal(flags.length, 1);
+});
+
+test('nextObservabilityReviewTask does not rescan a project already marked scanned', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeOnboardedProject(dir, 'demo-project');
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+
+  nextObservabilityReviewTask(); // first call scans + queues the one finding
+  const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
+  const flagsAfterFirst = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+
+  // Simulate the first finding's task now sitting in pending/ so the next call must move on.
+  const pendingDir = path.join(dir, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  const finding = flagsAfterFirst[0];
+  const taskId = `observability-demo-project-silent-catch-block-worker-js-${finding.line}`;
+  fs.writeFileSync(path.join(pendingDir, `${taskId}.json`), '{}');
+
+  assert.equal(nextObservabilityReviewTask(), null); // no re-scan, no duplicate flags, nothing new to offer
+  const flagsAfterSecond = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(flagsAfterSecond.length, flagsAfterFirst.length);
+});
+
+test('nextObservabilityReviewTask skips a finding whose task already exists in the queue', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeOnboardedProject(dir, 'demo-project');
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+
+  // Pre-scan once to learn the real finding's line number, then pre-seed its task id.
+  const first = nextObservabilityReviewTask();
+  fs.unlinkSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH); // force a fresh run below to re-hit the same finding
+  fs.unlinkSync(path.join(dir, 'queue', 'observability-flags.json'));
+
+  const pendingDir = path.join(dir, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, `${first.id}.json`), '{}');
+
+  assert.equal(nextObservabilityReviewTask(), null);
+});

@@ -16,6 +16,7 @@ const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate } = require('./apply-group-a.js');
+const { scanProject } = require('./observability-scan.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -666,6 +667,114 @@ function nextUnusedExportTask() {
   return null;
 }
 
+// --- Source: observability_review -- flags observability-hygiene issues in projects
+// already onboarded by deep_dive (priority 80, alongside arch_discovery) ----------------
+//
+// Project idea "OpenTelemetry-Observability-Idea" (2026-07-26): rides on deep_dive's
+// coverage file (deepDiveCoveragePath) for its project list/clonePaths rather than
+// cloning its own copies -- deep_dive already does the slow clone+graph-build step inline
+// per tick, duplicating that here would double the clone traffic for no benefit. This
+// source only reads that file, never writes it.
+//
+// observability-scan.js is a pure deterministic scanner (no LLM, see its own header
+// comment) -- running it is fast enough to do inline, same reasoning as deep_dive's own
+// onboarding step. Each project is scanned exactly once (tracked in
+// observabilityCoveragePath, a small sibling of deep-dive-coverage.json); findings
+// accumulate in queue/observability-flags.json and are handed to Ornith one at a time,
+// oldest first, for the same genuine-issue-vs-false-positive judgment
+// nextUnusedExportTask() already uses for dead-code candidates.
+function nextObservabilityReviewTask() {
+  const { pipelineDir, defaultDomain, deepDiveCoveragePath, observabilityCoveragePath } = getConfig();
+
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const deepDiveProjects = deepDiveCoverage.projects || {};
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(observabilityCoveragePath) || '{"projects":{}}');
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'observability-flags.json');
+  let flags;
+  try {
+    flags = JSON.parse(readIfExists(flagsPath) || '[]');
+  } catch {
+    flags = [];
+  }
+
+  let coverageChanged = false;
+  let flagsChanged = false;
+  for (const [slug, proj] of Object.entries(deepDiveProjects)) {
+    if (coverage.projects[slug]) continue; // already scanned once
+    if (!proj.clonePath || !fs.existsSync(proj.clonePath)) continue;
+    try {
+      flags.push(...scanProject(proj.clonePath, slug));
+      flagsChanged = true;
+    } catch (e) {
+      // A scan failure (unreadable file, scanner bug on unusual input) must never crash
+      // the worker loop -- same rule onboardDeepDiveProject's own try/catch follows. Mark
+      // it scanned anyway so a persistently-broken project doesn't retry every tick forever.
+      console.error(`observability_review: failed to scan "${slug}": ${e.message}`);
+    }
+    coverage.projects[slug] = { scannedAt: new Date().toISOString() };
+    coverageChanged = true;
+  }
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(observabilityCoveragePath), { recursive: true });
+    fs.writeFileSync(observabilityCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+  if (flagsChanged) {
+    fs.mkdirSync(path.dirname(flagsPath), { recursive: true });
+    fs.writeFileSync(flagsPath, JSON.stringify(flags, null, 2));
+  }
+
+  const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
+  for (const finding of sorted) {
+    const taskId = `observability-${slugifyForId(finding.projectSlug)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    // Attach a small surrounding-source snippet for context, same reasoning as
+    // nextUnusedExportTask's callSites: a bare rule/file/line claim is exactly the kind of
+    // "unverified claim" a triage judgment shouldn't be asked to trust blindly.
+    let snippet = null;
+    const proj = finding.file && deepDiveProjects[finding.projectSlug];
+    if (proj && proj.clonePath) {
+      const content = readIfExists(path.join(proj.clonePath, finding.file));
+      if (content) {
+        const lines = content.split('\n');
+        const start = Math.max(0, (finding.line || 1) - 4);
+        const end = Math.min(lines.length, (finding.line || 1) + 3);
+        snippet = lines.slice(start, end).join('\n');
+      }
+    }
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: 'observability_review',
+      title: `Observability triage: ${finding.rule} — ${finding.projectSlug}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
+      promptContext: {
+        rule: finding.rule,
+        detail: finding.detail,
+        file: finding.file,
+        line: finding.line,
+        projectSlug: finding.projectSlug,
+        snippet,
+      },
+    };
+  }
+
+  return null;
+}
+
 // --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
 // (priority 42, right after secondbrain's 40) -----------------------------------------
 //
@@ -804,6 +913,15 @@ registerTaskSource('arch_discovery', {
     const { archReviewCandidatesPath } = getConfig();
     return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
   },
+});
+
+// observability_review shares arch_discovery's tier (80) deliberately -- it's the same
+// kind of proactive review of already-scanned projects, not pure speculative cleanup like
+// unused_export (90). See nextObservabilityReviewTask's own header comment for the full
+// design (project idea "OpenTelemetry-Observability-Idea", 2026-07-26).
+registerTaskSource('observability_review', {
+  priority: taskPriority('observability_review', 80),
+  next: nextObservabilityReviewTask,
 });
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
@@ -966,7 +1084,7 @@ module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
-  nextArchImportTask, nextBrainDumpSortTask,
+  nextArchImportTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

@@ -83,9 +83,11 @@ Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
 | `adhoc` | 10 | `queue/adhoc/*.json` (submit via `queue-adhoc-task.js`) |
 | `trouble_log` | 20 | `AGENT_MANAGER_TROUBLE_LOG_PATH`, entries flagged 🤖 |
 | `secondbrain` | 40 | `SECOND_BRAIN_DIR/Inbox/*.md` |
+| `brain_dump_sort` | 42 | `AGENT_MANAGER_BRAIN_DUMP_PATH`, entries with `status: 'captured'` -- always active regardless of any task-source allowlist, sits above any single project |
 | `arch_review` | 70 | `AGENT_MANAGER_ARCH_CANDIDATES_PATH`, entries rated Strong |
 | `arch_import_review` | 71 | `AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH` (ADR-0020) — same fulfillment logic as `arch_review`, against `arch_import`'s own candidates doc |
 | `arch_discovery` | 80 | `AGENT_MANAGER_GRAPH_PATH` + `AGENT_MANAGER_COMMUNITY_COVERAGE_PATH` — generates new candidates one graph community at a time |
+| `observability_review` | 80 | `AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH` + `AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH` — runs `observability-scan.js` (deterministic, no LLM) once per deep_dive-onboarded project, flags in `queue/observability-flags.json` triaged one at a time |
 | `arch_import` | 81 | `AGENT_MANAGER_IMPORT_COVERAGE_PATH` + deep_dive's analysis docs (ADR-0020) — promotes a reviewed `deep_dive` Use/Adapt finding into a real, agent-manager-grounded import candidate |
 | `deep_dive` | 82 | Reviews one import-graph community at a time from a `project_search` Strong lead's cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019) |
 | `project_search` | 85 | Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment (ADR-0018) |

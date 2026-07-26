@@ -174,6 +174,32 @@ function unusedExportPlanPrompt(task) {
   ].join('\n');
 }
 
+// observability_review's plan pass (project idea "OpenTelemetry-Observability-Idea",
+// 2026-07-26): same "judgment call, not a code-change" framing as unusedExportPlanPrompt
+// above, since observability-scan.js's rules are heuristics (brace-matching, keyword
+// windows), not a real parser -- every flagged `rule` is a candidate for Ornith to
+// confirm or reject, not an assumed-true fact.
+function observabilityReviewPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing. Determine whether it is a GENUINE issue or a false positive.',
+    '',
+    `Rule flagged: ${ctx.rule}`,
+    `Project: ${ctx.projectSlug}`,
+    ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
+    `Scanner detail: ${ctx.detail}`,
+    '',
+    'SURROUNDING SOURCE (if available):',
+    ctx.snippet || '(no snippet available for this finding)',
+    '',
+    'Write a numbered PLAN that is actually a REASONED VERDICT:',
+    '- "genuine issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
+    '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
+    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
+    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
+  ].join('\n');
+}
+
 // project_search's plan pass has a different JOB than every other source's plan pass: it
 // doesn't plan a change, it proposes SEARCH QUERIES for the harness to execute against
 // GitHub/Hugging Face between plan and implement (see ornith-worker.ps1's project_search
@@ -491,6 +517,7 @@ updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
+updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });

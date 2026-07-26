@@ -1383,8 +1383,8 @@ def api_pipeline_status():
 # reasoning as AGENT_MANAGER_BRAIN_DUMP_PATH).
 TASK_SOURCE_CATALOG = [
     "adhoc", "trouble_log", "secondbrain", "brain_dump_sort", "arch_review",
-    "arch_import_review", "arch_discovery", "arch_import", "deep_dive",
-    "project_search", "unused_export",
+    "arch_import_review", "arch_discovery", "arch_import", "observability_review",
+    "deep_dive", "project_search", "unused_export",
 ]
 
 # Exempt from any allowlist restriction regardless of stored state -- task-sources.js's
@@ -1409,8 +1409,8 @@ def read_active_job_types() -> set:
 # source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no override for it.
 TASK_SOURCE_DEFAULT_PRIORITIES = {
     "adhoc": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
-    "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "arch_import": 81,
-    "deep_dive": 82, "project_search": 85, "unused_export": 90,
+    "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "observability_review": 80,
+    "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,
 }
 
 

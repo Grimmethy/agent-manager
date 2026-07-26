@@ -16,6 +16,7 @@ community-coverage.json
 task-domains.json
 deep-dive-coverage.json
 import-coverage.json
+observability-coverage.json
 dashboard.pid
 .claude/
 brain-dump.json
