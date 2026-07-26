@@ -31,6 +31,13 @@
   .badge.bad { background: rgba(224,87,92,.15); color: var(--bad); }
   .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
   .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+  /* Nav sidebar tab-count severity dot (harnss UI pattern, adapted 2026-07-26): a solid
+     small circle, distinct from .badge's translucent pill -- a tiny dot needs a solid
+     fill to read at a glance, especially next to a bare number in the nav rail. */
+  .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .status-dot.ok { background: var(--ok); }
+  .status-dot.warn { background: var(--warn); }
+  .status-dot.bad { background: var(--bad); }
   .stale-timer { color: var(--bad); font-size: 11px; font-variant-numeric: tabular-nums; }
   .state-timer { color: var(--muted, #8b949e); font-size: 11px; font-variant-numeric: tabular-nums; }
   .worker-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
@@ -221,12 +228,34 @@ async function fetchJson(url) {
   return r.json();
 }
 
+// Nav tab-count severity thresholds (harnss UI pattern, adapted 2026-07-26): 'blocked' is
+// the one state that always deserves attention -- see this whole session's worth of
+// "entry stuck forever, no automatic path back" bugs -- so ANY count there is bad, not
+// just a large one. 'pending' only escalates once the backlog itself is the anomaly, not
+// its everyday size (60-90 pending items was completely normal pipeline behavior today).
+// Every other tab stays a plain, uncolored count -- an expected/transient state (drafting,
+// review, approved, done) doesn't need a severity read at a glance.
+const TAB_COUNT_SEVERITY_THRESHOLDS = {
+  blocked: { bad: 1 },
+  pending: { warn: 50, bad: 150 },
+};
+
+function severityForTab(tabKey, count) {
+  const thresholds = TAB_COUNT_SEVERITY_THRESHOLDS[tabKey];
+  if (!thresholds || typeof count !== 'number') return null;
+  if (thresholds.bad !== undefined && count >= thresholds.bad) return 'bad';
+  if (thresholds.warn !== undefined && count >= thresholds.warn) return 'warn';
+  return null;
+}
+
 function renderTabButton(tab, indent) {
   const btn = document.createElement('button');
   btn.className = tab.key === activeTab ? 'active' : '';
   if (indent) btn.style.paddingLeft = '36px';
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
-  btn.innerHTML = `<span>${tab.label}</span><span class="count">${count}</span>`;
+  const severity = severityForTab(tab.key, count);
+  const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
+  btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
   btn.onclick = () => {
     if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
     if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
