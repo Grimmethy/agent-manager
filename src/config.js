@@ -109,6 +109,25 @@ function getConfig() {
     if (name && num && !Number.isNaN(Number(num))) taskPriorityOverrides[name] = Number(num);
   });
 
+  // Three-tier approval mode (harnss's per-tool approval_mode pattern, adapted
+  // 2026-07-26): 'auto' (apply-runner.ps1 applies automatically once Ornith approves),
+  // 'approve' (waits in queue/approved/ for a human to manually apply via the dashboard's
+  // per-task Apply button), 'prompt' (same as 'approve' -- still requires an explicit
+  // human click, never auto-applies on a timeout -- but the dashboard actively badges it
+  // rather than leaving it as a plain count, so it doesn't just sit unnoticed). Same
+  // sparse-override format/semantics as AGENT_MANAGER_TASK_PRIORITIES. A source with no
+  // override falls back to defaultApprovalMode below, derived from the existing
+  // AGENT_MANAGER_INCLUDE_APPLY global toggle -- so nothing changes for an existing setup
+  // until a source is explicitly configured here.
+  const rawApprovalModes = process.env.AGENT_MANAGER_APPROVAL_MODES || '';
+  const approvalModeOverrides = {};
+  const VALID_APPROVAL_MODES = ['auto', 'prompt', 'approve'];
+  rawApprovalModes.split(',').forEach((pair) => {
+    const [name, mode] = pair.split(':').map((s) => (s || '').trim());
+    if (name && VALID_APPROVAL_MODES.includes(mode)) approvalModeOverrides[name] = mode;
+  });
+  const defaultApprovalMode = process.env.AGENT_MANAGER_INCLUDE_APPLY === 'true' ? 'auto' : 'approve';
+
   return {
     repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
@@ -116,6 +135,7 @@ function getConfig() {
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
+    approvalModeOverrides, defaultApprovalMode,
   };
 }
 
