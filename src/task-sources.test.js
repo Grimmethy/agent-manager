@@ -452,3 +452,70 @@ test('nextObservabilityReviewTask skips a finding whose task already exists in t
 
   assert.equal(nextObservabilityReviewTask(), null);
 });
+
+function makeDagFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  return dir;
+}
+
+test('isTaskReady is true for a task with no deps field at all', () => {
+  const dir = makeDagFixtureRepo();
+  const { isTaskReady } = freshTaskSources(dir);
+  assert.equal(isTaskReady({ id: 'x' }, dir), true);
+});
+
+test('isTaskReady is true for a task with an empty deps array', () => {
+  const dir = makeDagFixtureRepo();
+  const { isTaskReady } = freshTaskSources(dir);
+  assert.equal(isTaskReady({ id: 'x', deps: [] }, dir), true);
+});
+
+test('isTaskReady is false when a listed dep has not reached done/', () => {
+  const dir = makeDagFixtureRepo();
+  const { isTaskReady } = freshTaskSources(dir);
+  assert.equal(isTaskReady({ id: 'x', deps: ['upstream-task'] }, dir), false);
+});
+
+test('isTaskReady is true only once EVERY listed dep has reached done/', () => {
+  const dir = makeDagFixtureRepo();
+  const { isTaskReady } = freshTaskSources(dir);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'dep-a.json'), '{}');
+  assert.equal(isTaskReady({ id: 'x', deps: ['dep-a', 'dep-b'] }, dir), false);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'dep-b.json'), '{}');
+  assert.equal(isTaskReady({ id: 'x', deps: ['dep-a', 'dep-b'] }, dir), true);
+});
+
+test('isTaskReady does not consider a dep "done" just because it exists in pending/blocked (must be in done/ specifically)', () => {
+  const dir = makeDagFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'blocked'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'blocked', 'upstream-task.json'), '{}');
+  const { isTaskReady } = freshTaskSources(dir);
+  assert.equal(isTaskReady({ id: 'x', deps: ['upstream-task'] }, dir), false);
+});
+
+test('pendingReadinessMap reports every pending task, defaulting ready=true for the common no-deps case', () => {
+  const dir = makeDagFixtureRepo();
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'task-a.json'), JSON.stringify({ id: 'task-a' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'task-b.json'), JSON.stringify({ id: 'task-b', deps: ['not-done-yet'] }));
+  const { pendingReadinessMap } = freshTaskSources(dir);
+  assert.deepEqual(pendingReadinessMap(), { 'task-a': true, 'task-b': false });
+});
+
+test('pendingReadinessMap treats a malformed pending file as ready rather than letting a readiness bug block a claimable task', () => {
+  const dir = makeDagFixtureRepo();
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'broken.json'), 'not valid json');
+  const { pendingReadinessMap } = freshTaskSources(dir);
+  assert.deepEqual(pendingReadinessMap(), { broken: true });
+});
+
+test('pendingReadinessMap returns {} when pending/ does not exist', () => {
+  const dir = makeDagFixtureRepo();
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const { pendingReadinessMap } = freshTaskSources(dir);
+  assert.deepEqual(pendingReadinessMap(), {});
+});

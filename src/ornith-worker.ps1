@@ -259,9 +259,25 @@ while ($true) {
     $priorityMap = $null
     try { $priorityMap = $priorityMapJson | ConvertFrom-Json } catch { }
 
+    # DAG readiness (agent-engine's TaskGraph pattern, adapted 2026-07-26, ahead of real
+    # need -- no built-in task source declares `deps` today; this exists so claim order
+    # already respects it the moment one does, without another priority-ladder-shaped
+    # retrofit later). A task not present in the map (the common case: no deps field, or
+    # task-sources.js couldn't be reached) is treated as ready -- same fail-open reasoning
+    # $priorityMap's own missing-name fallback already uses, so a readiness-check hiccup
+    # degrades to "claim order ignores deps this tick," never to "nothing is claimable."
+    $readinessMapJson = node (Join-Path $PackageSrcDir 'task-sources.js') --pending-readiness 2>$null
+    $readinessMap = $null
+    try { $readinessMap = $readinessMapJson | ConvertFrom-Json } catch { }
+
     $next = Get-ChildItem $pendingDir -Filter '*.json' -ErrorAction SilentlyContinue |
         ForEach-Object {
             $rank = 999
+            $ready = $true
+            $taskId = $_.BaseName
+            if ($readinessMap -and $readinessMap.PSObject.Properties[$taskId] -and $readinessMap.$taskId -eq $false) {
+                $ready = $false
+            }
             try {
                 $task = Get-Content $_.FullName -Raw | ConvertFrom-Json
                 # Mirrors task-source-registry.js's resolveSourceName(): most sources
@@ -276,8 +292,9 @@ while ($true) {
                     $rank = $priorityMap.$name
                 }
             } catch { }
-            [PSCustomObject]@{ File = $_; Rank = $rank; CreationTime = $_.CreationTime }
+            [PSCustomObject]@{ File = $_; Rank = $rank; CreationTime = $_.CreationTime; Ready = $ready }
         } |
+        Where-Object { $_.Ready } |
         Sort-Object Rank, CreationTime |
         Select-Object -First 1 -ExpandProperty File
 

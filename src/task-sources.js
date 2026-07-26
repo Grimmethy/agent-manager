@@ -55,6 +55,52 @@ function taskIdExistsInQueue(id) {
   });
 }
 
+// Lightweight DAG-readiness check (agent-engine's TaskGraph pattern, adapted 2026-07-26,
+// ahead of real need -- no built-in task source declares `deps` today, since every one
+// generates fully independent units of work; this exists so a future task source CAN
+// declare `deps: [taskId, ...]` and have the worker's claim order actually respect it, once
+// running more than one worker process is a genuine throughput win rather than several
+// processes contending for one loaded model).
+//
+// A task with no deps (the default, and every real task today) is always ready. Otherwise
+// every listed dep must have reached queue/done/<depId>.json specifically -- not "exists
+// anywhere in the queue" (taskIdExistsInQueue's question), a materially different question
+// ("did the thing I depend on finish SUCCESSFULLY") from "is something already working on
+// this exact id" (taskIdExistsInQueue's job, used to avoid re-generating a duplicate).
+function isTaskReady(task, pipelineDir) {
+  const deps = task && Array.isArray(task.deps) ? task.deps : [];
+  if (deps.length === 0) return true;
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  return deps.every((depId) => fs.existsSync(path.join(doneDir, `${depId}.json`)));
+}
+
+// CLI mode (`node task-sources.js --pending-readiness`, mirrors --priority-map): computes
+// isTaskReady() for every task currently sitting in pending/, so ornith-worker.ps1's claim
+// order can skip a not-yet-ready task without re-implementing this check in PowerShell.
+function pendingReadinessMap() {
+  const { pipelineDir } = getConfig();
+  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  const map = {};
+  let files;
+  try {
+    files = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return map;
+  }
+  for (const f of files) {
+    const id = f.slice(0, -'.json'.length);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(path.join(pendingDir, f), 'utf8'));
+    } catch {
+      map[id] = true; // malformed file -- do not let a readiness bug block an otherwise-claimable task
+      continue;
+    }
+    map[id] = isTaskReady(task, pipelineDir);
+  }
+  return map;
+}
+
 // --- Source: queue/adhoc/, a manually-submitted one-off task (priority 10) --------------
 //
 // Lets a human or an orchestrating agent hand this pipeline a specific task right now,
@@ -1105,6 +1151,7 @@ module.exports = {
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
   nextArchImportTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
+  isTaskReady, pendingReadinessMap,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
@@ -1131,6 +1178,14 @@ if (require.main === module) {
     const map = {};
     for (const source of getRegisteredSources()) map[source.name] = source.priority;
     console.log(JSON.stringify(map));
+    return;
+  }
+
+  // `node task-sources.js --pending-readiness` prints {taskId: boolean} for every task
+  // currently sitting in pending/ -- see isTaskReady()'s own header comment. Same
+  // "compute it once in JS, consume it from PowerShell" split as --priority-map above.
+  if (process.argv.includes('--pending-readiness')) {
+    console.log(JSON.stringify(pendingReadinessMap()));
     return;
   }
 
