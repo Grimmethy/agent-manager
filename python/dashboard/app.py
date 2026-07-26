@@ -1601,31 +1601,63 @@ def read_approval_modes() -> dict:
 # REVIEW_PROVIDER branch, which nothing here uses -- so any valid placeholder works; kept
 # identical to "default" for simplicity rather than inventing a new value with no
 # behavioral difference.
+# Maps a task-source NAME (TASK_SOURCE_CATALOG's entries) to the DOMAIN KEY it actually
+# stamps onto its tasks. Most built-ins use their own name as the domain (project_search,
+# deep_dive, brain_dump_sort, secondbrain) -- but six of them (trouble_log, arch_review,
+# arch_import_review, arch_discovery, arch_import, observability_review, unused_export)
+# all share the single 'default' domain (task-sources.js's defaultDomain), since
+# task-sources.js's own getConfig().defaultDomain is what nextCandidateFulfillmentTask/
+# nextTroubleLogTask/nextArchDiscoveryTask/nextArchImportTask/nextObservabilityReviewTask/
+# nextUnusedExportTask all stamp -- confirmed by reading each one directly, not assumed
+# from the source name. Getting this mapping WRONG (or incomplete) is exactly what
+# happened before this fix: 'default' was missing entirely from _DOMAIN_DEFAULTS_TO_ENSURE,
+# so every arch_import/observability_review/trouble_log task failed immediately with
+# "Unknown task domain: default" from its very first run against a freshly-started project
+# (confirmed live 2026-07-26 on TaxHarvest: 250 tasks accumulated blocked before anyone
+# noticed, since a blocked task produces no visible error beyond the Blocked tab's count).
+_SOURCE_TO_DOMAIN_KEY = {
+    "trouble_log": "default", "arch_review": "default", "arch_import_review": "default",
+    "arch_discovery": "default", "arch_import": "default", "observability_review": "default",
+    "unused_export": "default",
+    "project_search": "project_search", "deep_dive": "deep_dive",
+    "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
+}
+
 _DOMAIN_DEFAULTS_TO_ENSURE = {
+    "default": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+    "adhoc": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+    "secondbrain": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
     "project_search": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
     "deep_dive": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
     "brain_dump_sort": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
 }
 
-# brain_dump_sort is always in read_active_job_types()'s result (see ALWAYS_ACTIVE_SOURCES
-# above), so this list is redundant in the normal call path -- kept as a belt-and-suspenders
-# floor in case some future call site ever passes a hand-built task_sources list that forgot
-# it, since the failure mode ("Unknown task domain") is silent and easy to miss.
-_ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort"]
+# adhoc and brain_dump_sort are always in read_active_job_types()'s result regardless of
+# any allowlist (see ALWAYS_ACTIVE_SOURCES above) -- ensure their domains unconditionally,
+# a belt-and-suspenders floor in case some future call site ever passes a hand-built
+# task_sources list that forgot one, since the failure mode ("Unknown task domain") is
+# silent and easy to miss (as just proven).
+_ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort", "adhoc"]
 
 
 def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
-    """Confirmed live (2026-07-22, mission-control and TaxHarvest): review-runner.ps1 calls
-    Get-DomainConfig for EVERY task's domain unconditionally (fact-checker.js's working-
-    directory lookup, shared by both the ornith and claude review providers) -- not just
-    git-based domains. A task-domains.json with only "default" blocks every project_search
-    (and, by the same mechanism, every deep_dive) task immediately with "Unknown task
-    domain: ...", even though apply-task.js already special-cases both domains correctly
-    (no git involved for either). Rather than requiring every consumer project to know to
-    pre-add these entries themselves, add whichever of them this run's task_sources
-    actually uses -- additively, never overwriting an existing entry or any other key --
-    so this doesn't have to be rediscovered per-project."""
-    relevant = [s for s in {*task_sources, *_ALWAYS_ENSURE_DOMAINS} if s in _DOMAIN_DEFAULTS_TO_ENSURE]
+    """Confirmed live (2026-07-22, mission-control and TaxHarvest; recurred 2026-07-26,
+    TaxHarvest again, 250 blocked tasks): review-runner.ps1 calls Get-DomainConfig for
+    EVERY task's domain unconditionally (fact-checker.js's working-directory lookup,
+    shared by both the ornith and claude review providers) -- not just git-based domains.
+    A fresh project's task-domains.json missing even ONE domain key any ACTIVE task
+    source needs blocks every task of that source type immediately with "Unknown task
+    domain: ...", even for domains apply-task.js already special-cases correctly (no git
+    involved). Rather than requiring every consumer project to know to pre-add these
+    entries themselves, add whichever domain keys this run's active task_sources actually
+    need -- additively, never overwriting an existing entry or any other key -- so this
+    doesn't have to be rediscovered per-project. See _SOURCE_TO_DOMAIN_KEY's own comment
+    for why this maps by DOMAIN KEY, not by source name directly (several sources share
+    one domain)."""
+    domain_keys_needed = {
+        _SOURCE_TO_DOMAIN_KEY[s] for s in {*task_sources, *_ALWAYS_ENSURE_DOMAINS} if s in _SOURCE_TO_DOMAIN_KEY
+    }
+    relevant = [d for d in domain_keys_needed if d in _DOMAIN_DEFAULTS_TO_ENSURE]
     if not relevant:
         return
 
@@ -1640,9 +1672,9 @@ def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
     if not isinstance(domains, dict):
         return
     changed = False
-    for source in relevant:
-        if source not in domains:
-            domains[source] = _DOMAIN_DEFAULTS_TO_ENSURE[source]
+    for domain_key in relevant:
+        if domain_key not in domains:
+            domains[domain_key] = _DOMAIN_DEFAULTS_TO_ENSURE[domain_key]
             changed = True
     if not changed:
         return
@@ -1814,6 +1846,21 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_INCLUDE_APPLY", "true" if include_apply else "false")
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_SKIP_PUSH", "true" if skip_push else "false")
+
+    # Fix, 2026-07-26 (Grimmethy: "I keep setting the Project tab's path to TaxHarvest,
+    # but it doesn't stick -- navigating away and back reverts to agent-manager"):
+    # get_active_repo_root() checks os.environ FIRST, only falling back to the .env FILE
+    # if unset -- by design, so a project pre-configured via launch.bat's own env vars
+    # wins at startup rather than a stale leftover .env value silently overriding it. But
+    # writing the new path to the file above was never reflected back into THIS already-
+    # running dashboard process's own os.environ, so get_active_repo_root() kept
+    # returning whatever the dashboard happened to be launched with, forever -- no
+    # dashboard restart, no amount of clicking Start Pipeline, would ever change what it
+    # reported as active. Mutating os.environ here keeps the original precedence (an
+    # externally-set env var still wins at the NEXT dashboard restart) while making an
+    # in-dashboard project switch actually take effect and persist for the rest of this
+    # process's lifetime, matching what the Project tab visibly promises.
+    os.environ["AGENT_MANAGER_REPO_ROOT"] = raw_path
 
     env_overrides = read_env_file(ENV_FILE_PATH)
     env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
