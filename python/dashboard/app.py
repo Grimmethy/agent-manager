@@ -624,6 +624,77 @@ def api_task_detail(state, task_id):
     return jsonify(data)
 
 
+@app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
+def api_task_archive(state, task_id):
+    """Manual archive (Job Status > Blocked/Done tabs, per-row button): moves the task file
+    to queue/done/_archived_no_action/ -- not a new convention, the exact folder already
+    used for every manual archive done by hand earlier in this project's history.
+    Load-bearing detail: src/task-sources.js's taskIdExistsInQueue() only ever checks the
+    direct queue/<state>/<id>.json path, never nested subfolders, so moving a file here
+    silently frees up its underlying item (a brain-dump entry, an arch_import itemId, a
+    deep_dive community) for reconsideration next time its source generator runs -- with
+    zero source-specific logic needed on this end."""
+    if state not in ("blocked", "done"):
+        abort(400, description="only a blocked or done task can be archived")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / state / f"{task_id}.json"
+    if not src.is_file():
+        abort(404)
+
+    dest_dir = qdir / "done" / "_archived_no_action"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"an archived copy of '{task_id}' already exists")
+    shutil.move(str(src), str(dest))
+    return jsonify({"id": task_id, "archived": True})
+
+
+@app.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """Manual requeue (Job Status > Blocked/Done tabs, per-row button): moves the task back
+    to pending/, stripped to the same shape a freshly-generated task has -- every
+    drafting/review/apply artifact (blockedReason, doneMarker, ornithVotes, planResponse,
+    implementResponse, etc.) is dropped, not carried forward. ornithRejectCount resets to 0
+    deliberately: a manual requeue is a deliberate human do-over, not a continuation of the
+    same automatic retry cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for
+    review-stage rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count
+    forward would let a manually-requeued task block again after fewer real attempts than
+    a task hitting that cap for the first time gets."""
+    if state not in ("blocked", "done"):
+        abort(400, description="only a blocked or done task can be requeued")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / state / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": now_iso,
+        "history": [{"status": "pending", "at": now_iso, "note": f"manually requeued from {state}/"}],
+    }
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "requeued": True})
+
+
 @app.route("/api/task-anywhere/<task_id>")
 def api_task_anywhere(task_id):
     """Workers tab click-through: an instance's currentTaskId doesn't say which queue
