@@ -333,12 +333,20 @@ function applyArchImportCandidate({ implementResponse, candidatesPath, importCov
     coverage = { items: {} };
   }
   if (!coverage.items) coverage.items = {};
+  const nowIso = new Date().toISOString();
   coverage.items[itemId] = {
-    promotedAt: new Date().toISOString(),
-    // null, not omitted, when skipped -- an explicit "considered, no candidate came of
-    // it" is a real, distinguishable outcome from "never looked at," same reasoning
-    // deep_dive already applies to Ignore-rated items getting a stableId at all.
-    candidateId: result.skipped ? null : result.candidateIds[0],
+    // Was unconditional (promotedAt stamped even when result.skipped) -- confirmed live
+    // 2026-07-26: 134/134 "promoted" items had candidateId:null, ARCH_IMPORT_CANDIDATES.md
+    // never even existed, and nextArchImportTask()'s `if (promotedAt) continue` treated
+    // every one as permanently done. A zero-harness-grounding skip (the documented COMMON
+    // case, see ornith-worker.ps1's $skipImplement comment -- 10/14 in the original sample)
+    // is NOT the same as "genuinely evaluated, doesn't fit" -- agent-manager's own codebase
+    // keeps growing, so a query with zero hits today can have a real hit next week. Only a
+    // REAL candidate (result.skipped === false) is a terminal outcome now; a skip just
+    // records lastAttemptedAt so nextArchImportTask() can retry it later instead of never.
+    promotedAt: result.skipped ? (coverage.items[itemId]?.promotedAt ?? null) : nowIso,
+    candidateId: result.skipped ? (coverage.items[itemId]?.candidateId ?? null) : result.candidateIds[0],
+    lastAttemptedAt: nowIso,
     projectSlug: sourceProject,
   };
   fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });

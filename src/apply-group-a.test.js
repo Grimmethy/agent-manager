@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -375,4 +375,56 @@ test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured',
 
   assert.equal(result.skipped, true);
   assert.match(result.reason, /SECOND_BRAIN_DIR/);
+});
+
+test('applyArchImportCandidate leaves promotedAt null (not stamped) on a skipped/empty implement response', () => {
+  // Regression for the 2026-07-26 fix: promotedAt used to be stamped unconditionally,
+  // permanently hiding an item from nextArchImportTask() even though nothing was ever
+  // produced -- confirmed live as 134/134 real "promoted" items with candidateId:null and
+  // ARCH_IMPORT_CANDIDATES.md never even existing.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-arch-import-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_IMPORT_CANDIDATES.md');
+  const importCoveragePath = path.join(dir, 'import-coverage.json');
+  const task = { promptContext: { itemId: 'proj-1', sourceProject: 'proj' } };
+
+  const result = applyArchImportCandidate({ implementResponse: '', candidatesPath, importCoveragePath, task });
+  assert.equal(result.skipped, true);
+  assert.equal(fs.existsSync(candidatesPath), false, 'no candidates doc should be created on a skip');
+
+  const coverage = JSON.parse(fs.readFileSync(importCoveragePath, 'utf8'));
+  assert.equal(coverage.items['proj-1'].promotedAt, null);
+  assert.equal(coverage.items['proj-1'].candidateId, null);
+  assert.ok(coverage.items['proj-1'].lastAttemptedAt, 'lastAttemptedAt should still be recorded so a retry cooldown can apply');
+});
+
+test('applyArchImportCandidate stamps promotedAt/candidateId only when a real candidate was produced', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-arch-import-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_IMPORT_CANDIDATES.md');
+  const importCoveragePath = path.join(dir, 'import-coverage.json');
+  const task = { promptContext: { itemId: 'proj-1', sourceProject: 'proj' } };
+
+  const implementResponse = candidateBlock({ id: 'AC-1', title: 'Real Candidate' });
+  const result = applyArchImportCandidate({ implementResponse, candidatesPath, importCoveragePath, task });
+  assert.equal(result.skipped, undefined);
+  assert.equal(result.candidateCount, 1);
+
+  const coverage = JSON.parse(fs.readFileSync(importCoveragePath, 'utf8'));
+  assert.ok(coverage.items['proj-1'].promotedAt, 'a real candidate should mark this permanently promoted');
+  assert.equal(coverage.items['proj-1'].candidateId, 'AC-1');
+});
+
+test('applyArchImportCandidate does not clobber an existing real promotion if somehow re-applied with an empty response', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-arch-import-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_IMPORT_CANDIDATES.md');
+  const importCoveragePath = path.join(dir, 'import-coverage.json');
+  fs.writeFileSync(importCoveragePath, JSON.stringify({
+    items: { 'proj-1': { promotedAt: '2026-01-01T00:00:00.000Z', candidateId: 'AC-1', projectSlug: 'proj' } },
+  }));
+  const task = { promptContext: { itemId: 'proj-1', sourceProject: 'proj' } };
+
+  applyArchImportCandidate({ implementResponse: '', candidatesPath, importCoveragePath, task });
+
+  const coverage = JSON.parse(fs.readFileSync(importCoveragePath, 'utf8'));
+  assert.equal(coverage.items['proj-1'].promotedAt, '2026-01-01T00:00:00.000Z');
+  assert.equal(coverage.items['proj-1'].candidateId, 'AC-1');
 });

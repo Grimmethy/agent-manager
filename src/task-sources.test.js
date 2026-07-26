@@ -107,6 +107,32 @@ test('nextArchImportTask never re-offers an already-promoted item', () => {
   assert.equal(nextArchImportTask(), null);
 });
 
+test('nextArchImportTask retries a previously-skipped (zero-harness-grounding) item once its retry cooldown has elapsed', () => {
+  // Regression for the 2026-07-26 fix: candidateId:null used to mean "permanently done"
+  // (via an unconditionally-stamped promotedAt) even though nothing was ever produced --
+  // confirmed live as 134/134 real "promoted" items with candidateId:null. promotedAt
+  // must stay null on a skip; only lastAttemptedAt (past its cooldown) should gate retry.
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
+  fs.writeFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, JSON.stringify({
+    items: { 'proj-1': { promotedAt: null, candidateId: null, lastAttemptedAt: '2020-01-01T00:00:00.000Z', projectSlug: 'proj' } },
+  }));
+  const { nextArchImportTask } = freshTaskSources(dir);
+  const task = nextArchImportTask();
+  assert.ok(task, 'expected the skipped item to be retryable once its cooldown elapsed');
+  assert.equal(task.id, 'arch-import-proj-1');
+});
+
+test('nextArchImportTask does not re-offer a skipped item still inside its retry cooldown', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
+  fs.writeFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, JSON.stringify({
+    items: { 'proj-1': { promotedAt: null, candidateId: null, lastAttemptedAt: new Date().toISOString(), projectSlug: 'proj' } },
+  }));
+  const { nextArchImportTask } = freshTaskSources(dir);
+  assert.equal(nextArchImportTask(), null);
+});
+
 test('nextArchImportTask skips an item already sitting in the queue', () => {
   const dir = makeFixtureRepo();
   fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));

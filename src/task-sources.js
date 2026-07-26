@@ -947,6 +947,8 @@ registerTaskSource('observability_review', {
 // (written before that stamping existed) are deliberately never considered -- same
 // "pre-existing entries are ambiguous, not retroactively fixed" precedent
 // docs/deep-dive-pipeline.md already sets for community-name matching.
+const ARCH_IMPORT_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
 function nextArchImportTask() {
   const { deepDiveAnalysisDir, importCoveragePath, defaultDomain } = getConfig();
 
@@ -986,7 +988,16 @@ function nextArchImportTask() {
         coverage.items[itemId] = { promotedAt: null, candidateId: null, projectSlug };
         coverageChanged = true;
       }
-      if (coverage.items[itemId].promotedAt) continue; // already promoted
+      const itemCoverage = coverage.items[itemId];
+      if (itemCoverage.promotedAt) continue; // a REAL candidate was produced -- genuinely done
+      // A skipped (zero-harness-grounding, or Ornith declined) attempt is retryable, not
+      // terminal -- agent-manager's own codebase keeps growing, so a query with zero hits
+      // today can find a real match later. Confirmed live 2026-07-26: the old unconditional
+      // promotedAt stamp had permanently blocked 134/134 real attempts, none of which ever
+      // produced an actual candidate. ARCH_IMPORT_RETRY_COOLDOWN_MS below just stops the
+      // SAME just-attempted item from being re-picked every single tick forever while
+      // nothing about the codebase has changed yet.
+      if (itemCoverage.lastAttemptedAt && Date.now() - Date.parse(itemCoverage.lastAttemptedAt) < ARCH_IMPORT_RETRY_COOLDOWN_MS) continue;
 
       const ratingMatch = block.match(/^\*\*Rating:\*\*\s*(\S+)/m);
       const rating = ratingMatch ? ratingMatch[1] : '';
