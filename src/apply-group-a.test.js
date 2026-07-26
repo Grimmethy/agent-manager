@@ -232,6 +232,21 @@ test('parseBrainDumpSortResult parses a well-formed classification object', () =
   });
 });
 
+test('parseBrainDumpSortResult parses a classification wrapped in a ```json fence', () => {
+  // Regression for the "job status blocked -- need archive/requeue button" entry
+  // (confirmed live 2026-07-26): a real, valid, 3/3-APPROVE-reviewed classification was
+  // silently dropped because this function used to do a bare JSON.parse with no fence
+  // tolerance, unlike apply-group-b.js's identical case.
+  const fenced = '```json\n' + JSON.stringify({
+    category: 'task', secondBrainPath: 'Agent Manager/app-job-status.md', actionable: true, belongsToProject: 'agent-manager',
+  }) + '\n```';
+  const result = parseBrainDumpSortResult(fenced);
+  assert.ok(result, 'expected a parsed classification, got null');
+  assert.equal(result.category, 'task');
+  assert.equal(result.secondBrainPath, 'Agent Manager/app-job-status.md');
+  assert.equal(result.belongsToProject, 'agent-manager');
+});
+
 test('parseBrainDumpSortResult parses a belongsToProject value when present', () => {
   const result = parseBrainDumpSortResult(JSON.stringify({
     category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: 'agent-manager',

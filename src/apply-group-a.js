@@ -17,6 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseJsonMaybeFenced } = require('./json-fence.js');
 
 function applySecondBrainNote({ implementResponse, notePath, secondBrainDir }) {
   const resolvedPath = path.isAbsolute(notePath) ? notePath : path.join(secondBrainDir, notePath);
@@ -360,7 +361,15 @@ function parseBrainDumpSortResult(implementResponse) {
   if (!text) return null;
   let parsed;
   try {
-    parsed = JSON.parse(text);
+    // Was a bare JSON.parse(text) -- threw on the extremely common case of Ornith wrapping
+    // its output in a ```json fence despite the prompt asking for none, silently swallowed
+    // by the catch below, leaving the entry stuck as 'captured' forever with no automatic
+    // retry. Confirmed live 2026-07-26 on a fully-approved (3/3 APPROVE) classification for
+    // the "job status blocked -- need archive/requeue button" entry: real, valid JSON, just
+    // fenced, parsed successfully by apply-group-b.js's identical case via this same helper
+    // but never applied here because parseBrainDumpSortResult had its own unfenced JSON.parse
+    // instead of reusing it.
+    parsed = parseJsonMaybeFenced(text);
   } catch {
     return null;
   }
