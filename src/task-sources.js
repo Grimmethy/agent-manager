@@ -15,7 +15,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
-const { applyArchDiscoveryCandidates, applyArchImportCandidate } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { scanProject } = require('./observability-scan.js');
 
 function slugifyForId(str) {
@@ -977,6 +977,13 @@ registerTaskSource('arch_discovery', {
 registerTaskSource('observability_review', {
   priority: taskPriority('observability_review', 80),
   next: nextObservabilityReviewTask,
+  // Fix, 2026-07-26: this source used to have no apply function at all, silently
+  // falling through to the generic Group-B-JSON path -- a hard mismatch for a
+  // judgment-verdict task that never produces a real code fix. See
+  // observabilityReviewImplementPrompt's own header comment (prompts.js) for the full
+  // story, confirmed live on a real blocked task whose implement response was a
+  // perfectly sensible "there are no steps to implement" given the old mismatched prompt.
+  apply: applyVerdictOnly,
 });
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
@@ -1109,7 +1116,12 @@ registerTaskSource('arch_import', {
 
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask });
 registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask });
-registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask });
+// apply: applyVerdictOnly -- fix, 2026-07-26, same reasoning as observability_review's own
+// (see unusedExportImplementPrompt's header comment, prompts.js). Never actually confirmed
+// live (dead-code-flags.json has never existed in this pipeline's real history), but the
+// registration gap was identical, so fixed for consistency ahead of the scanner ever
+// actually running.
+registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
 
 function getNextTask() {
   const { taskSourceAllowlist } = getConfig();

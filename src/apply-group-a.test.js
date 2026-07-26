@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -427,4 +427,31 @@ test('applyArchImportCandidate does not clobber an existing real promotion if so
   const coverage = JSON.parse(fs.readFileSync(importCoveragePath, 'utf8'));
   assert.equal(coverage.items['proj-1'].promotedAt, '2026-01-01T00:00:00.000Z');
   assert.equal(coverage.items['proj-1'].candidateId, 'AC-1');
+});
+
+test('applyVerdictOnly always returns {skipped: true} with the verdict prose as reason', () => {
+  const result = applyVerdictOnly({ implementResponse: 'This is a false positive because the catch is intentional.' });
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, 'This is a false positive because the catch is intentional.');
+});
+
+test('applyVerdictOnly truncates an overly long verdict to 500 chars', () => {
+  const long = 'x'.repeat(1000);
+  const result = applyVerdictOnly({ implementResponse: long });
+  assert.equal(result.reason.length, 500);
+});
+
+test('applyVerdictOnly handles an empty/refusal-shaped response without throwing (the exact real bug this fixes)', () => {
+  // Regression for 2026-07-26: this was the "Invalid JSON in Group B implementResponse"
+  // failure mode -- a prose refusal ("there are no numbered steps... nothing remains to
+  // implement") that used to hit a JSON.parse call it was never going to satisfy.
+  const result = applyVerdictOnly({ implementResponse: 'This plan contains only analysis and a verdict — there are no numbered or labeled "steps".' });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no numbered/);
+});
+
+test('applyVerdictOnly returns a placeholder reason for a truly empty implement response', () => {
+  const result = applyVerdictOnly({ implementResponse: '' });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no verdict text/);
 });

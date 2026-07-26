@@ -541,6 +541,23 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   return { file: fullPath, category: result.category };
 }
 
+// Shared apply for judgment-verdict-only task sources (observability_review, unused_export
+// -- fix, 2026-07-26): neither ever produces a real code fix in this task (a genuine issue
+// becomes a separate follow-up task, same as arch_discovery filing a candidate rather than
+// fixing it immediately), so there is nothing to write and no branch to keep. Always
+// {skipped: true}: apply-task.js's git-branch-diff flow treats that as a legitimate
+// no-op-this-time outcome (abandons the branch it pre-created, marks the task done with
+// `reason` as doneMarker) -- the exact same shape arch_discovery/arch_import already use
+// for "nothing groundable/nothing to promote," not a failure path. Plain prose in,
+// truncated for the doneMarker/log -- no JSON parsing, so a malformed or refusal-shaped
+// response can't produce the "Invalid JSON in Group B implementResponse" apply-stage
+// failure this fix exists to close.
+function applyVerdictOnly({ implementResponse }) {
+  const text = (implementResponse || '').trim();
+  const reason = text.length > 0 ? text.slice(0, 500) : '(no verdict text returned)';
+  return { skipped: true, reason };
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
@@ -552,5 +569,6 @@ module.exports = {
   applyArchImportCandidate,
   isEffectivelyEmptyResponse,
   applyBrainDumpSort,
+  applyVerdictOnly,
   parseBrainDumpSortResult,
 };

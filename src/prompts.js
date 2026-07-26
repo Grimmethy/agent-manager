@@ -202,6 +202,46 @@ function observabilityReviewPlanPrompt(task) {
   ].join('\n');
 }
 
+// observability_review's implement pass (fix, 2026-07-26): this source registered ONLY a
+// buildPlanPrompt, no buildImplementPrompt/apply -- so its implement pass silently fell
+// through to genericFallbackImplementPrompt ("write the concrete next step of that plan"),
+// which does not fit a judgment-verdict plan (there IS no "step 1" to implement) at all.
+// Confirmed live 2026-07-26 on a real blocked task: the plan was a correct, well-reasoned
+// FALSE POSITIVE verdict, and Ornith's implement response was a perfectly sensible "there
+// are no numbered steps in this plan... nothing remains to implement" -- Ornith did the
+// right thing given a mismatched prompt; the bug was never an Ornith reliability issue.
+// This task type never produces a real code fix (that would be a separate follow-up task,
+// same as arch_discovery filing a candidate rather than fixing it immediately) -- the
+// implement pass just needs a short prose summary of the plan's verdict, not JSON or a
+// diff, so there's one fewer parsing failure mode than a structured-output requirement
+// would add.
+function observabilityReviewImplementPrompt(task, planText) {
+  return [
+    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding -- there is no further code change to make in this task (a genuine issue becomes a separate follow-up task later, the same way an architecture-discovery finding becomes a candidate rather than an immediate fix).',
+    '',
+    planText,
+    '',
+    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: state whether it was genuine/false-positive/uncertain, and if genuine, what the concrete fix would look like. Plain prose only -- no JSON, no code fence, no "steps".',
+  ].join('\n');
+}
+
+// unused_export's implement pass has the identical gap observability_review's just had
+// fixed (2026-07-26) -- registered only a buildPlanPrompt, so it silently fell through to
+// the same mismatched genericFallbackImplementPrompt. Never actually confirmed live
+// (queue/dead-code-flags.json has never existed in this pipeline's real history, so no
+// real unused_export task has ever been drafted) -- fixed anyway for consistency, since
+// the design gap is identical and would hit the exact same failure the moment the scanner
+// is ever actually run.
+function unusedExportImplementPrompt(task, planText) {
+  return [
+    'Your plan above is the final REASONED VERDICT for this dead-code candidate -- there is no further code change to make in this task (removing genuinely dead code would be a separate follow-up task, not this one).',
+    '',
+    planText,
+    '',
+    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: genuinely-dead/false-positive/uncertain, and why. Plain prose only -- no JSON, no code fence, no "steps".',
+  ].join('\n');
+}
+
 // project_search's plan pass has a different JOB than every other source's plan pass: it
 // doesn't plan a change, it proposes SEARCH QUERIES for the harness to execute against
 // GitHub/Hugging Face between plan and implement (see ornith-worker.ps1's project_search
@@ -520,8 +560,8 @@ updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, b
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
-updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt });
-updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt });
+updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
+updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
