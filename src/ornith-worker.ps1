@@ -537,7 +537,31 @@ while ($true) {
     # the reasoning trace. Everything else's implement pass is prose/code -> leave it
     # unconstrained + thinking on.
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'implement'
-    $abModel = Select-AbModel -TaskId $task.id -Candidates $AbCandidates
+    $abCandidate = Select-AbModel -TaskId $task.id -Candidates $AbCandidates
+
+    # Resolve the selected candidate through model-strategies.js's named registry (chatdev's
+    # ThinkingRegistration pattern, adapted 2026-07-26): a candidate can be a bare Ollama
+    # model tag (today's exact ORNITH_AB_MODELS=ornith:9b,hermes3:8b usage, unchanged) or a
+    # registered strategy NAME carrying its own temperature/numPredict/think overrides.
+    # $abModel stays the resolved MODEL TAG either way (never a strategy name) -- every
+    # downstream use (-ModelOverride, the stats DB's `model` column) expects a real tag.
+    $abModel = $abCandidate
+    $abStrategyTemperature = $null
+    $abStrategyNumPredict = $null
+    $abStrategyThink = $null
+    if ($abCandidate) {
+        try {
+            $strategyJson = node (Join-Path $PackageSrcDir 'model-strategies.js') --resolve $abCandidate 2>$null
+            $strategy = $strategyJson | ConvertFrom-Json
+            if ($strategy -and $strategy.model) {
+                $abModel = $strategy.model
+                if ($null -ne $strategy.temperature) { $abStrategyTemperature = [double]$strategy.temperature }
+                if ($null -ne $strategy.numPredict) { $abStrategyNumPredict = [int]$strategy.numPredict }
+                if ($null -ne $strategy.think) { $abStrategyThink = [bool]$strategy.think }
+            }
+        } catch { }
+    }
+
     $implSw = [System.Diagnostics.Stopwatch]::StartNew()
 
     # arch_import deterministic short-circuit: skip the implement call entirely when the
@@ -565,10 +589,19 @@ while ($true) {
         # trouble_log/arch_review/adhoc's Group B JSON above (think=$true + format:json can
         # return an EMPTY response on this model; think=$false + format:json returns clean
         # parseable JSON).
+        # Per-call defaults fall back to today's fixed values whenever the selected
+        # strategy doesn't override that particular parameter -- an unset/bare-tag
+        # ORNITH_AB_MODELS resolves to no overrides at all (model-strategies.js's own
+        # backward-compatibility guarantee), so this is byte-identical to before the
+        # registry existed unless a strategy explicitly opts into different settings.
+        $implTemperature = if ($null -ne $abStrategyTemperature) { $abStrategyTemperature } else { 0.4 }
+        $implNumPredict = if ($null -ne $abStrategyNumPredict) { $abStrategyNumPredict } else { 1400 }
         if ($task.source -in @('trouble_log', 'arch_review', 'brain_dump_sort') -or $task.domain -eq 'adhoc') {
-            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $false -Temperature 0.4 -NumPredict 1400 -Format 'json' -ModelOverride $abModel
+            $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $false }
+            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -Format 'json' -ModelOverride $abModel
         } else {
-            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $true -Temperature 0.4 -NumPredict 1400 -ModelOverride $abModel
+            $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $true }
+            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -ModelOverride $abModel
         }
     }
     $implSw.Stop()
