@@ -1152,3 +1152,46 @@ prevent in the first place).
 automation loop treats as its own git working tree, even for "just docs and unrelated
 tooling" — the loop doesn't know the difference between your edits and its own, and a
 `git checkout` doesn't care whose changes it would overwrite.
+
+## Update 2026-07-27: a narrow "fix this one line" follow-up derailed into a fabricated, unrelated module — worse than restating the whole task
+
+Delegated a small, fully-specified one-off (a ~20-line Chatterbox TTS voice-cloning test
+script, via raw one-off `curl` calls to Ollama, not yet routed through this pipeline's
+adhoc queue) outside any project this pipeline was pointed at. Three-round pattern, all at
+default sampling:
+
+1. **First attempt:** invented a nonexistent callable API (`Chatterbox(text).audio`) instead
+   of the real `ChatterboxTTS.from_pretrained(...).generate(...)` shape — ordinary
+   confident-fabrication, matches this doc's existing "bad at" list.
+2. **Second attempt, given the real API read straight from the installed package's source:**
+   95% correct — one bug, a single malformed line (`torchaudio.save("cloned.wav", int(wav2),
+   float(model.sr))`, wrapping a tensor in `int()` and a sample rate in `float()`).
+3. **Third attempt — a narrow correction turn, NOT a full task restatement** ("here's the
+   bug in your last script: `int(wav2)`/`float(model.sr)` is wrong, fix it, everything else
+   the same"): instead of returning the same script with that one line fixed, it discarded
+   the entire correct script and produced ~35 lines of **fabricated, wholly unrelated code**
+   — an imported `from trainer import ChatterBoxTrainer` (does not exist), a class
+   redefining itself as its own base class, undefined names (`DEFAULT_NUM_SAMPLES`, `device`,
+   `Trainer`), a training-pipeline `DataLoader`/`tqdm` shape that has nothing to do with the
+   original ask. This is qualitatively worse than a wrong-but-related fix — it's a complete
+   loss of task context triggered specifically by a diff-shaped prompt.
+
+**Fix applied in the moment:** abandoned the retry, hand-patched the one line in attempt 2's
+otherwise-correct output directly, per this doc's own "don't apply Ornith output directly,
+but also don't burn more rounds once a retry has visibly derailed" judgment call.
+
+**New rule for the Implement pass's redraft/correction step, distinct from the existing
+"targeted correction... has succeeded every time it's been tried" finding above:** that
+earlier finding's successes were all corrections **with the full original context restated
+alongside the fix** (a complete corrected plan handed back, not just a diff instruction).
+A bare "here's the bug, fix just that" prompt — with the rest of the task left implicit,
+assumed still in scope from a prior turn — is a different, riskier shape and produced the
+worst fabrication in this specific delegation. **When sending a task back for correction,
+always re-include the full original spec/prior-good-output verbatim in the same prompt,
+never just the delta** — this matches `agent-manager`'s own `queue-watchdog.ps1` reject-retry
+design (a fresh `pending/` requeue re-runs the *whole* Plan→Implement→Critique chain from
+the task's full original spec, not a patch instruction against the rejected draft) rather
+than the ad hoc raw-curl pattern used here, which is the more likely reason this pipeline's
+existing retry path hasn't hit this exact failure yet. Reinforces the CLAUDE.md-level
+decision (2026-07-27) to route delegations through this pipeline's adhoc queue instead of
+raw one-off calls going forward.

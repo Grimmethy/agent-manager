@@ -342,6 +342,31 @@ while ($true) {
 
     $task = Read-TaskJson $draftingPath
 
+    # Repo-scoping guard (added 2026-07-27, see task-sources.js's writeTask() comment for
+    # the incident): several sources resolve config paths that collapse to the SAME
+    # absolute location regardless of which sibling repo AGENT_MANAGER_REPO_ROOT currently
+    # points at, so a task generated under one repo can otherwise be claimed and drafted
+    # against a totally different one if the pipeline gets repointed in between. Checked
+    # here, immediately after claim and before the Plan pass spends any real Ornith
+    # compute -- not silently skipped, blocked with a clear reason, same as every other
+    # early-exit in this loop. A task with no generatedForRepoRoot at all predates this
+    # fix and is let through unchanged (fail-open only for that legacy case, so shipping
+    # this doesn't instantly block the existing real backlog) -- but a task that HAS the
+    # field and doesn't match is a real, actionable mismatch, not an ambiguous one.
+    if ($task.PSObject.Properties['generatedForRepoRoot'] -and
+        $task.generatedForRepoRoot -and
+        $task.generatedForRepoRoot -ne $env:AGENT_MANAGER_REPO_ROOT) {
+        $reason = 'Task was generated for repo "{0}" but this worker is currently pointed at "{1}" -- refusing to draft against the wrong repo.' -f $task.generatedForRepoRoot, $env:AGENT_MANAGER_REPO_ROOT
+        Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'repo-scope-mismatch'
+        $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+        Write-TaskJson $blockedPath $task
+        Remove-Item $draftingPath -Force
+        Write-Host ('Blocked (repo-scope mismatch): {0}' -f $task.id) -ForegroundColor Yellow
+        Invoke-TaskDb 'blocked' $blockedPath (@{ reason = $reason } | ConvertTo-Json -Compress)
+        Write-Heartbeat -Status 'idle'
+        continue
+    }
+
     Write-Host ('Drafting: {0}' -f $task.title) -ForegroundColor Green
     Invoke-TaskDb 'claimed' $draftingPath (@{ instanceId = $InstanceId; model = $Model } | ConvertTo-Json -Compress)
 

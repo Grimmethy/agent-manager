@@ -1143,13 +1143,25 @@ function getNextTask() {
   return null;
 }
 
+// generatedForRepoRoot stamps which repo's config was live when this task was generated.
+// Several sources (project_search, deep_dive, arch_import, and anything reading a path
+// derived from path.dirname(repoRoot) rather than repoRoot itself) resolve to the SAME
+// absolute path regardless of which sibling repo under the same parent directory
+// AGENT_MANAGER_REPO_ROOT currently points at -- switching a running pipeline to a new
+// project does not isolate it from that shared backlog, and a task generated under one
+// repoRoot can otherwise be claimed and applied against a totally different one if the
+// pipeline gets repointed in between (reproduced live 2026-07-27: repointing at a fresh
+// throwaway repo caused ~48 unrelated cross-project import candidates to be drafted and
+// auto-approved against it). ornith-worker.ps1 checks this at claim time, before any
+// Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
-  const { pipelineDir } = getConfig();
+  const { pipelineDir, repoRoot } = getConfig();
   const dir = path.join(pipelineDir, 'queue', 'pending');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${task.id}.json`);
   const record = {
     ...task,
+    generatedForRepoRoot: repoRoot,
     status: 'pending',
     createdAt: new Date().toISOString(),
     history: [{ status: 'pending', at: new Date().toISOString() }],
