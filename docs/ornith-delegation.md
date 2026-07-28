@@ -1195,3 +1195,63 @@ than the ad hoc raw-curl pattern used here, which is the more likely reason this
 existing retry path hasn't hit this exact failure yet. Reinforces the CLAUDE.md-level
 decision (2026-07-27) to route delegations through this pipeline's adhoc queue instead of
 raw one-off calls going forward.
+
+## Update 2026-07-28: "create new file" treated as "edit existing file," and a self-disclosed 90%-incomplete draft still got 3/3 APPROVE
+
+First real task routed through this pipeline's adhoc queue (per the 2026-07-27 decision
+above) against a live consumer project (Beyond All Reason Player AI, a Spring/Recoil Lua
+widget) — a two-file task: create one new panel module from scratch, then wire it into ~10
+specific numbered locations across an existing 800+ line file. Full context (exact current
+code for every touched function, an explicit `explicitlyOutOfScope` list, and acceptance
+criteria) was handed over directly in the adhoc task's `promptContext`, not left for Ornith
+to explore.
+
+**New failure shape: Implement pass emitted `mode:"edit"` find/replace diffs against a file
+the task explicitly said to CREATE.** The prompt was unambiguous (`"action": "CREATE new
+file"`), but the Implement response was two `find`/`replace` blocks quoting specific existing
+lines of `mex_builder_panel.lua` as if the file already had content to diff against. There is
+no base file for those edits to apply to — the draft is not just wrong, it's structurally
+inapplicable. This is a new variant of the doc's existing fabrication pattern (Update
+2026-07-05, "confident fabrication") but specifically triggered by a CREATE-shaped task —
+worth testing whether phrasing the instruction as "write the full file contents" rather than
+"create new file" (still true, but avoids any wording overlap with edit-pass vocabulary) heads
+this off; not yet tried.
+
+**Second, more concerning failure: the draft explicitly admitted to skipping the majority of
+the task, and still passed review 3/3.** ~90% of the required work (9 of 10 numbered changes)
+was in `bar_economy_ai.lua`; the Implement response left that file completely untouched and
+appended its own note: *"Flag 2 (wiring into bar_economy_ai.lua) cannot be addressed here —
+that file is out of scope for this edit set."* This is not a case of Ornith failing to notice
+an omission — it noticed and said so, then the critique pass correctly flagged the same
+omission a second time ("The draft never wires MexBuilderPanel into bar_economy_ai.lua...
+None of these behaviors can be implemented without modifying bar_economy_ai.lua"), and the
+subsequent revision **still did not fix it** — the revision's only visible change was
+combining two redundant edits inside the untouched new file, plus a note re-explaining why
+the main file was skipped. All 3 review votes independently returned bare `APPROVE` with no
+comment engaging with either the structural-diff problem or the self-disclosed incompleteness
+the critique pass itself had already surfaced in the same task's history.
+
+**Why this matters more than a normal wrong-answer case:** the critique step worked exactly
+as designed (caught both real problems, in writing, unprompted) — but nothing downstream
+acted on it. The revision pass had the critique's own text available and chose not to
+address it; the review pass had the same critique text available (or should have) and voted
+APPROVE anyway. **A correct critique that the pipeline doesn't enforce is equivalent to no
+critique at all.** Caught here only because apply then separately failed for an unrelated
+reason (no git remote configured on this consumer repo) — if that infrastructure failure
+hadn't existed, a non-functional, half-wired panel file would have been committed to a real
+game widget with a clean 3/3 approval on record.
+
+**Open question, not yet resolved:** should the review pass be given the critique response
+and revision diff explicitly and asked "does this revision actually address every point in
+the critique?" as a distinct, mechanical yes/no check before the normal quality vote — rather
+than reviewing the final draft in isolation, blind to whether its own pipeline's earlier
+critique step was ever satisfied? The `Confident majority APPROVE (votes: 3/3 real)` tally in
+this case was procedurally valid (3 real, non-degenerate votes, correctly counted per the
+2026-07-05 absolute-count fix) — the bug is that the vote question itself never asked about
+critique compliance, not that the counting broke.
+
+**Practical mitigation used this time:** did not apply, archived the pipeline's copy, and
+implemented the two-file change directly instead — consistent with this doc's standing
+"never apply Ornith output directly" rule, just reached at the review-vote stage instead of
+by manual read-through, since the vote tally alone (3/3 APPROVE) would have looked clean
+without opening `implementResponse`.
