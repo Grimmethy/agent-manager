@@ -516,20 +516,37 @@ const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 24000;
 // applyProjectSearchFindings), so a table row with a matching heading is Strong; one
 // without is Weak. There is no per-row Strength column in the rendered table itself, so
 // this cross-reference is the only way to recover which leads are Strong after the fact.
+//
+// Also extracts the "Relevant to" column (the 3rd cell after the name/url one; table shape
+// is | Project | Source | Description | Relevant to | Status |) -- nextProjectSearchTask()
+// writes this as "<projectTag> -- <reason>" (Ornith fills in the reason, projectTag is
+// exactly path.basename(repoRoot), same convention used everywhere else in this file), so
+// the leading token before " -- " recovers which consumer project a lead was discovered
+// FOR. Added 2026-07-27 after this field existed in the data but was silently discarded
+// here, which is the root cause behind deep_dive/arch_import treating every lead as fair
+// game for whichever project's pipeline happened to be running (see task-sources.js's
+// writeTask() comment for the incident this traces back to).
 function parseStrongLeadsFromIndex(indexText) {
   if (!indexText) return [];
   const notesIdx = indexText.indexOf('## Notes');
   const notesText = notesIdx === -1 ? '' : indexText.slice(notesIdx);
   const strongNames = new Set([...notesText.matchAll(/^### (.+)$/gm)].map((m) => m[1].trim()));
 
-  const rows = [...indexText.matchAll(/\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|/g)];
   const seen = new Set();
   const leads = [];
-  for (const [, rawName, rawUrl] of rows) {
+  for (const line of indexText.split('\n')) {
+    const cellMatch = line.match(/^\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|(.*)$/);
+    if (!cellMatch) continue;
+    const [, rawName, rawUrl, restCells] = cellMatch;
     const name = rawName.trim();
     if (!strongNames.has(name) || seen.has(name)) continue;
     seen.add(name);
-    leads.push({ name, url: rawUrl.trim() });
+    // restCells is "Source | Description | Relevant to | Status |" -- Source, Description,
+    // Relevant to, Status, trailing empty string from the closing pipe, in that order.
+    const cells = restCells.split('|').map((c) => c.trim());
+    const relevantToCell = cells[2] || '';
+    const relevantTo = relevantToCell.split(/\s*--\s*/)[0].trim() || null;
+    leads.push({ name, url: rawUrl.trim(), relevantTo });
   }
   return leads;
 }
@@ -565,7 +582,10 @@ function onboardDeepDiveProject(lead, clonesDir) {
 }
 
 function nextDeepDiveTask() {
-  const { projectSearchIndexPath, deepDiveCoveragePath, deepDiveClonesDir } = getConfig();
+  const { repoRoot, projectSearchIndexPath, deepDiveCoveragePath, deepDiveClonesDir } = getConfig();
+  // Same convention nextProjectSearchTask() already uses to write the "Relevant to" column
+  // in the first place -- matching it here is what makes the filter below meaningful.
+  const projectTag = path.basename(repoRoot);
 
   let coverage;
   try {
@@ -575,7 +595,12 @@ function nextDeepDiveTask() {
   }
   if (!coverage.projects) coverage.projects = {};
 
-  const strongLeads = parseStrongLeadsFromIndex(readIfExists(projectSearchIndexPath));
+  // Scoping fix (2026-07-27, see writeTask()'s comment for the incident): only onboard a
+  // lead that was actually discovered FOR this project. Without this, deep_dive treated
+  // every Strong lead in the shared ledger as fair game for whichever project's pipeline
+  // happened to be running.
+  const strongLeads = parseStrongLeadsFromIndex(readIfExists(projectSearchIndexPath))
+    .filter((lead) => lead.relevantTo === projectTag);
   let coverageChanged = false;
   for (const lead of strongLeads) {
     const slug = slugifyForId(lead.name);
@@ -587,6 +612,10 @@ function nextDeepDiveTask() {
         clonePath: onboarded.clonePath,
         clonedAt: new Date().toISOString(),
         communities: onboarded.communities,
+        // Stamped at onboarding time so arch_import's own filter (nextArchImportTask) can
+        // trace a promoted item back to which consumer project it was ever relevant to,
+        // without needing to re-parse INDEX.md itself.
+        relevantToProject: projectTag,
       };
       coverageChanged = true;
     } catch (e) {
@@ -608,8 +637,18 @@ function nextDeepDiveTask() {
   // win the tiebreak first, ahead of the normal oldest-first rule -- every remaining
   // community in a hotlisted project drafts before any community in a non-hotlisted one,
   // regardless of how long that other project has been waiting in rotation.
+  //
+  // Only this project's own onboarded entries are eligible (relevantToProject match) --
+  // an entry with NO relevantToProject at all predates this fix (2026-07-27) and is
+  // deliberately excluded rather than guessed at: it sat in the shared coverage file before
+  // any project association was tracked, so there's no reliable way to know which project
+  // it was really for. Known consequence, not chased further here: the real backlog of
+  // already-onboarded external projects from before this fix will sit idle until manually
+  // re-tagged (or re-discovered fresh by project_search under the new scoping) rather than
+  // being silently guessed into whichever project happens to run next.
   const candidates = [];
   for (const [slug, proj] of Object.entries(coverage.projects)) {
+    if (proj.relevantToProject !== projectTag) continue;
     for (const community of proj.communities || []) {
       candidates.push({ slug, proj, community, hotlist: !!proj.hotlist });
     }
@@ -1003,7 +1042,9 @@ registerTaskSource('observability_review', {
 const ARCH_IMPORT_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 function nextArchImportTask() {
-  const { deepDiveAnalysisDir, importCoveragePath, defaultDomain } = getConfig();
+  const { repoRoot, deepDiveAnalysisDir, deepDiveCoveragePath, importCoveragePath, defaultDomain } = getConfig();
+  // Same convention nextDeepDiveTask()/nextProjectSearchTask() already use.
+  const projectTag = path.basename(repoRoot);
 
   let entries;
   try {
@@ -1011,6 +1052,26 @@ function nextArchImportTask() {
   } catch {
     return null; // no analysis dir yet -- nothing to promote
   }
+
+  // Scoping fix (2026-07-27, see writeTask()'s comment for the incident): an analysis doc
+  // (one per onboarded external project, e.g. "autogen-microsoft.md") only contributes
+  // candidates when deep-dive-coverage.json says that external project was onboarded FOR
+  // this consumer project. Without this, arch_import offered ANY Use/Adapt-rated item from
+  // ANY analysis doc as a candidate against whichever repoRoot happened to be active --
+  // this is what generated ~48 unrelated import candidates against a throwaway test repo.
+  // A doc with no recorded relevantToProject at all predates this fix and is excluded, same
+  // fail-closed reasoning as nextDeepDiveTask()'s candidate filter.
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const relevantSlugs = new Set(
+    Object.entries(deepDiveCoverage.projects || {})
+      .filter(([, proj]) => proj.relevantToProject === projectTag)
+      .map(([slug]) => slug),
+  );
 
   let coverage;
   try {
@@ -1025,6 +1086,7 @@ function nextArchImportTask() {
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
     const projectSlug = entry.name.replace(/\.md$/, '');
+    if (!relevantSlugs.has(projectSlug)) continue;
     const text = readIfExists(path.join(deepDiveAnalysisDir, entry.name));
     if (!text) continue;
 
@@ -1174,7 +1236,8 @@ module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
-  nextArchImportTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
+  nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
+  parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
 };
 

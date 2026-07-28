@@ -39,9 +39,31 @@ function makeFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   fs.mkdirSync(path.join(dir, 'analysis'), { recursive: true });
   process.env.AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR = path.join(dir, 'analysis');
+  process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
   process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH = path.join(dir, 'import-coverage.json');
   process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH = path.join(dir, 'ARCH_IMPORT_CANDIDATES.md');
   return dir;
+}
+
+// nextArchImportTask() (2026-07-27 scoping fix) only offers candidates from an analysis
+// doc whose deep-dive-coverage.json entry records relevantToProject matching the CURRENT
+// AGENT_MANAGER_REPO_ROOT's project tag (path.basename(repoRoot)) -- every fixture below
+// must mark its own analysis-doc slug(s) relevant this way, mirroring what
+// nextDeepDiveTask() stamps for real at onboarding time.
+function markRelevantToCurrentProject(dir, ...slugs) {
+  const coveragePath = path.join(dir, 'deep-dive-coverage.json');
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+  const projectTag = path.basename(dir);
+  for (const slug of slugs) {
+    coverage.projects[slug] = { ...(coverage.projects[slug] || {}), relevantToProject: projectTag };
+  }
+  fs.writeFileSync(coveragePath, JSON.stringify(coverage, null, 2));
 }
 
 test('nextArchImportTask returns null when the analysis dir does not exist', () => {
@@ -55,6 +77,7 @@ test('nextArchImportTask returns null when the analysis dir does not exist', () 
 test('nextArchImportTask ignores items with no **ID:** at all (pre-existing, never considered)', () => {
   const dir = makeFixtureRepo();
   fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: null, rating: 'Use' }));
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   assert.equal(nextArchImportTask(), null);
 });
@@ -62,6 +85,7 @@ test('nextArchImportTask ignores items with no **ID:** at all (pre-existing, nev
 test('nextArchImportTask ignores Ignore-rated items -- nothing to promote from an honest negative', () => {
   const dir = makeFixtureRepo();
   fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Ignore' }));
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   assert.equal(nextArchImportTask(), null);
 });
@@ -72,6 +96,7 @@ test('nextArchImportTask picks up a real Use-rated item and builds correct promp
     path.join(dir, 'analysis', 'crewai.md'),
     '# crewai — Deep Dive\n\n' + analysisItem({ id: 'crewai-14', title: 'Per-project settings store', rating: 'Use', files: 'settings.py', rationale: 'A validated settings pattern worth taking.' })
   );
+  markRelevantToCurrentProject(dir, 'crewai');
   const { nextArchImportTask } = freshTaskSources(dir);
   const task = nextArchImportTask();
   assert.ok(task, 'expected a task, got null');
@@ -91,6 +116,7 @@ test('nextArchImportTask registers newly-seen items in import-coverage.json even
     path.join(dir, 'analysis', 'proj.md'),
     '# proj — Deep Dive\n\n' + [analysisItem({ id: 'proj-1', rating: 'Ignore' }), analysisItem({ id: 'proj-2', rating: 'Use' })].join('\n\n')
   );
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   nextArchImportTask();
   const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, 'utf8'));
@@ -103,6 +129,7 @@ test('nextArchImportTask never re-offers an already-promoted item', () => {
   const dir = makeFixtureRepo();
   fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
   fs.writeFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, JSON.stringify({ items: { 'proj-1': { promotedAt: '2026-01-01T00:00:00.000Z', candidateId: 'AC-1', projectSlug: 'proj' } } }));
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   assert.equal(nextArchImportTask(), null);
 });
@@ -117,6 +144,7 @@ test('nextArchImportTask retries a previously-skipped (zero-harness-grounding) i
   fs.writeFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, JSON.stringify({
     items: { 'proj-1': { promotedAt: null, candidateId: null, lastAttemptedAt: '2020-01-01T00:00:00.000Z', projectSlug: 'proj' } },
   }));
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   const task = nextArchImportTask();
   assert.ok(task, 'expected the skipped item to be retryable once its cooldown elapsed');
@@ -129,6 +157,7 @@ test('nextArchImportTask does not re-offer a skipped item still inside its retry
   fs.writeFileSync(process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH, JSON.stringify({
     items: { 'proj-1': { promotedAt: null, candidateId: null, lastAttemptedAt: new Date().toISOString(), projectSlug: 'proj' } },
   }));
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   assert.equal(nextArchImportTask(), null);
 });
@@ -138,8 +167,27 @@ test('nextArchImportTask skips an item already sitting in the queue', () => {
   fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
   fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'queue', 'pending', 'arch-import-proj-1.json'), '{}');
+  markRelevantToCurrentProject(dir, 'proj');
   const { nextArchImportTask } = freshTaskSources(dir);
   assert.equal(nextArchImportTask(), null);
+});
+
+test('nextArchImportTask excludes an analysis doc whose deep-dive-coverage entry belongs to a DIFFERENT project (2026-07-27 scoping fix)', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
+  fs.writeFileSync(path.join(dir, 'deep-dive-coverage.json'), JSON.stringify({
+    projects: { proj: { relevantToProject: 'some-totally-different-project' } },
+  }));
+  const { nextArchImportTask } = freshTaskSources(dir);
+  assert.equal(nextArchImportTask(), null, 'a candidate tagged for a different project must never be offered here');
+});
+
+test('nextArchImportTask excludes an analysis doc with NO deep-dive-coverage entry at all (legacy, predates the scoping fix)', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'analysis', 'proj.md'), '# proj — Deep Dive\n\n' + analysisItem({ id: 'proj-1', rating: 'Use' }));
+  // Deliberately no deep-dive-coverage.json at all -- simulates real pre-fix backlog data.
+  const { nextArchImportTask } = freshTaskSources(dir);
+  assert.equal(nextArchImportTask(), null, 'an untagged legacy doc must fail closed, not be silently offered');
 });
 
 test('full round-trip: nextArchImportTask -> applyArchImportCandidate -> arch_import_review sees it', () => {
@@ -148,6 +196,7 @@ test('full round-trip: nextArchImportTask -> applyArchImportCandidate -> arch_im
     path.join(dir, 'analysis', 'crewai.md'),
     '# crewai — Deep Dive\n\n' + analysisItem({ id: 'crewai-14', title: 'Per-project settings store', rating: 'Use', files: 'settings.py' })
   );
+  markRelevantToCurrentProject(dir, 'crewai');
   const { nextArchImportTask } = freshTaskSources(dir);
   const { applyArchImportCandidate } = require('./apply-group-a.js');
   const { getRegisteredSource } = require('./task-source-registry.js');
@@ -518,4 +567,110 @@ test('pendingReadinessMap returns {} when pending/ does not exist', () => {
   process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
   const { pendingReadinessMap } = freshTaskSources(dir);
   assert.deepEqual(pendingReadinessMap(), {});
+});
+
+// --- parseStrongLeadsFromIndex / nextDeepDiveTask project scoping (2026-07-27) ----------
+// See task-sources.js's writeTask() comment for the incident this traces back to: INDEX.md
+// already recorded which project a lead was discovered for (the "Relevant to" column,
+// written by nextProjectSearchTask()'s own projectTag convention), but deep_dive/arch_import
+// silently discarded it and treated every Strong lead as fair game for whichever project's
+// pipeline happened to be running.
+
+function fixtureIndexMd(rows) {
+  const tableRows = rows.map((r) => `| [${r.name}](${r.url}) | github | Some description. | ${r.relevantTo} -- some reason. | lead |`).join('\n');
+  const notesRows = rows.map((r) => `### ${r.name}\n\nSome notes.`).join('\n\n');
+  return [
+    '# Index',
+    '',
+    '| Project | Source | Description | Relevant to | Status |',
+    '|---|---|---|---|---|',
+    tableRows,
+    '',
+    '## Notes',
+    '',
+    notesRows,
+    '',
+  ].join('\n');
+}
+
+test('parseStrongLeadsFromIndex extracts the relevantTo project name from the "Relevant to" column', () => {
+  const dir = makeDagFixtureRepo();
+  const { parseStrongLeadsFromIndex } = freshTaskSources(dir);
+  const text = fixtureIndexMd([
+    { name: 'lead-one', url: 'https://github.com/x/lead-one', relevantTo: 'TaxHarvest' },
+    { name: 'lead-two', url: 'https://github.com/x/lead-two', relevantTo: 'agent-manager' },
+  ]);
+  const leads = parseStrongLeadsFromIndex(text);
+  assert.equal(leads.length, 2);
+  assert.equal(leads.find((l) => l.name === 'lead-one').relevantTo, 'TaxHarvest');
+  assert.equal(leads.find((l) => l.name === 'lead-two').relevantTo, 'agent-manager');
+});
+
+test('parseStrongLeadsFromIndex only returns Strong (Notes-section) leads, same as before this fix', () => {
+  const dir = makeDagFixtureRepo();
+  const { parseStrongLeadsFromIndex } = freshTaskSources(dir);
+  // Weak lead: in the table but with no matching '### name' Notes subsection.
+  const text = fixtureIndexMd([{ name: 'strong-lead', url: 'https://github.com/x/s', relevantTo: 'TaxHarvest' }])
+    .replace('## Notes\n\n### strong-lead', '## Notes\n\n### strong-lead')
+    + '\n| [weak-lead](https://github.com/x/w) | github | desc | TaxHarvest -- reason. | lead |\n';
+  const leads = parseStrongLeadsFromIndex(text);
+  assert.deepEqual(leads.map((l) => l.name), ['strong-lead']);
+});
+
+function makeDeepDiveFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH = path.join(dir, 'INDEX.md');
+  process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
+  return dir;
+}
+
+test('nextDeepDiveTask never attempts to onboard a lead relevant to a DIFFERENT project (no clone side effect)', () => {
+  const dir = makeDeepDiveFixtureRepo();
+  const otherProjectTag = path.basename(dir) + '-a-totally-different-project';
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([
+    { name: 'unrelated-lead', url: 'https://github.com/x/unrelated', relevantTo: otherProjectTag },
+  ]));
+  const { nextDeepDiveTask } = freshTaskSources(dir);
+  assert.equal(nextDeepDiveTask(), null);
+  // The real proof this is the scoping filter working, not just "no leads at all": the
+  // coverage file was never even written, meaning onboardDeepDiveProject() (which shells
+  // out to a real `git clone`) was never attempted for the excluded lead -- writeFileSync
+  // for deep-dive-coverage.json only fires when something actually changed.
+  assert.equal(fs.existsSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH), false);
+});
+
+test('nextDeepDiveTask excludes an already-onboarded project whose relevantToProject does not match the current project', () => {
+  const dir = makeDeepDiveFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([]));
+  // Pre-seed an already-onboarded project (as if a prior run under a DIFFERENT repoRoot did
+  // the real cloning/graph-build) tagged for some other project entirely.
+  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify({
+    projects: {
+      'someproject': {
+        sourceUrl: 'https://github.com/x/someproject',
+        clonePath: path.join(dir, 'clones', 'someproject'),
+        communities: [{ id: 0, name: 'root', lastReviewedAt: null, actionItemCount: null }],
+        relevantToProject: 'some-other-project-entirely',
+      },
+    },
+  }));
+  const { nextDeepDiveTask } = freshTaskSources(dir);
+  assert.equal(nextDeepDiveTask(), null, 'a community from a project onboarded for a different consumer must never be offered here');
+});
+
+test('nextDeepDiveTask excludes an already-onboarded project with NO relevantToProject at all (legacy, predates the scoping fix)', () => {
+  const dir = makeDeepDiveFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([]));
+  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify({
+    projects: {
+      'someproject': {
+        sourceUrl: 'https://github.com/x/someproject',
+        clonePath: path.join(dir, 'clones', 'someproject'),
+        communities: [{ id: 0, name: 'root', lastReviewedAt: null, actionItemCount: null }],
+        // no relevantToProject field at all
+      },
+    },
+  }));
+  const { nextDeepDiveTask } = freshTaskSources(dir);
+  assert.equal(nextDeepDiveTask(), null, 'an untagged legacy project must fail closed, not be silently offered');
 });
