@@ -30,7 +30,7 @@ function readIfExists(filePath) {
   }
 }
 
-const QUEUE_STATES = ['pending', 'drafting', 'review', 'blocked', 'done'];
+const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done'];
 
 // A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
 // directly (a per-instance claim subfolder) -- every task source shares this function, so a

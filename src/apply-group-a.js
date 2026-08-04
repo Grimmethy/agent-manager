@@ -240,7 +240,7 @@ function isEffectivelyEmptyResponse(text) {
 function parseArchDiscoveryCandidates(implementResponse) {
   const text = (implementResponse || '').trim();
   if (isEffectivelyEmptyResponse(text)) return [];
-  const blocks = text.split(/(?=^### AC-\d+)/m).map((b) => b.trim()).filter(Boolean);
+  const blocks = text.split(/(?=^#{1,6}\s*AC-\d+)/m).map((b) => b.trim()).filter(Boolean);
   return blocks
     .map((block) => {
       const headingLine = block.split('\n')[0];

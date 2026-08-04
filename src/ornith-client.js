@@ -141,9 +141,25 @@ if (require.main === module) {
     try {
       if (req.mode === 'majority-vote') {
         const markers = req.classifyMarkers || [];
+        const minReasoningChars = req.minReasoningChars || 0;
         const classify = (text) => {
           const lower = text.toLowerCase();
-          return markers.find((m) => lower.includes(m.toLowerCase())) || null;
+          const marker = markers.find((m) => lower.includes(m.toLowerCase()));
+          if (!marker) return null;
+          if (minReasoningChars > 0) {
+            // Strip the marker itself (plus a following colon) and require real reasoning
+            // text beyond it -- a bare "APPROVE" with the marker removed leaves nothing,
+            // and should not count as a real vote. Added 2026-08-03: repeated live cases
+            // where 3/3 bare "APPROVE" (zero reasoning) outvoted one correctly-reasoned
+            // REJECT that specifically identified real bugs in the draft -- the model was
+            // never asked to justify an APPROVE the way it was asked to justify a REJECT,
+            // so it never did. Votes failing this check are excluded from the tally
+            // entirely (same treatment as a degenerate vote), not counted as a weaker
+            // APPROVE -- an unreasoned vote carries no signal either way.
+            const stripped = text.replace(new RegExp(marker + '\\s*:?', 'i'), '').trim();
+            if (stripped.length < minReasoningChars) return null;
+          }
+          return marker;
         };
         const result = await majorityVote({ ...req, classify });
         process.stdout.write(JSON.stringify(result));
