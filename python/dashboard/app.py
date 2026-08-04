@@ -408,7 +408,9 @@ def write_project_links(links: dict):
 
 
 def brain_dump_path() -> Path | None:
-    override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH")
+    override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH") or read_env_file(ENV_FILE_PATH).get(
+        "AGENT_MANAGER_BRAIN_DUMP_PATH"
+    )
     if override:
         return Path(override)
     d = get_pipeline_dir()

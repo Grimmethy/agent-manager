@@ -405,20 +405,43 @@ while ($true) {
     # --- Plan pass ---
     Write-Heartbeat -Status 'working' -TaskId $task.id -Pass 'plan'
     $planSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $planPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'plan'
-    # arch_discovery's plan pass was wired to try a real, narrow, read-only codebase-search
-    # tool (grep_codebase via ornith-tool-client.js's /api/chat tool-calling loop) instead
-    # of the plain single-shot /api/generate call every other source uses. DISABLED
-    # 2026-07-15: confirmed live that Ollama's /api/chat + tools hangs indefinitely on this
-    # model/hardware (a standalone test with a trivial prompt never returned in 30 minutes),
-    # and a real arch_discovery task through Invoke-OrnithToolClient stalled the whole
-    # worker for 13+ minutes with no progress even AFTER the Node-side kill-switch file was
-    # already in place -- the degrade-to-plain-call path did not actually unstick it. Rather
-    # than keep debugging a known-broken feature live against the production queue, this
-    # reverts arch_discovery to the same plain call every other source already uses, byte-
-    # for-byte. Do not re-enable Invoke-OrnithToolClient here until the underlying hang is
-    # root-caused and fixed in isolation, off the live queue.
-    $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
+
+    # Skip-plan-on-retry, added 2026-08-04: when the LAST attempt's rejection came from a
+    # deterministic gate (review-runner.ps1's non-implementation check or fixedLiterals
+    # compliance check -- reviewProvider starts with 'deterministic-'), the plan itself was
+    # never in question, only implement failed to follow it or copy given data verbatim.
+    # Reusing the already-produced plan and going straight to a fresh implement (now also
+    # informed by priorRejectionFeedback, see prompts.js) saves one full ~7-8min Ornith call
+    # per retry. Deliberately does NOT apply when the last rejection came from genuine
+    # Ornith review (reviewProvider='ornith') -- confirmed live this session that a real bug
+    # (a wrong Prisma property name) originated in the PLAN text itself, not implement, so a
+    # plan-quality judgment call from Ornith review must still get a fresh plan attempt, not
+    # risk silently repeating a flawed one forever.
+    $skipPlan = $task.ornithRejectCount -gt 0 -and
+        $task.PSObject.Properties['reviewProvider'] -and
+        $task.reviewProvider -like 'deterministic-*' -and
+        $task.PSObject.Properties['planResponse'] -and
+        -not [string]::IsNullOrWhiteSpace($task.planResponse)
+
+    if ($skipPlan) {
+        Write-Host ('Plan pass skipped (prior rejection was a deterministic gate, not a plan problem): {0}' -f $task.id) -ForegroundColor DarkCyan
+        $planResult = [PSCustomObject]@{ response = $task.planResponse; thinking = ''; degenerate = $null; toolCallLog = $null }
+    } else {
+        $planPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'plan'
+        # arch_discovery's plan pass was wired to try a real, narrow, read-only codebase-search
+        # tool (grep_codebase via ornith-tool-client.js's /api/chat tool-calling loop) instead
+        # of the plain single-shot /api/generate call every other source uses. DISABLED
+        # 2026-07-15: confirmed live that Ollama's /api/chat + tools hangs indefinitely on this
+        # model/hardware (a standalone test with a trivial prompt never returned in 30 minutes),
+        # and a real arch_discovery task through Invoke-OrnithToolClient stalled the whole
+        # worker for 13+ minutes with no progress even AFTER the Node-side kill-switch file was
+        # already in place -- the degrade-to-plain-call path did not actually unstick it. Rather
+        # than keep debugging a known-broken feature live against the production queue, this
+        # reverts arch_discovery to the same plain call every other source already uses, byte-
+        # for-byte. Do not re-enable Invoke-OrnithToolClient here until the underlying hang is
+        # root-caused and fixed in isolation, off the live queue.
+        $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
+    }
     $planSw.Stop()
     # Invoke-OrnithToolClient's result shape is { response, toolCallLog, turnsUsed,
     # toolsDisabled } -- no .thinking or .degenerate fields, unlike Invoke-OrnithClient's
@@ -442,7 +465,7 @@ while ($true) {
     # returning here). See docs/ornith-delegation.md's own hard-won conclusion: "thinking
     # off -- don't just raise num_predict and hope it finishes." Retrying once WITHOUT
     # thinking frees the whole budget for the answer instead, before giving up and blocking.
-    if ($planDegenerate -eq 'empty') {
+    if ($planDegenerate -eq 'empty' -and -not $skipPlan) {
         Write-Host ('Plan empty with thinking on, retrying without thinking: {0}' -f $task.id) -ForegroundColor DarkYellow
         $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $false -Temperature 0.4 -NumPredict 1400
         $planThinking = if ($null -ne $planResult.thinking) { $planResult.thinking } else { '' }

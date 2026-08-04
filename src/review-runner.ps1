@@ -87,9 +87,9 @@ function Invoke-OrnithClient {
 # "unclear" votes pass as a false 1-0 consensus. Used here instead of a single call for the
 # review verdict specifically because it gates a real state change (approved -> apply-runner).
 function Invoke-OrnithMajorityVote {
-    param([string]$Prompt, [string[]]$ClassifyMarkers, [int]$N = 3, [int]$MinAgreeing = 2, [double]$Temperature = 0.2)
+    param([string]$Prompt, [string[]]$ClassifyMarkers, [int]$N = 3, [int]$MinAgreeing = 2, [double]$Temperature = 0.2, [int]$MinReasoningChars = 0)
     $reqPath = Join-Path $TempDir ('review-vote-req-{0}.json' -f ([guid]::NewGuid()))
-    $reqObj = [PSCustomObject]@{ prompt = $Prompt; mode = 'majority-vote'; classifyMarkers = $ClassifyMarkers; n = $N; minAgreeing = $MinAgreeing; temperature = $Temperature }
+    $reqObj = [PSCustomObject]@{ prompt = $Prompt; mode = 'majority-vote'; classifyMarkers = $ClassifyMarkers; n = $N; minAgreeing = $MinAgreeing; temperature = $Temperature; minReasoningChars = $MinReasoningChars }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
     $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
     try {
@@ -470,6 +470,113 @@ function Invoke-ReviewPass {
             return 'approved'
         }
 
+        # Deterministic gate, added 2026-08-03: auto-reject drafts that are mechanically NOT
+        # a real implementation attempt, without spending an Ornith review call on them at
+        # all. Confirmed live, twice in one session: a bare tool-call request
+        # ({"mode":"read","path":...} with no edit/create content) and pure meta-commentary
+        # ("Let me read the current state of the file to understand the full context...")
+        # each won a 3/3 APPROVE vote -- there is no judgment call here for a model to make;
+        # "does this response contain any actual edit/create content" is already knowable
+        # from the text alone. Deliberately excludes $emptyApprovalSources above (arch_
+        # discovery/project_search/deep_dive/arch_import) -- those sources have a
+        # DOCUMENTED, legitimate reason a truly empty response can be correct, which this
+        # gate must not override.
+        $nonImplPatterns = @(
+            '"mode"\s*:\s*"read"',
+            '^(let me|i need to|i will|i''ll|i am going to|i''m going to)\s+(read|check|look at|search|verify|examine|understand)\b'
+        )
+        $isNonImplementation = $false
+        if (-not $isEffectivelyEmpty) {
+            foreach ($pat in $nonImplPatterns) {
+                if ($trimmedImplResponse -match $pat) { $isNonImplementation = $true; break }
+            }
+            # A genuine diff/full-file/edit-JSON draft is never this short and lacks any
+            # code fence -- catches the same failure shape even if it doesn't match either
+            # phrase pattern above.
+            if (-not $isNonImplementation -and $trimmedImplResponse.Length -lt 80 -and $trimmedImplResponse -notmatch '```') {
+                $isNonImplementation = $true
+            }
+        }
+        if ($isNonImplementation -and ($task.source -notin $emptyApprovalSources)) {
+            $reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).'
+            Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-non-implementation' -Force
+            $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+            Write-TaskJson $blockedPath $task
+            Remove-Item $next.FullName -Force
+            $reviewSw.Stop()
+            Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
+            Write-Host ('Auto-rejected (non-implementation, deterministic): {0}' -f $task.id) -ForegroundColor Yellow
+            return 'blocked'
+        }
+
+        # Deterministic gate, added 2026-08-03: general pipeline pattern pairing with
+        # promptContext.fixedLiterals (see prompts.js's fixedLiteralsBlock, which instructs
+        # the drafter to copy these verbatim rather than write them from memory). Mechanically
+        # verify each declared literal actually appears character-for-character in the draft
+        # BEFORE spending an Ornith review call -- confirmed live this session: an exact
+        # 16-item field list given verbatim in the prompt was reproduced WRONG on all 4 of 4
+        # attempts (a different incorrect list each time, including fabricated fields with no
+        # basis anywhere in the prompt) -- not a judgment call, a mechanically checkable fact.
+        # Gives the next redraft attempt a specific expected-vs-missing diff instead of the
+        # vague prose an Ornith critique pass sometimes produces (or fails to -- critique
+        # itself went degenerate on 2 of these 4 attempts).
+        $fixedLiterals = @()
+        if ($task.promptContext -and $task.promptContext.PSObject.Properties['fixedLiterals']) {
+            $fixedLiterals = @($task.promptContext.fixedLiterals)
+        }
+        if ($fixedLiterals.Count -gt 0) {
+            # Compare against the DECODED code text, not the raw implementResponse envelope.
+            # implementResponse is JSON (per groupBJsonInstructions) -- real newlines inside
+            # "content"/"find"/"replace" string values are escaped as literal \n per JSON
+            # string syntax. A fixed literal built from real, unescaped source code will
+            # never .Contains()-match the raw envelope text at those positions even when the
+            # draft copied it 100% correctly. Confirmed live 2026-08-03: a multi-line fixed
+            # block that Ornith reproduced perfectly still got auto-rejected by this exact
+            # bug before the fix below -- decode-group-b-content.js runs the same
+            # parseJsonMaybeFenced() apply-group-b.js itself uses, so the comparison happens
+            # against what will actually be written to disk.
+            $decodePath = Join-Path $TempDir ('decode-content-{0}.txt' -f ([guid]::NewGuid()))
+            $decodedContent = ''
+            try {
+                [System.IO.File]::WriteAllText($decodePath, $task.implementResponse)
+                $decodeScript = Join-Path $PackageSrcDir 'decode-group-b-content.js'
+                $decodedContent = (Invoke-WithSafeEnv { & node $decodeScript $decodePath 2>$null }) -join "`n"
+            } catch {
+                $decodedContent = ''
+            } finally {
+                Remove-Item $decodePath -ErrorAction SilentlyContinue
+            }
+            # Fall back to the raw envelope text if decoding produced nothing (implement
+            # wasn't valid/recoverable JSON at all -- broken for other reasons the
+            # non-implementation gate above, or the Ornith review below, will still catch).
+            $compareText = if ($decodedContent) { $decodedContent } else { $trimmedImplResponse }
+            # .Contains(), NOT -like: -like treats '[' / ']' / '*' / '?' in the pattern as
+            # wildcards, so a literal containing array-bracket syntax (e.g. the exact case
+            # this gate exists for -- a field-list array) would falsely report as "missing"
+            # even when present verbatim. Confirmed live testing this exact scenario before
+            # shipping -- -like returned $false for content that WAS present character-for-
+            # character, purely because of the brackets.
+            $missingLiterals = @($fixedLiterals | Where-Object { -not $compareText.Contains($_.content) })
+            if ($missingLiterals.Count -gt 0) {
+                $missingNames = ($missingLiterals | ForEach-Object { $_.name }) -join ', '
+                $reason = 'Deterministic gate: draft does not contain the required fixed block(s) character-for-character: {0}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no Ornith review call spent on a draft that already fails a mechanical check.' -f $missingNames
+                Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+                $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-fixed-literals' -Force
+                $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+                Write-TaskJson $blockedPath $task
+                Remove-Item $next.FullName -Force
+                $reviewSw.Stop()
+                Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+                Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+                Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
+                Write-Host ('Auto-rejected (missing fixed literal(s): {0}, deterministic): {1}' -f $missingNames, $task.id) -ForegroundColor Yellow
+                return 'blocked'
+            }
+        }
+
         # --- Ornith path: verdict ONLY. Ornith has no tool access via ornith-client.js --
         # it cannot git-push or write files, so an APPROVE verdict moves the task to
         # queue/approved/ for apply-runner.ps1 to actually execute, rather than to done/. ---
@@ -574,9 +681,18 @@ function Invoke-ReviewPass {
             # zero-friction allowance forward, since the shape of the risk is identical.
             $verdictLines.Add('This is an architecture-import task (an idea from an external project, being checked against agent-manager''s own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.')
         }
-        $verdictLines.Add('Respond with EXACTLY one of these two forms, nothing else:')
-        $verdictLines.Add('APPROVE')
-        $verdictLines.Add('REJECT: <one-sentence reason>')
+        # 2026-08-03: previously this instruction told the model "APPROVE" needed zero
+        # justification while "REJECT" required a reason -- confirmed live, repeatedly, as
+        # the direct cause of 3/3 bare "APPROVE" votes outvoting a single correctly-reasoned
+        # REJECT that had actually found real bugs (invalid Prisma API usage, a field-list
+        # that didn't match the spec, an implementResponse that was literally just "let me
+        # read the file first" with no code at all). Both verdicts now require a concrete
+        # reason citing something specific in the draft -- an unreasoned vote carries no
+        # signal either way and is discarded before tallying (see minReasoningChars below).
+        $verdictLines.Add('Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)? Does anything in it contradict the real grounding source or fact-check above?')
+        $verdictLines.Add('Respond with EXACTLY one of these two forms, nothing else. BOTH require a concrete, specific reason -- cite an actual file name, field name, or line of the draft. A reason that just restates the verdict word ("looks correct", "seems fine", "meets requirements") is not acceptable and will be discarded as unreasoned.')
+        $verdictLines.Add('APPROVE: <one-sentence reason citing the specific requirement(s) you verified are met>')
+        $verdictLines.Add('REJECT: <one-sentence reason citing the specific problem>')
         $verdictPrompt = [string]::Join("`n", $verdictLines)
 
         $reviewFailed = $false
@@ -584,8 +700,14 @@ function Invoke-ReviewPass {
         $voteResult = $null
         try {
             Wait-ForOrnithAvailability
-            # 3 votes, requires 2 agreeing real votes, temperature 0.2.
-            $voteResult = Invoke-OrnithMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 2 -Temperature 0.2
+            # 3 votes, requires ALL 3 agreeing real votes (raised from 2 on 2026-08-03 --
+            # 2/3 let a single correctly-reasoned REJECT get outvoted by two bare, unreasoned
+            # APPROVEs on two separate real drafts in one session; unanimous is the direct
+            # fix). minReasoningChars=20 discards any vote whose reasoning, once the
+            # verdict marker itself is stripped out, is under 20 characters -- catches a
+            # model that ignores the reasoning instruction above and reverts to a bare
+            # marker; such a vote is excluded from the tally rather than counted.
+            $voteResult = Invoke-OrnithMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 3 -Temperature 0.2 -MinReasoningChars 20
         } catch {
             $reviewFailed = $true
             $reviewFailReason = $_.Exception.Message

@@ -42,7 +42,8 @@ from networkx.algorithms.community import greedy_modularity_communities
 
 JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
 PY_EXTENSIONS = {".py"}
-MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS
+LUA_EXTENSIONS = {".lua"}
+MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS | LUA_EXTENSIONS
 EXCLUDE_DIRS = {
     "node_modules", ".git", "queue",
     # Only matters when walk_source_files falls back to scanning the whole repo_root
@@ -70,6 +71,17 @@ IMPORT_RE_PY = re.compile(
     r"""|^\s*from\s+(\.*[\w.]*)\s+import\s"""
     , re.MULTILINE,
 )
+
+# Beyond-All-Reason/Spring widgets load each other via VFS.Include/dofile/require/
+# VFS.LoadFile, not a native `import` statement -- same call-then-string-literal shape
+# this repo's own docs/build_dependency_graph.py already parses (see that file for the
+# proven pattern this mirrors). LUA_STRLIT_RE is applied to whatever LUA_INCLUDE_RE
+# captured as the call's argument, taking the LAST match, so `BASE .. "foo.lua"` still
+# resolves via the literal even though BASE itself is a runtime value regex can't see.
+LUA_INCLUDE_RE = re.compile(
+    r"""(?:VFS\.Include|dofile|require|VFS\.LoadFile)\s*\(\s*([^\)]*?)\s*[,\)]"""
+)
+LUA_STRLIT_RE = re.compile(r'"([^"]*\.lua)"')
 
 
 def get_config():
@@ -168,6 +180,26 @@ def resolve_python_import(from_file: Path, spec: str, repo_root: Path) -> Path |
     return None
 
 
+def resolve_lua_import(spec: str, repo_root: Path, file_set: set[Path]) -> Path | None:
+    """Lua VFS.Include/require/dofile calls in this ecosystem show up in two shapes: a
+    full repo-relative path string ('LuaUI/Widgets/foo/bar.lua') or a bare filename
+    concatenated onto a BASE variable at runtime ('BASE .. "bar.lua"') -- regex can only
+    ever see the string literal, not BASE's runtime value. Direct repo-relative
+    resolution first; a basename-match fallback against the already-walked file set
+    handles the concatenated case. Ambiguous if two files in the scanned scope share a
+    basename (falls through to None rather than guessing) -- same accepted-gap tolerance
+    already given to the JS/Python resolvers above, this graph is a reading-order aid,
+    not a correctness-critical artifact."""
+    direct = (repo_root / spec).resolve()
+    if direct in file_set:
+        return direct
+    name = Path(spec).name
+    matches = [f for f in file_set if f.name == name]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
     files = walk_source_files(repo_root, grep_dirs)
     file_set = {f.resolve() for f in files}
@@ -183,6 +215,7 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
             continue
         rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
         is_python = f.suffix in PY_EXTENSIONS
+        is_lua = f.suffix in LUA_EXTENSIONS
 
         if is_python:
             for match in IMPORT_RE_PY.finditer(text):
@@ -190,6 +223,16 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
                 if not spec:
                     continue
                 target = resolve_python_import(f, spec, repo_root)
+                if target and target in file_set:
+                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                    if rel_to != rel_from:
+                        graph.add_edge(rel_from, rel_to)
+        elif is_lua:
+            for match in LUA_INCLUDE_RE.finditer(text):
+                lit_matches = LUA_STRLIT_RE.findall(match.group(1))
+                if not lit_matches:
+                    continue
+                target = resolve_lua_import(lit_matches[-1], repo_root, file_set)
                 if target and target in file_set:
                     rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
                     if rel_to != rel_from:
