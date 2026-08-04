@@ -507,12 +507,48 @@ function troubleLogImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// General pipeline pattern, added 2026-08-03: some data an implement pass needs is not
+// something to GENERATE at all -- it's already fully known (an exact field list, an API
+// call shape copied verbatim from real code, a connection-string pattern). Live testing
+// this session found Ornith substitutes a plausible-looking but WRONG version of exactly
+// this kind of data on every attempt (4 separate redrafts of the same field-list array,
+// 4 different wrong lists, none matching the one given verbatim in the prompt) -- not
+// random hallucination, but confidently reaching for a generic prior over the specific
+// given data, even under an explicit "copy these exact strings" instruction. Distinct
+// from the preDrafted escape hatch above (ornith-worker.ps1) which skips generation for an
+// ENTIRE already-known implementResponse -- this is for the more common case where only
+// PART of a file is fixed/known and the surrounding logic still needs real generation.
+// task.promptContext.fixedLiterals: optional array of { name, content } -- content is
+// required to appear character-for-character in the final draft. Paired with a
+// deterministic post-implement grep gate in review-runner.ps1 that verifies compliance
+// before spending an Ornith review call, and gives a specific expected-vs-found diff back
+// to the next redraft attempt instead of vague prose criticism.
+function fixedLiteralsBlock(task) {
+  const literals = task.promptContext && Array.isArray(task.promptContext.fixedLiterals)
+    ? task.promptContext.fixedLiterals
+    : [];
+  if (literals.length === 0) return [];
+  const lines = [
+    '',
+    'The following block(s) are FIXED, already-verified content -- they are not something to write or improve, only to place. Copy each one character-for-character into your output at the point it belongs. Do NOT paraphrase, reorder, abbreviate, "correct," or substitute a different-but-similar version from your own knowledge -- any deviation, however minor, is a hard failure that will be mechanically detected and rejected before anyone even reads your reasoning.',
+    '',
+  ];
+  for (const lit of literals) {
+    lines.push(`--- FIXED BLOCK: ${lit.name} ---`);
+    lines.push(lit.content);
+    lines.push('--- END FIXED BLOCK ---');
+    lines.push('');
+  }
+  return lines;
+}
+
 function adhocImplementPrompt(task, planText) {
   return [
     'Earlier you wrote this PLAN for a one-off task submitted directly by a human or an orchestrating agent:',
     '',
     planText,
     '',
+    ...fixedLiteralsBlock(task),
     groupBJsonInstructions,
   ].join('\n');
 }
@@ -587,22 +623,46 @@ updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildIm
 
 // ---- Thin lookup functions -- the real public API of this file ----
 
+// Added 2026-08-03: queue-watchdog.ps1 has carefully tracked WHY every past attempt on
+// this task was rejected (task.priorRejectionFeedback, one string per attempt) since it
+// first existed -- but until now nothing ever read it back out. Confirmed live this
+// session: a task redrafted 3 times in a row made a DIFFERENT wrong thing each time
+// (missing field list -> then a different content bug -> then a wrong Prisma property
+// name) rather than fixing the specific thing it was just told about, because it never
+// saw that feedback -- each redraft was a blind fresh roll, not an informed retry.
+// Domain-agnostic (lives in the two thin lookup functions below, not per-source
+// builders) so every task source benefits, not just adhoc.
+function priorRejectionBlock(task) {
+  const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+  if (feedback.length === 0) return '';
+  const lines = [
+    '',
+    `This task has been attempted ${feedback.length} time(s) before and rejected each time. Do NOT repeat any of these specific mistakes -- read each one and make sure your new attempt genuinely avoids it, not just avoids restating it:`,
+    '',
+  ];
+  feedback.forEach((reason, i) => lines.push(`${i + 1}. ${reason}`));
+  lines.push('');
+  return lines.join('\n');
+}
+
 function buildPlanPrompt(task) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  if (source && typeof source.buildPlanPrompt === 'function') {
-    return source.buildPlanPrompt(task);
-  }
-  return genericFallbackPlanPrompt(task);
+  const prior = priorRejectionBlock(task);
+  const base = source && typeof source.buildPlanPrompt === 'function'
+    ? source.buildPlanPrompt(task)
+    : genericFallbackPlanPrompt(task);
+  return prior ? prior + base : base;
 }
 
 function buildImplementPrompt(task, planText) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  if (source && typeof source.buildImplementPrompt === 'function') {
-    return source.buildImplementPrompt(task, planText);
-  }
-  return genericFallbackImplementPrompt(task, planText);
+  const prior = priorRejectionBlock(task);
+  const base = source && typeof source.buildImplementPrompt === 'function'
+    ? source.buildImplementPrompt(task, planText)
+    : genericFallbackImplementPrompt(task, planText);
+  return prior ? prior + base : base;
 }
 
 // Independent second-opinion pass: a fresh model call reviews the drafter's own Implement

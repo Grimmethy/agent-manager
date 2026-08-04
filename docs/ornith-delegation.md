@@ -1255,3 +1255,143 @@ implemented the two-file change directly instead — consistent with this doc's 
 "never apply Ornith output directly" rule, just reached at the review-vote stage instead of
 by manual read-through, since the vote tally alone (3/3 APPROVE) would have looked clean
 without opening `implementResponse`.
+
+## Update 2026-08-03: the 2026-07-28 rubber-stamp pattern recurred on 2 of 2 tasks in one session, one of them a truncated 6-line fragment
+
+TaxHarvest, adhoc queue, `includeApply: false`. Three tasks queued back-to-back (a cross-DB
+merge script, a 3-file Python schema/status-tracking change, a read-only report script). All
+three came back unusable on inspection, despite two of three showing `queue/approved/` with
+`Confident majority APPROVE (votes: 3/3 real, tally: APPROVE=3)`.
+
+- **Task 1 (merge script) correctly landed in `blocked`** after 2 reject rounds — this one
+  worked as designed. `implementResponse` was genuinely truncated mid-statement
+  (`else if (apn) matchKey = ap`), one reviewer still voted APPROVE with reasoning that
+  explicitly says "It's incomplete and cannot be executed as-is... I'll approve it... rather
+  than reject it outright" — approving *because* it was a good-faith partial attempt, not
+  because it was correct. The other two reviewers correctly rejected. Net: the 2-of-3 rule
+  saved this one.
+- **Task 2 (schema/status fields) reached `approved/` with 3/3 bare `APPROVE` — zero reasoning
+  text on any vote — over a draft that only touches 1 of the 3 required files, and even that
+  one file's diff is invalid Prisma syntax** (inserts trailing commas between field
+  declarations; Prisma model fields are newline-separated, not comma-separated). The
+  `implementResponse` itself contains a self-authored note admitting the other two files
+  "could not be modified because their contents are not visible in this context" — same
+  self-disclosed-incompleteness-ignored-by-review shape as 2026-07-28, but this time with
+  **no reasoning text at all** on the approving votes (2026-07-28's bare votes at least existed
+  in the same "no engagement" sense; this run didn't even restate the question).
+- **Task 3 (report script) also reached `approved/` with 3/3 bare `APPROVE`** over an
+  `implementResponse` that cuts off after ~6 lines, mid-array-literal (`'ownerName', '`) — not
+  a subtle omission, a raw truncated fragment with no closing brackets, no logic, nothing
+  resembling a working script. The critique pass one round earlier had correctly caught five
+  concrete, serious problems in the prior draft (infinite loop from duplicated code, SQL
+  injection via `$queryRawUnsafe` string concatenation directly contradicting an explicit
+  prompt instruction, no county join, no output logic, wrong groupBy shape) — the revision
+  that followed didn't fix those, it just got shorter and cut off earlier.
+
+**This confirms the 2026-07-28 "open question" empirically, twice more, at a worse severity
+(zero-reasoning votes vs. that entry's still-present-but-wrong reasoning):** the review pass
+is not reliably reading the draft it's voting on, or not weighing what it reads. Bare
+`APPROVE`/`REJECT` with no response text should probably be treated as a lower-confidence
+vote than a reasoned one, not counted equally — not yet implemented, still an open question,
+now with three independent occurrences across two different consumer repos (BAR Player AI,
+TaxHarvest) supporting it.
+
+**Practical mitigation used this time, consistent with 2026-07-28's precedent:** neither
+`approved/` draft was applied. Reported to the human as genuinely failed attempts (not
+silently "done") for direct implementation instead of a further Ornith retry, given this is
+now a repeated, not one-off, review-pass failure on top of two already-confirmed
+generation-length failures in the same batch.
+
+## Update 2026-07-30: `approved/` missing from `QUEUE_STATES` caused an all-night infinite
+re-draft loop on `includeApply: false` — a pipeline-plumbing bug, not a model failure
+
+First unattended overnight run against TaxHarvest after standing the pipeline back up
+(`includeApply: false`, the safe default — nothing auto-applies to real files/git). Checked
+in the next morning expecting a night's worth of `arch_discovery`/adhoc/backlog progress;
+instead found almost nothing had moved, despite Ollama's own `server.log` showing continuous
+request traffic (~130 requests/hour, every hour, all night — the model was never idle).
+
+**Root cause: `task-sources.js`'s `QUEUE_STATES = ['pending', 'drafting', 'review', 'blocked',
+'done']` never included `'approved'`.** `taskIdExistsInQueue(id)` — the dedup check every task
+source calls before generating a task — walks exactly that list. The instant a task clears
+review and lands in `queue/approved/`, the dedup check goes blind to it. With `includeApply:
+false`, nothing ever drains `approved/` into `done/` (the one state the check *does* see), so
+on the very next poll cycle the same task source picks the same not-yet-actioned source item
+(a brain-dump entry, in this case) and regenerates the identical deterministic task ID from
+scratch. Plan → Implement → Critique → Review (3 votes) → approve → loop, forever, with no
+error, no visible stall, and no distinguishing log signature short of counting.
+
+**How it was found:** grepping `SecondBrain/Ornith Live Log.md` (the append-only log
+`ornith-worker.ps1` writes every pass to — see the `LiveLogPath` mechanics near the top of
+this doc) for entry counts per task ID. A normal completed task shows ~5-6 entries total
+(plan/implement/critique/review×3/apply). Two task IDs showed **419** and **334** entries
+each — effectively the entire night's compute spent re-litigating two tasks that had already
+been correctly approved hours earlier, while everything else in the backlog (arch_discovery,
+county-adapter adhoc tasks, etc.) starved after its first pass. **This is the diagnostic to
+reach for first** any time an overnight/unattended run "looks idle" despite the worker
+reporting `status: working` and the model server showing real traffic — count log entries
+per task ID before assuming a hang; a stall and an infinite loop on one task look identical
+from the outside (worker busy, nothing new landing) but have opposite fixes.
+
+**Why this matters beyond TaxHarvest:** nothing about the bug is project-specific — any
+project run with `includeApply: false` (the recommended safe default while trust in a task
+source is still being established) will eventually hit this the moment a task reaches
+`approved`, silently converting "safe, supervised, nothing auto-applies" into "burns 100% of
+available compute on repeat work, indefinitely." A safety default and a live bug combined to
+produce a worse outcome than either alone.
+
+**Fix:** one-line change, `'approved'` added to `QUEUE_STATES`. Verified against the existing
+`task-sources.test.js` suite (40/40 pass, nothing else depended on the old five-state list),
+then confirmed live — restarted the pipeline and the worker immediately picked a genuinely new
+task instead of re-drafting either of the two stuck ones, which stayed untouched in
+`approved/` as expected.
+
+**No collateral damage from the loop itself, but worth the reflex of checking:** `includeApply:
+false` held for the entire night as configured — `git status` in the target repo stayed clean
+(no rogue commits), and no SecondBrain notes were spuriously written for the two stuck
+brain-dump-sort tasks (confirmed by checking `SecondBrain/Projects/` directly for the files the
+approved drafts named). A large stray "534 APPLY" count in the same live-log grep initially
+looked alarming but turned out to be all-time log history from a stale run two days prior, not
+overnight activity — **always check the actual timestamp on a log-count match before treating
+raw frequency as evidence; the log file is append-only across every run this pipeline has ever
+had, not scoped to the current session.**
+
+## Update 2026-07-30: a majority-vote APPROVE whose own response text argues REJECT
+
+An adhoc task (TaxHarvest, "fix HUD FMR rent/cap-rate gap for Lincoln County OR") reached
+`queue/approved/` with `ornithVotes` showing `APPROVE=2` — a real majority by the existing
+"≥2 of 3 real votes" rule (see the 2026-07-05 all-zeros/degenerate-vote entry above, which
+this rule was originally built to guard against). But the draft that got approved was not a
+fix at all: after an earlier draft was correctly critiqued and rejected (an unrelated `* 1.0`
+multiplier edit), the revision attempt was **just a bash `find` command with the note "I need
+to actually read the relevant code first instead of speculating"** — no code change, no
+diagnosis, nothing applicable. Reading the individual vote records showed why the tally still
+said APPROVE: one vote's `verdict` field literally recorded `"APPROVE"` while that same vote's
+own `response` text read, verbatim, **"REJECT: Draft contains no verdict, attempts command
+execution violating constraints, and consists only of meta-commentary without any actual
+analysis."** The parsed verdict field and the free-text justification directly contradicted
+each other within the same vote — not a degenerate/garbage vote (which the existing ≥2-real-
+votes rule already guards against), but a **coherent, well-reasoned rejection whose own
+verdict-extraction step flipped the label to the opposite of what the prose argued.**
+
+**Why this evaded every existing safeguard:** the degenerate-output checks (all-repeated-
+character, non-ASCII-ratio) correctly assume garbage votes look garbled. This vote was fluent,
+specific, and correctly identified all four real problems with the draft — it just got
+tagged with the wrong verdict word, so the ≥2-real-votes counting logic (which only inspects
+the `verdict` field, not whether that field agrees with the vote's own reasoning) counted it
+as a second APPROVE and cleared the majority bar.
+
+**This was caught only because a human (Claude, per the standing review duty) read the
+`ornithVotes` array's actual response text before trusting the tally** — the pipeline itself
+had no mechanism to catch it; the task sat in `queue/approved/` looking done.
+
+**Fix not yet implemented, recommended for `review-runner.ps1`'s vote-tallying step:** before
+counting a vote's `verdict` field, cheaply sanity-check that the verdict *agrees* with its own
+response text — e.g. if `verdict == "APPROVE"` but the response contains a leading `"REJECT"`
+token or starts with the word "Reject", treat it as a contradictory/unparseable vote (same
+bucket as a degenerate vote) rather than counting it at face value. This is a distinct check
+from the existing degenerate-output detector — it's not about response *quality*, it's about
+internal *consistency* between a structured field and the free text that's supposed to justify
+it. Until this exists, **do not trust an `ornithVotes` tally by count alone — always read each
+vote's actual response text, not just its `verdict` field, before treating a task in
+`queue/approved/` as genuinely ready to apply.**
