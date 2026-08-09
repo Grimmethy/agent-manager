@@ -30,6 +30,15 @@ Four always-on processes, each in its own terminal:
   (and for this package's own dev loop, is) a directory also being edited live.
 - **`queue-watchdog.ps1`** — dead-process detection (restarts a crashed loop) and
   reject-retry-requeue (a genuinely rejected draft gets one bounded redraft attempt).
+- **`pipeline-doctor.ps1`** — a one-shot, manually-run health check + safe auto-repair,
+  not a always-on loop. Reports queue stage counts, drafting claims, and instance
+  heartbeats, and can safely clear stuck state -- but only ever after confirming, via a
+  live child-process check, that whatever it's about to touch isn't genuinely mid-work.
+  Written up after an overnight incident (`docs/pipeline-incident-2026-07-19.md`) where
+  duplicate `ornith-worker` instances, a silently-wedged Ollama, and orphaned drafting
+  claims each took real time to hand-diagnose. Run it any time the pipeline looks stuck,
+  slow, or is producing empty/degenerate output:
+  `powershell -File src/pipeline-doctor.ps1`.
 
 State lives entirely in a filesystem queue (`queue/pending/`, `queue/review/`,
 `queue/approved/`, `queue/blocked/`, `queue/done/`) plus per-process heartbeat files in
@@ -76,7 +85,7 @@ convention the underlying model client already used. Set these before launching 
 
 ## Built-in task sources
 
-Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
+Twelve, at priorities 10/20/40/42/70/71/80/80/81/82/85/90 (30/50/60 left open for yours):
 
 | Source | Priority | Reads |
 |---|---|---|
