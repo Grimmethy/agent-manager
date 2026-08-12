@@ -22,6 +22,14 @@ const KEEP_ALIVE = process.env.ORNITH_KEEP_ALIVE || '30m';
 
 function detectDegenerate(text) {
   if (!text || text.trim().length === 0) return 'empty';
+  // Ornith sometimes writes the literal two-character JSON-style empty-string
+  // representation ('""' or "''") instead of a genuinely empty response -- confirmed
+  // live (see review-runner.ps1's isEffectivelyEmpty check, which mirrors this same
+  // definition). Without this, that quirk skips the implement-degenerate block entirely,
+  // burns a full critique+revision cycle on two characters, and for any task source not
+  // in review-runner.ps1's emptyApprovalSources allowlist previously reached a full
+  // 3-vote Ornith review with nothing real to evaluate.
+  if (text.trim() === '""' || text.trim() === "''") return 'empty';
 
   // Repeated-character garbage (e.g. a literal run of "000000..." was observed for 20
   // straight calls in one documented overnight run).

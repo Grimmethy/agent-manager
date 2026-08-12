@@ -1395,3 +1395,53 @@ internal *consistency* between a structured field and the free text that's suppo
 it. Until this exists, **do not trust an `ornithVotes` tally by count alone — always read each
 vote's actual response text, not just its `verdict` field, before treating a task in
 `queue/approved/` as genuinely ready to apply.**
+
+## Update 2026-08-12: three more deterministic gates, closing gaps a whole-system correctness audit found alongside the 2026-08-03 hardening
+
+A `/grill-with-docs` audit session read through this doc's own failure history plus
+`review-runner.ps1`, `fact-checker.js`, and `ornith-client.js` looking specifically for
+places where a deterministic signal already existed but wasn't actually enforced — the same
+shape as every gate `f867b39` added. Found three, all fixed directly (per this repo's
+established precedent of writing self-referential pipeline-hardening changes directly rather
+than delegating them to the model whose failure modes they exist to catch):
+
+1. **The critique-compliance open question from 2026-07-28/2026-08-03 is now closed.**
+   `review-runner.ps1` never once looked at `task.critiqueResponse` when building the verdict
+   prompt, despite it having been on the task object (see `ornith-worker.ps1`'s critique/
+   revise block) the whole time — the review pass voted on the final draft in total isolation
+   from its own pipeline's critique step. New gate, only when `critiqueOutcome ==
+   'issues-flagged'`: if `revisionApplied` is `$false`, deterministic auto-reject (nothing
+   to check compliance against — no Ornith call needed). Otherwise, one single, narrowly-
+   scoped, reasoning-required Ornith call asking "does the final draft address every point in
+   the critique?", fails closed (a failed call, an unreasoned response, or an explicit
+   `NON_COMPLIANT` verdict all block) — same "an unclear signal must never default to letting
+   a task through" philosophy the main verdict already uses. Deliberately a single call, not
+   the main verdict's 3-vote unanimous scheme: this is a narrow factual cross-check between
+   two texts already in hand, not the open-ended quality judgment the main vote makes.
+2. **Empty-`implementResponse` handling was asymmetric.** The existing empty-response carve-
+   out only ever checked `emptyApprovalSources` for *auto-approval* — a normal code-change
+   source (adhoc, trouble_log, etc.) producing a genuinely empty or `'""'`/`"''"` response
+   fell through every gate (the non-implementation gate right after it is itself guarded by
+   `-not $isEffectivelyEmpty`) and reached a full 3-vote Ornith review on nothing. Fixed at
+   both ends: `ornith-client.js`'s `detectDegenerate` now also catches the `'""'`/`"''"`
+   quirk (previously only `trim().length === 0` counted), so it's caught before the
+   critique+revision cycle even starts; `review-runner.ps1` also gained the symmetric
+   deterministic-reject counterpart to the existing auto-approve, as defense-in-depth for
+   anything that becomes effectively empty later than the upstream check runs.
+3. **`fact-checker.js`'s two highest-precision flags were advisory-only.** `ungrounded-url`
+   and `ungrounded-field` — per the checker's own comments, "almost never a false positive,"
+   the exact "confident fabrication of a plausible value" pattern this doc calls the worst,
+   most-repeated failure mode — were only ever injected into the verdict prompt as context
+   for Ornith to weigh, never enforced. Given this doc's own throughline that the review pass
+   cannot be trusted to reliably act on evidence it's merely shown (it didn't for the critique
+   text either, see above), these two flag types now hard-block before the main vote runs.
+   `missing-file` deliberately stays advisory — fact-checker.js has no notion of a draft's own
+   declared `mode`, so it can't distinguish a legitimately-new CREATE-mode target from a
+   typo'd real path, and a naive hard-block would false-positive-reject every valid CREATE
+   task.
+
+**Not fixed this session, flagged for later:** the verdict/response-text contradiction gap
+documented directly above (2026-07-30 entry) is still open — `Invoke-OrnithMajorityVote`'s
+classify function still only pattern-matches for a marker anywhere in the response, with no
+check that a parsed `APPROVE`/`COMPLIANT` verdict doesn't contradict its own justification
+text. The three gates above don't touch that path. Recommended next, same file family.

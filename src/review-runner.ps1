@@ -470,6 +470,35 @@ function Invoke-ReviewPass {
             return 'approved'
         }
 
+        # Deterministic gate, added 2026-08-12: symmetric counterpart to the auto-approve
+        # above. isEffectivelyEmpty was only ever checked against $emptyApprovalSources for
+        # APPROVAL -- a normal code-change source (adhoc, trouble_log, etc, none of whose
+        # implement prompts document "empty is a valid outcome") producing a genuinely empty
+        # or '""'/"''" implementResponse fell through every gate below (the non-implementation
+        # gate right after this one is itself guarded by `-not $isEffectivelyEmpty`) and
+        # reached a full 3-vote Ornith review with nothing real to evaluate -- the same
+        # rubber-stamp risk the non-implementation gate exists to close, just for an even
+        # emptier draft. ornith-client.js's detectDegenerate now also catches the '""'/"''"
+        # quirk upstream (skips the whole critique+revision cycle before it starts), but this
+        # gate stays as defense-in-depth for anything that becomes effectively empty later
+        # than that check runs (e.g. a revision pass whose degenerate output still leaves the
+        # pre-revision implementResponse in place -- covered by the gate above -- or any other
+        # path that sets implementResponse directly).
+        if ($isEffectivelyEmpty -and ($task.source -notin $emptyApprovalSources)) {
+            $reason = 'Deterministic gate: implementResponse is empty for a source with no documented "empty is a valid outcome" contract -- no Ornith review call spent (mechanically detectable, not a judgment call).'
+            Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-reject' -Force
+            $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+            Write-TaskJson $blockedPath $task
+            Remove-Item $next.FullName -Force
+            $reviewSw.Stop()
+            Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
+            Write-Host ('Auto-rejected (empty response, deterministic): {0}' -f $task.id) -ForegroundColor Yellow
+            return 'blocked'
+        }
+
         # Deterministic gate, added 2026-08-03: auto-reject drafts that are mechanically NOT
         # a real implementation attempt, without spending an Ornith review call on them at
         # all. Confirmed live, twice in one session: a bare tool-call request
@@ -573,6 +602,125 @@ function Invoke-ReviewPass {
                 Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
                 Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
                 Write-Host ('Auto-rejected (missing fixed literal(s): {0}, deterministic): {1}' -f $missingNames, $task.id) -ForegroundColor Yellow
+                return 'blocked'
+            }
+        }
+
+        # Deterministic gate, added 2026-08-12: hard-block on fact-checker.js's two highest-
+        # precision flag types instead of leaving them as advisory context for the verdict
+        # vote below. fact-checker.js's own comments call ungrounded-url/ungrounded-field
+        # "almost never a false positive" -- unlike missing-file (ambiguous against a
+        # legitimate CREATE-mode target fact-checker.js can't distinguish from a typo'd real
+        # path, since it has no notion of the draft's own declared mode), a URL or
+        # ALLCAPS_UNDERSCORE field token that appears nowhere in the source material Ornith
+        # was actually given is definitionally fabricated -- the exact "confident fabrication
+        # of a plausible value" failure ornith-delegation.md documents as the worst, most-
+        # repeated failure mode, and the one constrained decoding structurally cannot prevent.
+        # Advisory-only wasn't enough: the same review pass that rubber-stamped self-disclosed-
+        # incomplete drafts and bare tool-call requests (see the gates above) cannot be
+        # trusted to reliably act on a flag it's merely shown, any more than it reliably acted
+        # on its own critique pass's text (see the critique-compliance gate below).
+        # missing-file deliberately stays advisory -- left for the verdict vote to weigh.
+        $highPrecisionFlags = @()
+        if ($factCheck -and $factCheck.flags) {
+            $highPrecisionFlags = @($factCheck.flags | Where-Object { $_.type -in @('ungrounded-url', 'ungrounded-field') })
+        }
+        if ($highPrecisionFlags.Count -gt 0) {
+            $flagDetails = ($highPrecisionFlags | ForEach-Object { '{0}: {1}' -f $_.type, $_.detail }) -join '; '
+            $reason = 'Deterministic gate: draft contains value(s) that do not appear anywhere in the source material Ornith was given: {0}. This is fact-checker.js''s highest-precision fabrication signal -- no Ornith review call spent on a draft that already fails a mechanical check.' -f $flagDetails
+            Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-fact-check' -Force
+            $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+            Write-TaskJson $blockedPath $task
+            Remove-Item $next.FullName -Force
+            $reviewSw.Stop()
+            Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason; factCheckResult = $factCheckVerdict } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
+            Write-Host ('Auto-rejected (ungrounded value(s): {0}, deterministic): {1}' -f $flagDetails, $task.id) -ForegroundColor Yellow
+            return 'blocked'
+        }
+
+        # Deterministic + single-call gate, added 2026-08-12: closes the open question
+        # ornith-delegation.md has carried since 2026-07-28 (recurred 2026-08-03, worse) --
+        # the review pass has never once seen this same task's own critique pass output, so a
+        # draft the critique pass already correctly flagged as broken/incomplete could still
+        # win a clean vote with nothing downstream ever checking whether the revision actually
+        # addressed it. Two documented real cases: a revision that left 9 of 10 required
+        # changes untouched despite the critique naming them explicitly, and a revision that
+        # "got shorter and cut off earlier" without fixing any of five concrete problems the
+        # critique had raised. Runs ONLY when critiqueOutcome is 'issues-flagged' --
+        # 'no-issues' and 'critique-degenerate' have nothing to check compliance against.
+        if ($task.critiqueOutcome -eq 'issues-flagged') {
+            if (-not $task.revisionApplied) {
+                # No revision pass ran, or it came back degenerate -- issues were flagged and
+                # nothing was revised, so the draft is definitionally non-compliant. No
+                # Ornith call needed; this is deterministic, not a judgment call.
+                $reason = 'Deterministic gate: critique flagged real issues but no revision was applied (revision pass was skipped or came back degenerate) -- draft cannot be compliant with a critique it never attempted to address.'
+                Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+                $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-critique-noncompliance' -Force
+                $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+                Write-TaskJson $blockedPath $task
+                Remove-Item $next.FullName -Force
+                $reviewSw.Stop()
+                Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+                Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+                Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
+                Write-Host ('Auto-rejected (critique issues flagged, no revision applied, deterministic): {0}' -f $task.id) -ForegroundColor Yellow
+                return 'blocked'
+            }
+
+            # A revision was attempted -- ask a single, narrow, reasoned question: did it
+            # actually address the critique, point by point? Deliberately NOT the same
+            # 3-vote unanimous scheme as the main verdict below -- this is a factual
+            # cross-check between two texts already in hand (the critique, the final draft),
+            # not the open-ended quality judgment the main verdict makes, so it doesn't need
+            # the same vote count to be trustworthy. MinReasoningChars=20 matches the main
+            # verdict's bar so a bare marker doesn't count as a real answer here either.
+            $compliancePromptLines = [System.Collections.Generic.List[string]]::new()
+            $compliancePromptLines.Add('This task went through a critique pass that flagged real issues in an earlier draft, then a revision pass attempted to fix them. Your ONLY job here is a narrow factual cross-check -- NOT a general quality review.')
+            $compliancePromptLines.Add('')
+            $compliancePromptLines.Add(('TASK: {0}' -f $task.title))
+            $compliancePromptLines.Add('')
+            $compliancePromptLines.Add('--- CRITIQUE (issues flagged against an earlier draft) ---')
+            $compliancePromptLines.Add($task.critiqueResponse)
+            $compliancePromptLines.Add('')
+            $compliancePromptLines.Add('--- FINAL DRAFT (after the revision pass) ---')
+            $compliancePromptLines.Add($task.implementResponse)
+            $compliancePromptLines.Add('')
+            $compliancePromptLines.Add('Does the final draft above address EVERY point raised in the critique? Check each critique point individually against the final draft -- do not judge overall quality or correctness beyond the critique''s own points, only whether each flagged point was actually addressed.')
+            $compliancePromptLines.Add('Respond with EXACTLY one of these two forms, nothing else. Both require a concrete reason citing a specific critique point.')
+            $compliancePromptLines.Add('COMPLIANT: <one-sentence reason citing which critique point(s) were actually fixed>')
+            $compliancePromptLines.Add('NON_COMPLIANT: <one-sentence reason citing which specific critique point remains unaddressed>')
+            $compliancePrompt = [string]::Join("`n", $compliancePromptLines)
+
+            $complianceResult = $null
+            $complianceFailed = $false
+            try {
+                Wait-ForOrnithAvailability
+                $complianceResult = Invoke-OrnithMajorityVote -Prompt $compliancePrompt -ClassifyMarkers @('COMPLIANT', 'NON_COMPLIANT') -N 1 -MinAgreeing 1 -Temperature 0.2 -MinReasoningChars 20
+            } catch {
+                $complianceFailed = $true
+            }
+
+            # Fail closed, same philosophy the main verdict below already uses ("an unclear
+            # signal must never default to letting a task through"): a failed call, a
+            # degenerate/unreasoned response, or an explicit NON_COMPLIANT verdict all block
+            # here, without spending the full 3-vote main review on a draft this narrower,
+            # cheaper check already has reason to distrust.
+            if ($complianceFailed -or -not $complianceResult -or -not $complianceResult.verdict -or $complianceResult.verdict -eq 'NON_COMPLIANT') {
+                $sampleVote = if ($complianceResult) { ($complianceResult.votes | Select-Object -First 1) } else { $null }
+                $reason = if ($sampleVote -and $sampleVote.response -match 'NON_COMPLIANT:\s*(.+)') { 'Critique-compliance check: {0}' -f $matches[1] } elseif ($complianceFailed) { 'Critique-compliance check call failed' } else { 'Critique-compliance check inconclusive -- no confident verdict' }
+                Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
+                $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith-critique-compliance' -Force
+                $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
+                Write-TaskJson $blockedPath $task
+                Remove-Item $next.FullName -Force
+                $reviewSw.Stop()
+                Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
+                Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
+                Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'REJECTED' -Detail $reason
+                Write-Host ('Rejected (critique-compliance check): {0} ({1})' -f $task.id, $reason) -ForegroundColor Yellow
                 return 'blocked'
             }
         }
