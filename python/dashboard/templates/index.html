@@ -87,6 +87,15 @@
   .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
   .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
+  .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
+  .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .grill-msg-assistant .grill-msg-role { color: var(--accent); }
+  .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .grill-msg-user { align-self: flex-end; max-width: 85%; }
+  .grill-msg-user .grill-msg-role { text-align: right; }
+  .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }
+  .grill-session .grill-answer { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
+  .grill-enriched-badge { color: var(--ok); font-size: 12px; margin-top: 10px; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
   .priority-input { width: 60px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
@@ -1612,13 +1621,102 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button></div><div id="grill-panel"></div>`;
+    panel.querySelectorAll('.grill-start').forEach((btn) => {
+      btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
+    });
   } catch (e) {
     panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
   }
   document.querySelectorAll('#bd-browser .browser-entry[data-file]').forEach((el) => {
     el.classList.toggle('active', el.dataset.file === filePath);
   });
+}
+
+function grillRenderTranscript(transcript) {
+  const rows = transcript.map((t) => {
+    const roleLabel = t.role === 'assistant' ? 'Ornith' : 'You';
+    const cls = t.role === 'assistant' ? 'grill-msg-assistant' : 'grill-msg-user';
+    return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${escapeHtml(t.text)}</div></div>`;
+  }).join('');
+  return `<div class="field-label">Conversation</div><div class="grill-transcript">${rows}</div>`;
+}
+
+function grillRenderPanel(session) {
+  const el = document.getElementById('grill-panel');
+  if (!el) return;
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  if (session.status === 'complete') {
+    // No auto-reload-away-from-this-panel on enrich (see grillEnrich) -- the whole point
+    // of keeping the transcript scrollable and visible is so enriching doesn't lose it;
+    // reloading the note immediately would wipe this panel right when a user would most
+    // want to double-check what actually got asked/answered before the note changes.
+    const actionHtml = session.enrichedAt
+      ? `<div class="grill-enriched-badge">Enriched ✓ (note updated — the full conversation above is not written to the note itself, only the summary)</div><button type="button" class="secondary grill-reload" data-file="${escapeAttr(session.notePath)}">Reload Note</button>`
+      : `<button type="button" class="action grill-enrich" data-session="${escapeAttr(session.id)}">Enrich Brain</button>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Session complete</div>${transcriptHtml}${actionHtml}</div>`;
+    const enrichBtn = el.querySelector('.grill-enrich');
+    if (enrichBtn) enrichBtn.onclick = (e) => grillEnrich(session.id, e.target);
+    const reloadBtn = el.querySelector('.grill-reload');
+    if (reloadBtn) reloadBtn.onclick = () => loadSecondBrainFile(reloadBtn.dataset.file);
+  } else {
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Your answer..."></textarea><button type="button" class="action grill-submit" data-session="${escapeAttr(session.id)}">Submit Answer</button></div>`;
+    el.querySelector('.grill-submit').onclick = (e) => grillSubmitAnswer(session.id, el.querySelector('.grill-answer').value, e.target);
+  }
+  const scrollEl = el.querySelector('.grill-transcript');
+  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+async function grillStartSession(notePath, mode) {
+  const el = document.getElementById('grill-panel');
+  if (el) el.innerHTML = '<div class="empty">Starting session...</div>';
+  try {
+    const resp = await fetch('/api/second-brain/grill/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath, mode }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    grillRenderPanel(session);
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not start session: ${e.message}</div>`;
+  }
+}
+
+async function grillSubmitAnswer(sessionId, answer, btn) {
+  if (!answer || !answer.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/second-brain/grill/' + encodeURIComponent(sessionId) + '/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    grillRenderPanel(session);
+  } catch (e) {
+    alert('Could not submit answer: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Submit Answer';
+  }
+}
+
+async function grillEnrich(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Enriching...';
+  try {
+    const resp = await fetch('/api/second-brain/grill/' + encodeURIComponent(sessionId) + '/enrich', { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    grillRenderPanel(result);
+  } catch (e) {
+    alert('Could not enrich note: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Enrich Brain';
+  }
 }
 
 async function enterBrainDumpTab() {
