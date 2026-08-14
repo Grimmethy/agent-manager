@@ -1612,7 +1612,7 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me (Matt P.)</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs (Matt P.)</button></div><div id="grill-panel"></div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button></div><div id="grill-panel"></div>`;
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
