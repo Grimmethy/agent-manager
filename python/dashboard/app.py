@@ -1068,6 +1068,62 @@ def api_second_brain_sync_github_projects():
     return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
 
 
+@app.route("/api/second-brain/grill/start", methods=["POST"])
+def api_second_brain_grill_start():
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    note_path = (body.get("notePath") or "").strip()
+    mode = body.get("mode")
+    source_url = body.get("sourceUrl")
+    if not note_path or mode not in ("grill-me", "grill-with-docs"):
+        abort(400, description="notePath and a valid mode ('grill-me' or 'grill-with-docs') are required")
+    from grill_sessions import start_session
+    session = start_session(root, note_path, mode, source_url)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>/answer", methods=["POST"])
+def api_second_brain_grill_answer(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    answer = (body.get("answer") or "").strip()
+    if not answer:
+        abort(400, description="answer is required")
+    from grill_sessions import submit_answer
+    session = submit_answer(root, session_id, answer)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>", methods=["GET"])
+def api_second_brain_grill_get(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    from grill_sessions import get_session
+    session = get_session(root, session_id)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>/enrich", methods=["POST"])
+def api_second_brain_grill_enrich(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    from grill_sessions import enrich_note
+    session = enrich_note(root, session_id)
+    if not session:
+        abort(404, description="session not found or not complete")
+    return jsonify(session)
+
+
 def _slugify_project_name(stem: str) -> str:
     """Note filename (no .md) -> filesystem/repo-friendly name: spaces to hyphens, strip
     anything that isn't alphanumeric/hyphen/underscore. Deliberately NOT lowercased --
