@@ -11,6 +11,16 @@ from pathlib import Path
 
 from ollama_client import generate
 
+# Hard cap on user answers per session -- confirmed live 2026-08-14: without an enforced
+# limit, a real session (pci-ai-accelerators.md) ran to 73 turns and counting, still
+# active, because the prompt's own "roughly 4-6 exchanges" instruction is a soft
+# suggestion the model kept finding reasons not to follow -- each answer honestly did
+# prompt a good, on-topic follow-up (the conversation never degraded in quality, it just
+# never stopped). A soft prompt hint alone is not a real constraint against a model that
+# is, if anything, TOO good at finding the next interesting question. This is enforced in
+# code below, not left to the model's judgment.
+MAX_EXCHANGES = 6
+
 
 def grill_sessions_path(second_brain_dir: Path) -> Path:
     return second_brain_dir / ".agent-manager-grill-sessions.json"
@@ -30,7 +40,7 @@ def _write_sessions(second_brain_dir: Path, sessions: dict):
     grill_sessions_path(second_brain_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
-def _build_prompt(note_content: str, mode: str, source_url, transcript: list) -> str:
+def _build_prompt(note_content: str, mode: str, source_url, transcript: list, force_complete: bool = False) -> str:
     lines = []
     if mode == "grill-with-docs" and source_url:
         lines.append(
@@ -52,18 +62,31 @@ def _build_prompt(note_content: str, mode: str, source_url, transcript: list) ->
             role = "You" if turn["role"] == "assistant" else "User"
             lines.append(f"{role}: {turn['text']}")
         lines.append("")
-    lines.append(
-        "Ask ONE focused question at a time, Socratic style -- don't lecture. If the user's last "
-        "answer was strong, briefly affirm why, then ask a deeper follow-up. If it was weak or "
-        "missing, offer a gentle hint and re-ask. After a genuinely thorough back-and-forth (roughly "
-        "4-6 solid exchanges), instead of another question, respond with:\n"
-        "STATUS: COMPLETE\n"
-        "SUMMARY: <2-4 sentences on what the user now demonstrably understands, written as durable "
-        "notes to append to their second brain>\n"
-        "Otherwise, always start your response with:\n"
-        "STATUS: CONTINUE\n"
-        "QUESTION: <your next question>"
-    )
+    if force_complete:
+        # Backstop for the MAX_EXCHANGES cap in submit_answer -- that cap is enforced in
+        # code regardless of what the model says, but a prompt that still asks for another
+        # question here would just get its question thrown away, wasting the call. Ask for
+        # the real thing directly instead.
+        lines.append(
+            "This is the FINAL exchange of this session -- do not ask another question, no "
+            "matter how promising a follow-up seems. Respond with EXACTLY:\n"
+            "STATUS: COMPLETE\n"
+            "SUMMARY: <2-4 sentences on what the user now demonstrably understands, written as "
+            "durable notes to append to their second brain>"
+        )
+    else:
+        lines.append(
+            "Ask ONE focused question at a time, Socratic style -- don't lecture. If the user's last "
+            "answer was strong, briefly affirm why, then ask a deeper follow-up. If it was weak or "
+            "missing, offer a gentle hint and re-ask. After a genuinely thorough back-and-forth (roughly "
+            "4-6 solid exchanges), instead of another question, respond with:\n"
+            "STATUS: COMPLETE\n"
+            "SUMMARY: <2-4 sentences on what the user now demonstrably understands, written as durable "
+            "notes to append to their second brain>\n"
+            "Otherwise, always start your response with:\n"
+            "STATUS: CONTINUE\n"
+            "QUESTION: <your next question>"
+        )
     return "\n".join(lines)
 
 
@@ -111,11 +134,19 @@ def submit_answer(second_brain_dir: Path, session_id: str, answer: str):
     note_content = note_file.read_text(encoding="utf-8") if note_file.is_file() else ""
 
     session["transcript"].append({"role": "user", "text": answer})
+    user_turns = sum(1 for t in session["transcript"] if t["role"] == "user")
+    force_complete = user_turns >= MAX_EXCHANGES
     result = generate(
-        _build_prompt(note_content, session["mode"], session.get("sourceUrl"), session["transcript"]),
+        _build_prompt(note_content, session["mode"], session.get("sourceUrl"), session["transcript"], force_complete=force_complete),
         think=False, temperature=0.5, num_predict=500,
     )
     parsed = _parse_response(result["response"])
+    # Hard enforcement: once the cap is reached, this session ends on this turn regardless
+    # of what the model actually said -- the force_complete prompt above is a strong hint,
+    # not a guarantee, and "a hint alone doesn't reliably stop it" is the exact failure
+    # this cap exists to fix (see MAX_EXCHANGES's own comment).
+    if force_complete:
+        parsed["complete"] = True
     session["transcript"].append({"role": "assistant", "text": parsed["text"]})
     if parsed["complete"]:
         session["status"] = "complete"
