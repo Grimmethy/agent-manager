@@ -1657,18 +1657,15 @@ function grillRenderPanel(session) {
   if (!el) return;
   const transcriptHtml = grillRenderTranscript(session.transcript);
   if (session.status === 'complete') {
-    // No auto-reload-away-from-this-panel on enrich (see grillEnrich) -- the whole point
-    // of keeping the transcript scrollable and visible is so enriching doesn't lose it;
-    // reloading the note immediately would wipe this panel right when a user would most
-    // want to double-check what actually got asked/answered before the note changes.
+    // grillEnrich refreshes the note-content readout in place automatically -- no manual
+    // reload step needed (previously required navigating away and back, or a separate
+    // "Reload Note" click, to see the appended summary at all).
     const actionHtml = session.enrichedAt
-      ? `<div class="grill-enriched-badge">Enriched ✓ (note updated — the full conversation above is not written to the note itself, only the summary)</div><button type="button" class="secondary grill-reload" data-file="${escapeAttr(session.notePath)}">Reload Note</button>`
+      ? `<div class="grill-enriched-badge">Enriched ✓ (note updated — the full conversation above is not written to the note itself, only the summary)</div>`
       : `<button type="button" class="action grill-enrich" data-session="${escapeAttr(session.id)}">Enrich Brain</button>`;
     el.innerHTML = `<div class="grill-session"><div class="field-label">Session complete</div>${transcriptHtml}${actionHtml}</div>`;
     const enrichBtn = el.querySelector('.grill-enrich');
     if (enrichBtn) enrichBtn.onclick = (e) => grillEnrich(session.id, e.target);
-    const reloadBtn = el.querySelector('.grill-reload');
-    if (reloadBtn) reloadBtn.onclick = () => loadSecondBrainFile(reloadBtn.dataset.file);
   } else {
     el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Your answer..."></textarea><button type="button" class="action grill-submit" data-session="${escapeAttr(session.id)}">Submit Answer</button></div>`;
     el.querySelector('.grill-submit').onclick = (e) => grillSubmitAnswer(session.id, el.querySelector('.grill-answer').value, e.target);
@@ -1738,6 +1735,18 @@ async function grillEnrich(sessionId, btn) {
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
     grillRenderPanel(result);
+    // Refresh the note-content readout in place so the newly-appended summary shows up
+    // immediately -- previously this required navigating away and back (or a separate
+    // manual "Reload Note" click) to see any change at all. Only the note-content div is
+    // touched, not the whole panel, so the transcript/enriched-badge just rendered above
+    // stays put.
+    if (result.notePath) {
+      try {
+        const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(result.notePath));
+        const noteContentEl = document.querySelector('#bd-file-panel .note-content');
+        if (noteContentEl) noteContentEl.textContent = data.content;
+      } catch (e) { /* best-effort -- enrich itself already succeeded; a failed refresh here just leaves the readout stale until the note is reopened */ }
+    }
   } catch (e) {
     alert('Could not enrich note: ' + e.message);
     btn.disabled = false;
