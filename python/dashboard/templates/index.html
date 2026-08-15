@@ -1625,6 +1625,16 @@ async function loadSecondBrainFile(filePath) {
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
+    // Surface an existing session for this note instead of leaving grill-panel empty and
+    // silently letting the next Grill Me click start a fresh one next to it -- confirmed
+    // live 2026-08-14: nothing was ever actually lost (every session persists correctly
+    // in .agent-manager-grill-sessions.json), but with no UI ever checking for or showing
+    // prior work, a completed-but-not-yet-enriched session was invisible the moment you
+    // navigated away and back.
+    try {
+      const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(filePath));
+      if (existing) grillRenderPanel(existing);
+    } catch (e) { /* best-effort -- a missing/unreadable sessions file just means no prior session to show */ }
   } catch (e) {
     panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
   }
@@ -1669,6 +1679,22 @@ function grillRenderPanel(session) {
 
 async function grillStartSession(notePath, mode) {
   const el = document.getElementById('grill-panel');
+  // Don't silently start a second session next to one already sitting there -- a
+  // completed-but-not-enriched (or still-active) session for this exact note+mode is
+  // real, persisted work; starting fresh should be a deliberate choice, not an accident
+  // of clicking the wrong button after navigating back to a note.
+  try {
+    const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(notePath));
+    if (existing && existing.mode === mode) {
+      const already = existing.status === 'complete'
+        ? (existing.enrichedAt ? 'a completed, already-enriched session' : 'a completed session that has not been enriched yet')
+        : 'a session already in progress';
+      if (!confirm(`This note has ${already} (${existing.transcript.length} messages). Start a brand new session anyway? (The existing one is kept, not deleted.)`)) {
+        grillRenderPanel(existing);
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- if it fails, fall through to starting normally */ }
   if (el) el.innerHTML = '<div class="empty">Starting session...</div>';
   try {
     const resp = await fetch('/api/second-brain/grill/start', {
