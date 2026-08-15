@@ -1068,6 +1068,22 @@ def api_second_brain_sync_github_projects():
     return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
 
 
+@app.route("/api/second-brain/grill/for-note", methods=["GET"])
+def api_second_brain_grill_for_note():
+    """Most recent existing session for this note, so the frontend can surface
+    already-completed-but-un-enriched (or still-active) work instead of silently letting
+    Grill Me start a fresh session next to it every time the note is reopened."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    note_path = (request.args.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    from grill_sessions import latest_session_for_note
+    session = latest_session_for_note(root, note_path)
+    return jsonify(session)
+
+
 @app.route("/api/second-brain/grill/start", methods=["POST"])
 def api_second_brain_grill_start():
     root = second_brain_dir()
