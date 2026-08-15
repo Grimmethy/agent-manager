@@ -1667,8 +1667,19 @@ function grillRenderPanel(session) {
     const enrichBtn = el.querySelector('.grill-enrich');
     if (enrichBtn) enrichBtn.onclick = (e) => grillEnrich(session.id, e.target);
   } else {
-    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Your answer..."></textarea><button type="button" class="action grill-submit" data-session="${escapeAttr(session.id)}">Submit Answer</button></div>`;
-    el.querySelector('.grill-submit').onclick = (e) => grillSubmitAnswer(session.id, el.querySelector('.grill-answer').value, e.target);
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Your answer... (Enter to send, Shift+Enter for a new line)"></textarea><button type="button" class="action grill-submit" data-session="${escapeAttr(session.id)}">Submit Answer</button></div>`;
+    const answerEl = el.querySelector('.grill-answer');
+    const submitBtn = el.querySelector('.grill-submit');
+    submitBtn.onclick = (e) => grillSubmitAnswer(session.id, answerEl.value, e.target);
+    // Enter sends, Shift+Enter inserts a newline (the browser's own default for a plain
+    // Enter in a textarea is also a newline -- only intercept the un-modified case).
+    answerEl.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        grillSubmitAnswer(session.id, answerEl.value, submitBtn);
+      }
+    };
+    answerEl.focus();
   }
   const scrollEl = el.querySelector('.grill-transcript');
   if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
