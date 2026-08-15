@@ -161,6 +161,22 @@ def get_session(second_brain_dir: Path, session_id: str):
     return _read_sessions(second_brain_dir).get(session_id)
 
 
+def latest_session_for_note(second_brain_dir: Path, note_path: str, mode: str = None):
+    """Most recently started session for this note (optionally filtered to one mode),
+    or None if this note has never been grilled. Confirmed live 2026-08-14: nothing was
+    ever lost -- every session was always persisted correctly -- but the UI never checked
+    for or surfaced an existing session before starting a new one, so a completed,
+    un-enriched session was invisible the moment you navigated away and back, and clicking
+    Grill Me again silently started a fresh session next to it rather than resuming or
+    even mentioning it existed."""
+    sessions = _read_sessions(second_brain_dir)
+    candidates = [s for s in sessions.values() if s.get("notePath") == note_path and (mode is None or s.get("mode") == mode)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
+    return candidates[0]
+
+
 def enrich_note(second_brain_dir: Path, session_id: str):
     sessions = _read_sessions(second_brain_dir)
     session = sessions.get(session_id)
