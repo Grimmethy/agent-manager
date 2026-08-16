@@ -267,3 +267,34 @@ function Write-HeartbeatFile {
     if ($StartedAt) { $hb.startedAt = $StartedAt }
     [System.IO.File]::WriteAllText($hbPath, ($hb | ConvertTo-Json -Depth 10))
 }
+
+# Startup liveness check -- Bash port: scripts/agent-manager-common.sh's
+# check_instance_liveness, see its own comment for the full rationale (adapted from
+# taskmesh's dead-worker detection + taskforge's lease-must-exceed-heartbeat principle,
+# scouted-repo survey 2026-08-16). Refuses to start under an InstanceId a DIFFERENT,
+# still-alive process already holds -- the exact duplicate-instance race CONTEXT.md's
+# "Duplicate instance" entry describes (manual restart racing queue-watchdog's automatic
+# one), watched happen live on the Bash side this session. A stale heartbeat (older than
+# 3x this daemon's own tick interval) or a dead PID means the previous holder is gone --
+# takeover proceeds normally, logged rather than refusing forever on an abandoned file.
+function Test-InstanceLiveness {
+    param([string]$InstanceId, [int]$TickSecs = 30)
+    $hbPath = Join-Path $InstancesDir ($InstanceId + '.json')
+    if (-not (Test-Path $hbPath)) { return $true }
+
+    try {
+        $hb = [System.IO.File]::ReadAllText($hbPath) | ConvertFrom-Json
+    } catch {
+        return $true  # unreadable/corrupt heartbeat -- treat as abandoned, not a live holder.
+    }
+    if (-not $hb.pid -or $hb.pid -eq $PID) { return $true }
+
+    $otherProcess = Get-Process -Id $hb.pid -ErrorAction SilentlyContinue
+    if (-not $otherProcess) { return $true }  # PID not running -- previous holder is gone.
+
+    $ageSec = ((Get-Date) - [datetime]$hb.lastHeartbeat).TotalSeconds
+    if ($ageSec -gt ($TickSecs * 3)) { return $true }  # stale -- previous holder is gone.
+
+    Write-Host ("[{0}] refusing to start: {1} is already claimed by live pid {2} (heartbeat within {3}s) -- exiting instead of duplicating it. If that process is actually gone, delete {1} and retry." -f $InstanceId, $hbPath, $hb.pid, ($TickSecs * 3)) -ForegroundColor Red
+    return $false
+}

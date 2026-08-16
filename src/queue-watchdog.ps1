@@ -18,6 +18,13 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 . (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
 
+# Refuse to start if a live process already holds this InstanceId -- see
+# agent-manager-common.ps1's Test-InstanceLiveness for the full rationale. Applies to the
+# watchdog's OWN identity here -- distinct from (and unrelated to) the dead-PROCESS restart
+# logic this same daemon runs later for the OTHER daemons. 30s is a safe floor well above
+# $CheckIntervalSeconds (defined below, default 10s).
+if (-not (Test-InstanceLiveness -InstanceId 'queue-watchdog' -TickSecs 30)) { exit 1 }
+
 # Two jobs, deliberately in ONE script -- "is this task actually stuck" answered in one
 # place:
 #

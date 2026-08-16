@@ -153,3 +153,55 @@ write_heartbeat_file() {
     fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
   ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "$$"
 }
+
+# Startup liveness check -- adapted from taskmesh's dead-worker detection
+# (detectDeadWorkers: check lastHeartbeat against a timeout, mark DEAD, recover) and
+# taskforge's companion principle that a lease must comfortably exceed the heartbeat
+# interval (scouted-repo survey, 2026-08-16). Refuses to start under an instanceId a
+# DIFFERENT, still-alive process already holds, instead of silently overwriting its
+# heartbeat and creating a duplicate claimant -- exactly CONTEXT.md's "Duplicate
+# instance" entry ("two or more processes sharing the same instanceId... root-caused
+# but not yet fixed in code as of 2026-07-19"), watched happen live this session: an
+# EPIPE crash auto-restarted ornith-worker.sh worker-1 while a second worker-1 was
+# ALSO started manually, both racing to write instances/worker-1.json and claim from
+# the same drafting/worker-1/ folder. write_heartbeat_file (above) still writes
+# unconditionally on every tick -- this is a one-time gate at startup only, before the
+# main loop's first claim, not a per-tick check (a per-tick check can't prevent the
+# race that matters: the SECOND process's first claim, which happens before its first
+# heartbeat write).
+#
+# A stale heartbeat (older than 3x this daemon's own tick interval -- comfortably more
+# than one missed tick, matching taskforge's "lease must exceed heartbeat" ratio) or a
+# dead pid means the previous holder is gone, not still alive -- takeover proceeds
+# normally (logged, not silent) rather than refusing forever on an abandoned file.
+check_instance_liveness() {
+  local instance_id="$1" tick_secs="${2:-30}"
+  local hb_path="${INSTANCES_DIR}/${instance_id}.json"
+  [[ -f "$hb_path" ]] || return 0
+
+  local stale_secs=$(( tick_secs * 3 ))
+  local other_pid
+  other_pid="$(node -e '
+    const fs = require("fs");
+    const [hbPath, myPid, staleSecs] = process.argv.slice(1);
+    let hb;
+    try { hb = JSON.parse(fs.readFileSync(hbPath, "utf8")); } catch { process.exit(0); }
+    if (!hb || !hb.pid || String(hb.pid) === myPid) process.exit(0);
+    let alive = true;
+    try { process.kill(hb.pid, 0); } catch { alive = false; }
+    if (!alive) process.exit(0);
+    const ageMs = Date.now() - new Date(hb.lastHeartbeat || 0).getTime();
+    if (!(ageMs <= Number(staleSecs) * 1000)) process.exit(0);
+    // Still alive and recently heard from -- print its pid (stdout) and signal via exit 1.
+    console.log(hb.pid);
+    process.exit(1);
+  ' "$hb_path" "$$" "$stale_secs")"
+  local rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    printf '[%s] refusing to start: instances/%s.json is already claimed by live pid %s (heartbeat within %ss) -- exiting instead of duplicating it. If that process is actually gone (e.g. the machine crashed without cleanup), delete %s and retry.\n' \
+      "$instance_id" "$instance_id" "$other_pid" "$stale_secs" "$hb_path" >&2
+    return 1
+  fi
+  return 0
+}
