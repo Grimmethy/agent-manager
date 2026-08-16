@@ -1,0 +1,1 @@
+AGENT_MANAGER_REPO_ROOT="${AGENT_MANAGER_REPO_ROOT:-\${SCRIPT_DIR}/..}"                                  # resolve repo root from script location (works whether invoked via relative or absolute path, same result as $PSScriptRoot on PowerShell).  

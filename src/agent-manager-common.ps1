@@ -11,6 +11,15 @@
 # definition time), exactly as they already did before being copy-pasted into every
 # script. Nothing about how they're called changes.
 
+# Sentinel dir resolution mirrors QueueDir/InstancesDir pattern: $env:SENTINELS_DIR if
+# set (in agent-manager.env or on caller), otherwise "$PipelineDir/sentinel" default.
+$SentinelsDir = if ($env:SENTINELS_DIR) { $env:SENTINELS_DIR } else { "$PipelineDir\sentinel" }
+
+# Grace period (seconds) before the watchdog force-stops orchestrators during Stop-Pipeline.
+# Default 90 matches current watchdog's "stale-worker" threshold which is what was already
+# chosen by observation; overrides via AGENT_MANAGER_STOP_GRACE_SEC env var for operator control.
+$_StopGraceSec = if ($env:AGENT_MANAGER_STOP_GRACE_SEC -and $env:AGENT_MANAGER_STOP_GRACE_SEC -match '^\d+$') { [int]$env:AGENT_MANAGER_STOP_GRACE_SEC } else { 90 }
+
 # Best-effort DB mirror -- a CONSUMER-owned script (e.g. agent-task-db.js), not part of
 # this package, living in the consumer's own pipeline dir alongside its queue/instances
 # data. The filesystem queue is the working state; a DB row (if the consumer has one) is

@@ -62,6 +62,8 @@
   button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.action:disabled { opacity: .5; cursor: not-allowed; }
   button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.danger:disabled { opacity: .5; cursor: not-allowed; }
   .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
@@ -87,6 +89,15 @@
   .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
   .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
+  .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
+  .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .grill-msg-assistant .grill-msg-role { color: var(--accent); }
+  .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .grill-msg-user { align-self: flex-end; max-width: 85%; }
+  .grill-msg-user .grill-msg-role { text-align: right; }
+  .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }
+  .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
+  .grill-enriched-badge { color: var(--ok); font-size: 12px; margin-top: 10px; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
   .priority-input { width: 60px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
@@ -148,6 +159,12 @@ let browsePath = '';
 let browserOpen = false;
 let historyOpen = false;
 let projectStatusInterval = null;
+// Tracks which click this is on the Start/Stop/Force-Stop toggle button while the
+// pipeline is running: false = not yet clicked (button reads "Stop Pipeline"), true =
+// a graceful stop was already requested and is in flight (button reads "Force Stop
+// Pipeline" so a stuck daemon can be killed without waiting out the grace period).
+// Reset to false whenever the pipeline is confirmed not running.
+let stopRequested = false;
 let projectHistory = [];
 
 // Brain Dump tab state -- same "own render lifecycle, not the generic 5s cycle" reasoning
@@ -156,6 +173,23 @@ let projectHistory = [];
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
 let brainDumpEntriesInterval = null;
+
+// Single choke point for every place that changes which project is active (typed input,
+// History panel, Browse panel, and the server-sync in refreshPipelineStatus). grepDirs is
+// scoped to whichever project it was typed for -- carrying it over to a different path is
+// exactly how "none of the given grepDirs exist under this path" happens (e.g. a leftover
+// "frontend/src, backend/src" from a prior project, or here, a stale value that happened to
+// equal the old project's own folder name).
+function setProjectPath(newPath) {
+  if (newPath !== projectPath) {
+    grepDirs = '';
+    localStorage.setItem('agentManagerGrepDirs', '');
+    const grepInput = document.getElementById('project-grepdirs-input');
+    if (grepInput) grepInput.value = '';
+  }
+  projectPath = newPath;
+  localStorage.setItem('agentManagerProjectPath', projectPath);
+}
 
 // Retrofits #project-path-input into a searchable dropdown of previously-loaded
 // projects via a native <datalist> -- typing filters/suggests past paths, picking one
@@ -194,8 +228,7 @@ function renderHistoryPanel() {
   `).join('');
   panel.querySelectorAll('[data-select]').forEach((el) => {
     el.onclick = () => {
-      projectPath = el.dataset.select;
-      localStorage.setItem('agentManagerProjectPath', projectPath);
+      setProjectPath(el.dataset.select);
       document.getElementById('project-path-input').value = projectPath;
       lastRenderedStatusKey = null;
       historyOpen = false;
@@ -942,8 +975,7 @@ async function enterProjectTab() {
   try {
     const status = await fetchJson('/api/pipeline/status');
     if (status.activeRepoRoot && status.activeRepoRoot !== projectPath) {
-      projectPath = status.activeRepoRoot;
-      localStorage.setItem('agentManagerProjectPath', projectPath);
+      setProjectPath(status.activeRepoRoot);
     }
     // Same reasoning as the path sync above: reflect whatever's actually configured
     // server-side (env file / another tab / launch.bat) rather than only ever showing
@@ -990,8 +1022,7 @@ async function enterProjectTab() {
   `;
   lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
   document.getElementById('project-path-input').addEventListener('change', (e) => {
-    projectPath = e.target.value.trim();
-    localStorage.setItem('agentManagerProjectPath', projectPath);
+    setProjectPath(e.target.value.trim());
     lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
     refreshProjectStatus();
   });
@@ -1051,34 +1082,42 @@ async function refreshPipelineStatus() {
         <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong> (${escapeHtml(applyLabel)})</span>
         <span class="badge ok">RUNNING</span>
       </div>
-      <div class="meta"><button class="secondary" id="stop-pipeline-btn" style="margin-top:8px">Stop Pipeline</button></div>
-    `;
-    document.getElementById('stop-pipeline-btn').onclick = stopPipeline;
-  } else if (status.activeRepoRoot) {
-    panel.innerHTML = `
-      <div class="row">
-        <span>Last configured project: <strong>${escapeHtml(status.activeRepoRoot)}</strong></span>
-        <span class="badge idle">NOT RUNNING</span>
-      </div>
-      <div class="meta">Browse to a folder above (or reuse this one) and click Start Pipeline.</div>
     `;
   } else {
-    panel.innerHTML = `<div class="row"><span>No project configured yet.</span><span class="badge idle">IDLE</span></div>`;
+    stopRequested = false; // confirmed not running -- next click on the toggle starts fresh, not a stray "force stop"
+    if (status.activeRepoRoot) {
+      panel.innerHTML = `
+        <div class="row">
+          <span>Last configured project: <strong>${escapeHtml(status.activeRepoRoot)}</strong></span>
+          <span class="badge idle">NOT RUNNING</span>
+        </div>
+        <div class="meta">Browse to a folder above (or reuse this one) and click Start Pipeline.</div>
+      `;
+    } else {
+      panel.innerHTML = `<div class="row"><span>No project configured yet.</span><span class="badge idle">IDLE</span></div>`;
+    }
   }
 
-  // "Start Pipeline" lives next to the path input itself, not in this panel, since it
-  // acts on whatever's currently in the input -- only show/enable it when nothing is
-  // already running and a path is actually entered.
+  // Single button, reused for Start/Stop/Force Stop rather than a separate button per
+  // state -- lives next to the path input, not in the panel above, since Start acts on
+  // whatever's currently in that input.
   let startBtn = document.getElementById('start-pipeline-btn');
   if (!startBtn) {
     startBtn = document.createElement('button');
     startBtn.id = 'start-pipeline-btn';
+    document.querySelector('.path-row').appendChild(startBtn);
+  }
+  if (status.running) {
+    startBtn.className = 'danger';
+    startBtn.disabled = false;
+    startBtn.textContent = stopRequested ? 'Force Stop Pipeline' : 'Stop Pipeline';
+    startBtn.onclick = stopRequested ? forceStopPipeline : stopPipeline;
+  } else {
     startBtn.className = 'action';
     startBtn.textContent = 'Start Pipeline';
     startBtn.onclick = startPipeline;
-    document.querySelector('.path-row').appendChild(startBtn);
+    startBtn.disabled = !projectPath;
   }
-  startBtn.disabled = status.running || !projectPath;
 }
 
 async function startPipeline() {
@@ -1097,19 +1136,49 @@ async function startPipeline() {
   } catch (e) {
     alert('Could not start pipeline: ' + e.message);
   }
-  btn.textContent = 'Start Pipeline';
   await loadProjectHistory();
   await refreshPipelineStatus();
 }
 
+// First click on the toggle while running: request a graceful stop (SIGTERM, each daemon
+// finishes its current tick per its own trap, grace period, then SIGKILL stragglers --
+// see stop.sh). The server backgrounds this and returns immediately, so the button flips
+// to "Force Stop Pipeline" right away rather than sitting on "Stopping..." for up to the
+// full grace period -- the next status poll reports actually-stopped once daemons exit.
 async function stopPipeline() {
-  const btn = document.getElementById('stop-pipeline-btn');
+  stopRequested = true;
+  const btn = document.getElementById('start-pipeline-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Stopping...'; }
   try {
-    await fetch('/api/pipeline/stop', { method: 'POST' });
+    await fetch('/api/pipeline/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: false }),
+    });
   } catch (e) {
     alert('Could not stop pipeline: ' + e.message);
   }
+  await refreshPipelineStatus();
+}
+
+// Second click on the toggle (after a graceful stop is already in flight): SIGKILL
+// immediately, no grace-period wait, for a daemon that's stuck (wedged mid model-call,
+// ignoring its own trap). Resets stopRequested regardless of outcome so a still-running
+// pipeline (the force call itself failed) offers a fresh graceful attempt rather than
+// getting stuck only ever offering force.
+async function forceStopPipeline() {
+  const btn = document.getElementById('start-pipeline-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Force stopping...'; }
+  try {
+    await fetch('/api/pipeline/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: true }),
+    });
+  } catch (e) {
+    alert('Could not force-stop pipeline: ' + e.message);
+  }
+  stopRequested = false;
   await refreshPipelineStatus();
 }
 
@@ -1139,8 +1208,7 @@ async function loadBrowsePanel() {
     });
     panel.querySelectorAll('[data-select]').forEach(el => {
       el.onclick = () => {
-        projectPath = el.dataset.select;
-        localStorage.setItem('agentManagerProjectPath', projectPath);
+        setProjectPath(el.dataset.select);
         document.getElementById('project-path-input').value = projectPath;
         lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
         browserOpen = false;
@@ -1489,8 +1557,27 @@ async function loadSecondBrainBrowser() {
   try {
     data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
   } catch (e) {
-    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
-    return;
+    // brainDumpBrowsePath is persisted in localStorage across sessions -- a folder it
+    // points at can legitimately stop existing between visits (renamed, merged, deleted
+    // outside the dashboard entirely, e.g. by hand or by another tool), which otherwise
+    // permanently wedges this panel on a dead 404 with no way back short of clearing
+    // localStorage yourself. Confirmed live 2026-08-16: the "projects"/"Projects"
+    // case-duplicate folders got merged, and a browser that had "projects" saved from
+    // before the merge 404'd here forever after. Fall back to root once rather than
+    // leaving a stale path permanently wedged.
+    if (brainDumpBrowsePath !== '') {
+      brainDumpBrowsePath = '';
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
+      try {
+        data = await fetchJson('/api/second-brain/browse?path=');
+      } catch (e2) {
+        panel.innerHTML = `<div class="empty">Could not browse: ${e2.message}</div>`;
+        return;
+      }
+    } else {
+      panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+      return;
+    }
   }
 
   if (!data.configured) {
@@ -1612,13 +1699,148 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button></div><div id="grill-panel"></div>`;
+    panel.querySelectorAll('.grill-start').forEach((btn) => {
+      btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
+    });
+    // Surface an existing session for this note instead of leaving grill-panel empty and
+    // silently letting the next Grill Me click start a fresh one next to it -- confirmed
+    // live 2026-08-14: nothing was ever actually lost (every session persists correctly
+    // in .agent-manager-grill-sessions.json), but with no UI ever checking for or showing
+    // prior work, a completed-but-not-yet-enriched session was invisible the moment you
+    // navigated away and back.
+    try {
+      const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(filePath));
+      if (existing) grillRenderPanel(existing);
+    } catch (e) { /* best-effort -- a missing/unreadable sessions file just means no prior session to show */ }
   } catch (e) {
     panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
   }
   document.querySelectorAll('#bd-browser .browser-entry[data-file]').forEach((el) => {
     el.classList.toggle('active', el.dataset.file === filePath);
   });
+}
+
+function grillRenderTranscript(transcript) {
+  const rows = transcript.map((t) => {
+    const roleLabel = t.role === 'assistant' ? 'Ornith' : 'You';
+    const cls = t.role === 'assistant' ? 'grill-msg-assistant' : 'grill-msg-user';
+    return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${escapeHtml(t.text)}</div></div>`;
+  }).join('');
+  return `<div class="field-label">Conversation</div><div class="grill-transcript">${rows}</div>`;
+}
+
+function grillRenderPanel(session) {
+  const el = document.getElementById('grill-panel');
+  if (!el) return;
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  if (session.status === 'complete') {
+    // grillEnrich refreshes the note-content readout in place automatically -- no manual
+    // reload step needed (previously required navigating away and back, or a separate
+    // "Reload Note" click, to see the appended summary at all).
+    const actionHtml = session.enrichedAt
+      ? `<div class="grill-enriched-badge">Enriched ✓ (note updated — the full conversation above is not written to the note itself, only the summary)</div>`
+      : `<button type="button" class="action grill-enrich" data-session="${escapeAttr(session.id)}">Enrich Brain</button>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Session complete</div>${transcriptHtml}${actionHtml}</div>`;
+    const enrichBtn = el.querySelector('.grill-enrich');
+    if (enrichBtn) enrichBtn.onclick = (e) => grillEnrich(session.id, e.target);
+  } else {
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Your answer... (Enter to send, Shift+Enter for a new line)"></textarea><button type="button" class="action grill-submit" data-session="${escapeAttr(session.id)}">Submit Answer</button></div>`;
+    const answerEl = el.querySelector('.grill-answer');
+    const submitBtn = el.querySelector('.grill-submit');
+    submitBtn.onclick = (e) => grillSubmitAnswer(session.id, answerEl.value, e.target);
+    // Enter sends, Shift+Enter inserts a newline (the browser's own default for a plain
+    // Enter in a textarea is also a newline -- only intercept the un-modified case).
+    answerEl.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        grillSubmitAnswer(session.id, answerEl.value, submitBtn);
+      }
+    };
+    answerEl.focus();
+  }
+  const scrollEl = el.querySelector('.grill-transcript');
+  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+async function grillStartSession(notePath, mode) {
+  const el = document.getElementById('grill-panel');
+  // Don't silently start a second session next to one already sitting there -- a
+  // completed-but-not-enriched (or still-active) session for this exact note+mode is
+  // real, persisted work; starting fresh should be a deliberate choice, not an accident
+  // of clicking the wrong button after navigating back to a note.
+  try {
+    const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(notePath));
+    if (existing && existing.mode === mode) {
+      const already = existing.status === 'complete'
+        ? (existing.enrichedAt ? 'a completed, already-enriched session' : 'a completed session that has not been enriched yet')
+        : 'a session already in progress';
+      if (!confirm(`This note has ${already} (${existing.transcript.length} messages). Start a brand new session anyway? (The existing one is kept, not deleted.)`)) {
+        grillRenderPanel(existing);
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- if it fails, fall through to starting normally */ }
+  if (el) el.innerHTML = '<div class="empty">Starting session...</div>';
+  try {
+    const resp = await fetch('/api/second-brain/grill/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath, mode }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    grillRenderPanel(session);
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not start session: ${e.message}</div>`;
+  }
+}
+
+async function grillSubmitAnswer(sessionId, answer, btn) {
+  if (!answer || !answer.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/second-brain/grill/' + encodeURIComponent(sessionId) + '/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    grillRenderPanel(session);
+  } catch (e) {
+    alert('Could not submit answer: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Submit Answer';
+  }
+}
+
+async function grillEnrich(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Enriching...';
+  try {
+    const resp = await fetch('/api/second-brain/grill/' + encodeURIComponent(sessionId) + '/enrich', { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    grillRenderPanel(result);
+    // Refresh the note-content readout in place so the newly-appended summary shows up
+    // immediately -- previously this required navigating away and back (or a separate
+    // manual "Reload Note" click) to see any change at all. Only the note-content div is
+    // touched, not the whole panel, so the transcript/enriched-badge just rendered above
+    // stays put.
+    if (result.notePath) {
+      try {
+        const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(result.notePath));
+        const noteContentEl = document.querySelector('#bd-file-panel .note-content');
+        if (noteContentEl) noteContentEl.textContent = data.content;
+      } catch (e) { /* best-effort -- enrich itself already succeeded; a failed refresh here just leaves the readout stale until the note is reopened */ }
+    }
+  } catch (e) {
+    alert('Could not enrich note: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Enrich Brain';
+  }
 }
 
 async function enterBrainDumpTab() {

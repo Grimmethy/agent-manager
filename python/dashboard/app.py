@@ -349,8 +349,13 @@ def model_stats_db_path() -> Path | None:
 
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
-    kept in sync by hand since this dashboard is Python, not Node."""
+    kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
+    agent-manager.env directly, same as get_active_repo_root(), since the dashboard is
+    often started with no env vars pre-set at all."""
     v = os.environ.get("SECOND_BRAIN_DIR")
+    if v:
+        return Path(v)
+    v = read_env_file(ENV_FILE_PATH).get("SECOND_BRAIN_DIR")
     return Path(v) if v else None
 
 
@@ -1066,6 +1071,78 @@ def api_second_brain_sync_github_projects():
 
     write_project_links(links)
     return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
+
+
+@app.route("/api/second-brain/grill/for-note", methods=["GET"])
+def api_second_brain_grill_for_note():
+    """Most recent existing session for this note, so the frontend can surface
+    already-completed-but-un-enriched (or still-active) work instead of silently letting
+    Grill Me start a fresh session next to it every time the note is reopened."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    note_path = (request.args.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    from grill_sessions import latest_session_for_note
+    session = latest_session_for_note(root, note_path)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/start", methods=["POST"])
+def api_second_brain_grill_start():
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    note_path = (body.get("notePath") or "").strip()
+    mode = body.get("mode")
+    source_url = body.get("sourceUrl")
+    if not note_path or mode not in ("grill-me", "grill-with-docs"):
+        abort(400, description="notePath and a valid mode ('grill-me' or 'grill-with-docs') are required")
+    from grill_sessions import start_session
+    session = start_session(root, note_path, mode, source_url)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>/answer", methods=["POST"])
+def api_second_brain_grill_answer(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    answer = (body.get("answer") or "").strip()
+    if not answer:
+        abort(400, description="answer is required")
+    from grill_sessions import submit_answer
+    session = submit_answer(root, session_id, answer)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>", methods=["GET"])
+def api_second_brain_grill_get(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    from grill_sessions import get_session
+    session = get_session(root, session_id)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/grill/<session_id>/enrich", methods=["POST"])
+def api_second_brain_grill_enrich(session_id):
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    from grill_sessions import enrich_note
+    session = enrich_note(root, session_id)
+    if not session:
+        abort(404, description="session not found or not complete")
+    return jsonify(session)
 
 
 def _slugify_project_name(stem: str) -> str:
@@ -1804,38 +1881,75 @@ def api_job_types_approval_mode():
     return jsonify({"name": name, "approvalMode": mode})
 
 
-def _stop_pipeline() -> list:
-    """Kills whatever the current instances/*.json heartbeats say is running, by PID --
-    same trust model queue-watchdog.ps1's own dead-process check already uses. Does NOT
-    touch anything if nothing looks like it's running, so this is safe to call even when
-    unsure. Shared by /api/pipeline/stop and _restart_pipeline()."""
-    inst_dir = instances_dir()
-    if not inst_dir or not inst_dir.is_dir():
-        return []
+def _stop_pipeline(force: bool = False) -> list:
+    """Stops whatever launch.sh/launch.bat started. On Windows, kills by PID from the
+    current instances/*.json heartbeats (same trust model queue-watchdog.ps1's own
+    dead-process check already uses) via taskkill. On Linux there is no taskkill --
+    confirmed live (2026-08-15): every call here silently no-op'd (OSError from the
+    missing binary, caught and ignored) except for deleting the heartbeat file below, so
+    Stop Pipeline in the dashboard *looked* successful (heartbeats vanished, UI showed
+    stopped) while every daemon kept running untouched in the background. Linux instead
+    shells out to scripts/stop.sh, which SIGTERMs each daemon by its launch.sh pidfile,
+    waits out a grace period for it to exit cleanly (see each daemon's own trap), and
+    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here.
 
+    force=False (the toggle button's first click) launches stop.sh in the background and
+    returns immediately -- the frontend's existing 3s status poll picks up the moment
+    daemons actually exit, and the toggle offers a force option meanwhile rather than the
+    request hanging open for up to the grace period. force=True (the toggle's second
+    click, or _restart_pipeline() which needs this to be synchronous) waits for stop.sh's
+    own --force path, which skips SIGTERM/grace entirely and SIGKILLs immediately.
+
+    Does NOT touch anything if nothing looks like it's running, so this is safe to call
+    even when unsure. Shared by /api/pipeline/stop and _restart_pipeline()."""
+    inst_dir = instances_dir()
     stopped = []
-    for f in inst_dir.glob("*.json"):
-        data = read_json_safe(f)
-        if not data or not data.get("pid"):
-            continue
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(data["pid"])], capture_output=True, timeout=10)
-            stopped.append(data.get("instanceId", str(data["pid"])))
-        except (OSError, subprocess.SubprocessError):
-            continue
-        finally:
+    if inst_dir and inst_dir.is_dir():
+        for f in inst_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and data.get("instanceId"):
+                stopped.append(data["instanceId"])
+            if os.name == "nt":
+                pid = data.get("pid") if data else None
+                if pid:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
             # Confirmed live (2026-07-22): without this, _pipeline_running()'s worker-1
             # heartbeat check kept reporting the pipeline as running for up to
             # WORKING_STALE_SECONDS (20 min) after a real, successful stop -- the killed
             # process's last-written heartbeat file just sat there looking recent, and
             # /api/pipeline/start's "already running" guard blocked a genuine restart the
-            # whole time. Remove the heartbeat regardless of whether taskkill itself
+            # whole time. Remove the heartbeat regardless of whether the kill itself
             # reported success (the process may have already been dead) -- either way,
             # this instance should no longer read as live.
             try:
                 f.unlink()
             except OSError:
                 pass
+
+    if os.name != "nt":
+        stop_sh = PACKAGE_ROOT / "scripts" / "stop.sh"
+        if stop_sh.is_file():
+            args = ["bash", str(stop_sh), "--keep-dashboard"]
+            if force:
+                args.append("--force")
+            try:
+                if force:
+                    # --force SIGKILLs immediately, no grace-period wait -- fast enough to
+                    # block on, and _restart_pipeline() needs the old daemons actually gone
+                    # before it starts new ones against the same pidfiles/queue dir.
+                    subprocess.run(args, capture_output=True, timeout=10)
+                else:
+                    # Backgrounded so this request returns immediately instead of holding
+                    # the (single-threaded dev server) connection open for up to the grace
+                    # period -- the toggle button's second click (force) needs to reach the
+                    # server promptly, not queue behind this one.
+                    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+
     return stopped
 
 
@@ -1879,7 +1993,20 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
 
     if os.name != "nt":
-        return {"started": False, "reason": "process auto-start is only implemented for Windows -- use launch.bat manually"}
+        import platform, subprocess as sp, shlex
+        LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+        launch_py = str(PACKAGE_ROOT / 'scripts' / 'launch.sh')
+        if not Path(launch_py).is_file():
+            return {"started": False, "reason": f"{launch_py} missing; cannot start daemons on Linux without a working launch script."}
+        subprocess.Popen(
+            ["bash", launch_py, "--no-browser"],
+            env=child_env,
+            cwd=str(PACKAGE_ROOT),
+            stdout=(LOG_DIR / 'launch-python.log').open('a'),
+            stderr=sp.STDOUT,
+            start_new_session=True,
+        )
+        return {"started": True, "repoRoot": raw_path}
 
     creationflags = subprocess.CREATE_NEW_CONSOLE
     scripts = [
@@ -1904,7 +2031,7 @@ def _restart_pipeline():
     raw_path = env.get("AGENT_MANAGER_REPO_ROOT", "")
     if not raw_path or not Path(raw_path).is_dir():
         return
-    _stop_pipeline()
+    _stop_pipeline(force=True)  # needs to be synchronous -- start_pipeline() below must not race a still-shutting-down daemon for the same pidfiles/queue dir
     include_apply = env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true"
     skip_push = env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true"
     _start_pipeline(raw_path, include_apply, skip_push)
@@ -1937,7 +2064,9 @@ def api_pipeline_start():
 
 @app.route("/api/pipeline/stop", methods=["POST"])
 def api_pipeline_stop():
-    return jsonify({"stopped": _stop_pipeline()})
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+    return jsonify({"stopped": _stop_pipeline(force=force)})
 
 
 if __name__ == "__main__":
