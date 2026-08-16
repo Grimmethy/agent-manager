@@ -397,6 +397,61 @@ function parseBrainDumpSortResult(implementResponse) {
   };
 }
 
+// Bare, undifferentiated filenames that give no hint what the note is actually about --
+// confirmed live 2026-08-16: Ornith filed a real note (a feature idea about brain-dump
+// job context) under plain "ideas.md", indistinguishable at a glance from any other idea
+// ever captured. Checked against the FINAL path segment's stem only (no extension) --
+// a folder named e.g. "Ideas/" is fine (that's a category), a FILE named "ideas.md" is
+// not (that's the note's own name doing zero work). Deliberately short: this is a floor
+// against the worst offenders, not a style guide -- most bad names won't match this list
+// and are expected to be caught by prompts.js's instructions instead.
+const GENERIC_FILENAME_BLOCKLIST = new Set([
+  'ideas', 'idea', 'notes', 'note', 'misc', 'miscellaneous', 'stuff', 'todo', 'todos',
+  'random', 'general', 'other', 'things', 'inbox', 'info', 'information', 'data', 'new',
+  'untitled', 'temp', 'draft', 'journal', 'log',
+]);
+
+// Rejects a proposed secondBrainPath outright (returns a reason string) rather than
+// silently accepting it -- applyBrainDumpSort treats a rejection the same as unparseable
+// JSON (entry left as 'captured', retried next tick with a fresh model call), so a bad
+// name never actually lands on disk. Two checks, both about names actively working
+// against future retrieval rather than style preference:
+//   1. the file's own basename is a bare generic word (see blocklist above) -- a name
+//      that describes nothing beyond "this is a note".
+//   2. the top-level folder is a different-case duplicate of one that already exists --
+//      the exact bug that produced both "Projects/" and "projects/" in this vault
+//      (confirmed live 2026-08-16), silently splitting one category across two folders
+//      that look identical to a human skimming the sidebar.
+// Returns null when the path is fine.
+function validateSecondBrainPath(relPath, secondBrainDir) {
+  const segments = relPath.split(/[\\/]/).filter(Boolean);
+  if (segments.length === 0) return 'secondBrainPath is empty';
+
+  const baseName = segments[segments.length - 1];
+  const stem = baseName.replace(/\.[^./]+$/, '').toLowerCase().trim();
+  if (GENERIC_FILENAME_BLOCKLIST.has(stem)) {
+    return `filename "${baseName}" is too generic to find again later -- name it after the actual subject of the note (e.g. "ebay-cross-post-automation.md", not "ideas.md")`;
+  }
+
+  if (segments.length > 1 && secondBrainDir) {
+    const topLevel = segments[0];
+    let existingNames;
+    try {
+      existingNames = fs.readdirSync(secondBrainDir, { withFileTypes: true })
+        .filter((e) => !e.name.startsWith('.'))
+        .map((e) => e.name);
+    } catch {
+      existingNames = [];
+    }
+    const conflict = existingNames.find((name) => name.toLowerCase() === topLevel.toLowerCase() && name !== topLevel);
+    if (conflict) {
+      return `top-level folder "${topLevel}" is a different-case duplicate of the existing "${conflict}" -- reuse "${conflict}" exactly (same capitalization)`;
+    }
+  }
+
+  return null;
+}
+
 // Classifies one Brain Dump entry (captured by the dashboard's Brain Dump tab / POST
 // /api/brain-dump/capture) into a second-brain destination, appending a dated line to the
 // chosen note (creating it if new) and marking the entry 'sorted' in brainDumpPath. A
@@ -458,6 +513,11 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   }
   if (!secondBrainDir) {
     return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir);
+  if (namingError) {
+    return { skipped: true, reason: `rejected secondBrainPath "${result.secondBrainPath}": ${namingError} -- entry left as captured for retry` };
   }
 
   const matchedProject = result.actionable && result.belongsToProject
@@ -571,4 +631,5 @@ module.exports = {
   applyBrainDumpSort,
   applyVerdictOnly,
   parseBrainDumpSortResult,
+  validateSecondBrainPath,
 };

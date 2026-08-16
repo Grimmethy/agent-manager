@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Queue-watchdog / pipeline-doctor daemon. Periodically checks draft items
+# are progressing (not stuck in pending state after being picked up).
+set -u
+
+# Locate this scripts/ dir regardless of invocation origin — same reliability
+# pattern all four daemons use so relative paths don't break us when bash is
+# backgrounded with no specific cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load shared env + require AGENT_MANAGER_REPO_ROOT, MODEL_URL (same check
+# applied to every daemon; logs [common] ERROR and exits if missing).
+source "${SCRIPT_DIR}/orc-common.sh"
+
+readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
+
+# Graceful stop: same reasoning as the other daemons' traps -- deferred until the current
+# foreground tick (dead-process check / reject-retry check / stale scan) returns, so this
+# never gets killed mid-restart-decision and leaves a half-restarted worker behind.
+trap 'printf "[watchdog] SIGTERM/SIGINT received -- exiting after current tick.\n" >&2; exit 0' TERM INT
+
+# Matches launch.sh's own STATE_DIR/PID_DIR exactly -- restarts here must write to the SAME
+# pidfiles launch.sh uses, or stop.sh's/is_running()'s bookkeeping goes stale the moment
+# this daemon restarts something.
+PID_DIR="${HOME}/.local/state/agent-manager/pids"
+mkdir -p "$PID_DIR" 2>/dev/null
+
+# HOME_LOGS: temp dir for watchdog status logs (same shape PS pipeline-doctor.ps1 uses).
+HOME_LOGS="$(mktemp -d)"
+
+echo '[queue-watcher] loaded env, HOME_LOGS='"$HOME_LOGS" >&2
+echo "[queue-watcher] instance=$INSTANCE_ID waiting ${ORC_TICK_SECS:-60}s for first tick." >&2
+
+STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
+
+# Infinite polling loop — bash while : form identical to PowerShell's while ($true).
+while :; do
+    printf '[watchdog] %s tick: checking pending items for staleness\n' "${INSTANCE_ID}" >&2
+    write_heartbeat_file "$INSTANCE_ID" "idle" "" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- same "invisible to the dashboard even while alive" gap as the other two daemons.
+
+    # Dead-process detection + restart: a daemon instance whose heartbeat has gone stale
+    # (pid confirmed gone, or -- workers only -- pid alive but stuck well past a normal
+    # call) gets killed if still lingering and relaunched, same pidfile convention
+    # launch.sh itself uses so stop.sh stays accurate afterward. Port of
+    # queue-watchdog.ps1's Invoke-DeadProcessCheck; decision logic (staleness/zombie/
+    # cooldown) lives in dead-process-check.js, OS-level kill/spawn stays here in bash
+    # where the rest of this pipeline's process control already lives. Without this,
+    # nothing on Linux ever recovers from worker-1/reviewer crashing -- confirmed
+    # 2026-08-14: repeated manual restarts were the ONLY thing keeping this pipeline
+    # running for most of that day's development.
+    while IFS= read -r action_line; do
+      [[ -n "$action_line" ]] || continue
+      action_kind="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.action||"")}catch(e){}')"
+      action_instance="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.instanceId||"")}catch(e){}')"
+      action_pid="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.pid||"")}catch(e){}')"
+      action_reason="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.reason||"")}catch(e){}')"
+
+      if [[ "$action_kind" == "flag" ]]; then
+        printf '[watchdog] %s looks dead (%s) but no restart rule matches -- flagging only.\n' "$action_instance" "$action_reason" >&2
+        continue
+      fi
+
+      action_script="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.script||"")}catch(e){}')"
+      action_pidfile_name="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.pidfileName||"")}catch(e){}')"
+      mapfile -t action_args < <(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));(o.args||[]).forEach(a=>console.log(a))}catch(e){}')
+
+      if [[ "$action_kind" == "restart-after-kill" && -n "$action_pid" ]]; then
+        kill -9 "$action_pid" 2>/dev/null    # zombie: the pid is still real and running (that's the whole problem) -- force-kill before restarting, or it keeps squatting the drafting claim/heartbeat file identity alongside the fresh replacement.
+      fi
+
+      nohup bash "${SCRIPT_DIR}/${action_script}" "${action_args[@]}" > "${LOG_DIR}/${action_instance}.log" 2>&1 &
+      new_pid=$!
+      echo "$new_pid" > "${PID_DIR}/${action_pidfile_name}"
+      printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2
+    done < <(node "${PACKAGE_SRC_DIR}/dead-process-check.js" 2>>"${HOME_LOGS}/dead-process-check.log")
+
+    # Reject-retry-requeue: a task genuinely rejected by review (blockedStage:'review') gets
+    # one more redraft attempt, up to reject-retry-check.js's own retry cap -- port of
+    # queue-watchdog.ps1's Invoke-RejectRetryCheck (that script's OTHER job, dead-process
+    # detection/restart, is not ported here; a separate, still-open gap). Runs every tick,
+    # unconditionally, before the pending-staleness check below -- without this, EVERY
+    # review-stage rejection was a permanent dead end on Linux (confirmed live 2026-08-14:
+    # 17 real blocked tasks, zero retries, since nothing here ever looked at
+    # ornithRejectCount at all).
+    reject_retry_result="$(node "${PACKAGE_SRC_DIR}/reject-retry-check.js" 2>>"${HOME_LOGS}/reject-retry-check.log")"
+    printf '[watchdog] reject-retry-check: %s\n' "$reject_retry_result" >&2
+
+    _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither ornith-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
+    stale_count=0
+
+    if [[ ! -d "$_pending_dir" ]]; then
+        sleep "${ORC_TICK_SECS:-60}"
+        continue
+    fi
+
+    # Iterate all pending .json files — null-delimited find for safety.
+    now_seconds="$(date +%s)"
+    processed_count=0
+
+    while IFS= read -r -d '' file; do
+        [[ "$(wc -c < "$file" 2>/dev/null || echo 0)" -gt 0 ]] || continue
+        _created_at_raw="$(stat --format=%W "$file" 2>/dev/null \
+                          || stat -f %m "$file" 2>/dev/null \
+                          || echo "$now_seconds")"
+        age=$(( now_seconds - _created_at_raw ))
+
+        if [[ "$age" -gt ${ORC_STALE_SECS:-86400} ]]; then
+            stale_count=$((stale_count + 1))
+            printf '[watchdog] WARNING: %s is stale (%ds past threshold)\n' \
+                "$(basename "$file")" "$age" >&2
+            # Mirror PowerShell's Out-File to HOME_LOGS/stale/$id_age.txt
+            mkdir -p "$HOME_LOGS/stale" 2>/dev/null || true
+            printf '%s\n%s\n' "$age" "$(cat "$file" 2>/dev/null)" \
+                >"$HOME_LOGS/stale/${INSTANCE_ID}_${age}s.txt"
+        else
+            processed_count=$((processed_count + 1))
+            printf '[watchdog] %s: %ds old (ok)\n' "$(basename "$file")" "$age" >&2
+        fi
+    done < <(find "${_pending_dir}" -maxdepth 1 -name '*.json' \! -empty -type f \
+                -print0 2>/dev/null | sort -z)    # -print0/sort -z: NUL-delimited throughout, matching the `read -r -d ''` loop below. Was plain `find | sort` (newline-delimited) feeding a NUL-delimited read -- with no NUL byte anywhere in the stream, `read -d ''` reads the ENTIRE piped output as one "line" on its first (and only) iteration, so $file became every filename joined by newlines, "$file" as a literal path never existed, `wc -c < "$file"` failed, and the loop body never ran for ANY real file, ever -- reproduced live 2026-08-14: this exact loop against 2 real dummy files still logged 0 iterations. Confirmed by every single watchdog tick this whole session logging "processed=0 stale=0" regardless of actual queue/pending/ contents.
+
+    printf '[watchdog] %s tick result: processed=%d stale=%d\n' \
+        "${INSTANCE_ID}" "$processed_count" "$stale_count" >&2
+    [[ "$stale_count" -eq 0 ]] && all_clean=true || all_clean=false
+
+    sleep "${ORC_TICK_SECS:-60}"
+done

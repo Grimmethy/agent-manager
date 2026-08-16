@@ -674,3 +674,81 @@ test('nextDeepDiveTask excludes an already-onboarded project with NO relevantToP
   const { nextDeepDiveTask } = freshTaskSources(dir);
   assert.equal(nextDeepDiveTask(), null, 'an untagged legacy project must fail closed, not be silently offered');
 });
+
+// --- offline-connectivity gate (2026-08-16) ---------------------------------------------
+// See connectivity-check.js's own header for the incident: project_search tasks kept
+// getting drafted and dumped into queue/blocked/ in bulk while the internet connection
+// was down, since nothing upstream ever checked connectivity before spending a
+// plan+implement pass on a task guaranteed to fail. nextProjectSearchTask() and
+// nextDeepDiveTask()'s onboarding step (a real `git clone`) both gate on isOnline() now.
+//
+// Injects a fake connectivity-check.js module via require.cache -- same technique
+// freshTaskSources() above already uses for task-source-registry.js/apply-group-a.js,
+// extended to this new dependency so these tests never make a real network call (fast,
+// deterministic, no dependency on this machine's actual connectivity).
+function mockConnectivity(online) {
+  const connectivityPath = require.resolve('./connectivity-check.js');
+  require.cache[connectivityPath] = {
+    id: connectivityPath,
+    filename: connectivityPath,
+    loaded: true,
+    exports: { isOnline: () => online },
+  };
+}
+
+function makeProjectSearchFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  fs.writeFileSync(path.join(dir, 'CONTEXT.md'), 'Some project context for search query generation.');
+  return dir;
+}
+
+test('nextProjectSearchTask returns null while offline, before generating any task', () => {
+  const dir = makeProjectSearchFixtureRepo();
+  mockConnectivity(false);
+  const { nextProjectSearchTask } = freshTaskSources(dir);
+  assert.equal(nextProjectSearchTask(), null);
+});
+
+test('nextProjectSearchTask still returns a real task while online (no regression from the gate)', () => {
+  const dir = makeProjectSearchFixtureRepo();
+  mockConnectivity(true);
+  const { nextProjectSearchTask } = freshTaskSources(dir);
+  const task = nextProjectSearchTask();
+  assert.ok(task, 'expected a real task while online');
+  assert.equal(task.domain, 'project_search');
+});
+
+test('nextDeepDiveTask does not attempt onboarding (no git clone side effect) while offline', () => {
+  const dir = makeDeepDiveFixtureRepo();
+  const projectTag = path.basename(dir);
+  // A Strong lead relevant to THIS project -- would normally trigger a real `git clone`
+  // in onboardDeepDiveProject() the moment nextDeepDiveTask() runs.
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([
+    { name: 'some-lead', url: 'https://github.com/x/some-lead', relevantTo: projectTag },
+  ]));
+  mockConnectivity(false);
+  const { nextDeepDiveTask } = freshTaskSources(dir);
+  assert.equal(nextDeepDiveTask(), null);
+  // Same "did the clone actually get attempted" proof the pre-existing scoping tests
+  // above use: deep-dive-coverage.json only gets written when onboarding actually ran
+  // (coverageChanged), so its absence proves onboardDeepDiveProject() -- and the git
+  // clone inside it -- was never even attempted while offline.
+  assert.equal(fs.existsSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH), false);
+});
+
+test('nextDeepDiveTask never calls isOnline at all when nothing actually needs onboarding', () => {
+  const dir = makeDeepDiveFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([]));
+  const connectivityPath = require.resolve('./connectivity-check.js');
+  require.cache[connectivityPath] = {
+    id: connectivityPath,
+    filename: connectivityPath,
+    loaded: true,
+    // Throws if ever invoked -- proves the "only probe when a lead actually needs
+    // onboarding" optimization (see nextDeepDiveTask's own comment) really holds, not
+    // just that the offline case happens to return null for some other reason.
+    exports: { isOnline: () => { throw new Error('isOnline should not be called when there is nothing to onboard'); } },
+  };
+  const { nextDeepDiveTask } = freshTaskSources(dir);
+  assert.doesNotThrow(() => nextDeepDiveTask());
+});
