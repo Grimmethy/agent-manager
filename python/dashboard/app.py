@@ -49,7 +49,7 @@ def handle_http_exception(e):
     return jsonify(description=e.description), e.code
 
 
-QUEUE_STATES = ["pending", "review", "approved", "blocked", "done"]
+QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
 
 # dashboard/ -> python/ -> package root (where agent-manager.env, launch.bat, and src/ live).
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -479,6 +479,11 @@ def task_summary(data: dict, filename: str) -> dict:
         "reviewedAt": data.get("reviewedAt"),
         "appliedAt": data.get("appliedAt"),
         "ornithRejectCount": data.get("ornithRejectCount"),
+        # Small (a reason string + a handful of short candidate paths at most) -- nothing
+        # like the promptContext/planResponse bulk excluded above, and the needs-
+        # clarification row rendering needs it to show WHICH kind of hold this is without
+        # a second round-trip per row.
+        "needsClarification": data.get("needsClarification"),
     }
 
 
@@ -655,9 +660,14 @@ def api_task_archive(state, task_id):
     direct queue/<state>/<id>.json path, never nested subfolders, so moving a file here
     silently frees up its underlying item (a brain-dump entry, an arch_import itemId, a
     deep_dive community) for reconsideration next time its source generator runs -- with
-    zero source-specific logic needed on this end."""
-    if state not in ("blocked", "done"):
-        abort(400, description="only a blocked or done task can be archived")
+    zero source-specific logic needed on this end. 'needs-clarification' included since
+    2026-08-16 -- "reject the dump" (Discuss session on context-aware-file-path-prefetch-
+    job.md) is exactly this action for a held task the user decides isn't worth chasing
+    down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING
+    a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
+    is exactly this action too: give up on it rather than let it apply."""
+    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
+        abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
     qdir = queue_dir()
     if not qdir:
         abort(404)
@@ -672,6 +682,36 @@ def api_task_archive(state, task_id):
         abort(409, description=f"an archived copy of '{task_id}' already exists")
     shutil.move(str(src), str(dest))
     return jsonify({"id": task_id, "archived": True})
+
+
+@app.route("/api/task/awaiting-confirm/<task_id>/confirm", methods=["POST"])
+def api_task_confirm_delete(task_id):
+    """The other half of the awaiting-confirm gate (src/apply-task.js): a human explicitly
+    confirming a delete-containing Group B batch, moving it from queue/awaiting-confirm/
+    back into queue/approved/ so the next apply-task.sh pass re-runs it for real. Stamps
+    deleteConfirmedAt -- apply-task.js's gate checks for its PRESENCE (not its value) to
+    let this exact task through without holding it again, the same 'ran once, don't
+    re-trigger' idea as promotedAt/lastReviewedAt elsewhere in this codebase. Denying
+    instead of confirming is just the existing generic archive action above (state=
+    'awaiting-confirm') -- no separate deny endpoint needed."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / "awaiting-confirm" / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    data["deleteConfirmedAt"] = datetime.now(timezone.utc).isoformat()
+
+    approved_dir = qdir / "approved"
+    approved_dir.mkdir(parents=True, exist_ok=True)
+    dest = approved_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in approved/")
+    dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "confirmed": True})
 
 
 @app.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
@@ -715,6 +755,40 @@ def api_task_requeue(state, task_id):
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     return jsonify({"id": task_id, "requeued": True})
+
+
+@app.route("/api/task/needs-clarification/<task_id>/resolve", methods=["POST"])
+def api_task_resolve_clarification(task_id):
+    """Moves a held task from queue/needs-clarification/ into queue/adhoc/ (NOT
+    queue/pending/ -- unlike requeue above, this is an adhoc-domain task, and
+    nextAdhocTask() only ever scans queue/adhoc/; landing it in pending/ the way requeue
+    does would silently orphan it) so ornith-worker.sh can finally claim and draft it.
+    Body: {"paths": [...]}  -- the file path(s) the user picked (from the 'ambiguous'
+    candidates, or hand-typed for a 'no-match' case) become promptContext.prefetchedPaths;
+    an empty/omitted paths list means "proceed with no prefetch at all," a deliberate
+    choice, not an error."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / "needs-clarification" / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    body = request.get_json(silent=True) or {}
+    paths = body.get("paths")
+    if paths and isinstance(paths, list):
+        data.setdefault("promptContext", {})["prefetchedPaths"] = [str(p) for p in paths]
+    data.pop("needsClarification", None)
+
+    adhoc_dir = qdir / "adhoc"
+    adhoc_dir.mkdir(parents=True, exist_ok=True)
+    dest = adhoc_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
 @app.route("/api/task/approved/<task_id>/apply", methods=["POST"])
@@ -847,18 +921,69 @@ def default_task_domain() -> str:
     return "default"
 
 
+def _task_state_index(qdir) -> dict:
+    """One-pass task-id -> queue-state lookup, built once per /api/brain-dump call rather
+    than one filesystem round-trip per entry. Confirmed live 2026-08-16: every one of a
+    real user's "actioned" brain-dump entries was silently sitting in blocked/ (truncated
+    drafts, fabricated file paths, one that was pure meta-commentary refusing the work) --
+    completely invisible from the Brain Dump tab, which only ever showed the static
+    "actioned"/"queued" badge regardless of what actually happened to the task downstream.
+    Covers every location a task can really be sitting in: each QUEUE_STATES dir, the
+    manual-archive folder (api_task_archive's own destination), and drafting/ (per-worker
+    subfolders, matching /api/queue/drafting's own legacy-no-subfolder fallback)."""
+    index = {}
+    if not qdir:
+        return index
+    for state in QUEUE_STATES:
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            index[f.stem] = state
+    archived_dir = qdir / "done" / "_archived_no_action"
+    if archived_dir.is_dir():
+        for f in archived_dir.glob("*.json"):
+            index[f.stem] = "archived"
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for sub in drafting_root.iterdir():
+            if sub.is_dir():
+                for f in sub.glob("*.json"):
+                    index[f.stem] = "drafting"
+        for f in drafting_root.glob("*.json"):  # legacy: no per-worker subfolder
+            index[f.stem] = "drafting"
+    return index
+
+
 @app.route("/api/brain-dump")
 def api_brain_dump():
     """Brain Dump tab's left pane. Defaults to everything not yet actioned (captured +
-    sorted) -- the working queue a human actually needs to see. ?status=<value> narrows to
-    one status, ?status=all returns the full history."""
+    sorted) PLUS any actioned entry whose downstream task actually needs a human
+    (blocked/needs-clarification) -- confirmed live 2026-08-16: every one of a real
+    user's actioned entries had silently blocked, invisible under the old default filter
+    (which excluded every actioned entry unconditionally, cleanly-completed or not) same
+    as under the old flat "queued" badge. A genuinely still-in-progress or successfully
+    completed actioned entry stays hidden by default -- only ?status=actioned/all
+    surfaces those -- since there's nothing for a human to act on there.
+    ?status=<value> narrows to one status, ?status=all returns the full history."""
     entries = read_brain_dump_entries()
+    task_states = _task_state_index(queue_dir())
+    for e in entries:
+        qid = e.get("queuedTaskId")
+        if qid:
+            e["taskStatus"] = task_states.get(qid, "unknown")
+
     status_filter = request.args.get("status", "").strip()
+    NEEDS_ATTENTION = {"blocked", "needs-clarification", "awaiting-confirm"}
     if status_filter and status_filter != "all":
         entries = [e for e in entries if e.get("status") == status_filter]
     elif not status_filter:
-        entries = [e for e in entries if e.get("status") != "actioned"]
+        entries = [
+            e for e in entries
+            if e.get("status") != "actioned" or e.get("taskStatus") in NEEDS_ATTENTION
+        ]
     entries = sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
+
     return jsonify(entries)
 
 
@@ -993,8 +1118,128 @@ def api_brain_dump_discuss_start(entry_id):
     if not pipeline_dir:
         abort(500, description="no active project configured")
     from discuss_sessions import start_session
-    session = start_session(pipeline_dir, entry_id, entry["rawText"])
+    session = start_session(pipeline_dir, entry_id, entry["rawText"], kind="brain-dump")
     return jsonify(session)
+
+
+@app.route("/api/task/needs-clarification/<task_id>/discuss/latest", methods=["GET"])
+def api_needs_clarification_discuss_latest(task_id):
+    """Held-task counterpart to the brain-dump/second-brain discuss/latest checks above --
+    same "don't silently start a duplicate" reasoning."""
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import latest_session_for_subject
+    session = latest_session_for_subject(pipeline_dir, task_id)
+    return jsonify(session)
+
+
+@app.route("/api/task/needs-clarification/<task_id>/discuss/start", methods=["POST"])
+def api_needs_clarification_discuss_start(task_id):
+    """"Rather than inputting a file path manually we should open a 'discuss' to get more
+    information about the task itself" -- the actual ask. Starts a conversation about a
+    held queue/needs-clarification/ task, using its rawText as the subject. Ending it
+    (see api_discuss_end's 'needs-clarification' branch) reopens the task for a fresh
+    path_prefetch_resolve attempt with the enriched text, rather than just leaving a
+    human to manually resolve it with no more information than they started with."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(500, description="no active project configured")
+    held_path = qdir / "needs-clarification" / f"{task_id}.json"
+    held = read_json_safe(held_path)
+    if not held:
+        abort(404)
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    subject_text = (held.get("promptContext") or {}).get("rawText") or held.get("title") or ""
+    from discuss_sessions import start_session
+    session = start_session(pipeline_dir, task_id, subject_text, kind="needs-clarification")
+    return jsonify(session)
+
+
+# Matches the exact cross-reference line applyBrainDumpSort (apply-group-a.js) writes
+# into a vault note when belongsToProject matches -- "Queued as adhoc task `id` in
+# **label**", with an optional ", held for clarification (...)" suffix after the closing
+# ** that this regex doesn't need to care about (it only needs the id/label pair).
+_TASK_REF_RE = re.compile(r"Queued as adhoc task `([^`]+)` in \*\*([^*]+)\*\*")
+
+
+@app.route("/api/second-brain/task-refs")
+def api_second_brain_task_refs():
+    """Second-brain counterpart to the Brain Dump tab's live taskStatus badges
+    (2026-08-16): a note can carry a task cross-reference naming a DIFFERENT project than
+    whatever pipeline is currently active. That project's queue is looked up directly via
+    projects.json (repoRoot/pipelineDir) rather than requiring it to be switched active
+    first -- a real, live status is available regardless of what's currently running,
+    same as any other registered project's queue files sitting right there on disk.
+    Only when the project isn't registered at all, or its pipeline dir isn't reachable on
+    this machine, does this fall back to a plain informational note instead of a real
+    status -- see each branch below for the user-facing wording."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    note_path_str = (request.args.get("notePath") or "").strip()
+    if not note_path_str:
+        abort(400, description="notePath is required")
+    full_path = _resolve_under_second_brain(root.resolve(), note_path_str)
+    if not full_path.is_file():
+        return jsonify([])
+
+    content = full_path.read_text(encoding="utf-8")
+    matches = _TASK_REF_RE.findall(content)
+    if not matches:
+        return jsonify([])
+
+    registry = read_project_registry()
+    active_root = get_active_repo_root()
+    active_root_norm = os.path.normpath(active_root) if active_root else None
+
+    # Cache per-project task-state indexes -- a note can reference the same project
+    # multiple times (several entries queued into the same pipeline over time); no
+    # reason to re-scan that project's queue dirs once per reference found.
+    index_cache = {}
+    results = []
+    seen = set()
+    for task_id, raw_label in matches:
+        label = raw_label.strip()
+        key = (task_id, label)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        project = next((p for p in registry if p.get("label") == label), None)
+        if not project:
+            results.append({
+                "taskId": task_id, "projectLabel": label, "projectFound": False,
+                "isActiveProject": False, "taskStatus": None,
+                "note": f'Project "{label}" is not currently registered -- open it once via the Project tab to enable status lookups for its tasks.',
+            })
+            continue
+
+        is_active = bool(active_root_norm) and os.path.normpath(project.get("repoRoot", "")) == active_root_norm
+        pipeline_dir_str = project.get("pipelineDir")
+        pipeline_dir = Path(pipeline_dir_str) if pipeline_dir_str else None
+        if not pipeline_dir or not pipeline_dir.is_dir():
+            results.append({
+                "taskId": task_id, "projectLabel": label, "projectFound": True,
+                "isActiveProject": is_active, "taskStatus": None,
+                "note": f'"{label}"\'s pipeline directory is not reachable on this machine right now.',
+            })
+            continue
+
+        if pipeline_dir_str not in index_cache:
+            index_cache[pipeline_dir_str] = _task_state_index(pipeline_dir / "queue")
+        status = index_cache[pipeline_dir_str].get(task_id, "unknown")
+        note = None
+        if not is_active:
+            note = f'Belongs to "{label}" -- switch to it via the Project tab for the pipeline to actively work on it further.'
+        results.append({
+            "taskId": task_id, "projectLabel": label, "projectFound": True,
+            "isActiveProject": is_active, "taskStatus": status, "note": note,
+        })
+
+    return jsonify(results)
 
 
 @app.route("/api/second-brain/discuss/for-note", methods=["GET"])
@@ -1025,24 +1270,33 @@ def api_second_brain_discuss_start():
     full_path = _resolve_under_second_brain(root.resolve(), note_path)
     note_content = full_path.read_text(encoding="utf-8") if full_path.is_file() else ""
     from discuss_sessions import start_session
-    session = start_session(root, note_path, note_content)
+    session = start_session(root, note_path, note_content, kind="second-brain")
     return jsonify(session)
 
 
 def _resolve_discuss_session(session_id):
     """Discuss sessions live in one of two storage locations depending on where the
-    conversation started -- pipeline_dir for a brain-dump entry, SECOND_BRAIN_DIR for a
-    vault note (see discuss_sessions.py's own header). Session ids are already globally
-    unique (uuid4 suffix), so trying both known locations here is simpler and more honest
-    than threading a kind-prefix through every session id just to route this lookup.
-    Returns (kind, storage_dir, session) where kind is 'brain-dump' or 'second-brain', or
-    (None, None, None) if the session isn't in either."""
+    conversation started -- pipeline_dir for a brain-dump entry OR a held
+    queue/needs-clarification/ task, SECOND_BRAIN_DIR for a vault note (see
+    discuss_sessions.py's own header). Session ids are already globally unique (uuid4
+    suffix), so trying both known locations here is simpler and more honest than
+    threading a kind-prefix through every session id just to route this lookup.
+
+    Two kinds now share pipeline_dir storage (brain-dump entries and held tasks), so
+    storage location alone can no longer disambiguate them the way it still can for a
+    vault note -- the session's own "kind" field (set at start_session time) is what
+    actually decides the return value; falls back to "brain-dump" for a pipeline_dir
+    session with no kind at all (sessions written before the needs-clarification kind
+    existed), preserving old behavior for anything already in flight.
+
+    Returns (kind, storage_dir, session), or (None, None, None) if the session isn't in
+    either location."""
     from discuss_sessions import get_session
     pipeline_dir = get_pipeline_dir()
     if pipeline_dir:
         session = get_session(pipeline_dir, session_id)
         if session:
-            return "brain-dump", pipeline_dir, session
+            return session.get("kind") or "brain-dump", pipeline_dir, session
     root = second_brain_dir()
     if root:
         session = get_session(root, session_id)
@@ -1084,9 +1338,14 @@ def api_discuss_end(session_id):
       kind of text change that should make a stale prior sort get re-evaluated).
     - vault note: appended as a "## Discuss session -- <date>" section, same convention
       grill_sessions.py's enrich_note() already uses for Grill Me/Grill With Docs.
-    discuss_sessions.py deliberately never touches either data store itself -- this is
-    the one place that happens, same division of responsibility as every other mutation
-    of either store in this file."""
+    - held queue/needs-clarification/ task: appended to promptContext.rawText, AND
+      reopened for another path_prefetch_resolve attempt (suggestionAttempted cleared,
+      any stale suggestion dropped) -- per the actual ask: discussing a held task should
+      leave you with a real shot at an automatic resolution, not just more text sitting
+      next to the same manual picker you started with.
+    discuss_sessions.py deliberately never touches any of these data stores itself --
+    this is the one place that happens, same division of responsibility as every other
+    mutation of any of them in this file."""
     kind, storage_dir, existing = _resolve_discuss_session(session_id)
     if not storage_dir:
         abort(404)
@@ -1097,6 +1356,7 @@ def api_discuss_end(session_id):
 
     entry = None
     note_updated = False
+    held_task = None
     summary = (session.get("summary") or "").strip()
     if summary and kind == "brain-dump":
         entries = read_brain_dump_entries()
@@ -1118,8 +1378,26 @@ def api_discuss_end(session_id):
                 entry_text = f"\n\n## Discuss session -- {stamp}\n\n{summary}\n"
                 note_path.write_text(note_path.read_text(encoding="utf-8") + entry_text, encoding="utf-8")
                 note_updated = True
+    elif summary and kind == "needs-clarification":
+        qdir = queue_dir()
+        if qdir:
+            held_path = qdir / "needs-clarification" / f"{session['subjectId']}.json"
+            held_task = read_json_safe(held_path)
+            if held_task:
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                ctx = held_task.setdefault("promptContext", {})
+                ctx["rawText"] = f"{ctx.get('rawText', '')}\n\n[Discussed {stamp}]: {summary}"
+                nc = held_task.setdefault("needsClarification", {})
+                nc.pop("suggested", None)
+                nc["suggestionAttempted"] = False
+                # Bumped so nextPathPrefetchResolveTask()'s resolve-task id includes the
+                # attempt number -- without this, a second attempt's id collides with the
+                # first attempt's now-done/ file forever (taskIdExistsInQueue() checks
+                # done/ too), silently blocking every re-attempt after Discuss.
+                nc["attempt"] = nc.get("attempt", 1) + 1
+                held_path.write_text(json.dumps(held_task, indent=2), encoding="utf-8")
 
-    return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated})
+    return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated, "heldTask": held_task})
 
 
 def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
@@ -1742,8 +2020,8 @@ def api_pipeline_status():
 # a top-level, cross-project setting, the same "sits above any single active project"
 # reasoning as AGENT_MANAGER_BRAIN_DUMP_PATH).
 TASK_SOURCE_CATALOG = [
-    "adhoc", "trouble_log", "secondbrain", "brain_dump_sort", "arch_review",
-    "arch_import_review", "arch_discovery", "arch_import", "observability_review",
+    "adhoc", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
+    "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
     "deep_dive", "project_search", "unused_export",
 ]
 
@@ -1752,7 +2030,11 @@ TASK_SOURCE_CATALOG = [
 # "preempts every deterministic source"; 'brain_dump_sort': always-on background source,
 # confirmed live 2026-07-23 it was silently getting gated out by Project Search mode's
 # allowlist before that fix). Presenting either as toggleable in the UI would be a lie.
-ALWAYS_ACTIVE_SOURCES = {"adhoc", "brain_dump_sort"}
+# 'path_prefetch_resolve' joins them 2026-08-16: it only ever exists to resolve a held
+# task brain_dump_sort's own always-on pipeline produced -- gating it behind a
+# project-mode allowlist would mean held tasks silently never get an LLM-suggestion
+# attempt whenever that allowlist doesn't happen to include it.
+ALWAYS_ACTIVE_SOURCES = {"adhoc", "brain_dump_sort", "path_prefetch_resolve"}
 
 
 def read_active_job_types() -> set:
@@ -1769,6 +2051,7 @@ def read_active_job_types() -> set:
 # source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no override for it.
 TASK_SOURCE_DEFAULT_PRIORITIES = {
     "adhoc": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
+    "path_prefetch_resolve": 45,
     "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "observability_review": 80,
     "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,
 }
@@ -1852,6 +2135,7 @@ _SOURCE_TO_DOMAIN_KEY = {
     "unused_export": "default",
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
+    "path_prefetch_resolve": "path_prefetch_resolve",
 }
 
 _DOMAIN_DEFAULTS_TO_ENSURE = {
@@ -1861,14 +2145,15 @@ _DOMAIN_DEFAULTS_TO_ENSURE = {
     "project_search": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
     "deep_dive": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
     "brain_dump_sort": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
+    "path_prefetch_resolve": {"workDirKind": "repoRoot", "successCheck": "git-branch-diff"},
 }
 
-# adhoc and brain_dump_sort are always in read_active_job_types()'s result regardless of
-# any allowlist (see ALWAYS_ACTIVE_SOURCES above) -- ensure their domains unconditionally,
-# a belt-and-suspenders floor in case some future call site ever passes a hand-built
-# task_sources list that forgot one, since the failure mode ("Unknown task domain") is
-# silent and easy to miss (as just proven).
-_ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort", "adhoc"]
+# adhoc, brain_dump_sort, and (2026-08-16) path_prefetch_resolve are always in
+# read_active_job_types()'s result regardless of any allowlist (see ALWAYS_ACTIVE_SOURCES
+# above) -- ensure their domains unconditionally, a belt-and-suspenders floor in case some
+# future call site ever passes a hand-built task_sources list that forgot one, since the
+# failure mode ("Unknown task domain") is silent and easy to miss (as just proven).
+_ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort", "adhoc", "path_prefetch_resolve"]
 
 
 def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):

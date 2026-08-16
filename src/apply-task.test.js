@@ -108,6 +108,74 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'checkoutMain', 'deleteBranch']);
 });
 
+// --- awaiting-confirm gate: a Group B batch containing a delete holds for human
+// confirmation instead of touching git or disk (src/apply-group-b.js's
+// batchContainsDeleteMode + src/apply-task.js's gate just before the git-branch-diff
+// flow) ----------------------------------------------------------------------------
+
+test('a delete-containing batch is held for confirmation and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ implementResponse: JSON.stringify({ mode: 'delete', file: 'foo.js' }) });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  assert.match(result.reason, /delete/);
+  assert.deepEqual(gitRunner.calls, []);
+  // Nothing on disk touched either -- the gate fires before writeArtifact is ever called.
+  assert.equal(fs.readFileSync(path.join(REPO_ROOT, 'foo.js'), 'utf8'), 'a');
+});
+
+test('a delete-containing batch inside an array is also held for confirmation', () => {
+  const gitRunner = createFakeGitRunner();
+  const batch = [{ mode: 'create', file: 'new.js', content: 'x' }, { mode: 'delete', file: 'foo.js' }];
+  const task = baseTask({ implementResponse: JSON.stringify(batch) });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.needsConfirmation, true);
+  assert.deepEqual(gitRunner.calls, []);
+});
+
+test('deleteConfirmedAt lets a previously-held delete batch proceed for real', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    implementResponse: JSON.stringify({ mode: 'delete', file: 'foo.js' }),
+    deleteConfirmedAt: '2026-08-16T00:00:00.000Z',
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.branch, 'agent/test-task-1');
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, 'foo.js')), false);
+});
+
+test('a batch with no delete never hits the gate (unaffected by this change)', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.needsConfirmation, undefined);
+});
+
+test('a source with its own registered apply (e.g. brain_dump_sort) never hits the delete gate, even with delete-shaped implementResponse', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'brain_dump_sort',
+    source: 'brain_dump_sort',
+    implementResponse: JSON.stringify({ mode: 'delete', file: 'foo.js' }),
+    promptContext: { brainDumpEntryId: 'bd-1', rawText: 'irrelevant' },
+  });
+  const brainDumpPath = path.join(os.tmpdir(), 'apply-task-gate-brain-dump.json');
+  fs.writeFileSync(brainDumpPath, JSON.stringify({ entries: [] }));
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, brainDumpPath, secondBrainDir: os.tmpdir() });
+
+  assert.equal(result.needsConfirmation, undefined);
+  assert.deepEqual(gitRunner.calls, []); // brain_dump_sort never touches git regardless
+  fs.rmSync(brainDumpPath, { force: true });
+});
+
 test('a fetchMain failure surfaces as a failure with no branch created', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'fetchMain', failMessage: 'network unreachable' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
@@ -175,4 +243,46 @@ test('domain brain_dump_sort reports skipped-but-succeeded when the classificati
   assert.equal(entries[0].status, 'captured');
 
   fs.rmSync(scratchDir, { recursive: true, force: true });
+});
+
+// --- domain: 'path_prefetch_resolve' -- must skip git entirely (non-git write), same as
+// brain_dump_sort above. Without this special case in applyTask(), it would fall through
+// to the git-branch-diff flow below and try to `git add`/commit an artifact shape
+// (suggested/heldTaskId/paths) that was never a {file}/{files} in the first place. -------
+
+test('domain path_prefetch_resolve never touches git -- writes the suggestion onto the held task instead', () => {
+  const scratchPipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-path-prefetch-test-'));
+  const heldDir = path.join(scratchPipelineDir, 'queue', 'needs-clarification');
+  fs.mkdirSync(heldDir, { recursive: true });
+  fs.writeFileSync(path.join(heldDir, 'held-1.json'), JSON.stringify({
+    id: 'held-1', domain: 'adhoc', source: 'brain_dump', title: 'held task',
+    promptContext: { rawText: 'held task text' },
+    needsClarification: { reason: 'no-match' },
+  }));
+
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'path_prefetch_resolve',
+    source: 'path_prefetch_resolve',
+    promptContext: { heldTaskId: 'held-1' },
+    // confident:false deliberately -- a confident suggestion now auto-resolves into
+    // adhoc/ (see apply-group-a.test.js's own coverage of that path), which would make
+    // "held.json still exists in needs-clarification/" below false and is not what this
+    // test is checking. This test's own job is just "no git calls for this domain."
+    implementResponse: JSON.stringify({ paths: ['src/auth.ts'], rationale: 'the note is about login', confident: false }),
+  });
+
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: scratchPipelineDir, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(gitRunner.calls.length, 0, 'a non-git domain must never call the git runner');
+
+  const held = JSON.parse(fs.readFileSync(path.join(heldDir, 'held-1.json'), 'utf8'));
+  assert.deepEqual(held.needsClarification.suggested.paths, ['src/auth.ts']);
+  assert.equal(held.needsClarification.suggestionAttempted, true);
+  // Still held, not moved to adhoc/ -- a non-confident guess still requires a human to
+  // accept it via the dashboard's resolve endpoint.
+  assert.equal(fs.existsSync(path.join(scratchPipelineDir, 'queue', 'adhoc', 'held-1.json')), false);
+
+  fs.rmSync(scratchPipelineDir, { recursive: true, force: true });
 });

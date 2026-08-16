@@ -128,7 +128,26 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
         ? task.promptContext.fixedLiterals.reduce((sum, lit) => sum + (lit.content ? lit.content.length : 0), 0)
         : 0;
       const hasFixedLiterals = fixedLiteralsChars > 0;
-      const implNumPredict = Math.min(8000, Math.max(1400, fixedLiteralsChars));
+      // Non-fixedLiterals tasks still run think:true below, so the same starvation this
+      // comment block documents for fixedLiterals (reasoning trace consuming the budget
+      // before real output is produced) applies to them too -- 1400 was too tight even
+      // before accounting for a thinking trace. A flat 2800 floor (tried live 2026-08-16)
+      // cleared small/medium tasks but still truncated large multi-file ones -- a
+      // 4912-char plan (8 files: chat-server.js, tool-registry.js, priority-scheduler.js,
+      // agent-manager.js, ChatPopup.tsx, ToolTogglePanel.tsx, useChatSocket.ts, plus
+      // message-protocol.js) cut off after only 1 of 8 files at 4061 output chars, and a
+      // 2155-char plan cut off mid-function at 3088 chars. Scaling by plan size (same
+      // principle as the fixedLiterals content-derived floor above, just keyed off the
+      // plan instead of literal content since there's no literal to measure) tracks task
+      // complexity better than either flat number: a plan enumerating many files/steps is
+      // the leading signal for how much output the implement pass will need. ~2 chars of
+      // plan per token of implement output is calibrated to comfortably clear both
+      // real-world cutoffs above; floor keeps the 2800 that already worked for
+      // small/medium tasks, ceiling bounds worst-case latency/cost.
+      const planChars = (task.planResponse || '').length;
+      const implNumPredict = hasFixedLiterals
+        ? Math.min(8000, Math.max(1400, fixedLiteralsChars))
+        : Math.min(8000, Math.max(2800, planChars * 2));
       // think:false when fixedLiterals are present -- num_predict is a cap on TOTAL
       // generated tokens, thinking trace included, so a "think" pass spent reasoning
       // about a plain transcription task eats directly into the same budget the actual
@@ -138,7 +157,17 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
       // reasoning, not reaching the output at all. There is nothing to reason about when
       // the task is "copy this exact block character-for-character" -- skip thinking
       // entirely and hand the full budget to the transcription itself.
-      const implResult = await ornithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict });
+      //
+      // num_ctx must cover prompt + thinking trace + output together, not just output --
+      // the 8192 callOnce default was sized for the old flat 1400 numPredict, so scaling
+      // numPredict up to 8000 without also raising this would let the context window
+      // itself truncate (silently dropping the oldest prompt tokens, e.g. the task
+      // instructions) before generation even gets to use the larger output budget. Model
+      // supports up to 262144 (`ollama show ornith:35b`), so there's ample headroom;
+      // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
+      // output budget plus a fixed margin for the thinking trace.
+      const implNumCtx = Math.min(32768, Math.max(8192, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
+      const implResult = await ornithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx });
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
       // Models tab) and stamps task.abCallId so a later outcome (review verdict, watchdog

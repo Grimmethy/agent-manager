@@ -15,8 +15,8 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort } = require('./apply-group-a.js');
-const { applyGroupB } = require('./apply-group-b.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve } = require('./apply-group-a.js');
+const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -26,10 +26,20 @@ const { createRealGitRunner } = require('./git-runner.js');
 require('./task-sources.js');
 ensureRegistered();
 
+// Shared by writeArtifact (which needs to know WHICH apply to call) and the
+// awaiting-confirm gate below (which needs to know whether one's coming, before calling
+// it) -- a source with its own registered `apply` (arch_discovery, arch_import,
+// unused_export, etc.) never touches applyGroupB at all, so the delete gate has nothing to
+// check for those; only a source with no custom apply falls through to the generic Group B
+// JSON-change-object path.
+function usesGroupB(task) {
+  const source = getRegisteredSource(resolveSourceName(task));
+  return !(source && typeof source.apply === 'function');
+}
+
 function writeArtifact(task, repoRoot, pipelineDir) {
-  const sourceName = resolveSourceName(task);
-  const source = getRegisteredSource(sourceName);
-  if (source && typeof source.apply === 'function') {
+  if (!usesGroupB(task)) {
+    const source = getRegisteredSource(resolveSourceName(task));
     return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
   }
   return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
@@ -104,6 +114,44 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       return { succeeded: true, doneMarker: `${result.itemCount} action item(s) appended to ${result.file}` };
     }
 
+    // path_prefetch_resolve's target (a held task JSON under pipelineDir/queue/
+    // needs-clarification/) lives outside any project's repo root too, same non-git
+    // shape as brain_dump_sort/project_search/deep_dive above -- see apply-group-a.js's
+    // applyPathPrefetchResolve. Without this branch, the git-branch-diff flow below would
+    // try to `git add`/commit an artifact shape (suggested/heldTaskId/paths) that was
+    // never a {file}/{files} in the first place, on a domain with nothing to commit at all.
+    if (task.domain === 'path_prefetch_resolve') {
+      const result = applyPathPrefetchResolve({ implementResponse: task.implementResponse, task, pipelineDir });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: `suggested ${result.paths.length} path(s) for ${result.heldTaskId} (confident: ${result.confident})` };
+    }
+
+    // Awaiting-confirm gate (usability/benefit investigation of TheAgent's per-action
+    // approval idea, 2026-08-16): a Group B batch containing a `delete` gets ONE more
+    // checkpoint before touching git or disk at all -- distinct from the reviewer's
+    // whole-draft APPROVE/REJECT (review-task.js never distinguishes effect kind at all,
+    // confirmed by reading its prompt-building code) and from the static, all-or-nothing
+    // queue/.delete-mode-disabled kill switch (apply-group-b.js, global on/off with no
+    // per-task record of who allowed what). TheAgent's own mechanism (an in-memory Map +
+    // Promise blocking a live Express request, deny-by-default after a fixed 10-minute
+    // window) doesn't port: nothing here is a long-lived process that COULD block on it --
+    // every stage is a poll-and-exit daemon or a one-shot CLI call talking through
+    // queue/<state>/ files. This is the filesystem-native equivalent instead: hold in
+    // queue/awaiting-confirm/ (no fixed timeout -- matches how approved/blocked/needs-
+    // clarification already just sit until a human acts, since this pipeline's real
+    // observed review cadence is hours, not minutes) until the dashboard's confirm action
+    // stamps deleteConfirmedAt and moves it back to queue/approved/ for a real re-run.
+    // Only fires for tasks that would actually reach applyGroupB -- a source with its own
+    // registered apply (arch_discovery, arch_import, unused_export) never touches Group B's
+    // delete mode at all, so has nothing for this gate to check.
+    if (usesGroupB(task) && !task.deleteConfirmedAt && batchContainsDeleteMode(task.implementResponse)) {
+      return {
+        succeeded: false,
+        needsConfirmation: true,
+        reason: 'this batch includes a delete -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
+      };
+    }
+
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
     // then write the artifact, so the change lands on the new branch, never on main.
     gitRunner.fetchMain();
@@ -116,6 +164,13 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     try {
       artifact = writeArtifact(task, repoRoot, pipelineDir);
     } catch (writeErr) {
+      // checkoutMain + deleteBranch here only ever cleans up the git branch pointer -- it
+      // does NOT touch uncommitted working-tree writes (an untracked file persists
+      // regardless of branch; an edit just rides along as a dirty change). For a Group B
+      // multi-item batch, writeErr.message already carries the outcome of THAT file's own
+      // internal rollback of its already-applied items (see apply-group-b.js) by the time
+      // it reaches here -- this block is not, and was never sufficient as, the only
+      // guarantee against a partial multi-file write surviving a mid-batch failure.
       try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
       return { succeeded: false, reason: writeErr.message };
     }

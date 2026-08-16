@@ -30,6 +30,7 @@ QUEUE_DIR="${PIPELINE_DIR}/queue"
 APPROVED_DIR="${QUEUE_DIR}/approved"
 DONE_DIR="${QUEUE_DIR}/done"
 BLOCKED_DIR="${QUEUE_DIR}/blocked"
+AWAITING_CONFIRM_DIR="${QUEUE_DIR}/awaiting-confirm"
 
 if [[ ! -d "$APPROVED_DIR" ]]; then
   printf '[apply-task] nothing to do: %s does not exist yet.\n' "$APPROVED_DIR"
@@ -45,7 +46,7 @@ if [[ ${#files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-mkdir -p "$DONE_DIR" "$BLOCKED_DIR"
+mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR"
 
 for file in "${files[@]}"; do
   task_id="$(basename "$file" .json)"
@@ -53,8 +54,16 @@ for file in "${files[@]}"; do
 
   result="$(node "${REPO_DIR}/src/apply-task.js" "$file")"
   succeeded="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
+  # Checked BEFORE succeeded -- a delete-containing Group B batch reports succeeded:false
+  # (nothing was touched, so it genuinely isn't a success) but this is a hold for a human,
+  # not a failure; routing it to blocked/ would bury it among real apply failures instead of
+  # its own queue/awaiting-confirm/ stage. See apply-task.js's own gate comment.
+  needs_confirmation="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsConfirmation?"true":"false")}catch(e){console.log("false")}')"
 
-  if [[ "$succeeded" == "true" ]]; then
+  if [[ "$needs_confirmation" == "true" ]]; then
+    mv "$file" "${AWAITING_CONFIRM_DIR}/${task_id}.json"
+    printf '[apply-task] %s: awaiting human confirmation (delete in batch) -> %s\n' "$task_id" "$result"
+  elif [[ "$succeeded" == "true" ]]; then
     mv "$file" "${DONE_DIR}/${task_id}.json"
     printf '[apply-task] %s: applied -> %s\n' "$task_id" "$result"
   else

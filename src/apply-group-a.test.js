@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -377,6 +377,127 @@ test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured',
   assert.match(result.reason, /SECOND_BRAIN_DIR/);
 });
 
+// --- applyBrainDumpSort's adhoc + path-prefetch routing (2026-08-16) --------------------
+// belongsToProject + actionable queues a real adhoc task in the matched project's own
+// queue/adhoc/ -- and, since the path-prefetch feature, resolves anchor keywords against
+// that project's graphify-out/graph.json BEFORE queuing, routing to queue/adhoc/ (matched
+// or greenfield) or queue/needs-clarification/ (no-match or ambiguous) accordingly. Uses
+// AGENT_MANAGER_PROJECTS_REGISTRY_PATH to point readProjectRegistry() at a throwaway
+// fixture instead of this repo's own real, live projects.json (which the actual running
+// pipeline reads/writes concurrently -- unsafe to swap out from under it for a test run).
+function setupMatchedProjectFixture(dir, { label = 'test-project' } = {}) {
+  const repoRoot = path.join(dir, 'repo');
+  const pipelineDir = path.join(dir, 'pipeline');
+  fs.mkdirSync(repoRoot, { recursive: true });
+  fs.mkdirSync(pipelineDir, { recursive: true });
+
+  const domainsPath = path.join(pipelineDir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ adhoc: {}, default: {} }));
+
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify([{ repoRoot, pipelineDir, domainsPath, label }]));
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+
+  return { repoRoot, pipelineDir, label };
+}
+
+function writeGraphFixture(repoRoot, nodes) {
+  fs.mkdirSync(path.join(repoRoot, 'graphify-out'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'graphify-out', 'graph.json'), JSON.stringify({ nodes, links: [] }));
+}
+
+test('applyBrainDumpSort injects prefetchedPaths and queues to adhoc/ on an unambiguous anchor match', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  const adhocFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  assert.equal(adhocFiles.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', adhocFiles[0]), 'utf8'));
+  assert.deepEqual(written.promptContext.prefetchedPaths, ['src/budget_guard.ts']);
+  assert.equal(written.needsClarification, undefined);
+  assert.equal(result.queuedTaskId, adhocFiles[0].replace(/\.json$/, ''));
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false);
+});
+
+test('applyBrainDumpSort routes to queue/needs-clarification/ (not adhoc/) when no anchor keyword matches', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/unrelated.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Totally unrelated topic entirely' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Totally unrelated topic entirely' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false, 'must not land in adhoc/ where the worker would silently claim it');
+  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
+  assert.equal(heldFiles.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
+  assert.equal(written.needsClarification.reason, 'no-match');
+});
+
+test('applyBrainDumpSort routes to queue/needs-clarification/ with candidates when a keyword matches multiple files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(repoRoot, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'auth.ts'), '// stub\n');
+  fs.writeFileSync(path.join(repoRoot, 'server', 'auth.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [
+    { id: 0, community: 0, source_file: 'src/auth.ts' },
+    { id: 1, community: 0, source_file: 'server/auth.ts' },
+  ]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix the auth bug' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix the auth bug' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
+  assert.equal(heldFiles.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
+  assert.equal(written.needsClarification.reason, 'ambiguous');
+  assert.deepEqual(new Set(written.needsClarification.candidates.auth), new Set(['src/auth.ts', 'server/auth.ts']));
+});
+
+test('applyBrainDumpSort queues to adhoc/ normally (no prefetchedPaths, not held) when the project has no graph yet -- greenfield is not an error', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const { pipelineDir, label } = setupMatchedProjectFixture(dir);
+  // Deliberately no graphify-out/graph.json written at all.
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Build a brand new feature from scratch' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Build a brand new feature from scratch' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false);
+  const adhocFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  assert.equal(adhocFiles.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', adhocFiles[0]), 'utf8'));
+  assert.equal(written.promptContext.prefetchedPaths, undefined);
+  assert.equal(written.needsClarification, undefined);
+});
+
 test('applyArchImportCandidate leaves promotedAt null (not stamped) on a skipped/empty implement response', () => {
   // Regression for the 2026-07-26 fix: promotedAt used to be stamped unconditionally,
   // permanently hiding an item from nextArchImportTask() even though nothing was ever
@@ -454,4 +575,170 @@ test('applyVerdictOnly returns a placeholder reason for a truly empty implement 
   const result = applyVerdictOnly({ implementResponse: '' });
   assert.equal(result.skipped, true);
   assert.match(result.reason, /no verdict text/);
+});
+
+// --- parsePathPrefetchResolveResult / applyPathPrefetchResolve (hybrid path-prefetch
+// fallback, 2026-08-16) -------------------------------------------------------------------
+
+test('parsePathPrefetchResolveResult parses a well-formed confident-match object', () => {
+  const result = parsePathPrefetchResolveResult(JSON.stringify({
+    paths: ['src/auth.ts'], rationale: 'the note names auth directly', confident: true,
+  }));
+  assert.deepEqual(result, { paths: ['src/auth.ts'], rationale: 'the note names auth directly', confident: true });
+});
+
+test('parsePathPrefetchResolveResult parses a no-match verdict with an empty paths array', () => {
+  const result = parsePathPrefetchResolveResult(JSON.stringify({
+    paths: [], rationale: 'nothing in the file list plausibly relates', confident: false,
+  }));
+  assert.deepEqual(result, { paths: [], rationale: 'nothing in the file list plausibly relates', confident: false });
+});
+
+test('parsePathPrefetchResolveResult parses a response wrapped in a ```json fence', () => {
+  const fenced = '```json\n' + JSON.stringify({ paths: ['a.ts'], rationale: 'r', confident: true }) + '\n```';
+  const result = parsePathPrefetchResolveResult(fenced);
+  assert.deepEqual(result, { paths: ['a.ts'], rationale: 'r', confident: true });
+});
+
+test('parsePathPrefetchResolveResult returns null for unparseable JSON', () => {
+  assert.equal(parsePathPrefetchResolveResult('not json'), null);
+  assert.equal(parsePathPrefetchResolveResult(''), null);
+});
+
+test('parsePathPrefetchResolveResult returns null when the paths field is missing entirely', () => {
+  assert.equal(parsePathPrefetchResolveResult(JSON.stringify({ rationale: 'r', confident: true })), null);
+});
+
+function writeHeldTaskFixture(pipelineDir, id, needsClarification) {
+  const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  fs.mkdirSync(heldDir, { recursive: true });
+  const held = { id, domain: 'adhoc', source: 'brain_dump', title: 'held task', promptContext: { rawText: 'held task text' }, needsClarification };
+  fs.writeFileSync(path.join(heldDir, `${id}.json`), JSON.stringify(held, null, 2));
+  return path.join(heldDir, `${id}.json`);
+}
+
+test('applyPathPrefetchResolve writes a NON-confident suggestion onto the held task without moving it out of needs-clarification/', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'ambiguous', candidates: { auth: ['src/auth.ts', 'server/auth.ts'] } });
+  const implementResponse = JSON.stringify({ paths: ['src/auth.ts'], rationale: 'best guess, not sure', confident: false });
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  assert.equal(result.suggested, true);
+  assert.deepEqual(result.paths, ['src/auth.ts']);
+  assert.equal(result.confident, false);
+
+  // Still in needs-clarification/ -- a non-confident guess still requires the human's own
+  // Accept Suggestion/manual-path/Proceed click via the dashboard's resolve endpoint.
+  assert.ok(fs.existsSync(heldPath));
+  const written = JSON.parse(fs.readFileSync(heldPath, 'utf8'));
+  assert.deepEqual(written.needsClarification.suggested.paths, ['src/auth.ts']);
+  assert.equal(written.needsClarification.suggested.confident, false);
+  assert.equal(written.needsClarification.suggestionAttempted, true);
+  // Original ambiguous candidates are preserved alongside the new suggestion -- the
+  // human picker can still show both.
+  assert.deepEqual(written.needsClarification.candidates, { auth: ['src/auth.ts', 'server/auth.ts'] });
+});
+
+// Auto-resolve on a confident suggestion (2026-08-16): the actual ask was that ending a
+// Discuss session should be enough by itself to get a held task off the Needs
+// Clarification list, not require yet another manual click on top of whatever context the
+// human just supplied. Scoped to confident:true only -- see the module header comment for
+// why a non-confident guess (covered by the test above) still requires the human's click.
+test('applyPathPrefetchResolve auto-resolves straight into queue/adhoc/, off the needs-clarification list, when the suggestion is confident', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match' });
+  const implementResponse = JSON.stringify({ paths: ['src/auth.ts'], rationale: 'the note names auth directly', confident: true });
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  assert.equal(result.autoResolved, true);
+  assert.deepEqual(result.paths, ['src/auth.ts']);
+  assert.ok(!fs.existsSync(heldPath), 'must be removed from needs-clarification/ once auto-resolved');
+
+  const adhocPath = path.join(pipelineDir, 'queue', 'adhoc', 'held-1.json');
+  assert.ok(fs.existsSync(adhocPath));
+  const written = JSON.parse(fs.readFileSync(adhocPath, 'utf8'));
+  assert.deepEqual(written.promptContext.prefetchedPaths, ['src/auth.ts']);
+  assert.equal(written.needsClarification, undefined, 'needsClarification must be cleared -- this is now a normal adhoc task, not a held one');
+});
+
+test('applyPathPrefetchResolve does not auto-resolve a confident suggestion with an empty paths array (nothing real to prefetch)', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match' });
+  const implementResponse = JSON.stringify({ paths: [], rationale: 'confident nothing matches', confident: true });
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  assert.equal(result.suggested, true);
+  assert.ok(fs.existsSync(heldPath), 'stays held -- confident-but-empty is not the same as a confident real path to auto-apply');
+});
+
+test('applyPathPrefetchResolve falls back to leaving the held task in needs-clarification/ if adhoc/ already has this id (raced with a manual resolve)', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match' });
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.writeFileSync(path.join(adhocDir, 'held-1.json'), JSON.stringify({ id: 'held-1', promptContext: { prefetchedPaths: ['manually-picked.ts'] } }));
+  const implementResponse = JSON.stringify({ paths: ['src/auth.ts'], rationale: 'r', confident: true });
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  assert.equal(result.suggested, true);
+  assert.ok(fs.existsSync(heldPath), 'must not clobber the already-resolved adhoc/ file');
+  const adhocWritten = JSON.parse(fs.readFileSync(path.join(adhocDir, 'held-1.json'), 'utf8'));
+  assert.deepEqual(adhocWritten.promptContext.prefetchedPaths, ['manually-picked.ts'], 'the manually-resolved adhoc/ file must be untouched');
+});
+
+test('applyPathPrefetchResolve marks suggestionAttempted even when the implement response is malformed, so it is never retried forever', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match' });
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+
+  const result = applyPathPrefetchResolve({ implementResponse: 'not json at all', task, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  const written = JSON.parse(fs.readFileSync(heldPath, 'utf8'));
+  assert.equal(written.needsClarification.suggestionAttempted, true);
+  assert.equal(written.needsClarification.suggested, undefined);
+});
+
+test('applyPathPrefetchResolve skips cleanly when the held task was already resolved/rejected before this task got approved (real race)', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  // Deliberately never written -- simulates a human resolving (moved to queue/adhoc/) or
+  // rejecting (archived) the held task while this resolve task was still in flight.
+  const task = { promptContext: { heldTaskId: 'already-gone' } };
+  const implementResponse = JSON.stringify({ paths: ['x.ts'], rationale: 'r', confident: true });
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no longer exists/);
+});
+
+test('applyPathPrefetchResolve skips cleanly when the held task exists but its needsClarification was already cleared (resolved via the dashboard mid-flight)', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  fs.mkdirSync(heldDir, { recursive: true });
+  // needsClarification absent -- as if the dashboard's resolve flow already ran (it
+  // deletes this field before moving the file to queue/adhoc/); a stray copy left behind
+  // here (unrealistic in production, but exercises the guard directly) must not be
+  // treated as still-pending.
+  fs.writeFileSync(path.join(heldDir, 'held-1.json'), JSON.stringify({ id: 'held-1', promptContext: {} }));
+  const task = { promptContext: { heldTaskId: 'held-1' } };
+  const implementResponse = JSON.stringify({ paths: ['x.ts'], rationale: 'r', confident: true });
+
+  const result = applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no longer has needsClarification/);
+});
+
+test('applyPathPrefetchResolve skips cleanly (with a clear reason) when promptContext has no heldTaskId at all', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const result = applyPathPrefetchResolve({ implementResponse: '{}', task: { promptContext: {} }, pipelineDir });
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /heldTaskId/);
 });
