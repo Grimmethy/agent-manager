@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=Agent Manager
+Comment=Launch all agent-manager daemons (worker, review-runner, apply-task, queue-watcher) in background. Bash-only port of src/launch.ps1; no PowerShell dependency required.
+Icon=utilities-terminal
+Exec=env -u PYTHONPATH bash /media/model-cache/github/agent-manager/scripts/launch.sh --start
+Terminal=true
+Categories=Development;System;Utility;
+Keywords=orchestrator,worker,reviewer,dashboard,nvidia-agent-sdk;
+StartupNotify=false
+X-GNOME-Autostart-Phase=startup
+
+[Desktop Action LaunchWorker]
+Name=Launch Worker Only
+Icon=view-list
+Exec=bash -c "source /media/model-cache/github/agent-manager/scripts/orc-common.sh && bash /media/model-cache/github/agent-manager/scripts/ornith-worker.sh worker"
+
+[Desktop Action LaunchReviewer]
+Name=Launch Reviewer Only
+Icon=view-list
+Exec=bash -c "source /media/model-cache/github/agent-manager/scripts/orc-common.sh && bash /media/model-cache/github/agent-manager/scripts/review-runner.sh reviewer"
+
+[Desktop Action LaunchTaskApplier]
+Name=Launch Apply-Task Only
+Icon=view-history
+Exec=bash -c "source /media-model-cache/github/agent-manager/scripts/orc-common.sh && bash /media-model-cache/github/agent-manager/scripts/apply-task.sh applier"

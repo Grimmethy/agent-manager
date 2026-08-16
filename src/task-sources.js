@@ -17,6 +17,7 @@ const { registerTaskSource, getRegisteredSources } = require('./task-source-regi
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { scanProject } = require('./observability-scan.js');
+const { isOnline } = require('./connectivity-check.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -467,6 +468,13 @@ function nextArchDiscoveryTask() {
 // already-known leads happens via the INDEX.md content embedded below, read by Ornith
 // itself when proposing queries and synthesizing findings.
 function nextProjectSearchTask() {
+  // Real GitHub/HuggingFace search happens later, in ornith-draft.js's harness-fetch step
+  // (project-search-fetch.js) -- but that's AFTER a plan+implement pass has already been
+  // spent drafting this task. Checking connectivity here, before the task is even
+  // generated, is what actually stops the "ton of blocked repo search jobs" (offline
+  // 2026-08-15): no point queuing work that's guaranteed to fail its one real dependency.
+  if (!isOnline()) return null;
+
   const { repoRoot, projectSearchIndexPath, defaultDomain } = getConfig();
   const projectTag = path.basename(repoRoot);
 
@@ -570,7 +578,24 @@ function onboardDeepDiveProject(lead, clonesDir) {
   const graphOutPath = path.join(clonePath, '.deep-dive-graph.json');
   if (!fs.existsSync(graphOutPath)) {
     const buildGraphScript = path.join(__dirname, '..', 'python', 'build_graph.py');
-    execSync(`python "${buildGraphScript}" --target-dir "${clonePath}" --output "${graphOutPath}" --no-model-naming`, { stdio: 'pipe' });
+    // Prefer this package's own .venv interpreter (same one launch.sh uses for the
+    // dashboard: PACKAGE_ROOT/.venv/bin/python) -- that's where build_graph.py's actual
+    // dependencies (networkx, per python/requirements.txt) are installed. Falls back to a
+    // bare python3/python off PATH for a consumer without this exact venv layout. Two
+    // stacked bugs found live 2026-08-14, both silent until now (ornith-worker.sh only
+    // recently started keeping task-sources.js's stderr instead of discarding it to
+    // /dev/null): (1) the original hardcoded 'python' is a Windows-ism -- most Linux
+    // distros, this one included, only ever install a 'python3' binary, no 'python' alias,
+    // so this failed with `/bin/sh: 1: python: not found` on every single attempt; (2) even
+    // after fixing the binary name, the system-wide python3 doesn't have networkx installed
+    // at all -- only this repo's own .venv does. Together, EVERY onboarding attempt for
+    // EVERY real, well-grounded Strong lead that had accumulated (8 of them) failed, and
+    // Scouted Repos stayed empty long after real Strong leads existed to onboard.
+    const venvPython = process.platform === 'win32'
+      ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
+      : path.join(__dirname, '..', '.venv', 'bin', 'python');
+    const pythonBin = fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3');
+    execSync(`"${pythonBin}" "${buildGraphScript}" --target-dir "${clonePath}" --output "${graphOutPath}" --no-model-naming`, { stdio: 'pipe' });
   }
 
   const graphData = JSON.parse(readIfExists(graphOutPath) || '{"nodes":[],"links":[],"communities":[]}');
@@ -601,8 +626,15 @@ function nextDeepDiveTask() {
   // happened to be running.
   const strongLeads = parseStrongLeadsFromIndex(readIfExists(projectSearchIndexPath))
     .filter((lead) => lead.relevantTo === projectTag);
+  // Onboarding (below) does a real `git clone` of the lead's URL -- same offline failure
+  // mode as project_search's search calls, just via git instead of https directly. Only
+  // guards the clone step, not the whole function: drafting from ALREADY-onboarded
+  // communities (the candidates loop further down) is pure local filesystem work and
+  // stays available offline.
+  const onboardingOnline = strongLeads.some((lead) => !coverage.projects[slugifyForId(lead.name)]) ? isOnline() : true;
   let coverageChanged = false;
   for (const lead of strongLeads) {
+    if (!onboardingOnline) break;
     const slug = slugifyForId(lead.name);
     if (coverage.projects[slug]) continue; // already onboarded (or a prior onboarding attempt failed and will retry below)
     try {
@@ -891,9 +923,27 @@ function listSecondBrainTopLevel(secondBrainDir) {
   } catch {
     return [];
   }
-  return entries
-    .filter((e) => !e.name.startsWith('.'))
-    .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+  // De-dupe case-insensitively before this ever reaches the model: showing it both
+  // "Projects/" and "projects/" as two separate "existing" options is exactly what let it
+  // pick a different-case variant of a folder that already existed (confirmed live
+  // 2026-08-16 -- the vault actually had both). If the vault somehow still has both
+  // (should only happen transiently, e.g. mid-manual-cleanup), keep whichever has more
+  // entries -- the more-populated one is the one actually in use -- and fall back to
+  // alphabetical for a stable tie-break so this doesn't flip between ticks.
+  const byLower = new Map();
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const key = e.name.toLowerCase();
+    const count = e.isDirectory() ? (() => {
+      try { return fs.readdirSync(path.join(secondBrainDir, e.name)).length; } catch { return 0; }
+    })() : -1;
+    const existing = byLower.get(key);
+    if (!existing || count > existing.count || (count === existing.count && e.name < existing.name)) {
+      byLower.set(key, { name: e.name, isDir: e.isDirectory(), count });
+    }
+  }
+  return [...byLower.values()]
+    .map((v) => (v.isDir ? `${v.name}/` : v.name))
     .sort();
 }
 
@@ -1239,6 +1289,7 @@ module.exports = {
   nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
+  listSecondBrainTopLevel,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
@@ -1292,9 +1343,29 @@ if (require.main === module) {
 
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  const draftingDir = path.join(pipelineDir, 'queue', 'drafting');
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
-  const alreadyPending = fs.existsSync(pendingDir)
-    && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json'));
+  // Checked pendingDir only until 2026-08-14 -- a claimed task moves OUT of pending/ into
+  // drafting/<instanceId>/ within the same worker tick that claims it (see
+  // ornith-worker.sh), well before the real plan/implement/critique work behind it is
+  // done, so pending/ alone reads "empty" almost immediately after every claim regardless
+  // of how deep the real backlog sitting in drafting/ already is. Confirmed live: 15+
+  // project_search tasks piled up in drafting/ while this throttle kept seeding a new one
+  // on every single ~30s tick, since it only ever saw an empty pending/. drafting/ is one
+  // level deeper (per-instance subfolders), so this checks any *.json under any of those,
+  // not just the top level.
+  const hasDraftingWork = fs.existsSync(draftingDir)
+    && fs.readdirSync(draftingDir, { withFileTypes: true }).some((entry) => {
+      if (!entry.isDirectory()) return false;
+      const instanceDir = path.join(draftingDir, entry.name);
+      try {
+        return fs.readdirSync(instanceDir).some((f) => f.endsWith('.json'));
+      } catch {
+        return false;
+      }
+    });
+  const alreadyPending = hasDraftingWork
+    || (fs.existsSync(pendingDir) && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json')));
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception

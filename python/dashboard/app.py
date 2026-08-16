@@ -349,8 +349,13 @@ def model_stats_db_path() -> Path | None:
 
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
-    kept in sync by hand since this dashboard is Python, not Node."""
+    kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
+    agent-manager.env directly, same as get_active_repo_root(), since the dashboard is
+    often started with no env vars pre-set at all."""
     v = os.environ.get("SECOND_BRAIN_DIR")
+    if v:
+        return Path(v)
+    v = read_env_file(ENV_FILE_PATH).get("SECOND_BRAIN_DIR")
     return Path(v) if v else None
 
 
@@ -963,6 +968,158 @@ def api_brain_dump_prioritize(entry_id):
     entry["queuedAt"] = datetime.now(timezone.utc).isoformat()
     write_brain_dump_entries(entries)
     return jsonify(entry)
+
+
+@app.route("/api/brain-dump/<entry_id>/discuss/latest", methods=["GET"])
+def api_brain_dump_discuss_latest(entry_id):
+    """Same "don't silently start a duplicate session" check grill/for-note already does
+    for Grill Me -- see discuss_sessions.py's latest_session_for_subject() for the
+    incident that pattern traces back to."""
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import latest_session_for_subject
+    session = latest_session_for_subject(pipeline_dir, entry_id)
+    return jsonify(session)
+
+
+@app.route("/api/brain-dump/<entry_id>/discuss/start", methods=["POST"])
+def api_brain_dump_discuss_start(entry_id):
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import start_session
+    session = start_session(pipeline_dir, entry_id, entry["rawText"])
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/discuss/for-note", methods=["GET"])
+def api_second_brain_discuss_for_note():
+    """Vault-note counterpart to /api/brain-dump/<id>/discuss/latest -- same "don't
+    silently start a duplicate" check, surfaced next to Grill Me/Grill With Docs in the
+    Second Brain file viewer."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    note_path = (request.args.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    from discuss_sessions import latest_session_for_subject
+    session = latest_session_for_subject(root, note_path)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/discuss/start", methods=["POST"])
+def api_second_brain_discuss_start():
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    note_path = (body.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    full_path = _resolve_under_second_brain(root.resolve(), note_path)
+    note_content = full_path.read_text(encoding="utf-8") if full_path.is_file() else ""
+    from discuss_sessions import start_session
+    session = start_session(root, note_path, note_content)
+    return jsonify(session)
+
+
+def _resolve_discuss_session(session_id):
+    """Discuss sessions live in one of two storage locations depending on where the
+    conversation started -- pipeline_dir for a brain-dump entry, SECOND_BRAIN_DIR for a
+    vault note (see discuss_sessions.py's own header). Session ids are already globally
+    unique (uuid4 suffix), so trying both known locations here is simpler and more honest
+    than threading a kind-prefix through every session id just to route this lookup.
+    Returns (kind, storage_dir, session) where kind is 'brain-dump' or 'second-brain', or
+    (None, None, None) if the session isn't in either."""
+    from discuss_sessions import get_session
+    pipeline_dir = get_pipeline_dir()
+    if pipeline_dir:
+        session = get_session(pipeline_dir, session_id)
+        if session:
+            return "brain-dump", pipeline_dir, session
+    root = second_brain_dir()
+    if root:
+        session = get_session(root, session_id)
+        if session:
+            return "second-brain", root, session
+    return None, None, None
+
+
+@app.route("/api/discuss/<session_id>/message", methods=["POST"])
+def api_discuss_message(session_id):
+    kind, storage_dir, existing = _resolve_discuss_session(session_id)
+    if not storage_dir:
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+    if not message:
+        abort(400, description="message is required")
+    from discuss_sessions import send_message
+    session = send_message(storage_dir, session_id, message)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/discuss/<session_id>", methods=["GET"])
+def api_discuss_get(session_id):
+    kind, storage_dir, session = _resolve_discuss_session(session_id)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/discuss/<session_id>/end", methods=["POST"])
+def api_discuss_end(session_id):
+    """Ends the conversation and, if it produced a real summary, applies it to whatever
+    it was discussing:
+    - brain-dump entry: appended to rawText, reusing PUT /api/brain-dump/<id>'s own
+      sorted->captured reset logic (a discussion that adds real context is exactly the
+      kind of text change that should make a stale prior sort get re-evaluated).
+    - vault note: appended as a "## Discuss session -- <date>" section, same convention
+      grill_sessions.py's enrich_note() already uses for Grill Me/Grill With Docs.
+    discuss_sessions.py deliberately never touches either data store itself -- this is
+    the one place that happens, same division of responsibility as every other mutation
+    of either store in this file."""
+    kind, storage_dir, existing = _resolve_discuss_session(session_id)
+    if not storage_dir:
+        abort(404)
+    from discuss_sessions import end_session
+    session = end_session(storage_dir, session_id)
+    if not session:
+        abort(404)
+
+    entry = None
+    note_updated = False
+    summary = (session.get("summary") or "").strip()
+    if summary and kind == "brain-dump":
+        entries = read_brain_dump_entries()
+        entry = next((e for e in entries if e.get("id") == session["subjectId"]), None)
+        if entry:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry["rawText"] = f"{entry['rawText']}\n\n[Discussed {stamp}]: {summary}"
+            if entry.get("status") == "sorted":
+                entry["status"] = "captured"
+                entry.pop("sort", None)
+            entry["editedAt"] = datetime.now(timezone.utc).isoformat()
+            write_brain_dump_entries(entries)
+    elif summary and kind == "second-brain":
+        root = second_brain_dir()
+        if root:
+            note_path = _resolve_under_second_brain(root.resolve(), session["subjectId"])
+            if note_path.is_file():
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                entry_text = f"\n\n## Discuss session -- {stamp}\n\n{summary}\n"
+                note_path.write_text(note_path.read_text(encoding="utf-8") + entry_text, encoding="utf-8")
+                note_updated = True
+
+    return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated})
 
 
 def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
@@ -1876,38 +2033,75 @@ def api_job_types_approval_mode():
     return jsonify({"name": name, "approvalMode": mode})
 
 
-def _stop_pipeline() -> list:
-    """Kills whatever the current instances/*.json heartbeats say is running, by PID --
-    same trust model queue-watchdog.ps1's own dead-process check already uses. Does NOT
-    touch anything if nothing looks like it's running, so this is safe to call even when
-    unsure. Shared by /api/pipeline/stop and _restart_pipeline()."""
-    inst_dir = instances_dir()
-    if not inst_dir or not inst_dir.is_dir():
-        return []
+def _stop_pipeline(force: bool = False) -> list:
+    """Stops whatever launch.sh/launch.bat started. On Windows, kills by PID from the
+    current instances/*.json heartbeats (same trust model queue-watchdog.ps1's own
+    dead-process check already uses) via taskkill. On Linux there is no taskkill --
+    confirmed live (2026-08-15): every call here silently no-op'd (OSError from the
+    missing binary, caught and ignored) except for deleting the heartbeat file below, so
+    Stop Pipeline in the dashboard *looked* successful (heartbeats vanished, UI showed
+    stopped) while every daemon kept running untouched in the background. Linux instead
+    shells out to scripts/stop.sh, which SIGTERMs each daemon by its launch.sh pidfile,
+    waits out a grace period for it to exit cleanly (see each daemon's own trap), and
+    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here.
 
+    force=False (the toggle button's first click) launches stop.sh in the background and
+    returns immediately -- the frontend's existing 3s status poll picks up the moment
+    daemons actually exit, and the toggle offers a force option meanwhile rather than the
+    request hanging open for up to the grace period. force=True (the toggle's second
+    click, or _restart_pipeline() which needs this to be synchronous) waits for stop.sh's
+    own --force path, which skips SIGTERM/grace entirely and SIGKILLs immediately.
+
+    Does NOT touch anything if nothing looks like it's running, so this is safe to call
+    even when unsure. Shared by /api/pipeline/stop and _restart_pipeline()."""
+    inst_dir = instances_dir()
     stopped = []
-    for f in inst_dir.glob("*.json"):
-        data = read_json_safe(f)
-        if not data or not data.get("pid"):
-            continue
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(data["pid"])], capture_output=True, timeout=10)
-            stopped.append(data.get("instanceId", str(data["pid"])))
-        except (OSError, subprocess.SubprocessError):
-            continue
-        finally:
+    if inst_dir and inst_dir.is_dir():
+        for f in inst_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and data.get("instanceId"):
+                stopped.append(data["instanceId"])
+            if os.name == "nt":
+                pid = data.get("pid") if data else None
+                if pid:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
             # Confirmed live (2026-07-22): without this, _pipeline_running()'s worker-1
             # heartbeat check kept reporting the pipeline as running for up to
             # WORKING_STALE_SECONDS (20 min) after a real, successful stop -- the killed
             # process's last-written heartbeat file just sat there looking recent, and
             # /api/pipeline/start's "already running" guard blocked a genuine restart the
-            # whole time. Remove the heartbeat regardless of whether taskkill itself
+            # whole time. Remove the heartbeat regardless of whether the kill itself
             # reported success (the process may have already been dead) -- either way,
             # this instance should no longer read as live.
             try:
                 f.unlink()
             except OSError:
                 pass
+
+    if os.name != "nt":
+        stop_sh = PACKAGE_ROOT / "scripts" / "stop.sh"
+        if stop_sh.is_file():
+            args = ["bash", str(stop_sh), "--keep-dashboard"]
+            if force:
+                args.append("--force")
+            try:
+                if force:
+                    # --force SIGKILLs immediately, no grace-period wait -- fast enough to
+                    # block on, and _restart_pipeline() needs the old daemons actually gone
+                    # before it starts new ones against the same pidfiles/queue dir.
+                    subprocess.run(args, capture_output=True, timeout=10)
+                else:
+                    # Backgrounded so this request returns immediately instead of holding
+                    # the (single-threaded dev server) connection open for up to the grace
+                    # period -- the toggle button's second click (force) needs to reach the
+                    # server promptly, not queue behind this one.
+                    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+
     return stopped
 
 
@@ -1951,7 +2145,20 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
 
     if os.name != "nt":
-        return {"started": False, "reason": "process auto-start is only implemented for Windows -- use launch.bat manually"}
+        import platform, subprocess as sp, shlex
+        LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+        launch_py = str(PACKAGE_ROOT / 'scripts' / 'launch.sh')
+        if not Path(launch_py).is_file():
+            return {"started": False, "reason": f"{launch_py} missing; cannot start daemons on Linux without a working launch script."}
+        subprocess.Popen(
+            ["bash", launch_py, "--no-browser"],
+            env=child_env,
+            cwd=str(PACKAGE_ROOT),
+            stdout=(LOG_DIR / 'launch-python.log').open('a'),
+            stderr=sp.STDOUT,
+            start_new_session=True,
+        )
+        return {"started": True, "repoRoot": raw_path}
 
     creationflags = subprocess.CREATE_NEW_CONSOLE
     scripts = [
@@ -1976,7 +2183,7 @@ def _restart_pipeline():
     raw_path = env.get("AGENT_MANAGER_REPO_ROOT", "")
     if not raw_path or not Path(raw_path).is_dir():
         return
-    _stop_pipeline()
+    _stop_pipeline(force=True)  # needs to be synchronous -- start_pipeline() below must not race a still-shutting-down daemon for the same pidfiles/queue dir
     include_apply = env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true"
     skip_push = env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true"
     _start_pipeline(raw_path, include_apply, skip_push)
@@ -2009,7 +2216,9 @@ def api_pipeline_start():
 
 @app.route("/api/pipeline/stop", methods=["POST"])
 def api_pipeline_stop():
-    return jsonify({"stopped": _stop_pipeline()})
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+    return jsonify({"stopped": _stop_pipeline(force=force)})
 
 
 if __name__ == "__main__":
