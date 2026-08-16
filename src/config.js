@@ -10,6 +10,49 @@
 // REPO_ROOT is the one REQUIRED setting -- there is no sensible package-relative default
 // once this code no longer lives inside the consumer's own repo.
 
+// The dashboard's own "Build Graph" button (Project tab) and arch_discovery/
+// path-prefetch.js's graph consumers used to point at two entirely different files --
+// confirmed live 2026-08-16: a user built a graph via the dashboard, expecting it to
+// feed both, and neither arch_discovery nor the new path-prefetch feature ever saw it,
+// since the dashboard writes to <repoRoot>/.agent-manager-cache/<grepDirsSlug>/graph.json
+// (python/dashboard/app.py's project_cache_paths/_grepdirs_slug) while the Node-side
+// default here pointed at <repoRoot>/graphify-out/graph.json -- a path nothing in this
+// package ever actually writes to on its own (only ever populated by someone manually
+// running python/build_graph.py's CLI directly, which is how this went unnoticed).
+//
+// Resolution order: (1) .agent-manager-cache/default/graph.json -- the common case, no
+// grepDirs configured, a predictable non-hashed path per _grepdirs_slug's own "'default'
+// for the common no-grepDirs case" comment; (2) if that's missing, the most recently
+// modified graph.json across any .agent-manager-cache/<hash>/ subdirectory (a grepDirs-
+// scoped build) -- picking freshest rather than replicating Python's exact hash algorithm
+// here, which would just be two implementations to keep in sync for no real benefit;
+// (3) the old graphify-out/graph.json location, kept as a last-resort fallback for
+// anyone who already has one from manually running build_graph.py's CLI -- not
+// regressing that existing (if rare) usage just because the dashboard button now has
+// its own, preferred path.
+function resolveGraphPath(repoRoot) {
+  const fs = require('fs');
+  const path = require('path');
+  const cacheDir = path.join(repoRoot, '.agent-manager-cache');
+
+  const defaultCacheGraph = path.join(cacheDir, 'default', 'graph.json');
+  if (fs.existsSync(defaultCacheGraph)) return defaultCacheGraph;
+
+  try {
+    const candidates = fs.readdirSync(cacheDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(cacheDir, e.name, 'graph.json'))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length > 0) return candidates[0].p;
+  } catch {
+    // cacheDir itself doesn't exist -- fall through to the legacy default below.
+  }
+
+  return path.join(repoRoot, 'graphify-out', 'graph.json');
+}
+
 function getConfig() {
   const path = require('path');
   const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
@@ -40,7 +83,7 @@ function getConfig() {
   const archReviewCandidatesPath = process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_REVIEW_CANDIDATES.md');
   const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
-  const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || path.join(repoRoot, 'graphify-out', 'graph.json');
+  const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
   // project_search's apply target lives OUTSIDE any single project's repo root by design
   // (see ADR-0018) -- a cross-project lead ledger, not something scoped to repoRoot the way
@@ -147,4 +190,4 @@ function ensureRegistered() {
   if (registerPath) require(registerPath);
 }
 
-module.exports = { getConfig, ensureRegistered };
+module.exports = { getConfig, ensureRegistered, resolveGraphPath };

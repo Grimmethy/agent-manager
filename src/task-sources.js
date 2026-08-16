@@ -951,8 +951,12 @@ function listSecondBrainTopLevel(secondBrainDir) {
 // so brain_dump_sort can tell Ornith which tracked codebases exist. Best-effort: a
 // missing/corrupt registry just yields an empty list, same convention as
 // listSecondBrainTopLevel above -- this is context for the model, not a hard dependency.
+// AGENT_MANAGER_PROJECTS_REGISTRY_PATH override exists purely for this file's own tests
+// -- same reasoning as apply-group-a.js's readProjectRegistry(): the real registry is a
+// live file the actual running pipeline reads/writes concurrently, unsafe to swap out
+// from under it for a test run.
 function readProjectLabels() {
-  const registryPath = path.join(__dirname, '..', 'projects.json');
+  const registryPath = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH || path.join(__dirname, '..', 'projects.json');
   try {
     const list = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
     return Array.isArray(list) ? list.map((p) => p.label).filter(Boolean) : [];
@@ -999,8 +1003,125 @@ function nextBrainDumpSortTask() {
       rawText: chosen.rawText,
       existingStructure: listSecondBrainTopLevel(secondBrainDir),
       projectLabels: readProjectLabels(),
+      // If this package's own source directory is ALSO one of the tracked projects (this
+      // deployment: agent-manager operating on itself), self-referential notes -- about
+      // the brain-dump/pipeline/dashboard system itself -- are near-certainly a feature/
+      // bug for THAT project specifically, not "no project applies." Confirmed live
+      // 2026-08-16: a real note ("brain dump entries should track an interaction count")
+      // was classified actionable:false, belongsToProject:null -- correctly recognized
+      // as a real note per the self-referential guard already in the prompt, but that
+      // guard only ever said "this is real, don't treat it as a placeholder," never
+      // "and therefore it belongs to the project it's describing." Computed generically
+      // (package dir name, not a hardcoded "agent-manager" string) so this still works
+      // correctly for a consumer project with a different name; only passed through when
+      // that label is actually registered/routable, never invented.
+      selfProjectLabel: (() => {
+        const candidate = path.basename(path.join(__dirname, '..'));
+        return readProjectLabels().includes(candidate) ? candidate : null;
+      })(),
     },
   };
+}
+
+// --- Source: path_prefetch_resolve -- LLM-assisted fallback for a held
+// queue/needs-clarification/ task path-prefetch.js's deterministic keyword match
+// couldn't resolve on its own (context-aware-file-path-prefetch-job.md, hybrid design
+// 2026-08-16: pure keyword matching doesn't hold up as a codebase grows or contributors
+// don't know it well -- vague descriptions, vocabulary drift between what someone calls
+// a feature and what the code calls it, accidental substring collisions in a large repo.
+// This is the smart fallback for exactly the cases the fast deterministic pass gives up
+// on, not a replacement for it -- see apply-group-a.js's applyBrainDumpSort, which still
+// tries the free/instant keyword match FIRST and only ever lands a task in
+// queue/needs-clarification/ when that fails.
+//
+// Deliberately does NOT auto-resolve the held task -- see prompts.js's
+// pathPrefetchResolveImplementPrompt and apply-group-a.js's applyPathPrefetchResolve:
+// this only ever writes a SUGGESTION (path(s) + rationale) back onto the held task for a
+// human to accept or override in the dashboard's clarification picker, same fail-safe
+// property the deterministic pass already has (never silently prefetch the wrong file).
+// -----------------------------------------------------------------------------------------
+function nextPathPrefetchResolveTask() {
+  const { pipelineDir, graphPath } = getConfig();
+  const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  let files;
+  try {
+    // Oldest-first (mtime), same convention nextAdhocTask() already uses for its own
+    // queue/adhoc/ scan -- readdirSync's own order is unspecified, and a held task
+    // deserves the same FIFO treatment as everything else this pipeline processes, not
+    // whatever arbitrary order the filesystem happens to return.
+    files = fs.readdirSync(heldDir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => ({ f, mtime: fs.statSync(path.join(heldDir, f)).mtimeMs }))
+      .sort((a, b) => a.mtime - b.mtime)
+      .map((entry) => entry.f);
+  } catch {
+    return null; // no held tasks at all -- nothing to do
+  }
+
+  for (const f of files) {
+    let held;
+    try {
+      held = JSON.parse(fs.readFileSync(path.join(heldDir, f), 'utf8'));
+    } catch {
+      continue; // unreadable/mid-write -- skip this tick, same non-fatal-skip convention as everywhere else in this file
+    }
+    if (!held || !held.needsClarification) continue;
+    // Only ever attempted once per held task -- suggestionAttempted is set by
+    // applyPathPrefetchResolve() regardless of whether the LLM call actually produced a
+    // usable suggestion, so a genuinely unresolvable note doesn't get re-attempted (and
+    // re-spend a model call) every single tick forever.
+    if (held.needsClarification.suggested || held.needsClarification.suggestionAttempted) continue;
+
+    const heldId = held.id || f.replace(/\.json$/, '');
+    // Suffixed with the attempt number, not just heldId alone -- taskIdExistsInQueue()
+    // checks queue/done/ too, so a bare `path-prefetch-resolve-${heldId}` id would
+    // collide with the FIRST attempt's now-done/ file forever, permanently blocking a
+    // legitimate second attempt after Discuss resets suggestionAttempted to false.
+    // Confirmed live 2026-08-16: two held tasks came back from Discuss with
+    // suggestionAttempted:false as designed, but this loop still silently skipped both of
+    // them every tick because their first attempt's id already existed in done/. app.py's
+    // discuss-end handler bumps needsClarification.attempt alongside the reset; default to
+    // 1 for a held task that predates this field (first-ever attempt).
+    const attempt = held.needsClarification.attempt || 1;
+    const resolveId = attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`;
+    if (taskIdExistsInQueue(resolveId)) continue;
+
+    // Same candidate universe path-prefetch.js's own deterministic pass already
+    // searched -- the LLM fallback reasons over the exact same real files, not a
+    // separate signal that could disagree with what "matched" would even mean. Uses
+    // getConfig().graphPath (config.js's resolveGraphPath()) rather than re-deriving the
+    // old hardcoded graphify-out/graph.json default here -- confirmed live 2026-08-16:
+    // this function had its OWN independent copy of that stale default, so it never
+    // actually benefited from the resolveGraphPath() fix even after that fix shipped,
+    // and silently returned null (graph "not found") for every real held task.
+    let fileList;
+    try {
+      const graph = JSON.parse(readIfExists(graphPath) || '{}');
+      fileList = [...new Set((graph.nodes || []).map((n) => n.source_file).filter(Boolean))];
+    } catch {
+      fileList = [];
+    }
+    if (fileList.length === 0) continue; // greenfield project -- nothing for the LLM to match against either; leave held as-is
+
+    return {
+      id: resolveId,
+      domain: 'path_prefetch_resolve',
+      source: 'path_prefetch_resolve',
+      title: `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
+      promptContext: {
+        heldTaskId: heldId,
+        rawText: (held.promptContext && held.promptContext.rawText) || held.title || '',
+        taskTitle: held.title || '',
+        reason: held.needsClarification.reason,
+        candidates: held.needsClarification.candidates || null,
+        // Budget cap matching path-prefetch.js's own MAX_PREFETCHED_PATHS reasoning --
+        // this is meant to give the model a real candidate list, not the whole repo's
+        // worth of paths crammed into one prompt.
+        fileList: fileList.slice(0, 400),
+      },
+    };
+  }
+  return null;
 }
 
 // Per-source priority override (Job List tab, AGENT_MANAGER_TASK_PRIORITIES via
@@ -1032,6 +1153,18 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // domain==='brain_dump_sort' before writeArtifact() is ever called. See apply-task.js's
 // applyBrainDumpSort branch instead.
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask });
+// Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
+// place, ahead of every other job type. A held task blocks real work from ever being
+// drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
+// not compete on equal footing with routine backlog like arch_review/deep_dive.
+// No `apply` registered here -- same reasoning as brain_dump_sort just above:
+// applyTask() intercepts domain==='path_prefetch_resolve' before writeArtifact() (the
+// only thing that would ever read a registered `apply`) is reached at all. See
+// apply-task.js's own path_prefetch_resolve branch instead.
+registerTaskSource('path_prefetch_resolve', {
+  priority: taskPriority('path_prefetch_resolve', 45),
+  next: nextPathPrefetchResolveTask,
+});
 registerTaskSource('arch_review', {
   priority: taskPriority('arch_review', 70),
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
@@ -1287,6 +1420,7 @@ module.exports = {
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
   nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
+  nextPathPrefetchResolveTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
@@ -1393,7 +1527,37 @@ if (require.main === module) {
     }
   })();
 
-  if (alreadyPending && !hasAdhocWaiting && !hasBrainDumpWaiting) {
+  // Same exception, same reasoning, as adhoc/brain_dump_sort above -- for a held
+  // queue/needs-clarification/ task that just came out of a Discuss session (or was never
+  // attempted yet): nextPathPrefetchResolveTask() (priority 45) never gets a chance to run
+  // at all while pending/drafting/ already has a backlog, no matter how it ranks on the
+  // priority ladder, because the throttle above short-circuits before getNextTask() is
+  // even called. Confirmed live 2026-08-16: two held tasks sat with
+  // suggestionAttempted:false behind a deep arch_import backlog indefinitely. Arrival rate
+  // here is bounded by how many tasks are actually sitting in needs-clarification/ waiting
+  // on a fresh attempt (a human just discussed one), same bounded-arrival argument that
+  // justifies brain_dump_sort's exemption, so this can't create the unbounded-pileup
+  // problem the throttle exists to prevent.
+  const hasHeldClarificationWaiting = (() => {
+    const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+    let files;
+    try {
+      files = fs.readdirSync(heldDir).filter((f) => f.endsWith('.json'));
+    } catch {
+      return false;
+    }
+    return files.some((f) => {
+      try {
+        const held = JSON.parse(fs.readFileSync(path.join(heldDir, f), 'utf8'));
+        return held && held.needsClarification
+          && !held.needsClarification.suggested && !held.needsClarification.suggestionAttempted;
+      } catch {
+        return false;
+      }
+    });
+  })();
+
+  if (alreadyPending && !hasAdhocWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
     console.log('pending/ already has work queued, not adding another task');
   } else {
     const task = getNextTask();

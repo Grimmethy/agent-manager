@@ -109,7 +109,7 @@ def _build_summary_prompt(subject_text: str, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def start_session(storage_dir: Path, subject_id: str, subject_text: str) -> dict:
+def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: str = None) -> dict:
     result = generate(_build_chat_prompt(subject_text, []), think=False, temperature=0.6, num_predict=400)
     opener = result["response"].strip()
 
@@ -118,6 +118,13 @@ def start_session(storage_dir: Path, subject_id: str, subject_text: str) -> dict
     session = {
         "id": session_id,
         "subjectId": subject_id,
+        # Opaque to this module -- app.py's own routing hint for what "ending" should do
+        # (append to a brain-dump entry vs. a vault note vs. re-open a held
+        # queue/needs-clarification/ task for another resolution attempt). Needed because
+        # two of the three kinds (brain-dump entries and held tasks) share the same
+        # storage_dir (pipeline_dir) -- storage location alone can no longer tell them
+        # apart the way it still can for a vault note (SECOND_BRAIN_DIR).
+        "kind": kind,
         "rawText": subject_text,
         "status": "active",
         "transcript": [{"role": "assistant", "text": opener}],

@@ -417,6 +417,178 @@ test('nextBrainDumpSortTask offers the next-oldest captured entry when the oldes
   assert.equal(task.promptContext.brainDumpEntryId, 'bd-2');
 });
 
+// --- nextBrainDumpSortTask's selfProjectLabel (2026-08-16) ------------------------------
+// Confirmed live: a real self-referential note ("brain dump entries should track an
+// interaction count") was classified actionable:false, belongsToProject:null despite
+// being a genuine feature request for agent-manager's own brain-dump system -- the old
+// prompt only ever said "a self-referential note is real, not a placeholder," never
+// connected that to "and therefore belongs to the project it describes." selfProjectLabel
+// is __dirname-derived (this file's own location, NOT mockable via env), so these tests
+// use the real resulting value ("agent-manager", since src/task-sources.js always lives
+// under a directory named that) rather than a fake candidate.
+function writeProjectsRegistryFixture(dir, labels) {
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify(labels.map((label) => ({ label, repoRoot: '/x', pipelineDir: '/x', domainsPath: '/x' }))));
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+}
+
+test('nextBrainDumpSortTask sets selfProjectLabel when this package\'s own directory name is a tracked project', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  writeProjectsRegistryFixture(dir, ['agent-manager', 'some-other-project']);
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+  assert.equal(task.promptContext.selfProjectLabel, 'agent-manager');
+});
+
+test('nextBrainDumpSortTask leaves selfProjectLabel null when this package is not itself a tracked project', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  writeProjectsRegistryFixture(dir, ['some-consumer-project', 'another-project']);
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+  assert.equal(task.promptContext.selfProjectLabel, null);
+});
+
+test('nextBrainDumpSortTask leaves selfProjectLabel null when the project registry is empty/missing', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = path.join(dir, 'nonexistent-projects.json');
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  const task = nextBrainDumpSortTask();
+  assert.equal(task.promptContext.selfProjectLabel, null);
+});
+
+// --- nextPathPrefetchResolveTask (hybrid path-prefetch fallback, 2026-08-16) ------------
+
+function writeHeldTask(dir, id, needsClarification, extra = {}) {
+  const heldDir = path.join(dir, 'queue', 'needs-clarification');
+  fs.mkdirSync(heldDir, { recursive: true });
+  const held = { id, domain: 'adhoc', source: 'brain_dump', title: 'held task', promptContext: { rawText: 'held task text' }, needsClarification, ...extra };
+  fs.writeFileSync(path.join(heldDir, `${id}.json`), JSON.stringify(held));
+  return held;
+}
+
+function writeProjectGraph(dir, sourceFiles) {
+  fs.mkdirSync(path.join(dir, 'graphify-out'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'graphify-out', 'graph.json'), JSON.stringify({
+    nodes: sourceFiles.map((f, i) => ({ id: i, community: 0, source_file: f })),
+    links: [],
+  }));
+}
+
+test('nextPathPrefetchResolveTask returns null when queue/needs-clarification/ does not exist', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask returns null for a held task with no needsClarification at all', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', null);
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask returns null (greenfield, no graph to reason over) when the project has no graph yet', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match' });
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask skips a held task that already has a suggestion', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggested: { paths: [], rationale: 'nope', confident: false } });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask skips a held task whose suggestion was already attempted (even if it produced nothing)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask builds a correct task for a genuinely unresolved held task', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'ambiguous', candidates: { auth: ['src/auth.ts', 'server/auth.ts'] } },
+    { title: 'Fix the auth bug', promptContext: { rawText: 'Fix the auth bug' } });
+  writeProjectGraph(dir, ['src/auth.ts', 'server/auth.ts', 'src/unrelated.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+
+  assert.equal(task.id, 'path-prefetch-resolve-held-1');
+  assert.equal(task.domain, 'path_prefetch_resolve');
+  assert.equal(task.source, 'path_prefetch_resolve');
+  assert.equal(task.promptContext.heldTaskId, 'held-1');
+  assert.equal(task.promptContext.rawText, 'Fix the auth bug');
+  assert.equal(task.promptContext.reason, 'ambiguous');
+  assert.deepEqual(task.promptContext.candidates, { auth: ['src/auth.ts', 'server/auth.ts'] });
+  assert.deepEqual(new Set(task.promptContext.fileList), new Set(['src/auth.ts', 'server/auth.ts', 'src/unrelated.ts']));
+});
+
+test('nextPathPrefetchResolveTask does not re-offer a held task that already has a resolve task in queue', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match' });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const pendingDir = path.join(dir, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, 'path-prefetch-resolve-held-1.json'), '{}');
+
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null);
+});
+
+test('nextPathPrefetchResolveTask suffixes the resolve task id with the attempt number when attempt > 1', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', attempt: 2 });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+  assert.equal(task.id, 'path-prefetch-resolve-held-1-attempt2');
+});
+
+// Confirmed live 2026-08-16: a held task's first attempt lands in queue/done/ under the
+// bare id, then Discuss legitimately resets suggestionAttempted to false for a second
+// attempt -- but taskIdExistsInQueue() checks done/ too, so without the attempt suffix
+// above, this second attempt silently found "already in queue" forever and never
+// regenerated, no matter how many times the user discussed and re-triggered it.
+test('nextPathPrefetchResolveTask regenerates for attempt 2 even though attempt 1 already sits in queue/done/ under the bare id', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', attempt: 2 });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, 'path-prefetch-resolve-held-1.json'), '{}');
+
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+  assert.ok(task, 'attempt 2 must produce a new task despite attempt 1 sitting in done/ under the bare id');
+  assert.equal(task.id, 'path-prefetch-resolve-held-1-attempt2');
+});
+
+test('nextPathPrefetchResolveTask processes held tasks oldest-file-first, skipping ones already resolved/attempted/in-queue', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-done', { reason: 'no-match', suggestionAttempted: true });
+  writeHeldTask(dir, 'held-target', { reason: 'no-match' });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+  assert.ok(task);
+  assert.equal(task.promptContext.heldTaskId, 'held-target');
+});
+
 function makeObservabilityFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
