@@ -970,6 +970,95 @@ def api_brain_dump_prioritize(entry_id):
     return jsonify(entry)
 
 
+@app.route("/api/brain-dump/<entry_id>/discuss/latest", methods=["GET"])
+def api_brain_dump_discuss_latest(entry_id):
+    """Same "don't silently start a duplicate session" check grill/for-note already does
+    for Grill Me -- see discuss_sessions.py's latest_session_for_entry() for the incident
+    that pattern traces back to."""
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import latest_session_for_entry
+    session = latest_session_for_entry(pipeline_dir, entry_id)
+    return jsonify(session)
+
+
+@app.route("/api/brain-dump/<entry_id>/discuss/start", methods=["POST"])
+def api_brain_dump_discuss_start(entry_id):
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import start_session
+    session = start_session(pipeline_dir, entry_id, entry["rawText"])
+    return jsonify(session)
+
+
+@app.route("/api/discuss/<session_id>/message", methods=["POST"])
+def api_discuss_message(session_id):
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+    if not message:
+        abort(400, description="message is required")
+    from discuss_sessions import send_message
+    session = send_message(pipeline_dir, session_id, message)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/discuss/<session_id>", methods=["GET"])
+def api_discuss_get(session_id):
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import get_session
+    session = get_session(pipeline_dir, session_id)
+    if not session:
+        abort(404)
+    return jsonify(session)
+
+
+@app.route("/api/discuss/<session_id>/end", methods=["POST"])
+def api_discuss_end(session_id):
+    """Ends the conversation and, if it produced a real summary, appends it to the
+    originating brain-dump entry's rawText -- reusing PUT /api/brain-dump/<id>'s own
+    sorted->captured reset logic (a discussion that adds real context is exactly the kind
+    of text change that should make a stale prior sort get re-evaluated) rather than
+    duplicating it. discuss_sessions.py deliberately never touches brain-dump.json itself
+    -- this is the one place that happens, same division of responsibility as every other
+    brain-dump mutation in this file."""
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+    from discuss_sessions import end_session
+    session = end_session(pipeline_dir, session_id)
+    if not session:
+        abort(404)
+
+    entry = None
+    summary = (session.get("summary") or "").strip()
+    if summary:
+        entries = read_brain_dump_entries()
+        entry = next((e for e in entries if e.get("id") == session["entryId"]), None)
+        if entry:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry["rawText"] = f"{entry['rawText']}\n\n[Discussed {stamp}]: {summary}"
+            if entry.get("status") == "sorted":
+                entry["status"] = "captured"
+                entry.pop("sort", None)
+            entry["editedAt"] = datetime.now(timezone.utc).isoformat()
+            write_brain_dump_entries(entries)
+
+    return jsonify({"session": session, "entry": entry})
+
+
 def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
     """Resolves raw_path against root, rejecting anything that escapes it (../ traversal,
     an absolute path elsewhere, a symlink pointing out). Unlike /api/browse (which

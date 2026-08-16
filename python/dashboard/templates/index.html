@@ -1385,6 +1385,14 @@ function renderBrainDumpShell() {
 // rebuilding the list entirely while it's set, same reasoning as brainDumpBrowsePath.
 let brainDumpEditingId = null;
 
+// Same reasoning as brainDumpEditingId above -- only one entry can be under discussion at
+// a time, tracked globally so the periodic poll skips rebuilding the list while a
+// conversation is in progress (an open-ended chat can run for a while; losing it to a 5s
+// refresh tick would be a real bug, not a cosmetic one). brainDumpDiscussSession caches
+// the session itself so re-rendering after each message doesn't need a separate fetch.
+let brainDumpDiscussingId = null;
+let brainDumpDiscussSession = null;
+
 function renderBrainDumpEditCard(entry) {
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
@@ -1486,13 +1494,124 @@ function wireBrainDumpCardHandlers(el) {
       if (e.key === 'Escape') el.querySelector(`[data-cancel-edit="${CSS.escape(input.dataset.editInput)}"]`).click();
     };
   });
+
+  el.querySelectorAll('[data-discuss]').forEach((btn) => {
+    btn.onclick = () => brainDumpDiscussStart(btn.dataset.discuss);
+  });
+
+  el.querySelectorAll('[data-discuss-send]').forEach((btn) => {
+    const card = btn.closest('.bd-entry');
+    const textarea = card ? card.querySelector('.grill-answer') : null;
+    const send = () => brainDumpDiscussSend(btn.dataset.discussSend, textarea ? textarea.value : '', btn);
+    btn.onclick = send;
+    if (textarea) {
+      textarea.onkeydown = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      };
+    }
+  });
+
+  el.querySelectorAll('[data-discuss-end]').forEach((btn) => {
+    btn.onclick = () => brainDumpDiscussEnd(btn.dataset.discussEnd, btn);
+  });
+
+  el.querySelectorAll('[data-discuss-close]').forEach((btn) => {
+    btn.onclick = () => {
+      brainDumpDiscussingId = null;
+      brainDumpDiscussSession = null;
+      refreshBrainDumpEntries(true);
+    };
+  });
+
+  // Same tail-scroll/focus treatment as grillRenderPanel -- keeps the latest message in
+  // view and the input ready to type into, on every re-render (each message send
+  // re-renders this card the same way submitting a grill answer does).
+  if (brainDumpDiscussingId) {
+    const discussScroll = el.querySelector(`[data-id="${CSS.escape(brainDumpDiscussingId)}"] .grill-transcript`);
+    if (discussScroll) discussScroll.scrollTop = discussScroll.scrollHeight;
+    const discussInput = el.querySelector(`[data-id="${CSS.escape(brainDumpDiscussingId)}"] .grill-answer`);
+    if (discussInput) discussInput.focus();
+  }
+}
+
+// Don't silently start a second conversation next to one already sitting there for this
+// entry -- same "surface existing work instead of burying it" reasoning as
+// grillStartSession's own existing-session check.
+async function brainDumpDiscussStart(entryId) {
+  try {
+    const existing = await fetchJson('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/latest');
+    if (existing && existing.status === 'active') {
+      brainDumpDiscussingId = entryId;
+      brainDumpDiscussSession = existing;
+      await refreshBrainDumpEntries(true);
+      return;
+    }
+    if (existing && existing.status === 'ended') {
+      if (!confirm(`This entry already has a past discussion (${existing.transcript.length} messages). Start a new one anyway? (The old one is kept, not deleted.)`)) {
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- fall through to starting normally */ }
+
+  brainDumpDiscussingId = entryId;
+  brainDumpDiscussSession = null;
+  await refreshBrainDumpEntries(true);
+  try {
+    const resp = await fetch('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/start', { method: 'POST' });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not start discussion: ' + e.message);
+    brainDumpDiscussingId = null;
+    brainDumpDiscussSession = null;
+    await refreshBrainDumpEntries(true);
+  }
+}
+
+async function brainDumpDiscussSend(sessionId, message, btn) {
+  if (!message || !message.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not send message: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
+}
+
+async function brainDumpDiscussEnd(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = data.session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not end discussion: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'End Discussion';
+  }
 }
 
 // force=true bypasses the "don't clobber an in-progress edit" guard -- used after an
 // action (save/cancel/delete/prioritize) that just resolved that edit itself, as opposed
 // to the periodic 5s poll (enterBrainDumpTab), which must respect it.
 async function refreshBrainDumpEntries(force = false) {
-  if (brainDumpEditingId && !force) return;
+  if ((brainDumpEditingId || brainDumpDiscussingId) && !force) return;
   const el = document.getElementById('bd-entries');
   if (!el) return;
   let entries;
@@ -1508,9 +1627,11 @@ async function refreshBrainDumpEntries(force = false) {
     return;
   }
 
-  el.innerHTML = entries.map((entry) => (
-    entry.id === brainDumpEditingId ? renderBrainDumpEditCard(entry) : renderBrainDumpCard(entry)
-  )).join('');
+  el.innerHTML = entries.map((entry) => {
+    if (entry.id === brainDumpEditingId) return renderBrainDumpEditCard(entry);
+    if (entry.id === brainDumpDiscussingId) return renderBrainDumpDiscussCard(entry, brainDumpDiscussSession);
+    return renderBrainDumpCard(entry);
+  }).join('');
 
   wireBrainDumpCardHandlers(el);
 }
@@ -1541,10 +1662,45 @@ function renderBrainDumpCard(entry) {
         <span>${queuedBadge}</span>
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
+          <button class="secondary" data-discuss="${escapeAttr(entry.id)}">Discuss</button>
           <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
         </span>
       </div>
+    </div>
+  `;
+}
+
+// "Discuss" -- an open-ended conversation to add context to a captured entry before it
+// gets sorted, without going through the more structured Grill Me flow (see
+// discuss_sessions.py's own header for why that's a separate module, not a shared one).
+// Reuses grill's .grill-transcript/.grill-msg-* CSS wholesale -- visually this IS the
+// same "chat transcript" shape, no reason for a second, near-identical set of classes.
+function renderBrainDumpDiscussCard(entry, session) {
+  if (!session) {
+    return `
+      <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+        <div class="row"><span class="text">${escapeHtml(entry.rawText)}</span></div>
+        <div class="empty">Starting conversation...</div>
+      </div>
+    `;
+  }
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const bodyHtml = session.status === 'ended'
+    ? `${transcriptHtml}` +
+      (session.summary
+        ? `<div class="grill-enriched-badge">Added to entry ✓: ${escapeHtml(session.summary)}</div>`
+        : `<div class="meta" style="margin-top:8px">Ended with nothing said -- entry unchanged.</div>`) +
+      `<div class="row" style="margin-top:10px"><span></span><button type="button" class="secondary" data-discuss-close="${escapeAttr(entry.id)}">Close</button></div>`
+    : `${transcriptHtml}` +
+      `<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea>` +
+      `<div class="row" style="margin-top:8px">` +
+      `<button type="button" class="secondary" data-discuss-end="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">End Discussion</button>` +
+      `<button type="button" class="action" data-discuss-send="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">Send</button>` +
+      `</div>`;
+  return `
+    <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      <div class="grill-session">${bodyHtml}</div>
     </div>
   `;
 }
