@@ -973,13 +973,13 @@ def api_brain_dump_prioritize(entry_id):
 @app.route("/api/brain-dump/<entry_id>/discuss/latest", methods=["GET"])
 def api_brain_dump_discuss_latest(entry_id):
     """Same "don't silently start a duplicate session" check grill/for-note already does
-    for Grill Me -- see discuss_sessions.py's latest_session_for_entry() for the incident
-    that pattern traces back to."""
+    for Grill Me -- see discuss_sessions.py's latest_session_for_subject() for the
+    incident that pattern traces back to."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
-    from discuss_sessions import latest_session_for_entry
-    session = latest_session_for_entry(pipeline_dir, entry_id)
+    from discuss_sessions import latest_session_for_subject
+    session = latest_session_for_subject(pipeline_dir, entry_id)
     return jsonify(session)
 
 
@@ -997,17 +997,71 @@ def api_brain_dump_discuss_start(entry_id):
     return jsonify(session)
 
 
+@app.route("/api/second-brain/discuss/for-note", methods=["GET"])
+def api_second_brain_discuss_for_note():
+    """Vault-note counterpart to /api/brain-dump/<id>/discuss/latest -- same "don't
+    silently start a duplicate" check, surfaced next to Grill Me/Grill With Docs in the
+    Second Brain file viewer."""
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    note_path = (request.args.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    from discuss_sessions import latest_session_for_subject
+    session = latest_session_for_subject(root, note_path)
+    return jsonify(session)
+
+
+@app.route("/api/second-brain/discuss/start", methods=["POST"])
+def api_second_brain_discuss_start():
+    root = second_brain_dir()
+    if not root:
+        abort(400, description="SECOND_BRAIN_DIR is not configured")
+    body = request.get_json(silent=True) or {}
+    note_path = (body.get("notePath") or "").strip()
+    if not note_path:
+        abort(400, description="notePath is required")
+    full_path = _resolve_under_second_brain(root.resolve(), note_path)
+    note_content = full_path.read_text(encoding="utf-8") if full_path.is_file() else ""
+    from discuss_sessions import start_session
+    session = start_session(root, note_path, note_content)
+    return jsonify(session)
+
+
+def _resolve_discuss_session(session_id):
+    """Discuss sessions live in one of two storage locations depending on where the
+    conversation started -- pipeline_dir for a brain-dump entry, SECOND_BRAIN_DIR for a
+    vault note (see discuss_sessions.py's own header). Session ids are already globally
+    unique (uuid4 suffix), so trying both known locations here is simpler and more honest
+    than threading a kind-prefix through every session id just to route this lookup.
+    Returns (kind, storage_dir, session) where kind is 'brain-dump' or 'second-brain', or
+    (None, None, None) if the session isn't in either."""
+    from discuss_sessions import get_session
+    pipeline_dir = get_pipeline_dir()
+    if pipeline_dir:
+        session = get_session(pipeline_dir, session_id)
+        if session:
+            return "brain-dump", pipeline_dir, session
+    root = second_brain_dir()
+    if root:
+        session = get_session(root, session_id)
+        if session:
+            return "second-brain", root, session
+    return None, None, None
+
+
 @app.route("/api/discuss/<session_id>/message", methods=["POST"])
 def api_discuss_message(session_id):
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
+    kind, storage_dir, existing = _resolve_discuss_session(session_id)
+    if not storage_dir:
+        abort(404)
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
     if not message:
         abort(400, description="message is required")
     from discuss_sessions import send_message
-    session = send_message(pipeline_dir, session_id, message)
+    session = send_message(storage_dir, session_id, message)
     if not session:
         abort(404)
     return jsonify(session)
@@ -1015,11 +1069,7 @@ def api_discuss_message(session_id):
 
 @app.route("/api/discuss/<session_id>", methods=["GET"])
 def api_discuss_get(session_id):
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
-    from discuss_sessions import get_session
-    session = get_session(pipeline_dir, session_id)
+    kind, storage_dir, session = _resolve_discuss_session(session_id)
     if not session:
         abort(404)
     return jsonify(session)
@@ -1027,26 +1077,30 @@ def api_discuss_get(session_id):
 
 @app.route("/api/discuss/<session_id>/end", methods=["POST"])
 def api_discuss_end(session_id):
-    """Ends the conversation and, if it produced a real summary, appends it to the
-    originating brain-dump entry's rawText -- reusing PUT /api/brain-dump/<id>'s own
-    sorted->captured reset logic (a discussion that adds real context is exactly the kind
-    of text change that should make a stale prior sort get re-evaluated) rather than
-    duplicating it. discuss_sessions.py deliberately never touches brain-dump.json itself
-    -- this is the one place that happens, same division of responsibility as every other
-    brain-dump mutation in this file."""
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
+    """Ends the conversation and, if it produced a real summary, applies it to whatever
+    it was discussing:
+    - brain-dump entry: appended to rawText, reusing PUT /api/brain-dump/<id>'s own
+      sorted->captured reset logic (a discussion that adds real context is exactly the
+      kind of text change that should make a stale prior sort get re-evaluated).
+    - vault note: appended as a "## Discuss session -- <date>" section, same convention
+      grill_sessions.py's enrich_note() already uses for Grill Me/Grill With Docs.
+    discuss_sessions.py deliberately never touches either data store itself -- this is
+    the one place that happens, same division of responsibility as every other mutation
+    of either store in this file."""
+    kind, storage_dir, existing = _resolve_discuss_session(session_id)
+    if not storage_dir:
+        abort(404)
     from discuss_sessions import end_session
-    session = end_session(pipeline_dir, session_id)
+    session = end_session(storage_dir, session_id)
     if not session:
         abort(404)
 
     entry = None
+    note_updated = False
     summary = (session.get("summary") or "").strip()
-    if summary:
+    if summary and kind == "brain-dump":
         entries = read_brain_dump_entries()
-        entry = next((e for e in entries if e.get("id") == session["entryId"]), None)
+        entry = next((e for e in entries if e.get("id") == session["subjectId"]), None)
         if entry:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             entry["rawText"] = f"{entry['rawText']}\n\n[Discussed {stamp}]: {summary}"
@@ -1055,8 +1109,17 @@ def api_discuss_end(session_id):
                 entry.pop("sort", None)
             entry["editedAt"] = datetime.now(timezone.utc).isoformat()
             write_brain_dump_entries(entries)
+    elif summary and kind == "second-brain":
+        root = second_brain_dir()
+        if root:
+            note_path = _resolve_under_second_brain(root.resolve(), session["subjectId"])
+            if note_path.is_file():
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                entry_text = f"\n\n## Discuss session -- {stamp}\n\n{summary}\n"
+                note_path.write_text(note_path.read_text(encoding="utf-8") + entry_text, encoding="utf-8")
+                note_updated = True
 
-    return jsonify({"session": session, "entry": entry})
+    return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated})
 
 
 def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
