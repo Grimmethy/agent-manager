@@ -48,6 +48,7 @@
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   tr.top-row td:first-child { border-left: 2px solid var(--ok); }
+  tr.needs-clarification-row td:first-child { border-left: 2px solid var(--warn); }
   .bar-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 2px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
@@ -131,6 +132,8 @@ const TABS = [
     { key: 'review', label: 'Review' },
     { key: 'approved', label: 'Approved' },
     { key: 'blocked', label: 'Blocked' },
+    { key: 'needs-clarification', label: '⚠ Needs Clarification' },
+    { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm' },
     { key: 'done', label: 'Done' },
   ] },
 ];
@@ -271,6 +274,15 @@ async function fetchJson(url) {
 const TAB_COUNT_SEVERITY_THRESHOLDS = {
   blocked: { bad: 1 },
   pending: { warn: 50, bad: 150 },
+  // Orange, not red -- a held task isn't broken (see 'blocked'), it's just waiting on a
+  // human decision path-prefetch couldn't make safely on its own (no anchor match, or an
+  // ambiguous one). Any count at all deserves the same "don't silently sit forever"
+  // visibility 'blocked' already gets, just a calmer color for a calmer kind of pending.
+  'needs-clarification': { warn: 1 },
+  // Red like 'blocked', not orange like 'needs-clarification' -- this is holding a delete
+  // specifically, not just an ambiguous path match, so it deserves the same "don't
+  // silently sit forever" urgency as blocked, any count at all.
+  'awaiting-confirm': { bad: 1 },
 };
 
 function severityForTab(tabKey, count) {
@@ -501,7 +513,7 @@ async function postTaskAction(state, id, action, confirmMessage) {
 // refresh() poll and across tab switches (switching away and back keeps your scroll
 // depth) -- only a full page reload resets them to the first page.
 const QUEUE_PAGE_SIZE = 10;
-const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'done'];
+const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'done'];
 const queueLoadedCount = {};
 const queueHasMore = {};
 let queueLoadInFlight = false;
@@ -529,6 +541,16 @@ async function renderQueueTab(state) {
   const main = document.getElementById('main');
   if (tasks.length === 0) { main.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
   const showArchiveRequeue = state === 'blocked' || state === 'done';
+  // Archive alone (no generic Requeue -- that moves to pending/, wrong for an
+  // adhoc-domain task; resolving happens via the detail modal's own picker instead, see
+  // renderTaskDetailModal).
+  const showArchiveOnly = state === 'needs-clarification';
+  // apply-task.js's awaiting-confirm gate (src/apply-group-b.js's batchContainsDeleteMode):
+  // Confirm re-runs this exact task for real (stamps deleteConfirmedAt, moves to approved/
+  // for the next apply-task.sh pass); Deny is the existing generic Archive action -- no
+  // separate deny endpoint needed, giving up on a delete-containing batch is exactly what
+  // Archive already means everywhere else in this table.
+  const showConfirmDeny = state === 'awaiting-confirm';
   const showApply = state === 'approved';
 
   // 'prompt'-tier tasks get an active badge here instead of a plain row -- the whole
@@ -545,28 +567,53 @@ async function renderQueueTab(state) {
 
   const rows = tasks.map(t => {
     const isPrompt = showApply && approvalModeBySource[t.source] === 'prompt';
+    // Orange left-border + ⚠ prefix on every row here -- the actual ask (Discuss session
+    // on context-aware-file-path-prefetch-job.md): surface these prominently rather than
+    // let them blend into an ordinary-looking list and get silently orphaned.
+    const rowClass = state === 'needs-clarification' ? 'clickable needs-clarification-row' : 'clickable';
+    const detailCell = t.needsClarification
+      ? `<span style="color:var(--warn)">⚠ ${t.needsClarification.reason === 'ambiguous' ? 'ambiguous match' : 'no anchor match'}</span>`
+      : state === 'awaiting-confirm'
+        ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
+        : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
     return `
-    <tr class="clickable" data-id="${t.id}" data-state="${state}">
+    <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       <td>${t.id}</td>
       <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
-      <td>${t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || '')}</td>
+      <td>${detailCell}</td>
       ${showArchiveRequeue ? `<td>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
+      </td>` : ''}
+      ${showArchiveOnly ? `<td>
+        <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
+      </td>` : ''}
+      ${showConfirmDeny ? `<td>
+        <button type="button" class="secondary task-confirm-delete-btn" data-id="${escapeAttr(t.id)}">Confirm Delete</button>
+        <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Deny</button>
       </td>` : ''}
       ${showApply ? `<td><button type="button" class="secondary task-apply-btn" data-id="${escapeAttr(t.id)}">Apply</button></td>` : ''}
     </tr>
   `;
   }).join('');
-  const actionHeader = (showArchiveRequeue || showApply) ? '<th>Actions</th>' : '';
-  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`;
+  const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
+  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
+    + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path (or proceed with no prefetch) and send it to drafting.</div>' : '');
   main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
   });
   main.querySelectorAll('.task-archive-btn').forEach((btn) => {
-    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'archive', `Archive '${btn.dataset.id}'? This frees up its underlying item for reconsideration but does not apply anything.`); };
+    const msg = state === 'needs-clarification'
+      ? `Reject '${btn.dataset.id}'? This holds it aside without ever drafting it -- the original brain-dump entry is unaffected.`
+      : state === 'awaiting-confirm'
+        ? `Deny the delete in '${btn.dataset.id}'? This gives up on the batch entirely -- nothing in it (including any non-delete items in the same batch) will be applied.`
+        : `Archive '${btn.dataset.id}'? This frees up its underlying item for reconsideration but does not apply anything.`;
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'archive', msg); };
+  });
+  main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'confirm', `Confirm the delete in '${btn.dataset.id}'? This lets the next apply pass run the batch for real, including the delete.`); };
   });
   main.querySelectorAll('.task-requeue-btn').forEach((btn) => {
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'requeue', `Requeue '${btn.dataset.id}' for a fresh draft? This resets its retry history.`); };
@@ -589,10 +636,226 @@ function renderTaskDetailModal(task) {
   html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
   if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
   if (task.branch) html += `<div class="field-label">Branch</div><div>${task.branch}</div>`;
+  if (task.promptContext && task.promptContext.prefetchedPaths && task.promptContext.prefetchedPaths.length) {
+    html += `<div class="field-label">Prefetched Paths</div><div>${task.promptContext.prefetchedPaths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
+  }
+  if (task.needsClarification) html += renderClarificationPicker(task);
   if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
   if (task.implementResponse) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
   content.innerHTML = html;
   backdrop.classList.add('open');
+  if (task.needsClarification) wireClarificationPicker(task.id);
+}
+
+// Path-prefetch's "needs clarification" resolution UI (context-aware-file-path-prefetch-
+// job.md): 'ambiguous' shows every candidate file per matched keyword as its own pick
+// button (never auto-picks -- the actual ask); 'no-match' just offers a manual path
+// input. Both cases also get "Proceed without prefetch" -- the explicit escape hatch for
+// when prefetch genuinely has nothing useful to offer, rather than blocking the task
+// forever over it.
+function renderClarificationPicker(task) {
+  const nc = task.needsClarification;
+  let html = `<div class="field-label">⚠ Needs Clarification</div>`;
+  // LLM-assisted fallback suggestion (path_prefetch_resolve, hybrid design 2026-08-16) --
+  // shown FIRST and most prominent, since accepting it is the one-click path that's the
+  // whole point of the hybrid: still a human decision (never auto-applied), just a much
+  // faster one than manually knowing the codebase. Sits above the raw candidate/manual
+  // options below it, which stay available as a fallback if the suggestion is wrong.
+  if (nc.suggested) {
+    const s = nc.suggested;
+    const confidenceLabel = s.confident ? 'confident' : 'best guess';
+    if (s.paths && s.paths.length) {
+      html += `<div class="grill-session" style="margin-top:8px;border:1px solid var(--warn)">`;
+      html += `<div class="field-label">Suggested (${confidenceLabel})</div>`;
+      html += `<div>${s.paths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
+      if (s.rationale) html += `<div class="meta" style="margin-top:6px">${escapeHtml(s.rationale)}</div>`;
+      html += `<button type="button" class="action clarify-accept-suggestion-btn" data-suggested-paths="${escapeAttr(JSON.stringify(s.paths))}" style="margin-top:8px">Accept Suggestion</button>`;
+      html += `</div>`;
+    } else {
+      html += `<div class="grill-session" style="margin-top:8px"><div class="field-label">Suggestion attempted</div><div class="meta">The model couldn't find a match either${s.rationale ? ': ' + escapeHtml(s.rationale) : '.'}</div></div>`;
+    }
+  }
+  if (nc.reason === 'ambiguous' && nc.candidates) {
+    html += `<div class="meta">One or more keywords matched more than one file -- pick which one(s) belong:</div>`;
+    for (const [keyword, files] of Object.entries(nc.candidates)) {
+      html += `<div style="margin-top:6px"><strong>${escapeHtml(keyword)}</strong><br>`;
+      html += files.map(f => `<button type="button" class="secondary clarify-pick-btn" data-path="${escapeAttr(f)}" style="margin:3px 6px 0 0">${escapeHtml(f)}</button>`).join('');
+      html += `</div>`;
+    }
+  } else {
+    html += `<div class="meta">No file in the project graph matched anything in this task's text. Type a path by hand, or proceed without one.</div>`;
+  }
+  html += `<div style="margin-top:10px"><input type="text" id="clarify-manual-path" placeholder="relative/path/to/file.ts" style="width:60%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-family:monospace;font-size:12px">`;
+  html += `<button type="button" class="action" id="clarify-add-manual" style="margin-left:6px">Use This Path</button></div>`;
+  html += `<div id="clarify-selected-paths" style="margin-top:8px"></div>`;
+  html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-skip-btn">Proceed Without Prefetch</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button></div>`;
+  html += `<div id="clarify-discuss-panel" style="margin-top:10px"></div>`;
+  return html;
+}
+
+// "Discuss" on a held task -- the actual ask: "rather than inputting a file path manually
+// we should open a 'discuss' to get more information about the task itself." Shares
+// discuss_sessions.py and the generic /api/discuss/* endpoints with the other two Discuss
+// integrations; only /start and /for-note are needs-clarification-specific. Ending the
+// conversation re-opens the held task for a fresh path_prefetch_resolve attempt with the
+// enriched text (see app.py's api_discuss_end 'needs-clarification' branch) -- so this
+// isn't just note-taking, it's a real second shot at automatic resolution.
+function clarifyDiscussRenderPanel(taskId, session) {
+  const el = document.getElementById('clarify-discuss-panel');
+  if (!el) return;
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  if (session.status === 'ended') {
+    const actionHtml = session.summary
+      ? `<div class="grill-enriched-badge">Added to task ✓ -- re-queued for another resolution attempt with this context.</div>`
+      : `<div class="meta" style="margin-top:8px">Ended with nothing said -- task unchanged.</div>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Discussion ended</div>${transcriptHtml}${actionHtml}</div>`;
+  } else {
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea><div class="row" style="margin-top:8px"><button type="button" class="secondary" id="clarify-discuss-end">End Discussion</button><button type="button" class="action" id="clarify-discuss-send">Send</button></div></div>`;
+    const answerEl = el.querySelector('.grill-answer');
+    const sendBtn = el.querySelector('#clarify-discuss-send');
+    const endBtn = el.querySelector('#clarify-discuss-end');
+    const send = () => clarifyDiscussSend(taskId, session.id, answerEl.value, sendBtn);
+    sendBtn.onclick = send;
+    endBtn.onclick = () => clarifyDiscussEnd(taskId, session.id, endBtn);
+    answerEl.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    };
+    answerEl.focus();
+  }
+  const scrollEl = el.querySelector('.grill-transcript');
+  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+async function clarifyDiscussStart(taskId) {
+  const el = document.getElementById('clarify-discuss-panel');
+  try {
+    const existing = await fetchJson('/api/task/needs-clarification/' + encodeURIComponent(taskId) + '/discuss/latest');
+    if (existing && existing.status === 'active') {
+      clarifyDiscussRenderPanel(taskId, existing);
+      return;
+    }
+  } catch (e) { /* best-effort check -- fall through to starting normally */ }
+  if (el) el.innerHTML = '<div class="empty">Starting discussion...</div>';
+  try {
+    const resp = await fetch('/api/task/needs-clarification/' + encodeURIComponent(taskId) + '/discuss/start', { method: 'POST' });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    clarifyDiscussRenderPanel(taskId, session);
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not start discussion: ${e.message}</div>`;
+  }
+}
+
+async function clarifyDiscussSend(taskId, sessionId, message, btn) {
+  if (!message || !message.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    clarifyDiscussRenderPanel(taskId, session);
+  } catch (e) {
+    alert('Could not send message: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
+}
+
+async function clarifyDiscussEnd(taskId, sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    clarifyDiscussRenderPanel(taskId, result.session);
+    // The held task was just re-opened for another resolution attempt server-side --
+    // close the modal and refresh the list rather than leaving a stale picker open
+    // against a task that's no longer in the state it shows.
+    if (result.heldTask) {
+      setTimeout(() => {
+        closeDetail();
+        if (activeTab === 'needs-clarification') renderQueueTab('needs-clarification');
+      }, 1200);
+    }
+  } catch (e) {
+    alert('Could not end discussion: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'End Discussion';
+  }
+}
+
+function wireClarificationPicker(taskId) {
+  const selected = [];
+  const renderSelected = () => {
+    const el = document.getElementById('clarify-selected-paths');
+    if (!el) return;
+    el.innerHTML = selected.length
+      ? '<div class="meta">Selected: ' + selected.map(escapeHtml).join(', ') + '</div>'
+      : '';
+  };
+  document.querySelectorAll('.clarify-pick-btn').forEach((btn) => {
+    btn.onclick = () => {
+      const p = btn.dataset.path;
+      if (!selected.includes(p)) selected.push(p);
+      btn.disabled = true;
+      renderSelected();
+    };
+  });
+  const manualInput = document.getElementById('clarify-manual-path');
+  const addManualBtn = document.getElementById('clarify-add-manual');
+  if (addManualBtn) {
+    addManualBtn.onclick = () => {
+      const p = (manualInput.value || '').trim();
+      if (!p) return;
+      if (!selected.includes(p)) selected.push(p);
+      manualInput.value = '';
+      renderSelected();
+    };
+  }
+  const resolveBtn = document.getElementById('clarify-resolve-btn');
+  if (resolveBtn) resolveBtn.onclick = () => resolveNeedsClarification(taskId, selected);
+  const skipBtn = document.getElementById('clarify-skip-btn');
+  if (skipBtn) skipBtn.onclick = () => resolveNeedsClarification(taskId, []);
+  const acceptSuggestionBtn = document.querySelector('.clarify-accept-suggestion-btn');
+  if (acceptSuggestionBtn) {
+    acceptSuggestionBtn.onclick = () => {
+      let paths = [];
+      try { paths = JSON.parse(acceptSuggestionBtn.dataset.suggestedPaths || '[]'); } catch (e) { /* leave empty */ }
+      resolveNeedsClarification(taskId, paths);
+    };
+  }
+  const discussBtn = document.getElementById('clarify-discuss-btn');
+  if (discussBtn) discussBtn.onclick = () => clarifyDiscussStart(taskId);
+  // Surface an existing (active or already-ended) discussion instead of leaving the
+  // picker looking like nothing has been tried yet -- same "don't bury prior work"
+  // reasoning as every other Discuss integration's own for-note/latest check.
+  fetchJson('/api/task/needs-clarification/' + encodeURIComponent(taskId) + '/discuss/latest')
+    .then((existing) => { if (existing) clarifyDiscussRenderPanel(taskId, existing); })
+    .catch(() => { /* best-effort -- no prior session is the common case */ });
+}
+
+async function resolveNeedsClarification(taskId, paths) {
+  try {
+    const res = await fetch(`/api/task/needs-clarification/${encodeURIComponent(taskId)}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.description || `${res.status}`);
+    }
+    closeDetail();
+    if (activeTab === 'needs-clarification') renderQueueTab('needs-clarification');
+  } catch (e) {
+    alert(`Could not resolve '${taskId}': ` + e.message);
+  }
 }
 
 async function openDetail(state, id) {
@@ -633,6 +896,7 @@ const JOB_TYPES = [
   { source: 'trouble_log', domain: '(project default)', priority: 20, description: "Entries in the project's trouble-log doc flagged ready-for-agent (🤖 marker)." },
   { source: 'secondbrain', domain: 'secondbrain', priority: 40, description: 'Oldest unprocessed note in a SecondBrain-style Inbox/ folder.' },
   { source: 'brain_dump_sort', domain: 'brain_dump_sort', priority: 42, description: 'Sorts a captured Brain Dump entry into a second-brain destination and marks it filed. Always active -- sits above any single project, see the Brain Dump tab.' },
+  { source: 'path_prefetch_resolve', domain: 'path_prefetch_resolve', priority: 45, description: 'LLM-assisted fallback for a queue/needs-clarification/ held task path-prefetch\'s deterministic keyword match could not resolve on its own -- suggests file path(s) + rationale for a human to accept or override, never auto-resolves. Always active -- see the Needs Clarification job status tab.' },
   { source: 'arch_review', domain: '(project default)', priority: 70, description: 'Strong-rated architecture candidates awaiting a fulfillment task.' },
   { source: 'arch_import_review', domain: '(project default)', priority: 71, description: 'Strong-rated architecture-IMPORT candidates (from arch_import) awaiting a fulfillment task -- same logic as arch_review, parameterized, against a separate doc.' },
   { source: 'arch_discovery', domain: '(project default)', priority: 80, description: 'Generates new architecture candidates for one graphify community at a time.' },
@@ -1636,12 +1900,36 @@ async function refreshBrainDumpEntries(force = false) {
   wireBrainDumpCardHandlers(el);
 }
 
+// Live downstream task status, not just "queued and hopefully fine" -- confirmed live
+// 2026-08-16: every one of a real user's actioned brain-dump entries was actually
+// sitting blocked (truncated drafts, fabricated files, one pure refusal), completely
+// invisible under the old flat "queued" badge regardless of what really happened.
+// Module-scope (not per-render-function-local) since both the Brain Dump tab's cards
+// and the Second Brain file viewer's linked-task refs need the exact same mapping.
+const TASK_STATUS_BADGE = {
+  blocked: ['bad', 'blocked'],
+  'needs-clarification': ['warn', '⚠ needs clarification'],
+  'awaiting-confirm': ['bad', '🗑 awaiting confirm'],
+  pending: ['idle', 'queued'],
+  drafting: ['warn', 'drafting'],
+  review: ['warn', 'in review'],
+  approved: ['warn', 'approved'],
+  done: ['ok', 'done'],
+  archived: ['idle', 'archived'],
+  unknown: ['idle', 'status unknown'],
+};
+
+function taskStatusBadgeHtml(taskId, taskStatus) {
+  const [sev, label] = TASK_STATUS_BADGE[taskStatus] || TASK_STATUS_BADGE.unknown;
+  return `<span class="badge ${sev}" title="task ${escapeAttr(taskId)}">${escapeHtml(label)}</span>`;
+}
+
 function renderBrainDumpCard(entry) {
   const sort = entry.sort;
   const statusBadge = entry.status === 'sorted'
     ? '<span class="badge ok">sorted</span>'
     : '<span class="badge idle">captured</span>';
-  const queuedBadge = entry.queuedTaskId ? '<span class="badge warn">queued</span>' : '';
+  const queuedBadge = entry.queuedTaskId ? taskStatusBadgeHtml(entry.queuedTaskId, entry.taskStatus) : '';
   const jump = sort && sort.secondBrainPath
     ? `<a class="jump" data-jump="${escapeAttr(sort.secondBrainPath)}" href="#">open &rarr;</a>`
     : '';
@@ -1855,12 +2143,32 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button></div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div id="sb-task-refs"></div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button></div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
     const discussBtn = panel.querySelector('#sb-discuss-start');
     if (discussBtn) discussBtn.onclick = () => sbDiscussStart(filePath);
+    // Linked-task status (2026-08-16): a note can carry a "Queued as adhoc task `id` in
+    // **label**" cross-reference from applyBrainDumpSort -- surface its LIVE status here
+    // (looked up directly from that project's own queue, even if it isn't the currently
+    // active pipeline) instead of leaving the reader to wonder whether it ever went
+    // anywhere. Same motivating incident as the Brain Dump tab's own taskStatus badges:
+    // every one of a real user's queued tasks turned out to be silently blocked.
+    try {
+      const refs = await fetchJson('/api/second-brain/task-refs?notePath=' + encodeURIComponent(filePath));
+      const refsEl = panel.querySelector('#sb-task-refs');
+      if (refsEl && refs.length) {
+        refsEl.innerHTML = '<div class="field-label">Linked Tasks</div>' + refs.map((r) => {
+          const badge = r.projectFound && r.taskStatus
+            ? taskStatusBadgeHtml(r.taskId, r.taskStatus)
+            : '<span class="badge idle">unknown</span>';
+          const activeNote = r.isActiveProject ? '' : '<span class="meta"> (not the active project)</span>';
+          const noteLine = r.note ? `<div class="meta" style="margin-top:2px">${escapeHtml(r.note)}</div>` : '';
+          return `<div class="row" style="margin-top:4px"><span><code>${escapeHtml(r.taskId)}</code> in <strong>${escapeHtml(r.projectLabel)}</strong>${activeNote}</span>${badge}</div>${noteLine}`;
+        }).join('');
+      }
+    } catch (e) { /* best-effort -- a missing/unreadable note just means no refs to show */ }
     // Surface an existing session for this note instead of leaving grill-panel empty and
     // silently letting the next Grill Me click start a fresh one next to it -- confirmed
     // live 2026-08-14: nothing was ever actually lost (every session persists correctly

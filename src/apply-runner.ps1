@@ -267,6 +267,22 @@ function Invoke-ApplyPass {
 
     $applySw.Stop()
 
+    # Awaiting-confirm gate (Bash port: apply-task.sh) -- checked BEFORE the succeeded
+    # check below, same reasoning as there: a delete-containing Group B batch reports
+    # succeeded:false (nothing was touched) but this is a hold for a human, not an apply
+    # failure, so it gets its own queue/awaiting-confirm/ stage instead of being recorded
+    # as a blocked_apply outcome alongside real failures.
+    if ($result -and $result.needsConfirmation) {
+        $awaitingConfirmDir = Join-Path $QueueDir 'awaiting-confirm'
+        New-Item -ItemType Directory -Force -Path $awaitingConfirmDir | Out-Null
+        $awaitingConfirmPath = Join-Path $awaitingConfirmDir $next.Name
+        Write-TaskJson $awaitingConfirmPath $task
+        Remove-Item $next.FullName -Force
+        Add-ApplyLogEntry -TaskId $task.id -Title $task.title -Result 'AWAITING-CONFIRM' -Detail ([string]$result.reason)
+        Write-Host ('Awaiting human confirmation (delete in batch): {0}' -f $task.id) -ForegroundColor Yellow
+        return 'awaiting-confirm'
+    }
+
     if (-not $result -or -not $result.succeeded) {
         $applyFailed = $true
         $applyFailReason = if ($result -and $result.reason) { [string]$result.reason } else { 'apply-task.js produced no usable result' }

@@ -18,14 +18,17 @@
 const fs = require('fs');
 const path = require('path');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { resolveAnchors } = require('./path-prefetch.js');
+const { resolveGraphPath } = require('./config.js');
+const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 
 function applySecondBrainNote({ implementResponse, notePath, secondBrainDir }) {
   const resolvedPath = path.isAbsolute(notePath) ? notePath : path.join(secondBrainDir, notePath);
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  fs.writeFileSync(resolvedPath, implementResponse || '');
+  writeAtomicSync(resolvedPath, implementResponse || '');
 
   const markerPath = resolvedPath + '.done';
-  fs.writeFileSync(markerPath, '');
+  writeAtomicSync(markerPath, '');
 
   return { file: resolvedPath, marker: markerPath };
 }
@@ -97,7 +100,7 @@ function applyProjectSearchFindings({ implementResponse, indexPath }) {
   }
 
   fs.mkdirSync(path.dirname(indexPath), { recursive: true });
-  fs.writeFileSync(indexPath, indexText);
+  writeAtomicSync(indexPath, indexText);
 
   return { file: indexPath, findingCount: findings.length, strongCount: strongSubsections.length };
 }
@@ -169,7 +172,7 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
     }
   }
   fs.mkdirSync(path.dirname(coveragePath), { recursive: true });
-  fs.writeFileSync(coveragePath, JSON.stringify(coverage, null, 2));
+  writeJsonAtomicSync(coveragePath, coverage);
 
   if (items.length === 0) {
     return { skipped: true, reason: `community "${communityName}" reviewed, no action items produced` };
@@ -198,7 +201,7 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
   analysisText += '\n' + sections.join('\n\n') + '\n';
 
   fs.mkdirSync(analysisDir, { recursive: true });
-  fs.writeFileSync(analysisPath, analysisText);
+  writeAtomicSync(analysisPath, analysisText);
 
   return { file: analysisPath, itemCount: items.length };
 }
@@ -310,7 +313,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   }
 
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
-  fs.writeFileSync(candidatesPath, text);
+  writeAtomicSync(candidatesPath, text);
 
   return { file: candidatesPath, candidateCount: candidates.length, candidateIds };
 }
@@ -350,7 +353,7 @@ function applyArchImportCandidate({ implementResponse, candidatesPath, importCov
     projectSlug: sourceProject,
   };
   fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
-  fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
+  writeJsonAtomicSync(importCoveragePath, coverage);
 
   // Same shape applyArchDiscoveryCandidates already returns ({skipped,reason} or
   // {file,candidateCount,candidateIds}) -- apply-task.js's generic writeArtifact() flow
@@ -461,8 +464,11 @@ function validateSecondBrainPath(relPath, secondBrainDir) {
 // Registered projects (projects.json, at the package root -- one level up from src/), used
 // by the belongsToProject routing below. Best-effort: a missing/corrupt registry just
 // means no project can match, same convention as task-sources.js's readProjectLabels.
+// AGENT_MANAGER_PROJECTS_REGISTRY_PATH override exists purely for this file's own tests
+// -- the real registry is a live file the actual running pipeline reads/writes
+// concurrently, unsafe to swap out from under it for a test run.
 function readProjectRegistry() {
-  const registryPath = path.join(__dirname, '..', 'projects.json');
+  const registryPath = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH || path.join(__dirname, '..', 'projects.json');
   try {
     const list = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
     return Array.isArray(list) ? list : [];
@@ -484,6 +490,21 @@ function readProjectRegistry() {
 // chosen note, mark 'sorted'. A non-git write either way -- brain-dump.json lives in
 // pipelineDir, the note lives under secondBrainDir, neither inside repoRoot -- same
 // reasoning as applySecondBrainNote/applyProjectSearchFindings/applyDeepDiveFindings above.
+//
+// Both call sites below used to branch on fs.existsSync and pick appendFileSync (existing
+// note) or writeFileSync (new note, with a header) -- appendFileSync has no atomic-rename
+// equivalent (you cannot atomically append via a temp-file-and-rename without rewriting
+// the whole file anyway), so folding both branches into one read-then-atomic-rewrite here
+// gets the append case the same crash-safety as every other writer in this file, not just
+// the create case.
+function appendMarkdownLineAtomic(fullPath, line) {
+  const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : null;
+  const contents = existing !== null
+    ? existing + line
+    : `# ${path.basename(fullPath, path.extname(fullPath))}\n${line}`;
+  writeAtomicSync(fullPath, contents);
+}
+
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir }) {
   const { brainDumpEntryId, rawText } = task.promptContext;
 
@@ -535,8 +556,6 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
 
     if (validDomains.includes('adhoc')) {
       const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
-      const adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
-      fs.mkdirSync(adhocDir, { recursive: true });
       const adhocTask = {
         id: queuedId,
         domain: 'adhoc',
@@ -544,7 +563,49 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         title: rawText.slice(0, 120),
         promptContext: { rawText, brainDumpEntryId },
       };
-      fs.writeFileSync(path.join(adhocDir, `${queuedId}.json`), JSON.stringify(adhocTask, null, 2));
+
+      // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
+      // anchor keywords from this task's title/rawText against the target project's own
+      // dependency graph BEFORE it's ever claimed for drafting, so the plan/implement
+      // passes already have real, validated file paths in promptContext instead of the
+      // model searching for them (or worse, inventing them) from scratch on every call.
+      // 'greenfield' (no graph built yet for this project) is explicitly NOT an error --
+      // per the Discuss session's own note, that's just "nothing to prefetch," and the
+      // task queues normally. 'no-match'/'ambiguous' are the two cases the Grill Me/
+      // Discuss sessions asked to be held for a human rather than silently guessed at:
+      // written to queue/needs-clarification/ instead of queue/adhoc/, invisible to
+      // nextAdhocTask() (which only ever scans queue/adhoc/) until a human resolves it
+      // via the dashboard.
+      // graphPathOverride via config.js's resolveGraphPath() (not path-prefetch.js's own
+      // graphify-out/graph.json default) -- confirmed live 2026-08-16: the dashboard's
+      // Build Graph button writes to .agent-manager-cache/, not graphify-out/, so without
+      // this override every real project's graph looked absent ('greenfield') even after
+      // a real build, and this fast path silently never matched anything.
+      const anchorResult = resolveAnchors({
+        repoRoot: matchedProject.repoRoot,
+        title: adhocTask.title,
+        rawText,
+        graphPathOverride: resolveGraphPath(matchedProject.repoRoot),
+      });
+      let adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      let heldReason = null;
+      if (anchorResult.status === 'matched') {
+        adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+      } else if (anchorResult.status === 'no-match') {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        heldReason = 'no-match';
+        adhocTask.needsClarification = { reason: 'no-match' };
+      } else if (anchorResult.status === 'ambiguous') {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        heldReason = 'ambiguous';
+        adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
+        if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+      }
+      // 'greenfield': adhocTask left exactly as constructed above, queues normally with
+      // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
+
+      fs.mkdirSync(adhocDir, { recursive: true });
+      writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
 
       // Cross-reference note -- an audit trail, not the record of truth (brain-dump.json's
       // queuedTaskId/queuedAt is that): confirms this entry was routed as real work, not
@@ -552,19 +613,16 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       const fullPath = path.join(secondBrainDir, result.secondBrainPath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       const stamp = new Date().toISOString().slice(0, 10);
-      const line = `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}** -- ${rawText}\n`;
-      if (fs.existsSync(fullPath)) {
-        fs.appendFileSync(fullPath, line);
-      } else {
-        const title = path.basename(result.secondBrainPath, path.extname(result.secondBrainPath));
-        fs.writeFileSync(fullPath, `# ${title}\n${line}`);
-      }
+      const line = heldReason
+        ? `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}**, held for clarification (${heldReason}) before it can be drafted -- ${rawText}\n`
+        : `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}** -- ${rawText}\n`;
+      appendMarkdownLineAtomic(fullPath, line);
 
       entry.status = 'actioned';
       entry.queuedTaskId = queuedId;
       entry.queuedAt = new Date().toISOString();
       fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
-      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+      writeJsonAtomicSync(brainDumpPath, data);
 
       return { file: fullPath, category: result.category, queuedTaskId: queuedId, queuedProject: matchedProject.label };
     }
@@ -578,12 +636,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   const stamp = new Date().toISOString().slice(0, 10);
   const tagsSuffix = result.tags.length ? ` _(${result.tags.join(', ')})_` : '';
   const line = `\n- **${stamp}** ${rawText}${tagsSuffix}\n`;
-  if (fs.existsSync(fullPath)) {
-    fs.appendFileSync(fullPath, line);
-  } else {
-    const title = path.basename(result.secondBrainPath, path.extname(result.secondBrainPath));
-    fs.writeFileSync(fullPath, `# ${title}\n${line}`);
-  }
+  appendMarkdownLineAtomic(fullPath, line);
 
   entry.status = 'sorted';
   entry.sort = {
@@ -596,7 +649,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   entry.sortedAt = new Date().toISOString();
 
   fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
-  fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(brainDumpPath, data);
 
   return { file: fullPath, category: result.category };
 }
@@ -618,6 +671,100 @@ function applyVerdictOnly({ implementResponse }) {
   return { skipped: true, reason };
 }
 
+// Parses path_prefetch_resolve's implement-pass output -- a single JSON object (see
+// prompts.js's pathPrefetchResolveImplementPrompt for the exact schema):
+//   { "paths": ["..."], "rationale": "...", "confident": true/false }
+// paths may legitimately be empty (the model genuinely couldn't find a match either) --
+// rationale/confident are still meaningful in that case, telling the human WHY, same
+// value as a "genuinely uncertain" verdict elsewhere in this file.
+function parsePathPrefetchResolveResult(implementResponse) {
+  const text = (implementResponse || '').trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = parseJsonMaybeFenced(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!('paths' in parsed)) return null;
+  return {
+    paths: Array.isArray(parsed.paths) ? parsed.paths.map(String).filter(Boolean) : [],
+    rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
+    confident: !!parsed.confident,
+  };
+}
+
+// Writes the LLM's suggestion back onto the ORIGINAL held task in
+// queue/needs-clarification/. A non-confident guess stops there -- resolving it stays a
+// deliberate human action via the dashboard's clarification picker/resolve endpoint, same
+// fail-safe property path-prefetch.js's deterministic pass already has (never silently
+// prefetch the wrong file). A CONFIDENT suggestion (2026-08-16) auto-resolves straight
+// into queue/adhoc/ instead, off the Needs Clarification list entirely -- see the
+// confident-branch below for why. Marks suggestionAttempted regardless of parse success,
+// so nextPathPrefetchResolveTask() never re-spends a model call on a held task whose
+// implement response came back malformed -- manual resolution is still always available
+// either way.
+function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
+  const heldTaskId = task.promptContext && task.promptContext.heldTaskId;
+  if (!heldTaskId) {
+    return { skipped: true, reason: 'task has no heldTaskId in promptContext -- cannot locate the task it was meant to resolve' };
+  }
+  const heldPath = path.join(pipelineDir, 'queue', 'needs-clarification', `${heldTaskId}.json`);
+  let held;
+  try {
+    held = JSON.parse(fs.readFileSync(heldPath, 'utf8'));
+  } catch {
+    return { skipped: true, reason: `held task '${heldTaskId}' no longer exists in queue/needs-clarification/ (already resolved or rejected since this task was drafted)` };
+  }
+  if (!held.needsClarification) {
+    return { skipped: true, reason: `held task '${heldTaskId}' no longer has needsClarification set -- already resolved` };
+  }
+
+  const result = parsePathPrefetchResolveResult(implementResponse);
+  held.needsClarification.suggestionAttempted = true;
+  if (result) {
+    held.needsClarification.suggested = {
+      paths: result.paths,
+      rationale: result.rationale,
+      confident: result.confident,
+      suggestedAt: new Date().toISOString(),
+    };
+  }
+
+  // Auto-resolve straight into queue/adhoc/ (off the Needs Clarification list entirely)
+  // when the suggestion is confident -- per the actual ask (2026-08-16): ending a Discuss
+  // session should be enough by itself to close a held task out, not require yet another
+  // manual click on top of whatever context the human just supplied, PROVIDED the model's
+  // own confidence flag says it's sure. A non-confident guess still lands as `suggested`
+  // for the picker UI and requires the human's own Accept Suggestion/manual-path/Proceed
+  // click, same as before -- auto-applying a guess the model itself flagged as uncertain
+  // would defeat the "never auto-applied" premise this feature shipped with; this only
+  // narrows that to "never auto-applied unless the model itself is confident."
+  if (result && result.confident && result.paths && result.paths.length) {
+    const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+    fs.mkdirSync(adhocDir, { recursive: true });
+    const adhocPath = path.join(adhocDir, `${heldTaskId}.json`);
+    if (!fs.existsSync(adhocPath)) {
+      held.promptContext = held.promptContext || {};
+      held.promptContext.prefetchedPaths = result.paths;
+      delete held.needsClarification;
+      writeJsonAtomicSync(adhocPath, held);
+      fs.unlinkSync(heldPath);
+      return { autoResolved: true, heldTaskId, paths: result.paths };
+    }
+    // adhoc/ already has this id (raced with a manual resolve?) -- fall through to the
+    // normal "leave in needs-clarification, marked attempted/suggested" path below rather
+    // than clobbering or erroring, same non-fatal-skip convention as everywhere else here.
+  }
+
+  writeJsonAtomicSync(heldPath, held);
+
+  return result
+    ? { suggested: true, heldTaskId, paths: result.paths, confident: result.confident }
+    : { skipped: true, reason: 'implement pass did not return a valid suggestion -- held task marked attempted, left for manual resolution' };
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
@@ -632,4 +779,6 @@ module.exports = {
   applyVerdictOnly,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
+  applyPathPrefetchResolve,
+  parsePathPrefetchResolveResult,
 };
