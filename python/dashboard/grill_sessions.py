@@ -40,6 +40,26 @@ def _write_sessions(second_brain_dir: Path, sessions: dict):
     grill_sessions_path(second_brain_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
+# Confirmed live 2026-08-16 (context-aware-file-path-prefetch-job.md's own grill session):
+# the old instruction ("2-4 sentences on what the user now demonstrably understands")
+# produced exactly what it asked for -- a third-person assessment of the user's grasp of
+# the topic ("The user demonstrates a clear understanding of...", "They identified...",
+# "Crucially, they recognized...") instead of durable, actionable notes about the THING
+# being discussed. That's the right shape for the Socratic-quiz framing this session type
+# otherwise uses (Matt Pocock testing understanding), but wrong for what actually gets
+# appended to the note afterward -- future readers of that note care what to watch for
+# when they build it, not a transcript of how well today's conversation went. Written as
+# direct statements about the subject, explicitly not about the user, so it reads like
+# real notes rather than a performance review.
+_SUMMARY_INSTRUCTION = (
+    "<2-4 sentences of durable notes capturing the concrete decisions, risks, constraints, "
+    "and approach that came out of this conversation -- written as direct, actionable "
+    "context for whoever works on this next (e.g. \"Validate paths against the project "
+    "graph before writing them; stale references are the main risk\"), NOT a recap of what "
+    "the user said, understood, or demonstrated>"
+)
+
+
 def _build_prompt(note_content: str, mode: str, source_url, transcript: list, force_complete: bool = False) -> str:
     lines = []
     if mode == "grill-with-docs" and source_url:
@@ -71,8 +91,7 @@ def _build_prompt(note_content: str, mode: str, source_url, transcript: list, fo
             "This is the FINAL exchange of this session -- do not ask another question, no "
             "matter how promising a follow-up seems. Respond with EXACTLY:\n"
             "STATUS: COMPLETE\n"
-            "SUMMARY: <2-4 sentences on what the user now demonstrably understands, written as "
-            "durable notes to append to their second brain>"
+            f"SUMMARY: {_SUMMARY_INSTRUCTION}"
         )
     else:
         lines.append(
@@ -81,8 +100,7 @@ def _build_prompt(note_content: str, mode: str, source_url, transcript: list, fo
             "missing, offer a gentle hint and re-ask. After a genuinely thorough back-and-forth (roughly "
             "4-6 solid exchanges), instead of another question, respond with:\n"
             "STATUS: COMPLETE\n"
-            "SUMMARY: <2-4 sentences on what the user now demonstrably understands, written as durable "
-            "notes to append to their second brain>\n"
+            f"SUMMARY: {_SUMMARY_INSTRUCTION}\n"
             "Otherwise, always start your response with:\n"
             "STATUS: CONTINUE\n"
             "QUESTION: <your next question>"
