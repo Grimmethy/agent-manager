@@ -1,16 +1,27 @@
-"""Discuss session logic for the Brain Dump tab's "Discuss" action -- an open-ended
-conversation with the local model to add context to a captured brain-dump entry, without
-going through Grill Me's more structured flow. Deliberately NOT built on top of
-grill_sessions.py despite the similar shape: that flow is Socratic-quiz-style, has a
-model-decided completion point (with a hard MAX_EXCHANGES backstop -- see its own
-comment), and operates on an already-filed second-brain note file. This is free-form
-chat, ends only when the USER says so, and operates on a brain-dump entry that hasn't
-been sorted into the vault yet -- different enough in every dimension that sharing code
-would mean threading a bunch of "except when it's the brain-dump kind" branches through
-grill_sessions.py instead of just having two small, separately-readable modules.
+"""Discuss session logic -- an open-ended conversation with the local model to add
+context to something before it's finalized, without going through Grill Me's more
+structured flow. Two callers share this module: the Brain Dump tab's "Discuss" action (on
+a captured entry, not yet sorted into the vault) and the Second Brain file viewer's
+"Discuss" button (on an already-filed vault note, alongside Grill Me/Grill With Docs --
+added 2026-08-16 once the Brain Dump version proved useful enough to want everywhere).
+Deliberately NOT built on top of grill_sessions.py despite the similar shape: that flow is
+Socratic-quiz-style with a model-decided completion point (see its own MAX_EXCHANGES
+comment); this is free-form chat that ends only when the USER says so. Different enough
+that sharing code would mean threading "except for the discuss kind" branches through
+grill_sessions.py instead of two small, separately-readable modules.
 
-Session state persists to a JSON file in the pipeline dir (mirrors grill_sessions.py's
-own convention of a JSON file alongside the vault) so it survives a dashboard restart.
+Generic over WHAT is being discussed -- a subject_id (a brain-dump entry id or a vault
+note's relative path) plus its current text is all this module needs; it never looks at
+brain-dump.json or a note file itself, and never decides what "ending" does to the
+original source. That decision (append to the entry's rawText vs. append a "## Discuss
+session" section to the note file) lives entirely in app.py, which already owns both of
+those data stores and their own edit/reset conventions -- duplicating that here would
+just drift out of sync with it over time.
+
+storage_dir is passed in by the caller rather than assumed: brain-dump sessions live
+alongside brain-dump.json (the pipeline dir), note sessions live alongside the vault
+(SECOND_BRAIN_DIR) -- same "session file next to the thing it's about" convention
+grill_sessions.py already uses for its own storage.
 """
 import json
 import time
@@ -28,34 +39,43 @@ from ollama_client import generate
 MAX_TURNS = 40
 
 
-def discuss_sessions_path(pipeline_dir: Path) -> Path:
-    return pipeline_dir / ".agent-manager-discuss-sessions.json"
+def discuss_sessions_path(storage_dir: Path) -> Path:
+    return storage_dir / ".agent-manager-discuss-sessions.json"
 
 
-def _read_sessions(pipeline_dir: Path) -> dict:
-    p = discuss_sessions_path(pipeline_dir)
+def _read_sessions(storage_dir: Path) -> dict:
+    p = discuss_sessions_path(storage_dir)
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        sessions = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    # One-time migration: sessions written before 2026-08-16 (brain-dump-only, this
+    # module's original scope) used "entryId" -- renamed to the generic "subjectId" once
+    # vault-note sessions needed the same field to mean "note path" instead. Read-time
+    # only, not rewritten to disk here -- the next write (send_message/end_session) picks
+    # up the new key naturally, no separate migration step needed.
+    for session in sessions.values():
+        if "subjectId" not in session and "entryId" in session:
+            session["subjectId"] = session["entryId"]
+    return sessions
 
 
-def _write_sessions(pipeline_dir: Path, sessions: dict):
-    discuss_sessions_path(pipeline_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+def _write_sessions(storage_dir: Path, sessions: dict):
+    discuss_sessions_path(storage_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
-def _build_chat_prompt(raw_text: str, transcript: list) -> str:
+def _build_chat_prompt(subject_text: str, transcript: list) -> str:
     lines = [
-        "You are a thoughtful assistant helping someone think out loud about a note they "
-        "just jotted down, before it gets filed into their personal knowledge base. Have a "
-        "genuine, open-ended conversation -- ask clarifying questions, surface implications "
-        "they may not have considered -- but don't lecture or quiz them, and don't ask more "
-        "than one question at a time. Keep each reply to a few sentences.",
+        "You are a thoughtful assistant helping someone think out loud about a note, "
+        "before it's finalized. Have a genuine, open-ended conversation -- ask "
+        "clarifying questions, surface implications they may not have considered -- but "
+        "don't lecture or quiz them, and don't ask more than one question at a time. "
+        "Keep each reply to a few sentences.",
         "",
-        "=== THE NOTE THEY JOTTED DOWN ===",
-        raw_text,
+        "=== THE NOTE ===",
+        subject_text,
         "",
     ]
     if transcript:
@@ -68,16 +88,16 @@ def _build_chat_prompt(raw_text: str, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def _build_summary_prompt(raw_text: str, transcript: list) -> str:
+def _build_summary_prompt(subject_text: str, transcript: list) -> str:
     lines = [
         "The user just had the conversation below about the note quoted first, then chose "
         "to end it. Write a 2-4 sentence summary of the important context, decisions, or "
         "clarifications that came out of the discussion -- written as durable notes to "
-        "append to the original entry, not a transcript recap. If nothing substantive came "
+        "append to the original note, not a transcript recap. If nothing substantive came "
         "up, say so plainly in one sentence rather than padding it out.",
         "",
         "=== ORIGINAL NOTE ===",
-        raw_text,
+        subject_text,
         "",
         "=== CONVERSATION ===",
     ]
@@ -89,30 +109,30 @@ def _build_summary_prompt(raw_text: str, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def start_session(pipeline_dir: Path, entry_id: str, raw_text: str) -> dict:
-    result = generate(_build_chat_prompt(raw_text, []), think=False, temperature=0.6, num_predict=400)
+def start_session(storage_dir: Path, subject_id: str, subject_text: str) -> dict:
+    result = generate(_build_chat_prompt(subject_text, []), think=False, temperature=0.6, num_predict=400)
     opener = result["response"].strip()
 
     session_id = f"discuss-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     session = {
         "id": session_id,
-        "entryId": entry_id,
-        "rawText": raw_text,
+        "subjectId": subject_id,
+        "rawText": subject_text,
         "status": "active",
         "transcript": [{"role": "assistant", "text": opener}],
         "startedAt": now,
         "endedAt": None,
         "summary": None,
     }
-    sessions = _read_sessions(pipeline_dir)
+    sessions = _read_sessions(storage_dir)
     sessions[session_id] = session
-    _write_sessions(pipeline_dir, sessions)
+    _write_sessions(storage_dir, sessions)
     return session
 
 
-def send_message(pipeline_dir: Path, session_id: str, message: str):
-    sessions = _read_sessions(pipeline_dir)
+def send_message(storage_dir: Path, session_id: str, message: str):
+    sessions = _read_sessions(storage_dir)
     session = sessions.get(session_id)
     if not session or session["status"] != "active":
         return session
@@ -127,7 +147,7 @@ def send_message(pipeline_dir: Path, session_id: str, message: str):
         session["status"] = "ended"
         session["endedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         sessions[session_id] = session
-        _write_sessions(pipeline_dir, sessions)
+        _write_sessions(storage_dir, sessions)
         return session
 
     result = generate(
@@ -136,19 +156,17 @@ def send_message(pipeline_dir: Path, session_id: str, message: str):
     )
     session["transcript"].append({"role": "assistant", "text": result["response"].strip()})
     sessions[session_id] = session
-    _write_sessions(pipeline_dir, sessions)
+    _write_sessions(storage_dir, sessions)
     return session
 
 
-def end_session(pipeline_dir: Path, session_id: str):
+def end_session(storage_dir: Path, session_id: str):
     """User-triggered end -- the entire reason this session type exists alongside Grill
     Me's model-decided completion. Generates one final summary call (skipped if the user
     ended before ever actually saying anything -- nothing to summarize) and marks the
-    session ended. Deliberately does NOT touch brain-dump.json itself: app.py already
-    owns read_brain_dump_entries()/write_brain_dump_entries() and the sorted->captured
-    reset logic PUT /api/brain-dump/<id> uses for exactly this kind of text change --
-    duplicating that here would just drift out of sync with it over time."""
-    sessions = _read_sessions(pipeline_dir)
+    session ended. Deliberately does NOT touch the original brain-dump entry or note file
+    -- see this module's own header for why that decision belongs to app.py."""
+    sessions = _read_sessions(storage_dir)
     session = sessions.get(session_id)
     if not session:
         return None
@@ -165,22 +183,22 @@ def end_session(pipeline_dir: Path, session_id: str):
         session["status"] = "ended"
         session["endedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         sessions[session_id] = session
-        _write_sessions(pipeline_dir, sessions)
+        _write_sessions(storage_dir, sessions)
     return session
 
 
-def get_session(pipeline_dir: Path, session_id: str):
-    return _read_sessions(pipeline_dir).get(session_id)
+def get_session(storage_dir: Path, session_id: str):
+    return _read_sessions(storage_dir).get(session_id)
 
 
-def latest_session_for_entry(pipeline_dir: Path, entry_id: str):
-    """Most recently started session for this entry, or None. Same "don't silently start
-    a duplicate session next to an existing one" reasoning as grill_sessions.py's own
-    latest_session_for_note() -- see that function's comment for the incident this
+def latest_session_for_subject(storage_dir: Path, subject_id: str):
+    """Most recently started session for this subject, or None. Same "don't silently
+    start a duplicate session next to an existing one" reasoning as grill_sessions.py's
+    own latest_session_for_note() -- see that function's comment for the incident this
     pattern already fixed once for Grill Me; applying it here from the start rather than
     waiting to hit the same bug independently."""
-    sessions = _read_sessions(pipeline_dir)
-    candidates = [s for s in sessions.values() if s.get("entryId") == entry_id]
+    sessions = _read_sessions(storage_dir)
+    candidates = [s for s in sessions.values() if s.get("subjectId") == subject_id]
     if not candidates:
         return None
     candidates.sort(key=lambda s: s.get("startedAt") or "", reverse=True)

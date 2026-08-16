@@ -1855,10 +1855,12 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button></div><div id="grill-panel"></div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button></div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
+    const discussBtn = panel.querySelector('#sb-discuss-start');
+    if (discussBtn) discussBtn.onclick = () => sbDiscussStart(filePath);
     // Surface an existing session for this note instead of leaving grill-panel empty and
     // silently letting the next Grill Me click start a fresh one next to it -- confirmed
     // live 2026-08-14: nothing was ever actually lost (every session persists correctly
@@ -1869,6 +1871,11 @@ async function loadSecondBrainFile(filePath) {
       const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(filePath));
       if (existing) grillRenderPanel(existing);
     } catch (e) { /* best-effort -- a missing/unreadable sessions file just means no prior session to show */ }
+    // Same "don't bury existing work" treatment for a past/in-progress Discuss session.
+    try {
+      const existingDiscuss = await fetchJson('/api/second-brain/discuss/for-note?notePath=' + encodeURIComponent(filePath));
+      if (existingDiscuss) sbDiscussRenderPanel(existingDiscuss);
+    } catch (e) { /* best-effort -- same as above */ }
   } catch (e) {
     panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
   }
@@ -1996,6 +2003,110 @@ async function grillEnrich(sessionId, btn) {
     alert('Could not enrich note: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'Enrich Brain';
+  }
+}
+
+// "Discuss" for a vault note -- same open-ended, user-ended conversation as the Brain
+// Dump tab's Discuss button (shares discuss_sessions.py and the generic /api/discuss/*
+// endpoints; only /start and /for-note are note-vs-entry-specific), surfaced here
+// alongside Grill Me/Grill With Docs per the actual ask: "adjacent to the grill me and
+// grill with docs buttons." Structured as a single panel (grillRenderPanel's shape),
+// not a per-card toggle like the Brain Dump tab's version -- there's only ever one note
+// open here at a time, so no need for that version's brainDumpDiscussingId guard.
+function sbDiscussRenderPanel(session) {
+  const el = document.getElementById('sb-discuss-panel');
+  if (!el) return;
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  if (session.status === 'ended') {
+    const actionHtml = session.summary
+      ? `<div class="grill-enriched-badge">Added to note ✓: ${escapeHtml(session.summary)}</div>`
+      : `<div class="meta" style="margin-top:8px">Ended with nothing said -- note unchanged.</div>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Discussion ended</div>${transcriptHtml}${actionHtml}</div>`;
+  } else {
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea><div class="row" style="margin-top:8px"><button type="button" class="secondary" id="sb-discuss-end">End Discussion</button><button type="button" class="action" id="sb-discuss-send">Send</button></div></div>`;
+    const answerEl = el.querySelector('.grill-answer');
+    const sendBtn = el.querySelector('#sb-discuss-send');
+    const endBtn = el.querySelector('#sb-discuss-end');
+    sendBtn.onclick = () => sbDiscussSend(session.id, answerEl.value, sendBtn);
+    endBtn.onclick = () => sbDiscussEnd(session.id, endBtn);
+    answerEl.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sbDiscussSend(session.id, answerEl.value, sendBtn); }
+    };
+    answerEl.focus();
+  }
+  const scrollEl = el.querySelector('.grill-transcript');
+  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+async function sbDiscussStart(notePath) {
+  const el = document.getElementById('sb-discuss-panel');
+  try {
+    const existing = await fetchJson('/api/second-brain/discuss/for-note?notePath=' + encodeURIComponent(notePath));
+    if (existing) {
+      const already = existing.status === 'ended' ? 'a past discussion' : 'a discussion already in progress';
+      if (!confirm(`This note has ${already} (${existing.transcript.length} messages). Start a brand new one anyway? (The existing one is kept, not deleted.)`)) {
+        sbDiscussRenderPanel(existing);
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- fall through to starting normally */ }
+  if (el) el.innerHTML = '<div class="empty">Starting discussion...</div>';
+  try {
+    const resp = await fetch('/api/second-brain/discuss/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(session);
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not start discussion: ${e.message}</div>`;
+  }
+}
+
+async function sbDiscussSend(sessionId, message, btn) {
+  if (!message || !message.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(session);
+  } catch (e) {
+    alert('Could not send message: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
+}
+
+async function sbDiscussEnd(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(result.session);
+    // Same in-place note-content refresh grillEnrich already does, for the same reason:
+    // the summary just got appended to the file on disk, so the readout above should
+    // show it immediately rather than looking stale until the note is reopened.
+    if (result.noteUpdated && result.session && result.session.subjectId) {
+      try {
+        const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(result.session.subjectId));
+        const noteContentEl = document.querySelector('#bd-file-panel .note-content');
+        if (noteContentEl) noteContentEl.textContent = data.content;
+      } catch (e) { /* best-effort -- end itself already succeeded */ }
+    }
+  } catch (e) {
+    alert('Could not end discussion: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'End Discussion';
   }
 }
 
