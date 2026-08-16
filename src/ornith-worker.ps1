@@ -35,6 +35,12 @@ New-Item -ItemType Directory -Force -Path $InstancesDir | Out-Null
 
 . (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
 
+# Refuse to start if a live process already holds this InstanceId -- see
+# agent-manager-common.ps1's Test-InstanceLiveness for the full rationale. 60s matches
+# this loop's own idle-sleep tier (the longest gap between heartbeat writes when there's
+# no work).
+if (-not (Test-InstanceLiveness -InstanceId $InstanceId -TickSecs 60)) { exit 1 }
+
 # All concurrent instances should normally use the SAME model tier -- Ollama keeps only
 # one tier resident on typical hardware (OLLAMA_MAX_LOADED_MODELS effectively 1), so
 # mixing model tiers across instances causes swap-load thrashing, not parallelism.

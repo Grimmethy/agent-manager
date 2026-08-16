@@ -7,6 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
 
+# Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
+# identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
+check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-30}" || exit 1
+
 # Graceful stop: same reasoning as ornith-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
 trap 'printf "[review-%s] SIGTERM/SIGINT received -- exiting after current tick.\n" "$INSTANCE_ID" >&2; exit 0' TERM INT

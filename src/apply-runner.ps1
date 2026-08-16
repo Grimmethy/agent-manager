@@ -35,6 +35,11 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 . (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
 
+# Refuse to start if a live process already holds this InstanceId -- see
+# agent-manager-common.ps1's Test-InstanceLiveness for the full rationale. 600s matches
+# this loop's own budget-gate sleep tier (the longest gap between heartbeat writes).
+if (-not (Test-InstanceLiveness -InstanceId 'apply-runner' -TickSecs 600)) { exit 1 }
+
 # Applies tasks already APPROVED in review-runner.ps1 (queue/approved/). Ornith has no tool
 # access in this pipeline, so it can only produce a verdict -- this script is the one place
 # that actually executes an approved task: git branch/commit/push for repoRoot-domain

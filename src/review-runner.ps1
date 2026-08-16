@@ -17,6 +17,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir 'approved') | Out
 
 . (Join-Path $PackageSrcDir 'agent-manager-common.ps1')
 
+# Refuse to start if a live process already holds this InstanceId -- see
+# agent-manager-common.ps1's Test-InstanceLiveness for the full rationale. 600s matches
+# this loop's own budget-gate sleep tier (the longest gap between heartbeat writes).
+if (-not (Test-InstanceLiveness -InstanceId 'review-runner' -TickSecs 600)) { exit 1 }
+
 # Review provider is swappable, not hardcoded -- defaults to Ornith (free, local) so this
 # loop no longer scales token spend with task volume. `claude` remains available for cases
 # that need real judgment quality; set REVIEW_PROVIDER=claude to use it.

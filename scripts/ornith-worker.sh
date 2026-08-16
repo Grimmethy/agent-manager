@@ -8,6 +8,13 @@ readonly INSTANCE_ID="${1:-worker-0}"                                           
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
+# Refuse to start if a live process already holds this instanceId (agent-manager-common.sh's
+# check_instance_liveness, see its own comment) -- the exact duplicate-instance race a manual
+# restart racing queue-watchdog's automatic one produces, confirmed live this session (an
+# EPIPE crash auto-restarted worker-1 while a second worker-1 was also started manually,
+# both racing to claim from the same drafting/worker-1/ folder).
+check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-30}" || exit 1
+
 # Graceful stop: bash defers a trapped signal until the current foreground command
 # (e.g. the node ornith-draft.js call below) returns control to the shell, so this exits
 # right after finishing whatever draft is in flight rather than mid-call -- no orphaned
