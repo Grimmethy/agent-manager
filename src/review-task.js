@@ -133,8 +133,19 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push('This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.');
   } else if (task.source === 'arch_import') {
     lines.push("This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.");
+  } else if (task.source === 'brain_dump_sort') {
+    lines.push('This is a brain-dump CLASSIFICATION task, not a code-change task: the implement draft is a JSON metadata object (category/secondBrainPath/tags/actionable/rationale/belongsToProject) that files a note into a personal vault -- do not reject it for lacking implementation code or for being "just documentation," that was never the ask. secondBrainPath names the note file to create or append to; it commonly does NOT exist yet -- filing something brand new is the normal, most common, correct outcome, so a "missing-file" fact-check flag on secondBrainPath ALONE is expected and is NOT evidence of fabrication (unlike a missing-file flag on a claimed source-code reference elsewhere, which would be). Reject only if: the JSON itself is malformed or missing a required field, category is not one of task/reference/idea/journal/question, secondBrainPath is an obviously wrong or nonsensical destination given what the note is actually about, or belongsToProject names a project that plainly was not among the tracked projects listed in the PLAN above.');
   }
-  lines.push('Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)? Does anything in it contradict the real grounding source or fact-check above?');
+  const completenessQuestion = task.source === 'brain_dump_sort'
+    // Deliberately NOT "does it contain real, complete code" -- confirmed live
+    // 2026-08-16: that phrasing, left unconditional, directly contradicted the
+    // brain_dump_sort carve-out above (a reviewer told two conflicting things in the
+    // same prompt, one of which it's more likely to weight since it comes last) and
+    // was one of two compounding causes behind every brain_dump_sort draft getting
+    // rejected regardless of how correct the classification actually was.
+    ? 'Does it contain a complete, valid classification JSON (not a bare tool-call request, not meta-commentary, not a truncated/partial JSON fragment)?'
+    : 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
+  lines.push(`Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? ${completenessQuestion} Does anything in it contradict the real grounding source or fact-check above?`);
   lines.push('Respond with EXACTLY one of these two forms, nothing else. BOTH require a concrete, specific reason -- cite an actual file name, field name, or line of the draft. A reason that just restates the verdict word ("looks correct", "seems fine", "meets requirements") is not acceptable and will be discarded as unreasoned.');
   lines.push('APPROVE: <one-sentence reason citing the specific requirement(s) you verified are met>');
   lines.push('REJECT: <one-sentence reason citing the specific problem>');
@@ -176,6 +187,17 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       const ddProj = ddCoverage.projects && ddCoverage.projects[task.promptContext.projectSlug];
       if (ddProj && ddProj.clonePath) repoRootForCheck = ddProj.clonePath;
     } catch (e) { /* fall back to workDir */ }
+  } else if (task.source === 'brain_dump_sort' && secondBrainDir) {
+    // Same reasoning as deep_dive above: brain_dump_sort's implementResponse names a
+    // secondBrainPath, which is a location under the VAULT, never under repoRoot --
+    // task-domains.json's brain_dump_sort entry has workDirKind:'repoRoot' (a domain-
+    // config default, not specific to this source), so without this override every
+    // single brain_dump_sort draft's secondBrainPath got fact-checked against the wrong
+    // directory entirely and reported "missing" regardless of whether the destination
+    // note already existed. Confirmed live 2026-08-16: this was one of two compounding
+    // causes (see buildVerdictPrompt's brain_dump_sort carve-out below for the other)
+    // behind EVERY real brain_dump_sort task getting rejected at review.
+    repoRootForCheck = secondBrainDir;
   }
 
   const taskPathForGrounding = path.join(require('os').tmpdir(), `review-grounding-${task.id}.json`);
@@ -315,7 +337,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { reviewTask };
+module.exports = { reviewTask, buildVerdictPrompt };
 
 if (require.main === module) {
   main();
