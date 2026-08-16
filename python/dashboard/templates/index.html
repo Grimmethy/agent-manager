@@ -62,6 +62,8 @@
   button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.action:disabled { opacity: .5; cursor: not-allowed; }
   button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.danger:disabled { opacity: .5; cursor: not-allowed; }
   .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
@@ -157,6 +159,12 @@ let browsePath = '';
 let browserOpen = false;
 let historyOpen = false;
 let projectStatusInterval = null;
+// Tracks which click this is on the Start/Stop/Force-Stop toggle button while the
+// pipeline is running: false = not yet clicked (button reads "Stop Pipeline"), true =
+// a graceful stop was already requested and is in flight (button reads "Force Stop
+// Pipeline" so a stuck daemon can be killed without waiting out the grace period).
+// Reset to false whenever the pipeline is confirmed not running.
+let stopRequested = false;
 let projectHistory = [];
 
 // Brain Dump tab state -- same "own render lifecycle, not the generic 5s cycle" reasoning
@@ -165,6 +173,23 @@ let projectHistory = [];
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
 let brainDumpEntriesInterval = null;
+
+// Single choke point for every place that changes which project is active (typed input,
+// History panel, Browse panel, and the server-sync in refreshPipelineStatus). grepDirs is
+// scoped to whichever project it was typed for -- carrying it over to a different path is
+// exactly how "none of the given grepDirs exist under this path" happens (e.g. a leftover
+// "frontend/src, backend/src" from a prior project, or here, a stale value that happened to
+// equal the old project's own folder name).
+function setProjectPath(newPath) {
+  if (newPath !== projectPath) {
+    grepDirs = '';
+    localStorage.setItem('agentManagerGrepDirs', '');
+    const grepInput = document.getElementById('project-grepdirs-input');
+    if (grepInput) grepInput.value = '';
+  }
+  projectPath = newPath;
+  localStorage.setItem('agentManagerProjectPath', projectPath);
+}
 
 // Retrofits #project-path-input into a searchable dropdown of previously-loaded
 // projects via a native <datalist> -- typing filters/suggests past paths, picking one
@@ -203,8 +228,7 @@ function renderHistoryPanel() {
   `).join('');
   panel.querySelectorAll('[data-select]').forEach((el) => {
     el.onclick = () => {
-      projectPath = el.dataset.select;
-      localStorage.setItem('agentManagerProjectPath', projectPath);
+      setProjectPath(el.dataset.select);
       document.getElementById('project-path-input').value = projectPath;
       lastRenderedStatusKey = null;
       historyOpen = false;
@@ -951,8 +975,7 @@ async function enterProjectTab() {
   try {
     const status = await fetchJson('/api/pipeline/status');
     if (status.activeRepoRoot && status.activeRepoRoot !== projectPath) {
-      projectPath = status.activeRepoRoot;
-      localStorage.setItem('agentManagerProjectPath', projectPath);
+      setProjectPath(status.activeRepoRoot);
     }
     // Same reasoning as the path sync above: reflect whatever's actually configured
     // server-side (env file / another tab / launch.bat) rather than only ever showing
@@ -999,8 +1022,7 @@ async function enterProjectTab() {
   `;
   lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
   document.getElementById('project-path-input').addEventListener('change', (e) => {
-    projectPath = e.target.value.trim();
-    localStorage.setItem('agentManagerProjectPath', projectPath);
+    setProjectPath(e.target.value.trim());
     lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
     refreshProjectStatus();
   });
@@ -1060,34 +1082,42 @@ async function refreshPipelineStatus() {
         <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong> (${escapeHtml(applyLabel)})</span>
         <span class="badge ok">RUNNING</span>
       </div>
-      <div class="meta"><button class="secondary" id="stop-pipeline-btn" style="margin-top:8px">Stop Pipeline</button></div>
-    `;
-    document.getElementById('stop-pipeline-btn').onclick = stopPipeline;
-  } else if (status.activeRepoRoot) {
-    panel.innerHTML = `
-      <div class="row">
-        <span>Last configured project: <strong>${escapeHtml(status.activeRepoRoot)}</strong></span>
-        <span class="badge idle">NOT RUNNING</span>
-      </div>
-      <div class="meta">Browse to a folder above (or reuse this one) and click Start Pipeline.</div>
     `;
   } else {
-    panel.innerHTML = `<div class="row"><span>No project configured yet.</span><span class="badge idle">IDLE</span></div>`;
+    stopRequested = false; // confirmed not running -- next click on the toggle starts fresh, not a stray "force stop"
+    if (status.activeRepoRoot) {
+      panel.innerHTML = `
+        <div class="row">
+          <span>Last configured project: <strong>${escapeHtml(status.activeRepoRoot)}</strong></span>
+          <span class="badge idle">NOT RUNNING</span>
+        </div>
+        <div class="meta">Browse to a folder above (or reuse this one) and click Start Pipeline.</div>
+      `;
+    } else {
+      panel.innerHTML = `<div class="row"><span>No project configured yet.</span><span class="badge idle">IDLE</span></div>`;
+    }
   }
 
-  // "Start Pipeline" lives next to the path input itself, not in this panel, since it
-  // acts on whatever's currently in the input -- only show/enable it when nothing is
-  // already running and a path is actually entered.
+  // Single button, reused for Start/Stop/Force Stop rather than a separate button per
+  // state -- lives next to the path input, not in the panel above, since Start acts on
+  // whatever's currently in that input.
   let startBtn = document.getElementById('start-pipeline-btn');
   if (!startBtn) {
     startBtn = document.createElement('button');
     startBtn.id = 'start-pipeline-btn';
+    document.querySelector('.path-row').appendChild(startBtn);
+  }
+  if (status.running) {
+    startBtn.className = 'danger';
+    startBtn.disabled = false;
+    startBtn.textContent = stopRequested ? 'Force Stop Pipeline' : 'Stop Pipeline';
+    startBtn.onclick = stopRequested ? forceStopPipeline : stopPipeline;
+  } else {
     startBtn.className = 'action';
     startBtn.textContent = 'Start Pipeline';
     startBtn.onclick = startPipeline;
-    document.querySelector('.path-row').appendChild(startBtn);
+    startBtn.disabled = !projectPath;
   }
-  startBtn.disabled = status.running || !projectPath;
 }
 
 async function startPipeline() {
@@ -1106,19 +1136,49 @@ async function startPipeline() {
   } catch (e) {
     alert('Could not start pipeline: ' + e.message);
   }
-  btn.textContent = 'Start Pipeline';
   await loadProjectHistory();
   await refreshPipelineStatus();
 }
 
+// First click on the toggle while running: request a graceful stop (SIGTERM, each daemon
+// finishes its current tick per its own trap, grace period, then SIGKILL stragglers --
+// see stop.sh). The server backgrounds this and returns immediately, so the button flips
+// to "Force Stop Pipeline" right away rather than sitting on "Stopping..." for up to the
+// full grace period -- the next status poll reports actually-stopped once daemons exit.
 async function stopPipeline() {
-  const btn = document.getElementById('stop-pipeline-btn');
+  stopRequested = true;
+  const btn = document.getElementById('start-pipeline-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Stopping...'; }
   try {
-    await fetch('/api/pipeline/stop', { method: 'POST' });
+    await fetch('/api/pipeline/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: false }),
+    });
   } catch (e) {
     alert('Could not stop pipeline: ' + e.message);
   }
+  await refreshPipelineStatus();
+}
+
+// Second click on the toggle (after a graceful stop is already in flight): SIGKILL
+// immediately, no grace-period wait, for a daemon that's stuck (wedged mid model-call,
+// ignoring its own trap). Resets stopRequested regardless of outcome so a still-running
+// pipeline (the force call itself failed) offers a fresh graceful attempt rather than
+// getting stuck only ever offering force.
+async function forceStopPipeline() {
+  const btn = document.getElementById('start-pipeline-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Force stopping...'; }
+  try {
+    await fetch('/api/pipeline/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: true }),
+    });
+  } catch (e) {
+    alert('Could not force-stop pipeline: ' + e.message);
+  }
+  stopRequested = false;
   await refreshPipelineStatus();
 }
 
@@ -1148,8 +1208,7 @@ async function loadBrowsePanel() {
     });
     panel.querySelectorAll('[data-select]').forEach(el => {
       el.onclick = () => {
-        projectPath = el.dataset.select;
-        localStorage.setItem('agentManagerProjectPath', projectPath);
+        setProjectPath(el.dataset.select);
         document.getElementById('project-path-input').value = projectPath;
         lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
         browserOpen = false;
@@ -1326,6 +1385,14 @@ function renderBrainDumpShell() {
 // rebuilding the list entirely while it's set, same reasoning as brainDumpBrowsePath.
 let brainDumpEditingId = null;
 
+// Same reasoning as brainDumpEditingId above -- only one entry can be under discussion at
+// a time, tracked globally so the periodic poll skips rebuilding the list while a
+// conversation is in progress (an open-ended chat can run for a while; losing it to a 5s
+// refresh tick would be a real bug, not a cosmetic one). brainDumpDiscussSession caches
+// the session itself so re-rendering after each message doesn't need a separate fetch.
+let brainDumpDiscussingId = null;
+let brainDumpDiscussSession = null;
+
 function renderBrainDumpEditCard(entry) {
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
@@ -1427,13 +1494,124 @@ function wireBrainDumpCardHandlers(el) {
       if (e.key === 'Escape') el.querySelector(`[data-cancel-edit="${CSS.escape(input.dataset.editInput)}"]`).click();
     };
   });
+
+  el.querySelectorAll('[data-discuss]').forEach((btn) => {
+    btn.onclick = () => brainDumpDiscussStart(btn.dataset.discuss);
+  });
+
+  el.querySelectorAll('[data-discuss-send]').forEach((btn) => {
+    const card = btn.closest('.bd-entry');
+    const textarea = card ? card.querySelector('.grill-answer') : null;
+    const send = () => brainDumpDiscussSend(btn.dataset.discussSend, textarea ? textarea.value : '', btn);
+    btn.onclick = send;
+    if (textarea) {
+      textarea.onkeydown = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      };
+    }
+  });
+
+  el.querySelectorAll('[data-discuss-end]').forEach((btn) => {
+    btn.onclick = () => brainDumpDiscussEnd(btn.dataset.discussEnd, btn);
+  });
+
+  el.querySelectorAll('[data-discuss-close]').forEach((btn) => {
+    btn.onclick = () => {
+      brainDumpDiscussingId = null;
+      brainDumpDiscussSession = null;
+      refreshBrainDumpEntries(true);
+    };
+  });
+
+  // Same tail-scroll/focus treatment as grillRenderPanel -- keeps the latest message in
+  // view and the input ready to type into, on every re-render (each message send
+  // re-renders this card the same way submitting a grill answer does).
+  if (brainDumpDiscussingId) {
+    const discussScroll = el.querySelector(`[data-id="${CSS.escape(brainDumpDiscussingId)}"] .grill-transcript`);
+    if (discussScroll) discussScroll.scrollTop = discussScroll.scrollHeight;
+    const discussInput = el.querySelector(`[data-id="${CSS.escape(brainDumpDiscussingId)}"] .grill-answer`);
+    if (discussInput) discussInput.focus();
+  }
+}
+
+// Don't silently start a second conversation next to one already sitting there for this
+// entry -- same "surface existing work instead of burying it" reasoning as
+// grillStartSession's own existing-session check.
+async function brainDumpDiscussStart(entryId) {
+  try {
+    const existing = await fetchJson('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/latest');
+    if (existing && existing.status === 'active') {
+      brainDumpDiscussingId = entryId;
+      brainDumpDiscussSession = existing;
+      await refreshBrainDumpEntries(true);
+      return;
+    }
+    if (existing && existing.status === 'ended') {
+      if (!confirm(`This entry already has a past discussion (${existing.transcript.length} messages). Start a new one anyway? (The old one is kept, not deleted.)`)) {
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- fall through to starting normally */ }
+
+  brainDumpDiscussingId = entryId;
+  brainDumpDiscussSession = null;
+  await refreshBrainDumpEntries(true);
+  try {
+    const resp = await fetch('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/start', { method: 'POST' });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not start discussion: ' + e.message);
+    brainDumpDiscussingId = null;
+    brainDumpDiscussSession = null;
+    await refreshBrainDumpEntries(true);
+  }
+}
+
+async function brainDumpDiscussSend(sessionId, message, btn) {
+  if (!message || !message.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not send message: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
+}
+
+async function brainDumpDiscussEnd(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.description || ('HTTP ' + resp.status));
+    brainDumpDiscussSession = data.session;
+    await refreshBrainDumpEntries(true);
+  } catch (e) {
+    alert('Could not end discussion: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'End Discussion';
+  }
 }
 
 // force=true bypasses the "don't clobber an in-progress edit" guard -- used after an
 // action (save/cancel/delete/prioritize) that just resolved that edit itself, as opposed
 // to the periodic 5s poll (enterBrainDumpTab), which must respect it.
 async function refreshBrainDumpEntries(force = false) {
-  if (brainDumpEditingId && !force) return;
+  if ((brainDumpEditingId || brainDumpDiscussingId) && !force) return;
   const el = document.getElementById('bd-entries');
   if (!el) return;
   let entries;
@@ -1449,9 +1627,11 @@ async function refreshBrainDumpEntries(force = false) {
     return;
   }
 
-  el.innerHTML = entries.map((entry) => (
-    entry.id === brainDumpEditingId ? renderBrainDumpEditCard(entry) : renderBrainDumpCard(entry)
-  )).join('');
+  el.innerHTML = entries.map((entry) => {
+    if (entry.id === brainDumpEditingId) return renderBrainDumpEditCard(entry);
+    if (entry.id === brainDumpDiscussingId) return renderBrainDumpDiscussCard(entry, brainDumpDiscussSession);
+    return renderBrainDumpCard(entry);
+  }).join('');
 
   wireBrainDumpCardHandlers(el);
 }
@@ -1482,10 +1662,45 @@ function renderBrainDumpCard(entry) {
         <span>${queuedBadge}</span>
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
+          <button class="secondary" data-discuss="${escapeAttr(entry.id)}">Discuss</button>
           <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
         </span>
       </div>
+    </div>
+  `;
+}
+
+// "Discuss" -- an open-ended conversation to add context to a captured entry before it
+// gets sorted, without going through the more structured Grill Me flow (see
+// discuss_sessions.py's own header for why that's a separate module, not a shared one).
+// Reuses grill's .grill-transcript/.grill-msg-* CSS wholesale -- visually this IS the
+// same "chat transcript" shape, no reason for a second, near-identical set of classes.
+function renderBrainDumpDiscussCard(entry, session) {
+  if (!session) {
+    return `
+      <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+        <div class="row"><span class="text">${escapeHtml(entry.rawText)}</span></div>
+        <div class="empty">Starting conversation...</div>
+      </div>
+    `;
+  }
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const bodyHtml = session.status === 'ended'
+    ? `${transcriptHtml}` +
+      (session.summary
+        ? `<div class="grill-enriched-badge">Added to entry ✓: ${escapeHtml(session.summary)}</div>`
+        : `<div class="meta" style="margin-top:8px">Ended with nothing said -- entry unchanged.</div>`) +
+      `<div class="row" style="margin-top:10px"><span></span><button type="button" class="secondary" data-discuss-close="${escapeAttr(entry.id)}">Close</button></div>`
+    : `${transcriptHtml}` +
+      `<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea>` +
+      `<div class="row" style="margin-top:8px">` +
+      `<button type="button" class="secondary" data-discuss-end="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">End Discussion</button>` +
+      `<button type="button" class="action" data-discuss-send="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">Send</button>` +
+      `</div>`;
+  return `
+    <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      <div class="grill-session">${bodyHtml}</div>
     </div>
   `;
 }
@@ -1498,8 +1713,27 @@ async function loadSecondBrainBrowser() {
   try {
     data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
   } catch (e) {
-    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
-    return;
+    // brainDumpBrowsePath is persisted in localStorage across sessions -- a folder it
+    // points at can legitimately stop existing between visits (renamed, merged, deleted
+    // outside the dashboard entirely, e.g. by hand or by another tool), which otherwise
+    // permanently wedges this panel on a dead 404 with no way back short of clearing
+    // localStorage yourself. Confirmed live 2026-08-16: the "projects"/"Projects"
+    // case-duplicate folders got merged, and a browser that had "projects" saved from
+    // before the merge 404'd here forever after. Fall back to root once rather than
+    // leaving a stale path permanently wedged.
+    if (brainDumpBrowsePath !== '') {
+      brainDumpBrowsePath = '';
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
+      try {
+        data = await fetchJson('/api/second-brain/browse?path=');
+      } catch (e2) {
+        panel.innerHTML = `<div class="empty">Could not browse: ${e2.message}</div>`;
+        return;
+      }
+    } else {
+      panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+      return;
+    }
   }
 
   if (!data.configured) {
@@ -1621,10 +1855,12 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button></div><div id="grill-panel"></div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button></div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
+    const discussBtn = panel.querySelector('#sb-discuss-start');
+    if (discussBtn) discussBtn.onclick = () => sbDiscussStart(filePath);
     // Surface an existing session for this note instead of leaving grill-panel empty and
     // silently letting the next Grill Me click start a fresh one next to it -- confirmed
     // live 2026-08-14: nothing was ever actually lost (every session persists correctly
@@ -1635,6 +1871,11 @@ async function loadSecondBrainFile(filePath) {
       const existing = await fetchJson('/api/second-brain/grill/for-note?notePath=' + encodeURIComponent(filePath));
       if (existing) grillRenderPanel(existing);
     } catch (e) { /* best-effort -- a missing/unreadable sessions file just means no prior session to show */ }
+    // Same "don't bury existing work" treatment for a past/in-progress Discuss session.
+    try {
+      const existingDiscuss = await fetchJson('/api/second-brain/discuss/for-note?notePath=' + encodeURIComponent(filePath));
+      if (existingDiscuss) sbDiscussRenderPanel(existingDiscuss);
+    } catch (e) { /* best-effort -- same as above */ }
   } catch (e) {
     panel.innerHTML = `<div class="empty">Could not read file: ${e.message}</div>`;
   }
@@ -1762,6 +2003,110 @@ async function grillEnrich(sessionId, btn) {
     alert('Could not enrich note: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'Enrich Brain';
+  }
+}
+
+// "Discuss" for a vault note -- same open-ended, user-ended conversation as the Brain
+// Dump tab's Discuss button (shares discuss_sessions.py and the generic /api/discuss/*
+// endpoints; only /start and /for-note are note-vs-entry-specific), surfaced here
+// alongside Grill Me/Grill With Docs per the actual ask: "adjacent to the grill me and
+// grill with docs buttons." Structured as a single panel (grillRenderPanel's shape),
+// not a per-card toggle like the Brain Dump tab's version -- there's only ever one note
+// open here at a time, so no need for that version's brainDumpDiscussingId guard.
+function sbDiscussRenderPanel(session) {
+  const el = document.getElementById('sb-discuss-panel');
+  if (!el) return;
+  const transcriptHtml = grillRenderTranscript(session.transcript);
+  if (session.status === 'ended') {
+    const actionHtml = session.summary
+      ? `<div class="grill-enriched-badge">Added to note ✓: ${escapeHtml(session.summary)}</div>`
+      : `<div class="meta" style="margin-top:8px">Ended with nothing said -- note unchanged.</div>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Discussion ended</div>${transcriptHtml}${actionHtml}</div>`;
+  } else {
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea><div class="row" style="margin-top:8px"><button type="button" class="secondary" id="sb-discuss-end">End Discussion</button><button type="button" class="action" id="sb-discuss-send">Send</button></div></div>`;
+    const answerEl = el.querySelector('.grill-answer');
+    const sendBtn = el.querySelector('#sb-discuss-send');
+    const endBtn = el.querySelector('#sb-discuss-end');
+    sendBtn.onclick = () => sbDiscussSend(session.id, answerEl.value, sendBtn);
+    endBtn.onclick = () => sbDiscussEnd(session.id, endBtn);
+    answerEl.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sbDiscussSend(session.id, answerEl.value, sendBtn); }
+    };
+    answerEl.focus();
+  }
+  const scrollEl = el.querySelector('.grill-transcript');
+  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+async function sbDiscussStart(notePath) {
+  const el = document.getElementById('sb-discuss-panel');
+  try {
+    const existing = await fetchJson('/api/second-brain/discuss/for-note?notePath=' + encodeURIComponent(notePath));
+    if (existing) {
+      const already = existing.status === 'ended' ? 'a past discussion' : 'a discussion already in progress';
+      if (!confirm(`This note has ${already} (${existing.transcript.length} messages). Start a brand new one anyway? (The existing one is kept, not deleted.)`)) {
+        sbDiscussRenderPanel(existing);
+        return;
+      }
+    }
+  } catch (e) { /* best-effort check -- fall through to starting normally */ }
+  if (el) el.innerHTML = '<div class="empty">Starting discussion...</div>';
+  try {
+    const resp = await fetch('/api/second-brain/discuss/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(session);
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not start discussion: ${e.message}</div>`;
+  }
+}
+
+async function sbDiscussSend(sessionId, message, btn) {
+  if (!message || !message.trim()) return;
+  btn.disabled = true;
+  btn.textContent = 'Thinking...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const session = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(session);
+  } catch (e) {
+    alert('Could not send message: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Send';
+  }
+}
+
+async function sbDiscussEnd(sessionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+  try {
+    const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    sbDiscussRenderPanel(result.session);
+    // Same in-place note-content refresh grillEnrich already does, for the same reason:
+    // the summary just got appended to the file on disk, so the readout above should
+    // show it immediately rather than looking stale until the note is reopened.
+    if (result.noteUpdated && result.session && result.session.subjectId) {
+      try {
+        const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(result.session.subjectId));
+        const noteContentEl = document.querySelector('#bd-file-panel .note-content');
+        if (noteContentEl) noteContentEl.textContent = data.content;
+      } catch (e) { /* best-effort -- end itself already succeeded */ }
+    }
+  } catch (e) {
+    alert('Could not end discussion: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'End Discussion';
   }
 }
 

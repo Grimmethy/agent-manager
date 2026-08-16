@@ -133,6 +133,8 @@ function brainDumpSortPlanPrompt(task) {
     'Existing top-level folders/files already in the second brain (reuse one of these when the note fits, rather than inventing a new top-level folder for a single note):',
     structureText,
     '',
+    'Two naming rules, both non-negotiable: (1) if you reuse an existing top-level folder, copy its name EXACTLY as shown above, including capitalization -- "Projects" and "projects" are two different folders as far as the filesystem is concerned, and creating a case-variant of one that already exists silently splits it in two. (2) the FILE name (not the folder) must describe what the note is actually about -- never a bare generic word like "ideas.md", "notes.md", "misc.md", or "todo.md" that could just as easily be the name of every other note ever filed. "ebay-cross-post-automation.md" is a good file name; "ideas.md" is not, even inside an Ideas/ folder.',
+    '',
     'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
     ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
     '',
@@ -579,7 +581,7 @@ function brainDumpSortImplementPrompt(task, planText) {
     '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects"',
     '}',
     '',
-    'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown.',
+    'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown. If reusing an existing folder, its name must match the casing shown above EXACTLY. The file name itself must describe the note\'s actual subject, not a generic placeholder word (ideas/notes/misc/todo and similar are rejected automatically).',
   ].join('\n');
 }
 
