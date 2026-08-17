@@ -1906,6 +1906,15 @@ function renderBrainDumpShell() {
   `;
 
   const input = document.getElementById('bd-capture-input');
+  // Persist the draft across tab switches (brain-dump entry, 2026-08-17: "navigate to
+  // other tabs in order to gather or confirm information" without losing what's typed).
+  // renderBrainDumpShell() rebuilds #main -- and this input inside it -- from scratch on
+  // every visit to this tab, wiping any unsaved text; localStorage is the only thing
+  // that survives that. Same "browsePath survives across visits" pattern already used
+  // for brainDumpBrowsePath just below, applied to a draft instead of a folder path.
+  const DRAFT_KEY = 'agentManagerBrainDumpDraft';
+  input.value = localStorage.getItem(DRAFT_KEY) || '';
+  input.oninput = () => localStorage.setItem(DRAFT_KEY, input.value);
   const submit = async () => {
     const text = input.value.trim();
     if (!text) return;
@@ -1918,6 +1927,7 @@ function renderBrainDumpShell() {
         body: JSON.stringify({ text }),
       });
       input.value = '';
+      localStorage.removeItem(DRAFT_KEY);
       await refreshBrainDumpEntries(true);
     } catch (e) {
       alert('Could not capture: ' + e.message);
@@ -1961,6 +1971,12 @@ let brainDumpEditingId = null;
 // the session itself so re-rendering after each message doesn't need a separate fetch.
 let brainDumpDiscussingId = null;
 let brainDumpDiscussSession = null;
+// Lets the "Starting conversation..." state (brain-dump entry, 2026-08-17: "starting
+// conversation can take a long time to load, I need to be able to cancel") actually
+// interrupt the in-flight /discuss/start request rather than just hiding the wait --
+// only one Discuss start is ever in flight at a time (brainDumpDiscussingId's own
+// single-conversation-at-a-time design), so one controller is enough.
+let brainDumpDiscussStartController = null;
 
 function renderBrainDumpEditCard(entry) {
   const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span>` : '';
@@ -2074,7 +2090,7 @@ function wireBrainDumpCardHandlers(el) {
   el.querySelectorAll('[data-discuss-send]').forEach((btn) => {
     const card = btn.closest('.bd-entry');
     const textarea = card ? card.querySelector('.grill-answer') : null;
-    const send = () => brainDumpDiscussSend(btn.dataset.discussSend, textarea ? textarea.value : '', btn);
+    const send = () => brainDumpDiscussSend(btn.dataset.discussSend, textarea ? textarea.value : '', btn, btn.dataset.entry);
     btn.onclick = send;
     if (textarea) {
       textarea.onkeydown = (e) => {
@@ -2084,7 +2100,20 @@ function wireBrainDumpCardHandlers(el) {
   });
 
   el.querySelectorAll('[data-discuss-end]').forEach((btn) => {
-    btn.onclick = () => brainDumpDiscussEnd(btn.dataset.discussEnd, btn);
+    btn.onclick = () => brainDumpDiscussEnd(btn.dataset.discussEnd, btn, btn.dataset.entry);
+  });
+
+  el.querySelectorAll('[data-discuss-cancel]').forEach((btn) => {
+    btn.onclick = () => {
+      // Aborting the fetch alone isn't enough -- brainDumpDiscussStart's own catch
+      // block already no-ops once brainDumpDiscussingId no longer matches this entry
+      // (see its stale-response guard), so clearing it here is what actually makes
+      // Cancel silent instead of surfacing an "AbortError" failure toast a moment later.
+      if (brainDumpDiscussStartController) brainDumpDiscussStartController.abort();
+      brainDumpDiscussingId = null;
+      brainDumpDiscussSession = null;
+      refreshBrainDumpEntries(true);
+    };
   });
 
   el.querySelectorAll('[data-discuss-close]').forEach((btn) => {
@@ -2134,17 +2163,33 @@ async function brainDumpDiscussStart(entryId) {
 
   brainDumpDiscussingId = entryId;
   brainDumpDiscussSession = null;
+  const controller = new AbortController();
+  brainDumpDiscussStartController = controller;
   await refreshBrainDumpEntries(true);
   try {
     const resp = await fetch('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(providerBody),
+      body: JSON.stringify(providerBody), signal: controller.signal,
     });
     const session = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    // Stale-response guard (2026-08-17, brain-dump entry: reported "context bleed"
+    // between two simultaneous discussions -- root cause was never actually the two
+    // providers' backends crossing wires; it's this function's OWN response handler
+    // blindly overwriting the shared brainDumpDiscussSession/brainDumpDiscussingId
+    // singletons regardless of which entry is on screen by the time a slow reply
+    // finally lands. Switch to a different entry's Discuss card while entryId's request
+    // is still in flight, and its late response used to clobber whatever entry you'd
+    // since opened -- reproduces exactly the reported symptom (entry B's card shows
+    // entry A's transcript/provider). The server already persisted this response
+    // correctly under its own session regardless; only the UI application is stale, so
+    // discarding it here loses nothing -- reopening entryId's Discuss later resumes the
+    // real, up-to-date session via the existing "status === 'active'" path above.
+    if (brainDumpDiscussingId !== entryId) return;
     brainDumpDiscussSession = session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
+    if (brainDumpDiscussingId !== entryId) return;
     showToast('Could not start discussion: ' + e.message);
     brainDumpDiscussingId = null;
     brainDumpDiscussSession = null;
@@ -2152,7 +2197,7 @@ async function brainDumpDiscussStart(entryId) {
   }
 }
 
-async function brainDumpDiscussSend(sessionId, message, btn) {
+async function brainDumpDiscussSend(sessionId, message, btn, entryId) {
   if (!message || !message.trim()) return;
   btn.disabled = true;
   btn.textContent = 'Thinking...';
@@ -2164,6 +2209,10 @@ async function brainDumpDiscussSend(sessionId, message, btn) {
     });
     const session = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
+    // Same stale-response guard as brainDumpDiscussStart -- see its own comment. Without
+    // this, a reply to a message sent to entryId lands and overwrites whatever DIFFERENT
+    // entry the user has since switched to, appearing as cross-talk between two discussions.
+    if (brainDumpDiscussingId !== entryId) return;
     brainDumpDiscussSession = session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
@@ -2173,13 +2222,15 @@ async function brainDumpDiscussSend(sessionId, message, btn) {
   }
 }
 
-async function brainDumpDiscussEnd(sessionId, btn) {
+async function brainDumpDiscussEnd(sessionId, btn, entryId) {
   btn.disabled = true;
   btn.textContent = 'Ending...';
   try {
     const resp = await fetch('/api/discuss/' + encodeURIComponent(sessionId) + '/end', { method: 'POST' });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.description || ('HTTP ' + resp.status));
+    // Same stale-response guard as brainDumpDiscussStart/Send -- see the former's comment.
+    if (brainDumpDiscussingId !== entryId) return;
     brainDumpDiscussSession = data.session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
@@ -2290,7 +2341,7 @@ function renderBrainDumpDiscussCard(entry, session) {
     return `
       <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
         <div class="row"><span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span></div>
-        <div class="empty">Starting conversation...</div>
+        <div class="row" style="margin-top:8px"><span class="empty">Starting conversation...</span><button type="button" class="secondary" data-discuss-cancel="${escapeAttr(entry.id)}">Cancel</button></div>
       </div>
     `;
   }
