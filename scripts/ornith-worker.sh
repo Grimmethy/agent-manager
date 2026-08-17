@@ -23,6 +23,19 @@ esac
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
+# Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
+# reported model regardless of which lane was actually running -- confirmed live
+# 2026-08-17: the dashboard's Workers tab showed worker-claude as running "ornith:35b"
+# even though it only ever claims adhoc tasks and never calls Ornith at all. Computed
+# once, here, after orc-common.sh has actually loaded CLAUDE_MODEL/ORNITH_MODEL from
+# agent-manager.env -- same "claude:<model>" label format model-provider.js's own
+# labelFor() already uses for the Models tab, so the two stay consistent.
+if "$IS_CLAUDE_LANE"; then
+  HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+else
+  HEARTBEAT_MODEL="${ORNITH_MODEL:-}"
+fi
+
 # Refuse to start if a live process already holds this instanceId (agent-manager-common.sh's
 # check_instance_liveness, see its own comment) -- the exact duplicate-instance race a manual
 # restart racing queue-watchdog's automatic one produces, confirmed live this session (an
@@ -56,7 +69,7 @@ process_drafting_file() {
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
 
-  write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "draft" "$STARTED_AT"
+  write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/ornith-draft.js" "$wpath" 2>>"$LOG_FILE")"
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
@@ -75,13 +88,13 @@ process_drafting_file() {
     # retries it automatically.
     printf '[worker-%s] draft call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
   fi
-  write_heartbeat_file "$INSTANCE_ID" "idle" "${ORNITH_MODEL:-}" "" "" "$STARTED_AT"
+  write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
 }
 
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
-  write_heartbeat_file "$INSTANCE_ID" "idle" "${ORNITH_MODEL:-}" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
+  write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
 
   mkdir -p "$HOME_LOGS" 2>/dev/null                                              # ensure base home logs dir exists — PowerShell's New-Item creates the folder automatically when it doesn't exist (we mirror that behavior explicitly here because bash's redirection won't auto-create parent dirs the way PS does).
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
@@ -191,7 +204,7 @@ while :; do                                                                     
 
       if "$claim_succeeded"; then                                               # actual claim action: rename pending/$name -> drafting/${INSTANCE_ID}/$name (use mv because we don't want to COPY — mv is atomic on same filesystem which prevents race where another loop picks up the same draft after we 'claimed' it). Bash's `mv` works for this; equivalent of PowerShell's `Move-Item -Force` which would do identical work under its file-system abstraction but bash doesn't need `-Force`.
         printf '[worker-%s] claiming %s\n' "$INSTANCE_ID" "$name"               # log that we're about to attempt claim — same kind of status emit as PowerShell's `$null = Write-Host "Processing $draftName"` block which prints progress to operator console so they know daemon IS doing something (otherwise they'd wonder if it hung silently).
-        write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "claim" "$STARTED_AT"
+        write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "claim" "$STARTED_AT"
 
         mkdir -p "${QUEUE_DIR}/drafting/${INSTANCE_ID}" >/dev/null 2>&1 # ensure destination exists before moving into it — bash's mv doesn't auto-create parent dirs; if we didn't mkdir we'd get 'No such file or directory' error on first claim attempt which would look like daemon failed but actually just meant the folder wasn't created yet (same issue PowerShell hits too and they handle with pre-creation pattern via -Force flag on New-Item).
 
