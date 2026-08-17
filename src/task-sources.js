@@ -1517,11 +1517,24 @@ if (require.main === module) {
   // adhoc/deep_dive/project_search, brain_dump_sort's arrival rate is bounded by how often
   // a human actually captures a note, so letting it through here can't create the
   // unbounded-pileup problem this throttle exists to prevent.
+  //
+  // MUST also check taskIdExistsInQueue the same way nextBrainDumpSortTask() itself does
+  // -- confirmed live 2026-08-17, the same class of bug as the needs-clarification
+  // exemption above: a captured entry's status only flips to 'sorted' once its
+  // brain_dump_sort task is actually APPLIED, not once it's merely queued. With 16 real
+  // captured entries each already sitting in queue/pending/ as their own
+  // brain-dump-sort-<id> task (drafted or not, none applied yet), this exemption stayed
+  // open on every tick even though nextBrainDumpSortTask() itself correctly had nothing
+  // left to add -- reopening the FULL getNextTask() ladder and letting arch_import/
+  // arch_discovery/observability_review keep generating fresh tasks the whole time
+  // pending/ already sat 140+ deep, exactly the symptom the needs-clarification fix
+  // above was meant to close off for good.
   const hasBrainDumpWaiting = (() => {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured');
+      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured'
+        && !taskIdExistsInQueue('brain-dump-sort-' + e.id));
     } catch {
       return false;
     }
