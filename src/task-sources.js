@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
+const { reasoningTierFor } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
@@ -1408,7 +1409,21 @@ registerTaskSource('project_search', { priority: taskPriority('project_search', 
 // actually running.
 registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
 
-function getNextTask() {
+// tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
+// this, getNextTask() always returns the FIRST source in priority order with eligible
+// work and stops there, even when that source's task doesn't match the calling lane's own
+// reasoning tier. Confirmed live: with path_prefetch_resolve's automatic high-reasoning
+// retry (priority 69, beats arch_discovery/arch_import/observability_review at 79/80/79)
+// having a real 20+ item backlog, worker-1's generation calls kept returning a high-tier
+// retry task every single tick, which worker-1 then correctly declined to CLAIM (see
+// ornith-worker.sh's tier filter) -- but never got far enough down the ladder to generate
+// any LOW-tier work for itself either, so worker-1 sat idle while worker-claude did
+// everything. A mismatched-tier task is skipped (not returned) and the ladder keeps
+// walking to the next source instead of stopping -- safe because every next() function
+// here is a pure "what would I offer" read with no queue-write side effect (writeTask()
+// is the only thing that actually persists a task), so skipping a candidate wastes at
+// most one extra read, never loses or duplicates work.
+function getNextTask({ tierFilter } = {}) {
   const { taskSourceAllowlist } = getConfig();
   const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
   for (const source of getRegisteredSources()) {
@@ -1423,7 +1438,9 @@ function getNextTask() {
     if (restricted && !alwaysAllowed && !taskSourceAllowlist.includes(source.name)) continue;
     if (typeof source.next !== 'function') continue;
     const task = source.next();
-    if (task) return task;
+    if (!task) continue;
+    if (tierFilter && reasoningTierFor(task) !== tierFilter) continue;
+    return task;
   }
   return null;
 }
@@ -1516,6 +1533,13 @@ if (require.main === module) {
     return;
   }
 
+  // `node task-sources.js --tier=low|high` -- restricts generation to that reasoning
+  // tier (see getNextTask()'s own comment). Omitted entirely = no filter, generates
+  // whichever source is highest priority regardless of tier, matching this CLI's
+  // long-standing default behavior for any caller that doesn't care about tiers.
+  const tierArg = process.argv.find((a) => a.startsWith('--tier='));
+  const tierFilter = tierArg ? tierArg.slice('--tier='.length) : undefined;
+
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const draftingDir = path.join(pipelineDir, 'queue', 'drafting');
@@ -1529,18 +1553,32 @@ if (require.main === module) {
   // on every single ~30s tick, since it only ever saw an empty pending/. drafting/ is one
   // level deeper (per-instance subfolders), so this checks any *.json under any of those,
   // not just the top level.
+  // When tierFilter is set, a task file only counts toward "already pending" if it's
+  // actually THIS tier's own backlog -- otherwise a tier-scoped caller (e.g. worker-1
+  // calling --tier=low) would see worker-claude's high-tier drafting/pending backlog and
+  // throttle itself into never generating any low-tier work at all, the exact starvation
+  // this tier split exists to fix. Unreadable/mid-write files count as backlog either way
+  // (conservative default, matches every other non-fatal-skip convention in this file).
+  const taskFileMatchesTier = (filePath) => {
+    if (!tierFilter) return true;
+    try {
+      return reasoningTierFor(JSON.parse(fs.readFileSync(filePath, 'utf8'))) === tierFilter;
+    } catch {
+      return true;
+    }
+  };
   const hasDraftingWork = fs.existsSync(draftingDir)
     && fs.readdirSync(draftingDir, { withFileTypes: true }).some((entry) => {
       if (!entry.isDirectory()) return false;
       const instanceDir = path.join(draftingDir, entry.name);
       try {
-        return fs.readdirSync(instanceDir).some((f) => f.endsWith('.json'));
+        return fs.readdirSync(instanceDir).some((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(instanceDir, f)));
       } catch {
         return false;
       }
     });
   const alreadyPending = hasDraftingWork
-    || (fs.existsSync(pendingDir) && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json')));
+    || (fs.existsSync(pendingDir) && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(pendingDir, f))));
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception
@@ -1607,6 +1645,15 @@ if (require.main === module) {
   // backlog exists" throttle, while the 144+ item backlog it was meant to protect never
   // shrank -- two real held tasks stuck for hours were enough to flood the queue
   // indefinitely with unrelated low-priority work.
+  // Brain Dump #77: mirrors nextPathPrefetchResolveTask()'s own two-tier eligibility gate
+  // (attempted-flags-driven, NOT `suggested` truthiness -- a non-confident suggestion still
+  // sets `suggested`, and that's exactly the retry-eligible case). Confirmed live
+  // 2026-08-17: the OLD check here (`suggested || suggestionAttempted`) treated every one
+  // of this project's real stuck held tasks as "not waiting" (all already have a
+  // non-confident `suggested` from their first attempt), so this exemption never reopened
+  // the ladder for their automatic high-reasoning retry -- it only worked at all because
+  // the real backlog happened to be thin enough for the plain (non-exempted) throttle to
+  // stay open on its own.
   const hasHeldClarificationWaiting = (() => {
     const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
     let files;
@@ -1619,10 +1666,14 @@ if (require.main === module) {
       try {
         const held = JSON.parse(fs.readFileSync(path.join(heldDir, f), 'utf8'));
         if (!held || !held.needsClarification) return false;
-        if (held.needsClarification.suggested || held.needsClarification.suggestionAttempted) return false;
+        const nc = held.needsClarification;
+        const attempted = !!nc.suggestionAttempted;
+        if (attempted && nc.highReasoningAttempted) return false; // both tiers spent -- needs a human, not more generation
         const heldId = held.id || f.replace(/\.json$/, '');
-        const attempt = held.needsClarification.attempt || 1;
-        const resolveId = attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`;
+        const attempt = nc.attempt || 1;
+        const resolveId = attempted
+          ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
+          : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
         return !taskIdExistsInQueue(resolveId);
       } catch {
         return false;
@@ -1633,7 +1684,7 @@ if (require.main === module) {
   if (alreadyPending && !hasAdhocWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
     console.log('pending/ already has work queued, not adding another task');
   } else {
-    const task = getNextTask();
+    const task = getNextTask({ tierFilter });
     if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {

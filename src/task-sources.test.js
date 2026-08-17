@@ -317,6 +317,61 @@ test('getNextTask allowlist: brain_dump_sort always preempts, even when restrict
   delete process.env.AGENT_MANAGER_TASK_SOURCES;
 });
 
+// --- getNextTask tierFilter (Brain Dump #77 follow-up: keep both worker lanes busy in
+// parallel instead of the higher-priority tier's backlog starving the other) -----------
+
+test('getNextTask tierFilter: skips a higher-priority source whose task does not match the tier, falls through to the next one', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  // High-priority (low number) source always has work but is high-reasoning-tier --
+  // mirrors path_prefetch_resolve's automatic retry outranking arch_discovery/arch_import.
+  registerTaskSource('high_priority_high_tier', { priority: 10, reasoningTier: 'high', next: () => ({ id: 'hp-1', source: 'high_priority_high_tier' }) });
+  registerTaskSource('low_priority_low_tier', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_low_tier' }) });
+
+  const lowTierTask = getNextTask({ tierFilter: 'low' });
+  assert.equal(lowTierTask.source, 'low_priority_low_tier', 'a low-tier caller must not get stuck behind the high-tier source and must fall through to its own work');
+
+  const highTierTask = getNextTask({ tierFilter: 'high' });
+  assert.equal(highTierTask.source, 'high_priority_high_tier', 'a high-tier caller still gets the high-priority source normally');
+});
+
+test('getNextTask tierFilter: returns null when nothing at that tier is eligible, even if lower-priority tiers have work', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  registerTaskSource('only_low_tier_source', { priority: 10, next: () => ({ id: 'lt-1', source: 'only_low_tier_source' }) });
+
+  assert.equal(getNextTask({ tierFilter: 'high' }), null);
+  assert.ok(getNextTask({ tierFilter: 'low' }));
+});
+
+test('getNextTask tierFilter: omitted entirely behaves exactly like before (no filtering)', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
+  delete process.env.AGENT_MANAGER_TASK_SOURCES;
+
+  const { getNextTask } = freshTaskSources(repoRoot);
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  registerTaskSource('high_priority_high_tier', { priority: 10, reasoningTier: 'high', next: () => ({ id: 'hp-1', source: 'high_priority_high_tier' }) });
+  registerTaskSource('low_priority_low_tier', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_low_tier' }) });
+
+  const task = getNextTask();
+  assert.equal(task.source, 'high_priority_high_tier');
+});
+
 // --- nextBrainDumpSortTask --------------------------------------------------------------
 
 function makeBrainDumpFixtureRepo() {

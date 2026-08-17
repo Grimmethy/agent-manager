@@ -128,11 +128,21 @@ while :; do                                                                     
   # and the real `deep_dive: failed to onboard "...": ...` error task-sources.js logs via
   # console.error was silently discarded here, with no trace anywhere that onboarding had
   # ever been attempted or why Scouted Repos stayed empty despite tasks completing.
-  # Skipped entirely on the Claude lane -- this call GENERATES new pending/ tasks (not
-  # just claims existing ones), and only one process should ever be doing that at a time.
-  # worker-1 (or whichever non-Claude instance) already covers it every tick regardless of
-  # which lane ends up claiming the result -- generation and claiming are independent.
-  "$IS_CLAUDE_LANE" || node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+  # Runs on BOTH lanes now, each scoped to its own reasoning tier via --tier (Brain Dump
+  # #77 follow-up, 2026-08-17) -- previously skipped entirely on the Claude lane, with the
+  # (at the time correct) reasoning that only one process should ever be generating new
+  # pending/ tasks. That stopped holding once task generation itself became
+  # priority-ordered across BOTH tiers in one shared list (path_prefetch_resolve's
+  # automatic high-reasoning retry, priority 69, beats arch_discovery/arch_import at
+  # 79/80): confirmed live -- worker-1's generation calls kept returning a high-tier retry
+  # candidate every single tick (that source's own backlog dominating the priority
+  # ladder), which worker-1 then correctly declined to CLAIM, but never got far enough
+  # down the ladder to generate any work for ITSELF either, leaving it idle while
+  # worker-claude did everything. --tier scopes getNextTask() (see its own comment) to
+  # skip past a mismatched-tier candidate instead of stopping there, so each lane's own
+  # generation call always reaches its own tier's real work if any exists, independent of
+  # what the other tier's backlog looks like.
+  node "${PACKAGE_SRC_DIR}/task-sources.js" --tier="$( "$IS_CLAUDE_LANE" && echo high || echo low )" >>"$LOG_FILE" 2>&1 || true
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
