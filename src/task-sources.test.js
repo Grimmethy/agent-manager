@@ -587,6 +587,33 @@ test('nextPathPrefetchResolveTask offers a high-reasoning retry once the low-rea
   assert.equal(task.id, 'path-prefetch-resolve-held-1-attempt1-highreasoning');
 });
 
+// Confirmed live 2026-08-17: a resolve task that gets rejected by REVIEW never reaches
+// applyPathPrefetchResolve() (only a successful apply stamps the held task's own
+// attempted-flag), but if review-rejection retries (reject-retry-check.js's own generic
+// cap, unrelated to this tier system) exhaust FIRST, the resolveId permanently "exists" in
+// queue/blocked/ -- so this loop refuses to ever regenerate it, while the held task's own
+// flags still say "eligible", forever. Two real held tasks hit exactly this deadlock,
+// silently starving the high-reasoning worker lane of its only remaining work.
+test('nextPathPrefetchResolveTask self-heals a held task whose retry was review-rejected and exhausted (never reached apply)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  // The high-reasoning retry's OWN resolve task exists, but terminated in blocked/ --
+  // exhausted at review, never applied.
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(blockedDir, 'path-prefetch-resolve-held-1-attempt1-highreasoning.json'),
+    JSON.stringify({ id: 'path-prefetch-resolve-held-1-attempt1-highreasoning', history: [{ stage: 'exhausted' }] }),
+  );
+
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null, 'must not try to regenerate the same resolveId');
+
+  const held = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'needs-clarification', 'held-1.json'), 'utf8'));
+  assert.equal(held.needsClarification.highReasoningAttempted, true, 'must self-heal the flag so this held task is no longer offered on future ticks either');
+});
+
 test('nextPathPrefetchResolveTask skips a held task once BOTH tiers have been attempted', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true });

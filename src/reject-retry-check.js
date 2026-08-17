@@ -86,6 +86,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
 
       const retryCount = Number(task.ornithRejectCount) || 0;
       if (retryCount >= MAX_ORNITH_REJECT_RETRIES) {
+        // Already stamped on a prior tick -- an exhausted task stays in blocked/
+        // permanently (nothing here ever moves or deletes it), so without this guard this
+        // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
+        // real exhausted task accumulated 20+ duplicate 'exhausted' history entries (one
+        // per ~30s tick) over about 12 minutes before this was caught, unbounded growth
+        // for as long as the task sits there -- which, being exhausted, is indefinitely.
+        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
+        if (alreadyStamped) { summary.exhausted++; continue; }
         stampDeepDiveExhausted(task, deepDiveCoveragePath);
         // Persist the exhaustion itself onto the task -- previously this branch never
         // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
