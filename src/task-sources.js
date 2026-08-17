@@ -18,6 +18,7 @@ const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { scanProject } = require('./observability-scan.js');
 const { isOnline } = require('./connectivity-check.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1409,8 +1410,9 @@ function writeTask(task) {
     generatedForRepoRoot: repoRoot,
     status: 'pending',
     createdAt: new Date().toISOString(),
-    history: [{ status: 'pending', at: new Date().toISOString() }],
+    history: [],
   };
+  appendHistoryEvent(record, 'created', task.source);
   fs.writeFileSync(file, JSON.stringify(record, null, 2));
   return file;
 }

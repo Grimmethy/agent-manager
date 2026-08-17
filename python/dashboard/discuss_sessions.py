@@ -28,7 +28,59 @@ import time
 import uuid
 from pathlib import Path
 
-from ollama_client import generate
+import ollama_client
+import claude_client
+import model_stats_client
+
+# session["provider"] is one of these two -- "local" keeps the original Ollama-only
+# behavior; "claude" routes through claude_client.py (Claude Code CLI under a
+# subscription -- see that module's own header for the billing-safety reasoning).
+# Chosen once at start_session() and held for the session's lifetime rather than
+# re-selectable per turn: a mid-conversation provider switch would hand the new model
+# a transcript it didn't generate half of, with no way to tell it that happened.
+PROVIDER_LOCAL = "local"
+PROVIDER_CLAUDE = "claude"
+
+# Read-only real-file access for a claude-provider chat turn (2026-08-17, brain-dump
+# entry: "Claude in the agent-manager has no access to or context about the system
+# it's housed inside... essentially a naive dummy chat"). Read/Grep/Glob only -- no
+# Edit/Write/Bash -- a Discuss session is meant to help someone think, not touch the
+# codebase; Claude's own recommendation elsewhere for read-only tools before write
+# access is proven applies just as much here. Multiple turns needed (not the module's
+# usual single-shot) so a turn that reads a file still has a turn left to answer with
+# what it found.
+CLAUDE_DISCUSS_ALLOWED_TOOLS = "Read,Grep,Glob"
+CLAUDE_DISCUSS_MAX_TURNS = 8
+
+
+def _generate(provider: str, model: str, effort: str, prompt: str, temperature: float, num_predict: int,
+               repo_root: str = None) -> dict:
+    """Routes to the right backend and records the call to model-stats.db either way --
+    see model_stats_client.py's own header for why interactive sessions weren't tracked
+    at all before this, on any provider.
+
+    repo_root, when set, is only meaningful for the claude provider: it's passed as the
+    real working directory alongside CLAUDE_DISCUSS_ALLOWED_TOOLS, so Read/Grep/Glob
+    resolve the actual active project instead of claude-client.js's isolated scratch
+    dir. Unset (no active project, or provider is local) keeps the previous plain-text
+    behavior -- Ornith has no tool-calling path through this module at all."""
+    started = time.time()
+    if provider == PROVIDER_CLAUDE:
+        if repo_root:
+            result = claude_client.generate(
+                prompt, model=model, effort=effort,
+                cwd=repo_root, allowed_tools=CLAUDE_DISCUSS_ALLOWED_TOOLS, max_turns=CLAUDE_DISCUSS_MAX_TURNS,
+            )
+        else:
+            result = claude_client.generate(prompt, model=model, effort=effort)
+        # claude_client.generate() already returns the "claude:"-prefixed label.
+        stats_model = result["model"]
+    else:
+        result = ollama_client.generate(prompt, think=False, temperature=temperature, num_predict=num_predict)
+        stats_model = ollama_client.MODEL
+    latency_ms = int((time.time() - started) * 1000)
+    model_stats_client.record_call("discuss-session", stats_model, latency_ms, stage="discuss", result=result)
+    return result
 
 # Same reasoning as grill_sessions.py's MAX_EXCHANGES, confirmed live there: a model
 # that's good at asking follow-ups can keep a conversation going indefinitely without it
@@ -66,13 +118,25 @@ def _write_sessions(storage_dir: Path, sessions: dict):
     discuss_sessions_path(storage_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
-def _build_chat_prompt(subject_text: str, transcript: list) -> str:
+def _build_chat_prompt(subject_text: str, transcript: list, tools_available: bool = False) -> str:
     lines = [
         "You are a thoughtful assistant helping someone think out loud about a note, "
         "before it's finalized. Have a genuine, open-ended conversation -- ask "
         "clarifying questions, surface implications they may not have considered -- but "
         "don't lecture or quiz them, and don't ask more than one question at a time. "
         "Keep each reply to a few sentences.",
+    ]
+    if tools_available:
+        lines.append(
+            "You have real, read-only access to this project's own files via Read/Grep/"
+            "Glob, rooted at the project actually being worked on right now -- use it "
+            "when the note is about this system (agent-manager) itself, e.g. to check "
+            "how something actually works before answering. README.md, CONTEXT.md, and "
+            "AGENTS.md are good starting points for orienting yourself if you're unsure "
+            "what you're looking at. Don't go investigate on your own initiative for a "
+            "note that has nothing to do with this codebase."
+        )
+    lines += [
         "",
         "=== THE NOTE ===",
         subject_text,
@@ -109,8 +173,11 @@ def _build_summary_prompt(subject_text: str, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: str = None) -> dict:
-    result = generate(_build_chat_prompt(subject_text, []), think=False, temperature=0.6, num_predict=400)
+def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: str = None,
+                   provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None,
+                   repo_root: str = None) -> dict:
+    result = _generate(provider, model, effort, _build_chat_prompt(subject_text, [], tools_available=bool(repo_root)),
+                        0.6, 400, repo_root=repo_root)
     opener = result["response"].strip()
 
     session_id = f"discuss-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -127,6 +194,15 @@ def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: s
         "kind": kind,
         "rawText": subject_text,
         "status": "active",
+        # Fixed for the session's lifetime -- see this module's own PROVIDER_* comment
+        # for why this isn't re-selectable per turn. repoRoot rides along the same way
+        # (whatever project was active when the session started, not re-resolved per
+        # turn) so a mid-conversation project switch can't silently redirect an
+        # in-progress session's tool access to a different codebase.
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "repoRoot": repo_root,
         "transcript": [{"role": "assistant", "text": opener}],
         "startedAt": now,
         "endedAt": None,
@@ -157,9 +233,11 @@ def send_message(storage_dir: Path, session_id: str, message: str):
         _write_sessions(storage_dir, sessions)
         return session
 
-    result = generate(
-        _build_chat_prompt(session["rawText"], session["transcript"]),
-        think=False, temperature=0.6, num_predict=400,
+    repo_root = session.get("repoRoot")
+    result = _generate(
+        session.get("provider", PROVIDER_LOCAL), session.get("model"), session.get("effort"),
+        _build_chat_prompt(session["rawText"], session["transcript"], tools_available=bool(repo_root)), 0.6, 400,
+        repo_root=repo_root,
     )
     session["transcript"].append({"role": "assistant", "text": result["response"].strip()})
     sessions[session_id] = session
@@ -180,9 +258,9 @@ def end_session(storage_dir: Path, session_id: str):
     if session["status"] == "active":
         user_said_anything = any(t["role"] == "user" for t in session["transcript"])
         if user_said_anything:
-            result = generate(
-                _build_summary_prompt(session["rawText"], session["transcript"]),
-                think=False, temperature=0.3, num_predict=300,
+            result = _generate(
+                session.get("provider", PROVIDER_LOCAL), session.get("model"), session.get("effort"),
+                _build_summary_prompt(session["rawText"], session["transcript"]), 0.3, 300,
             )
             session["summary"] = result["response"].strip()
         else:

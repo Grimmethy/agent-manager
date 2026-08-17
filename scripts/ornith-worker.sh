@@ -71,6 +71,15 @@ while :; do                                                                     
   mkdir -p "$HOME_LOGS" 2>/dev/null                                              # ensure base home logs dir exists — PowerShell's New-Item creates the folder automatically when it doesn't exist (we mirror that behavior explicitly here because bash's redirection won't auto-create parent dirs the way PS does).
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
+  # GPU headroom check -- before spending any real model call this tick, see whether the
+  # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
+  # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best
+  # effort and always exits 0 (see gpu-guard.js's own header) -- a check failing here must
+  # never block the tick, same treatment task-sources.js's call below already gets.
+  # Confirmed live 2026-08-16: ComfyUI, not run in hours, left 23013/24576MB VRAM used --
+  # every ornithCall this tick would have timed out at 240s with no indication why.
+  node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
+
   # Seed pending/ with a new task if the queue has room to generate one -- ornith-worker.ps1
   # calls this every tick (task-sources.js's own CLI header: "Safe to call on every worker
   # tick"). Previously never called anywhere in this bash port, so pending/ could never

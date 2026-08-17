@@ -32,6 +32,12 @@ while :; do                                                                     
 
   [[ -d "$review_dir" && -r "$review_dir" ]]                                    || { sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
 
+  # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
+  # (n=3 votes per item), same starvation risk ornith-worker.sh's tick guards against;
+  # see gpu-guard.js's header for the live incident this responds to. Best-effort, never
+  # blocks the tick.
+  node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
+
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
   items=()
   while IFS= read -r name; do

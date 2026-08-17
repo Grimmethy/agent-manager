@@ -43,6 +43,9 @@ const MAX_BUDGET_USD = process.env.CLAUDE_MAX_BUDGET_USD || '';
 // set" carve-out could see, regardless of --allowedTools -- an empty scratch dir has
 // nothing sensitive in it even if some read-only capability slips through. Defense in
 // depth, not the primary control (the primary control is not granting tools at all).
+// A caller that explicitly wants real tool access against a real project (see
+// callOnce's own `cwd` param) is deliberately opting out of this isolation -- that's
+// the whole point of passing both allowedTools and cwd together.
 const CLAUDE_CWD = process.env.CLAUDE_CWD || path.join(os.tmpdir(), 'agent-manager-claude-client-scratch');
 
 function assertSubscriptionAuthAvailable() {
@@ -79,9 +82,17 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk' }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd }) {
   assertSubscriptionAuthAvailable();
-  fs.mkdirSync(CLAUDE_CWD, { recursive: true });
+  // cwd lets a caller run this against a real project directory instead of the
+  // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
+  // dump entry: "Claude in the agent-manager has no access to... the system it's
+  // housed inside") pass the active project's repoRoot here alongside a read-only
+  // allowedTools list, so Read/Grep/Glob actually resolve real files instead of an
+  // empty directory. Falls back to CLAUDE_CWD (the isolated scratch dir) for every
+  // caller that doesn't explicitly ask for this -- the existing, safer default.
+  const workDir = cwd || CLAUDE_CWD;
+  fs.mkdirSync(workDir, { recursive: true });
 
   const args = [
     '-p', prompt,
@@ -125,7 +136,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
       encoding: 'utf8',
       timeout: REQUEST_TIMEOUT_MS,
       maxBuffer: 32 * 1024 * 1024,
-      cwd: CLAUDE_CWD,
+      cwd: workDir,
       env: buildChildEnv(),
     });
   } catch (e) {

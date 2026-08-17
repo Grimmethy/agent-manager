@@ -94,3 +94,34 @@ for i in "${!pids[@]}"; do
     printf '[stop] %s (pid %s) exited cleanly.\n' "$name" "$pid"
   fi
 done
+
+# Stray sweep: worker-1/reviewer are the only two instanceIds queue-watchdog's own
+# dead-process-check.js will restart on its own initiative (see restartTargetFor there --
+# 'worker-*' -> ornith-worker.sh, 'reviewer' -> review-runner.sh; queue-watchdog never
+# restarts itself). This creates a real race against the pidfile-based stop above: this
+# script SIGTERMs queue-watchdog and immediately `rm -f`s every pidfile (line ~74 above,
+# before waiting for any exit), but a watchdog tick already in flight at that exact moment
+# -- it independently decided a moment earlier that worker-1 or reviewer looked dead and is
+# mid-way through spawning a replacement -- finishes that spawn anyway (its own SIGTERM
+# trap only cuts in when it next reaches the top of its loop), writing a brand-new pidfile
+# into the now-just-emptied pid dir. That new process is never in this script's own
+# tracked `pids` array (built from pidfiles that existed when THIS script started), so the
+# wait/force-kill loop above never sees it -- a fully "stopped" pipeline with a live worker
+# still silently claiming tasks. Confirmed live 2026-08-16, twice in one session: a stray
+# ornith-worker.sh worker-1, reparented to systemd --user, still running minutes after this
+# script reported everything exited cleanly. See the matching brain-dump entry ("Stop
+# pipeline currently does exactly that but I keep seeing workers starting up after the
+# fact") -- marked resolved earlier without the root cause ever being captured; this is it.
+#
+# Fix: sweep by COMMAND PATTERN, not pidfile, for exactly the two restart-eligible
+# scripts, and kill anything matching that this script didn't already account for.
+stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh' 2>/dev/null || true)"
+for stray_pid in $stray_pids; do
+  already_handled=false
+  for pid in "${pids[@]}"; do
+    [[ "$stray_pid" == "$pid" ]] && already_handled=true && break
+  done
+  "$already_handled" && continue
+  kill -KILL "$stray_pid" 2>/dev/null && \
+    printf '[stop] killed stray daemon (pid %s, not tracked by any pidfile -- see this script'"'"'s stray-sweep comment)\n' "$stray_pid"
+done
