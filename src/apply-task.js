@@ -188,6 +188,27 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       };
     }
 
+    // Same awaiting-confirm gate as the delete-mode one above, for a different reason:
+    // adhoc's agentic implement pass (adhoc-agentic-draft.js, Brain Dump #67) has real
+    // Read/Grep/Glob/Edit/Write/Bash access and produces a real, working diff -- a
+    // meaningfully bigger consequence than the blind JSON-diff guesser adhoc used before,
+    // which usually failed to parse and rarely did anything real. Confirmed live
+    // 2026-08-17 testing this exact feature: apply-task.sh applies EVERYTHING sitting in
+    // queue/approved/ unconditionally -- the three-tier approval-mode machinery in
+    // config.js/task-sources.js is only ever consumed by the unported Windows
+    // apply-runner.ps1, not this deployment's actual bash driver -- so without an explicit
+    // gate here, a real agentic code change lands and pushes with no human click at all.
+    // Only fires when there's an actual diff to land -- the no-changes-needed outcome
+    // (applyAdhocDiff's own {skipped} branch, checked below) never touches git either way,
+    // so it doesn't need this same checkpoint.
+    if (resolveSourceName(task) === 'adhoc' && (task.rawDiff || '').trim() && !task.adhocApplyConfirmedAt) {
+      return {
+        succeeded: false,
+        needsConfirmation: true,
+        reason: 'real agentic code diff ready to apply -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
+      };
+    }
+
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
     // then write the artifact, so the change lands on the new branch, never on main.
     gitRunner.fetchMain();

@@ -945,13 +945,21 @@ def api_task_archive(state, task_id):
 @app.route("/api/task/awaiting-confirm/<task_id>/confirm", methods=["POST"])
 def api_task_confirm_delete(task_id):
     """The other half of the awaiting-confirm gate (src/apply-task.js): a human explicitly
-    confirming a delete-containing Group B batch, moving it from queue/awaiting-confirm/
-    back into queue/approved/ so the next apply-task.sh pass re-runs it for real. Stamps
-    deleteConfirmedAt -- apply-task.js's gate checks for its PRESENCE (not its value) to
-    let this exact task through without holding it again, the same 'ran once, don't
-    re-trigger' idea as promotedAt/lastReviewedAt elsewhere in this codebase. Denying
-    instead of confirming is just the existing generic archive action above (state=
-    'awaiting-confirm') -- no separate deny endpoint needed."""
+    confirming a held task, moving it from queue/awaiting-confirm/ back into
+    queue/approved/ so the next apply-task.sh pass re-runs it for real. Two DIFFERENT
+    gates route here and are both satisfied by one click -- stamping a field the held
+    task doesn't need is harmless, so one endpoint covers both rather than needing the
+    dashboard to know which gate held a given task:
+      - deleteConfirmedAt: a delete-containing Group B batch (original gate).
+      - adhocApplyConfirmedAt: an adhoc task with a real, agentic-drafted code diff ready
+        to land (Brain Dump #67, 2026-08-17) -- the "require a human Apply click" gate
+        the agentic implement path needs precisely because it's real Bash/Edit/Write
+        access, not the earlier blind JSON-diff guesser.
+    apply-task.js's own gates check each field's PRESENCE (not its value) to let a task
+    through without holding it again, the same 'ran once, don't re-trigger' idea as
+    promotedAt/lastReviewedAt elsewhere in this codebase. Denying instead of confirming
+    is just the existing generic archive action above (state='awaiting-confirm') -- no
+    separate deny endpoint needed."""
     qdir = queue_dir()
     if not qdir:
         abort(404)
@@ -960,7 +968,9 @@ def api_task_confirm_delete(task_id):
     if not data:
         abort(404)
 
-    data["deleteConfirmedAt"] = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data["deleteConfirmedAt"] = now_iso
+    data["adhocApplyConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)
