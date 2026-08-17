@@ -522,6 +522,21 @@ const queueLoadedCount = {};
 const queueHasMore = {};
 let queueLoadInFlight = false;
 
+// Task-type filter (Job Status > Done, 2026-08-17: "Done is getting huge, need to
+// filter by task type"). Per-state so switching tabs doesn't carry a filter over to an
+// unrelated list; '' means unfiltered. Options come from /api/job-types (same source
+// catalog the Job List tab's own rows are built from) fetched once and cached module-
+// scope -- it barely changes, and re-fetching on every 5s poll would be wasteful for a
+// dropdown that just needs the name list.
+const queueSourceFilter = {};
+let allSourceNamesPromise = null;
+function allSourceNames() {
+  if (!allSourceNamesPromise) {
+    allSourceNamesPromise = fetchJson('/api/job-types').then((jobTypes) => jobTypes.map((j) => j.name).sort());
+  }
+  return allSourceNamesPromise;
+}
+
 window.addEventListener('scroll', () => {
   if (!QUEUE_STATE_TABS.includes(activeTab)) return;
   if (!queueHasMore[activeTab] || queueLoadInFlight) return;
@@ -530,12 +545,27 @@ window.addEventListener('scroll', () => {
   renderQueueTab(activeTab);
 });
 
+function wireQueueSourceFilter(state) {
+  const select = document.getElementById('queue-source-filter');
+  if (!select) return;
+  select.onchange = () => {
+    queueSourceFilter[state] = select.value;
+    // A new filter means a new result set -- start back at page 1, same reasoning
+    // scroll-triggered pagination already resets per-state, not just appends onto
+    // whatever page depth the PREVIOUS filter had scrolled to.
+    queueLoadedCount[state] = QUEUE_PAGE_SIZE;
+    renderQueueTab(state);
+  };
+}
+
 async function renderQueueTab(state) {
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
+  const sourceFilter = queueSourceFilter[state] || '';
+  const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '';
   let tasks, total;
   try {
-    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0`);
+    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0${filterQS}`);
     tasks = resp.items;
     total = resp.total;
   } finally {
@@ -543,7 +573,18 @@ async function renderQueueTab(state) {
   }
   queueHasMore[state] = queueLoadedCount[state] < total;
   const main = document.getElementById('main');
-  if (tasks.length === 0) { main.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
+
+  const sourceNames = await allSourceNames();
+  const filterOptionsHtml = ['<option value="">All task types</option>']
+    .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
+    .join('');
+  const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label></div>`;
+
+  if (tasks.length === 0) {
+    main.innerHTML = filterHtml + `<div class="empty">${sourceFilter ? `No "${escapeHtml(sourceFilter)}" tasks here.` : 'Nothing here.'}</div>`;
+    wireQueueSourceFilter(state);
+    return;
+  }
   const showArchiveRequeue = state === 'blocked' || state === 'done';
   // Archive alone (no generic Requeue -- that moves to pending/, wrong for an
   // adhoc-domain task; resolving happens via the detail modal's own picker instead, see
@@ -604,7 +645,8 @@ async function renderQueueTab(state) {
   const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
   const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
     + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path (or proceed with no prefetch) and send it to drafting.</div>' : '');
-  main.innerHTML = `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
+  main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
+  wireQueueSourceFilter(state);
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
   });
@@ -1277,11 +1319,11 @@ async function enterProjectTab() {
           <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
           Enable Apply Runner (writes/commits changes)
         </label>
-        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
           <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
-          Push approved commits to remote
+          Return to main after each apply (unchecked: stay on the applied branch)
         </label>
-        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab.</span>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
       </div>
       <div id="browser-panel" class="browser-panel" style="display:none"></div>
       <div id="pipeline-panel" class="worker-card"></div>
@@ -1344,7 +1386,7 @@ async function refreshPipelineStatus() {
   }
 
   if (status.running) {
-    const applyLabel = status.includeApply ? (status.skipPush ? 'Apply Runner on, no push' : 'Apply Runner on, pushing') : 'Apply Runner off';
+    const applyLabel = status.includeApply ? (status.skipPush ? 'Apply Runner on, pushing (stays on branch)' : 'Apply Runner on, pushing') : 'Apply Runner off';
     panel.innerHTML = `
       <div class="row">
         <span>Live pipeline running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong> (${escapeHtml(applyLabel)})</span>

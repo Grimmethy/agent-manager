@@ -55,6 +55,7 @@ function createRealGitRunner(repoRoot) {
     return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
   }
   return {
+    mainBranch,
     fetchMain: () => run(['fetch', 'origin', mainBranch]),
     // Auto-stash before the hard reset instead of silently destroying uncommitted work --
     // this exact `git reset --hard` wiped real, unrecoverable work TWICE in one session
@@ -80,6 +81,14 @@ function createRealGitRunner(repoRoot) {
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
+    // Pushes the main branch directly -- distinct from push(branchName) above, which
+    // pushes a throwaway agent/<id> branch. Used by apply-task.js's direct-to-main path
+    // for domains whose apply is a low-risk, additive-only doc append (arch_discovery,
+    // arch_import candidate lists) rather than real application code: those don't need
+    // per-task branch isolation, and resetToMain()'s hard reset to origin/<mainBranch>
+    // would otherwise silently destroy an un-pushed local commit on the very next apply
+    // -- confirmed live 2026-08-16, see apply-task.js's own comment on this path.
+    pushMain: () => run(['push', '-u', 'origin', mainBranch]),
   };
 }
 
@@ -101,6 +110,7 @@ function createFakeGitRunner(opts = {}) {
   }
   return {
     calls,
+    mainBranch: opts.mainBranch || 'main',
     fetchMain: () => record('fetchMain'),
     resetToMain: () => record('resetToMain'),
     createBranch: (name) => record('createBranch', name),
@@ -109,6 +119,7 @@ function createFakeGitRunner(opts = {}) {
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
     push: (branchName) => record('push', branchName),
+    pushMain: () => record('pushMain'),
   };
 }
 
