@@ -188,6 +188,18 @@ let projectStatusInterval = null;
 // Pipeline" so a stuck daemon can be killed without waiting out the grace period).
 // Reset to false whenever the pipeline is confirmed not running.
 let stopRequested = false;
+// Set the moment startPipeline() is clicked, cleared once the pipeline is actually
+// confirmed running (or the start attempt fails). Without this, refreshPipelineStatus()
+// has no way to tell "not running yet because daemons are still spinning up" apart from
+// "not running because nothing was asked to start" -- it would flip the button straight
+// back to a fully bright, enabled "Start Pipeline" the moment startPipeline()'s own
+// disabled/"Starting..." state got overwritten by the next status poll, then to the red
+// Stop button a moment later once daemons actually report running. Confirmed live
+// 2026-08-17 (brain-dump entry: "it darkens briefly then goes back to bright blue for a
+// moment before shifting to the red pipeline stop button... I'd prefer it stay the
+// darker blue while waiting"). This flag lets the button stay in its disabled/loading
+// look for that whole gap instead of visibly bouncing through the wrong state twice.
+let pipelineStarting = false;
 let projectHistory = [];
 
 // Brain Dump tab state -- same "own render lifecycle, not the generic 5s cycle" reasoning
@@ -1677,10 +1689,19 @@ async function refreshPipelineStatus() {
     document.querySelector('.path-row').appendChild(startBtn);
   }
   if (status.running) {
+    pipelineStarting = false; // confirmed running -- past the starting gap this flag exists to bridge
     startBtn.className = 'danger';
     startBtn.disabled = false;
     startBtn.textContent = stopRequested ? 'Force Stop Pipeline' : 'Stop Pipeline';
     startBtn.onclick = stopRequested ? forceStopPipeline : stopPipeline;
+  } else if (pipelineStarting) {
+    // Daemons are still spinning up between the /pipeline/start call returning and this
+    // status poll actually seeing status.running -- stay in the same disabled/"Starting..."
+    // look startPipeline() itself set, rather than snapping back to a fully bright,
+    // clickable "Start Pipeline" for one poll cycle. See pipelineStarting's own comment.
+    startBtn.className = 'action';
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting...';
   } else {
     startBtn.className = 'action';
     startBtn.textContent = 'Start Pipeline';
@@ -1694,6 +1715,7 @@ async function startPipeline() {
   const btn = document.getElementById('start-pipeline-btn');
   btn.disabled = true;
   btn.textContent = 'Starting...';
+  pipelineStarting = true;
   try {
     const res = await fetch('/api/pipeline/start', {
       method: 'POST',
@@ -1703,6 +1725,7 @@ async function startPipeline() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.reason || data.description || res.statusText);
   } catch (e) {
+    pipelineStarting = false; // start attempt itself failed -- nothing to bridge to, let the next render fall back to plain "Start Pipeline"
     alert('Could not start pipeline: ' + e.message);
   }
   await loadProjectHistory();
