@@ -1538,6 +1538,21 @@ if (require.main === module) {
   // on a fresh attempt (a human just discussed one), same bounded-arrival argument that
   // justifies brain_dump_sort's exemption, so this can't create the unbounded-pileup
   // problem the throttle exists to prevent.
+  //
+  // MUST also check whether a path-prefetch-resolve task for this held item is already
+  // in flight (same resolveId/taskIdExistsInQueue check nextPathPrefetchResolveTask()
+  // itself uses) -- confirmed live 2026-08-17: without this, the exemption stays open for
+  // the entire window between "resolve task queued" and "resolve task actually applied"
+  // (suggestionAttempted only flips once applyPathPrefetchResolve() runs, not merely once
+  // the task is queued). Every tick in that window re-opens the FULL getNextTask() ladder;
+  // nextPathPrefetchResolveTask() itself correctly returns null (nothing new to add, it
+  // already queued one), so the ladder falls all the way through to arch_discovery/
+  // arch_import (priority 79/80) -- which, unlike path_prefetch_resolve, always has more
+  // candidates to give from a large scouted repo. Result: pending/ kept receiving a fresh
+  // arch_import task roughly every tick, completely defeating the "don't add more while a
+  // backlog exists" throttle, while the 144+ item backlog it was meant to protect never
+  // shrank -- two real held tasks stuck for hours were enough to flood the queue
+  // indefinitely with unrelated low-priority work.
   const hasHeldClarificationWaiting = (() => {
     const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
     let files;
@@ -1549,8 +1564,12 @@ if (require.main === module) {
     return files.some((f) => {
       try {
         const held = JSON.parse(fs.readFileSync(path.join(heldDir, f), 'utf8'));
-        return held && held.needsClarification
-          && !held.needsClarification.suggested && !held.needsClarification.suggestionAttempted;
+        if (!held || !held.needsClarification) return false;
+        if (held.needsClarification.suggested || held.needsClarification.suggestionAttempted) return false;
+        const heldId = held.id || f.replace(/\.json$/, '');
+        const attempt = held.needsClarification.attempt || 1;
+        const resolveId = attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`;
+        return !taskIdExistsInQueue(resolveId);
       } catch {
         return false;
       }
