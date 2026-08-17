@@ -20,8 +20,8 @@ const MODEL = process.env.ORNITH_MODEL || 'ornith';
 // must share one model tier).
 const KEEP_ALIVE = process.env.ORNITH_KEEP_ALIVE || '30m';
 
-function detectDegenerate(text) {
-  if (!text || text.trim().length === 0) return 'empty';
+function detectDegenerate(text, { allowEmpty = false } = {}) {
+  if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
   // Repeated-character garbage (e.g. a literal run of "000000..." was observed for 20
   // straight calls in one documented overnight run).
@@ -74,11 +74,22 @@ const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
 // Calls Ornith once, retrying up to maxRetries times if the degenerate-output detector
 // fires — per the doc, degeneracy is usually a transient inference-state glitch that
 // self-heals on a later call with identical input, not a stable property of the prompt.
+//
+// opts.allowEmpty: several prompt templates (archDiscoveryImplementPrompt,
+// deepDiveImplementPrompt, archImportImplementPrompt, projectSearchImplementPrompt --
+// see prompts.js) explicitly instruct Ornith to "output the empty string and nothing
+// else" when there is genuinely nothing to report, rather than force a fabricated
+// candidate. Without this flag, detectDegenerate's 'empty' check can't tell that apart
+// from a real empty-output failure, so a correct "nothing applies here" response burned
+// 3 attempts (all correctly empty) before permanently blocking the task with
+// "Implement pass degenerate: empty" -- confirmed live 2026-08-16: 64 of 181 blocked
+// tasks, the single largest group in queue/blocked/, were exactly this -- Ornith
+// following its own instructions, not a model or resource problem.
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const result = await callOnce(opts);
-    const degenerate = detectDegenerate(result.response);
+    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
   }

@@ -35,10 +35,12 @@
 // apply-task.js leaves file-moving to its own caller.
 
 const fs = require('fs');
-const { call } = require('./ornith-client.js');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { runSearches } = require('./project-search-fetch.js');
+const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
+const { appendHistoryEvent } = require('./task-history.js');
+const { providerFor, labelFor } = require('./model-provider.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -49,11 +51,20 @@ function writeTaskJson(taskPath, task) {
  * can call it directly with a fake ornithCall.
  * @param {object} task - The parsed task record (mutated in place with pass results).
  * @param {object} [deps]
- * @param {function} [deps.ornithCall] - Defaults to ornith-client.js's call().
+ * @param {function} [deps.ornithCall] - Defaults to model-provider.js's per-task-source
+ *   pick (ornith-client.js's call() unless task.source is listed in
+ *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
-async function draftTask(task, { ornithCall = call, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall } = {}) {
+async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall } = {}) {
+  // Resolved here rather than as a static default param: the right backend depends on
+  // task.source, which isn't known until the task object itself is in hand. Explicit
+  // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
+  // production code leaves (ornith-draft.js's own main() calls draftTask(task) with no
+  // second argument at all).
+  const resolvedOrnithCall = ornithCall || providerFor(task.source).call;
   try {
+    appendHistoryEvent(task, 'draft-started', task.ornithRejectCount ? `retry ${task.ornithRejectCount}` : undefined);
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact
     // implementResponse -- skips plan+implement entirely, straight to critique. Matches
@@ -77,15 +88,18 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await ornithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400 });
+      planResult = await resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400 });
       if (planResult.degenerate) {
+        const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
+        appendHistoryEvent(task, 'blocked', blockedReason);
         return {
           succeeded: true,
           blocked: true,
-          blockedReason: `Plan pass degenerate: ${planResult.degenerate}`,
+          blockedReason,
         };
       }
       task.planResponse = planResult.response;
+      appendHistoryEvent(task, 'plan-done', `${planResult.attempts} attempt(s), ${task.planResponse.length} chars`);
 
       // project_search's plan pass proposes search queries only (Ornith has no network
       // access); the HARNESS runs them here, between plan and implement, and hands real
@@ -106,6 +120,41 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
           }
         }
         task.promptContext.searchResults = searchResults;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${searchResults.length} result(s)`);
+      }
+
+      // arch_import's plan pass proposes search terms for agent-manager's OWN repo (same
+      // two-call shape as project_search above, grep instead of an HTTP API -- see
+      // arch-import-fetch.js and archImportImplementPrompt in prompts.js), but this branch
+      // was never ported here (see this file's header: arch_import's extra pass was
+      // "deliberately NOT ported ... since neither domain is wired up outside the Windows
+      // path yet"), even though task-sources.js keeps generating real arch_import tasks
+      // that flow through this same generic pending/ pipeline regardless. Without it,
+      // task.promptContext.harnessHits/harnessFiles stayed permanently undefined, so
+      // archImportImplementPrompt's hits.length>0 branch was unreachable for every single
+      // arch_import task -- confirmed live 2026-08-16: 44 of the arch_import tasks in
+      // queue/blocked/, every one of them with harnessHits.length===0, either correctly
+      // (but uselessly) reporting "nothing found" or -- far more often -- fabricating
+      // plausible-looking file paths/imports the fact-check then caught as non-existent,
+      // because implement was never given any real grounding to work from.
+      if (task.source === 'arch_import') {
+        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+        let harnessHits = [];
+        let harnessFiles = [];
+        if (queries.length > 0) {
+          try {
+            const result = archImportFetch(queries);
+            harnessHits = result.hits || [];
+            harnessFiles = result.files || [];
+          } catch (e) {
+            // Non-fatal -- implement proceeds with no hits (its own prompt already handles
+            // an empty hits list: "(no matches -- the searches found nothing ...)"), same
+            // try/catch treatment project_search's branch above gives its own fetch call.
+          }
+        }
+        task.promptContext.harnessHits = harnessHits;
+        task.promptContext.harnessFiles = harnessFiles;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
       const implPrompt = buildImplementPrompt(task, task.planResponse);
@@ -167,7 +216,13 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
       // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
       // output budget plus a fixed margin for the thinking trace.
       const implNumCtx = Math.min(32768, Math.max(8192, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
-      const implResult = await ornithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx });
+      // These four sources' implement prompts explicitly tell Ornith to output the empty
+      // string when nothing genuinely applies (see prompts.js) -- an empty response from
+      // them is a valid, intended answer, not a failed call, so the degenerate-output
+      // detector's 'empty' check must not fire for them (see ornith-client.js's call()
+      // comment for the live-confirmed backlog this caused).
+      const allowEmptyImplement = ['arch_discovery', 'deep_dive', 'arch_import', 'project_search'].includes(task.source);
+      const implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement });
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
       // Models tab) and stamps task.abCallId so a later outcome (review verdict, watchdog
@@ -178,26 +233,34 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
       // AND this instrumentation itself had never been ported here regardless.
       task.abCallId = recordModelCall({
         taskId: task.id,
-        model: process.env.ORNITH_MODEL || 'ornith',
+        // Reflects whichever backend actually served this call -- was hardcoded
+        // 'ornith' from before model-provider.js's per-task-source routing existed,
+        // which would have silently mislabeled every Claude-served call as Ornith in
+        // model-stats.db (the Models tab's own data source) the moment that routing
+        // was used for anything.
+        model: labelFor(task.source),
         startedAt: implStartedAt,
         latencyMs: Date.now() - implStartMs,
         result: implResult,
       });
 
       if (implResult.degenerate) {
+        const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
+        appendHistoryEvent(task, 'blocked', blockedReason);
         return {
           succeeded: true,
           blocked: true,
-          blockedReason: `Implement pass degenerate: ${implResult.degenerate}`,
+          blockedReason,
         };
       }
       task.implementResponse = implResult.response;
+      appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
     }
 
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
     const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await ornithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900 });
+    const critiqueResult = await resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900 });
 
     if (critiqueResult.degenerate) {
       task.critiqueOutcome = 'critique-degenerate';
@@ -206,7 +269,7 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
     } else {
       task.critiqueOutcome = 'issues-flagged';
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await ornithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400 });
+      const reviseResult = await resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400 });
       if (!reviseResult.degenerate) {
         task.implementResponse = reviseResult.response;
         task.revisionApplied = true;
@@ -214,9 +277,10 @@ async function draftTask(task, { ornithCall = call, projectSearchFetch = runSear
       // Revision came back degenerate: bounded to one attempt, leave original draft
       // intact rather than lose a working draft to a bad revision call.
     }
+    appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 
     task.status = 'needs-review';
-    task.history = (task.history || []).concat([{ status: 'needs-review', at: new Date().toISOString() }]);
+    appendHistoryEvent(task, 'needs-review');
 
     return { succeeded: true, blocked: false };
   } catch (e) {

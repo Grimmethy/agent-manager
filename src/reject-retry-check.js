@@ -28,6 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 const MAX_ORNITH_REJECT_RETRIES = 2;
 
@@ -86,6 +87,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       const retryCount = Number(task.ornithRejectCount) || 0;
       if (retryCount >= MAX_ORNITH_REJECT_RETRIES) {
         stampDeepDiveExhausted(task, deepDiveCoveragePath);
+        // Persist the exhaustion itself onto the task -- previously this branch never
+        // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
+        // hitting the retry cap carried no record that retries were ever attempted or
+        // exhausted; only ornithRejectCount (no timestamp) hinted at it.
+        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_ORNITH_REJECT_RETRIES} retries used`);
+        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
         summary.exhausted++;
         continue;
       }
@@ -96,6 +103,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       task.ornithRejectCount = retryCount + 1;
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
+      appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
 
       const newPath = path.join(pendingDir, name);
       fs.mkdirSync(pendingDir, { recursive: true });

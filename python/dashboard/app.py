@@ -100,6 +100,199 @@ def record_project_used(path: str):
         pass
 
 
+# Live dashboard settings a user changes by clicking in the UI, not by editing
+# agent-manager.env -- that file only takes effect on the next pipeline restart (every
+# daemon sources it once at launch, see stop.sh/launch.sh), which is the wrong shape for
+# "pick a model for the conversation I'm about to start." Same "small JSON file next to
+# the other small state files" convention as PROJECT_HISTORY_PATH above, not a database,
+# since this is a handful of scalar preferences.
+DASHBOARD_SETTINGS_PATH = PACKAGE_ROOT / "dashboard-settings.json"
+CLAUDE_MODEL_CHOICES = ["sonnet", "opus", "haiku", "fable"]
+CLAUDE_EFFORT_CHOICES = ["low", "medium", "high", "xhigh", "max"]
+
+
+def read_dashboard_settings() -> dict:
+    if not DASHBOARD_SETTINGS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(DASHBOARD_SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_dashboard_settings(patch: dict):
+    """Merges `patch` into the existing settings file rather than overwriting it --
+    other, unrelated settings (present or future) must survive a write to just the
+    Claude defaults, same reasoning server-managed settings merging documents for its
+    own env-block precedence elsewhere in this codebase."""
+    current = read_dashboard_settings()
+    current.update(patch)
+    DASHBOARD_SETTINGS_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+
+def claude_defaults() -> dict:
+    settings = read_dashboard_settings()
+    return {
+        "model": settings.get("claudeDefaultModel") or "sonnet",
+        "effort": settings.get("claudeDefaultEffort") or "high",
+    }
+
+
+def _discuss_provider_args(body: dict = None):
+    """Reads {provider, model, effort} for a discuss/start call: per-call override from
+    the request body when the toggle in the UI picked one, else the Models tab's saved
+    Claude defaults (only consulted when provider is actually "claude" -- a local-model
+    call has no use for them). Centralized here so all three discuss/start routes
+    (brain-dump, needs-clarification, second-brain) apply the exact same fallback."""
+    if body is None:
+        body = request.get_json(silent=True) or {}
+    provider = (body.get("provider") or "local").strip().lower()
+    if provider not in ("local", "claude"):
+        provider = "local"
+    model = body.get("model")
+    effort = body.get("effort")
+    if provider == "claude":
+        defaults = claude_defaults()
+        model = model or defaults["model"]
+        effort = effort or defaults["effort"]
+    else:
+        model = None
+        effort = None
+    return provider, model, effort
+
+
+def _call_discuss(fn, *args, **kwargs):
+    """Runs a discuss_sessions.py call (start_session/send_message/end_session) and
+    turns claude_client.ClaudeClientError into a clean 4xx/5xx JSON response instead of
+    an unhandled-exception 500 -- confirmed live: a Claude-provider discuss/start with
+    CLAUDE_CODE_OAUTH_TOKEN unset previously surfaced as Flask's generic "internal
+    error" page with no indication of what actually went wrong or how to fix it."""
+    from claude_client import ClaudeClientError
+    try:
+        return fn(*args, **kwargs)
+    except ClaudeClientError as e:
+        abort(502, description=str(e))
+
+
+def is_claude_token_configured() -> bool:
+    """Checks both the current process env (set by _start_pipeline-style mutation, or by
+    however this dashboard itself was launched) and agent-manager.env on disk (set by
+    api_set_claude_token below, or by hand) -- either one is enough for claude-client.js
+    to actually pick it up at the next daemon launch. Never returns the token itself,
+    only whether one is present -- see api_set_claude_token's own header for why."""
+    return bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or read_env_file(ENV_FILE_PATH).get("CLAUDE_CODE_OAUTH_TOKEN"))
+
+
+@app.route("/api/settings/claude", methods=["GET"])
+def api_get_claude_settings():
+    return jsonify({
+        **claude_defaults(),
+        "modelChoices": CLAUDE_MODEL_CHOICES,
+        "effortChoices": CLAUDE_EFFORT_CHOICES,
+        "tokenConfigured": is_claude_token_configured(),
+    })
+
+
+@app.route("/api/settings/claude-token", methods=["POST"])
+def api_set_claude_token():
+    """Write-only, deliberately -- CLAUDE_CODE_OAUTH_TOKEN is a real, ~1-year-lived
+    credential for the user's own Claude subscription (see claude-client.js's own header
+    for the billing-safety reasoning it exists for). This endpoint accepts it and never
+    echoes it back in any response; api_get_claude_settings above reports only whether
+    one is configured, never its value. Same "loopback-only dashboard, plaintext POST is
+    fine" trust boundary as every other write endpoint here (app.run(host="127.0.0.1")).
+
+    Writes to agent-manager.env (same helper /api/pipeline/start already uses for
+    AGENT_MANAGER_REPO_ROOT) so it survives every future restart, not just this one --
+    then mutates os.environ so THIS dashboard process's own env reflects it immediately
+    (same reasoning _start_pipeline's own os.environ mutation comment gives for
+    AGENT_MANAGER_REPO_ROOT), and restarts the pipeline if one is currently configured
+    so the change takes effect right away instead of silently waiting for some future
+    manual restart the user has no reason to think is still needed."""
+    body = request.get_json(silent=True) or {}
+    raw_token = body.get("token") or ""
+    # Strip ALL whitespace, not just leading/trailing -- a real token
+    # (sk-ant-oat01-...) never legitimately contains any. Confirmed live 2026-08-16: a
+    # token pasted from a terminal that had wrapped it across two lines picked up an
+    # extra space or two at the wrap point, producing a value that looked plausible
+    # (right length, right prefix) but failed Claude's own auth check with a 401 "OAuth
+    # access token is invalid" -- silent and confusing from the user's side, since
+    # nothing here validated the shape before saving it. Removing internal whitespace
+    # rather than rejecting it: the corruption is common enough (long tokens + wrapped
+    # terminals) that silently fixing it is more useful than making the user notice,
+    # copy again, and hope it doesn't wrap the same way a second time.
+    token = re.sub(r"\s+", "", raw_token)
+    if not token:
+        abort(400, description="token is required")
+    if not token.startswith("sk-ant-oat"):
+        abort(400, description="that doesn't look like a Claude Code OAuth token (expected it to start with \"sk-ant-oat\") -- double check what was pasted")
+    write_env_value(ENV_FILE_PATH, "CLAUDE_CODE_OAUTH_TOKEN", token)
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({"saved": True, "restarted": restarted})
+
+
+@app.route("/api/settings/claude-token", methods=["DELETE"])
+def api_clear_claude_token():
+    """Removes the token from agent-manager.env and this process's own env -- e.g. to
+    revoke a compromised token or switch to a different subscription account. Does NOT
+    restart the pipeline: an already-running claude-client.js call in flight should be
+    allowed to finish rather than be killed mid-call by a credential removal, and the
+    next call after this will fail its own auth guard cleanly (see that module's header)
+    rather than silently keep using a token that's supposed to be gone."""
+    write_env_value(ENV_FILE_PATH, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    return jsonify({"cleared": True})
+
+
+@app.route("/api/settings/claude", methods=["POST"])
+def api_set_claude_settings():
+    body = request.get_json(silent=True) or {}
+    patch = {}
+    model = (body.get("model") or "").strip()
+    effort = (body.get("effort") or "").strip()
+    if model:
+        if model not in CLAUDE_MODEL_CHOICES:
+            abort(400, description=f"model must be one of {CLAUDE_MODEL_CHOICES}")
+        patch["claudeDefaultModel"] = model
+    if effort:
+        if effort not in CLAUDE_EFFORT_CHOICES:
+            abort(400, description=f"effort must be one of {CLAUDE_EFFORT_CHOICES}")
+        patch["claudeDefaultEffort"] = effort
+    if patch:
+        write_dashboard_settings(patch)
+    return jsonify(claude_defaults())
+
+
+@app.route("/api/claude-usage", methods=["GET"])
+def api_claude_usage():
+    """Wraps budget-monitor.js's isBudgetHealthy() -- see that module's own header for
+    exactly what signal this is (and isn't): Claude Code itself only ever tells you a
+    rate limit was hit, reactively, via an error event in its local session transcripts
+    -- there's no live "you've used N% of your 5-hour window" API to poll. What this
+    surfaces is real: the last actual rate-limit hit and its reset time (if any), plus
+    rolling 5h/7d token and call counts as a volume trend -- not a precise quota gauge.
+    Scans ~/.claude/projects, so headless calls this pipeline makes via claude-client.js
+    show up in the same rolling counts as any interactive `claude` session on this
+    machine, since both write to the same transcript directory."""
+    script_path = PACKAGE_ROOT / "budget-monitor.js"
+    try:
+        result = subprocess.run(["node", str(script_path)], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return jsonify({"available": False, "reason": "budget-monitor.js timed out"}), 504
+    if result.returncode != 0:
+        return jsonify({"available": False, "reason": (result.stderr or "budget-monitor.js exited non-zero").strip()[:500]})
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return jsonify({"available": False, "reason": "budget-monitor.js returned non-JSON output"})
+    return jsonify({"available": True, **data})
+
+
 PROJECT_REGISTRY_PATH = PACKAGE_ROOT / "projects.json"
 
 
@@ -573,6 +766,41 @@ def api_models():
             "errorCount": error_count or 0,
         })
     return jsonify(results)
+
+
+@app.route("/api/models/usage")
+def api_models_usage():
+    """Per-model call volume across EVERY stage, not just 'implement' -- api_models()
+    above is specifically about drafting-pass quality (approved/rejected against a real
+    review verdict), which an interactive Discuss/Grill session has no equivalent of
+    (there's no reviewer voting on a conversation). This is the simpler "how much did I
+    actually use each model" view claude_client.py's/model_stats_client.py's Discuss-
+    session recording feeds into, covering both providers on equal footing -- before
+    those existed, only the Node pipeline's own implement-pass calls were tracked at
+    all, so interactive sessions (on ANY model) were invisible here regardless."""
+    db_path = model_stats_db_path()
+    if not db_path or not db_path.is_file():
+        return jsonify([])
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("""
+            SELECT model, stage,
+                   COUNT(*) AS call_count,
+                   AVG(latency_ms) AS avg_latency_ms,
+                   MAX(started_at) AS last_used_at
+            FROM model_calls
+            GROUP BY model, stage
+            ORDER BY model, stage
+        """).fetchall()
+    finally:
+        conn.close()
+
+    return jsonify([
+        {"model": model, "stage": stage, "callCount": call_count,
+         "avgLatencyMs": avg_latency_ms, "lastUsedAt": last_used_at}
+        for model, stage, call_count, avg_latency_ms, last_used_at in rows
+    ])
 
 
 @app.route("/api/queue/<state>")
@@ -1159,7 +1387,9 @@ def api_brain_dump_discuss_start(entry_id):
     if not pipeline_dir:
         abort(500, description="no active project configured")
     from discuss_sessions import start_session
-    session = start_session(pipeline_dir, entry_id, entry["rawText"], kind="brain-dump")
+    provider, model, effort = _discuss_provider_args()
+    session = _call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump",
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
     return jsonify(session)
 
 
@@ -1195,7 +1425,9 @@ def api_needs_clarification_discuss_start(task_id):
         abort(500, description="no active project configured")
     subject_text = (held.get("promptContext") or {}).get("rawText") or held.get("title") or ""
     from discuss_sessions import start_session
-    session = start_session(pipeline_dir, task_id, subject_text, kind="needs-clarification")
+    provider, model, effort = _discuss_provider_args()
+    session = _call_discuss(start_session, pipeline_dir, task_id, subject_text, kind="needs-clarification",
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
     return jsonify(session)
 
 
@@ -1311,7 +1543,9 @@ def api_second_brain_discuss_start():
     full_path = _resolve_under_second_brain(root.resolve(), note_path)
     note_content = full_path.read_text(encoding="utf-8") if full_path.is_file() else ""
     from discuss_sessions import start_session
-    session = start_session(root, note_path, note_content, kind="second-brain")
+    provider, model, effort = _discuss_provider_args(body)
+    session = _call_discuss(start_session, root, note_path, note_content, kind="second-brain",
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
     return jsonify(session)
 
 
@@ -1356,7 +1590,7 @@ def api_discuss_message(session_id):
     if not message:
         abort(400, description="message is required")
     from discuss_sessions import send_message
-    session = send_message(storage_dir, session_id, message)
+    session = _call_discuss(send_message, storage_dir, session_id, message)
     if not session:
         abort(404)
     return jsonify(session)
@@ -1391,7 +1625,7 @@ def api_discuss_end(session_id):
     if not storage_dir:
         abort(404)
     from discuss_sessions import end_session
-    session = end_session(storage_dir, session_id)
+    session = _call_discuss(end_session, storage_dir, session_id)
     if not session:
         abort(404)
 

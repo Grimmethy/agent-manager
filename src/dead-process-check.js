@@ -24,7 +24,17 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 
 const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above ornith-client.js's 4-min REQUEST_TIMEOUT_MS per-call ceiling.
-const WORKER_ZOMBIE_THRESHOLD_SECONDS = 300; // worker-only: pid alive but heartbeat stale this long means a hung call, not a slow one.
+// worker-only: pid alive but heartbeat stale this long means a hung call, not a slow one.
+// draftTask() (ornith-draft.js) chains up to 4 sequential ornithCall()s per task -- plan,
+// implement, critique, and (if critique flags issues) revise -- each individually bounded
+// by ornith-client.js's REQUEST_TIMEOUT_MS (240s default), with no heartbeat write between
+// passes. Worst case is therefore ~4*240s=960s of legitimate, non-hung work between the
+// "working" heartbeat at claim time and the "idle" heartbeat at completion. The old 300s
+// value only covered a single call and was killing every multi-pass task mid-flight,
+// confirmed live 2026-08-16: worker-1 was SIGKILL'd and restarted by the watchdog roughly
+// every 5 minutes for hours straight, re-starting the same leftover drafting/ tasks from
+// scratch each time (no partial-pass checkpointing) and never completing one.
+const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200; // 20 min -- comfortably above the real ~960s worst-case chain, not a single call.
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
 // instanceId -> { script, args, pidfileName } -- mirrors launch.sh's own hardcoded

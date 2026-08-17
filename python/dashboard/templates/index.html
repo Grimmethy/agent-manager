@@ -62,6 +62,15 @@
   .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
   .modal .close { float: right; cursor: pointer; color: var(--muted); background: none; border: none; font-size: 18px; }
   .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
+  .task-history { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 4px; }
+  .task-history-row { font-size: 12px; padding: 3px 0; }
+  .task-history-stage { font-family: monospace; font-weight: 600; }
+  .task-history-row .meta { display: inline; }
+  .provider-toggle-claude { background: var(--accent); color: #0b1220; border-color: var(--accent); }
+  #toast { position: fixed; bottom: 20px; right: 20px; max-width: 420px; padding: 10px 16px; border-radius: 8px; font-size: 13px; line-height: 1.4; box-shadow: 0 4px 16px rgba(0,0,0,.35); z-index: 9999; opacity: 0; pointer-events: none; transform: translateY(8px); transition: opacity .15s ease, transform .15s ease; }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.toast-error { background: var(--bad); color: #fff; }
+  #toast.toast-info { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
   .path-row { display: flex; gap: 8px; margin-bottom: 12px; }
   .path-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; }
   button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
@@ -442,10 +451,206 @@ function renderBarCell(value, max, colorVar, fmt) {
   return `<div>${label}</div><div class="bar-track"><div class="bar-fill" style="width:${pct.toFixed(1)}%; background:var(--${colorVar})"></div></div>`;
 }
 
+// Populated on every renderModelsTab() call so the discuss/grill toggle buttons
+// elsewhere in this file (renderProviderToggle()) always reflect the saved default
+// without a separate fetch of their own -- Models tab is the one place this gets
+// refreshed from the server; everywhere else just reads this cache.
+let claudeSettingsCache = null;
+
+// Local/Claude toggle placed next to any button that starts a conversation (Discuss,
+// eventually Grill Me/Grill With Docs). A plain two-state button rather than a
+// dropdown -- there are only ever two choices, and a click-to-flip pill reads faster at
+// a glance than opening a select. `idAttr` must be unique per instance (one entry's
+// toggle must not flip a different entry's). Server-side, sending only {provider:
+// "claude"} with no model/effort is enough -- _discuss_provider_args() in app.py fills
+// in the Models tab's saved defaults itself, so this toggle doesn't need
+// claudeSettingsCache to be populated to work.
+//
+// providerChoices persists the flipped state across re-renders, keyed by idAttr (stable
+// across renders since callers always pass the same deterministic id for a given
+// entry/panel). Without this, the Brain Dump tab's periodic 5s refresh
+// (refreshBrainDumpEntries's setInterval) redraws every entry's card from scratch --
+// including a freshly-defaulted-to-"local" toggle -- wiping a click the user made but
+// hadn't yet acted on. Confirmed live 2026-08-16: clicking the toggle to "Claude" and
+// waiting a few seconds before clicking Discuss silently reverted it to "Local" with no
+// indication why, and no actual error had occurred -- the toggle was never wired to
+// anything that could error just by being clicked. brainDumpDiscussingId's own existing
+// "don't wipe in-progress state" guard doesn't cover this case: it's set only once a
+// discussion has actually STARTED, not from the moment the toggle is flipped.
+// Brief, auto-dismissing notification -- e.g. surfacing the real reason a Claude-
+// provider Discuss call failed (most commonly: CLAUDE_CODE_OAUTH_TOKEN isn't set yet)
+// without leaving a permanent error block sitting in the page. Reuses one DOM node
+// across calls rather than stacking multiple toasts -- a second error while one is
+// still showing replaces it and restarts the 3s timer, it doesn't queue.
+let toastHideTimer = null;
+function showToast(message, kind = 'error') {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.className = kind === 'error' ? 'toast-error' : 'toast-info';
+  // Force a reflow before adding "show" so the fade-in transition actually plays when
+  // the same node is reused back-to-back (toggling a class that's already set doesn't
+  // retrigger a CSS transition).
+  void el.offsetWidth;
+  el.classList.add('show');
+  clearTimeout(toastHideTimer);
+  toastHideTimer = setTimeout(() => { el.classList.remove('show'); }, 3000);
+}
+
+const providerChoices = {};
+
+function renderProviderToggle(idAttr) {
+  const provider = providerChoices[idAttr] || 'local';
+  const claudeClass = provider === 'claude' ? ' provider-toggle-claude' : '';
+  const label = provider === 'claude' ? 'Claude' : 'Local';
+  return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Local Ornith vs. your Claude subscription -- click to switch">${label}</button>`;
+}
+
+function wireProviderToggle(idAttr) {
+  const btn = document.getElementById(idAttr);
+  if (!btn) return;
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
+    providerChoices[idAttr] = next;
+    btn.dataset.provider = next;
+    btn.textContent = next === 'local' ? 'Local' : 'Claude';
+    btn.classList.toggle('provider-toggle-claude', next === 'claude');
+  };
+}
+
+function providerPayload(idAttr) {
+  const btn = document.getElementById(idAttr);
+  return { provider: (btn && btn.dataset.provider) || 'local' };
+}
+
+async function renderClaudeSettingsPanel() {
+  const settings = await fetchJson('/api/settings/claude');
+  claudeSettingsCache = settings;
+  const modelOpts = settings.modelChoices.map(m => `<option value="${m}" ${m === settings.model ? 'selected' : ''}>${m}</option>`).join('');
+  const effortOpts = settings.effortChoices.map(e => `<option value="${e}" ${e === settings.effort ? 'selected' : ''}>${e}</option>`).join('');
+  const tokenStatus = settings.tokenConfigured
+    ? '<span style="color:var(--ok)">Subscription token configured</span>'
+    : '<span style="color:var(--warn)">No subscription token set -- Claude toggle will fail until one is added</span>';
+  return `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Claude Subscription Defaults</div>
+      <div class="meta" style="margin-bottom:8px">Used whenever a Discuss/Grill conversation is switched to Claude via its toggle, unless that conversation picks a different model/effort itself.</div>
+      <div class="row" style="gap:8px;align-items:center">
+        <label>Model <select id="claude-default-model">${modelOpts}</select></label>
+        <label>Effort <select id="claude-default-effort">${effortOpts}</select></label>
+        <button type="button" class="action" id="claude-settings-save">Save</button>
+        <span id="claude-settings-status" class="meta"></span>
+      </div>
+      <div class="field-label" style="margin-top:14px">Subscription Token</div>
+      <div class="meta" style="margin-bottom:6px">${tokenStatus} -- generate one with <code>claude setup-token</code> (opens a browser to approve, then prints a token good for about a year). Pasted here, it's saved to <code>agent-manager.env</code> and never shown again, including to this page -- only whether one is set.</div>
+      <div class="row" style="gap:8px;align-items:center">
+        <input type="password" id="claude-token-input" placeholder="Paste token from \`claude setup-token\`" autocomplete="off" style="flex:1;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-family:monospace;font-size:12px">
+        <button type="button" class="action" id="claude-token-save">Save Token</button>
+        ${settings.tokenConfigured ? '<button type="button" class="secondary" id="claude-token-clear">Clear</button>' : ''}
+      </div>
+    </div>`;
+}
+
+function wireClaudeSettingsPanel() {
+  const btn = document.getElementById('claude-settings-save');
+  if (btn) btn.onclick = async () => {
+    const model = document.getElementById('claude-default-model').value;
+    const effort = document.getElementById('claude-default-effort').value;
+    const status = document.getElementById('claude-settings-status');
+    try {
+      claudeSettingsCache = await (await fetch('/api/settings/claude', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, effort }),
+      })).json();
+      status.textContent = 'Saved.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    } catch (e) {
+      status.textContent = 'Save failed: ' + e.message;
+    }
+  };
+
+  const tokenBtn = document.getElementById('claude-token-save');
+  if (tokenBtn) tokenBtn.onclick = async () => {
+    const input = document.getElementById('claude-token-input');
+    const token = input.value.trim();
+    if (!token) { showToast('Paste a token first.'); return; }
+    try {
+      const res = await fetch('/api/settings/claude-token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(result.description || ('HTTP ' + res.status));
+      // Wipe the field immediately rather than leaving the pasted secret sitting in a
+      // form input (and in the browser's own form-autofill history) any longer than
+      // the single click it took to save it.
+      input.value = '';
+      showToast(result.restarted ? 'Token saved -- pipeline restarted to pick it up.' : 'Token saved.', 'info');
+      renderModelsTab();
+    } catch (e) {
+      showToast('Could not save token: ' + e.message);
+    }
+  };
+
+  const clearBtn = document.getElementById('claude-token-clear');
+  if (clearBtn) clearBtn.onclick = async () => {
+    if (!confirm('Remove the saved Claude subscription token? The toggle will stop working until a new one is added.')) return;
+    try {
+      await fetch('/api/settings/claude-token', { method: 'DELETE' });
+      showToast('Token cleared.', 'info');
+      renderModelsTab();
+    } catch (e) {
+      showToast('Could not clear token: ' + e.message);
+    }
+  };
+}
+
+// budget-monitor.js's own signal, unchanged here -- see /api/claude-usage's docstring
+// for exactly what this is (a real rate-limit hit/reset history plus a rolling volume
+// trend) and isn't (a live "% of quota used" gauge -- Claude Code doesn't expose one).
+async function renderClaudeUsagePanel() {
+  let usage;
+  try {
+    usage = await fetchJson('/api/claude-usage');
+  } catch (e) {
+    return '';
+  }
+  if (!usage.available) {
+    return `<div class="grill-session" style="margin-bottom:16px"><div class="field-label">Claude Usage</div><div class="meta">Not available: ${escapeHtml(usage.reason || 'unknown')}</div></div>`;
+  }
+  const healthLabel = usage.healthy
+    ? '<span style="color:var(--ok)">healthy</span>'
+    : `<span style="color:var(--bad)">rate-limited</span>`;
+  const resetLine = usage.lastRateLimit && usage.lastRateLimit.resetsAt
+    ? `<div class="meta">Resets: ${new Date(usage.lastRateLimit.resetsAt).toLocaleString()}</div>` : '';
+  return `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Claude Usage</div>
+      <div>${healthLabel} <span class="meta">-- ${escapeHtml(usage.reason || '')}</span></div>
+      ${resetLine}
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat"><strong>${usage.rolling5h.calls}</strong>calls / last 5h</div>
+        <div class="stat"><strong>${usage.rolling5h.tokens.toLocaleString()}</strong>tokens / last 5h</div>
+        <div class="stat"><strong>${usage.rolling7d.calls}</strong>calls / last 7d</div>
+        <div class="stat"><strong>${usage.rolling7d.tokens.toLocaleString()}</strong>tokens / last 7d</div>
+      </div>
+      <div class="meta" style="margin-top:6px">Rolling volume trend, not a live quota gauge -- Claude Code only ever reports a rate-limit hit reactively, after it happens. Includes both interactive \`claude\` sessions and this pipeline's own headless calls on this machine.</div>
+    </div>`;
+}
+
 async function renderModelsTab() {
-  const models = await fetchJson('/api/models');
+  const [models, usageRows, settingsPanel, usagePanel] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+  ]);
   const main = document.getElementById('main');
-  if (models.length === 0) { main.innerHTML = '<div class="empty">No model-call stats yet -- set ORNITH_AB_MODELS to compare candidates on the implement pass.</div>'; return; }
 
   const sorted = models.slice().sort((a, b) => {
     const av = a[modelsSortKey], bv = b[modelsSortKey];
@@ -457,8 +662,8 @@ async function renderModelsTab() {
     return 0;
   });
 
-  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0));
-  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0));
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
 
   const headCells = MODELS_COLUMNS.map(col => {
     if (!col.sortable) return `<th>${col.label}</th>`;
@@ -480,7 +685,26 @@ async function renderModelsTab() {
     </tr>
   `).join('');
 
-  main.innerHTML = `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+  const implementTable = models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  const usageTableRows = usageRows.map(r => `
+    <tr>
+      <td>${escapeHtml(r.model)}</td>
+      <td>${escapeHtml(r.stage)}</td>
+      <td>${r.callCount}</td>
+      <td>${fmtNum(r.avgLatencyMs, 0)}</td>
+      <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  const usageTable = usageRows.length === 0 ? '' : `
+    <div class="field-label" style="margin-top:20px">All Calls (every stage, both providers)</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
+    <tbody>${usageTableRows}</tbody></table>`;
+
+  main.innerHTML = settingsPanel + usagePanel + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable;
+  wireClaudeSettingsPanel();
   main.querySelectorAll('th.sortable').forEach(th => {
     th.onclick = () => {
       const key = th.dataset.key;
@@ -686,6 +910,25 @@ function renderTaskDetailModal(task) {
     html += `<div class="field-label">Prefetched Paths</div><div>${task.promptContext.prefetchedPaths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
   }
   if (task.needsClarification) html += renderClarificationPicker(task);
+  // Pipeline History: task.history[] (task-history.js's appendHistoryEvent -- see that
+  // module for the schema). Was written correctly the whole time this session but never
+  // rendered anywhere in the app -- the data existed only if you went and read the raw
+  // task JSON off disk yourself, which defeats the point of a per-step timeline being a
+  // dashboard feature at all. Entries come in two shapes: older ones only ever have
+  // `status` (no `stage`, no `detail`) from before task-history.js existed -- render both
+  // so a task whose life started before this feature shipped doesn't just show a gap.
+  if (task.history && task.history.length) {
+    html += `<div class="field-label">Pipeline History</div><div class="task-history">`;
+    html += task.history.map(h => {
+      const label = h.stage || h.status || '?';
+      const when = h.at ? new Date(h.at).toLocaleString() : '';
+      const detail = h.detail || h.note || '';
+      return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(label)}</span> `
+        + `<span class="meta">${escapeHtml(when)}</span>`
+        + (detail ? `<div class="meta">${escapeHtml(detail)}</div>` : '')
+        + `</div>`;
+    }).join('') + `</div>`;
+  }
   if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
   if (task.implementResponse) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
   content.innerHTML = html;
@@ -734,7 +977,7 @@ function renderClarificationPicker(task) {
   html += `<div style="margin-top:10px"><input type="text" id="clarify-manual-path" placeholder="relative/path/to/file.ts" style="width:60%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-family:monospace;font-size:12px">`;
   html += `<button type="button" class="action" id="clarify-add-manual" style="margin-left:6px">Use This Path</button></div>`;
   html += `<div id="clarify-selected-paths" style="margin-top:8px"></div>`;
-  html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-skip-btn">Proceed Without Prefetch</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button></div>`;
+  html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-skip-btn">Proceed Without Prefetch</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button> ${renderProviderToggle('clarify-discuss-provider')}</div>`;
   html += `<div id="clarify-discuss-panel" style="margin-top:10px"></div>`;
   return html;
 }
@@ -783,12 +1026,16 @@ async function clarifyDiscussStart(taskId) {
   } catch (e) { /* best-effort check -- fall through to starting normally */ }
   if (el) el.innerHTML = '<div class="empty">Starting discussion...</div>';
   try {
-    const resp = await fetch('/api/task/needs-clarification/' + encodeURIComponent(taskId) + '/discuss/start', { method: 'POST' });
+    const resp = await fetch('/api/task/needs-clarification/' + encodeURIComponent(taskId) + '/discuss/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(providerPayload('clarify-discuss-provider')),
+    });
     const session = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
     clarifyDiscussRenderPanel(taskId, session);
   } catch (e) {
-    if (el) el.innerHTML = `<div class="empty">Could not start discussion: ${e.message}</div>`;
+    if (el) el.innerHTML = '';
+    showToast('Could not start discussion: ' + e.message);
   }
 }
 
@@ -806,7 +1053,7 @@ async function clarifyDiscussSend(taskId, sessionId, message, btn) {
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
     clarifyDiscussRenderPanel(taskId, session);
   } catch (e) {
-    alert('Could not send message: ' + e.message);
+    showToast('Could not send message: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'Send';
   }
@@ -830,7 +1077,7 @@ async function clarifyDiscussEnd(taskId, sessionId, btn) {
       }, 1200);
     }
   } catch (e) {
-    alert('Could not end discussion: ' + e.message);
+    showToast('Could not end discussion: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'End Discussion';
   }
@@ -878,6 +1125,7 @@ function wireClarificationPicker(taskId) {
   }
   const discussBtn = document.getElementById('clarify-discuss-btn');
   if (discussBtn) discussBtn.onclick = () => clarifyDiscussStart(taskId);
+  wireProviderToggle('clarify-discuss-provider');
   // Surface an existing (active or already-ended) discussion instead of leaving the
   // picker looking like nothing has been tried yet -- same "don't bury prior work"
   // reasoning as every other Discuss integration's own for-note/latest check.
@@ -1810,6 +2058,7 @@ function wireBrainDumpCardHandlers(el) {
   el.querySelectorAll('[data-discuss]').forEach((btn) => {
     btn.onclick = () => brainDumpDiscussStart(btn.dataset.discuss);
   });
+  el.querySelectorAll('[id^="bd-discuss-provider-"]').forEach((btn) => wireProviderToggle(btn.id));
 
   el.querySelectorAll('[data-discuss-send]').forEach((btn) => {
     const card = btn.closest('.bd-entry');
@@ -1850,6 +2099,10 @@ function wireBrainDumpCardHandlers(el) {
 // entry -- same "surface existing work instead of burying it" reasoning as
 // grillStartSession's own existing-session check.
 async function brainDumpDiscussStart(entryId) {
+  // Read the toggle BEFORE any re-render below -- refreshBrainDumpEntries() redraws
+  // this entry's card (including a freshly-defaulted-to-"local" toggle button), so
+  // capturing the chosen provider has to happen first or the choice is lost.
+  const providerBody = providerPayload('bd-discuss-provider-' + entryId);
   try {
     const existing = await fetchJson('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/latest');
     if (existing && existing.status === 'active') {
@@ -1869,13 +2122,16 @@ async function brainDumpDiscussStart(entryId) {
   brainDumpDiscussSession = null;
   await refreshBrainDumpEntries(true);
   try {
-    const resp = await fetch('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/start', { method: 'POST' });
+    const resp = await fetch('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(providerBody),
+    });
     const session = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
     brainDumpDiscussSession = session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
-    alert('Could not start discussion: ' + e.message);
+    showToast('Could not start discussion: ' + e.message);
     brainDumpDiscussingId = null;
     brainDumpDiscussSession = null;
     await refreshBrainDumpEntries(true);
@@ -1897,7 +2153,7 @@ async function brainDumpDiscussSend(sessionId, message, btn) {
     brainDumpDiscussSession = session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
-    alert('Could not send message: ' + e.message);
+    showToast('Could not send message: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'Send';
   }
@@ -1913,7 +2169,7 @@ async function brainDumpDiscussEnd(sessionId, btn) {
     brainDumpDiscussSession = data.session;
     await refreshBrainDumpEntries(true);
   } catch (e) {
-    alert('Could not end discussion: ' + e.message);
+    showToast('Could not end discussion: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'End Discussion';
   }
@@ -2000,6 +2256,7 @@ function renderBrainDumpCard(entry) {
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
           <button class="secondary" data-discuss="${escapeAttr(entry.id)}">Discuss</button>
+          ${renderProviderToggle('bd-discuss-provider-' + escapeAttr(entry.id))}
           <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
         </span>
@@ -2194,12 +2451,13 @@ async function loadSecondBrainFile(filePath) {
   panel.innerHTML = '<div class="empty">Loading...</div>';
   try {
     const data = await fetchJson('/api/second-brain/file?path=' + encodeURIComponent(filePath));
-    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div id="sb-task-refs"></div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button></div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
+    panel.innerHTML = `<div class="field-label">${escapeHtml(filePath)}</div><div class="note-content">${escapeHtml(data.content)}</div><div id="sb-task-refs"></div><div class="grill-controls"><button type="button" class="secondary grill-start" data-mode="grill-me">Grill Me</button> <button type="button" class="secondary grill-start" data-mode="grill-with-docs">Grill With Docs</button> <button type="button" class="secondary" id="sb-discuss-start">Discuss</button> ${renderProviderToggle('sb-discuss-provider')}</div><div id="grill-panel"></div><div id="sb-discuss-panel"></div>`;
     panel.querySelectorAll('.grill-start').forEach((btn) => {
       btn.onclick = () => grillStartSession(filePath, btn.dataset.mode);
     });
     const discussBtn = panel.querySelector('#sb-discuss-start');
     if (discussBtn) discussBtn.onclick = () => sbDiscussStart(filePath);
+    wireProviderToggle('sb-discuss-provider');
     // Linked-task status (2026-08-16): a note can carry a "Queued as adhoc task `id` in
     // **label**" cross-reference from applyBrainDumpSort -- surface its LIVE status here
     // (looked up directly from that project's own queue, even if it isn't the currently
@@ -2419,13 +2677,14 @@ async function sbDiscussStart(notePath) {
     const resp = await fetch('/api/second-brain/discuss/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notePath }),
+      body: JSON.stringify({ notePath, ...providerPayload('sb-discuss-provider') }),
     });
     const session = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
     sbDiscussRenderPanel(session);
   } catch (e) {
-    if (el) el.innerHTML = `<div class="empty">Could not start discussion: ${e.message}</div>`;
+    if (el) el.innerHTML = '';
+    showToast('Could not start discussion: ' + e.message);
   }
 }
 
@@ -2443,7 +2702,7 @@ async function sbDiscussSend(sessionId, message, btn) {
     if (!resp.ok) throw new Error(session.description || ('HTTP ' + resp.status));
     sbDiscussRenderPanel(session);
   } catch (e) {
-    alert('Could not send message: ' + e.message);
+    showToast('Could not send message: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'Send';
   }
@@ -2468,7 +2727,7 @@ async function sbDiscussEnd(sessionId, btn) {
       } catch (e) { /* best-effort -- end itself already succeeded */ }
     }
   } catch (e) {
-    alert('Could not end discussion: ' + e.message);
+    showToast('Could not end discussion: ' + e.message);
     btn.disabled = false;
     btn.textContent = 'End Discussion';
   }

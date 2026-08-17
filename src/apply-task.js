@@ -18,6 +18,7 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -307,6 +308,24 @@ function main() {
   const skipPush = process.env.AGENT_MANAGER_APPLY_SKIP_PUSH === 'true';
 
   const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush });
+
+  // Previously this module never wrote taskPath back at all -- a task landing in done/ or
+  // blocked/ after this step carried no record it was ever applied: no timestamp, no
+  // branch/commit info, no failure reason if apply itself failed. apply-task.sh (the
+  // caller) moves the SAME file afterward, so writing it back here in place -- same
+  // pattern ornith-draft.js/review-task.js already use -- lands before that move.
+  // needsConfirmation checked first, matching apply-task.sh's own precedence: it reports
+  // succeeded:false but is a hold for a human (a delete-containing batch), not a failure.
+  const applyStage = result.needsConfirmation ? 'awaiting-confirm' : (result.succeeded ? 'applied' : 'apply-failed');
+  appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
+  try {
+    fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+  } catch (e) {
+    // Non-fatal -- the apply outcome itself (result, already computed above) is what
+    // actually gates the caller's file-move decision; a failure to also persist the
+    // history event shouldn't turn a real apply success into a reported failure.
+  }
+
   process.stdout.write(JSON.stringify(result));
 }
 

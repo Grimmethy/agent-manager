@@ -21,6 +21,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const child_process = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const REAL_EXEC_FILE_SYNC = child_process.execFileSync;
 
@@ -148,6 +151,22 @@ test('callOnce passes --allowedTools instead of --tools when a caller explicitly
     );
     assert.ok(capturedArgs.includes('--allowedTools'));
     assert.ok(!capturedArgs.includes('--tools'));
+  });
+});
+
+test('callOnce runs the child process in the isolated scratch dir by default, but a caller-supplied cwd overrides it (e.g. Discuss sessions granting real file access)', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    const realProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-cwd-test-'));
+    let capturedCwd = null;
+    try {
+      await withMockedClient(
+        (bin, args, opts) => { capturedCwd = opts.cwd; return JSON.stringify({ result: 'ok' }); },
+        async ({ callOnce }) => { await callOnce({ prompt: 'hi', cwd: realProjectDir }); },
+      );
+      assert.equal(capturedCwd, realProjectDir);
+    } finally {
+      fs.rmSync(realProjectDir, { recursive: true, force: true });
+    }
   });
 });
 

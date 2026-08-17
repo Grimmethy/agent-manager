@@ -27,9 +27,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { checkDraft } = require('./fact-checker.js');
-const { majorityVote } = require('./ornith-client.js');
+const { providerFor } = require('./model-provider.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -173,7 +174,12 @@ function classifyVote(markers, minReasoningChars) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported so
  * tests can call it directly with a fake ornithMajorityVote.
  */
-async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, ornithMajorityVote = majorityVote, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, ornithMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+  // Resolved here rather than as a static default param, same reasoning as
+  // ornith-draft.js's draftTask() -- the right backend depends on task.source, only
+  // known once the task object is in hand. An explicit caller override always wins.
+  const resolvedMajorityVote = ornithMajorityVote || providerFor(task.source).majorityVote;
+  appendHistoryEvent(task, 'review-started');
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
 
@@ -222,6 +228,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     task.reviewProvider = 'deterministic-empty-approve';
     task.ornithVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no Ornith vote spent -- this is deterministic, not a judgment call)`;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+    appendHistoryEvent(task, 'approved', 'deterministic-empty-approve');
     return { succeeded: true, verdict: 'approved', factCheckVerdict };
   }
 
@@ -236,6 +243,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).';
     task.reviewProvider = 'deterministic-non-implementation';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
@@ -257,6 +265,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       const reason = `Deterministic gate: draft does not contain the required fixed block(s) character-for-character: ${missingNames}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no Ornith review call spent on a draft that already fails a mechanical check.`;
       task.reviewProvider = 'deterministic-fixed-literals';
       recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+      appendHistoryEvent(task, 'blocked', reason);
       return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
     }
   }
@@ -264,11 +273,20 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   await waitForOrnithAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
-  const voteResult = await ornithMajorityVote({
+  // minAgreeing: 2 of 3 -- a genuine majority, matching majorityVote()'s own documented
+  // default and intent (an ABSOLUTE count of agreeing real votes, guarding against e.g. 1
+  // real + 2 degenerate votes looking like a confident 1-0 consensus -- see that function's
+  // comment). This was 3 (i.e. requiring full unanimity from 3 independent, temperature-0.2
+  // but still stochastic votes) -- confirmed live 2026-08-16: 23 of 181 blocked tasks,
+  // the second-largest group in queue/blocked/, were real 2-1 splits (both real REJECT-
+  // majority AND, invisibly, any real APPROVE-majority) discarded as "no confident
+  // majority" purely because one of three votes dissented, not because the verdict was
+  // actually unclear.
+  const voteResult = await resolvedMajorityVote({
     prompt: verdictPrompt,
     classify: classifyVote(['APPROVE', 'REJECT'], 20),
     n: 3,
-    minAgreeing: 3,
+    minAgreeing: 2,
     temperature: 0.2,
   });
 
@@ -279,6 +297,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     task.reviewProvider = 'ornith';
     task.ornithVotes = voteResult.votes;
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
@@ -289,6 +308,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     task.ornithVerdict = `Confident majority APPROVE (${voteSummary})\n\n${sampleVote ? sampleVote.response : ''}`;
     task.ornithVotes = voteResult.votes;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+    appendHistoryEvent(task, 'approved', voteSummary);
     return { succeeded: true, verdict: 'approved', factCheckVerdict };
   }
 
@@ -298,6 +318,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   task.reviewProvider = 'ornith';
   task.ornithVotes = voteResult.votes;
   recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+  appendHistoryEvent(task, 'blocked', reason);
   return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
 }
 
