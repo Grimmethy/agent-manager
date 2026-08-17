@@ -1068,11 +1068,27 @@ function nextPathPrefetchResolveTask() {
       continue; // unreadable/mid-write -- skip this tick, same non-fatal-skip convention as everywhere else in this file
     }
     if (!held || !held.needsClarification) continue;
-    // Only ever attempted once per held task -- suggestionAttempted is set by
-    // applyPathPrefetchResolve() regardless of whether the LLM call actually produced a
-    // usable suggestion, so a genuinely unresolvable note doesn't get re-attempted (and
-    // re-spend a model call) every single tick forever.
-    if (held.needsClarification.suggested || held.needsClarification.suggestionAttempted) continue;
+    // NOTE: does NOT skip on `held.needsClarification.suggested` alone -- a non-confident
+    // (or confident-but-empty-paths) suggestion still sets `suggested`, and that's exactly
+    // the case this retry targets (a CONFIDENT non-empty suggestion already auto-resolved
+    // the task straight into queue/adhoc/ in applyPathPrefetchResolve(), removing it from
+    // this directory entirely, so it can never reach this loop at all). Eligibility is
+    // driven entirely by the two attempted-flags below instead. Confirmed live 2026-08-17:
+    // an earlier version of this gate skipped on bare `suggested` truthiness, which
+    // silently skipped every one of the 22 real stuck held tasks in this project's own
+    // queue/needs-clarification/ (all of which already carry a non-confident `suggested`
+    // from their first attempt) -- nextPathPrefetchResolveTask() returned null for all of
+    // them instead of offering the intended retry.
+    // Brain Dump #77: two automatic attempts per held task, not one -- a low-reasoning
+    // (Ornith) attempt first, same as always, then ONE automatic high-reasoning (Claude)
+    // retry if that first attempt didn't land a confident suggestion. Only once both flags
+    // are set does this fall back to requiring a human (Discuss, which resets both --
+    // see app.py's discuss-end handler).
+    let isHighReasoningRetry = false;
+    if (held.needsClarification.suggestionAttempted) {
+      if (held.needsClarification.highReasoningAttempted) continue;
+      isHighReasoningRetry = true;
+    }
 
     const heldId = held.id || f.replace(/\.json$/, '');
     // Suffixed with the attempt number, not just heldId alone -- taskIdExistsInQueue()
@@ -1085,7 +1101,12 @@ function nextPathPrefetchResolveTask() {
     // discuss-end handler bumps needsClarification.attempt alongside the reset; default to
     // 1 for a held task that predates this field (first-ever attempt).
     const attempt = held.needsClarification.attempt || 1;
-    const resolveId = attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`;
+    // The high-reasoning retry gets its own distinct id suffix, independent of `attempt`
+    // (which only tracks human/Discuss-driven retries) -- so the automatic retry never
+    // collides with a human-driven one's id in queue/done/, and vice versa.
+    const resolveId = isHighReasoningRetry
+      ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
+      : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
     if (taskIdExistsInQueue(resolveId)) continue;
 
     // Same candidate universe path-prefetch.js's own deterministic pass already
@@ -1109,6 +1130,10 @@ function nextPathPrefetchResolveTask() {
       id: resolveId,
       domain: 'path_prefetch_resolve',
       source: 'path_prefetch_resolve',
+      // Per-instance override (see model-provider.js's reasoningTierFor()) -- only the
+      // retry attempt sets this; the first attempt stays on path_prefetch_resolve's
+      // ordinary low-reasoning default (no static reasoningTier registered for that source).
+      ...(isHighReasoningRetry ? { reasoningTier: 'high' } : {}),
       title: `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
       promptContext: {
         heldTaskId: heldId,
@@ -1153,7 +1178,12 @@ function taskPriority(name, def) {
 // exact feature: drafting/review worked (both go through prompts.js), but apply fell
 // through to the generic Group B JSON-diff path and failed parsing a real unified diff
 // as JSON, every time, until this was moved here.
-registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff });
+// reasoningTier: 'high' -- feeds ornith-worker.sh's worker-lane claim filter (via
+// model-provider.js's reasoningTierFor()) so worker-claude* claims adhoc tasks, matching
+// what ornith-draft.js's own resolveSourceName()==='adhoc' branch already hardcodes
+// regardless of this registration -- kept here so the two can't drift apart (Brain Dump
+// #77's generalized tier filter, replacing the earlier adhoc-hardcoded bash check).
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high' });
 registerTaskSource('trouble_log', { priority: taskPriority('trouble_log', 20), next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), next: nextSecondBrainTask });
 // No `apply` key here, unlike arch_discovery/arch_import above -- writeArtifact() (called

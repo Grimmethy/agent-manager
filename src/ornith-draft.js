@@ -59,12 +59,15 @@ function writeTaskJson(taskPath, task) {
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
 async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement } = {}) {
-  // Resolved here rather than as a static default param: the right backend depends on
-  // task.source, which isn't known until the task object itself is in hand. Explicit
+  // Resolved here rather than as a static default param: the right backend depends on the
+  // task's reasoning tier (model-provider.js's reasoningTierFor()), which isn't known
+  // until the task object itself is in hand -- passing the whole task (not just
+  // task.source) lets a per-instance task.reasoningTier override take effect, e.g. Brain
+  // Dump #77's automatic high-reasoning retry for a needs-clarification task. Explicit
   // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
   // production code leaves (ornith-draft.js's own main() calls draftTask(task) with no
   // second argument at all).
-  const resolvedOrnithCall = ornithCall || providerFor(task.source).call;
+  const resolvedOrnithCall = ornithCall || providerFor(task).call;
   try {
     appendHistoryEvent(task, 'draft-started', task.ornithRejectCount ? `retry ${task.ornithRejectCount}` : undefined);
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
@@ -271,7 +274,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         // which would have silently mislabeled every Claude-served call as Ornith in
         // model-stats.db (the Models tab's own data source) the moment that routing
         // was used for anything.
-        model: labelFor(task.source),
+        model: labelFor(task),
         startedAt: implStartedAt,
         latencyMs: Date.now() - implStartMs,
         result: implResult,

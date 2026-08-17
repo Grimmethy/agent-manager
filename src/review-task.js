@@ -176,9 +176,11 @@ function classifyVote(markers, minReasoningChars) {
  */
 async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, ornithMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
-  // ornith-draft.js's draftTask() -- the right backend depends on task.source, only
-  // known once the task object is in hand. An explicit caller override always wins.
-  const resolvedMajorityVote = ornithMajorityVote || providerFor(task.source).majorityVote;
+  // ornith-draft.js's draftTask() -- the right backend depends on the task's reasoning
+  // tier, only known once the task object is in hand. Passing the whole task (not just
+  // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
+  // caller override always wins.
+  const resolvedMajorityVote = ornithMajorityVote || providerFor(task).majorityVote;
   appendHistoryEvent(task, 'review-started');
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
