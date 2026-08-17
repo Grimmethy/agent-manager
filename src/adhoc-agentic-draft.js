@@ -44,6 +44,12 @@ const ADHOC_MAX_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_MAX_TURNS) || 30;
 
 const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed)\b/i;
 
+// Same "claude:<model>" label format model-provider.js's labelFor()/ornith-worker.sh's
+// HEARTBEAT_MODEL use -- stamped onto task.draftModel below so apply-task.js's commit
+// message can attribute Co-Authored-By to whichever model actually drafted the change,
+// instead of always crediting Ornith (this path never calls Ornith at all).
+const DRAFT_MODEL_LABEL = `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
+
 function buildAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   return [
@@ -123,11 +129,12 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
 
     task.abCallId = recordModelCall({
       taskId: task.id,
-      model: 'claude:adhoc-agentic',
+      model: DRAFT_MODEL_LABEL,
       startedAt,
       latencyMs: Date.now() - startMs,
       result,
     });
+    task.draftModel = DRAFT_MODEL_LABEL;
 
     if (result.degenerate) {
       return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass degenerate: ${result.degenerate}` };
