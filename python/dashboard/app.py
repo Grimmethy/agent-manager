@@ -1691,6 +1691,10 @@ def api_discuss_end(session_id):
                 nc = held_task.setdefault("needsClarification", {})
                 nc.pop("suggested", None)
                 nc["suggestionAttempted"] = False
+                # Brain Dump #77: reset alongside suggestionAttempted so a human-reopened
+                # task gets a fresh automatic low-then-high reasoning pair again, not just
+                # the low tier (see task-sources.js's nextPathPrefetchResolveTask()).
+                nc["highReasoningAttempted"] = False
                 # Bumped so nextPathPrefetchResolveTask()'s resolve-task id includes the
                 # attempt number -- without this, a second attempt's id collides with the
                 # first attempt's now-done/ file forever (taskIdExistsInQueue() checks

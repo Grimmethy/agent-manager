@@ -18,13 +18,48 @@
 
 const ornith = require('./ornith-client.js');
 const claude = require('./claude-client.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 
 const CLAUDE_SOURCES = new Set(
   (process.env.AGENT_MANAGER_CLAUDE_SOURCES || '').split(',').map((s) => s.trim()).filter(Boolean),
 );
 
-function providerFor(source) {
-  return CLAUDE_SOURCES.has(source) ? claude : ornith;
+// Accepts either a bare source-name string (legacy call shape, still used by
+// model-provider.test.js and anywhere else that only has the string on hand) or a full
+// task object -- normalized to a task-shaped object either way so reasoningTierFor() has
+// one consistent input.
+function normalizeTask(sourceOrTask) {
+  return typeof sourceOrTask === 'string' ? { source: sourceOrTask } : (sourceOrTask || {});
+}
+
+// Single source of truth for "should this task run on the high-reasoning (Claude) or
+// low-reasoning (Ornith) tier" -- used by providerFor()/labelFor() below AND by
+// ornith-worker.sh's worker-lane claim filter (via a `node -e` call into this module), so
+// the two can never disagree about which lane a task belongs on. Checked in order:
+//   1. task.reasoningTier -- a per-instance override, e.g. the Brain Dump #77 automatic
+//      high-reasoning retry for a needs-clarification task whose FIRST (low-tier) attempt
+//      already failed to resolve confidently (see task-sources.js's
+//      nextPathPrefetchResolveTask()) -- the same *source* (path_prefetch_resolve) needs
+//      to run on different tiers depending on which attempt this is, which a static
+//      per-source default alone can't express.
+//   2. the task's registered source's own static `reasoningTier` (e.g. adhoc, registered
+//      'high' in task-sources.js -- though adhoc's actual draft call is hardcoded to
+//      Claude via ornith-draft.js's own resolveSourceName()==='adhoc' branch regardless;
+//      this registration exists so the worker-lane filter agrees with that by
+//      construction rather than by two people remembering to update two places).
+//   3. AGENT_MANAGER_CLAUDE_SOURCES (pre-existing opt-in env var, kept for compatibility).
+//   4. default: 'low'.
+function reasoningTierFor(task) {
+  const t = normalizeTask(task);
+  if (t.reasoningTier) return t.reasoningTier;
+  const entry = getRegisteredSource(resolveSourceName(t));
+  if (entry && entry.reasoningTier) return entry.reasoningTier;
+  if (CLAUDE_SOURCES.has(t.source)) return 'high';
+  return 'low';
+}
+
+function providerFor(sourceOrTask) {
+  return reasoningTierFor(sourceOrTask) === 'high' ? claude : ornith;
 }
 
 // Display/stats label for whichever backend providerFor(source) actually picked --
@@ -34,9 +69,9 @@ function providerFor(source) {
 // existed. Separate from providerFor() itself (rather than attaching `.label` to the
 // ornith/claude module objects) so providerFor()'s return value stays exactly the
 // required module -- model-provider.test.js asserts identity against it.
-function labelFor(source) {
-  if (!CLAUDE_SOURCES.has(source)) return process.env.ORNITH_MODEL || 'ornith';
+function labelFor(sourceOrTask) {
+  if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.ORNITH_MODEL || 'ornith';
   return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 }
 
-module.exports = { providerFor, labelFor };
+module.exports = { providerFor, labelFor, reasoningTierFor };

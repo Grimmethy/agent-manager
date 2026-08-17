@@ -641,6 +641,22 @@ test('applyPathPrefetchResolve writes a NON-confident suggestion onto the held t
   assert.deepEqual(written.needsClarification.candidates, { auth: ['src/auth.ts', 'server/auth.ts'] });
 });
 
+// Brain Dump #77: a task carrying reasoningTier:'high' (the automatic retry) marks
+// highReasoningAttempted instead of suggestionAttempted, so nextPathPrefetchResolveTask()
+// can tell the two tiers apart and only require a human once BOTH have run.
+test('applyPathPrefetchResolve marks highReasoningAttempted (not suggestionAttempted) for a high-reasoning-tier task', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match', suggestionAttempted: true });
+  const implementResponse = JSON.stringify({ paths: ['src/auth.ts'], rationale: 'still not sure', confident: false });
+  const task = { reasoningTier: 'high', promptContext: { heldTaskId: 'held-1' } };
+
+  applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  const written = JSON.parse(fs.readFileSync(heldPath, 'utf8'));
+  assert.equal(written.needsClarification.highReasoningAttempted, true);
+  assert.equal(written.needsClarification.suggestionAttempted, true, 'the low-tier flag from the first attempt must be preserved, not overwritten');
+});
+
 // Auto-resolve on a confident suggestion (2026-08-16): the actual ask was that ending a
 // Discuss session should be enough by itself to get a held task off the Needs
 // Clarification list, not require yet another manual click on top of whatever context the

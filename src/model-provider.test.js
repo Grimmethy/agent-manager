@@ -67,3 +67,48 @@ test('each provider exposes call and majorityVote (the two injection-point shape
     assert.equal(typeof provider.majorityVote, 'function');
   }
 });
+
+// --- reasoningTierFor (Brain Dump #77: generalized worker-tier concept, replacing the
+// earlier adhoc-hardcoded lane filter) ----------------------------------------------------
+
+test('reasoningTierFor: a per-instance task.reasoningTier override wins over everything else', () => {
+  withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: undefined }, () => {
+    const { reasoningTierFor } = freshModelProvider();
+    assert.equal(reasoningTierFor({ source: 'path_prefetch_resolve', reasoningTier: 'high' }), 'high');
+  });
+});
+
+test('reasoningTierFor: falls back to the registered source\'s static reasoningTier', () => {
+  const { reasoningTierFor } = freshModelProvider();
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  clearRegistry();
+  try {
+    registerTaskSource('arch_import', { reasoningTier: 'high' });
+    assert.equal(reasoningTierFor({ source: 'arch_import' }), 'high');
+    assert.equal(reasoningTierFor({ source: 'unregistered_source' }), 'low');
+  } finally {
+    clearRegistry();
+  }
+});
+
+test('reasoningTierFor: falls back to AGENT_MANAGER_CLAUDE_SOURCES when no override/static tier is set', () => {
+  withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: 'arch_import' }, () => {
+    const { reasoningTierFor } = freshModelProvider();
+    assert.equal(reasoningTierFor({ source: 'arch_import' }), 'high');
+    assert.equal(reasoningTierFor({ source: 'observability_review' }), 'low');
+  });
+});
+
+test('reasoningTierFor: defaults to low with no override, static tier, or env var', () => {
+  withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: undefined }, () => {
+    const { reasoningTierFor } = freshModelProvider();
+    assert.equal(reasoningTierFor({ source: 'observability_review' }), 'low');
+  });
+});
+
+test('reasoningTierFor: accepts a bare source-name string, same as providerFor/labelFor', () => {
+  withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: 'arch_import' }, () => {
+    const { reasoningTierFor } = freshModelProvider();
+    assert.equal(reasoningTierFor('arch_import'), 'high');
+  });
+});

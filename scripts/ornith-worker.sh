@@ -5,16 +5,24 @@ set -u                                                                          
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # locate scripts/ dir so we can reference sibling files regardless of how this script was invoked by launch.sh / user.
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 
-# Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17): any instance named
-# worker-claude* claims ONLY adhoc-shaped pending tasks (the ones whose implement pass is
-# a real agentic Claude Code CLI call, adhoc-agentic-draft.js -- see ornith-draft.js's own
-# domain/source dispatch), and every OTHER worker-* instance skips them instead, leaving
-# them for this lane. Pure naming convention, no new env var/config -- restartTargetFor()
-# (dead-process-check.js) already matches any instanceId.startsWith('worker-') generically
-# via this same script, so a worker-claude instance is auto-restart-eligible for free.
-# Motivation: Claude is cloud-based, no GPU contention with Ornith, but a single shared
-# worker-1 claiming BOTH kinds serially means a 5-15 minute agentic call blocks Ornith's
-# own (otherwise much faster) throughput behind it for that whole time.
+# Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17; generalized from
+# adhoc-only to a reasoning-tier concept for Brain Dump #77, 2026-08-17): any instance
+# named worker-claude* claims ONLY pending tasks whose reasoning tier (model-provider.js's
+# reasoningTierFor() -- the same function ornith-draft.js/review-task.js already call to
+# pick a backend) resolves to 'high', and every OTHER worker-* instance skips them
+# instead, leaving them for this lane. Originally this was hardcoded to "adhoc-shaped"
+# tasks specifically (the ones whose implement pass is a real agentic Claude Code CLI
+# call, adhoc-agentic-draft.js); it's now the general tier concept because a second kind
+# of high-reasoning-only task exists (Brain Dump #77's automatic high-reasoning retry for
+# a needs-clarification task whose first, low-reasoning attempt didn't resolve
+# confidently) -- adhoc itself still resolves to 'high' via its own static registration in
+# task-sources.js, so behavior for adhoc tasks is unchanged. Pure naming convention, no
+# new env var/config -- restartTargetFor() (dead-process-check.js) already matches any
+# instanceId.startsWith('worker-') generically via this same script, so a worker-claude
+# instance is auto-restart-eligible for free. Motivation: Claude is cloud-based, no GPU
+# contention with Ornith, but a single shared worker-1 claiming BOTH kinds serially means
+# a multi-minute high-reasoning call blocks Ornith's own (otherwise much faster) throughput
+# behind it for that whole time.
 case "$INSTANCE_ID" in
   worker-claude*) IS_CLAUDE_LANE=true ;;
   *) IS_CLAUDE_LANE=false ;;
@@ -184,19 +192,27 @@ while :; do                                                                     
       fi
 
       # Parallel Claude worker lane filter (see IS_CLAUDE_LANE's own comment above) --
-      # resolveSourceName() is the SAME function ornith-draft.js/apply-task.js already use
-      # to decide "is this an adhoc task", so this lane split can never disagree with what
-      # actually happens once a task is claimed. The Claude lane claims ONLY adhoc-shaped
-      # tasks; every other lane skips them, leaving them free for the Claude lane to pick
-      # up instead of racing for them.
+      # reasoningTierFor() is the SAME function ornith-draft.js/review-task.js already call
+      # to pick a backend, so this lane split can never disagree with what actually happens
+      # once a task is claimed. The Claude lane claims ONLY high-reasoning-tier tasks;
+      # every other lane skips them, leaving them free for the Claude lane to pick up
+      # instead of racing for them.
       if "$claim_succeeded"; then
-        resolved_source="$(echo "$parsed_payload" | node -e 'try{const {resolveSourceName}=require(process.argv[1]);const t=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(resolveSourceName(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-source-registry.js" 2>/dev/null)"
+        # reasoningTierFor() reads each source's static reasoningTier off the
+        # task-source-registry.js registry (e.g. adhoc's) -- that registry is only
+        # populated as a side effect of requiring task-sources.js (its registerTaskSource()
+        # calls run at module load), so this MUST be required first in this fresh `node -e`
+        # process, or every source would come back with no registered entry and silently
+        # fall through to 'low'. Confirmed live 2026-08-17: requiring model-provider.js
+        # alone here (mirroring the old resolveSourceName one-liner, which has no such
+        # dependency) reported adhoc as 'low' every time.
+        resolved_tier="$(echo "$parsed_payload" | node -e 'try{require(process.argv[1]);const {reasoningTierFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(reasoningTierFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
         if "$IS_CLAUDE_LANE"; then
-          if [[ "$resolved_source" != "adhoc" ]]; then
+          if [[ "$resolved_tier" != "high" ]]; then
             claim_succeeded=false
           fi
         else
-          if [[ "$resolved_source" == "adhoc" ]]; then
+          if [[ "$resolved_tier" == "high" ]]; then
             claim_succeeded=false
           fi
         fi

@@ -504,17 +504,37 @@ test('nextPathPrefetchResolveTask returns null (greenfield, no graph to reason o
   assert.equal(nextPathPrefetchResolveTask(), null);
 });
 
-test('nextPathPrefetchResolveTask skips a held task that already has a suggestion', () => {
+// A non-confident `suggested` alone (without suggestionAttempted set) doesn't occur in
+// real data -- applyPathPrefetchResolve() always sets both together -- but confirms the
+// gate is driven by the attempted-flags, not `suggested`'s own truthiness: this held task
+// is still eligible (as an ordinary first/low-tier attempt) since neither flag is set.
+test('nextPathPrefetchResolveTask is driven by the attempted-flags, not by suggested alone', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   writeHeldTask(dir, 'held-1', { reason: 'no-match', suggested: { paths: [], rationale: 'nope', confident: false } });
   writeProjectGraph(dir, ['src/foo.ts']);
   const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
-  assert.equal(nextPathPrefetchResolveTask(), null);
+  const task = nextPathPrefetchResolveTask();
+  assert.ok(task);
+  assert.equal(task.reasoningTier, undefined, 'not a retry -- suggestionAttempted was never set');
 });
 
-test('nextPathPrefetchResolveTask skips a held task whose suggestion was already attempted (even if it produced nothing)', () => {
+// Brain Dump #77: a held task whose low-reasoning attempt already ran (and didn't produce
+// a confident suggestion) is now eligible for exactly one automatic high-reasoning retry,
+// not skipped outright -- see the two dedicated tests below.
+test('nextPathPrefetchResolveTask offers a high-reasoning retry once the low-reasoning attempt has run', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+  assert.ok(task, 'the retry attempt must be offered');
+  assert.equal(task.reasoningTier, 'high');
+  assert.equal(task.id, 'path-prefetch-resolve-held-1-attempt1-highreasoning');
+});
+
+test('nextPathPrefetchResolveTask skips a held task once BOTH tiers have been attempted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true });
   writeProjectGraph(dir, ['src/foo.ts']);
   const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
   assert.equal(nextPathPrefetchResolveTask(), null);
@@ -580,7 +600,7 @@ test('nextPathPrefetchResolveTask regenerates for attempt 2 even though attempt 
 
 test('nextPathPrefetchResolveTask processes held tasks oldest-file-first, skipping ones already resolved/attempted/in-queue', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
-  writeHeldTask(dir, 'held-done', { reason: 'no-match', suggestionAttempted: true });
+  writeHeldTask(dir, 'held-done', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true });
   writeHeldTask(dir, 'held-target', { reason: 'no-match' });
   writeProjectGraph(dir, ['src/foo.ts']);
   const { nextPathPrefetchResolveTask } = freshTaskSources(dir);

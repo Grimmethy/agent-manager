@@ -722,7 +722,17 @@ function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
   }
 
   const result = parsePathPrefetchResolveResult(implementResponse);
-  held.needsClarification.suggestionAttempted = true;
+  // Brain Dump #77: which flag gets marked depends on which tier just ran -- the
+  // low-reasoning first attempt sets suggestionAttempted (as before); the automatic
+  // high-reasoning retry (task.reasoningTier === 'high', set by
+  // nextPathPrefetchResolveTask()) sets highReasoningAttempted instead, so
+  // nextPathPrefetchResolveTask()'s eligibility gate can tell the two apart and only
+  // require a human once BOTH tiers have been spent.
+  if (task.reasoningTier === 'high') {
+    held.needsClarification.highReasoningAttempted = true;
+  } else {
+    held.needsClarification.suggestionAttempted = true;
+  }
   if (result) {
     held.needsClarification.suggested = {
       paths: result.paths,
