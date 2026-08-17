@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -228,7 +228,7 @@ test('parseBrainDumpSortResult parses a well-formed classification object', () =
   }));
   assert.deepEqual(result, {
     category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
-    belongsToProject: null,
+    belongsToProject: null, requiresResearch: false,
   });
 });
 
@@ -375,6 +375,105 @@ test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured',
 
   assert.equal(result.skipped, true);
   assert.match(result.reason, /SECOND_BRAIN_DIR/);
+});
+
+// --- applyBrainDumpSort's requiresResearch routing (Brain Dump #1 follow-up, 2026-08-17) --
+
+test('applyBrainDumpSort queues a research task and marks the entry actioned when requiresResearch is true', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-research-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'investigate goblinnib.com for our own characters' })]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'investigate goblinnib.com for our own characters' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'references/goblinnib.md', tags: ['research'], actionable: true, requiresResearch: true,
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.researchQueued, true);
+  assert.ok(result.queuedTaskId.startsWith('research-brain-dump-bd-1-'));
+
+  const researchFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'research'));
+  assert.equal(researchFiles.length, 1);
+  const queued = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'research', researchFiles[0]), 'utf8'));
+  assert.equal(queued.domain, 'research');
+  assert.equal(queued.source, 'research_task');
+  assert.equal(queued.promptContext.secondBrainPath, 'references/goblinnib.md');
+
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'actioned');
+  assert.equal(entries[0].queuedTaskId, result.queuedTaskId);
+
+  // Audit-trail cross-reference line, same convention as the adhoc branch.
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'references/goblinnib.md'), 'utf8');
+  assert.match(noteText, /Queued as research task/);
+});
+
+test('applyBrainDumpSort skips cleanly (does not throw) when requiresResearch is true but no pipelineDir was given', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-research-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'investigate X' })]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'investigate X' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', requiresResearch: true,
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+  assert.equal(result.skipped, true);
+});
+
+test('applyBrainDumpSort does NOT queue a research task when requiresResearch is false (normal reference filing)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-research-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({
+    category: 'reference', secondBrainPath: 'x.md', requiresResearch: false,
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.ok(!fs.existsSync(path.join(pipelineDir, 'queue', 'research')), 'must not create queue/research/ when requiresResearch is false');
+});
+
+// --- applyResearchTask (Brain Dump #1 follow-up, 2026-08-17) ----------------------------
+
+test('applyResearchTask files the write-up under a dated heading at the chosen secondBrainPath', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-research-task-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const task = {
+    researchDoc: '# goblinnib\n\nReal findings here.',
+    promptContext: { secondBrainPath: 'references/goblinnib.md' },
+  };
+
+  const result = applyResearchTask({ task, secondBrainDir });
+
+  assert.equal(result.file, path.join(secondBrainDir, 'references/goblinnib.md'));
+  const noteText = fs.readFileSync(result.file, 'utf8');
+  assert.match(noteText, /Real findings here\./);
+  assert.match(noteText, /## Research --/);
+});
+
+test('applyResearchTask skips cleanly when researchDoc is empty', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-research-task-test-'));
+  const result = applyResearchTask({ task: { researchDoc: '', promptContext: { secondBrainPath: 'x.md' } }, secondBrainDir: path.join(dir, 'sb') });
+  assert.equal(result.skipped, true);
+});
+
+test('applyResearchTask skips cleanly when promptContext has no secondBrainPath', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-research-task-test-'));
+  const result = applyResearchTask({ task: { researchDoc: 'content', promptContext: {} }, secondBrainDir: path.join(dir, 'sb') });
+  assert.equal(result.skipped, true);
+});
+
+test('applyResearchTask skips cleanly when secondBrainDir is not configured', () => {
+  const result = applyResearchTask({ task: { researchDoc: 'content', promptContext: { secondBrainPath: 'x.md' } }, secondBrainDir: null });
+  assert.equal(result.skipped, true);
 });
 
 // --- applyBrainDumpSort's adhoc + path-prefetch routing (2026-08-16) --------------------

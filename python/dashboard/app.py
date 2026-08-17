@@ -955,6 +955,11 @@ def api_task_confirm_delete(task_id):
         to land (Brain Dump #67, 2026-08-17) -- the "require a human Apply click" gate
         the agentic implement path needs precisely because it's real Bash/Edit/Write
         access, not the earlier blind JSON-diff guesser.
+      - researchApplyConfirmedAt: a research task with a real, agentic web-research
+        write-up ready to file into SecondBrain (Brain Dump #1 follow-up, 2026-08-17) --
+        same reasoning as adhocApplyConfirmedAt, arguably higher-stakes since it's
+        AI-sourced content that can be confidently wrong entering a permanent personal
+        knowledge base, not a discardable git branch.
     apply-task.js's own gates check each field's PRESENCE (not its value) to let a task
     through without holding it again, the same 'ran once, don't re-trigger' idea as
     promotedAt/lastReviewedAt elsewhere in this codebase. Denying instead of confirming
@@ -971,6 +976,7 @@ def api_task_confirm_delete(task_id):
     now_iso = datetime.now(timezone.utc).isoformat()
     data["deleteConfirmedAt"] = now_iso
     data["adhocApplyConfirmedAt"] = now_iso
+    data["researchApplyConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)

@@ -142,7 +142,7 @@ function brainDumpSortPlanPrompt(task) {
     'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
     ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
     '',
-    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), and (5) if this describes a concrete feature/bug for one of the tracked code projects listed above, name which one -- otherwise say none apply.',
+    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), (5) if this describes a concrete feature/bug for one of the tracked code projects listed above, name which one -- otherwise say none apply, and (6) if properly resolving this note means going out and finding NEW information first (e.g. "investigate X", "look into Y for later") rather than just filing the note as stated, say so -- that makes it a real research task, independent of (5) (a research task is never a code change).',
     '',
     "If you're naming a tracked code project in (5), the note becomes a real queued task in that project's pipeline -- a downstream step tries to match keywords in your title/rationale against that project's own file structure to prefetch relevant paths, purely deterministic, no judgment call for you to make here. It just means: don't paraphrase away the concrete nouns already in the note (an actual file, module, or feature name) if they're there -- keep them recognizable in your title/rationale rather than replacing them with a vaguer summary phrase.",
   ].join('\n');
@@ -632,7 +632,8 @@ function brainDumpSortImplementPrompt(task, planText) {
     '  "tags": ["short", "lowercase", "keywords"],',
     '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
     '  "rationale": "one sentence explaining the category and destination",',
-    '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects"',
+    '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects",',
+    '  "requiresResearch": true or false -- true only if properly resolving this note means going out and finding NEW information (web search, reading real sources) before it can be documented, not just filing the note as stated. Independent of belongsToProject -- this is never a code change, and should never be true at the same time as naming a belongsToProject.',
     '}',
     '',
     'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown. If reusing an existing folder, its name must match the casing shown above EXACTLY. The file name itself must describe the note\'s actual subject, not a generic placeholder word (ideas/notes/misc/todo and similar are rejected automatically).',

@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -88,7 +88,10 @@ function writeArtifact(task, repoRoot, pipelineDir) {
 // correctly has nothing to close here). Best-effort -- see closeBrainDumpEntryResolved's
 // own header for why a missing/already-mutated entry is not an apply failure.
 function closeOriginatingBrainDumpEntry(task, brainDumpPath, note) {
-  if (task.domain !== 'adhoc') return;
+  // research (Brain Dump #1 follow-up, 2026-08-17): same shape as adhoc -- a
+  // brainDumpEntryId only ever appears on a task queued by applyBrainDumpSort's own
+  // requiresResearch branch, so this is unambiguous the same way adhoc's own check is.
+  if (task.domain !== 'adhoc' && task.domain !== 'research') return;
   const brainDumpEntryId = task.promptContext && task.promptContext.brainDumpEntryId;
   if (!brainDumpEntryId) return;
   try {
@@ -120,6 +123,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         task,
         brainDumpPath,
         secondBrainDir,
+        pipelineDir,
       });
       if (result.skipped) return { succeeded: true, doneMarker: result.reason };
       return { succeeded: true, doneMarker: `filed under "${result.category}" -> ${result.file}` };
@@ -207,6 +211,36 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         needsConfirmation: true,
         reason: 'real agentic code diff ready to apply -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
       };
+    }
+
+    // Same awaiting-confirm gate again, for research_task (Brain Dump #1 follow-up,
+    // 2026-08-17): a real web-research write-up, produced by an agentic Claude call that
+    // can be confidently wrong -- an arguably HIGHER misinformation-risk category than a
+    // "no fix needed" code verdict, since this becomes permanent content in a personal
+    // knowledge base rather than a discardable git branch. Own confirm field
+    // (researchApplyConfirmedAt), not adhocApplyConfirmedAt -- different content type,
+    // same mechanism (see python/dashboard/app.py's confirm endpoint, which stamps both
+    // unconditionally on one click).
+    if (task.domain === 'research' && (task.researchDoc || '').trim() && !task.researchApplyConfirmedAt) {
+      return {
+        succeeded: false,
+        needsConfirmation: true,
+        reason: 'real web research write-up ready to apply -- held in queue/awaiting-confirm/ for human confirmation before it enters SecondBrain',
+      };
+    }
+
+    // research's target (a note under secondBrainDir) is outside repoRoot and has nothing
+    // to do with the tracked code repo's git state -- same non-git shape as secondbrain/
+    // brain_dump_sort/project_search/path_prefetch_resolve above, intercepted here for the
+    // same reason: the git-branch-diff flow below unconditionally fetches/resets/branches
+    // the tracked repo for anything that reaches it, which would be actively wrong to run
+    // for a task that never touches that repo at all. Reached only once the confirm gate
+    // just above has already passed (researchApplyConfirmedAt set).
+    if (task.domain === 'research') {
+      const result = applyResearchTask({ task, secondBrainDir });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      closeOriginatingBrainDumpEntry(task, brainDumpPath, `Researched and filed to ${result.file} -- Task: ${task.id}`);
+      return { succeeded: true, doneMarker: `research write-up filed to ${result.file}` };
     }
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,

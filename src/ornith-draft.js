@@ -42,6 +42,7 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor } = require('./model-provider.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
+const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName } = require('./task-source-registry.js');
 
 function writeTaskJson(taskPath, task) {
@@ -58,7 +59,7 @@ function writeTaskJson(taskPath, task) {
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
-async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement } = {}) {
+async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement, draftResearchImplementFn = draftResearchImplement } = {}) {
   // Resolved here rather than as a static default param: the right backend depends on the
   // task's reasoning tier (model-provider.js's reasoningTierFor()), which isn't known
   // until the task object itself is in hand -- passing the whole task (not just
@@ -188,6 +189,28 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
           return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
         }
         appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+        task.status = 'needs-review';
+        appendHistoryEvent(task, 'needs-review');
+        return { succeeded: true, blocked: false };
+      }
+
+      // research_task (Brain Dump #1 follow-up, 2026-08-17): same reasoning as the adhoc
+      // branch above -- a real agentic Claude call (WebSearch/WebFetch this time, not
+      // Read/Grep/Glob/Edit/Write/Bash against a code repo) already did its own
+      // investigation and produced the final write-up; Ornith's own plan/critique/
+      // revision loop would add nothing (there's no repo state to reason about, and
+      // "revision" of a research write-up the model already finished is redundant with
+      // the normal review-task.js pass this still flows into afterward).
+      if (task.domain === 'research') {
+        const researchResult = await draftResearchImplementFn(task, { recordModelCall });
+        if (!researchResult.succeeded) {
+          return { succeeded: false, reason: researchResult.reason };
+        }
+        if (researchResult.blocked) {
+          appendHistoryEvent(task, 'blocked', researchResult.blockedReason);
+          return { succeeded: true, blocked: true, blockedReason: researchResult.blockedReason };
+        }
+        appendHistoryEvent(task, 'implement-done', `agentic research, ${(task.implementResponse || '').length} chars`);
         task.status = 'needs-review';
         appendHistoryEvent(task, 'needs-review');
         return { succeeded: true, blocked: false };

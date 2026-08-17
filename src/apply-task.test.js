@@ -330,6 +330,48 @@ test('adhocApplyConfirmedAt lets a previously-held adhoc diff proceed past the g
   assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
 });
 
+// --- research tasks: same awaiting-confirm gate, but never touch git at all (Brain Dump
+// #1 follow-up, 2026-08-17) -- SecondBrain is outside repoRoot, so a confirmed research
+// task must be intercepted BEFORE the git-branch-diff flow's fetch/reset/branch, not just
+// gated the same way adhoc is -------------------------------------------------------
+
+test('a research task with a real researchDoc is held for confirmation and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ domain: 'research', source: 'research_task', researchDoc: '# x\n\nfindings', promptContext: { secondBrainPath: 'x.md' } });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  assert.match(result.reason, /research/);
+  assert.deepEqual(gitRunner.calls, []);
+});
+
+test('researchApplyConfirmedAt lets a confirmed research task proceed, writes into SecondBrain, and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-research-test-'));
+  const secondBrainDir = path.join(scratchDir, 'secondbrain');
+  const brainDumpPath = path.join(scratchDir, 'brain-dump.json');
+  fs.writeFileSync(brainDumpPath, JSON.stringify({ entries: [{ id: 'bd-1', status: 'actioned' }] }));
+
+  const task = baseTask({
+    domain: 'research', source: 'research_task',
+    researchDoc: '# goblinnib\n\nReal findings.',
+    promptContext: { secondBrainPath: 'references/goblinnib.md', brainDumpEntryId: 'bd-1' },
+    researchApplyConfirmedAt: '2026-08-17T00:00:00.000Z',
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(gitRunner.calls, [], 'research never touches git, confirmed or not');
+
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'references/goblinnib.md'), 'utf8');
+  assert.match(noteText, /Real findings\./);
+
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'actioned');
+  assert.match(entries[0].resolvedNote, /Researched and filed/);
+});
+
 test('a fetchMain failure surfaces as a failure with no branch created', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'fetchMain', failMessage: 'network unreachable' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });

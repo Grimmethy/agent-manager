@@ -317,6 +317,58 @@ test('getNextTask allowlist: brain_dump_sort always preempts, even when restrict
   delete process.env.AGENT_MANAGER_TASK_SOURCES;
 });
 
+// --- nextResearchTask (Brain Dump #1 follow-up, 2026-08-17) -----------------------------
+
+function writeResearchTaskFile(dir, id, extra = {}) {
+  const researchDir = path.join(dir, 'queue', 'research');
+  fs.mkdirSync(researchDir, { recursive: true });
+  const task = { id, domain: 'research', source: 'research_task', title: `Research: ${id}`, promptContext: { rawText: 'x', secondBrainPath: 'x.md' }, ...extra };
+  fs.writeFileSync(path.join(researchDir, `${id}.json`), JSON.stringify(task));
+  return task;
+}
+
+test('nextResearchTask returns null when queue/research/ does not exist', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  const { nextResearchTask } = freshTaskSources(dir);
+  assert.equal(nextResearchTask(), null);
+});
+
+test('nextResearchTask returns the oldest eligible task, correctly shaped', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeResearchTaskFile(dir, 'research-brain-dump-bd-1-1000', { promptContext: { rawText: 'investigate X', secondBrainPath: 'references/x.md', tags: ['x'] } });
+  const { nextResearchTask } = freshTaskSources(dir);
+  const task = nextResearchTask();
+  assert.ok(task);
+  assert.equal(task.id, 'research-brain-dump-bd-1-1000');
+  assert.equal(task.domain, 'research');
+  assert.equal(task.source, 'research_task');
+  assert.equal(task.promptContext.secondBrainPath, 'references/x.md');
+});
+
+test('nextResearchTask does not re-offer a task already claimed/in-flight elsewhere in the queue', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  writeResearchTaskFile(dir, 'research-brain-dump-bd-1-1000');
+  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-claude');
+  fs.mkdirSync(draftingDir, { recursive: true });
+  fs.writeFileSync(path.join(draftingDir, 'research-brain-dump-bd-1-1000.json'), '{}');
+
+  const { nextResearchTask } = freshTaskSources(dir);
+  assert.equal(nextResearchTask(), null);
+});
+
+test('nextResearchTask skips a malformed/unreadable file and still finds a valid one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  const researchDir = path.join(dir, 'queue', 'research');
+  fs.mkdirSync(researchDir, { recursive: true });
+  fs.writeFileSync(path.join(researchDir, 'broken.json'), 'not json');
+  writeResearchTaskFile(dir, 'research-brain-dump-bd-1-1000');
+
+  const { nextResearchTask } = freshTaskSources(dir);
+  const task = nextResearchTask();
+  assert.ok(task);
+  assert.equal(task.id, 'research-brain-dump-bd-1-1000');
+});
+
 // --- getNextTask tierFilter (Brain Dump #77 follow-up: keep both worker lanes busy in
 // parallel instead of the higher-priority tier's backlog starving the other) -----------
 
