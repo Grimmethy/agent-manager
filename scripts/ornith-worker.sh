@@ -5,6 +5,21 @@ set -u                                                                          
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # locate scripts/ dir so we can reference sibling files regardless of how this script was invoked by launch.sh / user.
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 
+# Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17): any instance named
+# worker-claude* claims ONLY adhoc-shaped pending tasks (the ones whose implement pass is
+# a real agentic Claude Code CLI call, adhoc-agentic-draft.js -- see ornith-draft.js's own
+# domain/source dispatch), and every OTHER worker-* instance skips them instead, leaving
+# them for this lane. Pure naming convention, no new env var/config -- restartTargetFor()
+# (dead-process-check.js) already matches any instanceId.startsWith('worker-') generically
+# via this same script, so a worker-claude instance is auto-restart-eligible for free.
+# Motivation: Claude is cloud-based, no GPU contention with Ornith, but a single shared
+# worker-1 claiming BOTH kinds serially means a 5-15 minute agentic call blocks Ornith's
+# own (otherwise much faster) throughput behind it for that whole time.
+case "$INSTANCE_ID" in
+  worker-claude*) IS_CLAUDE_LANE=true ;;
+  *) IS_CLAUDE_LANE=false ;;
+esac
+
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
@@ -92,7 +107,11 @@ while :; do                                                                     
   # and the real `deep_dive: failed to onboard "...": ...` error task-sources.js logs via
   # console.error was silently discarded here, with no trace anywhere that onboarding had
   # ever been attempted or why Scouted Repos stayed empty despite tasks completing.
-  node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+  # Skipped entirely on the Claude lane -- this call GENERATES new pending/ tasks (not
+  # just claims existing ones), and only one process should ever be doing that at a time.
+  # worker-1 (or whichever non-Claude instance) already covers it every tick regardless of
+  # which lane ends up claiming the result -- generation and claiming are independent.
+  "$IS_CLAUDE_LANE" || node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
@@ -148,6 +167,25 @@ while :; do                                                                     
         task_id="$(echo "$parsed_payload" | node -e 'try{var j=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")); console.log(j.taskId||j.draftId||j.id)}catch(e){}' 2>/dev/null)"    # extract taskId (or fallback draftId, or fallback id -- task-sources.js's writeTask() writes the task's identifier under "id", never "taskId"/"draftId", so those two alone always came back empty) from parsed JSON with node CLI; bash captures stdout back into task_id (was overwriting parsed_payload instead, leaving task_id permanently "" so the -n check below could never pass regardless of what the JSON contained). JSON.parse's second arg was a reviver `(x)=>{throw x}` that unconditionally re-throws every value it's given, so parsing failed for every file regardless of content -- dropped it; JSON.parse needs no reviver here, we just want the plain parsed object. Same semantics as PowerShell's `var id = JSON.parse($json).taskId` except that one-line Node invocation gets redirected into a script context where the parsing logic has no top-level await so we wrap it in try-catch to swallow parse errors (which would otherwise crash this bash worker loop since the exit code non-zero terminates outer while).
         if [[ -n "$task_id" ]]; then                                            # guard: only mark success if some task id came back — same pattern as PowerShell's `$id = $result | ConvertTo-Json -Depth 3 | ... ; if ($null -ne $Id){...}; }'` conditional check that follows the data flow from parsing through to use.
           claim_succeeded=true                                                   # set to true only after successful extraction — mirrors what `try { $ok = true; ... } catch {}; if($ok)...` would do in PowerShell for same intent. We use explicit boolean assignment via string-true/strings-false rather than relying on exit codes being reliable because node's output can silently fail without non-zero exit code (e.g. malformed JSON that returns undefined taskId).
+        fi
+      fi
+
+      # Parallel Claude worker lane filter (see IS_CLAUDE_LANE's own comment above) --
+      # resolveSourceName() is the SAME function ornith-draft.js/apply-task.js already use
+      # to decide "is this an adhoc task", so this lane split can never disagree with what
+      # actually happens once a task is claimed. The Claude lane claims ONLY adhoc-shaped
+      # tasks; every other lane skips them, leaving them free for the Claude lane to pick
+      # up instead of racing for them.
+      if "$claim_succeeded"; then
+        resolved_source="$(echo "$parsed_payload" | node -e 'try{const {resolveSourceName}=require(process.argv[1]);const t=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(resolveSourceName(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-source-registry.js" 2>/dev/null)"
+        if "$IS_CLAUDE_LANE"; then
+          if [[ "$resolved_source" != "adhoc" ]]; then
+            claim_succeeded=false
+          fi
+        else
+          if [[ "$resolved_source" == "adhoc" ]]; then
+            claim_succeeded=false
+          fi
         fi
       fi
 

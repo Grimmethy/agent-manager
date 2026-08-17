@@ -51,6 +51,19 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   start_bg "worker-1" "${PID_DIR}/worker-1.pid" "${LOG_DIR}/worker-1.log" \
     bash "${SCRIPT_DIR}/ornith-worker.sh" worker-1
 
+  # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17) -- claims ONLY
+  # adhoc-shaped tasks (see ornith-worker.sh's own IS_CLAUDE_LANE comment), running
+  # independently of worker-1 so a multi-minute agentic Claude call never blocks Ornith's
+  # own throughput. Conditioned on CLAUDE_CODE_OAUTH_TOKEN the same way the apply loop
+  # below is conditioned on AGENT_MANAGER_INCLUDE_APPLY -- a deployment with no Claude
+  # subscription configured shouldn't spin up a lane that can only fail every tick.
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    start_bg "worker-claude" "${PID_DIR}/worker-claude.pid" "${LOG_DIR}/worker-claude.log" \
+      bash "${SCRIPT_DIR}/ornith-worker.sh" worker-claude
+  else
+    printf '[launch] CLAUDE_CODE_OAUTH_TOKEN is not set -- skipping the parallel Claude worker lane (adhoc tasks still get processed by worker-1, just serially).\n'
+  fi
+
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
     bash "${SCRIPT_DIR}/review-runner.sh" reviewer
 
