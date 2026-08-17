@@ -31,6 +31,10 @@
   .badge.bad { background: rgba(224,87,92,.15); color: var(--bad); }
   .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
   .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+  /* Brain Dump entry serial number -- a short, stable handle ("#12") to reference a
+     specific entry by in conversation instead of its long slugified id. Monospace so
+     digits stay visually distinct from the surrounding prose text they're prefixed to. */
+  .bd-serial { font-family: monospace; font-weight: 700; color: var(--accent); }
   /* Nav sidebar tab-count severity dot (harnss UI pattern, adapted 2026-07-26): a solid
      small circle, distinct from .badge's translucent pill -- a tiny dot needs a solid
      fill to read at a glance, especially next to a bare number in the nav rail. */
@@ -1658,8 +1662,10 @@ let brainDumpDiscussingId = null;
 let brainDumpDiscussSession = null;
 
 function renderBrainDumpEditCard(entry) {
+  const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span>` : '';
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      ${serialBadge ? `<div class="row meta" style="margin-bottom:4px">${serialBadge}</div>` : ''}
       <div class="capture-row" style="margin-bottom:0">
         <input data-edit-input="${escapeAttr(entry.id)}" value="${escapeAttr(entry.rawText)}">
       </div>
@@ -1936,10 +1942,11 @@ function renderBrainDumpCard(entry) {
   const meta = sort
     ? `${escapeHtml(sort.category || '')}${sort.tags && sort.tags.length ? ' &middot; ' + escapeHtml(sort.tags.join(', ')) : ''}`
     : new Date(entry.capturedAt).toLocaleString();
+  const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span> ` : '';
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
-        <span class="text">${escapeHtml(entry.rawText)}</span>
+        <span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span>
         ${statusBadge}
       </div>
       <div class="row meta">
@@ -1965,10 +1972,11 @@ function renderBrainDumpCard(entry) {
 // Reuses grill's .grill-transcript/.grill-msg-* CSS wholesale -- visually this IS the
 // same "chat transcript" shape, no reason for a second, near-identical set of classes.
 function renderBrainDumpDiscussCard(entry, session) {
+  const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span> ` : '';
   if (!session) {
     return `
       <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
-        <div class="row"><span class="text">${escapeHtml(entry.rawText)}</span></div>
+        <div class="row"><span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span></div>
         <div class="empty">Starting conversation...</div>
       </div>
     `;
@@ -1988,6 +1996,7 @@ function renderBrainDumpDiscussCard(entry, session) {
       `</div>`;
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
+      ${serialBadge ? `<div class="row meta" style="margin-bottom:4px">${serialBadge}</div>` : ''}
       <div class="grill-session">${bodyHtml}</div>
     </div>
   `;

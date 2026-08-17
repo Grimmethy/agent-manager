@@ -878,13 +878,36 @@ def api_summary():
     return jsonify(counts)
 
 
+def _assign_brain_dump_serials(entries: list) -> bool:
+    """Backfills a stable #N serial onto any entry that doesn't have one yet, so the
+    user has a short, stable handle to reference a specific entry by ("entry #12")
+    instead of its long slugified id. New entries get one at capture time (see
+    api_brain_dump_capture); this covers every entry that existed before that changed
+    and self-heals if brain-dump.json is ever hand-edited to drop the field. Assigns in
+    capturedAt order (oldest first) so backfilled numbers land in a sensible reading
+    order rather than dict/file order, continuing from whatever the current max already
+    is so a re-run never reassigns or collides with a number already handed out.
+    Returns True if anything changed, so the caller knows to persist it."""
+    missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
+    if not missing:
+        return False
+    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
+    for e in sorted(missing, key=lambda e: e.get("capturedAt") or ""):
+        e["serial"] = next_serial
+        next_serial += 1
+    return True
+
+
 def read_brain_dump_entries() -> list:
     path = brain_dump_path()
     if not path:
         return []
     data = read_json_safe(path)
     entries = data.get("entries") if isinstance(data, dict) else None
-    return entries if isinstance(entries, list) else []
+    entries = entries if isinstance(entries, list) else []
+    if _assign_brain_dump_serials(entries):
+        write_brain_dump_entries(entries)
+    return entries
 
 
 def write_brain_dump_entries(entries: list):
@@ -997,24 +1020,25 @@ def api_brain_dump_capture():
     if not text:
         abort(400, description="text is required")
 
-    path = brain_dump_path()
-    if not path:
+    if not brain_dump_path():
         abort(500, description="no active project configured")
 
-    data = read_json_safe(path)
-    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
-        data = {"entries": []}
+    # read_brain_dump_entries() backfills+persists a serial onto any pre-existing entry
+    # that doesn't already have one, so `entries` here is always fully migrated before
+    # next_serial is computed off it -- see _assign_brain_dump_serials()'s own header.
+    entries = read_brain_dump_entries()
+    next_serial = max((e.get("serial") or 0) for e in entries) + 1 if entries else 1
 
     entry_id = f"bd-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{slugify_for_id(text)}"
     entry = {
         "id": entry_id,
+        "serial": next_serial,
         "capturedAt": datetime.now(timezone.utc).isoformat(),
         "rawText": text,
         "status": "captured",
     }
-    data["entries"].append(entry)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    entries.append(entry)
+    write_brain_dump_entries(entries)
     return jsonify(entry)
 
 
