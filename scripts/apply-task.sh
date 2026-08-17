@@ -25,6 +25,30 @@ if [[ -z "${AGENT_MANAGER_REPO_ROOT:-}" ]]; then
   exit 64
 fi
 
+# Mutex: refuse to run if another apply-task.sh is already mid-apply. Confirmed live
+# 2026-08-17 (investigating a real queue/blocked/ backlog): every single apply-failed task
+# there showed the same symptom -- `git index.lock: File exists`, `fatal: branch 'agent/...'
+# already exists`, or a failed auto-stash -- and EVERY one of those already had a
+# successful queue/done/ copy of the same task id sitting right next to it. That's the
+# unmistakable signature of two apply-task.sh runs racing on the SAME shared git working
+# tree: one wins and reaches done/, the other trips over the first one's still-open
+# branch/index and gets misfiled into blocked/ as a "failure" that never actually was one.
+# This script's own header already documents manual re-runs (desktop shortcut) as expected
+# usage ALONGSIDE the launch.sh apply-task-loop daemon calling it every 30s -- exactly the
+# two callers that can race. flock on a fixed, well-known lockfile (not scoped to this
+# project's own pipelineDir, since the race is about the underlying git checkout /
+# ~/.local/state pidfile convention, not per-project state) makes a second concurrent run
+# exit immediately instead of fighting the first one for the same branch/index -- same
+# non-fatal-skip convention as everything else in this pipeline (this is a normal outcome
+# on a busy tick, not an error).
+LOCK_DIR="${HOME}/.local/state/agent-manager/locks"
+mkdir -p "$LOCK_DIR"
+exec 9>"${LOCK_DIR}/apply-task.lock"
+if ! flock -n 9; then
+  printf '[apply-task] another apply-task run is already in progress -- skipping this tick.\n'
+  exit 0
+fi
+
 PIPELINE_DIR="${AGENT_MANAGER_PIPELINE_DIR:-$AGENT_MANAGER_REPO_ROOT}"
 QUEUE_DIR="${PIPELINE_DIR}/queue"
 APPROVED_DIR="${QUEUE_DIR}/approved"
