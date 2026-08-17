@@ -1108,7 +1108,38 @@ function nextPathPrefetchResolveTask() {
     const resolveId = isHighReasoningRetry
       ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
       : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
-    if (taskIdExistsInQueue(resolveId)) continue;
+    if (taskIdExistsInQueue(resolveId)) {
+      // Self-heal a deadlock confirmed live 2026-08-17: a resolve task that gets rejected
+      // by REVIEW never reaches applyPathPrefetchResolve() at all, so the held task's own
+      // suggestionAttempted/highReasoningAttempted flag never gets stamped -- but if
+      // review-rejection retries (reject-retry-check.js's own generic 2-attempt cap,
+      // unrelated to this tier system) are exhausted first, the resolveId now permanently
+      // "exists" in queue/blocked/, so this loop refuses to ever regenerate it, while the
+      // held task's own flags still say "eligible", forever. Two real held tasks hit this
+      // exact deadlock (both attempt1-highreasoning resolve tasks exhausted at review),
+      // silently starving worker-claude of the only work it had left. If the existing
+      // resolveId reached a TERMINAL state (blocked/ or done/) without ever calling
+      // applyPathPrefetchResolve(), stamp the flag here instead of leaving it to that
+      // function alone, so this held task stops being offered (matches the "spent" outcome
+      // review-rejection-exhaustion already represents) and a human can pick it up via
+      // Discuss like any other exhausted case.
+      const heldPath = path.join(heldDir, f);
+      const resolveTerminalPath = ['blocked', 'done']
+        .map((state) => path.join(pipelineDir, 'queue', state, `${resolveId}.json`))
+        .find((p) => fs.existsSync(p));
+      if (resolveTerminalPath) {
+        const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
+        if (!held.needsClarification[flagKey]) {
+          held.needsClarification[flagKey] = true;
+          try {
+            fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
+          } catch {
+            // Non-fatal -- worst case this self-heal is retried next tick.
+          }
+        }
+      }
+      continue;
+    }
 
     // Same candidate universe path-prefetch.js's own deterministic pass already
     // searched -- the LLM fallback reasons over the exact same real files, not a
