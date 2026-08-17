@@ -703,7 +703,7 @@ function renderClarificationPicker(task) {
 function clarifyDiscussRenderPanel(taskId, session) {
   const el = document.getElementById('clarify-discuss-panel');
   if (!el) return;
-  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const transcriptHtml = grillRenderTranscript(session.transcript, session);
   if (session.status === 'ended') {
     const actionHtml = session.summary
       ? `<div class="grill-enriched-badge">Added to task ✓ -- re-queued for another resolution attempt with this context.</div>`
@@ -1973,7 +1973,7 @@ function renderBrainDumpDiscussCard(entry, session) {
       </div>
     `;
   }
-  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const transcriptHtml = grillRenderTranscript(session.transcript, session);
   const bodyHtml = session.status === 'ended'
     ? `${transcriptHtml}` +
       (session.summary
@@ -2192,9 +2192,14 @@ async function loadSecondBrainFile(filePath) {
   });
 }
 
-function grillRenderTranscript(transcript) {
+function grillRenderTranscript(transcript, session) {
+  // session.provider is only set on Discuss sessions ("local" or "claude" -- see
+  // discuss_sessions.py's PROVIDER_* comment); Grill Me sessions never set it and are
+  // always Ornith. Label the assistant turns for whichever model actually generated
+  // them instead of assuming Ornith unconditionally.
+  const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Ornith';
   const rows = transcript.map((t) => {
-    const roleLabel = t.role === 'assistant' ? 'Ornith' : 'You';
+    const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
     const cls = t.role === 'assistant' ? 'grill-msg-assistant' : 'grill-msg-user';
     return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${escapeHtml(t.text)}</div></div>`;
   }).join('');
@@ -2204,7 +2209,7 @@ function grillRenderTranscript(transcript) {
 function grillRenderPanel(session) {
   const el = document.getElementById('grill-panel');
   if (!el) return;
-  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const transcriptHtml = grillRenderTranscript(session.transcript, session);
   if (session.status === 'complete') {
     // grillEnrich refreshes the note-content readout in place automatically -- no manual
     // reload step needed (previously required navigating away and back, or a separate
@@ -2324,7 +2329,7 @@ async function grillEnrich(sessionId, btn) {
 function sbDiscussRenderPanel(session) {
   const el = document.getElementById('sb-discuss-panel');
   if (!el) return;
-  const transcriptHtml = grillRenderTranscript(session.transcript);
+  const transcriptHtml = grillRenderTranscript(session.transcript, session);
   if (session.status === 'ended') {
     const actionHtml = session.summary
       ? `<div class="grill-enriched-badge">Added to note ✓: ${escapeHtml(session.summary)}</div>`
@@ -2420,7 +2425,14 @@ async function sbDiscussEnd(sessionId, btn) {
 
 async function enterBrainDumpTab() {
   renderBrainDumpShell();
-  await refreshBrainDumpEntries();
+  // force=true -- brainDumpEditingId/brainDumpDiscussingId are module-level and outlive
+  // leaveBrainDumpTab() (by design, so an in-progress discussion survives a tab switch).
+  // An unforced call here would hit refreshBrainDumpEntries' own guard against those same
+  // flags and skip the list entirely on every return to this tab, appearing to hang
+  // indefinitely with no spinner (confirmed live 2026-08-17, see the brain-dump entry
+  // this fix closes out). The periodic poll below stays unforced on purpose -- that guard
+  // is still correct there, to keep a 5s tick from clobbering an open discussion/edit.
+  await refreshBrainDumpEntries(true);
   brainDumpEntriesInterval = setInterval(refreshBrainDumpEntries, 5000);
 }
 
