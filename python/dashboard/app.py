@@ -482,6 +482,19 @@ def get_active_repo_root() -> str | None:
     return read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_REPO_ROOT")
 
 
+def get_active_grep_dirs() -> str | None:
+    """Same env-then-file resolution as get_active_repo_root(), for the one other setting
+    Ornith's harness-mediated retrieval needs (discuss_sessions.py's
+    _ornith_harness_context) -- grep-codebase-tool.js/arch-import-fetch.js's own repoRoot-
+    relative search scope. Unset means grep_fetch_client falls back to the same
+    'frontend/src,backend/src' default src/config.js's getConfig() already uses for every
+    other AGENT_MANAGER_GREP_DIRS consumer."""
+    v = os.environ.get("AGENT_MANAGER_GREP_DIRS")
+    if v:
+        return v
+    return read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_GREP_DIRS")
+
+
 def get_pipeline_dir() -> Path | None:
     pipeline_dir = os.environ.get("AGENT_MANAGER_PIPELINE_DIR")
     if pipeline_dir:
@@ -1389,7 +1402,8 @@ def api_brain_dump_discuss_start(entry_id):
     from discuss_sessions import start_session
     provider, model, effort = _discuss_provider_args()
     session = _call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump",
-                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
+                             grep_dirs=get_active_grep_dirs())
     return jsonify(session)
 
 
@@ -1427,7 +1441,8 @@ def api_needs_clarification_discuss_start(task_id):
     from discuss_sessions import start_session
     provider, model, effort = _discuss_provider_args()
     session = _call_discuss(start_session, pipeline_dir, task_id, subject_text, kind="needs-clarification",
-                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
+                             grep_dirs=get_active_grep_dirs())
     return jsonify(session)
 
 
@@ -1545,7 +1560,8 @@ def api_second_brain_discuss_start():
     from discuss_sessions import start_session
     provider, model, effort = _discuss_provider_args(body)
     session = _call_discuss(start_session, root, note_path, note_content, kind="second-brain",
-                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root())
+                             provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
+                             grep_dirs=get_active_grep_dirs())
     return jsonify(session)
 
 
