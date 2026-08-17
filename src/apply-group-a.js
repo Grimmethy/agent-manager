@@ -397,6 +397,7 @@ function parseBrainDumpSortResult(implementResponse) {
     actionable: !!parsed.actionable,
     rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
     belongsToProject: parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null,
+    requiresResearch: !!parsed.requiresResearch,
   };
 }
 
@@ -505,7 +506,7 @@ function appendMarkdownLineAtomic(fullPath, line) {
   writeAtomicSync(fullPath, contents);
 }
 
-function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir }) {
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const { brainDumpEntryId, rawText } = task.promptContext;
 
   let data;
@@ -539,6 +540,44 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir);
   if (namingError) {
     return { skipped: true, reason: `rejected secondBrainPath "${result.secondBrainPath}": ${namingError} -- entry left as captured for retry` };
+  }
+
+  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
+  // change -- "investigate X, document findings" needs real web research, not a diff
+  // against any tracked project. Checked before matchedProject below since the two
+  // outcomes are mutually exclusive (the classifier prompt already tells the model never
+  // to set both), and a research task has nothing to do with belongsToProject at all.
+  if (result.requiresResearch) {
+    if (!pipelineDir) {
+      return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
+    }
+    const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+    const researchTask = {
+      id: queuedId,
+      domain: 'research',
+      source: 'research_task',
+      title: rawText.slice(0, 120),
+      promptContext: { rawText, brainDumpEntryId, secondBrainPath: result.secondBrainPath, tags: result.tags },
+    };
+    const researchDir = path.join(pipelineDir, 'queue', 'research');
+    fs.mkdirSync(researchDir, { recursive: true });
+    writeJsonAtomicSync(path.join(researchDir, `${queuedId}.json`), researchTask);
+
+    // Same audit-trail cross-reference convention the adhoc branch below already uses --
+    // an entry findable in the note it will eventually gain real content in, not the
+    // record of truth (brain-dump.json's queuedTaskId/queuedAt is that).
+    const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 10);
+    appendMarkdownLineAtomic(fullPath, `\n- **${stamp}** Queued as research task \`${queuedId}\` -- ${rawText}\n`);
+
+    entry.status = 'actioned';
+    entry.queuedTaskId = queuedId;
+    entry.queuedAt = new Date().toISOString();
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+
+    return { file: fullPath, category: result.category, queuedTaskId: queuedId, researchQueued: true };
   }
 
   const matchedProject = result.actionable && result.belongsToProject
@@ -775,6 +814,36 @@ function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
     : { skipped: true, reason: 'implement pass did not return a valid suggestion -- held task marked attempted, left for manual resolution' };
 }
 
+// Writes a research task's write-up into SecondBrain, once a human has confirmed it via
+// queue/awaiting-confirm/ (see apply-task.js's own gate for research tasks, mirroring the
+// existing adhoc-diff confirm gate). Registered as research_task's `apply` in
+// task-sources.js -- reached only after the confirm gate has already passed, same
+// ordering as applyAdhocDiff's own git-apply step.
+function applyResearchTask({ task, secondBrainDir }) {
+  const researchDoc = (task && task.researchDoc) || '';
+  if (!researchDoc.trim()) {
+    return { skipped: true, reason: 'task has no researchDoc -- nothing to file (should not normally be reachable, the confirm gate requires a non-empty researchDoc)' };
+  }
+  const secondBrainPath = task.promptContext && task.promptContext.secondBrainPath;
+  if (!secondBrainPath) {
+    return { skipped: true, reason: 'task has no promptContext.secondBrainPath -- do not know where to file this research' };
+  }
+  if (!secondBrainDir) {
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this research anywhere' };
+  }
+  const namingError = validateSecondBrainPath(secondBrainPath, secondBrainDir);
+  if (namingError) {
+    return { skipped: true, reason: `rejected secondBrainPath "${secondBrainPath}": ${namingError}` };
+  }
+
+  const fullPath = path.join(secondBrainDir, secondBrainPath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const stamp = new Date().toISOString().slice(0, 10);
+  appendMarkdownLineAtomic(fullPath, `\n## Research -- ${stamp}\n\n${researchDoc}\n`);
+
+  return { file: fullPath };
+}
+
 // Auto-closes a Brain Dump entry once agent-manager itself has actually resolved it
 // (Brain Dump #67) -- productionizes the exact manual step (hand-editing brain-dump.json
 // via a one-off script) a human/Claude session had been doing after every real fix this
@@ -825,4 +894,5 @@ module.exports = {
   applyPathPrefetchResolve,
   parsePathPrefetchResolveResult,
   closeBrainDumpEntryResolved,
+  applyResearchTask,
 };

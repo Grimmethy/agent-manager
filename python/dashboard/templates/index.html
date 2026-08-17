@@ -870,13 +870,19 @@ async function renderQueueTab(state) {
     // signal resolveSourceName() itself checks, cheap enough to duplicate client-side
     // rather than adding a field just for this label.
     const isAdhocConfirm = state === 'awaiting-confirm' && (t.domain === 'adhoc' || t.source === 'manual');
+    // A third thing this same shared gate/endpoint holds (Brain Dump #1 follow-up,
+    // 2026-08-17) -- a research task with a real agentic web-research write-up, same
+    // "check the task's own domain" signal as isAdhocConfirm above.
+    const isResearchConfirm = state === 'awaiting-confirm' && t.domain === 'research';
     const detailCell = t.needsClarification
       ? `<span style="color:var(--warn)">⚠ ${t.needsClarification.reason === 'ambiguous' ? 'ambiguous match' : 'no anchor match'}</span>`
       : isAdhocConfirm
         ? '<span style="color:var(--warn)">⚠ real code diff ready to apply</span>'
-        : state === 'awaiting-confirm'
-          ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
-          : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
+        : isResearchConfirm
+          ? '<span style="color:var(--warn)">📚 research write-up ready to file</span>'
+          : state === 'awaiting-confirm'
+            ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
+            : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
     return `
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       <td>${t.id}</td>
@@ -891,8 +897,8 @@ async function renderQueueTab(state) {
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
       </td>` : ''}
       ${showConfirmDeny ? `<td>
-        <button type="button" class="secondary task-confirm-delete-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}">${isAdhocConfirm ? 'Confirm & Apply' : 'Confirm Delete'}</button>
-        <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}">Deny</button>
+        <button type="button" class="secondary task-confirm-delete-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}" data-research="${isResearchConfirm}">${isAdhocConfirm ? 'Confirm & Apply' : isResearchConfirm ? 'Confirm & File' : 'Confirm Delete'}</button>
+        <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}" data-research="${isResearchConfirm}">Deny</button>
       </td>` : ''}
       ${showApply ? `<td><button type="button" class="secondary task-apply-btn" data-id="${escapeAttr(t.id)}">Apply</button></td>` : ''}
     </tr>
@@ -912,14 +918,18 @@ async function renderQueueTab(state) {
       : state === 'awaiting-confirm'
         ? (btn.dataset.adhoc === 'true'
           ? `Deny '${btn.dataset.id}'? This gives up on the drafted code diff entirely -- nothing will be committed.`
-          : `Deny the delete in '${btn.dataset.id}'? This gives up on the batch entirely -- nothing in it (including any non-delete items in the same batch) will be applied.`)
+          : btn.dataset.research === 'true'
+            ? `Deny '${btn.dataset.id}'? This gives up on the drafted research write-up entirely -- nothing will be filed into SecondBrain.`
+            : `Deny the delete in '${btn.dataset.id}'? This gives up on the batch entirely -- nothing in it (including any non-delete items in the same batch) will be applied.`)
         : `Archive '${btn.dataset.id}'? This frees up its underlying item for reconsideration but does not apply anything.`;
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'archive', msg); };
   });
   main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {
     const msg = btn.dataset.adhoc === 'true'
       ? `Confirm '${btn.dataset.id}'? Click into the row first to review the real diff this agentic pass drafted -- confirming lets the next apply pass commit and push it for real.`
-      : `Confirm the delete in '${btn.dataset.id}'? This lets the next apply pass run the batch for real, including the delete.`;
+      : btn.dataset.research === 'true'
+        ? `Confirm '${btn.dataset.id}'? Click into the row first to review the real research write-up this agentic pass drafted -- confirming lets the next apply pass file it into SecondBrain for real.`
+        : `Confirm the delete in '${btn.dataset.id}'? This lets the next apply pass run the batch for real, including the delete.`;
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'confirm', msg); };
   });
   main.querySelectorAll('.task-requeue-btn').forEach((btn) => {

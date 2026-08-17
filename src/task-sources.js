@@ -171,6 +171,56 @@ function nextAdhocTask() {
   return null;
 }
 
+// --- Source: research_task (Brain Dump #1 follow-up, 2026-08-17) -- notes brain_dump_sort
+// classified as requiresResearch land here (queue/research/), same shape as queue/adhoc/
+// but consumed by research-agentic-draft.js's WebSearch/WebFetch-backed agentic call
+// instead of adhoc-agentic-draft.js's code-repo one -- see task-source-registry.js's
+// registerTaskSource('research_task', ...) below.
+function nextResearchTask() {
+  const { pipelineDir } = getConfig();
+  const researchDir = path.join(pipelineDir, 'queue', 'research');
+  let entries;
+  try {
+    entries = fs.readdirSync(researchDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const files = entries
+    .filter((e) => e.isFile() && e.name.endsWith('.json'))
+    .map((e) => {
+      const full = path.join(researchDir, e.name);
+      return { full, mtime: fs.statSync(full).mtimeMs };
+    })
+    .sort((a, b) => a.mtime - b.mtime);
+
+  for (const f of files) {
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(f.full, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed.id !== 'string' || !parsed.id.trim()) continue;
+    const id = parsed.id.trim();
+    if (taskIdExistsInQueue(id)) continue;
+
+    // Only ever written by applyBrainDumpSort's requiresResearch branch, unlike
+    // queue/adhoc/ (which has several producers -- CLI, dashboard, brain_dump_sort) --
+    // trusted to already be shaped correctly, no need to reconstruct a fresh object from
+    // a handful of known-safe fields the way nextAdhocTask() does.
+    return {
+      id,
+      domain: 'research',
+      source: 'research_task',
+      title: parsed.title ?? `Research task: ${id}`,
+      promptContext: parsed.promptContext,
+    };
+  }
+
+  return null;
+}
+
 // --- Source: a project's own issue-tracker doc, entries flagged ready-for-agent (priority 20) --
 //
 // Only a hard body-length ceiling is auto-queued -- an oversized entry isn't narrow enough
@@ -1216,6 +1266,22 @@ function taskPriority(name, def) {
 // regardless of this registration -- kept here so the two can't drift apart (Brain Dump
 // #77's generalized tier filter, replacing the earlier adhoc-hardcoded bash check).
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high' });
+// research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
+// task" priority tier as adhoc, and reasoningTier: 'high' is UNCONDITIONAL (unlike
+// path_prefetch_resolve's two-tier design) -- Ornith has no web tools at all, so there is
+// no meaningful low-tier attempt to make. No `apply` registered here -- its target
+// (SecondBrain) is outside repoRoot and has nothing to do with the tracked code repo's
+// git state, the same "non-git write target" shape as secondbrain/brain_dump_sort/
+// project_search/path_prefetch_resolve above, all of which applyTask() intercepts
+// directly BEFORE writeArtifact() (the only thing that would ever read a registered
+// `apply`) is reached -- see apply-task.js's own research branch instead. (Unlike those,
+// still needs an explicit registerTaskSource() entry here since it's this package's own
+// new source, not an existing one being extended.)
+registerTaskSource('research_task', {
+  priority: taskPriority('research_task', 10),
+  next: nextResearchTask,
+  reasoningTier: 'high',
+});
 registerTaskSource('trouble_log', { priority: taskPriority('trouble_log', 20), next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), next: nextSecondBrainTask });
 // No `apply` key here, unlike arch_discovery/arch_import above -- writeArtifact() (called
@@ -1509,7 +1575,7 @@ module.exports = {
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
   nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
-  nextPathPrefetchResolveTask,
+  nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
@@ -1575,6 +1641,7 @@ if (require.main === module) {
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const draftingDir = path.join(pipelineDir, 'queue', 'drafting');
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const researchDir = path.join(pipelineDir, 'queue', 'research');
   // Checked pendingDir only until 2026-08-14 -- a claimed task moves OUT of pending/ into
   // drafting/<instanceId>/ within the same worker tick that claims it (see
   // ornith-worker.sh), well before the real plan/implement/critique work behind it is
@@ -1618,6 +1685,13 @@ if (require.main === module) {
   // everything else.
   const hasAdhocWaiting = fs.existsSync(adhocDir)
     && fs.readdirSync(adhocDir).some((f) => f.endsWith('.json'));
+
+  // Same exception, same reasoning, for research_task (priority 10, also "drop
+  // everything" -- see task-sources.js's own registerTaskSource('research_task', ...)):
+  // arrival is bounded by how often brain_dump_sort actually classifies a note as
+  // requiresResearch, same bounded-arrival argument as adhoc's own exemption above.
+  const hasResearchWaiting = fs.existsSync(researchDir)
+    && fs.readdirSync(researchDir).some((f) => f.endsWith('.json'));
 
   // Same exception, same reasoning, for brain_dump_sort (priority 42): confirmed live
   // 2026-07-25 that a sustained background backlog (e.g. the deep_dive rotation across
@@ -1712,7 +1786,7 @@ if (require.main === module) {
     });
   })();
 
-  if (alreadyPending && !hasAdhocWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
+  if (alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
     console.log('pending/ already has work queued, not adding another task');
   } else {
     const task = getNextTask({ tierFilter });
@@ -1723,6 +1797,9 @@ if (require.main === module) {
       console.log(`queued: ${file}`);
       if (task.domain === 'adhoc') {
         try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}
+      }
+      if (task.domain === 'research') {
+        try { fs.unlinkSync(path.join(researchDir, task.id + '.json')); } catch {}
       }
     }
   }
