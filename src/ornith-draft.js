@@ -42,6 +42,7 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor } = require('./model-provider.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
+const { resolveSourceName } = require('./task-source-registry.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -158,17 +159,23 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
-      // adhoc-domain tasks ("Process now" queues one of these regardless of task.source
-      // -- see task-source-registry.js's resolveSourceName()) implement via a real
-      // agentic Claude Code CLI call against an isolated git worktree instead of the
-      // blind JSON-diff implement pass below -- see adhoc-agentic-draft.js's own header
-      // (Brain Dump #67: formalize brain-dump processing inside the app itself, with real
-      // file access/test-running instead of a human doing it by hand outside the app).
-      // Critique+revision (below) is deliberately skipped for this branch: a blind
-      // text-completion "revision" of an already-real unified diff would almost
-      // certainly corrupt it (diffs are strict, line-based format; a freeform rewrite is
-      // not a safe way to edit one) -- this branch returns directly instead.
-      if (task.domain === 'adhoc') {
+      // adhoc-shaped tasks ("Process now" queues one of these -- see
+      // task-source-registry.js's resolveSourceName() for why this checks the SAME
+      // resolved name apply-task.js's own writeArtifact() dispatch uses, not a raw
+      // task.domain === 'adhoc' check: this project's own task-domains.json has both
+      // 'default' and 'adhoc' keys, and default_task_domain() prefers 'default', so a
+      // real "Process now" task here carries domain:'default' despite being adhoc-shaped
+      // in every other respect -- confirmed live 2026-08-17 testing this exact feature)
+      // implement via a real agentic Claude Code CLI call against an isolated git
+      // worktree instead of the blind JSON-diff implement pass below -- see
+      // adhoc-agentic-draft.js's own header (Brain Dump #67: formalize brain-dump
+      // processing inside the app itself, with real file access/test-running instead of
+      // a human doing it by hand outside the app). Critique+revision (below) is
+      // deliberately skipped for this branch: a blind text-completion "revision" of an
+      // already-real unified diff would almost certainly corrupt it (diffs are strict,
+      // line-based format; a freeform rewrite is not a safe way to edit one) -- this
+      // branch returns directly instead.
+      if (resolveSourceName(task) === 'adhoc') {
         const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
         if (!agenticResult.succeeded) {
           return { succeeded: false, reason: agenticResult.reason };

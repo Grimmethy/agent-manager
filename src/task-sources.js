@@ -16,6 +16,7 @@ const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
+const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { scanProject } = require('./observability-scan.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -1144,7 +1145,15 @@ function taskPriority(name, def) {
   }
 }
 
-registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask });
+// apply: applyAdhocDiff -- registered HERE, not via prompts.js's later updateTaskSource
+// call, same reasoning unused_export's own apply:applyVerdictOnly already established:
+// apply-task.js requires task-sources.js directly but never requires prompts.js at all,
+// so a custom apply attached only in prompts.js's updateTaskSource('adhoc', {...}) is
+// invisible to apply-task.js's own process -- confirmed live 2026-08-17 testing this
+// exact feature: drafting/review worked (both go through prompts.js), but apply fell
+// through to the generic Group B JSON-diff path and failed parsing a real unified diff
+// as JSON, every time, until this was moved here.
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff });
 registerTaskSource('trouble_log', { priority: taskPriority('trouble_log', 20), next: nextTroubleLogTask });
 registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), next: nextSecondBrainTask });
 // No `apply` key here, unlike arch_discovery/arch_import above -- writeArtifact() (called

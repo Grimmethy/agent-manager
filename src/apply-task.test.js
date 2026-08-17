@@ -282,6 +282,54 @@ test('a source with its own registered apply (e.g. brain_dump_sort) never hits t
   fs.rmSync(brainDumpPath, { force: true });
 });
 
+// --- awaiting-confirm gate: an adhoc task with a real agentic-drafted diff also holds
+// for human confirmation instead of touching git or disk (Brain Dump #67, 2026-08-17) --
+// confirmed live testing this exact feature that apply-task.sh applies EVERYTHING in
+// queue/approved/ unconditionally, so without this gate a real code change would land
+// and push with no human click at all -----------------------------------------------
+
+test('an adhoc task with a real rawDiff is held for confirmation and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ domain: 'adhoc', source: 'manual', rawDiff: 'diff --git a/x b/x\n', implementResponse: 'summary\n\n=== DIFF ===\ndiff --git a/x b/x\n' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  assert.match(result.reason, /agentic/);
+  assert.deepEqual(gitRunner.calls, []);
+});
+
+test('an adhoc task with an empty rawDiff (no-changes-needed) never hits the confirm gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ domain: 'adhoc', source: 'manual', rawDiff: '', adhocResolution: 'no-changes-needed', implementResponse: 'already resolved' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  // Falls through to applyAdhocDiff's own {skipped} branch instead -- nothing to confirm.
+  // The normal git-branch-diff sequence still runs fetch/reset/branch BEFORE writeArtifact
+  // is called (same as every other {skipped} outcome on a non-special-cased domain), then
+  // cleans the throwaway branch back up once it sees {skipped} -- no commit/push, though.
+  assert.equal(result.needsConfirmation, undefined);
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('commit'), 'a skipped (no-op) outcome must never commit');
+  assert.ok(!names.includes('push'), 'a skipped (no-op) outcome must never push');
+});
+
+test('adhocApplyConfirmedAt lets a previously-held adhoc diff proceed past the gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'adhoc', source: 'manual', rawDiff: 'diff --git a/x b/x\n', implementResponse: 'summary',
+    adhocApplyConfirmedAt: '2026-08-17T00:00:00.000Z',
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  // Past the confirm gate now -- resetToMain/createBranch ran, proving the gate didn't
+  // hold it again. (Fails at the real `git apply` step since REPO_ROOT here isn't a real
+  // git repo/matching diff -- applyAdhocDiff.test.js covers that path against real git.)
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
+});
+
 test('a fetchMain failure surfaces as a failure with no branch created', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'fetchMain', failMessage: 'network unreachable' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
