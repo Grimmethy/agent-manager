@@ -612,18 +612,35 @@ def api_queue_state(state):
 
     limit = request.args.get("limit", type=int)
     offset = request.args.get("offset", default=0, type=int)
+    source_filter = (request.args.get("source") or "").strip()
 
     entries = []
     total = 0
     state_dir = qdir / state
     if state_dir.is_dir():
         files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        total = len(files)
-        page = files[offset:offset + limit] if limit is not None else files[offset:]
-        for f in page:
-            data = read_json_safe(f)
-            if data:
-                entries.append(task_summary(data, f.stem))
+        if source_filter:
+            # Filtering by task type (Job Status > Done tab, 2026-08-17: "Done is getting
+            # huge, need to filter by task type") needs each file's own `source` field --
+            # unlike sorting, that's not derivable from the filename/mtime alone, so this
+            # reads every file in the state dir instead of just the requested page. Only
+            # pays that cost when a filter is actually selected; the default unfiltered
+            # request below keeps the cheap stat-only-sort-then-page-only-read behavior.
+            filtered = []
+            for f in files:
+                data = read_json_safe(f)
+                if data and data.get("source") == source_filter:
+                    filtered.append((f, data))
+            total = len(filtered)
+            page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
+            entries = [task_summary(data, f.stem) for f, data in page]
+        else:
+            total = len(files)
+            page = files[offset:offset + limit] if limit is not None else files[offset:]
+            for f in page:
+                data = read_json_safe(f)
+                if data:
+                    entries.append(task_summary(data, f.stem))
     return jsonify({"items": entries, "total": total})
 
 
@@ -2502,9 +2519,13 @@ def _restart_pipeline():
 def api_pipeline_start():
     """The Project tab's entry point. includeApply controls whether apply-runner.ps1 runs
     at all (False = nothing can touch the target repo's files or git history, the safest
-    setting); skipPush controls whether apply-runner is allowed to push approved commits
-    to the remote once it does run. Which job TYPES run is no longer chosen here -- see
-    /api/job-types, a top-level setting independent of which project this starts against."""
+    setting). skipPush no longer prevents pushing -- src/apply-task.js's applyTask() now
+    always pushes applied work regardless (an unpushed branch was a real durability risk,
+    confirmed live 2026-08-16/17: ~300 were silently lost to a bulk local branch cleanup
+    over time). What it still controls: whether the local checkout returns to main after
+    each apply, or stays on the applied branch for inspection. Which job TYPES run is no
+    longer chosen here -- see /api/job-types, a top-level setting independent of which
+    project this starts against."""
     if _pipeline_running():
         return jsonify({"started": False, "reason": "a pipeline is already running -- stop it first"}), 409
 

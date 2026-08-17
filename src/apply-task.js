@@ -32,6 +32,17 @@ ensureRegistered();
 // unused_export, etc.) never touches applyGroupB at all, so the delete gate has nothing to
 // check for those; only a source with no custom apply falls through to the generic Group B
 // JSON-change-object path.
+// arch_discovery/arch_import's apply is a low-risk, additive-only append to a
+// candidates-tracking doc -- never real application code (the actual code-writing
+// follow-up, arch_review/arch_import_review, goes through the normal branch+review
+// flow below like everything else). Confirmed live 2026-08-16: with every domain going
+// through the same throwaway agent/<task.id> branch + skipPush's "commit locally, stop
+// there" mode, these two domains' commits had nowhere durable to land -- ~311 such
+// branches were created over time, only 10 ever survived to be reviewed, and NONE had
+// ever reached main. See applyTask()'s own comment at the git-branch-diff flow for how
+// this set changes the sequence.
+const DIRECT_TO_MAIN_DOMAINS = new Set(['arch_discovery', 'arch_import']);
+
 function usesGroupB(task) {
   const source = getRegisteredSource(resolveSourceName(task));
   return !(source && typeof source.apply === 'function');
@@ -59,9 +70,12 @@ function writeArtifact(task, repoRoot, pipelineDir) {
  * @param {string} [config.deepDiveCoveragePath]
  * @param {string} [config.brainDumpPath]
  * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
- * @param {boolean} [config.skipPush] - "Implement" mode: commit locally on the new branch
- *   but don't push. Stays checked out on the branch (rather than returning to main) so the
- *   local working tree actually reflects the applied change for inspection.
+ * @param {boolean} [config.skipPush] - "Implement" mode. No longer skips the push itself
+ *   (see the git-branch-diff flow's own comment for why an unpushed branch is a
+ *   durability risk, not just an inspection nicety) -- the branch/direct-to-main commit
+ *   always gets pushed regardless. What this still controls: for the per-task-branch
+ *   path, stays checked out on the branch (rather than returning to main) so the local
+ *   working tree actually reflects the applied change for inspection.
  * @returns {{succeeded: boolean, branch?: string, pushed?: boolean, doneMarker?: string, reason?: string}}
  */
 function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
@@ -157,8 +171,12 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     gitRunner.fetchMain();
     gitRunner.resetToMain();
 
-    const branchName = `agent/${task.id}`;
-    gitRunner.createBranch(branchName);
+    // commitsDirectlyToMain domains skip the branch entirely (branchName stays null) --
+    // see DIRECT_TO_MAIN_DOMAINS' own header comment for why. Everything else keeps the
+    // normal throwaway agent/<id> branch.
+    const commitsDirectlyToMain = DIRECT_TO_MAIN_DOMAINS.has(task.domain);
+    const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
+    if (branchName) gitRunner.createBranch(branchName);
 
     let artifact;
     try {
@@ -171,13 +189,21 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       // internal rollback of its already-applied items (see apply-group-b.js) by the time
       // it reaches here -- this block is not, and was never sufficient as, the only
       // guarantee against a partial multi-file write surviving a mid-batch failure.
-      try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
+      if (branchName) {
+        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
+      } else {
+        // No branch to abandon -- just discard whatever partial write landed on main's
+        // own working tree so it can't ride along uncommitted into a later, unrelated apply.
+        try { gitRunner.resetToMain(); } catch (_) { /* best-effort cleanup */ }
+      }
       return { succeeded: false, reason: writeErr.message };
     }
 
     if (artifact && artifact.skipped) {
-      gitRunner.checkoutMain();
-      gitRunner.deleteBranch(branchName);
+      if (branchName) {
+        gitRunner.checkoutMain();
+        gitRunner.deleteBranch(branchName);
+      }
       return { succeeded: true, doneMarker: artifact.reason };
     }
 
@@ -202,26 +228,55 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       fs.unlinkSync(msgPath);
     }
 
-    // "Implement" mode: commit locally and stop there. Deliberately does NOT roll back or
-    // delete the branch on any later failure path the way the push branch below does --
-    // there's nothing after this to fail, and the whole point is to leave the applied
-    // branch/commit in place, checked out, for local inspection.
-    if (skipPush) {
-      return { succeeded: true, branch: branchName, pushed: false };
+    if (commitsDirectlyToMain) {
+      // Always pushes here, deliberately ignoring the global skipPush flag: unlike the
+      // branch path below (where "commit locally, stop there" just leaves a harmless
+      // unpushed branch for later inspection), a direct commit to main that's ahead of
+      // origin gets silently destroyed by the very next apply's resetToMain() hard
+      // reset -- leaving it unpushed would just recreate the exact data-loss bug this
+      // whole path exists to fix. These domains' apply is additive-only doc content
+      // that already passed the normal review gate before reaching here, so pushing
+      // without the extra skipPush gate is the same risk profile as any other approved
+      // task, not a new one.
+      try {
+        gitRunner.pushMain();
+      } catch (pushErr) {
+        // Deliberately NOT rolled back, unlike the branch path's push-failure rollback
+        // below: the commit is real, already-reviewed work. Discarding it here would
+        // recreate the loss this change exists to prevent. It stays local and goes out
+        // with whatever push succeeds next -- only a sustained, repeated push failure
+        // risks eventually losing it to a future resetToMain().
+        return { succeeded: false, reason: `push to main failed after commit succeeded (kept local, not rolled back): ${pushErr.message}` };
+      }
+      return { succeeded: true, branch: gitRunner.mainBranch, pushed: true };
     }
 
-    // A push failure here means the commit already succeeded -- a local branch with a
-    // real, un-pushed commit would otherwise be left behind silently, and no caller could
-    // tell this apart from a clean success (apply-runner.ps1 treats any non-throwing exit
-    // as authoritative). Roll back specifically on push failure, distinct from the
-    // write-failure cleanup above, so the failure is reported instead of orphaned.
+    // Always pushes the branch now, regardless of skipPush -- confirmed live
+    // 2026-08-16/17: an applied-but-unpushed agent/<id> branch is a real durability
+    // risk, not just an inspection convenience. It sits invisible (queue/done/ reports
+    // this task as succeeded either way, and nothing else in the dashboard
+    // distinguishes "done and actually reachable" from "done, only copy is a local
+    // branch"), and ~300 branches shaped exactly like this were eventually lost to a
+    // bulk local branch cleanup with no warning. Pushing doesn't merge anything or
+    // skip review -- the branch still needs a human (or arch_review/arch_import_
+    // review's own follow-up) to actually land it on main -- it just means the one
+    // copy of the applied work isn't purely local anymore. skipPush's only remaining
+    // effect is whether this returns to main afterward or stays checked out on the
+    // branch for local inspection -- that part of "Implement mode" is still worth
+    // keeping, since it's genuinely about convenience, not about hiding the change.
     try {
       gitRunner.push(branchName);
     } catch (pushErr) {
-      try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
-      return { succeeded: false, reason: `push failed after commit succeeded (rolled back): ${pushErr.message}` };
+      // Deliberately NOT rolled back, unlike the old behavior here: the commit is
+      // real work that already passed review. Deleting the branch because a push
+      // attempt failed would be strictly worse than leaving it local for a human (or
+      // a later retry) to push by hand -- same reasoning as the direct-to-main path
+      // above.
+      return { succeeded: false, branch: branchName, reason: `push failed after commit succeeded (kept local, not rolled back): ${pushErr.message}` };
     }
-    gitRunner.checkoutMain();
+    if (!skipPush) {
+      gitRunner.checkoutMain();
+    }
 
     return { succeeded: true, branch: branchName, pushed: true };
   } catch (e) {

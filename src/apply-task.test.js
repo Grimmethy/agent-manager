@@ -62,15 +62,17 @@ test('happy path: fetch/reset/branch/add/commit/push/checkout in order, succeeds
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 });
 
-test('skipPush ("Implement" mode): commits locally, never calls push or checkoutMain', () => {
+test('skipPush ("Implement" mode): still pushes the branch (durability), but stays checked out on it instead of returning to main', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, skipPush: true });
 
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
-  assert.equal(result.pushed, false);
+  assert.equal(result.pushed, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit']);
+  // push happens either way now; skipPush's only remaining effect is no checkoutMain
+  // afterward, so the branch stays checked out for local inspection.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('happy path (push enabled) reports pushed: true', () => {
@@ -79,22 +81,19 @@ test('happy path (push enabled) reports pushed: true', () => {
   assert.equal(result.pushed, true);
 });
 
-test('push failure after a successful commit rolls back instead of leaving an orphaned branch', () => {
+test('push failure after a successful commit keeps the branch instead of deleting real applied work', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'push', failMessage: 'remote: permission denied' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
   assert.equal(result.succeeded, false);
-  assert.match(result.reason, /push failed after commit succeeded \(rolled back\)/);
+  assert.equal(result.branch, 'agent/test-task-1');
+  assert.match(result.reason, /push failed after commit succeeded \(kept local, not rolled back\)/);
   assert.match(result.reason, /remote: permission denied/);
 
   const names = gitRunner.calls.map((c) => c.name);
-  // commit happened (it succeeded) BEFORE the push attempt, and cleanup (checkoutMain +
-  // deleteBranch) happened AFTER push failed -- this is the exact sequence the report
-  // flagged as missing: "if push throws here, commit already succeeded -- no cleanup".
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain', 'deleteBranch']);
-
-  const deleteBranchCall = gitRunner.calls.find((c) => c.name === 'deleteBranch');
-  assert.equal(deleteBranchCall.args[0], 'agent/test-task-1');
+  // commit happened, push was attempted and failed -- no checkoutMain/deleteBranch:
+  // the branch and its real commit are deliberately left in place, not discarded.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('artifact write failure rolls back the branch before any add/commit/push', () => {
@@ -106,6 +105,113 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   assert.equal(result.succeeded, false);
   const names = gitRunner.calls.map((c) => c.name);
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'checkoutMain', 'deleteBranch']);
+});
+
+// --- arch_discovery/arch_import: direct-to-main path (no throwaway branch) --------------
+// Confirmed live 2026-08-16: the old branch-per-task flow left ~301 of ~311 real applied
+// candidates stranded on branches nobody ever merged. These two domains commit straight
+// onto main instead and push immediately, ignoring skipPush -- see DIRECT_TO_MAIN_DOMAINS'
+// own header comment in apply-task.js for the full reasoning.
+
+function archDiscoveryTask(overrides = {}) {
+  return baseTask({
+    domain: 'arch_discovery',
+    source: 'arch_discovery',
+    implementResponse: [
+      '### AC-1 · Example candidate',
+      'Strength: Strong',
+      'Files: foo.js',
+      '',
+      'Problem: ...',
+      'Solution: ...',
+    ].join('\n'),
+    ...overrides,
+  });
+}
+
+test('arch_discovery: commits straight to main, no branch, pushes immediately even without skipPush set', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.pushed, true);
+  assert.equal(result.branch, gitRunner.mainBranch);
+  const names = gitRunner.calls.map((c) => c.name);
+  // No createBranch, no checkoutMain, no deleteBranch -- pushMain instead of push(branch).
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+});
+
+test('arch_discovery: still pushes even when skipPush is true -- an unpushed direct-to-main commit would be destroyed by the next resetToMain()', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, skipPush: true });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.pushed, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('pushMain'));
+});
+
+test('arch_discovery: push failure keeps the commit local instead of rolling it back (there is no branch to roll back)', () => {
+  const gitRunner = createFakeGitRunner({ failOn: 'pushMain', failMessage: 'remote: connection reset' });
+  const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.match(result.reason, /push to main failed after commit succeeded \(kept local, not rolled back\)/);
+  assert.match(result.reason, /remote: connection reset/);
+  const names = gitRunner.calls.map((c) => c.name);
+  // commit already happened and is deliberately left in place -- no checkoutMain/deleteBranch.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+});
+
+test('arch_discovery: artifact write failure resets main instead of trying to delete a branch that was never created', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = archDiscoveryTask({ implementResponse: 'not valid arch-discovery markdown' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  // No AC-N heading in the response -> parseArchDiscoveryCandidates returns [] ->
+  // applyArchDiscoveryCandidates returns {skipped: true}, not a thrown error -- exercises
+  // the *skipped* path, distinct from the write-throws path covered by the next test.
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain']);
+});
+
+test('arch_import: a genuinely thrown write error resets main again for cleanup (called twice: once up front, once in the catch)', () => {
+  const gitRunner = createFakeGitRunner();
+  // No promptContext at all -> applyArchImportCandidate's destructuring of
+  // task.promptContext throws a real TypeError, distinct from the "no candidates,
+  // cleanly skipped" case covered by the arch_discovery test above.
+  const task = baseTask({ domain: 'arch_import', source: 'arch_import', implementResponse: '### AC-1 · X\nStrength: Strong\n\nbody' });
+  delete task.promptContext;
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'resetToMain']);
+});
+
+test('arch_import: same direct-to-main shape as arch_discovery (both domains share DIRECT_TO_MAIN_DOMAINS)', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'arch_import',
+    source: 'arch_import',
+    promptContext: { itemId: 'item-1', sourceProject: 'some-external-repo' },
+    implementResponse: [
+      '### AC-1 · Example import candidate',
+      'Strength: Strong',
+      'Source: some-external-repo',
+      'Files: foo.js',
+      '',
+      'Problem: ...',
+      'Solution: ...',
+    ].join('\n'),
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.pushed, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 // --- awaiting-confirm gate: a Group B batch containing a delete holds for human
