@@ -1049,6 +1049,40 @@ def api_task_resolve_clarification(task_id):
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
+@app.route("/api/task/needs-clarification/<task_id>/done", methods=["POST"])
+def api_task_mark_done_clarification(task_id):
+    """Manual "mark as done" for a held needs-clarification task (Job Status > Needs
+    Clarification, 2026-08-17: "I found entries here that have been fully resolved"): unlike
+    Reject/archive above, which files it under done/_archived_no_action/ (a nested folder
+    api_queue_state() never lists, and taskIdExistsInQueue() never checks, so the underlying
+    item is silently freed up for reconsideration), this writes queue/done/<id>.json directly
+    -- the same path a real apply-pass completion uses -- so it shows up in the Done tab and
+    taskIdExistsInQueue() correctly treats it as already handled, matching what the user is
+    telling us: the work is genuinely finished, not merely dismissed."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / "needs-clarification" / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data["doneMarker"] = "manually marked done from Needs Clarification"
+    data.setdefault("history", []).append({
+        "status": "done", "at": now_iso, "note": "manually marked done from needs-clarification/",
+    })
+
+    done_dir = qdir / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    dest = done_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in done/")
+    dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "done": True})
+
+
 @app.route("/api/task/approved/<task_id>/apply", methods=["POST"])
 def api_task_apply(task_id):
     """Manual per-task apply (three-tier approval mode, 2026-07-26): the missing piece that
