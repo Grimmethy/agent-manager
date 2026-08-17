@@ -66,6 +66,13 @@
   .task-history-row { font-size: 12px; padding: 3px 0; }
   .task-history-stage { font-family: monospace; font-weight: 600; }
   .task-history-row .meta { display: inline; }
+  /* Base state (Ornith) also gets its own look, not just the Claude state -- previously
+     only .provider-toggle-claude had a distinct color, so the default Ornith state was
+     visually identical to a plain .secondary button (Discuss/Edit/Delete), which is how
+     a Discuss session got started against the wrong provider without anyone noticing
+     (confirmed live 2026-08-17: a human-simulated test clicked Discuss right past it).
+     Both states now read as "this is a mode switch," not "this is another action". */
+  .provider-toggle { border-color: var(--muted); }
   .provider-toggle-claude { background: var(--accent); color: #0b1220; border-color: var(--accent); }
   #toast { position: fixed; bottom: 20px; right: 20px; max-width: 420px; padding: 10px 16px; border-radius: 8px; font-size: 13px; line-height: 1.4; box-shadow: 0 4px 16px rgba(0,0,0,.35); z-index: 9999; opacity: 0; pointer-events: none; transform: translateY(8px); transition: opacity .15s ease, transform .15s ease; }
   #toast.show { opacity: 1; transform: translateY(0); }
@@ -503,11 +510,15 @@ function showToast(message, kind = 'error') {
 
 const providerChoices = {};
 
+// Label says "Ornith", not "Local" -- naming the actual model instead of its deployment
+// mode reads as a real choice between two named things, not a vague default vs. an
+// override (see this function's CSS comment for the same "make it read as a switch, not
+// a stray button" fix applied to the styling).
 function renderProviderToggle(idAttr) {
   const provider = providerChoices[idAttr] || 'local';
   const claudeClass = provider === 'claude' ? ' provider-toggle-claude' : '';
-  const label = provider === 'claude' ? 'Claude' : 'Local';
-  return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Local Ornith vs. your Claude subscription -- click to switch">${label}</button>`;
+  const label = provider === 'claude' ? 'Claude' : 'Ornith';
+  return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Ornith (local model) vs. your Claude subscription -- click to switch">${label}</button>`;
 }
 
 function wireProviderToggle(idAttr) {
@@ -518,7 +529,7 @@ function wireProviderToggle(idAttr) {
     const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
     providerChoices[idAttr] = next;
     btn.dataset.provider = next;
-    btn.textContent = next === 'local' ? 'Local' : 'Claude';
+    btn.textContent = next === 'local' ? 'Ornith' : 'Claude';
     btn.classList.toggle('provider-toggle-claude', next === 'claude');
   };
 }
@@ -2095,9 +2106,14 @@ function wireBrainDumpCardHandlers(el) {
   }
 }
 
-// Don't silently start a second conversation next to one already sitting there for this
-// entry -- same "surface existing work instead of burying it" reasoning as
-// grillStartSession's own existing-session check.
+// Resume an in-progress conversation instead of silently starting a second one next to
+// it. A past ENDED discussion doesn't get the same guard -- it's kept either way (never
+// deleted), so blocking on a confirm() here protected nothing, just added a click, and
+// a native confirm() dialog freezes ALL page script execution for as long as it's up,
+// which looks exactly like a hung page to anything driving the browser programmatically
+// (e.g. claude-in-chrome: screenshot/get_page_text calls timed out for 45s+ against a
+// perfectly healthy server -- confirmed live 2026-08-17). A toast surfaces the same
+// "your old discussion is still there" info without blocking anything.
 async function brainDumpDiscussStart(entryId) {
   // Read the toggle BEFORE any re-render below -- refreshBrainDumpEntries() redraws
   // this entry's card (including a freshly-defaulted-to-"local" toggle button), so
@@ -2112,9 +2128,7 @@ async function brainDumpDiscussStart(entryId) {
       return;
     }
     if (existing && existing.status === 'ended') {
-      if (!confirm(`This entry already has a past discussion (${existing.transcript.length} messages). Start a new one anyway? (The old one is kept, not deleted.)`)) {
-        return;
-      }
+      showToast(`Starting a new discussion -- the previous one (${existing.transcript.length} messages) is kept, not deleted.`);
     }
   } catch (e) { /* best-effort check -- fall through to starting normally */ }
 
