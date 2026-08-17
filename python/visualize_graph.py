@@ -174,6 +174,27 @@ FILL_ANCESTOR_HEIGHT_CSS = f"<style>{_read_asset('fill-ancestor-height.css')}</s
 COMMUNITY_DRAG_TOGGLE_HTML = _read_asset("community-drag-toggle.html")
 CROSSING_CHECK_BADGE_HTML = _read_asset("crossing-check-badge.html")
 AUTOSORT_TOGGLE_HTML = _read_asset("autosort-toggle.html")
+LEGEND_PANEL_HTML = _read_asset("legend-panel.html")
+
+
+def _build_legend_html(nodes: list[dict], names_by_id: dict) -> str:
+    """One row per community actually present in this graph -- color swatch (same
+    PALETTE lookup as each node's own color) plus its coverage-data name (same fallback-
+    to-bare-id as each node's own hover title, so the legend and the tooltips never
+    disagree) and a file count. Sorted by count descending -- the communities someone is
+    most likely to want to identify at a glance are the ones with the most dots."""
+    by_community = _group_by_community(nodes)
+    rows = []
+    for community_id, members in sorted(by_community.items(), key=lambda kv: len(kv[1]), reverse=True):
+        color = PALETTE[community_id % len(PALETTE)]
+        name = names_by_id.get(community_id, community_id)
+        rows.append(
+            f'<div style="display:flex;align-items:center;gap:6px;padding:3px 0;">'
+            f'<span style="flex:0 0 10px;width:10px;height:10px;border-radius:50%;background:{color};"></span>'
+            f'<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{name} ({len(members)} files)">{name} ({len(members)})</span>'
+            f'</div>'
+        )
+    return "".join(rows)
 
 
 def render_html(graph_data: dict, coverage_data: dict | None = None, positions: dict | None = None, project_path: str | None = None, grep_dirs: list[str] | None = None) -> str:
@@ -302,6 +323,16 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
 
     html = net.generate_html(notebook=False)
     html = html.replace("</head>", FILL_ANCESTOR_HEIGHT_CSS + "</head>")
+
+    # Runs unconditionally (no project_path/grepDirs placeholders needed, just graph_data
+    # already in scope) -- same reasoning as the crossing-check script below: a
+    # CLI-rendered file with no project_path still gets a legend. Placed as a direct
+    # child of <body>, sibling to .card -- fill-ancestor-height.css's own body{display:
+    # flex} rule is what actually makes it claim real width instead of overlapping the
+    # network, unlike every other injected overlay here (position:fixed, so flow order
+    # doesn't matter for those).
+    legend_html = LEGEND_PANEL_HTML.replace("__LEGEND_ROWS__", _build_legend_html(graph_data["nodes"], names_by_id))
+    html = html.replace("</body>", legend_html + "</body>", 1)
 
     encoded_grep_dirs = quote(",".join(grep_dirs or []), safe="")
 

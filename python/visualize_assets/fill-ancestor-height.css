@@ -6,3 +6,12 @@
    redundant scrollbar on top of it). */
 html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
 .card { height: 100%; }
+
+/* Brain-dump entry, 2026-08-17: "The graph is far too wide... use that remaining space
+   for a legend or key." pyvis's own .card sets width:100% INLINE (highest-specificity
+   short of !important, so a plain override here would lose to it) -- body becomes a flex
+   row so .card and the sibling #am-legend panel (see legend-panel.html) share the width
+   instead of the network claiming all of it. .card's own height:100% rule above still
+   applies unchanged. */
+body { display: flex; flex-direction: row; }
+.card { width: auto !important; flex: 1 1 0; min-width: 0; }
