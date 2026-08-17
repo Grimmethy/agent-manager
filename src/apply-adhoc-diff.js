@@ -1,0 +1,62 @@
+'use strict';
+
+// Custom apply for the adhoc source (Brain Dump #67) -- registered via
+// updateTaskSource('adhoc', { apply: applyAdhocDiff }) in prompts.js, the same
+// per-source extension point arch_discovery/arch_import/unused_export already use (see
+// apply-task.js's writeArtifact()). Unlike every other Group A/B writer, there is no
+// content to WRITE here -- adhoc-agentic-draft.js already produced a real unified diff
+// (task.rawDiff) by editing an isolated git worktree directly; this function's only job
+// is landing that diff onto the real repoRoot apply-task.js has already fetched/reset/
+// branched by the time this runs.
+//
+// task.rawDiff empty (adhoc-agentic-draft.js's agentic call decided nothing needed to
+// change, or something went wrong upstream) -- skipped, same {skipped, reason} shape
+// apply-task.js already handles for applyBrainDumpSort/applyProjectSearchFindings/etc.
+// Deliberately NOT gated on task.adhocResolution's own claim -- an empty diff always
+// means "nothing to apply" regardless of what the model said, and a non-empty diff
+// always goes through the normal git-apply + human-gated Apply click regardless of what
+// the model said. See adhoc-agentic-draft.js's own comment on this.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
+const GIT_TIMEOUT_MS = 60_000;
+
+function applyAdhocDiff({ task, repoRoot }) {
+  const rawDiff = (task && task.rawDiff) || '';
+  if (!rawDiff.trim()) {
+    const reason = task && task.adhocResolution === 'no-changes-needed'
+      ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
+      : 'adhoc agentic draft produced no diff';
+    return { skipped: true, reason };
+  }
+
+  const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
+  fs.writeFileSync(patchPath, rawDiff.endsWith('\n') ? rawDiff : `${rawDiff}\n`);
+  try {
+    // --numstat lists touched files without needing the patch already applied -- run
+    // first so a malformed patch fails via the SAME `git apply` error path either way
+    // (numstat also validates the patch parses, though not that it applies cleanly).
+    const numstat = execFileSync('git', ['apply', '--numstat', patchPath], {
+      cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
+    });
+    const files = numstat.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.split('\t').pop());
+    if (files.length === 0) {
+      throw new Error('git apply --numstat reported no files touched by this diff');
+    }
+
+    execFileSync('git', ['apply', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+
+    return { files };
+  } catch (e) {
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    throw new Error(`git apply failed: ${detail}`);
+  } finally {
+    try { fs.unlinkSync(patchPath); } catch (_) { /* best-effort cleanup */ }
+  }
+}
+
+module.exports = { applyAdhocDiff };

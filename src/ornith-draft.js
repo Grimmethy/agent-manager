@@ -41,6 +41,7 @@ const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor } = require('./model-provider.js');
+const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -56,7 +57,7 @@ function writeTaskJson(taskPath, task) {
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
-async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall } = {}) {
+async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement } = {}) {
   // Resolved here rather than as a static default param: the right backend depends on
   // task.source, which isn't known until the task object itself is in hand. Explicit
   // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
@@ -155,6 +156,31 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         task.promptContext.harnessHits = harnessHits;
         task.promptContext.harnessFiles = harnessFiles;
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      }
+
+      // adhoc-domain tasks ("Process now" queues one of these regardless of task.source
+      // -- see task-source-registry.js's resolveSourceName()) implement via a real
+      // agentic Claude Code CLI call against an isolated git worktree instead of the
+      // blind JSON-diff implement pass below -- see adhoc-agentic-draft.js's own header
+      // (Brain Dump #67: formalize brain-dump processing inside the app itself, with real
+      // file access/test-running instead of a human doing it by hand outside the app).
+      // Critique+revision (below) is deliberately skipped for this branch: a blind
+      // text-completion "revision" of an already-real unified diff would almost
+      // certainly corrupt it (diffs are strict, line-based format; a freeform rewrite is
+      // not a safe way to edit one) -- this branch returns directly instead.
+      if (task.domain === 'adhoc') {
+        const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
+        if (!agenticResult.succeeded) {
+          return { succeeded: false, reason: agenticResult.reason };
+        }
+        if (agenticResult.blocked) {
+          appendHistoryEvent(task, 'blocked', agenticResult.blockedReason);
+          return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
+        }
+        appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+        task.status = 'needs-review';
+        appendHistoryEvent(task, 'needs-review');
+        return { succeeded: true, blocked: false };
       }
 
       const implPrompt = buildImplementPrompt(task, task.planResponse);

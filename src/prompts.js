@@ -11,6 +11,7 @@
 // buildImplementPrompt. require('./task-sources.js') below is loaded purely for its side
 // effect of populating the registry with this package's 10 built-in sources.
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
+const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 require('./task-sources.js');
 
 function truncate(str, max) {
@@ -671,7 +672,15 @@ updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, b
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
 updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolvePlanPrompt, buildImplementPrompt: pathPrefetchResolveImplementPrompt });
-updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
+// apply here is applyAdhocDiff (Brain Dump #67), NOT the generic Group B JSON-diff path
+// -- ornith-draft.js's draftTask() now bypasses buildPlanPrompt/buildImplementPrompt's
+// generic implement pass for domain:'adhoc' entirely in favor of a real agentic
+// implement (adhoc-agentic-draft.js), which produces a real unified diff (task.rawDiff)
+// instead of a JSON-instructions blob. buildImplementPrompt/adhocImplementPrompt stay
+// registered regardless -- still a real, generic dispatch target (see this file's own
+// CLI entry point at the bottom), just no longer reachable from the adhoc production
+// path specifically.
+updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt, apply: applyAdhocDiff });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
 updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
