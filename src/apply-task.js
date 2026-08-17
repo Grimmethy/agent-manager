@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -79,6 +79,27 @@ function writeArtifact(task, repoRoot, pipelineDir) {
  *   working tree actually reflects the applied change for inspection.
  * @returns {{succeeded: boolean, branch?: string, pushed?: boolean, doneMarker?: string, reason?: string}}
  */
+// Auto-closes the originating Brain Dump entry once an adhoc task is actually resolved
+// (Brain Dump #67) -- productionizes the manual hand-editing step a human/Claude session
+// had been doing after every real fix landed this way. Only fires for domain:'adhoc'
+// (the agentic-implement path, adhoc-agentic-draft.js, is the only one that stamps
+// task.rawDiff/task.adhocResolution) with a brainDumpEntryId ("Process now" stamps this;
+// a raw queue-adhoc-task.js CLI task submitted with no brain-dump origin has none, and
+// correctly has nothing to close here). Best-effort -- see closeBrainDumpEntryResolved's
+// own header for why a missing/already-mutated entry is not an apply failure.
+function closeOriginatingBrainDumpEntry(task, brainDumpPath, note) {
+  if (task.domain !== 'adhoc') return;
+  const brainDumpEntryId = task.promptContext && task.promptContext.brainDumpEntryId;
+  if (!brainDumpEntryId) return;
+  try {
+    closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note });
+  } catch (e) {
+    // Never let bookkeeping failure turn a real, already-applied fix into a reported
+    // apply failure -- same "recording shouldn't break the real feature" contract
+    // model_stats_client.py's own header states for its own best-effort writes.
+  }
+}
+
 function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
   try {
     if (task.domain === 'secondbrain') {
@@ -205,6 +226,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         gitRunner.checkoutMain();
         gitRunner.deleteBranch(branchName);
       }
+      closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { succeeded: true, doneMarker: artifact.reason };
     }
 
@@ -279,6 +301,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       gitRunner.checkoutMain();
     }
 
+    closeOriginatingBrainDumpEntry(task, brainDumpPath, `Implemented and pushed to branch ${branchName} -- Task: ${task.id}`);
     return { succeeded: true, branch: branchName, pushed: true };
   } catch (e) {
     const reason = e.stderr ? e.stderr.toString() : e.message;

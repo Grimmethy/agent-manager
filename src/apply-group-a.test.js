@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyArchImportCandidate, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -741,4 +741,36 @@ test('applyPathPrefetchResolve skips cleanly (with a clear reason) when promptCo
   const result = applyPathPrefetchResolve({ implementResponse: '{}', task: { promptContext: {} }, pipelineDir });
   assert.equal(result.skipped, true);
   assert.match(result.reason, /heldTaskId/);
+});
+
+test('closeBrainDumpEntryResolved marks the entry actioned with a note and timestamp', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'close-brain-dump-test-'));
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const result = closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId: 'bd-1', note: 'Implemented and pushed to branch agent/task-1' });
+
+  assert.equal(result.closed, true);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'actioned');
+  assert.equal(entries[0].resolvedNote, 'Implemented and pushed to branch agent/task-1');
+  assert.ok(entries[0].resolvedAt);
+});
+
+test('closeBrainDumpEntryResolved skips cleanly when the entry no longer exists', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'close-brain-dump-test-'));
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const result = closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId: 'no-such-id', note: 'x' });
+
+  assert.equal(result.skipped, true);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'captured'); // untouched
+});
+
+test('closeBrainDumpEntryResolved skips cleanly when brainDumpEntryId is missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'close-brain-dump-test-'));
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const result = closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId: null, note: 'x' });
+  assert.equal(result.skipped, true);
 });

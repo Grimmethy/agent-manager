@@ -82,7 +82,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -134,7 +134,11 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   try {
     stdout = execFileSync(CLAUDE_BIN, args, {
       encoding: 'utf8',
-      timeout: REQUEST_TIMEOUT_MS,
+      // timeoutMs lets a caller running a genuinely long agentic session (real
+      // Read/Grep/Glob/Edit/Write/Bash investigation + implementation + test runs, not
+      // this module's usual single-completion call) override the 300s default sized for
+      // that ordinary case -- see adhoc-agentic-draft.js, the first caller that needs it.
+      timeout: timeoutMs || REQUEST_TIMEOUT_MS,
       maxBuffer: 32 * 1024 * 1024,
       cwd: workDir,
       env: buildChildEnv(),

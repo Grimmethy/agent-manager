@@ -765,6 +765,39 @@ function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
     : { skipped: true, reason: 'implement pass did not return a valid suggestion -- held task marked attempted, left for manual resolution' };
 }
 
+// Auto-closes a Brain Dump entry once agent-manager itself has actually resolved it
+// (Brain Dump #67) -- productionizes the exact manual step (hand-editing brain-dump.json
+// via a one-off script) a human/Claude session had been doing after every real fix this
+// pipeline made to its own repo. Called from apply-task.js after a successful adhoc
+// commit+push, AND from applyAdhocDiff's own {skipped} no-change-needed outcome (see
+// apply-adhoc-diff.js) -- either way, "resolved" here means the agentic implement pass
+// (adhoc-agentic-draft.js) already decided the entry's underlying request is done, not
+// that code necessarily changed.
+//
+// Best-effort like applyBrainDumpSort above: a missing/already-mutated entry is not an
+// error, just nothing to close (the entry may have been deleted or hand-edited since
+// this task was drafted).
+function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {
+  if (!brainDumpPath || !brainDumpEntryId) return { skipped: true, reason: 'no brainDumpPath/brainDumpEntryId to close' };
+
+  let data;
+  try {
+    data = JSON.parse(fs.existsSync(brainDumpPath) ? fs.readFileSync(brainDumpPath, 'utf8') : '{"entries":[]}');
+  } catch {
+    return { skipped: true, reason: 'brain-dump.json unreadable -- not closing anything' };
+  }
+  if (!Array.isArray(data.entries)) return { skipped: true, reason: 'brain-dump.json has no entries array' };
+
+  const entry = data.entries.find((e) => e && e.id === brainDumpEntryId);
+  if (!entry) return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists` };
+
+  entry.status = 'actioned';
+  entry.resolvedNote = note;
+  entry.resolvedAt = new Date().toISOString();
+  writeJsonAtomicSync(brainDumpPath, data);
+  return { closed: true, entryId: brainDumpEntryId };
+}
+
 module.exports = {
   applySecondBrainNote,
   applyProjectSearchFindings,
@@ -781,4 +814,5 @@ module.exports = {
   validateSecondBrainPath,
   applyPathPrefetchResolve,
   parsePathPrefetchResolveResult,
+  closeBrainDumpEntryResolved,
 };
