@@ -191,7 +191,7 @@ def _build_legend_html(nodes: list[dict], names_by_id: dict) -> str:
         rows.append(
             f'<div style="display:flex;align-items:center;gap:6px;padding:3px 0;">'
             f'<span style="flex:0 0 10px;width:10px;height:10px;border-radius:50%;background:{color};"></span>'
-            f'<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{name} ({len(members)} files)">{name} ({len(members)})</span>'
+            f'<span style="overflow-wrap:break-word;" title="{name} ({len(members)} files)">{name} ({len(members)})</span>'
             f'</div>'
         )
     return "".join(rows)
