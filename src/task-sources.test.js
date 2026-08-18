@@ -348,7 +348,7 @@ test('nextResearchTask returns the oldest eligible task, correctly shaped', () =
 test('nextResearchTask does not re-offer a task already claimed/in-flight elsewhere in the queue', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   writeResearchTaskFile(dir, 'research-brain-dump-bd-1-1000');
-  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-claude');
+  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-reasoning');
   fs.mkdirSync(draftingDir, { recursive: true });
   fs.writeFileSync(path.join(draftingDir, 'research-brain-dump-bd-1-1000.json'), '{}');
 

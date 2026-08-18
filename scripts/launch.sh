@@ -58,8 +58,8 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   # below is conditioned on AGENT_MANAGER_INCLUDE_APPLY -- a deployment with no Claude
   # subscription configured shouldn't spin up a lane that can only fail every tick.
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    start_bg "worker-claude" "${PID_DIR}/worker-claude.pid" "${LOG_DIR}/worker-claude.log" \
-      bash "${SCRIPT_DIR}/ornith-worker.sh" worker-claude
+    start_bg "worker-reasoning" "${PID_DIR}/worker-reasoning.pid" "${LOG_DIR}/worker-reasoning.log" \
+      bash "${SCRIPT_DIR}/ornith-worker.sh" worker-reasoning
   else
     printf '[launch] CLAUDE_CODE_OAUTH_TOKEN is not set -- skipping the parallel Claude worker lane (adhoc tasks still get processed by worker-1, just serially).\n'
   fi

@@ -7,7 +7,7 @@ readonly INSTANCE_ID="${1:-worker-0}"                                           
 
 # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17; generalized from
 # adhoc-only to a reasoning-tier concept for Brain Dump #77, 2026-08-17): any instance
-# named worker-claude* claims ONLY pending tasks whose reasoning tier (model-provider.js's
+# named worker-reasoning* claims ONLY pending tasks whose reasoning tier (model-provider.js's
 # reasoningTierFor() -- the same function ornith-draft.js/review-task.js already call to
 # pick a backend) resolves to 'high', and every OTHER worker-* instance skips them
 # instead, leaving them for this lane. Originally this was hardcoded to "adhoc-shaped"
@@ -18,13 +18,13 @@ readonly INSTANCE_ID="${1:-worker-0}"                                           
 # confidently) -- adhoc itself still resolves to 'high' via its own static registration in
 # task-sources.js, so behavior for adhoc tasks is unchanged. Pure naming convention, no
 # new env var/config -- restartTargetFor() (dead-process-check.js) already matches any
-# instanceId.startsWith('worker-') generically via this same script, so a worker-claude
+# instanceId.startsWith('worker-') generically via this same script, so a worker-reasoning
 # instance is auto-restart-eligible for free. Motivation: Claude is cloud-based, no GPU
 # contention with Ornith, but a single shared worker-1 claiming BOTH kinds serially means
 # a multi-minute high-reasoning call blocks Ornith's own (otherwise much faster) throughput
 # behind it for that whole time.
 case "$INSTANCE_ID" in
-  worker-claude*) IS_CLAUDE_LANE=true ;;
+  worker-reasoning*) IS_CLAUDE_LANE=true ;;
   *) IS_CLAUDE_LANE=false ;;
 esac
 
@@ -33,7 +33,7 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 
 # Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
 # reported model regardless of which lane was actually running -- confirmed live
-# 2026-08-17: the dashboard's Workers tab showed worker-claude as running "ornith:35b"
+# 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
 # even though it only ever claims adhoc tasks and never calls Ornith at all. Computed
 # once, here, after orc-common.sh has actually loaded CLAUDE_MODEL/ORNITH_MODEL from
 # agent-manager.env -- same "claude:<model>" label format model-provider.js's own
@@ -108,7 +108,7 @@ while :; do                                                                     
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
   # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy -- see its own
-  # comment) -- only the Claude lane needs this: worker-claude* instances are the only
+  # comment) -- only the Claude lane needs this: worker-reasoning* instances are the only
   # ones whose claimed/resumed tasks ever route to claude-client.js (the IS_CLAUDE_LANE
   # claim filter above already restricts this lane to high-reasoning-tier tasks, and
   # model-provider.js's providerFor() maps ONLY high-tier tasks to Claude). A low-tier
@@ -161,7 +161,7 @@ while :; do                                                                     
   # candidate every single tick (that source's own backlog dominating the priority
   # ladder), which worker-1 then correctly declined to CLAIM, but never got far enough
   # down the ladder to generate any work for ITSELF either, leaving it idle while
-  # worker-claude did everything. --tier scopes getNextTask() (see its own comment) to
+  # worker-reasoning did everything. --tier scopes getNextTask() (see its own comment) to
   # skip past a mismatched-tier candidate instead of stopping there, so each lane's own
   # generation call always reaches its own tier's real work if any exists, independent of
   # what the other tier's backlog looks like.

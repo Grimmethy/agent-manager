@@ -389,17 +389,19 @@ function statusBadgeClass(status, stale) {
   return 'warn';
 }
 
-// Which worker lane the Workers tab shows -- 'all' | 'ornith' | 'claude'. Kept in memory
-// only (like modelsSortKey below), not localStorage: this is a quick glance-time filter,
-// not a durable preference worth surviving a page reload. Lane is derived from
-// instanceId's 'worker-claude*' vs everything-else convention (see ornith-worker.sh's
-// IS_CLAUDE_LANE), the same distinction the two worker-* lanes already use to split
-// which tasks they claim -- there's no separate "type" field on the instance record to
-// filter on instead.
+// Which worker lane the Workers tab shows -- 'all' | 'ornith' | 'reasoning'. Kept in
+// memory only (like modelsSortKey below), not localStorage: this is a quick glance-time
+// filter, not a durable preference worth surviving a page reload. Lane is derived from
+// instanceId's 'worker-reasoning*' vs everything-else convention (see ornith-worker.sh's
+// IS_CLAUDE_LANE -- renamed from worker-claude* 2026-08-18, matching the underlying
+// concept generalizing from "the Claude-specific lane" to "the high-reasoning-tier lane"
+// per that script's own header), the same distinction the two worker-* lanes already use
+// to split which tasks they claim -- there's no separate "type" field on the instance
+// record to filter on instead.
 let workersTypeFilter = 'all';
 
 function laneForInstance(inst) {
-  return inst.instanceId.startsWith('worker-claude') ? 'claude' : 'ornith';
+  return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'ornith';
 }
 
 async function renderWorkers() {
@@ -410,7 +412,7 @@ async function renderWorkers() {
   instancesForTimers = instances;
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:10px">
-      ${[['all', 'All'], ['ornith', 'Ornith (grunt)'], ['claude', 'Claude (reasoning)']].map(([key, label]) => `
+      ${[['all', 'All'], ['ornith', 'Ornith (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
         <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
       `).join('')}
     </div>
