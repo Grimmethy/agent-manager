@@ -452,7 +452,7 @@ def main():
         return
 
     cfg = get_config()
-    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"])
+    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], use_model_naming=not args.no_model_naming)
 
     cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
     cfg["graph_path"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
