@@ -44,14 +44,37 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 # instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
 # call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
 # inherits the exported value, so no other call site needs to change.
+#
+# The reasoning lane's override can name EITHER backend (2026-08-18 follow-up, Grimmethy:
+# "reasoning is set to only show subscription models -- I need to be able to select from
+# both subscription and local models") -- the dropdown prefixes its value with "claude:"
+# or "ollama:" precisely so this can tell which one was picked (worker-1/reviewer's plain
+# Ornith-only dropdown has no such ambiguity, so its override stays a bare model name).
+# AGENT_MANAGER_FORCE_PROVIDER is model-provider.js's own hook for this -- see its header
+# comment for why adhoc/research_task's agentic Claude calls are unaffected either way.
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
   if "$IS_CLAUDE_LANE"; then
-    [[ -n "$override" ]] && CLAUDE_MODEL="$override"
-    export CLAUDE_MODEL
-    HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+    case "$override" in
+      ollama:*)
+        ORNITH_MODEL="${override#ollama:}"
+        export ORNITH_MODEL AGENT_MANAGER_FORCE_PROVIDER=ornith
+        HEARTBEAT_MODEL="$ORNITH_MODEL"
+        ;;
+      claude:*)
+        CLAUDE_MODEL="${override#claude:}"
+        export CLAUDE_MODEL AGENT_MANAGER_FORCE_PROVIDER=claude
+        HEARTBEAT_MODEL="claude:${CLAUDE_MODEL}"
+        ;;
+      *)
+        unset AGENT_MANAGER_FORCE_PROVIDER
+        export CLAUDE_MODEL
+        HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+        ;;
+    esac
   else
+    unset AGENT_MANAGER_FORCE_PROVIDER
     [[ -n "$override" ]] && ORNITH_MODEL="$override"
     export ORNITH_MODEL
     HEARTBEAT_MODEL="${ORNITH_MODEL:-}"

@@ -411,14 +411,18 @@ function laneForInstance(inst) {
   return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'ornith';
 }
 
-// Which model-list an instance's Workers-tab dropdown offers: the reasoning lane picks
-// from Claude models (same CLAUDE_MODEL_CHOICES the Models tab's default-model select
-// already uses), every other model-calling lane (worker-* / reviewer) picks from locally
-// pulled Ollama models, and watchdog gets no dropdown at all -- it never calls a model
-// (queue-watcher.sh always heartbeats model="").
+// Which model-list an instance's Workers-tab dropdown offers: the reasoning lane can run
+// EITHER backend (2026-08-18, Grimmethy: "reasoning is set to only show subscription
+// models -- I need to be able to select from both subscription and local models") -- it
+// gets Claude models AND locally pulled Ollama models in one dropdown, disambiguated by a
+// "claude:"/"ollama:" value prefix (see ornith-worker.sh's refresh_active_model, which
+// parses that same prefix to decide whether to force this lane onto the local model this
+// tick). Every other model-calling lane (worker-* / reviewer) only ever calls Ornith, so
+// its dropdown stays a plain Ollama-only list with no prefix. watchdog gets no dropdown at
+// all -- it never calls a model (queue-watcher.sh always heartbeats model="").
 function modelKindForInstance(inst) {
   if (inst.instanceId === 'watchdog') return null;
-  return laneForInstance(inst) === 'reasoning' ? 'claude' : 'ollama';
+  return laneForInstance(inst) === 'reasoning' ? 'mixed' : 'ollama';
 }
 
 async function setWorkerModel(instanceId, model) {
@@ -458,11 +462,21 @@ async function renderWorkers() {
         ${(() => {
           const kind = modelKindForInstance(inst);
           if (!kind) return '';
-          const choices = kind === 'claude' ? (workerModels.claudeModels || []) : (workerModels.ollamaModels || []);
           const current = overrides[inst.instanceId] || '';
-          const opts = [`<option value="">(default)</option>`]
-            .concat(choices.map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`));
-          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()">${opts.join('')}</select>`;
+          const optionsFor = (label, values) => values.length
+            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
+            : '';
+          let body;
+          if (kind === 'mixed') {
+            // Prefixed so ornith-worker.sh's refresh_active_model can tell which backend
+            // was picked -- see that function's own comment for why this is the fix for
+            // "reasoning only shows subscription models."
+            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+          } else {
+            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
+          }
+          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
         })()}
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>

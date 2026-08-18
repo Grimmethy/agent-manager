@@ -58,8 +58,29 @@ function reasoningTierFor(task) {
   return 'low';
 }
 
+// AGENT_MANAGER_FORCE_PROVIDER ('ornith'|'claude'): per-process override set by
+// ornith-worker.sh's refresh_active_model() when the Workers tab's worker-reasoning
+// dropdown picks a local model instead of a Claude one (2026-08-18, Grimmethy: "reasoning
+// is set to only show subscription models -- I need to be able to select from both
+// subscription and local models"). Only ornith-worker.sh's worker-reasoning* lane ever
+// sets this; every other caller of providerFor() (worker-1's low-tier tasks, reviewer's
+// votes, etc.) is unaffected since the env var is unset in their process tree. Checked
+// BEFORE reasoningTierFor()-based routing so it wins regardless of the task's own tier --
+// but adhoc/research_task's agentic implement calls (ornith-draft.js's own
+// resolveSourceName()==='adhoc'/'research_task' branches) bypass providerFor() entirely
+// and are never affected either way; those need Claude Code CLI's real tool access
+// (Read/Edit/Bash/WebSearch), which Ornith cannot provide, so forcing them onto a local
+// model would silently produce garbage instead of a real implementation -- this override
+// only ever reaches the generic, non-agentic call/majorityVote path.
+function forcedProvider() {
+  const forced = process.env.AGENT_MANAGER_FORCE_PROVIDER;
+  if (forced === 'ornith') return ornith;
+  if (forced === 'claude') return claude;
+  return null;
+}
+
 function providerFor(sourceOrTask) {
-  return reasoningTierFor(sourceOrTask) === 'high' ? claude : ornith;
+  return forcedProvider() || (reasoningTierFor(sourceOrTask) === 'high' ? claude : ornith);
 }
 
 // Display/stats label for whichever backend providerFor(source) actually picked --
@@ -70,6 +91,9 @@ function providerFor(sourceOrTask) {
 // ornith/claude module objects) so providerFor()'s return value stays exactly the
 // required module -- model-provider.test.js asserts identity against it.
 function labelFor(sourceOrTask) {
+  const forced = process.env.AGENT_MANAGER_FORCE_PROVIDER;
+  if (forced === 'ornith') return process.env.ORNITH_MODEL || 'ornith';
+  if (forced === 'claude') return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
   if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.ORNITH_MODEL || 'ornith';
   return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 }
