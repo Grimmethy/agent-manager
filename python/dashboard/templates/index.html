@@ -1005,6 +1005,15 @@ function renderTaskDetailModal(task) {
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  // task.title is truncated to 120 chars at creation time (see app.py's brain-dump
+  // ingestion) -- the full original text lives in promptContext.rawText and was never
+  // surfaced anywhere in this modal, leaving anyone deciding a needs-clarification task
+  // (or any other) with only a truncated title to go on. Only shown when it actually adds
+  // information over the title (it may just equal the title for non-brain-dump sources).
+  const rawText = task.promptContext && task.promptContext.rawText;
+  if (rawText && rawText !== task.title) {
+    html += `<div class="field-label">Full Text</div><pre>${escapeHtml(rawText)}</pre>`;
+  }
   html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
   if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
   if (task.branch) html += `<div class="field-label">Branch</div><div>${task.branch}</div>`;
