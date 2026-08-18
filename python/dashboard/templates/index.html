@@ -1234,6 +1234,7 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => { if 
 // isActive, since the mismatch is exactly the kind of bug this feature would otherwise hide.
 const JOB_TYPES = [
   { source: 'adhoc', domain: 'adhoc', priority: 10, description: 'Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.' },
+  { source: 'research_task', domain: 'research_task', priority: 10, description: 'A captured Brain Dump entry brain_dump_sort classified as requiresResearch (queue/research/*.json), drafted by research-agentic-draft.js\'s WebSearch/WebFetch-backed agentic call instead of the code-repo one. Always high-reasoning-tier (Claude) -- Ornith has no web tools. Same "drop everything" priority as adhoc.' },
   { source: 'trouble_log', domain: '(project default)', priority: 20, description: "Entries in the project's trouble-log doc flagged ready-for-agent (🤖 marker)." },
   { source: 'secondbrain', domain: 'secondbrain', priority: 40, description: 'Oldest unprocessed note in a SecondBrain-style Inbox/ folder.' },
   { source: 'brain_dump_sort', domain: 'brain_dump_sort', priority: 42, description: 'Sorts a captured Brain Dump entry into a second-brain destination and marks it filed. Always active -- sits above any single project, see the Brain Dump tab.' },

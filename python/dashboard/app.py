@@ -2331,7 +2331,7 @@ def api_pipeline_status():
 # a top-level, cross-project setting, the same "sits above any single active project"
 # reasoning as AGENT_MANAGER_BRAIN_DUMP_PATH).
 TASK_SOURCE_CATALOG = [
-    "adhoc", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
+    "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
     "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
     "deep_dive", "project_search", "unused_export",
 ]
@@ -2361,7 +2361,7 @@ def read_active_job_types() -> set:
 # itself mirrors src/task-sources.js's registerTaskSource() calls) -- the default a
 # source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no override for it.
 TASK_SOURCE_DEFAULT_PRIORITIES = {
-    "adhoc": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
+    "adhoc": 10, "research_task": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
     "path_prefetch_resolve": 45,
     "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "observability_review": 80,
     "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,

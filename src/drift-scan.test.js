@@ -157,6 +157,26 @@ test('checkPair extracts priorities from a markdown table (README.md pattern), n
   assert.deepEqual(result.staleInStatic, []);
 });
 
+test('checkPair (joined on source name) still flags a newly-registered source missing from the static list even when it shares a priority with an already-listed one', () => {
+  // Regression test for the real 2026-08-17 incident: research_task was registered
+  // sharing priority 10 with adhoc, and the OLD priority-joined pair() config saw 10
+  // already present (via adhoc) so it never flagged research_task as missing --
+  // drift-scan reported clean the whole time this bug existed. Joining on source name
+  // instead (the real production PAIRS config, not this file's priority-joined test
+  // helper) can't have that blind spot: every registry key is unique by construction.
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, STATIC_REL, "const JOB_TYPES = [\n{ source: 'adhoc', priority: 10 },\n];\n");
+  writeFixture(repoRoot, SOURCE_REL, "registerTaskSource('adhoc', { priority: 10, next: fn });\nregisterTaskSource('research_task', { priority: 10, next: fn });\n");
+
+  const result = checkPair(repoRoot, pair({
+    staticValueRegex: /source:\s*'([^']+)'/g,
+    sourceValueRegex: /registerTaskSource\('([^']+)'/g,
+  }));
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.missingFromStatic, ['research_task']);
+  assert.deepEqual(result.staleInStatic, []);
+});
+
 test('checkPair is not confused by an unrelated top-level array sharing the end marker text', () => {
   const repoRoot = makeTempRepo();
   writeFixture(

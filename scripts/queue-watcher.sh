@@ -91,6 +91,25 @@ while :; do
     reject_retry_result="$(node "${PACKAGE_SRC_DIR}/reject-retry-check.js" 2>>"${HOME_LOGS}/reject-retry-check.log")"
     printf '[watchdog] reject-retry-check: %s\n' "$reject_retry_result" >&2
 
+    # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
+    # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
+    # already existed to catch exactly this class of bug (a static list, e.g. the
+    # dashboard's JOB_TYPES table, silently drifting from the live task-sources.js
+    # registry) but was wired into nothing -- npm run drift-scan was the only way to run
+    # it, so it caught nothing automatically and research_task shipped invisible in the
+    # Job List tab for a full deployment before anyone noticed by hand. Cheap (a handful
+    # of regex passes over a few static files, no LLM/network involved), so run it every
+    # tick like reject-retry-check.js above rather than throttling it -- any future drift
+    # then surfaces here within one tick (<=ORC_TICK_SECS) of the registration change that
+    # caused it, not whenever someone next remembers to run the npm script by hand.
+    drift_scan_output="$(node "${PACKAGE_SRC_DIR}/drift-scan.js" 2>>"${HOME_LOGS}/drift-scan.log")"
+    drift_scan_rc=$?
+    if [[ $drift_scan_rc -ne 0 ]]; then
+      printf '[watchdog] drift-scan FLAGGED (see queue/drift-flags.json):\n%s\n' "$drift_scan_output" >&2
+    else
+      printf '[watchdog] %s\n' "$drift_scan_output" >&2
+    fi
+
     _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither ornith-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
     stale_count=0
 

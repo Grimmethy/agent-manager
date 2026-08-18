@@ -34,29 +34,36 @@ function sliceBetween(text, startMarker, endMarker) {
   return text.slice(startIdx, endIdx + endMarker.length);
 }
 
-// Matched by PRIORITY NUMBER, not by source-name string. The registry key passed to
-// registerTaskSource() and the human-facing `source:` label a next*Task() actually
-// stamps on its tasks are deliberately NOT always the same string (secondbrain's key is
-// 'secondbrain' but its label is 'inbox'; unused_export's key is 'unused_export' but its
-// label is 'deadcode_triage'; adhoc's key is 'adhoc' but its label is 'manual') -- these
-// are real, intentional aliases, confirmed by reading every next*Task() function, not a
-// second bug. Priority is the one value guaranteed to be assigned exactly once and never
-// aliased, so it's the only safe join key between the two files.
+// Matched by the registerTaskSource() REGISTRY KEY, not by priority number. This was
+// priority-joined until 2026-08-17, on the reasoning that the registry key and the
+// human-facing `source:` label a next*Task() stamps on its own generated tasks are
+// deliberately NOT always the same string (secondbrain's key is 'secondbrain' but a
+// generated task's label is 'inbox'; unused_export's key is 'unused_export' but its
+// label is 'deadcode_triage'; adhoc's key is 'adhoc' but its label is 'manual') -- true,
+// but irrelevant here: that aliasing is on a task's own runtime `source` field, a
+// different thing entirely from the registry key itself, which both static lists below
+// already echo verbatim in their own `source: 'name'` / `` `name` `` columns (verified
+// against every real entry). Priority turned out NOT to be the safe join key it was
+// assumed to be: registerTaskSource('research_task', ...) shares priority 10 with
+// 'adhoc' (both intentionally "drop everything, highest priority"), and arch_discovery/
+// observability_review both intentionally share 80. Confirmed live 2026-08-17: this
+// exact collision (research_task sharing adhoc's priority 10) is why research_task went
+// live missing from BOTH python/dashboard/templates/index.html's JOB_TYPES array AND
+// README.md's table -- the old number-based diff saw priority 10 already present (via
+// adhoc) and never flagged research_task as missing, even though drift-scan had been
+// running clean the whole time. The registry key has no such collision (each is
+// registered exactly once by construction -- registerTaskSource() itself would be the
+// one throwing on an actual duplicate key), so it's the join key that can't silently
+// paper over a second source sharing an existing one's priority.
 const PAIRS = [
   {
     label: 'Dashboard Job List tab vs task-sources.js registry',
     staticFile: 'python/dashboard/templates/index.html',
     staticStartMarker: 'const JOB_TYPES = [',
     staticEndMarker: '];',
-    staticValueRegex: /priority:\s*(\d+)/g,
+    staticValueRegex: /source:\s*'([^']+)'/g,
     sourceFile: 'src/task-sources.js',
-    // Matches both a bare literal (priority: 80) and the taskPriority()-wrapped form
-    // (priority: taskPriority('name', 80)) the per-source override feature introduced --
-    // the bare form stopped appearing anywhere once every registerTaskSource() call was
-    // migrated to taskPriority(), which silently broke this regex (confirmed live
-    // 2026-07-26: both PAIRS below reported "extracted zero values" against real,
-    // unmodified task-sources.js).
-    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(?:taskPriority\([^,]+,\s*)?(\d+)/g,
+    sourceValueRegex: /registerTaskSource\('([^']+)'/g,
   },
   {
     // Found the same day as the Job List bug, same root cause: README.md's own
@@ -67,9 +74,13 @@ const PAIRS = [
     staticFile: 'README.md',
     staticStartMarker: '| Source | Priority | Reads |',
     staticEndMarker: '## Building the codebase graph',
-    staticValueRegex: /\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|/g,
+    // Anchored to the START of the row (^, multiline) so this only ever matches the
+    // Source column -- an unanchored version also matched a Reads-column cell that
+    // happens to be nothing but a single backtick-wrapped path (confirmed live: matched
+    // `SECOND_BRAIN_DIR/Inbox/*.md` as if it were a registered source name).
+    staticValueRegex: /^\|\s*`([^`]+)`\s*\|/gm,
     sourceFile: 'src/task-sources.js',
-    sourceValueRegex: /registerTaskSource\('[^']+',\s*\{\s*priority:\s*(?:taskPriority\([^,]+,\s*)?(\d+)/g,
+    sourceValueRegex: /registerTaskSource\('([^']+)'/g,
   },
 ];
 
