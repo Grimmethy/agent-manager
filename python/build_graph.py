@@ -43,7 +43,19 @@ from networkx.algorithms.community import greedy_modularity_communities
 JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
 PY_EXTENSIONS = {".py"}
 LUA_EXTENSIONS = {".lua"}
-MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS | LUA_EXTENSIONS
+# HTML (2026-08-18, needs-clarification sweep): added specifically so Flask template files
+# (python/dashboard/templates/*.html) can appear in the graph at all -- confirmed live that
+# this project's own dashboard UI (buttons, columns, worker panels, the graph view, theme
+# colors) lives almost entirely in templates/index.html, not in any .py/.js file, and every
+# one of a large batch of stuck brain-dump notes about that UI was rationale-blocked with
+# some form of "none of the files are frontend/UI components." A .html file never has an
+# `import`/`require` OF its own (nothing to scan text/IMPORT_RE for), so this only matters
+# together with TEMPLATE_RE below giving it an INCOMING edge from whatever Python file
+# renders it -- otherwise it would just be walked, found isolated (zero edges either way),
+# and pruned right back out by build_graph_data's isolated-node cleanup, same fate the
+# python/dashboard/*.py files had before that fix.
+HTML_EXTENSIONS = {".html"}
+MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS | LUA_EXTENSIONS | HTML_EXTENSIONS
 EXCLUDE_DIRS = {
     "node_modules", ".git", "queue",
     # Only matters when walk_source_files falls back to scanning the whole repo_root
@@ -82,6 +94,16 @@ LUA_INCLUDE_RE = re.compile(
     r"""(?:VFS\.Include|dofile|require|VFS\.LoadFile)\s*\(\s*([^\)]*?)\s*[,\)]"""
 )
 LUA_STRLIT_RE = re.compile(r'"([^"]*\.lua)"')
+
+# Flask's render_template('index.html', ...) is the one real link from a Python file to a
+# .html template -- not an `import`, so IMPORT_RE_PY never sees it, but it's the exact
+# relationship path-prefetch-resolve needs: without SOME edge into a template file, HTML_
+# EXTENSIONS above is pointless (an edge-less template just gets pruned as isolated, same
+# as every python/dashboard/*.py file was before that fix). f-string prefix included since
+# a dynamic template name built from a fixed literal ('f"{page}.html"') is common enough
+# elsewhere in this codebase's own style to be worth not silently missing, though only the
+# plain-literal case actually resolves to anything (see resolve_template_import).
+TEMPLATE_RE = re.compile(r"""render_template\(\s*f?['"]([^'"]+)['"]""")
 
 
 def get_config():
@@ -205,6 +227,18 @@ def resolve_python_import(from_file: Path, spec: str, repo_root: Path) -> Path |
     return None
 
 
+def resolve_template_import(from_file: Path, template_name: str) -> Path | None:
+    """Flask's default template_folder is 'templates', a sibling of the app module unless
+    the app was constructed with an explicit template_folder= override (not done anywhere
+    in this project -- Flask(__name__) is called with no such argument). Only handles a
+    template living directly under that folder (the shape this project's own single-page
+    dashboard uses); a subdirectory reference ('partials/foo.html') would need the same
+    joinpath resolve.py's/JS's own resolvers already do, but no template in this codebase
+    currently uses one."""
+    candidate = from_file.parent / "templates" / template_name
+    return candidate if candidate.is_file() else None
+
+
 def resolve_lua_import(spec: str, repo_root: Path, file_set: set[Path]) -> Path | None:
     """Lua VFS.Include/require/dofile calls in this ecosystem show up in two shapes: a
     full repo-relative path string ('LuaUI/Widgets/foo/bar.lua') or a bare filename
@@ -248,6 +282,13 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
                 if not spec:
                     continue
                 target = resolve_python_import(f, spec, repo_root)
+                if target and target in file_set:
+                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                    if rel_to != rel_from:
+                        graph.add_edge(rel_from, rel_to)
+            for match in TEMPLATE_RE.finditer(text):
+                template_name = match.group(1)
+                target = resolve_template_import(f, template_name)
                 if target and target in file_set:
                     rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
                     if rel_to != rel_from:
