@@ -85,6 +85,9 @@
   button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.danger:disabled { opacity: .5; cursor: not-allowed; }
+  .worker-filter-bar { display: flex; gap: 8px; }
+  .worker-filter-bar button { background: var(--panel); color: var(--muted); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .worker-filter-bar button.active { color: var(--accent); border-color: var(--accent); }
   .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
@@ -381,14 +384,37 @@ function statusBadgeClass(status, stale) {
   return 'warn';
 }
 
+// Which worker lane the Workers tab shows -- 'all' | 'ornith' | 'claude'. Kept in memory
+// only (like modelsSortKey below), not localStorage: this is a quick glance-time filter,
+// not a durable preference worth surviving a page reload. Lane is derived from
+// instanceId's 'worker-claude*' vs everything-else convention (see ornith-worker.sh's
+// IS_CLAUDE_LANE), the same distinction the two worker-* lanes already use to split
+// which tasks they claim -- there's no separate "type" field on the instance record to
+// filter on instead.
+let workersTypeFilter = 'all';
+
+function laneForInstance(inst) {
+  return inst.instanceId.startsWith('worker-claude') ? 'claude' : 'ornith';
+}
+
 async function renderWorkers() {
   const instances = await fetchJson('/api/instances');
   const main = document.getElementById('main');
   const fetchedAt = Date.now();
   instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
   instancesForTimers = instances;
+  const filterBar = `
+    <div class="worker-filter-bar" style="margin-bottom:10px">
+      ${[['all', 'All'], ['ornith', 'Ornith (grunt)'], ['claude', 'Claude (reasoning)']].map(([key, label]) => `
+        <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
+      `).join('')}
+    </div>
+  `;
+  const shown = instances.filter(inst => workersTypeFilter === 'all' || laneForInstance(inst) === workersTypeFilter);
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
-  main.innerHTML = instances.map(inst => `
+  main.innerHTML = filterBar + (shown.length === 0
+    ? '<div class="empty">No workers match this filter.</div>'
+    : shown.map(inst => `
     <div class="worker-card ${inst.currentTaskId ? 'clickable' : ''}" ${inst.currentTaskId ? `data-task-id="${escapeAttr(inst.currentTaskId)}"` : ''}>
       <div class="row">
         <span class="id">${inst.instanceId}</span>
@@ -403,9 +429,12 @@ async function renderWorkers() {
         ${inst.currentTaskId ? ' · working on <strong>' + inst.currentTaskId + '</strong>' + (inst.currentPass ? ' (' + inst.currentPass + ')' : '') : ''}
       </div>
     </div>
-  `).join('');
+  `).join(''));
   main.querySelectorAll('.worker-card[data-task-id]').forEach((card) => {
     card.onclick = () => openTaskAnywhere(card.dataset.taskId);
+  });
+  main.querySelectorAll('[data-worker-filter]').forEach((btn) => {
+    btn.onclick = () => { workersTypeFilter = btn.dataset.workerFilter; renderWorkers(); };
   });
   updateStaleTimers();
 }
