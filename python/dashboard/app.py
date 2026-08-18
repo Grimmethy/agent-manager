@@ -998,21 +998,30 @@ def api_task_confirm_delete(task_id):
 
 @app.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
 def api_task_requeue(state, task_id):
-    """Manual requeue (Job Status > Blocked/Done tabs, per-row button): moves the task back
-    to pending/, stripped to the same shape a freshly-generated task has -- every
-    drafting/review/apply artifact (blockedReason, doneMarker, ornithVotes, planResponse,
-    implementResponse, etc.) is dropped, not carried forward. ornithRejectCount resets to 0
-    deliberately: a manual requeue is a deliberate human do-over, not a continuation of the
-    same automatic retry cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for
-    review-stage rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count
-    forward would let a manually-requeued task block again after fewer real attempts than
-    a task hitting that cap for the first time gets."""
-    if state not in ("blocked", "done"):
-        abort(400, description="only a blocked or done task can be requeued")
+    """Manual requeue (Job Status > Blocked/Done tabs, per-row button; also the Brain Dump
+    tab's "Reopen" action on an archived entry's badge): moves the task back to pending/,
+    stripped to the same shape a freshly-generated task has -- every drafting/review/apply
+    artifact (blockedReason, doneMarker, ornithVotes, planResponse, implementResponse, etc.)
+    is dropped, not carried forward. ornithRejectCount resets to 0 deliberately: a manual
+    requeue is a deliberate human do-over, not a continuation of the same automatic retry
+    cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for review-stage
+    rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count forward would
+    let a manually-requeued task block again after fewer real attempts than a task hitting
+    that cap for the first time gets.
+
+    'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
+    api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
+    'archived', not 'done', so this must be handled as a separate lookup path rather than
+    falling through to state_dir/task_id.json, which would 404 (real gap found 2026-08-17
+    auditing the "always reversible" promise: an archived item couldn't actually be
+    un-archived through the UI before this)."""
+    if state not in ("blocked", "done", "archived"):
+        abort(400, description="only a blocked, done, or archived task can be requeued")
     qdir = queue_dir()
     if not qdir:
         abort(404)
-    src = qdir / state / f"{task_id}.json"
+    src = (qdir / "done" / "_archived_no_action" / f"{task_id}.json") if state == "archived" \
+        else (qdir / state / f"{task_id}.json")
     data = read_json_safe(src)
     if not data:
         abort(404)

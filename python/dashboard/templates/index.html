@@ -2227,6 +2227,24 @@ function wireBrainDumpCardHandlers(el) {
     };
   });
 
+  el.querySelectorAll('[data-reopen]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm(`Reopen '${btn.dataset.reopen}' for a fresh draft? This resets its retry history.`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/task/archived/${encodeURIComponent(btn.dataset.reopen)}/requeue`, { method: 'POST' });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.description || `${res.status}`);
+        }
+        await refreshBrainDumpEntries(true);
+      } catch (e) {
+        alert('Could not reopen: ' + e.message);
+        btn.disabled = false;
+      }
+    };
+  });
+
   el.querySelectorAll('[data-edit]').forEach((btn) => {
     btn.onclick = () => {
       brainDumpEditingId = btn.dataset.edit;
@@ -2490,6 +2508,9 @@ function renderBrainDumpCard(entry) {
     ? '<span class="badge ok">sorted</span>'
     : '<span class="badge idle">captured</span>';
   const queuedBadge = entry.queuedTaskId ? taskStatusBadgeHtml(entry.queuedTaskId, entry.taskStatus) : '';
+  const reopenBtn = entry.taskStatus === 'archived'
+    ? `<button class="secondary" data-reopen="${escapeAttr(entry.queuedTaskId)}">Reopen</button>`
+    : '';
   const jump = sort && sort.secondBrainPath
     ? `<a class="jump" data-jump="${escapeAttr(sort.secondBrainPath)}" href="#">open &rarr;</a>`
     : '';
@@ -2515,6 +2536,7 @@ function renderBrainDumpCard(entry) {
           ${renderProviderToggle('bd-discuss-provider-' + escapeAttr(entry.id))}
           <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
+          ${reopenBtn}
         </span>
       </div>
     </div>
