@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, listSourceFiles, lineOfIndex } = require('./observability-scan.js');
+const { extractBraceBody, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./observability-scan.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
 const LOOP_START_RE = /\bfor\s*\([^)]*\)\s*\{|\bwhile\s*\([^)]*\)\s*\{/g;
@@ -95,6 +95,11 @@ function scanProject(clonePath, projectSlug) {
   for (const file of files) {
     let text;
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    // Same minified/bundled-build-output skip as observability-scan.js's own scanProject
+    // -- a loop-body/deep-clone finding inside a hashed bundler output file is exactly as
+    // unfixable-by-design as a silent-catch-block one there (see isLikelyMinified's
+    // comment for the live-confirmed repeat-offender queue/blocked/ backlog this fixes).
+    if (isLikelyMinified(text)) continue;
     const relPath = path.relative(clonePath, file).replace(/\\/g, '/');
     findings.push(...findLoopBodyIssues(text, relPath));
     findings.push(...findJsonDeepCloneAntipattern(text, relPath));

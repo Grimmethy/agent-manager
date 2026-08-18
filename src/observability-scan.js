@@ -50,6 +50,33 @@ function listSourceFiles(dir, extensions) {
   }
 }
 
+// Minified/bundled build output (index-BoHO2STY.js-style hashed bundler filenames under
+// static/assets/, dist/, etc.) has no meaningful line structure to reason about, but
+// SKIP_DIRS above only catches known BUILD DIRECTORY names -- a bundler that outputs into
+// static/assets/ (a real, common convention, not something worth guessing every variant
+// of into an ever-growing SKIP_DIRS list) sails right through undetected. Confirmed live,
+// 2026-08-18: queue/blocked/ had 100+ repeat-offender observability_review tasks against
+// exactly this shape -- captain-claw/flight_deck/static/assets/index-BoHO2STY.js, a
+// React production bundle (single-letter minified identifiers, zero whitespace) -- every
+// one blocked in review because no drafting model can meaningfully fix (or even parse) a
+// "silent catch block" inside minified third-party runtime code that was never meant to
+// be hand-edited in the first place; even if it could, the fix belongs in the pre-bundle
+// source, not the bundle. A minifier collapsing an entire module into one line routinely
+// produces lines in the tens or hundreds of thousands of characters -- real hand-written
+// source, however dense, essentially never does. Checked once per file, not per rule, so
+// every rule in this module benefits without each needing its own guard.
+const MINIFIED_LINE_LENGTH_THRESHOLD = 2000;
+function isLikelyMinified(text) {
+  let lineStart = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i === text.length || text[i] === '\n') {
+      if (i - lineStart > MINIFIED_LINE_LENGTH_THRESHOLD) return true;
+      lineStart = i + 1;
+    }
+  }
+  return false;
+}
+
 function lineOfIndex(text, index) {
   let line = 1;
   for (let i = 0; i < index && i < text.length; i++) {
@@ -244,7 +271,15 @@ function findMissingReservedAttributes(repoRoot, files) {
 // clones anything itself). Returns findings with projectSlug/scannedAt attached, ready
 // to append to queue/observability-flags.json.
 function scanProject(clonePath, projectSlug) {
-  const files = listSourceFiles(clonePath, SCAN_EXTENSIONS);
+  const allFiles = listSourceFiles(clonePath, SCAN_EXTENSIONS);
+  // One read+check per file, up front, so every rule below (silent-catch-block,
+  // unguarded-loop, OTel naming, reserved-attribute) skips minified/bundled files the
+  // same way instead of each needing its own guard -- see isLikelyMinified's own comment.
+  const files = allFiles.filter((file) => {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { return false; }
+    return !isLikelyMinified(text);
+  });
   const scannedAt = new Date().toISOString();
   const findings = [];
 
@@ -280,4 +315,5 @@ module.exports = {
   extractBraceBody,
   listSourceFiles,
   lineOfIndex,
+  isLikelyMinified,
 };
