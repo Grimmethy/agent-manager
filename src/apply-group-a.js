@@ -767,7 +767,15 @@ function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
   // nextPathPrefetchResolveTask()) sets highReasoningAttempted instead, so
   // nextPathPrefetchResolveTask()'s eligibility gate can tell the two apart and only
   // require a human once BOTH tiers have been spent.
-  if (task.reasoningTier === 'high') {
+  // Brain Dump (2026-08-18): a periodic reattempt (task-sources.js's
+  // nextPathPrefetchResolveTask, once both automatic tiers are spent) doesn't touch
+  // suggestionAttempted/highReasoningAttempted -- both are already true by the time this
+  // tier fires. Advances its OWN counter/timestamp instead, which is what the periodic
+  // eligibility check reads to know when the next round is due.
+  if (task.promptContext && task.promptContext.periodicReattempt) {
+    held.needsClarification.lastPeriodicReattemptAt = new Date().toISOString();
+    held.needsClarification.periodicReattemptCount = (held.needsClarification.periodicReattemptCount || 0) + 1;
+  } else if (task.reasoningTier === 'high') {
     held.needsClarification.highReasoningAttempted = true;
   } else {
     held.needsClarification.suggestionAttempted = true;

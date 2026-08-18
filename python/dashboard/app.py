@@ -1448,6 +1448,17 @@ def api_brain_dump_prioritize(entry_id):
     if not entry:
         abort(404)
 
+    # Idempotency guard (2026-08-18): this endpoint used to create a brand-new task file
+    # on every call, no matter how many times it was hit -- a double-click (or a slow
+    # response plus an impatient re-click) queued the SAME entry twice, and the second
+    # call's queuedTaskId write silently overwrote the first, orphaning it: a real task
+    # file sitting in the queue that nothing -- not the Brain Dump tab, not the entry's
+    # own record -- ever pointed back to again. Confirmed live: 7 real orphans found this
+    # way in queue/needs-clarification/ alone. An already-actioned entry just returns its
+    # existing queuedTaskId instead of minting a second one.
+    if entry.get("status") == "actioned" and entry.get("queuedTaskId"):
+        return jsonify(entry)
+
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
