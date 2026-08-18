@@ -302,6 +302,11 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         latencyMs: Date.now() - implStartMs,
         result: implResult,
       });
+      // Stamped onto the task itself (not just recorded into model-stats.db, which
+      // apply-task.js has no access path back to via just task.abCallId) so its commit
+      // message can attribute Co-Authored-By to whichever backend actually drafted the
+      // change instead of always crediting Ornith -- see apply-task.js's own comment.
+      task.draftModel = labelFor(task.source);
 
       if (implResult.degenerate) {
         const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;

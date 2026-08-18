@@ -44,6 +44,20 @@ ensureRegistered();
 // this set changes the sequence.
 const DIRECT_TO_MAIN_DOMAINS = new Set(['arch_discovery', 'arch_import']);
 
+// task.draftModel (stamped by ornith-draft.js/adhoc-agentic-draft.js at draft time, same
+// "claude:<model>"-or-"ornith" label model-provider.js's labelFor() and the Workers/Models
+// tabs already use) says which backend actually drafted this change -- was previously
+// ignored entirely, hardcoding every commit's Co-Authored-By to Ornith even when e.g. the
+// adhoc agentic pass (Claude Code CLI, never Ornith) produced the diff. Falls back to
+// Ornith for any task queued before draftModel existed, matching the old hardcoded behavior.
+function coAuthorTrailer(task) {
+  const draftModel = task.draftModel || '';
+  if (draftModel.startsWith('claude:')) {
+    return `Co-Authored-By: Claude (${draftModel.slice('claude:'.length)}) <noreply@anthropic.com>`;
+  }
+  return 'Co-Authored-By: Ornith <noreply@ornith.local>';
+}
+
 function usesGroupB(task) {
   const source = getRegisteredSource(resolveSourceName(task));
   return !(source && typeof source.apply === 'function');
@@ -297,7 +311,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       '',
       `Task: ${task.id} (${task.domain}/${task.source})`,
       '',
-      'Co-Authored-By: Ornith <noreply@ornith.local>',
+      coAuthorTrailer(task),
     ].join('\n');
     fs.writeFileSync(msgPath, commitMessage);
     try {
