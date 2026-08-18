@@ -40,7 +40,11 @@ function applyAdhocDiff({ task, repoRoot }) {
     // --numstat lists touched files without needing the patch already applied -- run
     // first so a malformed patch fails via the SAME `git apply` error path either way
     // (numstat also validates the patch parses, though not that it applies cleanly).
-    const numstat = execFileSync('git', ['apply', '--numstat', patchPath], {
+    // --recount here too (see the real `git apply` call below for why) -- confirmed live
+    // 2026-08-18: this call has no --recount of its own, so a hunk with a wrong stated
+    // line-count rejected THIS call as "corrupt patch" before ever reaching the real
+    // apply below, even after --recount was added there alone.
+    const numstat = execFileSync('git', ['apply', '--numstat', '--recount', patchPath], {
       cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
     });
     const files = numstat.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.split('\t').pop());
@@ -48,7 +52,16 @@ function applyAdhocDiff({ task, repoRoot }) {
       throw new Error('git apply --numstat reported no files touched by this diff');
     }
 
-    execFileSync('git', ['apply', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    // --recount: confirmed live 2026-08-18 -- a real, otherwise-valid diff from
+    // adhoc-agentic-draft.js's agentic capture (`git diff` against an isolated worktree)
+    // failed here with "corrupt patch at line 68" on a plain `git apply`, while `git apply
+    // --check --recount` against the identical bytes succeeded cleanly. The hunk header's
+    // stated line counts didn't match the actual hunk body -- recount ignores the stated
+    // counts and recalculates them from the body instead, which is exactly the tolerance
+    // needed for a diff captured this way (not hand-written, so a header/body mismatch is
+    // a capture-format quirk, not a sign of real corruption -- --numstat above already
+    // proved the patch parses and lists real files before this point).
+    execFileSync('git', ['apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
 
     return { files };
   } catch (e) {

@@ -79,6 +79,25 @@ test('applyAdhocDiff returns {skipped} when task.rawDiff is empty, without touch
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
 });
 
+test('applyAdhocDiff applies a real diff whose hunk header line-count is wrong (regression: 2026-08-18 "corrupt patch" incident)', () => {
+  // A plain `git apply` (no --recount) rejects a hunk whose "@@ -a,b +c,d @@" counts
+  // don't match the actual hunk body as corrupt, even when the body itself is completely
+  // valid -- confirmed live against a real adhoc-agentic-draft.js diff that failed this
+  // way in production. Deliberately corrupt the header by hand here (a real diff's
+  // header/body already agree, so this can't be reproduced through makeRealDiff() --
+  // it has to be forced) to prove applyAdhocDiff's --recount flag tolerates it.
+  const repoDir = makeRepo();
+  const rawDiff = makeRealDiff(repoDir, (dir) => fs.writeFileSync(path.join(dir, 'tracked.txt'), 'v2\n'));
+  const corrupted = rawDiff.replace(/^@@ -1 \+1 @@$/m, '@@ -1 +1,2 @@');
+  assert.notEqual(corrupted, rawDiff, 'test setup: expected hunk header pattern not found in real diff -- update the regex to match makeRealDiff()\'s actual output');
+  const task = { id: 'apply-test-recount', rawDiff: corrupted, implementResponse: 'summary', adhocResolution: 'implemented' };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.deepEqual(result.files, ['tracked.txt']);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2\n');
+});
+
 test('applyAdhocDiff throws a clear error on a malformed diff, without leaving a stray patch file', () => {
   const repoDir = makeRepo();
   const task = { id: 'apply-test-4', rawDiff: 'this is not a real diff', implementResponse: 'summary' };
