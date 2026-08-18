@@ -928,6 +928,7 @@ async function renderQueueTab(state) {
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
       </td>` : ''}
       ${showArchiveOnly ? `<td>
+        <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
       </td>` : ''}
       ${showConfirmDeny ? `<td>
@@ -957,6 +958,12 @@ async function renderQueueTab(state) {
             : `Deny the delete in '${btn.dataset.id}'? This gives up on the batch entirely -- nothing in it (including any non-delete items in the same batch) will be applied.`)
         : `Archive '${btn.dataset.id}'? This frees up its underlying item for reconsideration but does not apply anything.`;
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'archive', msg); };
+  });
+  main.querySelectorAll('.task-done-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      postTaskAction(state, btn.dataset.id, 'done', `Mark '${btn.dataset.id}' as done? Use this when the underlying work is already finished (e.g. done by hand) -- unlike Reject, this moves it to the Done tab and stops it from being regenerated.`);
+    };
   });
   main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {
     const msg = btn.dataset.adhoc === 'true'
