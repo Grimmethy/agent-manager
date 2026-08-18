@@ -149,6 +149,7 @@ const TABS = [
   { key: 'joblist', label: 'Job List' },
   { key: 'deepdive', label: 'Scouted Repos' },
   { key: 'brain-dump', label: 'Brain Dump' },
+  { key: 'branches', label: '🌿 Unmerged Branches' },
   { group: 'Job Status', children: [
     { key: 'drafting', label: 'Drafting' },
     { key: 'pending', label: 'Pending' },
@@ -318,6 +319,10 @@ const TAB_COUNT_SEVERITY_THRESHOLDS = {
   // specifically, not just an ambiguous path match, so it deserves the same "don't
   // silently sit forever" urgency as blocked, any count at all.
   'awaiting-confirm': { bad: 1 },
+  // Orange, same reasoning as 'needs-clarification': a pushed-but-unmerged branch isn't
+  // broken, it's already-reviewed work just sitting invisible until someone merges it --
+  // exactly the "sandbox" gap this tab exists to surface (2026-08-18).
+  branches: { warn: 1 },
 };
 
 function severityForTab(tabKey, count) {
@@ -1278,6 +1283,73 @@ const JOB_TYPES = [
   { source: 'unused_export', domain: '(project default)', priority: 90, description: 'Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive.' },
 ];
 
+// Unmerged Branches tab (2026-08-18): closes the "sandbox" visibility gap -- a pushed
+// agent/<task.id> branch previously sat invisible until someone happened to go looking,
+// which is exactly what let a real apply failure quietly mask itself as "done" with
+// nothing actually landed. One click here does the full fetch/merge/push/live-sync
+// sequence server-side (see app.py's api_git_merge_branch) instead of the manual clone/
+// branch/merge/push dance that incident required by hand.
+async function renderBranchesTab() {
+  const main = document.getElementById('main');
+  let branches;
+  try {
+    branches = await fetchJson('/api/git/unmerged-branches');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (branches.length === 0) {
+    main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
+    return;
+  }
+  main.innerHTML = branches.map((b) => `
+    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}">
+      <div class="row">
+        <span class="id">${escapeHtml(b.title)}</span>
+        <div class="badge-col">
+          <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
+        </div>
+      </div>
+      <div class="meta">
+        ${b.domain ? `domain <strong>${escapeHtml(b.domain)}</strong>${b.source ? ' · source <strong>' + escapeHtml(b.source) + '</strong>' : ''} · ` : ''}
+        pushed ${fmtAge((Date.now() - new Date(b.pushedAt).getTime()) / 1000)} ago
+        ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
+      </div>
+      <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="action" data-merge-branch="${escapeAttr(b.branch)}">Merge to ${escapeHtml(b.mainBranch)}</button>
+      </div>
+    </div>
+  `).join('');
+
+  main.querySelectorAll('[data-merge-branch]').forEach((btn) => {
+    btn.onclick = async () => {
+      const branch = btn.dataset.mergeBranch;
+      if (!confirm(`Merge "${branch}" into master and sync the live dashboard?`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Merging...';
+      try {
+        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, { method: 'POST' });
+        const result = await resp.json();
+        if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        if (result.liveSync && result.liveSync.restartTriggered) {
+          btn.textContent = 'Merged -- dashboard reloading...';
+          // Werkzeug's reloader restart is near-instant but not synchronous with this
+          // response -- give it a moment, then just re-render; if it's still mid-restart
+          // renderMain()'s own try/catch shows a normal "disconnected" state until the
+          // next 5s poll succeeds, same as any other brief connection drop.
+          setTimeout(() => renderMain(), 1500);
+        } else {
+          await renderBranchesTab();
+        }
+      } catch (e) {
+        alert('Merge failed: ' + e.message);
+        await renderBranchesTab();
+      }
+    };
+  });
+}
+
 async function renderJobListTab() {
   const main = document.getElementById('main');
   let jobTypes;
@@ -1574,6 +1646,7 @@ async function renderMain() {
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
+    else if (activeTab === 'branches') await renderBranchesTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;

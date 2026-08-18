@@ -9,6 +9,7 @@ queue/ and instances/ live, same as every other script in this package.
 AGENT_MANAGER_DASHBOARD_PORT (default 7420) picks the port.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ import string
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1140,6 +1142,11 @@ def api_summary():
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
     counts["brain-dump"] = sum(1 for e in read_brain_dump_entries() if e.get("status") != "actioned")
+    # Cached (list_unmerged_branches(force=False)) -- this route is polled every 5s by
+    # the nav badge cycle, and a live `git fetch` on every single poll would be both slow
+    # and needlessly hammer the remote. The dedicated /api/git/unmerged-branches route
+    # (used when the tab is actually open) always forces a fresh fetch instead.
+    counts["branches"] = len(list_unmerged_branches(force=False))
     if not qdir:
         return jsonify(counts)
 
@@ -2307,6 +2314,284 @@ def _pipeline_running() -> bool:
     age = (datetime.now(timezone.utc) - last_hb).total_seconds()
     threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
     return age <= threshold
+
+
+# --- Unmerged branches (the "sandbox" visibility gap) -----------------------------------
+# apply-task.js's adhoc/default apply path never merges to main -- it pushes a throwaway
+# agent/<task.id> branch and stops there BY DESIGN (review gate before landing real code).
+# Confirmed live 2026-08-18: that gate has no counterpart on the OTHER side -- nothing
+# ever told the operator a pushed branch was still sitting there unmerged, so "the pipeline
+# says done" and "the change is actually live" silently drifted apart, compounding with a
+# separate bug (see apply-task.js's recordApplyOutcome()) that could mark a task done with
+# NO branch at all. This section closes that gap: list what's pushed-but-unmerged, and let
+# a human merge one with a single click instead of the manual clone/branch/merge/push/sync
+# dance that incident required.
+#
+# PACKAGE_ROOT (this dashboard's own repo) and get_active_repo_root() (the repo the
+# pipeline drafts/pushes against) can be two different checkouts of the SAME remote --
+# confirmed live this same incident: an agent-manager "live" deployment and an
+# "agent-manager-apply-target" consumer checkout. Branches are listed/merged against the
+# ACTIVE REPO ROOT (where they were actually pushed); the live sync step below is what
+# then catches PACKAGE_ROOT up to the result.
+
+_BRANCH_CACHE_TTL_SECONDS = 45
+_branch_cache = {"at": 0.0, "branches": []}
+_branch_cache_lock = threading.Lock()
+
+
+def _run_git(args, cwd, timeout=30):
+    result = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout
+
+
+def _detect_main_branch(repo_root):
+    """Same candidate order as src/git-runner.js's detectDefaultBranch() -- kept in sync
+    by hand (same convention as the task-source-catalog duplication elsewhere in this
+    file), since a Python dashboard route and a Node apply step both need to agree on
+    which branch 'main' means for the same repo."""
+    override = os.environ.get("AGENT_MANAGER_MAIN_BRANCH")
+    candidates = [c for c in [override, "main", "master"] if c]
+    for candidate in candidates:
+        check = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{candidate}"],
+            cwd=str(repo_root), capture_output=True, timeout=10,
+        )
+        if check.returncode == 0:
+            return candidate
+    return "main"
+
+
+def _label_for_branch(task_id, pipeline_dir, subject):
+    """Best-effort human label: the originating task's own title/domain/source if a
+    matching queue file can still be found (checked across every terminal-ish state a
+    merge-worthy branch's task could be sitting in), else the branch tip's own commit
+    subject line -- never just the raw branch name, which is an opaque id nobody but this
+    pipeline can read at a glance."""
+    if pipeline_dir:
+        qdir = pipeline_dir / "queue"
+        for state in ("done", "blocked", "awaiting-confirm", "approved"):
+            data = read_json_safe(qdir / state / f"{task_id}.json")
+            if data:
+                return {
+                    "title": data.get("title") or subject or task_id,
+                    "domain": data.get("domain"),
+                    "source": data.get("source"),
+                    "matchedTaskState": state,
+                }
+    return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None}
+
+
+def _list_unmerged_branches_uncached():
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        return []
+    repo_root = Path(repo_root)
+    pipeline_dir = get_pipeline_dir()
+
+    _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+    main_branch = _detect_main_branch(repo_root)
+
+    raw = _run_git(
+        ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
+        repo_root,
+    )
+    branches = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        full_ref, pushed_at, subject = parts
+        branch = full_ref.removeprefix("origin/")
+        task_id = branch.removeprefix("agent/")
+
+        try:
+            ahead_raw = _run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root)
+            ahead = int(ahead_raw.strip() or "0")
+        except (RuntimeError, ValueError):
+            continue
+        if ahead == 0:
+            # Already fully merged (e.g. landed by hand, or a stale ref pending prune on
+            # the remote) -- nothing for a human to act on, would just be clutter here.
+            continue
+
+        label = _label_for_branch(task_id, pipeline_dir, subject.strip())
+        branches.append({
+            "branch": branch,
+            "taskId": task_id,
+            "title": label["title"],
+            "domain": label["domain"],
+            "source": label["source"],
+            "matchedTaskState": label["matchedTaskState"],
+            "subject": subject.strip(),
+            "pushedAt": pushed_at,
+            "ahead": ahead,
+            "mainBranch": main_branch,
+        })
+
+    branches.sort(key=lambda b: b["pushedAt"])
+    return branches
+
+
+def list_unmerged_branches(force=False):
+    with _branch_cache_lock:
+        age = time.time() - _branch_cache["at"]
+        if not force and age < _BRANCH_CACHE_TTL_SECONDS:
+            return _branch_cache["branches"]
+    try:
+        branches = _list_unmerged_branches_uncached()
+    except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+        # Best-effort, same "a check failing here must never block the rest of the
+        # dashboard" rule as everything else that shells out in this file -- a git/network
+        # hiccup here shouldn't take down /api/summary's 5s poll cycle with it.
+        print(f"[branches] list failed (non-fatal): {e}", file=sys.stderr)
+        with _branch_cache_lock:
+            return _branch_cache["branches"]
+    with _branch_cache_lock:
+        _branch_cache["at"] = time.time()
+        _branch_cache["branches"] = branches
+    return branches
+
+
+def _invalidate_branch_cache():
+    with _branch_cache_lock:
+        _branch_cache["at"] = 0.0
+
+
+@app.route("/api/git/unmerged-branches")
+def api_git_unmerged_branches():
+    return jsonify(list_unmerged_branches(force=True))
+
+
+# Same well-known lockfile apply-task.sh itself flocks (scripts/apply-task.sh's own header
+# comment explains why: the race is about the shared git working tree, not this project's
+# pipelineDir, so it has to be the same fixed path regardless of caller). A merge from
+# here does the same fetch/reset/branch-touching sequence apply-task.sh's loop does every
+# ~30s -- without this, a merge click racing that loop mid-apply would corrupt the
+# other's half-finished branch/index state, exactly the failure mode that lockfile
+# already exists to prevent between apply-task.sh's own two callers.
+def _acquire_apply_lock(timeout_seconds=5):
+    lock_dir = Path.home() / ".local" / "state" / "agent-manager" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_dir / "apply-task.lock", "w")
+    deadline = time.time() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                lock_fd.close()
+                return None
+            time.sleep(0.5)
+
+
+def _release_apply_lock(lock_fd):
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        lock_fd.close()
+
+
+def _sync_live_checkout(main_branch):
+    """After a branch lands on the ACTIVE repo root's main, fast-forward THIS dashboard's
+    own repo (PACKAGE_ROOT) to match, if it's a clone of the same remote and clean enough
+    to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
+    developer's own in-progress manual edit, confirmed to happen during this same
+    incident) is left alone and reported, not silently discarded; that mirrors this
+    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work)."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+    )
+    if status.returncode != 0:
+        return {"synced": False, "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
+    if status.stdout.strip():
+        return {"synced": False, "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
+
+    try:
+        before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+        _run_git(["fetch", "origin"], PACKAGE_ROOT)
+        _run_git(["pull", "--ff-only", "origin", main_branch], PACKAGE_ROOT)
+        after = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+    except RuntimeError as e:
+        return {"synced": False, "reason": str(e)}
+
+    if before == after:
+        return {"synced": True, "changed": False, "restartTriggered": False}
+
+    changed_files = _run_git(["diff", "--name-only", before, after], PACKAGE_ROOT).splitlines()
+    dashboard_touched = any(f.startswith("python/dashboard/") for f in changed_files)
+    restart_triggered = False
+    if dashboard_touched:
+        # Werkzeug's StatReloader (use_reloader=True below) only watches .py files, not
+        # Jinja templates -- confirmed live this same incident: a template-only change
+        # left the running process silently serving the OLD page until manually killed
+        # and restarted, the exact "looks synced, isn't" gap this whole feature exists to
+        # close. Touching app.py's own mtime forces a full process restart regardless of
+        # WHICH dashboard file actually changed, so a template-only merge can't slip
+        # through un-reloaded the way it did during that incident.
+        try:
+            os.utime(Path(__file__), None)
+            restart_triggered = True
+        except OSError:
+            pass
+    return {"synced": True, "changed": True, "changedFiles": changed_files, "restartTriggered": restart_triggered}
+
+
+@app.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
+def api_git_merge_branch(branch):
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
+    # process already enumerated itself -- re-derive the current list (cheap: cached
+    # unless stale) and require an exact match, the same "only act on what we ourselves
+    # already offered" gate api_task_archive/api_task_requeue's state allowlists use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    lock_fd = _acquire_apply_lock()
+    if lock_fd is None:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    main_branch = match["mainBranch"]
+    try:
+        _run_git(["fetch", "origin"], repo_root)
+        _run_git(["checkout", main_branch], repo_root)
+        _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+        try:
+            _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+        except RuntimeError as merge_err:
+            subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+            raise merge_err
+        _run_git(["push", "origin", main_branch], repo_root)
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+        except RuntimeError:
+            # Non-fatal -- the merge to main already succeeded and is the part that
+            # matters; a leftover now-fully-merged remote branch is harmless clutter
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            pass
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    _invalidate_branch_cache()
+    live_sync = _sync_live_checkout(main_branch)
+
+    return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
 
 
 @app.route("/api/pipeline/status")
