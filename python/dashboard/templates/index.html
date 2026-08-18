@@ -2273,6 +2273,19 @@ function wireBrainDumpCardHandlers(el) {
     };
   });
 
+  el.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copyText || '');
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = original; }, 1200);
+      } catch (e) {
+        alert('Could not copy: ' + e.message);
+      }
+    };
+  });
+
   el.querySelectorAll('[data-delete]').forEach((btn) => {
     btn.onclick = async () => {
       if (!confirm('Delete this brain dump entry?')) return;
@@ -2592,6 +2605,7 @@ function renderBrainDumpCard(entry) {
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
           <button class="secondary" data-discuss="${escapeAttr(entry.id)}">Discuss</button>
           ${renderProviderToggle('bd-discuss-provider-' + escapeAttr(entry.id))}
+          <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}">Copy</button>
           <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
           ${reopenBtn}
