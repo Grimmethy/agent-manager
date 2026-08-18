@@ -18,6 +18,46 @@ const os = require('os');
 const PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR
   || path.join(os.homedir(), '.claude', 'projects');
 
+// Every call previously did a full recursive readFileSync+JSON.parse pass over ALL of
+// PROJECTS_DIR (519 files / 114MB in the observed case -- ~2s of CPU) from a fresh
+// node -e subprocess spawned once per tick by every Claude-lane worker/reviewer. That's
+// the actual bottleneck a 2026-08-17 CPU check found: repeated multi-second 100%-core
+// spikes, worsening as the transcript dir grows. A cached result on disk, reused for
+// CACHE_TTL_MS, turns "every tick" into "at most once per TTL window" regardless of how
+// many callers/instances are ticking concurrently -- healthy/unhealthy doesn't need
+// tick-level freshness, it only needs to notice a rate-limit hit or reset within a few
+// minutes.
+// Keyed by a hash of PROJECTS_DIR (not just a fixed path) so distinct scan targets --
+// notably this module's own tests, which point CLAUDE_PROJECTS_DIR at a fresh mkdtemp
+// dir per test -- never read back another target's cached result.
+function projectsDirHash(dir) {
+  let h = 0;
+  for (let i = 0; i < dir.length; i++) h = (Math.imul(h, 31) + dir.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+const CACHE_PATH = process.env.BUDGET_MONITOR_CACHE_PATH
+  || path.join(__dirname, '.agent-manager-cache', 'default', `budget-monitor.${projectsDirHash(PROJECTS_DIR)}.json`);
+const CACHE_TTL_MS = Number(process.env.BUDGET_MONITOR_CACHE_TTL_MS) || 5 * 60 * 1000;
+
+function readCache() {
+  try {
+    const cached = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
+    if (Date.now() - cached._cachedAt < CACHE_TTL_MS) return cached._result;
+  } catch {
+    // missing/corrupt/stale -- fall through to a fresh computation
+  }
+  return null;
+}
+
+function writeCache(result) {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
+    fs.writeFileSync(CACHE_PATH, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
+  } catch {
+    // best-effort -- a failed cache write must not fail the health check itself
+  }
+}
+
 function listJsonlFiles(dir) {
   let out = [];
   let entries;
@@ -190,6 +230,14 @@ function estimateTimeToCap(allEntries, ceilingTokens, usedTokens, now) {
 }
 
 function isBudgetHealthy() {
+  const cached = readCache();
+  if (cached) return cached;
+  const result = computeBudgetHealthy();
+  writeCache(result);
+  return result;
+}
+
+function computeBudgetHealthy() {
   const now = Date.now();
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
 
@@ -267,7 +315,7 @@ function isBudgetHealthy() {
   };
 }
 
-module.exports = { isBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs };
+module.exports = { isBudgetHealthy, computeBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs };
 
 if (require.main === module) {
   console.log(JSON.stringify(isBudgetHealthy(), null, 2));
