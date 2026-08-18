@@ -1350,7 +1350,7 @@ async function renderBranchesTab() {
       ? `<span class="badge" style="background:var(--panel);color:var(--muted)" title="master has moved ${b.behind} commit${b.behind === 1 ? '' : 's'} since this branch was forked -- git's 3-way merge still only applies this branch's OWN changes, so being behind alone is not itself dangerous.">${b.behind} behind</span>`
       : '';
     return `
-    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}">
+    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
       <div class="row">
         <span class="id">${escapeHtml(b.title)}</span>
         <div class="badge-col">
@@ -1372,8 +1372,19 @@ async function renderBranchesTab() {
   `;
   }).join('');
 
+  main.querySelectorAll('[data-open-branch]').forEach((card) => {
+    card.onclick = (e) => {
+      // Don't hijack the Merge button's own click -- that has its own handler and
+      // confirm() flow below, opening the history modal underneath it would be surprising.
+      if (e.target.closest('[data-merge-branch]')) return;
+      const b = branches.find((x) => x.branch === card.dataset.openBranch);
+      if (b) renderBranchDetailModal(b);
+    };
+  });
+
   main.querySelectorAll('[data-merge-branch]').forEach((btn) => {
-    btn.onclick = async () => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
       const branch = btn.dataset.mergeBranch;
       const confirmMsg = btn.dataset.willConflict === 'true'
         ? `"${branch}" is flagged as WILL CONFLICT with master on: ${btn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
@@ -1401,6 +1412,41 @@ async function renderBranchesTab() {
       }
     };
   });
+}
+
+// Branch detail modal (2026-08-18): the card itself only ever showed the tip commit's
+// subject line -- selecting a branch with several commits gave no way to read what it
+// actually did short of a manual `git log` on the box running the dashboard. Reuses the
+// same #modal-backdrop/#modal-content + closeDetail() plumbing renderTaskDetailModal uses.
+async function renderBranchDetailModal(b) {
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2><div class="meta">Loading history...</div>`;
+  backdrop.classList.add('open');
+  let data;
+  try {
+    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`);
+  } catch (e) {
+    content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2>`;
+  html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
+  if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
+  html += `<div class="field-label">Commits (${data.commits.length}, newest first)</div>`;
+  if (!data.commits.length) {
+    html += `<div class="meta">No commits found ahead of ${escapeHtml(b.mainBranch)}.</div>`;
+  } else {
+    html += `<div class="task-history">` + data.commits.map((c) => {
+      const when = c.date ? new Date(c.date).toLocaleString() : '';
+      return `<div class="task-history-row">`
+        + `<span class="task-history-stage">${escapeHtml(c.subject)}</span> `
+        + `<span class="meta">${escapeHtml(c.author)} · ${escapeHtml(when)} · <code>${escapeHtml(c.sha.slice(0, 8))}</code></span>`
+        + (c.body ? `<pre>${escapeHtml(c.body)}</pre>` : '')
+        + `</div>`;
+    }).join('') + `</div>`;
+  }
+  content.innerHTML = html;
 }
 
 async function renderJobListTab() {
