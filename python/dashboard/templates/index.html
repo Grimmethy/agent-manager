@@ -1309,12 +1309,30 @@ async function renderBranchesTab() {
     main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
     return;
   }
-  main.innerHTML = branches.map((b) => `
+  main.innerHTML = branches.map((b) => {
+    // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
+    // real 3-way merge computed entirely against the object database, no working tree
+    // touched -- run fresh every time this tab loads, not just at merge time. Added
+    // after a real near-miss (2026-08-18): two branches that independently created the
+    // same new file only revealed that conflict as an opaque error AFTER a merge was
+    // already attempted. null means the check itself failed (not "no conflict") --
+    // shown as unknown, never silently treated as safe.
+    const conflictBadge = b.willConflict === true
+      ? `<span class="badge bad" title="Conflicts on: ${escapeAttr((b.conflictFiles || []).join(', '))}">⚠ will conflict</span>`
+      : b.willConflict === null
+        ? `<span class="badge warn" title="Could not preview this merge -- outcome unknown until attempted.">? conflict unknown</span>`
+        : '';
+    const behindBadge = typeof b.behind === 'number' && b.behind > 0
+      ? `<span class="badge" style="background:var(--panel);color:var(--muted)" title="master has moved ${b.behind} commit${b.behind === 1 ? '' : 's'} since this branch was forked -- git's 3-way merge still only applies this branch's OWN changes, so being behind alone is not itself dangerous.">${b.behind} behind</span>`
+      : '';
+    return `
     <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}">
       <div class="row">
         <span class="id">${escapeHtml(b.title)}</span>
         <div class="badge-col">
+          ${conflictBadge}
           <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
+          ${behindBadge}
         </div>
       </div>
       <div class="meta">
@@ -1324,15 +1342,19 @@ async function renderBranchesTab() {
       </div>
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
-        <button class="action" data-merge-branch="${escapeAttr(b.branch)}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}">Merge to ${escapeHtml(b.mainBranch)}</button>
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
 
   main.querySelectorAll('[data-merge-branch]').forEach((btn) => {
     btn.onclick = async () => {
       const branch = btn.dataset.mergeBranch;
-      if (!confirm(`Merge "${branch}" into master and sync the live dashboard?`)) return;
+      const confirmMsg = btn.dataset.willConflict === 'true'
+        ? `"${branch}" is flagged as WILL CONFLICT with master on: ${btn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
+        : `Merge "${branch}" into master and sync the live dashboard?`;
+      if (!confirm(confirmMsg)) return;
       btn.disabled = true;
       btn.textContent = 'Merging...';
       try {

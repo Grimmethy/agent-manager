@@ -2400,6 +2400,40 @@ def _detect_main_branch(repo_root):
     return "main"
 
 
+# Regex, not exact string matching -- git's own conflict-line wording varies by conflict
+# TYPE ("Merge conflict in X" for content conflicts, "Merge conflict in X" for add/add
+# too, but the parenthesized kind before it differs: "(content)", "(add/add)", "(rename)",
+# etc.) -- only the trailing file path after 'in ' is what callers need, so match loosely
+# on that structural shape rather than hardcoding one conflict-type's exact wording.
+_CONFLICT_LINE_RE = re.compile(r"^CONFLICT \([^)]+\):.*\bin (.+)$", re.MULTILINE)
+
+
+def _check_merge_conflict(repo_root, main_branch, branch):
+    """Cheap, side-effect-free conflict preview: git merge-tree (2.38+) computes a real
+    3-way merge entirely against the object database -- no working tree or index touched,
+    nothing to clean up regardless of outcome -- and reports whether it WOULD conflict
+    without actually attempting one. Added after a real near-miss (2026-08-18): two
+    pushed-but-unmerged branches both independently created the same new file, and the
+    only way that surfaced was an opaque git error AFTER a merge was already attempted --
+    exactly the kind of surprise a 'one button' merge shouldn't produce. Best-effort: any
+    unexpected error here is reported as 'unknown', not 'safe' -- a staleness/conflict
+    check that silently says 'no conflict' on its own failure would be worse than no
+    check at all.
+    """
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", f"origin/{main_branch}", f"origin/{branch}"],
+        cwd=str(repo_root), capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 0:
+        return {"willConflict": False, "conflictFiles": [], "checked": True}
+    if result.returncode == 1:
+        files = _CONFLICT_LINE_RE.findall(result.stdout)
+        return {"willConflict": True, "conflictFiles": files, "checked": True}
+    # returncode > 1: merge-tree itself errored (not a conflict verdict) -- report
+    # "unknown" rather than guessing either way.
+    return {"willConflict": None, "conflictFiles": [], "checked": False}
+
+
 def _label_for_branch(task_id, pipeline_dir, subject):
     """Best-effort human label: the originating task's own title/domain/source if a
     matching queue file can still be found (checked across every terminal-ish state a
@@ -2455,6 +2489,14 @@ def _list_unmerged_branches_uncached():
             # the remote) -- nothing for a human to act on, would just be clutter here.
             continue
 
+        try:
+            behind_raw = _run_git(["rev-list", "--count", f"{full_ref}..origin/{main_branch}"], repo_root)
+            behind = int(behind_raw.strip() or "0")
+        except (RuntimeError, ValueError):
+            behind = None
+
+        conflict = _check_merge_conflict(repo_root, main_branch, branch)
+
         label = _label_for_branch(task_id, pipeline_dir, subject.strip())
         branches.append({
             "branch": branch,
@@ -2466,7 +2508,10 @@ def _list_unmerged_branches_uncached():
             "subject": subject.strip(),
             "pushedAt": pushed_at,
             "ahead": ahead,
+            "behind": behind,
             "mainBranch": main_branch,
+            "willConflict": conflict["willConflict"],
+            "conflictFiles": conflict["conflictFiles"],
         })
 
     branches.sort(key=lambda b: b["pushedAt"])
@@ -2607,6 +2652,18 @@ def api_git_merge_branch(branch):
             _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
         except RuntimeError as merge_err:
             subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+            # match['willConflict']/['conflictFiles'] came from list_unmerged_branches's
+            # own merge-tree preview a moment ago (same request, force-refreshed above) --
+            # if it already predicted this exact outcome, say so plainly instead of
+            # surfacing raw git stderr. Confirmed live 2026-08-18: an add/add conflict
+            # between two independently-drafted candidate docs produced exactly this kind
+            # of opaque failure with no indication of WHICH files or WHY.
+            if match.get("willConflict") and match.get("conflictFiles"):
+                files = ", ".join(match["conflictFiles"])
+                raise RuntimeError(
+                    f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
+                    f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
+                ) from merge_err
             raise merge_err
         _run_git(["push", "origin", main_branch], repo_root)
         try:
