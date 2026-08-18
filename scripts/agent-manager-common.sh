@@ -174,6 +174,34 @@ write_heartbeat_file() {
 # than one missed tick, matching taskforge's "lease must exceed heartbeat" ratio) or a
 # dead pid means the previous holder is gone, not still alive -- takeover proceeds
 # normally (logged, not silent) rather than refusing forever on an abandoned file.
+# Claude rate-limit gate. budget-monitor.js's isBudgetHealthy() (see that module's own
+# header) reads Claude Code's own local transcript for a real rate-limit-hit event -- it
+# existed and was already wired into review-runner.ps1/apply-runner.ps1 (both check it
+# before spending a pass), but was never ported to any Linux daemon: claude-client.js
+# itself has no rate-limit awareness at all (its only retry logic is for degenerate
+# output), so nothing here previously stopped a worker/reviewer from repeatedly trying --
+# and failing -- to start Claude-backed work while rate-limited, instead of backing off
+# until the known reset time. Prints the reason to stdout either way (for the caller to
+# log); exit 0 means healthy, exit 1 means back off Claude-backed work this tick. A
+# missing script or a monitor failure is treated as healthy (fail open), same "a check
+# failing here must never block the tick" rule gpu-guard.js's own header documents --
+# this is a budget hint, not a correctness gate.
+check_budget_healthy() {
+  local budget_script="${PACKAGE_SRC_DIR}/../budget-monitor.js"
+  [[ -f "$budget_script" ]] || return 0
+  node -e '
+    try {
+      const { isBudgetHealthy } = require(process.argv[1]);
+      const b = isBudgetHealthy();
+      console.log(b.reason);
+      process.exit(b.healthy ? 0 : 1);
+    } catch (e) {
+      console.log("budget-monitor.js error (treating as healthy): " + e.message);
+      process.exit(0);
+    }
+  ' "$budget_script"
+}
+
 check_instance_liveness() {
   local instance_id="$1" tick_secs="${2:-30}"
   local hb_path="${INSTANCES_DIR}/${instance_id}.json"
