@@ -1175,7 +1175,14 @@ def api_summary():
     qdir = queue_dir()
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
-    counts["brain-dump"] = sum(1 for e in read_brain_dump_entries() if e.get("status") != "actioned")
+    bd_entries = _brain_dump_entries_with_task_status()
+    # Unprocessed (captured/sorted) PLUS actioned-but-stuck -- see
+    # BRAIN_DUMP_NEEDS_ATTENTION_STATES's own header for why the latter half exists: a
+    # stuck-actioned entry previously gave zero nav-level signal at all.
+    counts["brain-dump"] = (
+        sum(1 for e in bd_entries if e.get("status") != "actioned")
+        + _brain_dump_needs_attention_count(bd_entries)
+    )
     # Cached (list_unmerged_branches(force=False)) -- this route is polled every 5s by
     # the nav badge cycle, and a live `git fetch` on every single poll would be both slow
     # and needlessly hammer the remote. The dedicated /api/git/unmerged-branches route
@@ -1293,6 +1300,40 @@ def _task_state_index(qdir) -> dict:
     return index
 
 
+# Module-level (not inline in api_brain_dump) so api_summary's nav-badge count can share
+# the EXACT same definition -- confirmed live 2026-08-18: the tab's own default filter
+# already surfaced every actioned-but-stuck entry correctly (taskStatus badges, built
+# 2026-08-16), but the nav sidebar's Brain Dump count (api_summary, below) only ever
+# counted status != 'actioned' -- captured/sorted, never a stuck-actioned entry -- so a
+# real backlog of 27 actioned-but-blocked/needs-clarification/awaiting-confirm entries
+# gave ZERO signal at the nav level. Discovering them required opening the tab with no
+# filter and remembering to check, exactly the manual-audit gap this pair of definitions
+# closes: one source of truth for "needs attention," read by both the badge count and the
+# tab's own default view, so they can't drift the way two independently-hand-maintained
+# lists always eventually do in this codebase (see drift-scan.js's whole existence).
+BRAIN_DUMP_NEEDS_ATTENTION_STATES = {"blocked", "needs-clarification", "awaiting-confirm"}
+
+
+def _brain_dump_entries_with_task_status():
+    """read_brain_dump_entries() + each entry's live queue state (taskStatus), the same
+    enrichment api_brain_dump() and api_summary() both need -- factored out so neither can
+    silently stop doing it."""
+    entries = read_brain_dump_entries()
+    task_states = _task_state_index(queue_dir())
+    for e in entries:
+        qid = e.get("queuedTaskId")
+        if qid:
+            e["taskStatus"] = task_states.get(qid, "unknown")
+    return entries
+
+
+def _brain_dump_needs_attention_count(entries):
+    return sum(
+        1 for e in entries
+        if e.get("status") == "actioned" and e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES
+    )
+
+
 @app.route("/api/brain-dump")
 def api_brain_dump():
     """Brain Dump tab's left pane. Defaults to everything not yet actioned (captured +
@@ -1304,21 +1345,15 @@ def api_brain_dump():
     completed actioned entry stays hidden by default -- only ?status=actioned/all
     surfaces those -- since there's nothing for a human to act on there.
     ?status=<value> narrows to one status, ?status=all returns the full history."""
-    entries = read_brain_dump_entries()
-    task_states = _task_state_index(queue_dir())
-    for e in entries:
-        qid = e.get("queuedTaskId")
-        if qid:
-            e["taskStatus"] = task_states.get(qid, "unknown")
+    entries = _brain_dump_entries_with_task_status()
 
     status_filter = request.args.get("status", "").strip()
-    NEEDS_ATTENTION = {"blocked", "needs-clarification", "awaiting-confirm"}
     if status_filter and status_filter != "all":
         entries = [e for e in entries if e.get("status") == status_filter]
     elif not status_filter:
         entries = [
             e for e in entries
-            if e.get("status") != "actioned" or e.get("taskStatus") in NEEDS_ATTENTION
+            if e.get("status") != "actioned" or e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES
         ]
     entries = sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
 
