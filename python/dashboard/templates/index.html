@@ -10,19 +10,19 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  header { padding: 14px 20px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
   .layout { display: flex; }
-  nav { width: 200px; padding: 16px 0; border-right: 1px solid var(--border); min-height: calc(100vh - 53px); }
+  nav { width: 200px; padding: 16px 0; border-right: 2px solid var(--border); min-height: calc(100vh - 53px); }
   nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
   main { flex: 1; padding: 20px; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--border); }
-  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--border); }
+  td { padding: 9px 10px; border-bottom: 2px solid var(--border); vertical-align: top; }
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: var(--panel); }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
@@ -44,7 +44,7 @@
   .status-dot.bad { background: var(--bad); }
   .stale-timer { color: var(--bad); font-size: 11px; font-variant-numeric: tabular-nums; }
   .state-timer { color: var(--muted, #8b949e); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .worker-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+  .worker-card { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
@@ -57,9 +57,9 @@
   .bar-fill { height: 100%; border-radius: 2px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
   .modal-backdrop.open { display: flex; }
-  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
+  .modal { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
   .modal h2 { margin-top: 0; font-size: 15px; }
-  .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
+  .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
   .modal .close { float: right; cursor: pointer; color: var(--muted); background: none; border: none; font-size: 18px; }
   .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
   .task-history { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 4px; }
@@ -77,18 +77,18 @@
   #toast { position: fixed; bottom: 20px; right: 20px; max-width: 420px; padding: 10px 16px; border-radius: 8px; font-size: 13px; line-height: 1.4; box-shadow: 0 4px 16px rgba(0,0,0,.35); z-index: 9999; opacity: 0; pointer-events: none; transform: translateY(8px); transition: opacity .15s ease, transform .15s ease; }
   #toast.show { opacity: 1; transform: translateY(0); }
   #toast.toast-error { background: var(--bad); color: #fff; }
-  #toast.toast-info { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  #toast.toast-info { background: var(--panel); color: var(--text); border: 2px solid var(--border); }
   .path-row { display: flex; gap: 8px; margin-bottom: 12px; }
-  .path-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; }
+  .path-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; }
   button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.action:disabled { opacity: .5; cursor: not-allowed; }
-  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button.secondary { background: var(--panel); color: var(--text); border: 2px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.danger:disabled { opacity: .5; cursor: not-allowed; }
   .worker-filter-bar { display: flex; gap: 8px; }
-  .worker-filter-bar button { background: var(--panel); color: var(--muted); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .worker-filter-bar button { background: var(--panel); color: var(--muted); border: 2px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   .worker-filter-bar button.active { color: var(--accent); border-color: var(--accent); }
-  .browser-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
+  .browser-panel { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
   .browser-crumb .crumb-link:hover { text-decoration: underline; }
@@ -100,30 +100,30 @@
   .stat-row { display: flex; gap: 24px; margin: 14px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
-  .build-log { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
+  .build-log { background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
   .build-log div { color: var(--muted); }
-  iframe.viz { width: 100%; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 8px; margin-top: 16px; }
+  iframe.viz { width: 100%; flex: 1; min-height: 0; border: 2px solid var(--border); border-radius: 8px; margin-top: 16px; }
   .split-pane { display: flex; gap: 16px; align-items: flex-start; }
   .split-pane > div { flex: 1; min-width: 0; }
   .capture-row { display: flex; gap: 8px; margin-bottom: 14px; }
-  .capture-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
-  .bd-entry { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .capture-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
   .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .bd-entry .text { font-size: 13px; }
   .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
   .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
-  .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
-  .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
+  .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
+  .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
   .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .grill-msg-assistant .grill-msg-role { color: var(--accent); }
   .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
   .grill-msg-user { align-self: flex-end; max-width: 85%; }
   .grill-msg-user .grill-msg-role { text-align: right; }
   .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }
-  .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
+  .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
   .grill-enriched-badge { color: var(--ok); font-size: 12px; margin-top: 10px; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
-  .priority-input { width: 60px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
 </style>
 </head>
@@ -606,7 +606,7 @@ async function renderClaudeSettingsPanel() {
       <div class="field-label" style="margin-top:14px">Subscription Token</div>
       <div class="meta" style="margin-bottom:6px">${tokenStatus} -- generate one with <code>claude setup-token</code> (opens a browser to approve, then prints a token good for about a year). Pasted here, it's saved to <code>agent-manager.env</code> and never shown again, including to this page -- only whether one is set.</div>
       <div class="row" style="gap:8px;align-items:center">
-        <input type="password" id="claude-token-input" placeholder="Paste token from \`claude setup-token\`" autocomplete="off" style="flex:1;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-family:monospace;font-size:12px">
+        <input type="password" id="claude-token-input" placeholder="Paste token from \`claude setup-token\`" autocomplete="off" style="flex:1;background:var(--panel);border:2px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-family:monospace;font-size:12px">
         <button type="button" class="action" id="claude-token-save">Save Token</button>
         ${settings.tokenConfigured ? '<button type="button" class="secondary" id="claude-token-clear">Clear</button>' : ''}
       </div>
@@ -1055,7 +1055,7 @@ function renderClarificationPicker(task) {
   } else {
     html += `<div class="meta">No file in the project graph matched anything in this task's text. Type a path by hand, or proceed without one.</div>`;
   }
-  html += `<div style="margin-top:10px"><input type="text" id="clarify-manual-path" placeholder="relative/path/to/file.ts" style="width:60%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-family:monospace;font-size:12px">`;
+  html += `<div style="margin-top:10px"><input type="text" id="clarify-manual-path" placeholder="relative/path/to/file.ts" style="width:60%;background:var(--panel);border:2px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-family:monospace;font-size:12px">`;
   html += `<button type="button" class="action" id="clarify-add-manual" style="margin-left:6px">Use This Path</button></div>`;
   html += `<div id="clarify-selected-paths" style="margin-top:8px"></div>`;
   html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-skip-btn">Proceed Without Prefetch</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button> ${renderProviderToggle('clarify-discuss-provider')}</div>`;
@@ -1912,7 +1912,7 @@ async function loadBrowsePanel() {
       html += `<div class="browser-entry" data-nav="${escapeAttr(data.parent)}"><span>.. (up)</span></div>`;
     }
     if (data.path) {
-      html += `<div class="browser-entry" data-select="${escapeAttr(data.path)}" style="border-top:1px solid var(--border);margin-top:4px;padding-top:8px">
+      html += `<div class="browser-entry" data-select="${escapeAttr(data.path)}" style="border-top:2px solid var(--border);margin-top:4px;padding-top:8px">
         <span><strong>Use this folder</strong></span><span>&rarr;</span></div>`;
     }
     for (const entry of data.entries) {
