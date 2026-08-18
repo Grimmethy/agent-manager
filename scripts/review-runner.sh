@@ -58,6 +58,25 @@ while :; do                                                                     
     [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check ornith-worker.sh's claim loop uses.
 
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
+
+    # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy). Unlike
+    # ornith-worker.sh's lane-wide gate, this has to be per-item: review/ mixes drafts from
+    # both lanes, and review-task.js's own majorityVote call routes through the SAME
+    # per-task reasoningTierFor() tier ornith-draft.js used to draft it (model-provider.js's
+    # providerFor()) -- a high-tier item lands here having been drafted by Claude, and its
+    # review vote also calls Claude. Skip (don't consume) just this item and leave it in
+    # review/ for a later tick if Claude's rate-limited; low-tier items keep reviewing
+    # normally regardless, since they never touch Claude.
+    resolved_tier="$(node -e 'try{require(process.argv[2]);const {reasoningTierFor}=require(process.argv[3]);const t=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(reasoningTierFor(t))}catch(e){}' "$file" "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
+    if [[ "$resolved_tier" == "high" ]]; then
+      budget_reason="$(check_budget_healthy)"
+      budget_rc=$?
+      if [[ $budget_rc -ne 0 ]]; then
+        printf '[review-%s] Claude budget not healthy: %s -- skipping %s this tick.\n' "$INSTANCE_ID" "$budget_reason" "$task_id" >&2
+        continue
+      fi
+    fi
+
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 

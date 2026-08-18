@@ -107,6 +107,29 @@ while :; do                                                                     
   mkdir -p "$HOME_LOGS" 2>/dev/null                                              # ensure base home logs dir exists — PowerShell's New-Item creates the folder automatically when it doesn't exist (we mirror that behavior explicitly here because bash's redirection won't auto-create parent dirs the way PS does).
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
+  # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy -- see its own
+  # comment) -- only the Claude lane needs this: worker-claude* instances are the only
+  # ones whose claimed/resumed tasks ever route to claude-client.js (the IS_CLAUDE_LANE
+  # claim filter above already restricts this lane to high-reasoning-tier tasks, and
+  # model-provider.js's providerFor() maps ONLY high-tier tasks to Claude). A low-tier
+  # Ornith worker checking this too would wrongly stall local Ornith work every time
+  # Claude's account-wide cap is hit, even though it never calls Claude at all -- that's
+  # not the bug being fixed here. Gated once per tick, before the resume-drafting pass AND
+  # the claim-from-pending loop, since both can reach a Claude call for this lane; skips
+  # straight to the budget-gate sleep tier (matching review-runner.ps1/apply-runner.ps1's
+  # own 10-minute 'budget' backoff) rather than the normal idle/busy tick interval, so a
+  # known rate-limit window doesn't get hammered with a fresh attempt every 30-60s.
+  if "$IS_CLAUDE_LANE"; then
+    budget_reason="$(check_budget_healthy)"
+    budget_rc=$?
+    if [[ $budget_rc -ne 0 ]]; then
+      printf '[worker-%s] Claude budget not healthy: %s -- skipping this tick.\n' "$INSTANCE_ID" "$budget_reason" >&2
+      write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "budget" "$STARTED_AT"
+      sleep "${ORC_BUDGET_GATE_SECS:-600}"
+      continue
+    fi
+  fi
+
   # GPU headroom check -- before spending any real model call this tick, see whether the
   # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
   # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best
