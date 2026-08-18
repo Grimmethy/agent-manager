@@ -22,7 +22,7 @@ const { ensureRegistered } = require('./config.js');
 // any test does. A throwaway value is fine; no test here exercises the real repoRoot.
 process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || os.tmpdir();
 
-const { applyTask } = require('./apply-task.js');
+const { applyTask, recordApplyOutcome } = require('./apply-task.js');
 
 const REPO_ROOT = path.join(os.tmpdir(), 'apply-task-test-repo');
 const PIPELINE_DIR = REPO_ROOT;
@@ -481,4 +481,49 @@ test('domain path_prefetch_resolve never touches git -- writes the suggestion on
   assert.equal(fs.existsSync(path.join(scratchPipelineDir, 'queue', 'adhoc', 'held-1.json')), false);
 
   fs.rmSync(scratchPipelineDir, { recursive: true, force: true });
+});
+
+// Regression tests for recordApplyOutcome() (2026-08-18 incident): an apply failure on an
+// already-APPROVED task was silently reclassified as a review rejection by
+// reject-retry-check.js purely because the task still carried a stale blockedStage:
+// 'review' from an earlier, already-resolved rejection -- discarding an already-approved,
+// human-confirmed diff for a full blind redraft instead of leaving it for a human to see.
+test('recordApplyOutcome overwrites a stale blockedStage:"review" with "apply" on a new apply failure, so reject-retry-check.js cannot misfire on it', () => {
+  const task = {
+    id: 'stale-blocked-task',
+    // Leftover from an EARLIER, already-resolved review rejection -- approval never
+    // clears these fields, only a NEW block overwrites them.
+    blockedStage: 'review',
+    blockedReason: 'an old, unrelated review rejection from a prior draft attempt',
+    history: [],
+  };
+  const result = { succeeded: false, reason: 'git apply failed: error: corrupt patch at line 68' };
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'apply-failed');
+  assert.equal(task.blockedStage, 'apply');
+  assert.equal(task.blockedReason, result.reason);
+  assert.notEqual(task.blockedStage, 'review', 'reject-retry-check.js\'s isReviewRejection() must not match this');
+});
+
+test('recordApplyOutcome does not touch blockedStage/blockedReason on a successful apply', () => {
+  const task = { id: 'ok-task', history: [] };
+  const result = { succeeded: true, branch: 'agent/ok-task', pushed: true };
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'applied');
+  assert.equal(task.blockedStage, undefined);
+  assert.equal(task.blockedReason, undefined);
+});
+
+test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needsConfirmation hold, and does not stamp blockedStage', () => {
+  const task = { id: 'hold-task', history: [] };
+  const result = { succeeded: false, needsConfirmation: true, reason: 'real agentic code diff ready to apply -- held for human confirmation' };
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'awaiting-confirm');
+  assert.equal(task.blockedStage, undefined);
 });

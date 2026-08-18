@@ -364,6 +364,35 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
   }
 }
 
+// Mutates `task` in place with the outcome of an applyTask() result (history event, and
+// on failure, blockedStage/blockedReason), returning the stage name written. Extracted
+// from main() so this is unit-testable without spawning the CLI -- see its own inline
+// comment on the apply-failed branch for why the stamping matters, not just the history
+// event.
+function recordApplyOutcome(task, result) {
+  // needsConfirmation checked first, matching apply-task.sh's own precedence: it reports
+  // succeeded:false but is a hold for a human (a delete-containing batch), not a failure.
+  const applyStage = result.needsConfirmation ? 'awaiting-confirm' : (result.succeeded ? 'applied' : 'apply-failed');
+  // An apply-failed task lands in queue/blocked/ next (apply-task.sh's own move), the same
+  // directory reject-retry-check.js scans for blockedStage==='review' to auto-requeue. A
+  // task that reached apply (i.e. got APPROVED) can still carry a stale blockedStage:
+  // 'review'/blockedReason from an EARLIER, already-resolved review rejection -- approval
+  // never clears those fields, only overwrites them on a NEW block. Confirmed live
+  // 2026-08-18: a real apply failure (the --recount bug in apply-adhoc-diff.js) got
+  // silently reclassified as a review rejection purely because of this leftover field, and
+  // reject-retry-check.js discarded an already-approved, human-confirmed diff for a full
+  // blind redraft instead of just leaving the apply failure for a human to look at. Stamp
+  // this failure's OWN blockedStage/blockedReason here so that leftover field can never
+  // survive past a real apply attempt -- 'apply' is deliberately not 'review', so
+  // isReviewRejection() in reject-retry-check.js won't match it.
+  if (applyStage === 'apply-failed') {
+    task.blockedStage = 'apply';
+    task.blockedReason = result.reason;
+  }
+  appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
+  return applyStage;
+}
+
 function main() {
   const taskPath = process.argv[2];
   if (!taskPath) {
@@ -392,10 +421,7 @@ function main() {
   // branch/commit info, no failure reason if apply itself failed. apply-task.sh (the
   // caller) moves the SAME file afterward, so writing it back here in place -- same
   // pattern ornith-draft.js/review-task.js already use -- lands before that move.
-  // needsConfirmation checked first, matching apply-task.sh's own precedence: it reports
-  // succeeded:false but is a hold for a human (a delete-containing batch), not a failure.
-  const applyStage = result.needsConfirmation ? 'awaiting-confirm' : (result.succeeded ? 'applied' : 'apply-failed');
-  appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
+  const applyStage = recordApplyOutcome(task, result);
   try {
     fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
   } catch (e) {
@@ -407,7 +433,7 @@ function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { applyTask };
+module.exports = { applyTask, recordApplyOutcome };
 
 if (require.main === module) {
   main();
