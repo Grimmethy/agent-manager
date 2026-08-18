@@ -20,10 +20,22 @@ const path = require('path');
 // discriminating work; this only needs to catch common English filler that would
 // otherwise "match" some innocuous file by pure substring coincidence (e.g. bare "add"
 // matching every file with "add" somewhere in its path).
+//
+// 'agent'/'manager' (2026-08-18, live needs-clarification sweep): this project's own
+// brain-dump notes are conventionally titled "Agent Manager > <area> > <detail>: ..." --
+// the product's own name, present in nearly every single note regardless of what it's
+// actually about, not a real anchor. "Agent" alone substring-matches every
+// *-agentic-draft.js file (adhoc-agentic-draft.js, research-agentic-draft.js and their
+// .test.js siblings), which was single-handedly the ENTIRE reason 8 of 23 real stuck
+// queue/needs-clarification/ items were marked "ambiguous" (confirmed live: their
+// candidates list contained nothing but 'Agent'), and added noise to several more --
+// exactly the kind of pure-coincidence substring match this list exists to filter out,
+// same as 'add' above.
 const STOPWORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'but', 'for', 'to', 'of', 'in', 'on', 'at', 'is', 'it',
   'this', 'that', 'we', 'need', 'needs', 'should', 'with', 'from', 'into', 'when', 'add',
   'fix', 'update', 'make', 'sure', 'file', 'files', 'code', 'task', 'tasks',
+  'agent', 'manager',
 ]);
 
 // Pulls candidate anchor keywords out of a task's title/text. Identifier-shaped tokens

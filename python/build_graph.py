@@ -177,6 +177,31 @@ def resolve_python_import(from_file: Path, spec: str, repo_root: Path) -> Path |
                 return path.resolve()
             except OSError:
                 return None
+
+    # Same-directory sibling import ('from claude_client import X', no leading dot, no
+    # repo-root-relative package path either) -- the common shape for this project's own
+    # dashboard/*.py scripts, which aren't a real package (no __init__.py) and rely on
+    # Python inserting the running script's own directory into sys.path[0] at runtime.
+    # Without this fallback every such import resolves against repo_root instead of
+    # from_file's own directory, never matches a real file, and silently produces no edge
+    # -- which is exactly why python/dashboard/*.py all showed up with degree 0 (no
+    # detected import edges at all) and were pruned as "isolated" from graph.json,
+    # confirmed live 2026-08-18 while investigating why every brain-dump note about the
+    # dashboard was permanently stuck in queue/needs-clarification/ (path-prefetch-resolve
+    # reads its entire candidate file universe from graph.json's node list, which had
+    # silently contained zero python/dashboard files as a result). Tried only for the
+    # non-relative (no leading dot) branch above -- a real leading-dot relative import
+    # already resolves correctly via the block above it.
+    if not spec.startswith("."):
+        same_dir_candidate = from_file.parent.joinpath(*parts)
+        same_dir_tried = [same_dir_candidate.with_suffix(ext) for ext in PY_EXTENSIONS]
+        same_dir_tried += [same_dir_candidate / "__init__.py"]
+        for path in same_dir_tried:
+            if path.is_file():
+                try:
+                    return path.resolve()
+                except OSError:
+                    return None
     return None
 
 
