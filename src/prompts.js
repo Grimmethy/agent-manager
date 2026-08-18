@@ -210,6 +210,28 @@ function adhocPlanPrompt(task) {
   ].join('\n');
 }
 
+// research_task never had a plan template registered here -- ornith-draft.js's main loop
+// unconditionally calls buildPlanPrompt() before checking task.domain (the domain==='research'
+// branch that skips straight to research-agentic-draft.js's own WebSearch/WebFetch call only
+// kicks in at the IMPLEMENT stage, further down), so every research task fell through to
+// genericFallbackPlanPrompt's throw and died on its very first tick, forever (found live
+// 2026-08-17: 3 research tasks retried and failed identically every tick, up to 6+ hours).
+// This plan is intentionally throwaway -- draftResearchImplement()/buildResearchPrompt()
+// build their agentic prompt straight from task.promptContext/task.title, never from
+// task.planResponse -- it only needs to be non-empty so the mandatory plan stage can pass
+// and the task can reach the real research call.
+function researchPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'A note has been classified as requiring real web research (not a code change). You will not do the research yourself here -- a separate pass with real web-search tools handles that next. Just write a short PLAN (2-4 numbered points) for what that research pass should look into and what a good write-up should cover.',
+    '',
+    `Title: ${task.title || ''}`,
+    '',
+    `NOTE: ${ctx.rawText || '(no text)'}`,
+    ctx.tags && ctx.tags.length ? `\nTags: ${ctx.tags.join(', ')}` : '',
+  ].join('\n');
+}
+
 // Prompt assembly: stable (identity/rules) block first, volatile (per-task) block last --
 // agent-engine's prompt-assembler.ts pattern (project idea shortlist, 2026-07-26),
 // adapted here. Putting ALL static instructional text in one contiguous leading block,
@@ -731,6 +753,10 @@ updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolve
 // own CLI entry point at the bottom), just no longer reachable from the adhoc
 // production path specifically.
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
+// No buildImplementPrompt -- domain==='research' bypasses buildImplementPrompt entirely
+// (see ornith-draft.js's own domain==='research' branch), same as adhoc's agentic bypass
+// just above. Only the mandatory plan stage needs a real template here.
+updateTaskSource('research_task', { buildPlanPrompt: researchPlanPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
 updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
 updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
