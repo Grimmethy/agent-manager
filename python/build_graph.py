@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 import networkx as nx
@@ -317,9 +318,18 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
     return graph
 
 
+# Directory names common enough across unrelated repos (and, per this repo's own
+# frontend/src + backend/src layout, common enough WITHIN one repo) that landing on one
+# alone as a community name is ambiguous rather than descriptive.
+_GENERIC_DIR_NAMES = {"src", "source", "lib", "app", "core", "common", "utils", "internal", "pkg", "."}
+
+
 def name_community_heuristic(files: list[str]) -> str:
     """Fallback when the model call fails or times out -- the shared directory prefix is
-    a reasonable, cheap stand-in for a real semantic name."""
+    a reasonable, cheap stand-in for a real semantic name, EXCEPT when that prefix is
+    itself a generic bucket name (e.g. bare "src") that many unrelated communities could
+    also share -- there we descend one more level and list the most common subdirectories
+    actually distinguishing this cluster's files."""
     parts_lists = [Path(f).parent.parts for f in files]
     if not parts_lists:
         return "Unnamed community"
@@ -329,7 +339,20 @@ def name_community_heuristic(files: list[str]) -> str:
             common.append(parts[0])
         else:
             break
-    return "/".join(common) if common else Path(files[0]).parent.name or "root"
+
+    if not common:
+        return Path(files[0]).parent.name or "root"
+
+    if common[-1].lower() not in _GENERIC_DIR_NAMES:
+        return "/".join(common)
+
+    depth = len(common)
+    next_segments = [parts[depth] for parts in parts_lists if len(parts) > depth]
+    if not next_segments:
+        return "/".join(common)
+
+    top_segments = [seg for seg, _ in Counter(next_segments).most_common(3)]
+    return "/".join(common) + "/{" + ",".join(top_segments) + "}"
 
 
 def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) -> str | None:
