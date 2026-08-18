@@ -276,11 +276,15 @@ def api_claude_usage():
     exactly what signal this is (and isn't): Claude Code itself only ever tells you a
     rate limit was hit, reactively, via an error event in its local session transcripts
     -- there's no live "you've used N% of your 5-hour window" API to poll. What this
-    surfaces is real: the last actual rate-limit hit and its reset time (if any), plus
-    rolling 5h/7d token and call counts as a volume trend -- not a precise quota gauge.
-    Scans ~/.claude/projects, so headless calls this pipeline makes via claude-client.js
-    show up in the same rolling counts as any interactive `claude` session on this
-    machine, since both write to the same transcript directory."""
+    surfaces is real: the last actual rate-limit hit and its reset time (if any), rolling
+    5h/7d token and call counts as a volume trend, and (Brain Dump #89, 2026-08-18) an
+    `estimate` object with a used/ceiling percentage and a projected time-to-cap -- see
+    budget-monitor.js's own estimateBudgetCeiling()/estimateTimeToCap() for how that's
+    derived ENTIRELY from real past rate-limit hits, never an invented number; `estimate`
+    is null when no real hit has been observed yet in the lookback window. None of this is
+    a precise live quota gauge. Scans ~/.claude/projects, so headless calls this pipeline
+    makes via claude-client.js show up in the same rolling counts as any interactive
+    `claude` session on this machine, since both write to the same transcript directory."""
     script_path = PACKAGE_ROOT / "budget-monitor.js"
     try:
         result = subprocess.run(["node", str(script_path)], capture_output=True, text=True, timeout=15)
