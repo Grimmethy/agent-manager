@@ -2583,10 +2583,24 @@ const TASK_STATUS_BADGE = {
   unknown: ['idle', 'status unknown'],
 };
 
+// Clickable everywhere it's used (Brain Dump cards, Second Brain "Linked Tasks") so the
+// same badge always opens the same task progress modal -- confirmed live 2026-08-18: a
+// Brain Dump entry showing "blocked" gave no way to see *why* short of hunting the task
+// down by hand in the right queue tab. openTaskAnywhere() (used by the Workers tab click-
+// through) already solves "find this task regardless of which queue state it's in".
 function taskStatusBadgeHtml(taskId, taskStatus) {
   const [sev, label] = TASK_STATUS_BADGE[taskStatus] || TASK_STATUS_BADGE.unknown;
-  return `<span class="badge ${sev}" title="task ${escapeAttr(taskId)}">${escapeHtml(label)}</span>`;
+  return `<span class="badge ${sev} clickable" data-open-task="${escapeAttr(taskId)}" style="cursor:pointer" title="task ${escapeAttr(taskId)} -- click for details">${escapeHtml(label)}</span>`;
 }
+
+// Delegated (not per-badge onclick) since taskStatusBadgeHtml's output gets dropped into
+// innerHTML in several different places (Brain Dump cards, Second Brain linked-task refs)
+// that each re-render on their own schedule -- one listener on the stable #main ancestor
+// survives all of those re-renders instead of needing to be rewired after each one.
+document.getElementById('main').addEventListener('click', (e) => {
+  const badge = e.target.closest('[data-open-task]');
+  if (badge) openTaskAnywhere(badge.dataset.openTask);
+});
 
 function renderBrainDumpCard(entry) {
   const sort = entry.sort;
