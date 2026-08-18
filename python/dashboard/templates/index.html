@@ -47,6 +47,7 @@
   .worker-card { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
+  .worker-model-select { margin-left: 10px; margin-right: auto; font-size: 12px; max-width: 220px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
   th.sortable { cursor: pointer; user-select: none; }
@@ -410,8 +411,31 @@ function laneForInstance(inst) {
   return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'ornith';
 }
 
+// Which model-list an instance's Workers-tab dropdown offers: the reasoning lane picks
+// from Claude models (same CLAUDE_MODEL_CHOICES the Models tab's default-model select
+// already uses), every other model-calling lane (worker-* / reviewer) picks from locally
+// pulled Ollama models, and watchdog gets no dropdown at all -- it never calls a model
+// (queue-watcher.sh always heartbeats model="").
+function modelKindForInstance(inst) {
+  if (inst.instanceId === 'watchdog') return null;
+  return laneForInstance(inst) === 'reasoning' ? 'claude' : 'ollama';
+}
+
+async function setWorkerModel(instanceId, model) {
+  await fetch(`/api/worker-models/${encodeURIComponent(instanceId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
+  });
+  await renderWorkers();
+}
+
 async function renderWorkers() {
-  const instances = await fetchJson('/api/instances');
+  const [instances, workerModels] = await Promise.all([
+    fetchJson('/api/instances'),
+    fetchJson('/api/worker-models'),
+  ]);
+  const overrides = workerModels.overrides || {};
   const main = document.getElementById('main');
   const fetchedAt = Date.now();
   instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
@@ -431,6 +455,15 @@ async function renderWorkers() {
     <div class="worker-card ${inst.currentTaskId ? 'clickable' : ''}" ${inst.currentTaskId ? `data-task-id="${escapeAttr(inst.currentTaskId)}"` : ''}>
       <div class="row">
         <span class="id">${inst.instanceId}</span>
+        ${(() => {
+          const kind = modelKindForInstance(inst);
+          if (!kind) return '';
+          const choices = kind === 'claude' ? (workerModels.claudeModels || []) : (workerModels.ollamaModels || []);
+          const current = overrides[inst.instanceId] || '';
+          const opts = [`<option value="">(default)</option>`]
+            .concat(choices.map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`));
+          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()">${opts.join('')}</select>`;
+        })()}
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
@@ -448,6 +481,10 @@ async function renderWorkers() {
   });
   main.querySelectorAll('[data-worker-filter]').forEach((btn) => {
     btn.onclick = () => { workersTypeFilter = btn.dataset.workerFilter; renderWorkers(); };
+  });
+  main.querySelectorAll('.worker-model-select').forEach((sel) => {
+    sel.onclick = (e) => e.stopPropagation();
+    sel.onchange = (e) => { e.stopPropagation(); setWorkerModel(sel.dataset.instanceId, sel.value); };
   });
   updateStaleTimers();
 }

@@ -824,6 +824,48 @@ def api_models_usage():
     ])
 
 
+# Per-instance model override for the Workers tab's dropdown (Grimmethy, 2026-08-18: "I
+# need to be able to manually select which model to use for each worker type"). Lives in
+# dashboard-settings.json alongside claudeDefaultModel/claudeDefaultEffort -- same "takes
+# effect without a pipeline restart" shape those already have, since agent-manager.env's
+# ORNITH_MODEL/CLAUDE_MODEL only apply at daemon launch. ornith-worker.sh/review-runner.sh
+# re-read this file once per tick (get_model_override in agent-manager-common.sh) so a
+# change here reaches a running worker within one tick, no restart needed. watchdog has no
+# entry -- it never calls a model at all (queue-watcher.sh always heartbeats model="").
+@app.route("/api/worker-models")
+def api_worker_models():
+    overrides = read_dashboard_settings().get("workerModelOverrides", {})
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    ollama_models = []
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{ollama_url}/api/tags", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        ollama_models = sorted(m["name"] for m in data.get("models", []))
+    except Exception:
+        pass  # Ollama unreachable -- dropdown just shows the Claude lane / empty, not a 500.
+    return jsonify({
+        "overrides": overrides,
+        "ollamaModels": ollama_models,
+        "claudeModels": CLAUDE_MODEL_CHOICES,
+    })
+
+
+@app.route("/api/worker-models/<instance_id>", methods=["POST"])
+def api_set_worker_model(instance_id):
+    """model: "" or omitted clears the override, reverting that instance to its
+    agent-manager.env default (ORNITH_MODEL or CLAUDE_MODEL) on its next tick."""
+    body = request.get_json(silent=True) or {}
+    model = (body.get("model") or "").strip()
+    overrides = dict(read_dashboard_settings().get("workerModelOverrides", {}))
+    if model:
+        overrides[instance_id] = model
+    else:
+        overrides.pop(instance_id, None)
+    write_dashboard_settings({"workerModelOverrides": overrides})
+    return jsonify({"instanceId": instance_id, "model": model or None})
+
+
 @app.route("/api/queue/<state>")
 def api_queue_state(state):
     """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:

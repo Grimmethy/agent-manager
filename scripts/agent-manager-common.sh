@@ -42,6 +42,28 @@ invoke_model_stats_db() {
   return 0
 }
 
+# Reads this instance's model override from dashboard-settings.json's
+# workerModelOverrides map -- the Workers tab dropdown (app.py's
+# api_set_worker_model) writes there, same file claudeDefaultModel/
+# claudeDefaultEffort already live in for the same "takes effect without a
+# pipeline restart" reason. Called once per tick (not just at daemon startup)
+# by ornith-worker.sh/review-runner.sh so a dashboard change reaches a running
+# worker within one tick. Prints nothing (not even a newline) when unset --
+# callers treat empty output as "use the agent-manager.env default".
+get_model_override() {
+  local instance_id="$1"
+  local settings_path="${PACKAGE_SRC_DIR}/../dashboard-settings.json"
+  [[ -f "$settings_path" ]] || return 0
+  node -e '
+    try {
+      const fs = require("fs");
+      const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const v = (d.workerModelOverrides || {})[process.argv[2]];
+      if (v) process.stdout.write(String(v));
+    } catch (e) {}
+  ' "$settings_path" "$instance_id"
+}
+
 # Redacts likely-credential substrings from text before it's written to a shared log file
 # (e.g. Ornith Live Log.md, which can live in a synced SecondBrain vault) -- deep_dive/
 # project_search/arch_import embed real third-party content in prompts, and that content

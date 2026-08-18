@@ -34,15 +34,30 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 # Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
 # reported model regardless of which lane was actually running -- confirmed live
 # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
-# even though it only ever claims adhoc tasks and never calls Ornith at all. Computed
-# once, here, after orc-common.sh has actually loaded CLAUDE_MODEL/ORNITH_MODEL from
-# agent-manager.env -- same "claude:<model>" label format model-provider.js's own
-# labelFor() already uses for the Models tab, so the two stay consistent.
-if "$IS_CLAUDE_LANE"; then
-  HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
-else
-  HEARTBEAT_MODEL="${ORNITH_MODEL:-}"
-fi
+# even though it only ever claims adhoc tasks and never calls Ornith at all. Same
+# "claude:<model>" label format model-provider.js's own labelFor() already uses for the
+# Models tab, so the two stay consistent.
+#
+# Re-run once per tick (not just once at startup, 2026-08-18: Workers tab per-instance
+# model dropdown) -- exports ORNITH_MODEL/CLAUDE_MODEL for this tick from
+# dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
+# instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
+# call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
+# inherits the exported value, so no other call site needs to change.
+refresh_active_model() {
+  local override
+  override="$(get_model_override "$INSTANCE_ID")"
+  if "$IS_CLAUDE_LANE"; then
+    [[ -n "$override" ]] && CLAUDE_MODEL="$override"
+    export CLAUDE_MODEL
+    HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+  else
+    [[ -n "$override" ]] && ORNITH_MODEL="$override"
+    export ORNITH_MODEL
+    HEARTBEAT_MODEL="${ORNITH_MODEL:-}"
+  fi
+}
+refresh_active_model
 
 # Refuse to start if a live process already holds this instanceId (agent-manager-common.sh's
 # check_instance_liveness, see its own comment) -- the exact duplicate-instance race a manual
@@ -101,6 +116,7 @@ process_drafting_file() {
 
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
+  refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
 
