@@ -81,9 +81,11 @@ Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
 | Source | Priority | Reads |
 |---|---|---|
 | `adhoc` | 10 | `queue/adhoc/*.json` (submit via `queue-adhoc-task.js`) |
+| `research_task` | 10 | `queue/research/*.json` -- notes `brain_dump_sort` classified as `requiresResearch`; drafted by `research-agentic-draft.js`'s WebSearch/WebFetch-backed agentic call. Always high-reasoning-tier (Claude) |
 | `trouble_log` | 20 | `AGENT_MANAGER_TROUBLE_LOG_PATH`, entries flagged 🤖 |
 | `secondbrain` | 40 | `SECOND_BRAIN_DIR/Inbox/*.md` |
 | `brain_dump_sort` | 42 | `AGENT_MANAGER_BRAIN_DUMP_PATH`, entries with `status: 'captured'` -- always active regardless of any task-source allowlist, sits above any single project |
+| `path_prefetch_resolve` | 45 | `queue/needs-clarification/*.json` -- LLM-assisted fallback suggesting file path(s) + rationale for a held task path-prefetch's deterministic keyword match couldn't resolve on its own; never auto-resolves. Always active |
 | `arch_review` | 70 | `AGENT_MANAGER_ARCH_CANDIDATES_PATH`, entries rated Strong |
 | `arch_import_review` | 71 | `AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH` (ADR-0020) — same fulfillment logic as `arch_review`, against `arch_import`'s own candidates doc |
 | `arch_discovery` | 80 | `AGENT_MANAGER_GRAPH_PATH` + `AGENT_MANAGER_COMMUNITY_COVERAGE_PATH` — generates new candidates one graph community at a time |
