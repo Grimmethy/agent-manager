@@ -172,6 +172,12 @@ function isGroupExpanded(groupName) {
 // every other tab, since re-rendering over a user's in-progress folder navigation every
 // 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
+// Last activeRepoRoot value seen from the server (see enterProjectTab's sync below).
+// Starts equal to projectPath so the very first sync is a no-op when they already agree --
+// only a genuine change on the server side (hand-edited env file, another browser tab,
+// launch.bat) should ever be treated as "external", not whatever the placeholder in a
+// freshly-copied agent-manager.env happens to hold.
+let lastSyncedActiveRepoRoot = projectPath;
 let grepDirs = localStorage.getItem('agentManagerGrepDirs') || '';
 // Removed 2026-07-23 at Grimmethy's request: which job TYPES run is no longer a bundled
 // "mode" choice here -- see the Job List tab's isActive checkboxes, a top-level setting
@@ -1779,10 +1785,19 @@ async function enterProjectTab() {
   // value, not on activeRepoRoot, that mismatch could launch a pipeline against the wrong
   // project with no warning. Only overrides on tab entry, not on the 3s poll thereafter, so a
   // deliberate browse-a-different-project session isn't fought by this sync mid-use.
+  //
+  // Compares against lastSyncedActiveRepoRoot (the last server value we actually observed),
+  // NOT against projectPath -- comparing against projectPath meant a typed-but-not-yet-started
+  // path (Start Pipeline never ran, so activeRepoRoot on the server never changed) got silently
+  // overwritten back to the server's stale/placeholder activeRepoRoot on every single tab
+  // revisit, since the two never stopped disagreeing. Bug: "Project File Path ... resets to a
+  // non-existent default path each time I navigate to it" (2026-08-18). Only a genuine change
+  // in what the server reports since we last looked now counts as "external".
   try {
     const status = await fetchJson('/api/pipeline/status');
-    if (status.activeRepoRoot && status.activeRepoRoot !== projectPath) {
-      setProjectPath(status.activeRepoRoot);
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
     }
     // Same reasoning as the path sync above: reflect whatever's actually configured
     // server-side (env file / another tab / launch.bat) rather than only ever showing
