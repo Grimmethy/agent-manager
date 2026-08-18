@@ -114,6 +114,34 @@ test('resolveAnchors returns ambiguous when a keyword matches more than one file
   assert.deepEqual(new Set(result.candidates.auth), new Set(['src/auth.ts', 'server/auth.ts']));
 });
 
+test('resolveAnchors defaults to the standard file, not its .test sibling, when a keyword substring-matches both', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/task-sources.js');
+  writeSourceFile(repoRoot, 'src/task-sources.test.js');
+  writeGraph(repoRoot, [
+    { id: 0, community: 0, source_file: 'src/task-sources.js' },
+    { id: 1, community: 0, source_file: 'src/task-sources.test.js' },
+  ]);
+  // "sources" alone doesn't exact-stem-match either file, so this falls to the substring
+  // pass, which would otherwise pick up both files and (wrongly) call it ambiguous.
+  const result = resolveAnchors({ repoRoot, title: 'Fix a bug in the sources handling', rawText: '' });
+  assert.deepEqual(result, { status: 'matched', paths: ['src/task-sources.js'] });
+});
+
+test('resolveAnchors still reports genuine ambiguity between a real file and an unrelated .test file, when the note text pulls in a keyword outside their shared sibling pair', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/task-sources.js');
+  writeSourceFile(repoRoot, 'src/other.test.js');
+  writeGraph(repoRoot, [
+    { id: 0, community: 0, source_file: 'src/task-sources.js' },
+    { id: 1, community: 0, source_file: 'src/other.test.js' },
+  ]);
+  const result = resolveAnchors({ repoRoot, title: 'Fix a bug in the sources handling', rawText: '' });
+  // 'other' isn't in the title, so only task-sources.js matches "sources" -- unambiguous,
+  // no unrelated test file dragged in.
+  assert.deepEqual(result, { status: 'matched', paths: ['src/task-sources.js'] });
+});
+
 test('resolveAnchors treats a matched-but-deleted (stale) file the same as no match', () => {
   const repoRoot = makeRepo();
   // Graph references it, but the file was never actually written to disk -- simulates a
