@@ -2684,6 +2684,57 @@ def _sync_live_checkout(main_branch):
     return {"synced": True, "changed": True, "changedFiles": changed_files, "restartTriggered": restart_triggered}
 
 
+_COMMIT_LOG_FIELD_SEP = "\x1f"  # unit separator -- won't collide with real commit text
+_COMMIT_LOG_RECORD_SEP = "\x1e"  # record separator between commits
+
+
+@app.route("/api/git/branches/<path:branch>/commits")
+def api_git_branch_commits(branch):
+    """Full commit history for one pushed-but-unmerged branch, ahead of mainBranch --
+    the Unmerged Branches tab previously only ever showed the tip commit's subject line,
+    so selecting a multi-commit branch gave no way to see what it actually did short of
+    a manual `git log` on the box running the dashboard."""
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Same "only act on what we ourselves already offered" gate api_git_merge_branch
+    # uses -- never trust a caller-supplied branch string as a raw git ref beyond what
+    # this process already enumerated itself.
+    branches = list_unmerged_branches(force=False)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    main_branch = match["mainBranch"]
+    fmt = _COMMIT_LOG_FIELD_SEP.join(["%H", "%an", "%aI", "%s", "%b"]) + _COMMIT_LOG_RECORD_SEP
+    try:
+        raw = _run_git(
+            ["log", f"origin/{main_branch}..origin/{branch}", f"--format={fmt}"],
+            repo_root,
+        )
+    except RuntimeError as e:
+        abort(502, description=f"git log failed: {e}")
+
+    commits = []
+    for record in raw.split(_COMMIT_LOG_RECORD_SEP):
+        if not record.strip("\n"):
+            continue
+        parts = record.lstrip("\n").split(_COMMIT_LOG_FIELD_SEP)
+        if len(parts) != 5:
+            continue
+        sha, author, date, subject, body = parts
+        commits.append({
+            "sha": sha,
+            "author": author,
+            "date": date,
+            "subject": subject,
+            "body": body.strip("\n"),
+        })
+    return jsonify({"branch": branch, "mainBranch": main_branch, "commits": commits})
+
+
 @app.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
 def api_git_merge_branch(branch):
     repo_root = get_active_repo_root()
