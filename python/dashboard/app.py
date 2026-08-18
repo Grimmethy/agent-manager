@@ -2770,6 +2770,7 @@ def api_pipeline_status():
 TASK_SOURCE_CATALOG = [
     "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
     "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
+    "performance_review",
     "deep_dive", "project_search", "unused_export",
 ]
 
@@ -2801,6 +2802,7 @@ TASK_SOURCE_DEFAULT_PRIORITIES = {
     "adhoc": 10, "research_task": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
     "path_prefetch_resolve": 45,
     "arch_review": 70, "arch_import_review": 71, "arch_discovery": 80, "observability_review": 80,
+    "performance_review": 80,
     "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,
 }
 
@@ -2865,12 +2867,12 @@ def read_approval_modes() -> dict:
 # behavioral difference.
 # Maps a task-source NAME (TASK_SOURCE_CATALOG's entries) to the DOMAIN KEY it actually
 # stamps onto its tasks. Most built-ins use their own name as the domain (project_search,
-# deep_dive, brain_dump_sort, secondbrain) -- but six of them (trouble_log, arch_review,
-# arch_import_review, arch_discovery, arch_import, observability_review, unused_export)
-# all share the single 'default' domain (task-sources.js's defaultDomain), since
-# task-sources.js's own getConfig().defaultDomain is what nextCandidateFulfillmentTask/
+# deep_dive, brain_dump_sort, secondbrain) -- but seven of them (trouble_log, arch_review,
+# arch_import_review, arch_discovery, arch_import, observability_review, performance_review,
+# unused_export) all share the single 'default' domain (task-sources.js's defaultDomain),
+# since task-sources.js's own getConfig().defaultDomain is what nextCandidateFulfillmentTask/
 # nextTroubleLogTask/nextArchDiscoveryTask/nextArchImportTask/nextObservabilityReviewTask/
-# nextUnusedExportTask all stamp -- confirmed by reading each one directly, not assumed
+# nextPerformanceReviewTask/nextUnusedExportTask all stamp -- confirmed by reading each one directly, not assumed
 # from the source name. Getting this mapping WRONG (or incomplete) is exactly what
 # happened before this fix: 'default' was missing entirely from _DOMAIN_DEFAULTS_TO_ENSURE,
 # so every arch_import/observability_review/trouble_log task failed immediately with
@@ -2880,6 +2882,7 @@ def read_approval_modes() -> dict:
 _SOURCE_TO_DOMAIN_KEY = {
     "trouble_log": "default", "arch_review": "default", "arch_import_review": "default",
     "arch_discovery": "default", "arch_import": "default", "observability_review": "default",
+    "performance_review": "default",
     "unused_export": "default",
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",

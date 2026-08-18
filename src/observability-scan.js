@@ -279,4 +279,5 @@ module.exports = {
   isValidOtelName,
   extractBraceBody,
   listSourceFiles,
+  lineOfIndex,
 };

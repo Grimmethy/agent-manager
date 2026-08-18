@@ -300,6 +300,50 @@ function observabilityReviewImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// performance_review's plan pass (Brain Dump #94, 2026-08-18: "our pretty little cpu is
+// getting overloaded... we need to develop a performance review job for projects
+// anyways"). Identical framing to observabilityReviewPlanPrompt above, same reason:
+// performance-scan.js's rules are heuristics (brace-matching, keyword windows around a
+// loop body), not real profiling -- a flagged sync-io-in-loop or sequential-await could
+// easily be a false positive (a loop that only ever runs once, a deliberately
+// rate-limited sequence), so every finding is a candidate for Ornith to judge, not an
+// assumed-true fact.
+function performanceReviewPlanPrompt(task) {
+  const ctx = task.promptContext;
+  const stable = [
+    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible performance issue in a project this pipeline is reviewing (rule/project/file/snippet given below). Determine whether it is a GENUINE issue or a false positive.',
+    'Write a numbered PLAN that is actually a REASONED VERDICT:',
+    '- "genuine issue — here\'s the concrete performance cost (e.g. blocking I/O per loop iteration, needless sequential network calls) and a proposed fix"',
+    '- "false positive — here\'s why (e.g. the loop only ever runs a handful of times, the sequence is deliberately rate-limited/ordered, the sync call runs once at startup not in a hot path)"',
+    '- "uncertain — here\'s what would need to be checked that isn\'t given here (e.g. real call frequency, profiling data)"',
+    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a profiler, and false positives are expected.',
+  ];
+  const volatile = [
+    `Rule flagged: ${ctx.rule}`,
+    `Project: ${ctx.projectSlug}`,
+    ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
+    `Scanner detail: ${ctx.detail}`,
+    '',
+    'SURROUNDING SOURCE (if available):',
+    ctx.snippet || '(no snippet available for this finding)',
+  ];
+  return assemblePrompt(stable, volatile);
+}
+
+// performance_review's implement pass: same "no real code fix in THIS task" shape as
+// observabilityReviewImplementPrompt -- registered from the start (unlike
+// observability_review's own history), since that gap was already found and fixed once
+// on the sibling source and there's no reason to reintroduce it here.
+function performanceReviewImplementPrompt(task, planText) {
+  return [
+    'Your plan above is the final REASONED VERDICT for this performance finding -- there is no further code change to make in this task (a genuine issue becomes a separate follow-up task later, the same way an architecture-discovery finding becomes a candidate rather than an immediate fix).',
+    '',
+    planText,
+    '',
+    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: state whether it was genuine/false-positive/uncertain, and if genuine, what the concrete fix would look like. Plain prose only -- no JSON, no code fence, no "steps".',
+  ].join('\n');
+}
+
 // unused_export's implement pass has the identical gap observability_review's just had
 // fixed (2026-07-26) -- registered only a buildPlanPrompt, so it silently fell through to
 // the same mismatched genericFallbackImplementPrompt. Never actually confirmed live
@@ -689,6 +733,7 @@ updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolve
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
 updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
+updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
