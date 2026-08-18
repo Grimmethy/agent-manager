@@ -165,6 +165,7 @@ function pathPrefetchResolvePlanPrompt(task) {
     '- "best guess: <path(s)> -- here\'s the reasoning, but flag the uncertainty" (plausible but not certain -- still worth surfacing to a human as a suggestion, just labeled honestly)',
     '- "no real match -- here\'s why nothing in the file list plausibly relates" (genuinely nothing fits; do not force a guess just to have an answer)',
     'Do not invent a file that is not in the list below. If the note is genuinely too vague (e.g. "fix the bug" with zero identifying detail), say so instead of guessing at random.',
+    'If your choice comes down to a file and its own near-identical .test/.spec file (e.g. "foo.js" vs "foo.test.js") with nothing in the note pointing specifically at the test itself, default to the standard, non-test file.',
   ];
   const volatile = [
     `NOTE: ${ctx.rawText || ctx.taskTitle || '(no text)'}`,
