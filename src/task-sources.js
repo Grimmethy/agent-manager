@@ -1093,6 +1093,12 @@ function nextBrainDumpSortTask() {
 // human to accept or override in the dashboard's clarification picker, same fail-safe
 // property the deterministic pass already has (never silently prefetch the wrong file).
 // -----------------------------------------------------------------------------------------
+// 14 days -- long enough that a genuinely-static idea (e.g. an exploratory "investigate
+// X" note with no real anchor to any file) doesn't get re-spent on every tick forever,
+// short enough that real codebase growth has a realistic chance to produce a new match
+// within a few cycles, not months.
+const PERIODIC_REATTEMPT_INTERVAL_MS = 14 * 24 * 60 * 60 * 1000;
+
 function nextPathPrefetchResolveTask() {
   const { pipelineDir, graphPath } = getConfig();
   const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
@@ -1135,10 +1141,31 @@ function nextPathPrefetchResolveTask() {
     // retry if that first attempt didn't land a confident suggestion. Only once both flags
     // are set does this fall back to requiring a human (Discuss, which resets both --
     // see app.py's discuss-end handler).
+    // Brain Dump (2026-08-18, "build a system" for needs-clarification): a THIRD tier
+    // beyond the two automatic attempts above -- once both are spent, periodically retry
+    // the same safe, human-gated suggestion step anyway, on an interval, rather than
+    // requiring a human to remember to open Discuss forever. The codebase keeps growing;
+    // a keyword with no match today may have a real one in a few weeks, and this is the
+    // exact same non-auto-applying suggest-only step every other tier already uses --
+    // this only changes HOW OFTEN a person has to notice and act, never what happens
+    // automatically. Re-fires every PERIODIC_REATTEMPT_INTERVAL_MS indefinitely (not a
+    // third one-shot) so an old held task can't just age out of ever being retried.
     let isHighReasoningRetry = false;
+    let isPeriodicReattempt = false;
     if (held.needsClarification.suggestionAttempted) {
-      if (held.needsClarification.highReasoningAttempted) continue;
-      isHighReasoningRetry = true;
+      if (held.needsClarification.highReasoningAttempted) {
+        const anchorAt = held.needsClarification.lastPeriodicReattemptAt || held.createdAt;
+        const anchorMs = anchorAt ? Date.parse(anchorAt) : NaN;
+        // No anchor at all (missing/unparseable createdAt) is treated as "not due yet",
+        // not "due now" -- conservative on purpose, same direction every other unknown
+        // gets treated in this pipeline (an unknown budget/staleness signal is never
+        // silently read as "safe to proceed"). Every real held task has a real createdAt
+        // in practice; this only matters for the theoretical case where it doesn't.
+        if (Number.isNaN(anchorMs) || Date.now() - anchorMs < PERIODIC_REATTEMPT_INTERVAL_MS) continue;
+        isPeriodicReattempt = true;
+      } else {
+        isHighReasoningRetry = true;
+      }
     }
 
     const heldId = held.id || f.replace(/\.json$/, '');
@@ -1152,12 +1179,17 @@ function nextPathPrefetchResolveTask() {
     // discuss-end handler bumps needsClarification.attempt alongside the reset; default to
     // 1 for a held task that predates this field (first-ever attempt).
     const attempt = held.needsClarification.attempt || 1;
-    // The high-reasoning retry gets its own distinct id suffix, independent of `attempt`
-    // (which only tracks human/Discuss-driven retries) -- so the automatic retry never
-    // collides with a human-driven one's id in queue/done/, and vice versa.
-    const resolveId = isHighReasoningRetry
-      ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
-      : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
+    // The high-reasoning retry and periodic reattempts each get their own distinct id
+    // suffix, independent of `attempt` (which only tracks human/Discuss-driven retries)
+    // -- so none of the three ever collides with either other's id in queue/done/. The
+    // periodic round number comes from the held task itself (bumped by
+    // applyPathPrefetchResolve on each periodic run), so every cycle gets a fresh id.
+    const periodicRound = (held.needsClarification.periodicReattemptCount || 0) + 1;
+    const resolveId = isPeriodicReattempt
+      ? `path-prefetch-resolve-${heldId}-periodic${periodicRound}`
+      : isHighReasoningRetry
+        ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
+        : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
     if (taskIdExistsInQueue(resolveId)) {
       // Self-heal a deadlock confirmed live 2026-08-17: a resolve task that gets rejected
       // by REVIEW never reaches applyPathPrefetchResolve() at all, so the held task's own
@@ -1178,13 +1210,29 @@ function nextPathPrefetchResolveTask() {
         .map((state) => path.join(pipelineDir, 'queue', state, `${resolveId}.json`))
         .find((p) => fs.existsSync(p));
       if (resolveTerminalPath) {
-        const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
-        if (!held.needsClarification[flagKey]) {
-          held.needsClarification[flagKey] = true;
+        // Same deadlock class, applied to the periodic tier: a rejected periodic resolve
+        // task must still advance lastPeriodicReattemptAt/periodicReattemptCount, or this
+        // exact resolveId (round N) "exists" in queue/blocked/ forever and the interval
+        // check above never gets a fresh anchor to count forward from -- an indefinite
+        // stall identical to the pre-existing high-reasoning deadlock this block already
+        // self-heals, just for a different tier.
+        if (isPeriodicReattempt) {
+          held.needsClarification.lastPeriodicReattemptAt = new Date().toISOString();
+          held.needsClarification.periodicReattemptCount = periodicRound;
           try {
             fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
           } catch {
             // Non-fatal -- worst case this self-heal is retried next tick.
+          }
+        } else {
+          const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
+          if (!held.needsClarification[flagKey]) {
+            held.needsClarification[flagKey] = true;
+            try {
+              fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
+            } catch {
+              // Non-fatal -- worst case this self-heal is retried next tick.
+            }
           }
         }
       }
@@ -1216,7 +1264,9 @@ function nextPathPrefetchResolveTask() {
       // retry attempt sets this; the first attempt stays on path_prefetch_resolve's
       // ordinary low-reasoning default (no static reasoningTier registered for that source).
       ...(isHighReasoningRetry ? { reasoningTier: 'high' } : {}),
-      title: `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
+      title: isPeriodicReattempt
+        ? `Periodic re-check (round ${periodicRound}): suggest file path(s) for held task: ${(held.title || heldId).slice(0, 60)}`
+        : `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
       promptContext: {
         heldTaskId: heldId,
         rawText: (held.promptContext && held.promptContext.rawText) || held.title || '',
@@ -1227,6 +1277,11 @@ function nextPathPrefetchResolveTask() {
         // this is meant to give the model a real candidate list, not the whole repo's
         // worth of paths crammed into one prompt.
         fileList: fileList.slice(0, 400),
+        // Read by applyPathPrefetchResolve() to know which flag/counter to advance on
+        // completion -- see its own comment for why this can't just reuse
+        // suggestionAttempted/highReasoningAttempted (both are already true by the time
+        // this tier fires).
+        periodicReattempt: isPeriodicReattempt,
       },
     };
   }

@@ -666,12 +666,43 @@ test('nextPathPrefetchResolveTask self-heals a held task whose retry was review-
   assert.equal(held.needsClarification.highReasoningAttempted, true, 'must self-heal the flag so this held task is no longer offered on future ticks either');
 });
 
-test('nextPathPrefetchResolveTask skips a held task once BOTH tiers have been attempted', () => {
+// Brain Dump (2026-08-18, "build a system" for needs-clarification): a THIRD tier once
+// both automatic attempts are spent -- periodic reattempt, on an interval, rather than
+// permanently stuck until a human opens Discuss. These pin down all three real states.
+test('nextPathPrefetchResolveTask skips a held task once BOTH tiers have been attempted, until the periodic-reattempt interval has passed', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
-  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true });
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true }, { createdAt: new Date().toISOString() });
   writeProjectGraph(dir, ['src/foo.ts']);
   const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
-  assert.equal(nextPathPrefetchResolveTask(), null);
+  assert.equal(nextPathPrefetchResolveTask(), null, 'not due yet -- the interval has not passed since createdAt');
+});
+
+test('nextPathPrefetchResolveTask offers a periodic reattempt once BOTH tiers are spent and the interval has passed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  const staleCreatedAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days ago
+  writeHeldTask(dir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true }, { createdAt: staleCreatedAt });
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  const task = nextPathPrefetchResolveTask();
+  assert.ok(task, 'a periodic reattempt must be offered once the interval has passed');
+  assert.equal(task.id, 'path-prefetch-resolve-held-1-periodic1');
+  assert.equal(task.reasoningTier, undefined, 'periodic reattempts stay low-tier -- cheap, bounded, not a Claude call');
+  assert.equal(task.promptContext.periodicReattempt, true);
+  assert.match(task.title, /Periodic re-check \(round 1\)/);
+});
+
+test('nextPathPrefetchResolveTask uses lastPeriodicReattemptAt (not createdAt) to schedule the NEXT periodic round', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  const veryOldCreatedAt = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString();
+  const recentReattemptAt = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h ago -- round 1 JUST ran
+  writeHeldTask(
+    dir, 'held-1',
+    { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true, lastPeriodicReattemptAt: recentReattemptAt, periodicReattemptCount: 1 },
+    { createdAt: veryOldCreatedAt },
+  );
+  writeProjectGraph(dir, ['src/foo.ts']);
+  const { nextPathPrefetchResolveTask } = freshTaskSources(dir);
+  assert.equal(nextPathPrefetchResolveTask(), null, 'round 2 is not due yet -- must anchor to the last periodic attempt, not the original createdAt');
 });
 
 test('nextPathPrefetchResolveTask builds a correct task for a genuinely unresolved held task', () => {

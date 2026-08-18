@@ -756,6 +756,26 @@ test('applyPathPrefetchResolve marks highReasoningAttempted (not suggestionAttem
   assert.equal(written.needsClarification.suggestionAttempted, true, 'the low-tier flag from the first attempt must be preserved, not overwritten');
 });
 
+// Brain Dump (2026-08-18): a periodic reattempt (task.promptContext.periodicReattempt)
+// advances its own counter/timestamp instead of the two automatic-tier flags -- both are
+// already true by the time this tier ever fires, so touching them again would be a no-op
+// that also fails to record WHEN this round happened, breaking the interval check that
+// schedules the next one.
+test('applyPathPrefetchResolve advances lastPeriodicReattemptAt/periodicReattemptCount for a periodic reattempt, leaving the two automatic-tier flags untouched', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-resolve-test-'));
+  const heldPath = writeHeldTaskFixture(pipelineDir, 'held-1', { reason: 'no-match', suggestionAttempted: true, highReasoningAttempted: true, periodicReattemptCount: 1 });
+  const implementResponse = JSON.stringify({ paths: [], rationale: 'still no match', confident: false });
+  const task = { promptContext: { heldTaskId: 'held-1', periodicReattempt: true } };
+
+  applyPathPrefetchResolve({ implementResponse, task, pipelineDir });
+
+  const written = JSON.parse(fs.readFileSync(heldPath, 'utf8'));
+  assert.equal(written.needsClarification.periodicReattemptCount, 2, 'must increment, not reset');
+  assert.ok(written.needsClarification.lastPeriodicReattemptAt, 'must stamp a fresh timestamp for the next interval check to anchor to');
+  assert.equal(written.needsClarification.suggestionAttempted, true, 'unrelated automatic-tier flag must be untouched');
+  assert.equal(written.needsClarification.highReasoningAttempted, true, 'unrelated automatic-tier flag must be untouched');
+});
+
 // Auto-resolve on a confident suggestion (2026-08-16): the actual ask was that ending a
 // Discuss session should be enough by itself to get a held task off the Needs
 // Clarification list, not require yet another manual click on top of whatever context the
