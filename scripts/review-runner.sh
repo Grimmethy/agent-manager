@@ -24,7 +24,20 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 # Infinite polling loop same structure as all daemon scripts: bash 'while : do ... sleep' pattern matches what PowerShell does via while(true){ ... Start-Sleep -Seconds TICK } form in each .ps1 file.
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
+# Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
+# dropdown, 2026-08-18) -- exports ORNITH_MODEL for this tick so every write_heartbeat_file
+# and review-task.js call below picks it up automatically; no per-call-site change needed.
+# Reviewer is always Ornith (never Claude), unlike ornith-worker.sh's two lanes, so this is
+# the simpler single-model version of that script's refresh_active_model.
+refresh_active_model() {
+  local override
+  override="$(get_model_override "$INSTANCE_ID")"
+  [[ -n "$override" ]] && ORNITH_MODEL="$override"
+  export ORNITH_MODEL
+}
+
 while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
+  refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
   write_heartbeat_file "$INSTANCE_ID" "idle" "${ORNITH_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
 
