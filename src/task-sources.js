@@ -19,6 +19,7 @@ const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { scanProject } = require('./observability-scan.js');
+const { scanProject: scanProjectForPerformance } = require('./performance-scan.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 
@@ -945,6 +946,103 @@ function nextObservabilityReviewTask() {
   return null;
 }
 
+// --- Source: performance_review -- flags performance-hygiene issues in projects already
+// onboarded by deep_dive (priority 80, alongside arch_discovery/observability_review) ---
+//
+// Brain Dump #94 (2026-08-18: "our pretty little cpu is getting overloaded... we need to
+// develop a performance review job for projects anyways"). Structurally an exact copy of
+// nextObservabilityReviewTask immediately above -- same coverage-file/flags-file/oldest-
+// first/skip-if-queued shape, same reasoning for reusing deep_dive's clonePaths rather
+// than cloning again -- swapped to performance-scan.js's scanner and its own
+// coverage/flags files so the two sources never contend over the same state.
+function nextPerformanceReviewTask() {
+  const { pipelineDir, defaultDomain, deepDiveCoveragePath, performanceCoveragePath } = getConfig();
+
+  let deepDiveCoverage;
+  try {
+    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
+  } catch {
+    deepDiveCoverage = { projects: {} };
+  }
+  const deepDiveProjects = deepDiveCoverage.projects || {};
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(performanceCoveragePath) || '{"projects":{}}');
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+
+  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
+  let flags;
+  try {
+    flags = JSON.parse(readIfExists(flagsPath) || '[]');
+  } catch {
+    flags = [];
+  }
+
+  let coverageChanged = false;
+  let flagsChanged = false;
+  for (const [slug, proj] of Object.entries(deepDiveProjects)) {
+    if (coverage.projects[slug]) continue; // already scanned once
+    if (!proj.clonePath || !fs.existsSync(proj.clonePath)) continue;
+    try {
+      flags.push(...scanProjectForPerformance(proj.clonePath, slug));
+      flagsChanged = true;
+    } catch (e) {
+      // A scan failure must never crash the worker loop -- same rule
+      // nextObservabilityReviewTask's own try/catch follows.
+      console.error(`performance_review: failed to scan "${slug}": ${e.message}`);
+    }
+    coverage.projects[slug] = { scannedAt: new Date().toISOString() };
+    coverageChanged = true;
+  }
+  if (coverageChanged) {
+    fs.mkdirSync(path.dirname(performanceCoveragePath), { recursive: true });
+    fs.writeFileSync(performanceCoveragePath, JSON.stringify(coverage, null, 2));
+  }
+  if (flagsChanged) {
+    fs.mkdirSync(path.dirname(flagsPath), { recursive: true });
+    fs.writeFileSync(flagsPath, JSON.stringify(flags, null, 2));
+  }
+
+  const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
+  for (const finding of sorted) {
+    const taskId = `performance-${slugifyForId(finding.projectSlug)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    let snippet = null;
+    const proj = finding.file && deepDiveProjects[finding.projectSlug];
+    if (proj && proj.clonePath) {
+      const content = readIfExists(path.join(proj.clonePath, finding.file));
+      if (content) {
+        const lines = content.split('\n');
+        const start = Math.max(0, (finding.line || 1) - 4);
+        const end = Math.min(lines.length, (finding.line || 1) + 3);
+        snippet = lines.slice(start, end).join('\n');
+      }
+    }
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: 'performance_review',
+      title: `Performance triage: ${finding.rule} — ${finding.projectSlug}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
+      promptContext: {
+        rule: finding.rule,
+        detail: finding.detail,
+        file: finding.file,
+        line: finding.line,
+        projectSlug: finding.projectSlug,
+        snippet,
+      },
+    };
+  }
+
+  return null;
+}
+
 // --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
 // (priority 42, right after secondbrain's 40) -----------------------------------------
 //
@@ -1401,6 +1499,18 @@ registerTaskSource('observability_review', {
   apply: applyVerdictOnly,
 });
 
+// performance_review shares observability_review's tier (80) and shape exactly -- same
+// "proactive review of already-scanned projects" reasoning, and the same judgment-verdict-
+// only apply (no real code fix comes out of this task; a genuine finding becomes a
+// separate follow-up, same as observability_review/arch_discovery). See
+// nextPerformanceReviewTask's own header comment for the full design (Brain Dump #94,
+// 2026-08-18).
+registerTaskSource('performance_review', {
+  priority: taskPriority('performance_review', 80),
+  next: nextPerformanceReviewTask,
+  apply: applyVerdictOnly,
+});
+
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
 // agent-manager-grounded architecture candidate (priority 81, ADR-0020,
 // docs/arch-import-pipeline.md). Deliberately placed AFTER arch_import_review (71, its
@@ -1630,6 +1740,7 @@ module.exports = {
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
   nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
+  nextPerformanceReviewTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,

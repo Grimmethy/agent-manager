@@ -104,6 +104,11 @@ function getConfig() {
   // scanned by observability-scan.js, so a project is scanned exactly once, not every tick.
   const observabilityCoveragePath = process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH
     || path.join(pipelineDir, 'observability-coverage.json');
+  // performance_review (Brain Dump #94, 2026-08-18) -- same "ride on deep_dive's already-
+  // cloned projects, track which ones this scanner has covered" shape as
+  // observability_review immediately above.
+  const performanceCoveragePath = process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH
+    || path.join(pipelineDir, 'performance-coverage.json');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
@@ -176,6 +181,7 @@ function getConfig() {
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
+    performanceCoveragePath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,
