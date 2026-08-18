@@ -1297,7 +1297,7 @@ function nextPathPrefetchResolveTask() {
       // "exists" in queue/blocked/, so this loop refuses to ever regenerate it, while the
       // held task's own flags still say "eligible", forever. Two real held tasks hit this
       // exact deadlock (both attempt1-highreasoning resolve tasks exhausted at review),
-      // silently starving worker-claude of the only work it had left. If the existing
+      // silently starving worker-reasoning of the only work it had left. If the existing
       // resolveId reached a TERMINAL state (blocked/ or done/) without ever calling
       // applyPathPrefetchResolve(), stamp the flag here instead of leaving it to that
       // function alone, so this held task stops being offered (matches the "spent" outcome
@@ -1414,7 +1414,7 @@ function taskPriority(name, def) {
 // through to the generic Group B JSON-diff path and failed parsing a real unified diff
 // as JSON, every time, until this was moved here.
 // reasoningTier: 'high' -- feeds ornith-worker.sh's worker-lane claim filter (via
-// model-provider.js's reasoningTierFor()) so worker-claude* claims adhoc tasks, matching
+// model-provider.js's reasoningTierFor()) so worker-reasoning* claims adhoc tasks, matching
 // what ornith-draft.js's own resolveSourceName()==='adhoc' branch already hardcodes
 // regardless of this registration -- kept here so the two can't drift apart (Brain Dump
 // #77's generalized tier filter, replacing the earlier adhoc-hardcoded bash check).
@@ -1679,7 +1679,7 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // having a real 20+ item backlog, worker-1's generation calls kept returning a high-tier
 // retry task every single tick, which worker-1 then correctly declined to CLAIM (see
 // ornith-worker.sh's tier filter) -- but never got far enough down the ladder to generate
-// any LOW-tier work for itself either, so worker-1 sat idle while worker-claude did
+// any LOW-tier work for itself either, so worker-1 sat idle while worker-reasoning did
 // everything. A mismatched-tier task is skipped (not returned) and the ladder keeps
 // walking to the next source instead of stopping -- safe because every next() function
 // here is a pure "what would I offer" read with no queue-write side effect (writeTask()
@@ -1819,7 +1819,7 @@ if (require.main === module) {
   // not just the top level.
   // When tierFilter is set, a task file only counts toward "already pending" if it's
   // actually THIS tier's own backlog -- otherwise a tier-scoped caller (e.g. worker-1
-  // calling --tier=low) would see worker-claude's high-tier drafting/pending backlog and
+  // calling --tier=low) would see worker-reasoning's high-tier drafting/pending backlog and
   // throttle itself into never generating any low-tier work at all, the exact starvation
   // this tier split exists to fix. Unreadable/mid-write files count as backlog either way
   // (conservative default, matches every other non-fatal-skip convention in this file).
