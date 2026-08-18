@@ -276,8 +276,10 @@ def api_claude_usage():
     exactly what signal this is (and isn't): Claude Code itself only ever tells you a
     rate limit was hit, reactively, via an error event in its local session transcripts
     -- there's no live "you've used N% of your 5-hour window" API to poll. What this
-    surfaces is real: the last actual rate-limit hit and its reset time (if any), rolling
-    5h/7d token and call counts as a volume trend, and (Brain Dump #89, 2026-08-18) an
+    surfaces is real: the last actual rate-limit hit and its reset time (if any), token
+    and call counts since the current window's real start (`sinceLastLimit` -- anchored to
+    the last reset, not a generic trailing lookback) plus a 7d rolling volume trend, and
+    (Brain Dump #89, 2026-08-18) an
     `estimate` object with a used/ceiling percentage and a projected time-to-cap -- see
     budget-monitor.js's own estimateBudgetCeiling()/estimateTimeToCap() for how that's
     derived ENTIRELY from real past rate-limit hits, never an invented number; `estimate`

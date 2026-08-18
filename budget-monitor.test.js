@@ -13,7 +13,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { estimateBudgetCeiling, estimateTimeToCap } = require('./budget-monitor.js');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs, parseResetTime } = require('./budget-monitor.js');
 
 function usageEntry(ts, tokens) {
   return { _ts: ts, type: 'assistant', message: { usage: { input_tokens: tokens, output_tokens: 0 } } };
@@ -95,4 +98,103 @@ test('estimateTimeToCap ignores usage older than the last hour when computing th
   const result = estimateTimeToCap(entries, 1000, 600, now);
   const hoursOut = (new Date(result).getTime() - now) / HOUR;
   assert.ok(Math.abs(hoursOut - 4) < 0.01, `expected ~4 hours out (old burst excluded), got ${hoursOut}`);
+});
+
+// currentWindowStartMs (Brain Dump #89 follow-up, 2026-08-18): "since last limit" must
+// anchor to the REAL current-window boundary, not a generic trailing lookback -- these
+// pin down all three real states a lastRateLimit record can be in.
+test('currentWindowStartMs returns null when there is no rate-limit history at all', () => {
+  assert.equal(currentWindowStartMs(null, Date.now()), null);
+});
+
+test('currentWindowStartMs anchors to resetsAt when the reset has already passed -- a new window began there', () => {
+  const now = 10 * HOUR;
+  const lastRateLimit = { at: now - 2 * HOUR, resetsAt: new Date(now - HOUR) };
+  assert.equal(currentWindowStartMs(lastRateLimit, now), now - HOUR);
+});
+
+test('currentWindowStartMs anchors to the hit itself when still mid-limit (resetsAt in the future)', () => {
+  const now = 10 * HOUR;
+  const hitAt = now - HOUR;
+  const lastRateLimit = { at: hitAt, resetsAt: new Date(now + HOUR) };
+  assert.equal(currentWindowStartMs(lastRateLimit, now), hitAt);
+});
+
+test('currentWindowStartMs anchors to the hit itself when the reset time could not be parsed', () => {
+  const now = 10 * HOUR;
+  const hitAt = now - HOUR;
+  const lastRateLimit = { at: hitAt, resetsAt: null };
+  assert.equal(currentWindowStartMs(lastRateLimit, now), hitAt);
+});
+
+// End-to-end: real isBudgetHealthy() against synthetic transcript files (same technique
+// used to verify this live before shipping it -- CLAUDE_PROJECTS_DIR points at a
+// throwaway dir; budget-monitor.js reads PROJECTS_DIR at module-load time, so the module
+// has to be freshly required AFTER the env var is set, not just once at file scope).
+function withFreshBudgetMonitor(projectsDir, fn) {
+  const prev = process.env.CLAUDE_PROJECTS_DIR;
+  process.env.CLAUDE_PROJECTS_DIR = projectsDir;
+  delete require.cache[require.resolve('./budget-monitor.js')];
+  try {
+    return fn(require('./budget-monitor.js'));
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_PROJECTS_DIR;
+    else process.env.CLAUDE_PROJECTS_DIR = prev;
+    delete require.cache[require.resolve('./budget-monitor.js')];
+  }
+}
+
+function writeTranscript(dir, lines) {
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+}
+
+test('isBudgetHealthy: sinceLastLimit excludes usage from BEFORE the last reset, unlike a trailing-5h lookback would', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-monitor-test-'));
+  try {
+    const now = Date.now();
+    const resetsAtWallClock = new Date(now - 30 * 60 * 1000); // reset 30 min ago
+    // Build reset text budget-monitor.js's own parseResetTime() can actually parse, in
+    // the SAME timezone/format its regex expects, then confirm it round-trips before
+    // relying on it -- a silently-unparseable fixture would make this test meaningless.
+    const tz = 'America/Denver';
+    const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
+    const resetText = `You've hit your session limit · resets ${fmt.format(resetsAtWallClock).toLowerCase().replace(' ', '')} (${tz})`;
+    const hitAt = resetsAtWallClock.getTime() - 5 * 60 * 60 * 1000 - 60 * 1000; // a real hit ~5h before its own reset
+    assert.ok(parseResetTime(resetText, hitAt), 'test fixture setup: resetText must be parseable by the real parseResetTime()');
+
+    writeTranscript(dir, [
+      { type: 'assistant', timestamp: new Date(hitAt - 4 * 60 * 60 * 1000).toISOString(), message: { usage: { input_tokens: 9999 } } }, // long before the hit -- must not count
+      { type: 'assistant', timestamp: new Date(hitAt).toISOString(), error: 'rate_limit', message: { content: [{ text: resetText }] } },
+      { type: 'assistant', timestamp: new Date(resetsAtWallClock.getTime() + 5 * 60 * 1000).toISOString(), message: { usage: { input_tokens: 123 } } }, // after the reset -- must count
+    ]);
+
+    withFreshBudgetMonitor(dir, (bm) => {
+      const result = bm.isBudgetHealthy();
+      assert.equal(result.sinceLastLimit.usedFallback5h, false);
+      assert.equal(result.sinceLastLimit.tokens, 123);
+      assert.equal(result.healthy, true); // real usage after the reset corroborates it's over
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('isBudgetHealthy: falls back to a trailing-5h window and flags usedFallback5h when no rate-limit hit exists yet', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-monitor-test-'));
+  try {
+    const now = Date.now();
+    writeTranscript(dir, [
+      { type: 'assistant', timestamp: new Date(now - 6 * 60 * 60 * 1000).toISOString(), message: { usage: { input_tokens: 999 } } }, // older than 5h -- excluded by the fallback
+      { type: 'assistant', timestamp: new Date(now - 60 * 1000).toISOString(), message: { usage: { input_tokens: 42 } } },
+    ]);
+    withFreshBudgetMonitor(dir, (bm) => {
+      const result = bm.isBudgetHealthy();
+      assert.equal(result.sinceLastLimit.usedFallback5h, true);
+      assert.equal(result.sinceLastLimit.tokens, 42);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -703,12 +703,12 @@ async function renderClaudeUsagePanel() {
       ${resetLine}
       ${estimateLine}
       <div class="row" style="gap:24px;margin-top:6px">
-        <div class="stat"><strong>${usage.rolling5h.calls}</strong>calls / last 5h</div>
-        <div class="stat"><strong>${usage.rolling5h.tokens.toLocaleString()}</strong>tokens / last 5h</div>
+        <div class="stat" title="${usage.sinceLastLimit.usedFallback5h ? 'No rate-limit hit recorded yet in the last 7 days -- no real window boundary to anchor to, showing a trailing 5h lookback instead.' : 'Since ' + new Date(usage.sinceLastLimit.windowStart).toLocaleString() + ', the real start of the current rate-limit window (the last reset), not a generic trailing lookback.'}"><strong>${usage.sinceLastLimit.calls}</strong>calls since ${usage.sinceLastLimit.usedFallback5h ? 'last 5h (no hit yet)' : 'last limit'}</div>
+        <div class="stat" title="${usage.sinceLastLimit.usedFallback5h ? 'No rate-limit hit recorded yet in the last 7 days -- no real window boundary to anchor to, showing a trailing 5h lookback instead.' : 'Since ' + new Date(usage.sinceLastLimit.windowStart).toLocaleString() + ', the real start of the current rate-limit window (the last reset), not a generic trailing lookback.'}"><strong>${usage.sinceLastLimit.tokens.toLocaleString()}</strong>tokens since ${usage.sinceLastLimit.usedFallback5h ? 'last 5h (no hit yet)' : 'last limit'}</div>
         <div class="stat"><strong>${usage.rolling7d.calls}</strong>calls / last 7d</div>
         <div class="stat"><strong>${usage.rolling7d.tokens.toLocaleString()}</strong>tokens / last 7d</div>
       </div>
-      <div class="meta" style="margin-top:6px">Rolling volume trend, not a live quota gauge -- Claude Code only ever reports a rate-limit hit reactively, after it happens. Includes both interactive \`claude\` sessions and this pipeline's own headless calls on this machine.</div>
+      <div class="meta" style="margin-top:6px">Volume trend, not a live quota gauge -- Claude Code only ever reports a rate-limit hit reactively, after it happens. "Since last limit" is anchored to the real window boundary (the last reset), not a generic trailing lookback. Includes both interactive \`claude\` sessions and this pipeline's own headless calls on this machine.</div>
     </div>`;
 }
 

@@ -120,6 +120,27 @@ function usageTokenCount(usage) {
     + (usage.cache_read_input_tokens || 0);
 }
 
+// Brain Dump #89 follow-up (2026-08-18): the CURRENT rate-limit window doesn't start "5
+// hours before whenever someone happens to check" -- it starts at a specific boundary,
+// the last real reset. A trailing-5h lookback and the actual window can disagree by
+// almost a full window's width right after a fresh reset (showing 5h of STALE pre-reset
+// usage as if it were "current"), which is exactly the kind of drift this account's own
+// numbers shouldn't have. Anchors "since last limit" to that real boundary instead:
+// - a past reset already happened (resetsAt <= now) -> the new window began there.
+// - still mid-limit (resetsAt in the future, or unparsed) -> anchor to the hit itself;
+//   whatever accumulates between a hit and its reset is what will trigger the NEXT hit.
+// - no rate-limit history at all in the lookback window -> no real boundary to anchor
+//   to yet; falls back to the old trailing-5h behavior as the closest available proxy
+//   (flagged via usedFallback5h so callers/UI can say so rather than implying precision
+//   that isn't there).
+function currentWindowStartMs(lastRateLimit, now) {
+  if (!lastRateLimit) return null;
+  if (lastRateLimit.resetsAt && lastRateLimit.resetsAt.getTime() <= now) {
+    return lastRateLimit.resetsAt.getTime();
+  }
+  return lastRateLimit.at;
+}
+
 // Brain Dump #89 (2026-08-18): a real "(used/total ##%)" figure needs a real total, and
 // Claude Code under a subscription (CLAUDE_CODE_OAUTH_TOKEN -- see claude-client.js's own
 // header) never exposes one; only the API's pay-per-token `/v1/messages` responses carry
@@ -207,14 +228,16 @@ function isBudgetHealthy() {
     }
   }
 
-  const fiveHoursAgo = now - 5 * 60 * 60 * 1000;
-  const rolling5h = allEntries.filter((e) => e._ts >= fiveHoursAgo);
+  const windowStartMs = currentWindowStartMs(lastRateLimit, now);
+  const usedFallback5h = windowStartMs == null;
+  const sinceLastLimitStart = usedFallback5h ? now - 5 * 60 * 60 * 1000 : windowStartMs;
+  const sinceLastLimitEntries = allEntries.filter((e) => e._ts >= sinceLastLimitStart);
   const rolling7d = allEntries;
 
   const sumTokens = (entries) => entries.reduce((sum, e) => sum + usageTokenCount(e.message?.usage), 0);
   const countCalls = (entries) => entries.filter((e) => e.type === 'assistant' && usageTokenCount(e.message?.usage) > 0).length;
 
-  const rolling5hTokens = sumTokens(rolling5h);
+  const sinceLastLimitTokens = sumTokens(sinceLastLimitEntries);
   const ceiling = estimateBudgetCeiling(allEntries);
   // null (not { usedPercent: 0, ... }) when sampleCount is 0 -- "no estimate yet" must
   // stay visibly distinct from "0% used", the same "unknown is not the same as safe"
@@ -222,24 +245,29 @@ function isBudgetHealthy() {
   // this pipeline (agent-manager-common.sh).
   const estimate = ceiling.ceilingTokens ? {
     ceilingTokens: ceiling.ceilingTokens,
-    usedTokens: rolling5hTokens,
-    usedPercent: Math.min(100, Math.round((rolling5hTokens / ceiling.ceilingTokens) * 100)),
+    usedTokens: sinceLastLimitTokens,
+    usedPercent: Math.min(100, Math.round((sinceLastLimitTokens / ceiling.ceilingTokens) * 100)),
     sampleCount: ceiling.sampleCount,
     basis: 'empirical: max observed 5h-window token total across past real rate-limit hits -- not a real quota number, Claude Code under a subscription does not expose one',
-    estimatedCapAt: estimateTimeToCap(allEntries, ceiling.ceilingTokens, rolling5hTokens, now),
+    estimatedCapAt: estimateTimeToCap(allEntries, ceiling.ceilingTokens, sinceLastLimitTokens, now),
   } : null;
 
   return {
     healthy,
     reason,
     lastRateLimit: lastRateLimit ? { at: new Date(lastRateLimit.at).toISOString(), resetsAt: lastRateLimit.resetsAt?.toISOString() || null, text: lastRateLimit.text } : null,
-    rolling5h: { tokens: rolling5hTokens, calls: countCalls(rolling5h) },
+    sinceLastLimit: {
+      tokens: sinceLastLimitTokens,
+      calls: countCalls(sinceLastLimitEntries),
+      windowStart: new Date(sinceLastLimitStart).toISOString(),
+      usedFallback5h,
+    },
     rolling7d: { tokens: sumTokens(rolling7d), calls: countCalls(rolling7d) },
     estimate,
   };
 }
 
-module.exports = { isBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap };
+module.exports = { isBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs };
 
 if (require.main === module) {
   console.log(JSON.stringify(isBudgetHealthy(), null, 2));
