@@ -120,6 +120,54 @@ function usageTokenCount(usage) {
     + (usage.cache_read_input_tokens || 0);
 }
 
+// Brain Dump #89 (2026-08-18): a real "(used/total ##%)" figure needs a real total, and
+// Claude Code under a subscription (CLAUDE_CODE_OAUTH_TOKEN -- see claude-client.js's own
+// header) never exposes one; only the API's pay-per-token `/v1/messages` responses carry
+// `usage`/`limit` fields, which is deliberately NOT what this deployment uses (a prior
+// Brain Dump entry: "not the API, we don't want to get hit with usage bills"). This
+// module's own header already treats a real rate-limit HIT as ground truth over guessing
+// an unknown threshold -- this function extends that same philosophy instead of abandoning
+// it: every real hit IS a genuine data point proving "this many tokens was enough to hit
+// the cap," so a history of real hits lets an ACCOUNT-SPECIFIC ceiling be learned
+// empirically, entirely from ground-truth events, with no invented number anywhere.
+// Uses max (not median/mean) of observed per-hit window sums -- each sample is a real
+// upper bound that was actually reached, so the largest one is the best current estimate
+// of the true cap; a smaller sample just means that particular hit happened to land
+// earlier in its window, not that the cap is lower.
+function estimateBudgetCeiling(allEntries) {
+  const windowMs = 5 * 60 * 60 * 1000;
+  const samples = [];
+  for (const entry of allEntries) {
+    if (entry.error !== 'rate_limit' && entry.apiErrorStatus !== 429) continue;
+    const windowStart = entry._ts - windowMs;
+    const tokens = allEntries
+      .filter((e) => e._ts > windowStart && e._ts <= entry._ts)
+      .reduce((sum, e) => sum + usageTokenCount(e.message?.usage), 0);
+    if (tokens > 0) samples.push({ at: new Date(entry._ts).toISOString(), tokens });
+  }
+  if (samples.length === 0) return { ceilingTokens: null, sampleCount: 0, samples: [] };
+  const ceilingTokens = Math.max(...samples.map((s) => s.tokens));
+  return { ceilingTokens, sampleCount: samples.length, samples };
+}
+
+// Burn-rate projection for "estimated time cap will be reached": tokens/hour over a
+// SHORT recent window (60 min), not the full 5h rolling sum -- a short window reflects
+// current pace, where a 5h average would be diluted by idle stretches earlier in the
+// window and understate how soon a sustained burst would actually hit the ceiling.
+function estimateTimeToCap(allEntries, ceilingTokens, usedTokens, now) {
+  if (!ceilingTokens) return null;
+  const remaining = ceilingTokens - usedTokens;
+  if (remaining <= 0) return null; // already at/over the estimated ceiling
+  const oneHourAgo = now - 60 * 60 * 1000;
+  const recentTokens = allEntries
+    .filter((e) => e._ts >= oneHourAgo && e._ts <= now)
+    .reduce((sum, e) => sum + usageTokenCount(e.message?.usage), 0);
+  if (recentTokens <= 0) return null; // not currently accumulating -- no rate to project from
+  const tokensPerHour = recentTokens; // window IS one hour, so this is already the rate
+  const hoursToCap = remaining / tokensPerHour;
+  return new Date(now + hoursToCap * 60 * 60 * 1000).toISOString();
+}
+
 function isBudgetHealthy() {
   const now = Date.now();
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
@@ -166,16 +214,32 @@ function isBudgetHealthy() {
   const sumTokens = (entries) => entries.reduce((sum, e) => sum + usageTokenCount(e.message?.usage), 0);
   const countCalls = (entries) => entries.filter((e) => e.type === 'assistant' && usageTokenCount(e.message?.usage) > 0).length;
 
+  const rolling5hTokens = sumTokens(rolling5h);
+  const ceiling = estimateBudgetCeiling(allEntries);
+  // null (not { usedPercent: 0, ... }) when sampleCount is 0 -- "no estimate yet" must
+  // stay visibly distinct from "0% used", the same "unknown is not the same as safe"
+  // rule check_budget_healthy's own caller-side fallback already follows elsewhere in
+  // this pipeline (agent-manager-common.sh).
+  const estimate = ceiling.ceilingTokens ? {
+    ceilingTokens: ceiling.ceilingTokens,
+    usedTokens: rolling5hTokens,
+    usedPercent: Math.min(100, Math.round((rolling5hTokens / ceiling.ceilingTokens) * 100)),
+    sampleCount: ceiling.sampleCount,
+    basis: 'empirical: max observed 5h-window token total across past real rate-limit hits -- not a real quota number, Claude Code under a subscription does not expose one',
+    estimatedCapAt: estimateTimeToCap(allEntries, ceiling.ceilingTokens, rolling5hTokens, now),
+  } : null;
+
   return {
     healthy,
     reason,
     lastRateLimit: lastRateLimit ? { at: new Date(lastRateLimit.at).toISOString(), resetsAt: lastRateLimit.resetsAt?.toISOString() || null, text: lastRateLimit.text } : null,
-    rolling5h: { tokens: sumTokens(rolling5h), calls: countCalls(rolling5h) },
+    rolling5h: { tokens: rolling5hTokens, calls: countCalls(rolling5h) },
     rolling7d: { tokens: sumTokens(rolling7d), calls: countCalls(rolling7d) },
+    estimate,
   };
 }
 
-module.exports = { isBudgetHealthy, parseResetTime, usageTokenCount };
+module.exports = { isBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap };
 
 if (require.main === module) {
   console.log(JSON.stringify(isBudgetHealthy(), null, 2));

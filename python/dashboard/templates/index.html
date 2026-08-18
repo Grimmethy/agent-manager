@@ -670,6 +670,10 @@ function wireClaudeSettingsPanel() {
 // budget-monitor.js's own signal, unchanged here -- see /api/claude-usage's docstring
 // for exactly what this is (a real rate-limit hit/reset history plus a rolling volume
 // trend) and isn't (a live "% of quota used" gauge -- Claude Code doesn't expose one).
+// usage.estimate (Brain Dump #89, 2026-08-18) is the one exception, and it's labeled as
+// exactly that -- an ESTIMATE learned from real past rate-limit hits (each one a genuine
+// "this many tokens was enough to hit the cap" data point), never a live number Claude
+// Code itself reports. null until at least one real hit has been observed to learn from.
 async function renderClaudeUsagePanel() {
   let usage;
   try {
@@ -687,12 +691,17 @@ async function renderClaudeUsagePanel() {
     ? `<div class="meta">Last rate-limit hit: ${new Date(usage.lastRateLimit.at).toLocaleString()}</div>` : '';
   const resetLine = usage.lastRateLimit && usage.lastRateLimit.resetsAt
     ? `<div class="meta">Resets: ${new Date(usage.lastRateLimit.resetsAt).toLocaleString()}</div>` : '';
+  const est = usage.estimate;
+  const estimateLine = est
+    ? `<div class="meta" style="margin-top:6px" title="${escapeAttr(est.basis)}">Estimated: ${est.usedTokens.toLocaleString()}/~${est.ceilingTokens.toLocaleString()} tokens used (${est.usedPercent}%) -- learned from ${est.sampleCount} past rate-limit hit${est.sampleCount === 1 ? '' : 's'}${est.estimatedCapAt ? `, projected to hit the cap around ${new Date(est.estimatedCapAt).toLocaleString()} at the current pace` : ''}</div>`
+    : `<div class="meta" style="margin-top:6px">No used/total estimate yet -- needs at least one real rate-limit hit in the last 7 days to learn an account-specific ceiling from.</div>`;
   return `
     <div class="grill-session" style="margin-bottom:16px">
       <div class="field-label">Claude Usage</div>
       <div>${healthLabel} <span class="meta">-- ${escapeHtml(usage.reason || '')}</span></div>
       ${lastHitLine}
       ${resetLine}
+      ${estimateLine}
       <div class="row" style="gap:24px;margin-top:6px">
         <div class="stat"><strong>${usage.rolling5h.calls}</strong>calls / last 5h</div>
         <div class="stat"><strong>${usage.rolling5h.tokens.toLocaleString()}</strong>tokens / last 5h</div>
