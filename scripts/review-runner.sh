@@ -45,6 +45,20 @@ while :; do                                                                     
 
   [[ -d "$review_dir" && -r "$review_dir" ]]                                    || { sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
 
+  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap) --
+  # same guard ornith-worker.sh's worker-1 lane uses, tier='low' for the same reason: this
+  # daemon's own Ornith calls only ever review low-tier items (a high-tier item's vote
+  # routes straight to Claude inside review-task.js's own providerFor(task) call,
+  # independent of ORNITH_MODEL). No-op when reviewer already shares worker-1's model, the
+  # default and common case.
+  yield_verdict="$(should_yield_for_model_swap "${ORNITH_MODEL:-}" "low")"
+  if [[ "$yield_verdict" == "yield" ]]; then
+    printf '[review-%s] yielding this tick -- resident model still has pending work in the other tier.\n' "$INSTANCE_ID" >&2
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+  record_active_model "$INSTANCE_ID" "${ORNITH_MODEL:-}" "low"
+
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
   # (n=3 votes per item), same starvation risk ornith-worker.sh's tick guards against;
   # see gpu-guard.js's header for the live incident this responds to. Best-effort, never
