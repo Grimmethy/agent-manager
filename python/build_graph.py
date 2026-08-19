@@ -5,11 +5,8 @@ require graph (JS/TS + Python, see below), runs community detection, and writes 
 in the exact {nodes, links} shape task-sources.js's nextArchDiscoveryTask() already
 consumes -- no changes needed there.
 
-This is a periodic, manually-run scanner (same pattern as unused-export-scan.js /
-gis-probe.js), NOT run automatically on every task-generation tick -- the resulting
-graph.json and community-coverage.json are the cache.
-
 Usage: python build_graph.py
+       python build_graph.py --check-due
        python build_graph.py --target-dir <path> --output <graph.json path> [--no-model-naming]
 Without --target-dir, reads the same env vars as the rest of the package
 (AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_GREP_DIRS, AGENT_MANAGER_GRAPH_PATH,
@@ -22,11 +19,18 @@ skips the Ornith community-naming call entirely (deep_dive's own design delibera
 spends a model round-trip on naming -- see ADR-0019 -- unlike arch_discovery's default,
 which tries Ornith first and falls back to the heuristic below only on failure).
 
-IMPORTANT: rebuilding resets community-coverage.json's rotation progress (lastReviewedAt/
-lastCandidateCount). Community boundaries can genuinely shift between rebuilds, and a
-stale id pointing at a different file set would silently corrupt arch_discovery's rotation
-tracking -- worse than an honest fresh start. Re-run this only when you actually want that
-reset (e.g. after a large refactor), not on every tick.
+Both the plain `python build_graph.py` and `--check-due` (Grimmethy, 2026-08-19: "This
+should be a daily task so that the review steps keep up with the project") now MERGE the
+freshly-built coverage into the existing one via merge_coverage() rather than blindly
+overwriting it: each community's identity is the sorted set of its member file paths
+(community `id`/position is NOT stable across two independent
+greedy_modularity_communities() runs, even with no real code change), so a community whose
+member files are unchanged keeps its lastReviewedAt/lastCandidateCount, and only a
+genuinely new or changed community starts fresh at null/-1. `--check-due` additionally
+tracks a last-built timestamp (AGENT_MANAGER_PIPELINE_DIR/instances/.graph-build-schedule.json)
+and only rebuilds once GRAPH_BUILD_INTERVAL_SECONDS has elapsed -- wired into
+queue-watcher.sh's tick loop so arch_discovery's candidate pool tracks real code changes
+daily without a human remembering to click Build.
 """
 
 import argparse
@@ -36,6 +40,7 @@ import re
 import sys
 import urllib.request
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import networkx as nx
@@ -122,6 +127,7 @@ def get_config():
 
     return {
         "repo_root": repo_root,
+        "pipeline_dir": pipeline_dir,
         "grep_dirs": grep_dirs,
         "graph_path": graph_path,
         "coverage_path": coverage_path,
@@ -261,6 +267,14 @@ def resolve_lua_import(spec: str, repo_root: Path, file_set: set[Path]) -> Path 
 
 
 def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
+    # Resolve up front, matching file_set's own f.resolve() below -- repo_root can be a
+    # symlink (e.g. this project's own self-hosted setup: AGENT_MANAGER_REPO_ROOT points
+    # at /media/wok/model-cache/agent-manager-apply-target, a symlink to
+    # /media/model-cache/github/agent-manager-apply-target). Without this, every f in
+    # file_set carries the REAL resolved path while repo_root stays as the symlink path,
+    # so f.relative_to(repo_root) raises ValueError ("... is not in the subpath of ...")
+    # for every single file -- confirmed live 2026-08-19, dashboard "Build" button.
+    repo_root = repo_root.resolve()
     files = walk_source_files(repo_root, grep_dirs)
     file_set = {f.resolve() for f in files}
     graph = nx.Graph()
@@ -449,12 +463,126 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
     }
 
 
+def _community_member_signature(community_id, graph_nodes):
+    """A community's stable identity across two independent builds -- the sorted set of
+    its member file paths. `id` itself is just an enumerate() position over communities
+    sorted by size (see build_graph_data above), which can shift between two builds even
+    when nothing meaningfully changed (a near-size-tie reordering, one new file nudging a
+    community's rank) -- matching by id across builds would silently attach the wrong
+    community's review history to a different one."""
+    return tuple(sorted(n["id"] for n in graph_nodes if n.get("community") == community_id))
+
+
+def merge_coverage(old_coverage: dict, old_graph_nodes: list, new_coverage: dict, new_graph_nodes: list) -> dict:
+    """Carries lastReviewedAt/lastCandidateCount forward from old_coverage into
+    new_coverage for every community whose member-file SET is byte-identical across both
+    builds -- a real code change that moves even one file into/out of a community starts
+    that community's review state fresh (deliberately conservative: a stale
+    lastReviewedAt on a community that actually changed would let arch_discovery skip real
+    new content, which is worse than reviewing a handful of unchanged files again).
+    Communities with no matching old signature (genuinely new or changed) keep
+    new_coverage's own fresh lastReviewedAt=None/lastCandidateCount=-1."""
+    old_by_signature = {
+        _community_member_signature(c["id"], old_graph_nodes): c
+        for c in old_coverage.get("communities", [])
+    }
+
+    merged = []
+    for c in new_coverage.get("communities", []):
+        signature = _community_member_signature(c["id"], new_graph_nodes)
+        old = old_by_signature.get(signature)
+        if old:
+            merged.append({
+                **c,
+                "lastReviewedAt": old.get("lastReviewedAt"),
+                "lastCandidateCount": old.get("lastCandidateCount", -1),
+            })
+        else:
+            merged.append(c)
+    return {"communities": merged}
+
+
+GRAPH_BUILD_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def _graph_build_schedule_path(pipeline_dir: Path) -> Path:
+    return pipeline_dir / "instances" / ".graph-build-schedule.json"
+
+
+def _read_json_or_default(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def check_due(progress=print) -> bool:
+    """Rebuilds the pipeline's own graph.json/community-coverage.json if
+    GRAPH_BUILD_INTERVAL_SECONDS has elapsed since the last build (or it has never been
+    built) -- called once per queue-watcher.sh tick, same "cheap check, rare real work"
+    shape as system-report.js's own --check-due. Returns True if a build actually ran.
+
+    Always runs with use_model_naming=False (the directory-prefix heuristic, same as
+    deep_dive's own default -- see ADR-0019) rather than arch_discovery's usual
+    Ornith-first naming: community.name is purely a display label (task-sources.js's
+    nextArchDiscoveryTask only ever uses it for a task title/prompt string, never for
+    ranking or selection), not worth spending a real Ollama round-trip PER COMMUNITY
+    contending with the live pipeline's actual drafting/review work for the same model
+    slot every single day. Confirmed live 2026-08-19: a manual full run (with naming on)
+    against this repo's own ~15+ communities was still running after 13+ minutes, 0% CPU,
+    genuinely queued behind real worker traffic on the same Ollama instance -- exactly the
+    contention this avoids. A human running the plain `python build_graph.py` (no
+    --check-due) still gets Ornith-named communities if they want them.
+    """
+    cfg = get_config()
+    schedule_path = _graph_build_schedule_path(cfg["pipeline_dir"])
+    schedule = _read_json_or_default(schedule_path, {})
+
+    last_built_at = schedule.get("lastBuiltAt")
+    now = datetime.now(timezone.utc)
+    if last_built_at:
+        try:
+            last = datetime.fromisoformat(last_built_at.replace("Z", "+00:00"))
+        except ValueError:
+            last = None
+        if last and (now - last) < timedelta(seconds=GRAPH_BUILD_INTERVAL_SECONDS):
+            return False
+
+    old_graph = _read_json_or_default(cfg["graph_path"], {"nodes": [], "links": []})
+    old_coverage = _read_json_or_default(cfg["coverage_path"], {"communities": []})
+
+    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], progress=progress, use_model_naming=False)
+    merged_coverage = merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
+
+    cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
+    cfg["graph_path"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
+    cfg["coverage_path"].parent.mkdir(parents=True, exist_ok=True)
+    cfg["coverage_path"].write_text(json.dumps(merged_coverage, indent=2), encoding="utf-8")
+
+    schedule_path.parent.mkdir(parents=True, exist_ok=True)
+    schedule_path.write_text(json.dumps({"lastBuiltAt": now.isoformat()}, indent=2), encoding="utf-8")
+
+    carried = sum(1 for c in merged_coverage["communities"] if c.get("lastReviewedAt"))
+    progress(
+        f"[graph-build] rebuilt: {len(result['graph']['nodes'])} nodes, "
+        f"{len(merged_coverage['communities'])} communities "
+        f"({carried} carried forward existing review state, "
+        f"{len(merged_coverage['communities']) - carried} new/changed)"
+    )
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-dir", help="Scan this directory instead of AGENT_MANAGER_REPO_ROOT (whole tree, no grep_dirs scoping -- for deep_dive's cloned external repos, which have no known frontend/src,backend/src convention).")
     parser.add_argument("--output", help="Write the graph JSON here instead of AGENT_MANAGER_GRAPH_PATH. With --target-dir and no --output, defaults to <target-dir>/.deep-dive-graph.json. No coverage-tracker file is written in --target-dir mode -- deep_dive uses its own deep-dive-coverage.json, populated by task-sources.js, not this script.")
     parser.add_argument("--no-model-naming", action="store_true", help="Skip the Ornith community-naming call, go straight to the directory-prefix heuristic (deep_dive's default -- see ADR-0019).")
+    parser.add_argument("--check-due", action="store_true", help="Rebuild only if GRAPH_BUILD_INTERVAL_SECONDS has elapsed since the last build (see check_due()'s own docstring) -- the mode queue-watcher.sh calls every tick. Ignores --target-dir/--output/--no-model-naming.")
     args = parser.parse_args()
+
+    if args.check_due:
+        check_due()
+        return
 
     if args.target_dir:
         target_dir = Path(args.target_dir)
@@ -475,15 +603,20 @@ def main():
         return
 
     cfg = get_config()
+    old_graph = _read_json_or_default(cfg["graph_path"], {"nodes": [], "links": []})
+    old_coverage = _read_json_or_default(cfg["coverage_path"], {"communities": []})
+
     result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], use_model_naming=not args.no_model_naming)
+    merged_coverage = merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
 
     cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
     cfg["graph_path"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
     print(f"Wrote {cfg['graph_path']}")
 
     cfg["coverage_path"].parent.mkdir(parents=True, exist_ok=True)
-    cfg["coverage_path"].write_text(json.dumps(result["coverage"], indent=2), encoding="utf-8")
-    print(f"Wrote {cfg['coverage_path']} ({len(result['coverage']['communities'])} communities, rotation state reset)")
+    cfg["coverage_path"].write_text(json.dumps(merged_coverage, indent=2), encoding="utf-8")
+    carried = sum(1 for c in merged_coverage["communities"] if c.get("lastReviewedAt"))
+    print(f"Wrote {cfg['coverage_path']} ({len(merged_coverage['communities'])} communities, {carried} carried forward existing review state)")
 
 
 if __name__ == "__main__":
