@@ -44,6 +44,8 @@ const { providerFor, labelFor } = require('./model-provider.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName } = require('./task-source-registry.js');
+const { selectAbModel } = require('./ab-model-select.js');
+const { resolveStrategy } = require('./model-strategies.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -281,7 +283,43 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // detector's 'empty' check must not fire for them (see ornith-client.js's call()
       // comment for the live-confirmed backlog this caused).
       const allowEmptyImplement = ['arch_discovery', 'deep_dive', 'arch_import', 'project_search'].includes(task.source);
-      const implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement });
+
+      // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
+      // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
+      // this had zero real callers on Linux until now). ORNITH_AB_MODELS is a
+      // comma-separated list, each entry either a bare Ollama model tag, a
+      // model-strategies.js registry name, or a "claude:<model>" entry (new: this is the
+      // extension that lets an A/B run directly compare a local model against Claude,
+      // not just two local models). Empty/single-entry list -> selectAbModel returns null
+      // -> abModel stays null -> falls through to resolvedOrnithCall exactly as before,
+      // the same backward-compatibility guarantee model-strategies.js's own resolveStrategy()
+      // already promises. When abModel IS set, it deliberately overrides providerFor(task)'s
+      // normal tier-based routing rather than deferring to it -- the whole point of a
+      // cross-provider A/B entry is to run BOTH sides against the same real tasks
+      // regardless of which tier/provider that task would have used by default.
+      const abCandidates = (process.env.ORNITH_AB_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const abCandidateName = selectAbModel(task.id, abCandidates);
+      const abStrategy = abCandidateName ? resolveStrategy(abCandidateName) : null;
+      const abModel = abStrategy ? abStrategy.model : null;
+
+      let implResult;
+      if (abModel && abModel.startsWith('claude:')) {
+        const { call: abClaudeCall } = require('./claude-client.js');
+        implResult = await abClaudeCall({ prompt: implPrompt, model: abModel.slice('claude:'.length), maxTurns: 1, permissionMode: 'dontAsk' });
+      } else if (abModel) {
+        const { call: abOrnithCall } = require('./ornith-client.js');
+        implResult = await abOrnithCall({
+          prompt: implPrompt,
+          think: abStrategy.think != null ? abStrategy.think : !hasFixedLiterals,
+          temperature: abStrategy.temperature != null ? abStrategy.temperature : 0.4,
+          numPredict: abStrategy.numPredict != null ? abStrategy.numPredict : implNumPredict,
+          numCtx: implNumCtx,
+          allowEmpty: allowEmptyImplement,
+          model: abModel,
+        });
+      } else {
+        implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement });
+      }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
       // Models tab) and stamps task.abCallId so a later outcome (review verdict, watchdog
@@ -296,8 +334,12 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         // 'ornith' from before model-provider.js's per-task-source routing existed,
         // which would have silently mislabeled every Claude-served call as Ornith in
         // model-stats.db (the Models tab's own data source) the moment that routing
-        // was used for anything.
-        model: labelFor(task),
+        // was used for anything. abModel (when an A/B candidate was actually selected)
+        // takes precedence over labelFor(task) the same way it took precedence over
+        // resolvedOrnithCall above -- labelFor(task) only knows about providerFor(task)'s
+        // normal tier routing, not this call's deliberate override of it.
+        model: abModel || labelFor(task),
+        candidates: abCandidates.length > 1 ? abCandidates.join(',') : null,
         startedAt: implStartedAt,
         latencyMs: Date.now() - implStartMs,
         result: implResult,
@@ -306,7 +348,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // apply-task.js has no access path back to via just task.abCallId) so its commit
       // message can attribute Co-Authored-By to whichever backend actually drafted the
       // change instead of always crediting Ornith -- see apply-task.js's own comment.
-      task.draftModel = labelFor(task.source);
+      task.draftModel = abModel || labelFor(task.source);
 
       if (implResult.degenerate) {
         const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;

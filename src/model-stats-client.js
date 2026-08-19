@@ -35,13 +35,20 @@ function runEvent(event, payload) {
 // Call this once per implement-pass model call, right after it completes -- returns a
 // fresh callId to store on the task (as task.abCallId) so a later outcome (review verdict,
 // watchdog requeue) can be joined back to this same row.
-function recordCall({ taskId, stage = 'implement', model, startedAt, latencyMs, result }) {
+//
+// candidates (2026-08-19): the raw ORNITH_AB_MODELS list this call was chosen from, or
+// null when no A/B mechanism is active for this call -- model-stats-db.js's schema already
+// had this column (the PowerShell reference always populated it), it just had no way to
+// reach it through this JS wrapper until ab-model-select.js gave ornith-draft.js a real
+// selection to record.
+function recordCall({ taskId, stage = 'implement', model, candidates = null, startedAt, latencyMs, result }) {
   const callId = require('crypto').randomUUID();
   runEvent('record-call', {
     callId,
     taskId,
     stage,
     model,
+    candidates,
     startedAt,
     latencyMs,
     evalDurationNs: result && result.eval_duration != null ? result.eval_duration : null,
