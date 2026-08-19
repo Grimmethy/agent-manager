@@ -1916,6 +1916,24 @@ def api_second_brain_sync_github_projects():
     return jsonify({"synced": len(repos), "created": created, "totalLinked": len(links)})
 
 
+@app.route("/api/second-brain/projects", methods=["GET"])
+def api_second_brain_projects():
+    """Projects referenced in the second brain (Projects/GitHub/*.md, built by
+    sync-github-projects) for the Project tab's project dropdown. Falls back to a live
+    filesystem scan (discover_github_repos) when the link index is empty/missing -- e.g.
+    sync has never been run -- so the dropdown isn't stuck empty on a fresh install."""
+    links = read_project_links()
+    if links:
+        projects = [
+            {"name": Path(note_rel).stem, "path": repo_path}
+            for note_rel, repo_path in links.items()
+        ]
+    else:
+        projects = discover_github_repos()
+    projects.sort(key=lambda p: p["name"].lower())
+    return jsonify({"projects": projects})
+
+
 @app.route("/api/second-brain/grill/for-note", methods=["GET"])
 def api_second_brain_grill_for_note():
     """Most recent existing session for this note, so the frontend can surface

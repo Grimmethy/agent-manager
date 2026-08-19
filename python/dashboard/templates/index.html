@@ -251,6 +251,31 @@ async function loadProjectHistory() {
   if (list) list.innerHTML = projectHistory.map((p) => `<option value="${escapeAttr(p)}">`).join('');
 }
 
+// Populates the Project tab's default project picker from Second Brain's own
+// Projects/GitHub/ references (falls back server-side to a live filesystem scan when
+// nothing's been synced yet) -- the actual ask: "switch the filepath to a drop down
+// populated by projects held within second brain."
+async function loadProjectDropdown() {
+  const select = document.getElementById('project-select');
+  if (!select) return;
+  let projects = [];
+  try {
+    const data = await fetchJson('/api/second-brain/projects');
+    projects = data.projects || [];
+  } catch (e) { /* Second Brain not configured -- leave the dropdown at just the placeholder */ }
+  let matched = !projectPath;
+  let html = '<option value="">Select a project...</option>';
+  for (const p of projects) {
+    const selected = p.path === projectPath;
+    if (selected) matched = true;
+    html += `<option value="${escapeAttr(p.path)}"${selected ? ' selected' : ''}>${escapeHtml(p.name)}</option>`;
+  }
+  // Current path isn't a known Second Brain project (e.g. picked via Browse) -- keep it
+  // visible and selected rather than silently falling back to the placeholder.
+  if (!matched) html += `<option value="${escapeAttr(projectPath)}" selected>${escapeHtml(projectPath)}</option>`;
+  select.innerHTML = html;
+}
+
 // Explicit "show me everything" affordance, separate from the datalist above.
 // Confirmed live (2026-07-22): Chrome's native datalist popup filters suggestions to
 // substring-matches of whatever's currently TYPED in the input -- with a different
@@ -1816,7 +1841,8 @@ async function enterProjectTab() {
   main.innerHTML = `
     <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
       <div class="path-row">
-        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off" style="display:none;">
         <datalist id="project-history-list"></datalist>
         <button class="secondary" id="history-toggle">History...</button>
         <button class="secondary" id="browse-toggle">Browse...</button>
@@ -1860,9 +1886,21 @@ async function enterProjectTab() {
     skipPush = !e.target.checked;
     localStorage.setItem('agentManagerSkipPush', String(skipPush));
   });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
   document.getElementById('browse-toggle').onclick = () => {
     browserOpen = !browserOpen;
     document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    // Manual path entry only makes sense while actively browsing -- otherwise the
+    // dropdown (populated from Second Brain's referenced projects) is the only way
+    // to pick a project, per the actual ask.
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
     if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
   };
   document.getElementById('history-toggle').onclick = () => {
@@ -1877,6 +1915,7 @@ async function enterProjectTab() {
   document.getElementById('build-btn').onclick = triggerBuild;
 
   await loadProjectHistory();
+  await loadProjectDropdown();
   await refreshPipelineStatus();
   await refreshProjectStatus();
   projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
@@ -2046,6 +2085,9 @@ async function loadBrowsePanel() {
         lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
         browserOpen = false;
         panel.style.display = 'none';
+        document.getElementById('project-select').style.display = '';
+        document.getElementById('project-path-input').style.display = 'none';
+        loadProjectDropdown();  // reflects the freshly-browsed path, even if it's not a known Second Brain project
         refreshProjectStatus();
       };
     });
