@@ -606,6 +606,14 @@ function projectSearchImplementPrompt(task, planText) {
       'For each finding you keep, rate it Strong or Weak: Strong means specifically, concretely useful ' +
       'to this project (say how); Weak means plausibly related but not clearly actionable.',
     '',
+    'Every factual detail you state about a project -- star count, file names, what it does, what ' +
+      'language/library it uses -- must come only from the description/stat text given above for that ' +
+      'result, not from your own training-data knowledge of the name or URL, even if you recognize it. ' +
+      'If the description above does not mention a detail (e.g. a specific file, an exact star count ' +
+      'different from the one given), do not state that detail -- describe only what the result line ' +
+      'above actually says. This has caused real rejections before (fabricated star counts, an invented ' +
+      'missing file in a real repo) -- confirmed live 2026-08-19.',
+    '',
     'Each finding MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
     '',
     '### PROJECT: name',
