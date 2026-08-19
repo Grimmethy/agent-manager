@@ -22,6 +22,7 @@ const { scanProject, isLikelyMinified } = require('./observability-scan.js');
 const { scanProject: scanProjectForPerformance } = require('./performance-scan.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1709,6 +1710,56 @@ function nextArchImportTask() {
 
   return null;
 }
+
+// pipeline_self_audit (2026-08-19: "How can we turn this into a self improving
+// process?"): see pipeline-self-audit.js's own header for the full design. Deterministic
+// detection only -- reads queue/blocked/ fresh every call (not a persistent flags queue
+// like observability/performance_review's, deliberately: this project's own history has
+// already shown a persistent flags file can outlive the bug it was flagging, see
+// task-sources.js's isLikelyMinified re-validation fix above) and files a real adhoc task
+// once a failure cluster crosses CLUSTER_THRESHOLD, so the resulting fix goes through the
+// exact same real-agentic-Claude-plus-human-confirmation path every other adhoc task
+// does.
+function nextPipelineSelfAuditTask() {
+  const { pipelineDir, selfAuditCoveragePath } = getConfig();
+  const blockedDir = path.join(pipelineDir, 'queue', 'blocked');
+
+  let names;
+  try {
+    names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return null;
+  }
+
+  const blockedTasks = [];
+  for (const name of names) {
+    try {
+      blockedTasks.push(JSON.parse(fs.readFileSync(path.join(blockedDir, name), 'utf8')));
+    } catch {
+      // an unreadable/malformed blocked file is not itself evidence of a pattern -- skip it.
+    }
+  }
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(selfAuditCoveragePath) || '{}');
+  } catch {
+    coverage = {};
+  }
+
+  const clusters = findAuditClusters(blockedTasks, coverage);
+  if (clusters.length === 0) return null;
+
+  const cluster = clusters[0];
+  const task = buildAuditTask(cluster);
+  if (taskIdExistsInQueue(task.id)) return null;
+
+  coverage[cluster.signature] = { reportedAt: new Date().toISOString(), taskId: task.id, clusterSize: cluster.tasks.length };
+  fs.mkdirSync(path.dirname(selfAuditCoveragePath), { recursive: true });
+  fs.writeFileSync(selfAuditCoveragePath, JSON.stringify(coverage, null, 2));
+
+  return task;
+}
 registerTaskSource('arch_import', {
   priority: taskPriority('arch_import', 81),
   next: nextArchImportTask,
@@ -1726,6 +1777,12 @@ registerTaskSource('project_search', { priority: taskPriority('project_search', 
 // registration gap was identical, so fixed for consistency ahead of the scanner ever
 // actually running.
 registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
+// No `apply` key here -- domain:'adhoc' (see buildAuditTask) already resolves to 'adhoc'
+// via resolveSourceName(), so this goes through the exact same real-agentic-implement /
+// awaiting-confirm apply path every other adhoc task uses (task-source-registry.js's
+// resolveSourceName: `task.domain === 'adhoc' ... return 'adhoc'`, checked before
+// task.source at all).
+registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
 
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible

@@ -76,7 +76,7 @@ convention the underlying model client already used. Set these before launching 
 
 ## Built-in task sources
 
-Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
+Twelve, at priorities 10/20/40/42/45/65/70/71/80/81/82/85/90 (30/50/60 left open for yours):
 
 | Source | Priority | Reads |
 |---|---|---|
@@ -86,10 +86,12 @@ Ten, at priorities 10/20/40/70/71/80/81/82/85/90 (30/50/60 left open for yours):
 | `secondbrain` | 40 | `SECOND_BRAIN_DIR/Inbox/*.md` |
 | `brain_dump_sort` | 42 | `AGENT_MANAGER_BRAIN_DUMP_PATH`, entries with `status: 'captured'` -- always active regardless of any task-source allowlist, sits above any single project |
 | `path_prefetch_resolve` | 45 | `queue/needs-clarification/*.json` -- LLM-assisted fallback suggesting file path(s) + rationale for a held task path-prefetch's deterministic keyword match couldn't resolve on its own; never auto-resolves. Always active |
+| `pipeline_self_audit` | 65 | `queue/blocked/*.json` -- deterministically scans for a cluster of >=5 tasks failing the same way (`pipeline-self-audit.js`), files a real `adhoc`-shaped task asking a Claude agentic pass to find and fix the pipeline-code root cause. Tracks reported clusters in `AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH` so a signature is only reported once. Always requires human confirmation before applying, same as any other real adhoc diff |
 | `arch_review` | 70 | `AGENT_MANAGER_ARCH_CANDIDATES_PATH`, entries rated Strong |
 | `arch_import_review` | 71 | `AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH` (ADR-0020) — same fulfillment logic as `arch_review`, against `arch_import`'s own candidates doc |
 | `arch_discovery` | 80 | `AGENT_MANAGER_GRAPH_PATH` + `AGENT_MANAGER_COMMUNITY_COVERAGE_PATH` — generates new candidates one graph community at a time |
 | `observability_review` | 80 | `AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH` + `AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH` — runs `observability-scan.js` (deterministic, no LLM) once per deep_dive-onboarded project, flags in `queue/observability-flags.json` triaged one at a time |
+| `performance_review` | 80 | `AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH` + `AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH` — runs `performance-scan.js` (deterministic, no LLM) once per deep_dive-onboarded project, flags in `queue/performance-flags.json` triaged one at a time |
 | `arch_import` | 81 | `AGENT_MANAGER_IMPORT_COVERAGE_PATH` + deep_dive's analysis docs (ADR-0020) — promotes a reviewed `deep_dive` Use/Adapt finding into a real, agent-manager-grounded import candidate |
 | `deep_dive` | 82 | Reviews one import-graph community at a time from a `project_search` Strong lead's cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019) |
 | `project_search` | 85 | Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment (ADR-0018) |
