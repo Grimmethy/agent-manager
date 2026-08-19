@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
+export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so ornith-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
 # Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
@@ -105,9 +106,21 @@ while :; do                                                                     
     fi
 
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
-    write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
+    # "queued" until the single-flight lock is actually held, then "working" -- see
+    # ornith-worker.sh's process_drafting_file for the full rationale (2026-08-19,
+    # Grimmethy: "add the distinct queued status. The current is too unclear").
+    write_heartbeat_file "$INSTANCE_ID" "queued" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
+    # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
+    # own header) -- also taken for a review-task.js call that turns out to route to
+    # Claude internally (high-tier items), not just local Ornith ones: this script can't
+    # cheaply know which way a given item will route without duplicating review-task.js's
+    # own tier logic, and a Claude call briefly waiting behind a local one is a bounded
+    # cost, not a correctness problem, so it's simplest to always serialize here.
+    acquire_single_flight_lock
+    write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
     review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
+    release_single_flight_lock
     review_succeeded="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
     review_verdict="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.verdict||"")}catch(e){console.log("")}')"
 

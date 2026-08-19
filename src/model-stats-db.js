@@ -1,13 +1,25 @@
 #!/usr/bin/env node
+// Migrated off better-sqlite3 to node:sqlite (2026-08-19, Grimmethy: building the system-
+// report feature turned up that model-stats.db had recorded ZERO calls since
+// 2026-08-17T22:53 -- silently, since model-stats-client.js's runEvent() deliberately
+// swallows every error here (see that file's own header: "stats tracking must never break
+// real pipeline work"). Root cause: better-sqlite3's native .node addon needs to be
+// mmap'd with PROT_EXEC, and this package's own checkout lives on a filesystem mounted
+// noexec (`mount | grep model-cache/github` -> `noexec`) -- confirmed live, `node -e
+// "require('better-sqlite3')"` fails with ERR_DLOPEN_FAILED / "failed to map segment from
+// shared object" every single time, exactly matching the silent-swallow shape. node:sqlite
+// is a real (if still experimental, per its own runtime warning -- suppressed via
+// model-stats-client.js's --no-warnings node flag) part of the Node binary itself, no
+// separate compiled addon, so it's immune to this class of mount-flag failure entirely.
 const fs = require('fs')
 const path = require('path')
-const Database = require('better-sqlite3')
+const { DatabaseSync } = require('node:sqlite')
 
 try {
   const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH ||
     path.join(process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT, 'model-stats.db')
 
-  const db = new Database(dbPath)
+  const db = new DatabaseSync(dbPath)
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS model_calls (

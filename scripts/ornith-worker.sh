@@ -4,6 +4,7 @@
 set -u                                                                              # strict mode: catch unset var typos as failure (prevents silent "working on nothing" loop that PowerShell's lack-of-modes lets slide).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # locate scripts/ dir so we can reference sibling files regardless of how this script was invoked by launch.sh / user.
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
+export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so ornith-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
 # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17; generalized from
 # adhoc-only to a reasoning-tier concept for Brain Dump #77, 2026-08-17): any instance
@@ -115,8 +116,20 @@ process_drafting_file() {
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
 
+  # "queued" until the single-flight lock is actually held, then "working" -- 2026-08-19,
+  # Grimmethy: "add the distinct queued status. The current is too unclear" (a claimed
+  # task waiting its turn behind another lane's real Ollama call used to show "working"
+  # the whole time, indistinguishable from actually being mid-call -- confirmed live: the
+  # dashboard showed all three lanes "working" simultaneously even after the single-flight
+  # lock made only one of them genuinely active). acquire_single_flight_lock blocks here,
+  # not before this function, so claiming/GPU-guard/task-generation upstream still run
+  # freely across lanes; only the real Ollama-consuming call is serialized, and only the
+  # WAIT for that is what "queued" represents.
+  write_heartbeat_file "$INSTANCE_ID" "queued" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
+  acquire_single_flight_lock
   write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/ornith-draft.js" "$wpath" 2>>"$LOG_FILE")"
+  release_single_flight_lock
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
 

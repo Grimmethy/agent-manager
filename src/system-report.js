@@ -1,0 +1,414 @@
+'use strict';
+
+// Hourly/daily/weekly "what did the pipeline actually do" reports, filed into Second
+// Brain (Grimmethy, 2026-08-19 brain dump: "We need to start filing an hourly, daily and
+// weekly report into second brain showing what was accomplished during those time
+// periods. This should be a new task that is triggered on schedule. We need the report to
+// track downtimes and the amount of real time spent on junk tasks vs real benefit").
+//
+// Deliberately NOT a normal task-sources.js source: a report is a deterministic
+// aggregation of already-real data, not an LLM judgment call, so it never touches
+// drafting/review/approval -- same "pure code, no model call" shape drift-scan.js and
+// reject-retry-check.js already use for queue-watcher.sh's other per-tick housekeeping.
+//
+// Three inputs, each already real state this pipeline maintains for other reasons:
+//   1. queue/done/ + queue/blocked/ (including done/_archived_no_action/) -- what tasks
+//      reached a terminal state in the window, and how each is classified (see
+//      classifyTask()).
+//   2. instances/.uptime-log.jsonl (uptime-log.js, new alongside this) -- per-tick
+//      snapshots of every daemon's heartbeat, used to compute downtime.
+//   3. model-stats.db's model_calls table -- real per-call wall-clock time (latency_ms),
+//      joined back to each call's task_id so time can be summed per classification bucket
+//      instead of just counting tasks. Requires model-stats-db.js's node:sqlite migration
+//      (2026-08-19, same investigation that led here) to actually have data -- calls made
+//      before that fix landed simply have no rows and fall back to a task-count-only view
+//      for whatever window includes them, which the report's own methodology note says
+//      plainly rather than silently pretending the number is more precise than it is.
+//
+// CLI:
+//   node system-report.js --check-due               (queue-watcher.sh's own per-tick call)
+//   node system-report.js --period hourly|daily|weekly --start <iso> --end <iso> [--dry-run]
+
+const fs = require('fs');
+const path = require('path');
+const { getConfig } = require('./config.js');
+const { readSamplesInWindow } = require('./uptime-log.js');
+
+const PERIOD_MS = { hourly: 60 * 60 * 1000, daily: 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
+
+// A sample-to-sample gap wider than this counts as "pipeline down" for that whole gap --
+// generously above queue-watcher.sh's own default 60s tick interval so ordinary tick
+// jitter is never misreported as downtime; see uptime-log.js's header for why a gap is
+// the only signal available at all.
+const DOWN_GAP_THRESHOLD_SEC = 240;
+
+function terminalTimestamp(task) {
+  const hist = task.history;
+  if (Array.isArray(hist) && hist.length) {
+    const last = hist[hist.length - 1];
+    if (last && last.at) return last.at;
+  }
+  return task.createdAt || null;
+}
+
+// One task's place in the "junk vs. filtering vs. benefit" accounting -- see this
+// module's own header for why these four buckets specifically (mirrors the breakdown
+// already given directly to Grimmethy earlier the same session, "How do the completed
+// tasks benefit our program and projects?").
+//   'junk'        -- wasted compute, zero usable output (blocked, or archived as a
+//                    confirmed-bad finding, e.g. the minified-file scanner bug).
+//   'benefit'     -- a real, direct outcome: shipped code, a genuine issue caught, a
+//                    curated research artifact.
+//   'filtering'   -- a triage verdict that correctly dismissed a false positive. Real,
+//                    productive work (it's what stops a human reading 2,200 flagged
+//                    lines by hand), but not "benefit" in the direct sense, so kept
+//                    separate rather than inflated into the same bucket.
+//   'housekeeping'-- operational upkeep (filing a brain-dump note, resolving an ambiguous
+//                    path) that keeps the pipeline itself usable, neither junk nor a
+//                    direct product outcome.
+//   'unclear'     -- didn't match any of the above; reported as its own bucket rather
+//                    than guessed into one, same "don't silently misclassify" reasoning
+//                    as everywhere else in this pipeline.
+function classifyTask(task, queueState) {
+  if (queueState === 'blocked' || queueState === 'archived') return 'junk';
+
+  const source = task.source;
+  if (source === 'observability_review' || source === 'performance_review') {
+    const text = (task.implementResponse || '').toLowerCase();
+    if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
+    if (text.includes('genuine')) return 'benefit';
+    return 'unclear';
+  }
+  if (source === 'manual' || task.domain === 'adhoc') return 'benefit';
+  if (['arch_import', 'arch_discovery', 'deep_dive', 'project_search'].includes(source)) return 'benefit';
+  if (['brain_dump_sort', 'path_prefetch_resolve'].includes(source)) return 'housekeeping';
+  return 'unclear';
+}
+
+// Scans queue/done/ (including done/_archived_no_action/, which is where the minified-
+// file-bug cleanup archived 182 confirmed-junk tasks 2026-08-19 -- those are exactly the
+// kind of thing this report exists to surface, not hide) and queue/blocked/ for anything
+// whose terminal history timestamp falls in [startIso, endIso). Best-effort per file: an
+// unreadable/malformed task is skipped, never fatal to the whole scan.
+function scanTaskActivity(pipelineDir, startIso, endIso) {
+  const queueDir = path.join(pipelineDir, 'queue');
+  const start = new Date(startIso).getTime();
+  const end = new Date(endIso).getTime();
+
+  const dirs = [
+    { dir: path.join(queueDir, 'done'), state: 'done' },
+    { dir: path.join(queueDir, 'done', '_archived_no_action'), state: 'archived' },
+    { dir: path.join(queueDir, 'blocked'), state: 'blocked' },
+  ];
+
+  const tasks = [];
+  for (const { dir, state } of dirs) {
+    let names;
+    try {
+      names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      let task;
+      try {
+        task = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      } catch {
+        continue;
+      }
+      const at = terminalTimestamp(task);
+      if (!at) continue;
+      const t = new Date(at).getTime();
+      if (Number.isNaN(t) || t < start || t >= end) continue;
+      tasks.push({ id: task.id, source: task.source, domain: task.domain, at, queueState: state, classification: classifyTask(task, state) });
+    }
+  }
+  return tasks;
+}
+
+// Downtime from uptime-log.js's samples: a gap between consecutive samples wider than
+// DOWN_GAP_THRESHOLD_SEC is "pipeline down" for that whole gap (watchdog itself wasn't
+// ticking -- see uptime-log.js's header for why this is the best available signal).
+// Within samples that DO exist, a specific instance marked `stale` contributes to that
+// instance's own downtime separately, even while the rest of the pipeline was fine.
+function computeDowntime(instancesDir, startIso, endIso) {
+  const samples = readSamplesInWindow(instancesDir, startIso, endIso);
+  const windowStart = new Date(startIso).getTime();
+  const windowEnd = new Date(endIso).getTime();
+
+  let pipelineDownMs = 0;
+  const pipelineDownIntervals = [];
+  const perInstanceDownMs = {};
+
+  // Clamp every interval endpoint to the report window -- the "sample before the window"
+  // readSamplesInWindow includes can start before windowStart, and there's no sample
+  // guaranteed to exist exactly at windowEnd either.
+  const clamp = (ms) => Math.max(windowStart, Math.min(windowEnd, ms));
+
+  for (let i = 0; i < samples.length; i++) {
+    const cur = samples[i];
+    const curMs = new Date(cur.at).getTime();
+    const next = samples[i + 1];
+    const nextMs = next ? new Date(next.at).getTime() : windowEnd;
+    const segStart = clamp(curMs);
+    const segEnd = clamp(nextMs);
+    const gapSec = (nextMs - curMs) / 1000;
+
+    if (gapSec > DOWN_GAP_THRESHOLD_SEC && segEnd > segStart) {
+      pipelineDownMs += segEnd - segStart;
+      pipelineDownIntervals.push({ from: new Date(segStart).toISOString(), to: new Date(segEnd).toISOString() });
+    } else if (segEnd > segStart) {
+      // Pipeline itself was observed (gap is normal tick cadence) -- attribute any
+      // individual stale instance's share of this segment to its own downtime.
+      for (const [instanceId, info] of Object.entries(cur.instances || {})) {
+        if (info.stale) perInstanceDownMs[instanceId] = (perInstanceDownMs[instanceId] || 0) + (segEnd - segStart);
+      }
+    }
+  }
+
+  // No samples at all in the window (and none before it either) means the whole window
+  // is unobserved -- report it as fully down rather than silently showing zero downtime,
+  // which would read as "everything was fine" when really "nothing was watching."
+  if (samples.length === 0) {
+    pipelineDownMs = windowEnd - windowStart;
+    pipelineDownIntervals.push({ from: startIso, to: endIso });
+  }
+
+  return {
+    pipelineDownSec: Math.round(pipelineDownMs / 1000),
+    pipelineDownIntervals,
+    perInstanceDownSec: Object.fromEntries(Object.entries(perInstanceDownMs).map(([k, v]) => [k, Math.round(v / 1000)])),
+    sampleCount: samples.length,
+  };
+}
+
+// Real per-call wall-clock time (model-stats.db's model_calls.latency_ms), summed per
+// classification bucket by joining each call's task_id to the same tasks scanTaskActivity
+// already classified. Calls whose task_id doesn't match anything in `tasks` (e.g. a task
+// still in progress, not yet terminal) are summed separately as 'in-progress' rather than
+// dropped silently. Returns null (not thrown) if the db is missing/unreadable -- node:
+// sqlite is itself optional-at-runtime the same way the rest of this pipeline treats a
+// missing dependency, and a report with no time-accounting section is still useful.
+function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return null;
+  }
+  if (!fs.existsSync(dbPath)) return null;
+
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return null;
+  }
+
+  const byTaskId = new Map(tasks.map((t) => [t.id, t.classification]));
+  const bucketMs = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const bucketCalls = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+
+  try {
+    const rows = db.prepare('SELECT task_id, latency_ms FROM model_calls WHERE started_at >= ? AND started_at < ?').all(startIso, endIso);
+    for (const row of rows) {
+      const ms = row.latency_ms || 0;
+      const bucket = byTaskId.has(row.task_id) ? byTaskId.get(row.task_id) : 'in-progress';
+      bucketMs[bucket] = (bucketMs[bucket] || 0) + ms;
+      bucketCalls[bucket] = (bucketCalls[bucket] || 0) + 1;
+    }
+  } finally {
+    db.close();
+  }
+
+  return { bucketSec: Object.fromEntries(Object.entries(bucketMs).map(([k, v]) => [k, Math.round(v / 1000)])), bucketCalls };
+}
+
+function fmtDuration(sec) {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting }) {
+  const bySource = {};
+  const byClassification = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0 };
+  for (const t of tasks) {
+    bySource[t.source || 'unknown'] = (bySource[t.source || 'unknown'] || 0) + 1;
+    byClassification[t.classification] = (byClassification[t.classification] || 0) + 1;
+  }
+
+  const lines = [];
+  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${startIso} to ${endIso}`);
+  lines.push('');
+  lines.push(`**Tasks completed:** ${tasks.length}`);
+  lines.push('');
+
+  lines.push('## By Source');
+  for (const [source, count] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
+    lines.push(`- ${source}: ${count}`);
+  }
+  lines.push('');
+
+  lines.push('## Junk vs. Benefit (by task count)');
+  lines.push(`- Benefit: ${byClassification.benefit}`);
+  lines.push(`- Signal-filtering (correctly dismissed false positives): ${byClassification.filtering}`);
+  lines.push(`- Housekeeping: ${byClassification.housekeeping}`);
+  lines.push(`- Junk (blocked / confirmed-bad): ${byClassification.junk}`);
+  if (byClassification.unclear) lines.push(`- Unclear (not classified): ${byClassification.unclear}`);
+  lines.push('');
+
+  if (timeAccounting) {
+    lines.push('## Junk vs. Benefit (by real wall-clock time, from model-stats.db)');
+    const b = timeAccounting.bucketSec;
+    lines.push(`- Benefit: ${fmtDuration(b.benefit || 0)} (${timeAccounting.bucketCalls.benefit || 0} calls)`);
+    lines.push(`- Signal-filtering: ${fmtDuration(b.filtering || 0)} (${timeAccounting.bucketCalls.filtering || 0} calls)`);
+    lines.push(`- Housekeeping: ${fmtDuration(b.housekeeping || 0)} (${timeAccounting.bucketCalls.housekeeping || 0} calls)`);
+    lines.push(`- Junk: ${fmtDuration(b.junk || 0)} (${timeAccounting.bucketCalls.junk || 0} calls)`);
+    if (b['in-progress']) lines.push(`- In-progress / unmatched: ${fmtDuration(b['in-progress'])} (${timeAccounting.bucketCalls['in-progress']} calls)`);
+    lines.push('');
+  } else {
+    lines.push('## Junk vs. Benefit (by real wall-clock time)');
+    lines.push('_model-stats.db was unavailable for this period -- see task-count breakdown above instead._');
+    lines.push('');
+  }
+
+  lines.push('## Downtime');
+  lines.push(`- Total pipeline downtime: ${fmtDuration(downtime.pipelineDownSec)} (out of ${fmtDuration((new Date(endIso) - new Date(startIso)) / 1000)} in this period)`);
+  if (downtime.pipelineDownIntervals.length) {
+    lines.push('- Down intervals:');
+    for (const iv of downtime.pipelineDownIntervals) lines.push(`  - ${iv.from} → ${iv.to}`);
+  }
+  const perInstance = Object.entries(downtime.perInstanceDownSec);
+  if (perInstance.length) {
+    lines.push('- Per-instance downtime (pipeline otherwise up, this instance specifically stale/dead):');
+    for (const [id, sec] of perInstance) lines.push(`  - ${id}: ${fmtDuration(sec)}`);
+  }
+  lines.push('');
+
+  lines.push('## Methodology & Limitations');
+  lines.push('- "Junk vs. benefit" classification is a heuristic based on task source and verdict text, not a manual audit -- treat it as a strong first pass, not ground truth (the same review pipeline that classifies these has approved at least one fabricated candidate 3/3 votes).');
+  lines.push('- Downtime is inferred from gaps in per-tick heartbeat sampling; the pipeline cannot observe its own downtime any more precisely than "no samples were recorded."');
+  lines.push('- Wall-clock time accounting only covers calls recorded in model-stats.db for this window -- see the task-count breakdown as the always-available fallback.');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+function reportDir(secondBrainDir, period) {
+  return path.join(secondBrainDir, 'Agent Manager Reports', period);
+}
+
+function reportFilename(period, endIso) {
+  const d = new Date(endIso);
+  if (period === 'hourly') return `${d.toISOString().slice(0, 13)}h.md`; // 2026-08-19T14h.md
+  if (period === 'daily') return `${d.toISOString().slice(0, 10)}.md`; // 2026-08-19.md
+  return `${d.toISOString().slice(0, 10)}-week-ending.md`;
+}
+
+function generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir }) {
+  const tasks = scanTaskActivity(pipelineDir, startIso, endIso);
+  const downtime = computeDowntime(instancesDir, startIso, endIso);
+  const timeAccounting = computeTimeAccounting(dbPath, tasks, startIso, endIso);
+  const markdown = renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting });
+
+  const dir = reportDir(secondBrainDir, period);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, reportFilename(period, endIso));
+  fs.writeFileSync(filePath, markdown);
+
+  return { filePath, taskCount: tasks.length, downtime, timeAccounting };
+}
+
+// --- Scheduling: instances/.report-schedule.json tracks lastGeneratedAt per period -----
+function schedulePath(instancesDir) {
+  return path.join(instancesDir, '.report-schedule.json');
+}
+
+function loadSchedule(instancesDir) {
+  try {
+    return JSON.parse(fs.readFileSync(schedulePath(instancesDir), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveSchedule(instancesDir, schedule) {
+  fs.writeFileSync(schedulePath(instancesDir), JSON.stringify(schedule, null, 2));
+}
+
+// Generates any period whose interval has elapsed since its last report, covering
+// [lastGeneratedAt, now) -- a rolling window, not calendar-aligned buckets, so a gap
+// (pipeline down when an hour boundary "should" have fired) is naturally folded into the
+// next report's window instead of silently skipped. First-ever run bootstraps every
+// period's lastGeneratedAt to `now` WITHOUT generating a report -- an immediate backfill
+// over the pipeline's entire history would be both huge and not what "hourly/daily/
+// weekly" implies; real reports start accruing from whenever this feature first ran.
+function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, now = new Date() }) {
+  const schedule = loadSchedule(instancesDir);
+  const generated = [];
+  let changed = false;
+
+  for (const period of ['hourly', 'daily', 'weekly']) {
+    const last = schedule[period]?.lastGeneratedAt;
+    if (!last) {
+      schedule[period] = { lastGeneratedAt: now.toISOString() };
+      changed = true;
+      continue;
+    }
+    const elapsedMs = now.getTime() - new Date(last).getTime();
+    if (elapsedMs < PERIOD_MS[period]) continue;
+
+    const result = generateReport({ period, startIso: last, endIso: now.toISOString(), pipelineDir, instancesDir, dbPath, secondBrainDir });
+    generated.push({ period, ...result });
+    schedule[period] = { lastGeneratedAt: now.toISOString() };
+    changed = true;
+  }
+
+  if (changed) saveSchedule(instancesDir, schedule);
+  return generated;
+}
+
+module.exports = {
+  classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, renderMarkdown,
+  generateReport, checkDue, loadSchedule, saveSchedule, PERIOD_MS,
+};
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const flag = (name) => {
+    const i = args.indexOf(`--${name}`);
+    return i === -1 ? null : args[i + 1];
+  };
+
+  const { pipelineDir, secondBrainDir } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
+
+  if (args.includes('--check-due')) {
+    if (!secondBrainDir) {
+      console.error('system-report: SECOND_BRAIN_DIR is not set -- skipping (nowhere to write reports).');
+      process.exit(0);
+    }
+    const generated = checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir });
+    for (const g of generated) console.log(`[system-report] wrote ${g.period} report (${g.taskCount} tasks): ${g.filePath}`);
+    process.exit(0);
+  }
+
+  const period = flag('period');
+  const startIso = flag('start');
+  const endIso = flag('end');
+  if (!period || !startIso || !endIso) {
+    console.error('Usage: node system-report.js --check-due');
+    console.error('   or: node system-report.js --period hourly|daily|weekly --start <iso> --end <iso>');
+    process.exit(1);
+  }
+  if (!secondBrainDir) {
+    console.error('system-report: SECOND_BRAIN_DIR is not set.');
+    process.exit(1);
+  }
+  const result = generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir });
+  console.log(`wrote ${result.filePath} (${result.taskCount} tasks)`);
+}

@@ -11,13 +11,10 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "test": "node --test src/*.test.js *.test.js",
     "drift-scan": "node src/drift-scan.js"
-  },
-  "dependencies": {
-    "better-sqlite3": "^12.11.1"
   }
 }
