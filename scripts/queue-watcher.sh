@@ -124,6 +124,28 @@ while :; do
       printf '[watchdog] %s\n' "$system_report_output" >&2
     fi
 
+    # Daily project-graph rebuild (Grimmethy, 2026-08-19: "This should be a daily task so
+    # that the review steps keep up with the project" -- graph.json/community-coverage.json
+    # feed arch_discovery's candidate generation, see build_graph.py's own check_due()).
+    # Backgrounded, not awaited: check_due() itself returns almost instantly on every tick
+    # except the rare one where a rebuild is actually due, and a real rebuild (community
+    # detection plus one Ornith naming call per community) can run for MINUTES -- awaiting
+    # it here would stall dead-process-check/reject-retry-check/drift-scan/pending-
+    # staleness far past their own ~60s cadence. A PID lockfile guards against a slow
+    # rebuild still running when the next tick fires and independently deciding the SAME
+    # stale schedule state is still "due" -- without it, every ~60s tick during a multi-
+    # minute rebuild would launch its own redundant, overlapping rebuild.
+    GRAPH_BUILD_LOCK="${INSTANCES_DIR}/.graph-build.lock"
+    if [[ -f "$GRAPH_BUILD_LOCK" ]] && kill -0 "$(cat "$GRAPH_BUILD_LOCK" 2>/dev/null)" 2>/dev/null; then
+      : # a rebuild from an earlier tick is still running -- skip, don't pile up.
+    else
+      (
+        "${SCRIPT_DIR}/../.venv/bin/python" "${SCRIPT_DIR}/../python/build_graph.py" --check-due >>"${HOME_LOGS}/graph-build.log" 2>&1
+        rm -f "$GRAPH_BUILD_LOCK"
+      ) &
+      echo $! > "$GRAPH_BUILD_LOCK"
+    fi
+
     _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither ornith-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
     stale_count=0
 
