@@ -111,6 +111,12 @@ function getConfig() {
     || path.join(pipelineDir, 'performance-coverage.json');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
+  // pipeline_self_audit (2026-08-19: "how can we turn this into a self improving
+  // process?") -- tracks which failure signatures (see pipeline-self-audit.js) have
+  // already had an audit task filed, so the same blocked-task cluster doesn't generate a
+  // new audit task every tick once it's been reported once.
+  const selfAuditCoveragePath = process.env.AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH
+    || path.join(pipelineDir, 'self-audit-coverage.json');
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
   // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
   // both languages on purpose; there is no other link between them.
@@ -181,6 +187,7 @@ function getConfig() {
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
+    selfAuditCoveragePath,
     performanceCoveragePath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,

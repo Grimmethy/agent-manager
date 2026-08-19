@@ -3237,7 +3237,7 @@ TASK_SOURCE_CATALOG = [
     "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
     "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
     "performance_review",
-    "deep_dive", "project_search", "unused_export",
+    "deep_dive", "project_search", "unused_export", "pipeline_self_audit",
 ]
 
 # Exempt from any allowlist restriction regardless of stored state -- task-sources.js's

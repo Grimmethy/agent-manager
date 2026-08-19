@@ -1711,6 +1711,7 @@ const JOB_TYPES = [
   { source: 'deep_dive', domain: 'deep_dive', priority: 82, description: 'Reviews one import-graph community at a time from a project_search Strong lead\'s cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019). See the Scouted Repos tab.' },
   { source: 'project_search', domain: 'project_search', priority: 85, description: 'Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment.' },
   { source: 'unused_export', domain: '(project default)', priority: 90, description: 'Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive.' },
+  { source: 'pipeline_self_audit', domain: 'adhoc', priority: 65, description: 'Deterministically scans queue/blocked/ for a cluster of tasks failing the same way (>=5 sharing a failure signature); files a real adhoc task asking a Claude agentic pass to find and fix the root cause. Always requires human confirmation before applying (same awaiting-confirm gate as any other real adhoc diff), regardless of approval-mode settings.' },
 ];
 
 // Unmerged Branches tab (2026-08-18): closes the "sandbox" visibility gap -- a pushed
