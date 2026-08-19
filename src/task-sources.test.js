@@ -859,6 +859,39 @@ test('nextObservabilityReviewTask skips a finding whose task already exists in t
   assert.equal(nextObservabilityReviewTask(), null);
 });
 
+// 2026-08-19, Grimmethy: "I'm seeing a lot of performance triage in blocked ... look for
+// a permanent fix." Root cause: queue/observability-flags.json (and its performance
+// twin below) is a persistent, append-only queue -- a project is scanned once ever (see
+// the "already scanned once" skip in nextObservabilityReviewTask itself), so a flag
+// written by an OLDER scanner run stays queueable forever even after scanProject's own
+// isLikelyMinified skip is fixed. Confirmed live: 082346c added that scan-time skip, but
+// flags.json already held stale entries from before the fix, and they kept draining into
+// new, still-unfixable-by-design tasks for a full day afterward. This test seeds exactly
+// that stale-flag shape directly (bypassing the scanner) to prove the CONSUMER now
+// re-validates isLikelyMinified against current file content, closing the gap regardless
+// of how or when a bad flag entered the file.
+test('nextObservabilityReviewTask skips a stale flag whose target file is now minified, even though the project is already marked scanned', () => {
+  const dir = makeObservabilityFixtureRepo();
+  const clonePath = writeOnboardedProject(dir, 'demo-project');
+  fs.writeFileSync(path.join(clonePath, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+
+  // Simulate the project already being marked scanned (as it would be, hours or days
+  // after the real scan ran) with a stale flag already sitting in the queue for the now-
+  // minified file -- scanProject is never called again for an already-scanned project, so
+  // this flag would otherwise sit there forever regardless of what scanProject itself
+  // would say about bundle.js today.
+  fs.writeFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, JSON.stringify({
+    projects: { 'demo-project': { scannedAt: new Date(0).toISOString() } },
+  }));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'observability-flags.json'), JSON.stringify([
+    { rule: 'silent-catch-block', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: 'demo-project', scannedAt: new Date(0).toISOString() },
+  ]));
+
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+  assert.equal(nextObservabilityReviewTask(), null);
+});
+
 function makePerformanceFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
@@ -903,6 +936,26 @@ test('nextPerformanceReviewTask scans a newly-onboarded project and returns a tr
 
   const flags = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'performance-flags.json'), 'utf8'));
   assert.equal(flags.length, 1);
+});
+
+// See nextObservabilityReviewTask's identical test (2026-08-19) for the full root-cause
+// rationale: a persistent flags.json outlives the scanner fix meant to prevent bad
+// entries from ever reaching it.
+test('nextPerformanceReviewTask skips a stale flag whose target file is now minified, even though the project is already marked scanned', () => {
+  const dir = makePerformanceFixtureRepo();
+  const clonePath = writePerformanceOnboardedProject(dir, 'demo-project');
+  fs.writeFileSync(path.join(clonePath, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+
+  fs.writeFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, JSON.stringify({
+    projects: { 'demo-project': { scannedAt: new Date(0).toISOString() } },
+  }));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'performance-flags.json'), JSON.stringify([
+    { rule: 'sequential-await-in-loop', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: 'demo-project', scannedAt: new Date(0).toISOString() },
+  ]));
+
+  const { nextPerformanceReviewTask } = freshTaskSources(dir);
+  assert.equal(nextPerformanceReviewTask(), null);
 });
 
 test('nextPerformanceReviewTask does not rescan a project already marked scanned', () => {
@@ -1190,4 +1243,83 @@ test('nextDeepDiveTask never calls isOnline at all when nothing actually needs o
   };
   const { nextDeepDiveTask } = freshTaskSources(dir);
   assert.doesNotThrow(() => nextDeepDiveTask());
+});
+
+// 2026-08-19, Grimmethy: "the app is telling me we have 0 needs clarification tasks.
+// Please investigate" -- the count itself was accurate, but tracing one specific task
+// (genuinely held for clarification, then resolved) turned up a real bug: nextAdhocTask()
+// used to rebuild the task object from a hardcoded field list (id/domain/source/title/
+// promptContext), silently dropping everything else in the file -- including `history`,
+// which is exactly what a resolved needs-clarification task's real audit trail lives in
+// (api_task_resolve_clarification in python/dashboard/app.py moves that SAME file, with
+// its full history, straight into queue/adhoc/ for this function to pick up). The fix
+// spreads the whole file through and only force-overrides the fields this source's
+// contract actually requires.
+function makeAdhocFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
+  return dir;
+}
+
+function writeAdhocFile(dir, filename, contents) {
+  const adhocDir = path.join(dir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.writeFileSync(path.join(adhocDir, filename), JSON.stringify(contents));
+}
+
+test('nextAdhocTask preserves history and other fields already on the file (not just id/title/promptContext)', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'resolved-task.json', {
+    id: 'adhoc-resolved-task-1',
+    title: 'A task that was held for clarification and then resolved',
+    promptContext: { rawText: 'do the thing', prefetchedPaths: ['src/foo.js'] },
+    createdAt: '2026-08-19T00:00:00.000Z',
+    history: [
+      { stage: 'created', at: '2026-08-19T00:00:00.000Z', detail: 'manual' },
+      { status: 'needs-clarification', at: '2026-08-19T00:01:00.000Z' },
+      { status: 'resolved', at: '2026-08-19T00:02:00.000Z', note: 'user picked src/foo.js' },
+    ],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.history.length, 3);
+  assert.equal(task.history[2].status, 'resolved');
+  assert.equal(task.createdAt, '2026-08-19T00:00:00.000Z');
+  assert.deepEqual(task.promptContext.prefetchedPaths, ['src/foo.js']);
+});
+
+test('nextAdhocTask still force-overrides domain/source/id regardless of what the file itself claims', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'spoofed.json', {
+    id: 'adhoc-spoofed-1',
+    domain: 'arch_review', // a hand-edited file claiming a domain it has no business claiming
+    source: 'arch_discovery',
+    title: 'Should not be able to fake its own domain/source',
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.domain, 'adhoc');
+  assert.equal(task.source, 'manual');
+  assert.equal(task.id, 'adhoc-spoofed-1');
+});
+
+test('nextAdhocTask still carries preDrafted/implementResponse/planResponse through (the 2026-07-25 fix this change subsumes)', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'predrafted.json', {
+    id: 'adhoc-predrafted-1',
+    title: 'Already has its answer',
+    preDrafted: true,
+    implementResponse: 'the real diff',
+    planResponse: 'the real plan',
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.preDrafted, true);
+  assert.equal(task.implementResponse, 'the real diff');
+  assert.equal(task.planResponse, 'the real plan');
 });

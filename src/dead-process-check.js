@@ -80,7 +80,23 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
   const actions = [];
   let names = [];
   try {
-    names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json'));
+    // Real heartbeat files are always named "<instanceId>.json" with no leading dot
+    // (worker-1.json, reviewer.json, watchdog.json, ...). instances/ also holds non-
+    // heartbeat state files that happen to end in .json -- .active-local-model.json (the
+    // model-swap-thrashing guard's own state, agent-manager-common.sh's record_active_model)
+    // and .watchdog-restart-cooldown.json (this module's own cooldown bookkeeping, written
+    // a few lines below) -- both by convention dot-prefixed specifically so they're not
+    // mistaken for a real instance here. Before this filter, .active-local-model.json was
+    // getting read as a heartbeat: it has an `instanceId` field (whichever worker last
+    // recorded model residency) but no `lastHeartbeat`/`pid`, so `new Date(undefined)` ->
+    // NaN age and undefined pid -> isProcessAlive(undefined) -> false, which looked exactly
+    // like "process confirmed gone" for a perfectly healthy worker -- confirmed live
+    // 2026-08-19: repeated spurious "restarted worker-reasoning (was pid , ... heartbeat
+    // stale NaNs)" restarts, every time that state file's instanceId matched a real,
+    // already-alive worker, producing a duplicate process the startup liveness check then
+    // had to reject (agent-manager-common.sh's check_instance_liveness) -- harmless once
+    // rejected, but a needless spawn/reject cycle roughly every watchdog tick.
+    names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
   } catch (e) {
     return actions;
   }

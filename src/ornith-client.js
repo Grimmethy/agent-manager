@@ -8,7 +8,22 @@
 // (these have been observed to self-heal), and a majority-vote helper for judgment
 // calls that are otherwise an invisible coin flip at default temperature.
 
+const path = require('path');
 const { postJson } = require('./ollama-http.js');
+const inflightLock = require('./model-inflight-lock.js');
+
+// Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
+// unset, which would turn every caller of this module (including test files that require
+// it without setting up a full pipeline env) into a hard crash just from requiring
+// ornith-client.js. Same pipelineDir-falls-back-to-repoRoot derivation config.js uses,
+// just tolerant of "neither is set" (returns null -- the in-flight lock below then simply
+// isn't taken, same as any other best-effort failure in acquire()).
+function resolveInstancesDir() {
+  const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  if (!repoRoot) return null;
+  const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
+  return path.join(pipelineDir, 'instances');
+}
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL = process.env.ORNITH_MODEL || 'ornith';
@@ -59,7 +74,22 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
 
-  return postJson(`${OLLAMA_URL}/api/generate`, body, REQUEST_TIMEOUT_MS);
+  // In-flight lock (model-inflight-lock.js) -- held for the exact span of the real
+  // network call, so agent-manager-common.sh's should_yield_for_model_swap can see "a
+  // DIFFERENT model is actively being served right now" and refuse to swap Ollama's
+  // resident model out from under it, regardless of what queue/pending/ backlog counts
+  // say (see that guard's own updated comment for the race this closes). instancesDir
+  // resolving to null (no pipeline env configured -- e.g. a bare unit-test require of
+  // this module) just means no lock is taken, same as any other best-effort failure path
+  // here.
+  const instancesDir = resolveInstancesDir();
+  const lockModel = model || MODEL;
+  const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
+  try {
+    return await postJson(`${OLLAMA_URL}/api/generate`, body, REQUEST_TIMEOUT_MS);
+  } finally {
+    inflightLock.release(lockPath);
+  }
 }
 
 // 4 minutes is a deliberate overtime-fail line, not a safety margin around the worst call

@@ -7,9 +7,16 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --border: #2a3358; --text: #e6e8eb; --muted: #8a90a0;
     --accent: #5b9dff; --ok: #4caf7d; --warn: #e0a940; --bad: #e0575c;
+    /* Lighter than --accent specifically for link text -- #5b9dff reads fine for borders/
+       badges/fills but is too close to --bg (#0f1115) for thin anchor text to stay
+       legible at a glance (Grimmethy, 2026-08-19: "links... blend in too much with the
+       background"). */
+    --link: #8fc4ff;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
+  a { color: var(--link); }
+  a:hover { text-decoration: underline; }
   header { padding: 14px 20px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
@@ -56,6 +63,16 @@
   tr.needs-clarification-row td:first-child { border-left: 2px solid var(--warn); }
   .bar-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 2px; }
+  .benchmark-check-grid { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; }
+  .benchmark-check { font-size: 12px; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .bench-category-group { flex-basis: 100%; }
+  /* Case rows carry a trailing best/worst stats phrase (see renderCaseStats() in the JS) --
+     too much text for the models list's nowrap chip layout, so each case gets its own
+     wrapping block row instead. */
+  .bench-category-group .benchmark-check { display: block; white-space: normal; margin-top: 3px; }
+  .bench-case-stats { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .ok-text { color: var(--ok); }
+  .bad-text { color: var(--bad); }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
   .modal-backdrop.open { display: flex; }
   .modal { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
@@ -91,7 +108,7 @@
   .worker-filter-bar button.active { color: var(--accent); border-color: var(--accent); }
   .browser-panel { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
-  .browser-crumb .crumb-link { color: var(--accent); cursor: pointer; }
+  .browser-crumb .crumb-link { color: var(--link); cursor: pointer; }
   .browser-crumb .crumb-link:hover { text-decoration: underline; }
   .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
   .browser-entry:hover { background: var(--bg); }
@@ -112,7 +129,7 @@
   .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .bd-entry .text { font-size: 13px; }
   .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
-  .bd-entry a.jump { color: var(--accent); font-size: 12px; text-decoration: none; }
+  .bd-entry a.jump { color: var(--link); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
   .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
   .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
@@ -393,6 +410,12 @@ function statusBadgeClass(status, stale) {
   if (stale) return 'bad';
   if (status === 'working' || status === 'checking') return 'ok';
   if (status === 'idle') return 'idle';
+  // 'queued' (2026-08-19): a claimed task waiting its turn behind another lane at the
+  // single-flight lock (agent-manager-common.sh's acquire_single_flight_lock) -- amber,
+  // same as the generic 'warn' fallback below, but named explicitly so it reads as a
+  // deliberate third state (green=actively running, amber=waiting its turn, gray=idle)
+  // rather than falling through by accident.
+  if (status === 'queued') return 'warn';
   return 'warn';
 }
 
@@ -772,12 +795,34 @@ async function renderClaudeUsagePanel() {
 }
 
 async function renderModelsTab() {
-  const [models, usageRows, settingsPanel, usagePanel] = await Promise.all([
+  // Every fetch this tab needs -- including the benchmark panel's -- happens up front, in
+  // parallel, BEFORE any DOM write (2026-08-19, Grimmethy: "I refreshed and my screen
+  // still flashes"). The previous version wrote an EMPTY '<div id="benchmark-panel">'
+  // placeholder first and only populated it after its own separate await chain resolved
+  // (which itself wrote an empty '#benchmark-results' placeholder, populated by a THIRD
+  // await) -- a real collapse-then-expand on every single 5s background refresh, not just
+  // a scroll-offset problem (the earlier scrollY save/restore fix only corrected the
+  // FINAL position after that flash had already been visible). Fetching everything first
+  // and writing main.innerHTML exactly once eliminates the intermediate empty states
+  // entirely, so there is nothing left to flash.
+  const [models, usageRows, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
     fetchJson('/api/models'),
     fetchJson('/api/models/usage'),
     renderClaudeSettingsPanel(),
     renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
   ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  const viewingRunId = benchmarkViewingRunId || (benchRuns[0] && benchRuns[0].runId) || null;
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+
   const main = document.getElementById('main');
 
   const sorted = models.slice().sort((a, b) => {
@@ -831,7 +876,14 @@ async function renderModelsTab() {
     <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
     <tbody>${usageTableRows}</tbody></table>`;
 
-  main.innerHTML = settingsPanel + usagePanel + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable;
+  // Scroll-position preservation on top of the single-write fix above: the generic 5s
+  // refresh() cycle (see its own comment near setInterval(refresh, 5000)) still re-renders
+  // this whole tab on a timer regardless of what the user is doing on it, so restoring
+  // window.scrollY keeps their reading position stable across a background refresh they
+  // didn't ask for, even though the write itself no longer has an empty intermediate state.
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+    + benchmarkPanelHtml;
   wireClaudeSettingsPanel();
   main.querySelectorAll('th.sortable').forEach(th => {
     th.onclick = () => {
@@ -841,6 +893,270 @@ async function renderModelsTab() {
       renderModelsTab();
     };
   });
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+
+// Reasoning benchmark (Models tab, 2026-08-19): pick models + test cases + a run count,
+// launch src/reasoning-bench.js as a detached background process (python/dashboard/app.py's
+// api_benchmark_run), and watch it progress. Every response is saved under SECOND_BRAIN_DIR
+// (see reasoning-bench.js's own header) and readable here via the SAME renderTaskDetailModal
+// the Job List tabs already use for a real pipeline task -- no separate detail viewer.
+//
+// Every function below BUILDS an HTML string from already-fetched data -- none of them
+// fetch-then-write their own slice of the DOM independently. renderModelsTab() gathers
+// every input (including these) in one upfront Promise.all and performs exactly one
+// main.innerHTML write. See that function's own comment for why: the previous version's
+// three separate fetch-then-write stages (panel, then results, each starting from an
+// EMPTY placeholder div) was a real collapse-then-expand on every 5s background refresh.
+let benchmarkModelsCache = null;
+let benchmarkCasesCache = null;
+const benchmarkSelectedModels = new Set();
+const benchmarkSelectedCases = new Set();
+let benchmarkViewingRunId = null; // null == "show the most recent run"; '__all__' == combined view across every saved run
+
+const BENCHMARK_ALL_RUNS_ID = '__all__';
+
+function buildBenchmarkPanelHtml(models, cases, status, runs, viewingRunId, resultsHtml) {
+  const running = status.status === 'running';
+  const categories = [...new Set(cases.map(c => c.category))];
+
+  const modelChecks = models.map(m => `
+    <label class="benchmark-check"><input type="checkbox" class="bench-model-check" value="${escapeAttr(m)}" ${benchmarkSelectedModels.has(m) ? 'checked' : ''} ${running ? 'disabled' : ''}> ${escapeHtml(m)}</label>
+  `).join('');
+
+  // stats (best/worst scoring model pooled across every saved run, see app.py's
+  // _compute_case_stats) render inline next to each case -- one row per case rather than
+  // the models list's wrapped chip grid, since there's no room for this much text in a chip.
+  const renderCaseStats = (c) => {
+    if (!c.stats) return '';
+    const { best, worst } = c.stats;
+    const pct = (s) => `${Math.round(s.score * 100)}%`;
+    return ` <span class="bench-case-stats">best: <strong class="ok-text">${escapeHtml(best.model)}</strong> (${pct(best)}) &middot; worst: <strong class="bad-text">${escapeHtml(worst.model)}</strong> (${pct(worst)})</span>`;
+  };
+
+  const caseChecks = categories.map(cat => `
+    <div class="bench-category-group">
+      <div class="meta" style="margin-top:6px"><strong>${escapeHtml(cat)}</strong></div>
+      ${cases.filter(c => c.category === cat).map(c => `
+        <div class="benchmark-check"><input type="checkbox" class="bench-case-check" value="${escapeAttr(c.id)}" ${benchmarkSelectedCases.has(c.id) ? 'checked' : ''} ${running ? 'disabled' : ''}> <a href="#" class="bench-case-info" data-case-id="${escapeAttr(c.id)}" title="Click for what this test measures and its full prompt">${escapeHtml(c.id)}</a>${c.grader === 'judge' ? ' <span class="badge warn" title="Graded by a Claude subscription call, not auto-checkable">judge</span>' : ''}${renderCaseStats(c)}</div>
+      `).join('')}
+    </div>
+  `).join('');
+
+  const progressHtml = running ? `
+    <div class="grill-session" style="margin-top:10px">
+      <div class="field-label">Running: ${escapeHtml(status.runId)}</div>
+      <div>${status.completedSteps}/${status.totalSteps} steps${status.currentModel ? ` -- currently ${escapeHtml(status.currentModel)} :: ${escapeHtml(status.currentCase || '')}` : ''}</div>
+      <div class="bar-track" style="margin-top:6px"><div class="bar-fill" style="width:${status.totalSteps ? Math.round(100 * status.completedSteps / status.totalSteps) : 0}%; background:var(--accent)"></div></div>
+    </div>` : '';
+
+  // "All Runs (combined)" (2026-08-19, Grimmethy: "I only see 2 runs... we should have run
+  // 3 times each now") -- the underlying data was always complete (every saved run's
+  // responses pool correctly into the case picker's best/worst stats above), but the
+  // Responses table below is scoped to ONE selected run by design (that's what "a run" IS
+  // -- one invocation, N cases x M repeats), so after running the same model in two
+  // separate invocations there was no single place to see every response from both at
+  // once. This pseudo-run option covers that.
+  const runOptions = [`<option value="${BENCHMARK_ALL_RUNS_ID}" ${viewingRunId === BENCHMARK_ALL_RUNS_ID ? 'selected' : ''}>All Runs (combined)</option>`]
+    .concat(runs.map(r => `<option value="${escapeAttr(r.runId)}" ${viewingRunId === r.runId ? 'selected' : ''}>${escapeHtml(r.runId)} (${r.models.length} model${r.models.length === 1 ? '' : 's'}, ${r.caseIds.length} case${r.caseIds.length === 1 ? '' : 's'}, ${r.runs} run${r.runs === 1 ? '' : 'x'})</option>`))
+    .join('');
+  const runPicker = runs.length === 0 ? '<div class="empty">No saved benchmark runs yet.</div>' : `
+    <select id="benchmark-run-picker">${runOptions}</select>`;
+
+  return `
+    <div class="field-label" style="margin-top:24px">Reasoning Benchmark</div>
+    <div class="grill-session">
+      <div class="meta">Compare local models on a fixed battery of reasoning probes (misdirection traps, logic puzzles, code tracing, planning, quantitative -- plus open-ended reasoning cases scored by a Claude judge call). Every response is saved to Second Brain and browsable below, same as any other task.</div>
+      <div style="margin-top:10px"><strong>Models</strong> (<a href="#" id="bench-models-all">all</a> / <a href="#" id="bench-models-none">none</a>)</div>
+      <div class="benchmark-check-grid">${modelChecks || '<div class="empty">No local Ollama models found.</div>'}</div>
+      <div style="margin-top:10px"><strong>Test Cases</strong> (<a href="#" id="bench-cases-all">all</a> / <a href="#" id="bench-cases-none">none</a>)</div>
+      <div class="benchmark-check-grid">${caseChecks}</div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+        <label>Runs per case <input type="number" id="bench-runs-input" min="1" max="20" value="1" style="width:60px" ${running ? 'disabled' : ''}></label>
+        <label><input type="checkbox" id="bench-judge-input" ${running ? 'disabled' : ''}> Include judge-graded cases (uses Claude subscription)</label>
+        <button type="button" class="action" id="bench-run-btn" ${running ? 'disabled' : ''}>${running ? 'Running...' : 'Run Benchmark'}</button>
+      </div>
+      ${progressHtml}
+    </div>
+    <div class="field-label" style="margin-top:20px">Results</div>
+    <div style="margin-bottom:10px">${runPicker}</div>
+    <div id="benchmark-results">${resultsHtml}</div>
+  `;
+}
+
+// Fetches whatever the results section needs and returns its HTML -- called from
+// renderModelsTab() BEFORE the single main.innerHTML write, never independently.
+async function buildBenchmarkResultsHtml(viewingRunId, runs) {
+  if (!viewingRunId) return '<div class="empty">No saved benchmark runs yet.</div>';
+  if (viewingRunId === BENCHMARK_ALL_RUNS_ID) {
+    const fetched = await Promise.all(runs.map(r => fetchJson(`/api/benchmark/runs/${encodeURIComponent(r.runId)}`).catch(() => null)));
+    return buildAllRunsResultsHtml(fetched.filter(Boolean));
+  }
+  let run;
+  try {
+    run = await fetchJson(`/api/benchmark/runs/${encodeURIComponent(viewingRunId)}`);
+  } catch (e) {
+    return `<div class="empty">Could not load run: ${escapeHtml(e.message)}</div>`;
+  }
+  return buildSingleRunResultsHtml(run);
+}
+
+function buildSingleRunResultsHtml(run) {
+  const models = run.models;
+  const categories = [...new Set(run.results.map(r => r.category))];
+
+  // Per-category pass-rate bars, one row per model -- same renderBarCell() the
+  // Implement-Pass Quality table above already uses, so this reads as one visual system
+  // rather than a bolted-on second chart style.
+  const chartRows = categories.map(cat => {
+    const cells = models.map(m => {
+      const row = run.summary[m]?.byCategory?.[cat];
+      if (!row) return '<td></td>';
+      const pct = row.objectivePassRate != null ? row.objectivePassRate * 100 : (row.judgeAvg != null ? row.judgeAvg * 100 : null);
+      const label = row.objective || (row.judgeAvg != null ? `judge ${row.judgeAvg.toFixed(2)}` : 'n/a');
+      return `<td>${pct != null ? renderBarCell(pct, 100, 'ok', () => label) : label}</td>`;
+    }).join('');
+    return `<tr><td>${escapeHtml(cat)}</td>${cells}</tr>`;
+  }).join('');
+  const chartTable = `<table><thead><tr><th>Category</th>${models.map(m => `<th>${escapeHtml(m)}</th>`).join('')}</tr></thead><tbody>${chartRows}</tbody></table>`;
+
+  const perfRows = models.map(m => {
+    const s = run.summary[m] || {};
+    return `<tr>
+      <td>${escapeHtml(m)}</td>
+      <td>${s.objectivePassed ?? '-'}/${s.objectiveTotal ?? '-'}</td>
+      <td>${s.judgeTotal ? `${(s.avgJudgeScore ?? 0).toFixed(2)} (${s.judgeCount}/${s.judgeTotal})` : '-'}</td>
+      <td>${s.degenerateCount ?? '-'}</td>
+      <td>${fmtNum(s.avgLatencyMs, 0)}</td>
+      <td>${s.avgTokensPerSec != null ? fmtNum(s.avgTokensPerSec, 1) : '-'}</td>
+      <td>${s.loadDurationMs != null ? fmtNum(s.loadDurationMs, 0) : '-'}</td>
+      <td>${s.unloadDurationMs != null ? fmtNum(s.unloadDurationMs, 0) : '-'}</td>
+    </tr>`;
+  }).join('');
+  const perfTable = `<table><thead><tr><th>Model</th><th>Objective</th><th>Judge Avg</th><th>Degenerate</th><th>Avg Latency (ms)</th><th>Avg Tok/s</th><th>Load (ms)</th><th>Unload (ms)</th></tr></thead><tbody>${perfRows}</tbody></table>`;
+
+  const responseTable = buildResponseTable(run.results.map(r => ({ ...r, runId: run.runId })));
+
+  return `
+    <div class="meta">Run ${escapeHtml(run.runId)} -- ${run.generatedAt ? new Date(run.generatedAt).toLocaleString() : ''}</div>
+    <div class="field-label" style="margin-top:10px">Pass Rate by Category</div>
+    ${chartTable}
+    <div class="field-label" style="margin-top:16px">Performance</div>
+    ${perfTable}
+    <div class="field-label" style="margin-top:16px">Responses (click to view full prompt/response)</div>
+    ${responseTable}
+  `;
+}
+
+// Combined view across every saved run -- no re-aggregated chart/performance table (that
+// would mean re-implementing reasoning-bench.js's summarize() a second time in browser JS
+// just to merge per-run summaries; the case picker's best/worst stats above already give
+// the pooled-across-all-runs verdict). This is specifically the "show me every response
+// we've ever collected" view the single-run Responses table can't provide by itself.
+function buildAllRunsResultsHtml(runsData) {
+  if (runsData.length === 0) return '<div class="empty">No saved benchmark runs yet.</div>';
+  const allResults = runsData.flatMap(run => run.results.map(r => ({ ...r, runId: run.runId })))
+    .sort((a, b) => (a.model === b.model ? a.caseId.localeCompare(b.caseId) : a.model.localeCompare(b.model)));
+  const totalRuns = runsData.length;
+  return `
+    <div class="meta">${allResults.length} response${allResults.length === 1 ? '' : 's'} across ${totalRuns} saved run${totalRuns === 1 ? '' : 's'}.</div>
+    <div class="field-label" style="margin-top:16px">Responses (click to view full prompt/response)</div>
+    ${buildResponseTable(allResults)}
+  `;
+}
+
+function buildResponseTable(rows) {
+  const responseRows = rows.map(r => {
+    const verdict = r.grade.pass === true ? '<span class="badge ok">PASS</span>' : r.grade.pass === false ? '<span class="badge bad">FAIL</span>' : '<span class="badge">ungraded</span>';
+    const id = `${r.model.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')}__${r.caseId}__run${r.runIndex}`;
+    return `<tr class="worker-card" data-bench-response="${escapeAttr(id)}" data-bench-run="${escapeAttr(r.runId)}" style="cursor:pointer">
+      <td>${escapeHtml(r.model)}</td><td>${escapeHtml(r.caseId)}</td><td>${r.runIndex}</td><td>${verdict}</td>
+      <td>${fmtNum(r.latencyMs, 0)}ms</td><td>${r.metrics.tokensPerSecond != null ? fmtNum(r.metrics.tokensPerSecond, 1) : '-'}</td>
+    </tr>`;
+  }).join('');
+  return `<table><thead><tr><th>Model</th><th>Case</th><th>Run</th><th>Result</th><th>Latency</th><th>Tok/s</th></tr></thead><tbody>${responseRows}</tbody></table>`;
+}
+
+function wireBenchmarkPanel(models, cases) {
+  document.querySelectorAll('.bench-model-check').forEach(cb => {
+    cb.onchange = () => { cb.checked ? benchmarkSelectedModels.add(cb.value) : benchmarkSelectedModels.delete(cb.value); };
+  });
+  document.querySelectorAll('.bench-case-check').forEach(cb => {
+    cb.onchange = () => { cb.checked ? benchmarkSelectedCases.add(cb.value) : benchmarkSelectedCases.delete(cb.value); };
+  });
+  document.querySelectorAll('.bench-case-info').forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const kase = cases.find(c => c.id === a.dataset.caseId);
+      if (kase) renderCaseInfoModal(kase);
+    };
+  });
+  const bindAllNone = (allId, noneId, set, values) => {
+    document.getElementById(allId).onclick = (e) => { e.preventDefault(); values.forEach(v => set.add(v)); renderModelsTab(); };
+    document.getElementById(noneId).onclick = (e) => { e.preventDefault(); set.clear(); renderModelsTab(); };
+  };
+  bindAllNone('bench-models-all', 'bench-models-none', benchmarkSelectedModels, models);
+  bindAllNone('bench-cases-all', 'bench-cases-none', benchmarkSelectedCases, cases.map(c => c.id));
+
+  const runBtn = document.getElementById('bench-run-btn');
+  if (runBtn) {
+    runBtn.onclick = async () => {
+      const runs = Math.max(1, Math.min(20, Number(document.getElementById('bench-runs-input').value) || 1));
+      const includeJudge = document.getElementById('bench-judge-input').checked;
+      try {
+        const resp = await fetch('/api/benchmark/run', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ models: [...benchmarkSelectedModels], caseIds: [...benchmarkSelectedCases], runs, includeJudge }),
+        });
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          throw new Error(body.description || `${resp.status}`);
+        }
+        const data = await resp.json();
+        benchmarkViewingRunId = data.runId;
+        await renderModelsTab();
+      } catch (e) {
+        alert('Could not start benchmark: ' + e.message);
+      }
+    };
+  }
+  const picker = document.getElementById('benchmark-run-picker');
+  if (picker) {
+    picker.onchange = () => { benchmarkViewingRunId = picker.value; renderModelsTab(); };
+  }
+  document.querySelectorAll('[data-bench-response]').forEach(row => {
+    row.onclick = async () => {
+      try {
+        const task = await fetchJson(`/api/benchmark/response/${encodeURIComponent(row.dataset.benchRun)}/${encodeURIComponent(row.dataset.benchResponse)}`);
+        renderTaskDetailModal(task);
+      } catch (e) {
+        alert('Could not load response: ' + e.message);
+      }
+    };
+  });
+}
+
+// "What does this test actually measure?" (Grimmethy, 2026-08-19: "clicking on each of
+// the test cases should open a description of the test... the actual prompt and an
+// outline of what the test is and how the prompt measures this") -- reuses the same
+// modal-backdrop/modal-content DOM nodes renderTaskDetailModal() already owns rather than
+// building a second modal implementation, since only one modal is ever open at a time
+// anyway; closeDetail() (wired to the backdrop click-outside handler at module load)
+// closes this one too for free.
+function renderCaseInfoModal(kase) {
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  content.innerHTML = `
+    <button class="close" onclick="closeDetail()">&times;</button>
+    <h2>${escapeHtml(kase.id)}</h2>
+    <div><strong>Category:</strong> ${escapeHtml(kase.category)} &nbsp; <strong>Grader:</strong> ${escapeHtml(kase.grader)}${kase.grader === 'judge' ? ' <span class="badge warn">scored by a Claude call against a rubric, not auto-checkable</span>' : ''}</div>
+    <div class="field-label" style="margin-top:14px">What this measures</div>
+    <div>${escapeHtml(kase.description || '(no description)')}</div>
+    <div class="field-label" style="margin-top:14px">Full Prompt</div>
+    <pre>${escapeHtml(kase.prompt)}</pre>
+  `;
+  backdrop.classList.add('open');
 }
 
 // Manual archive/requeue (Job Status > Blocked/Done tabs) and manual apply (Approved tab,

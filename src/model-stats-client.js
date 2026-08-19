@@ -24,7 +24,12 @@ function runEvent(event, payload) {
   const tmpPath = path.join(os.tmpdir(), `model-stats-${event}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   try {
     fs.writeFileSync(tmpPath, JSON.stringify(payload));
-    execFileSync('node', [SCRIPT_PATH, event, tmpPath], { stdio: 'pipe' });
+    // --no-warnings: node:sqlite (model-stats-db.js's own DB layer, migrated off
+    // better-sqlite3 2026-08-19) emits an ExperimentalWarning on every single invocation
+    // otherwise -- harmless, but this call already runs with stdio:'pipe' specifically to
+    // stay quiet, and the warning would otherwise land in whatever captures this process's
+    // stderr (e.g. ornith-worker.sh's own log redirect) on every implement/review pass.
+    execFileSync('node', ['--no-warnings', SCRIPT_PATH, event, tmpPath], { stdio: 'pipe' });
   } catch (e) {
     // Non-fatal -- see header.
   } finally {

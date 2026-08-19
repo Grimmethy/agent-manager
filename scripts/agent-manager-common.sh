@@ -64,22 +64,22 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
-# Model-swap-thrashing guard (2026-08-18, Grimmethy: "make sure that all the tasks that
-# the currently loaded model has available to them is completed before switching to the
-# next model" -- a prerequisite for safely experimenting with a local model in the
-# worker-reasoning slot). Ollama keeps effectively one model resident on typical
-# single-GPU hardware (OLLAMA_MAX_LOADED_MODELS effectively 1 -- see ornith-worker.ps1's
-# own comment), so worker-1, worker-reasoning-when-forced-local, and reviewer racing to
-# call DIFFERENT local models causes repeated evict-and-reload instead of real
-# parallelism. These two functions coordinate through one shared state file
-# (instances/.active-local-model.json) rather than a lock: whichever local-model call
-# happens to run records itself as resident; the NEXT daemon wanting a different model
-# checks whether the resident model's own tier still has claimable pending/ work before
-# forcing a swap, yielding (skipping this tick's real work) if so. Fully inert -- always
-# returns "proceed" -- whenever no state file exists yet, or the caller's own target
-# model already matches whatever's resident, which covers the default config (every
-# local-model caller sharing agent-manager.env's one ORNITH_MODEL) with zero overhead
-# beyond one cheap file read.
+# Single-flight / model-swap-thrashing guard (2026-08-18, Grimmethy: "make sure that all
+# the tasks that the currently loaded model has available to them is completed before
+# switching to the next model"; widened 2026-08-19, Grimmethy: "it's still running two
+# jobs at once. We really need it to do one at a time"). Ollama keeps effectively one
+# model resident on typical single-GPU hardware (OLLAMA_MAX_LOADED_MODELS effectively 1
+# -- see ornith-worker.ps1's own comment) and serves it through one execution slot, so
+# worker-1, worker-reasoning-when-forced-local, and reviewer are only ever really running
+# ONE real call at a time regardless of how many of them THINK they're working. This
+# guard makes that true operationally, not just at the Ollama layer: the in-flight-lock
+# check below (model-inflight-lock.js) is a strict pipeline-wide mutex -- ANY held lock,
+# same model or not, makes every other lane yield this tick -- with the older
+# resident-model/pending-backlog heuristic underneath it as a secondary check for the
+# gap between calls (the window where nothing is actually in-flight but the resident
+# model hasn't finished its tier's backlog yet). Fully inert -- always returns "proceed"
+# -- whenever nothing is in flight and either no .active-local-model.json state file
+# exists yet, or the caller's own target model already matches whatever's resident.
 #
 # should_yield_for_model_swap <target_model> <target_tier>
 # Echoes "yield" (skip real work this tick, let the resident model's backlog drain first)
@@ -89,6 +89,51 @@ get_model_override() {
 # regardless of this guard), 'high' for worker-reasoning when forced local.
 should_yield_for_model_swap() {
   local target_model="$1" target_tier="$2"
+
+  # In-flight check (model-inflight-lock.js) -- a HARD gate, checked before the softer
+  # pending-backlog heuristic below and independent of whether .active-local-model.json
+  # even exists yet. Added 2026-08-19 after finding the backlog check alone has a real
+  # race: it only counts queue/pending/ (unclaimed) work for the resident tier, never
+  # queue/drafting/<instance>/ (a task already claimed and mid-generation). A worker can
+  # claim the LAST pending item for its tier and be actively calling Ollama on it -- at
+  # that exact moment pending-count reads 0, so the backlog check below would say
+  # "proceed" and let a different-model caller fire a competing Ollama request while the
+  # first is still in flight, with no VRAM headroom on this hardware to hold both (~3.5GB
+  # free with one ~20GB model resident, confirmed live). This lock check catches that
+  # window the backlog count can't see.
+  #
+  # Widened same-day (2026-08-19, Grimmethy: "it's still running two jobs at once. We
+  # really need it to do one at a time") from "yield only if a DIFFERENT model is
+  # in-flight" to "yield if ANY lock is held, same model or not". The original,
+  # narrower check was intentional back when worker-1/reviewer/worker-reasoning were
+  # expected to run different tiers on different models -- same-model overlap (e.g.
+  # worker-1 and reviewer both legitimately calling ORNITH_MODEL) was fine to allow
+  # concurrently since Ollama's own single execution slot serializes the actual
+  # generation anyway, no VRAM risk either way. But with all three lanes now pointed at
+  # the SAME model (dashboard-settings.json's workerModelOverrides), that narrower check
+  # let two lanes both claim and start a real Ollama call at once -- harmless to the GPU,
+  # but not what "one job at a time" means operationally, and it's what produced two
+  # simultaneously "working" rows on the dashboard. This is now a strict pipeline-wide
+  # mutex: whoever holds the one lock blocks every other lane's claim this tick,
+  # regardless of which model any of them target.
+  local locks_json any_inflight
+  locks_json="$(node -e '
+    try {
+      const { readActiveLocks } = require(process.argv[1]);
+      process.stdout.write(JSON.stringify(readActiveLocks(process.argv[2])));
+    } catch (e) { process.stdout.write("[]"); }
+  ' "${PACKAGE_SRC_DIR}/model-inflight-lock.js" "$INSTANCES_DIR" 2>/dev/null)"
+  any_inflight="$(node -e '
+    try {
+      const locks = JSON.parse(process.argv[1] || "[]");
+      process.stdout.write(locks.length > 0 ? "true" : "false");
+    } catch (e) { process.stdout.write("false"); }
+  ' "$locks_json")"
+  if [[ "$any_inflight" == "true" ]]; then
+    echo yield
+    return 0
+  fi
+
   local state_path="${INSTANCES_DIR}/.active-local-model.json"
   [[ -f "$state_path" ]] || { echo proceed; return 0; }
   local resident_model resident_tier
@@ -110,6 +155,40 @@ should_yield_for_model_swap() {
   else
     echo proceed
   fi
+}
+
+# Pipeline-wide single-flight mutex (2026-08-19, Grimmethy: "it's still running two jobs
+# at once. We really need it to do one at a time" -- reported AFTER should_yield_for_
+# model_swap's in-flight check above was already widened to treat any held lock, same
+# model or not, as a reason to yield). That widening closed the wrong gap: it's a
+# check-then-act heuristic with its own race -- two lanes can both read "nothing locked
+# yet" and both decide to proceed before either one's advisory lock file (model-
+# inflight-lock.js) actually exists, since the check happens once per TICK and the real
+# lock isn't written until deep inside the eventual Ollama call, several steps later.
+# Confirmed live: two lanes still ended up genuinely concurrent despite the widened
+# check. flock is different in kind, not just degree: it's a kernel-enforced exclusive
+# lock with no such window -- acquire_single_flight_lock BLOCKS until it can actually
+# hold the lock, so there is no gap between "I checked" and "I have it" for another
+# process to slip through. Callers wrap ONLY the real model call (ornith-worker.sh's
+# process_drafting_file / review-runner.sh's review-task.js invocation), not the whole
+# tick -- claiming a task, GPU-guard, task-generation etc. are all still allowed to run
+# concurrently across lanes; only the actual GPU-consuming call is serialized, which is
+# the one thing "one job at a time" is actually about.
+#
+# fd 200 is reserved for this across all three daemons -- picked well above any fd bash
+# itself or these scripts' own `node -e` pipelines would ever naturally allocate, and
+# distinct from the per-item `{VAR}` auto-allocated fds some node subprocess pipes use
+# elsewhere in these scripts, so there's no risk of collision.
+SINGLE_FLIGHT_LOCK_FD=200
+
+acquire_single_flight_lock() {
+  local lockfile="${INSTANCES_DIR}/.pipeline-single-flight.lock"
+  eval "exec ${SINGLE_FLIGHT_LOCK_FD}>\"\$lockfile\""
+  flock "$SINGLE_FLIGHT_LOCK_FD"   # blocking, exclusive -- waits for the current holder; no -n, no race window.
+}
+
+release_single_flight_lock() {
+  eval "exec ${SINGLE_FLIGHT_LOCK_FD}>&-" 2>/dev/null || true
 }
 
 # record_active_model <instance_id> <model> <tier>

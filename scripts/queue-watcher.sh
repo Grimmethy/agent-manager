@@ -110,6 +110,20 @@ while :; do
       printf '[watchdog] %s\n' "$drift_scan_output" >&2
     fi
 
+    # Uptime sampling + scheduled reports (Brain Dump: "start filing an hourly, daily and
+    # weekly report into second brain... track downtimes and real time spent on junk tasks
+    # vs real benefit", 2026-08-19). uptime-log.js's own header explains why THIS loop is
+    # the only place a sample can be taken from: it's the one process running continuously
+    # regardless of which worker/reviewer lane is up, so a gap here IS the downtime signal.
+    # Pruning (dropping samples older than uptime-log.js's own MAX_LOG_AGE_DAYS) happens
+    # probabilistically inside uptime-log.js's own --sample handler, not every tick --
+    # pruneOldSamples rewrites the whole file, which is wasteful to do on every ~60s tick.
+    node "${PACKAGE_SRC_DIR}/uptime-log.js" --sample 2>>"${HOME_LOGS}/uptime-log.log"
+    system_report_output="$(node "${PACKAGE_SRC_DIR}/system-report.js" --check-due 2>>"${HOME_LOGS}/system-report.log")"
+    if [[ -n "$system_report_output" ]]; then
+      printf '[watchdog] %s\n' "$system_report_output" >&2
+    fi
+
     _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither ornith-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
     stale_count=0
 
