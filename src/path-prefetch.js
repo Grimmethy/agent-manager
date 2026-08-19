@@ -79,6 +79,29 @@ function loadGraph(graphPath) {
   }
 }
 
+// A keyword like "sources" (too generic to exact-stem-match anything) falls through to
+// the substring pass below and picks up BOTH "src/task-sources.js" and its own
+// "src/task-sources.test.js" sibling -- two hits that look ambiguous but really aren't:
+// the .test file is never what a brain-dump note is actually about, it's just named
+// after the real file it tests. When the only reason a keyword looks ambiguous is that
+// one of its hits is the exact .test/.spec sibling of another, collapse straight to the
+// non-test file instead of forcing a human (or the LLM fallback) to pick between two
+// files that were never really a real choice.
+function stripTestSuffix(f) {
+  return f.replace(/\.(test|spec)(\.[^./]+)$/, '$2');
+}
+
+function preferNonTestSibling(hits) {
+  if (hits.length <= 1) return hits;
+  const isTestPath = (f) => /\.(test|spec)\.[^./]+$/.test(f);
+  const nonTest = hits.filter((f) => !isTestPath(f));
+  const testOnly = hits.filter(isTestPath);
+  if (nonTest.length === 1 && testOnly.length > 0 && testOnly.every((f) => stripTestSuffix(f) === nonTest[0])) {
+    return nonTest;
+  }
+  return hits;
+}
+
 // Matches one keyword against every source_file in the graph -- basename-stem match
 // (case- and separator-insensitive: "path_prefetch" === "path-prefetch") first, since an
 // exact filename hit is unambiguous; falls back to a substring match against the full
@@ -87,9 +110,9 @@ function loadGraph(graphPath) {
 function matchKeyword(keyword, sourceFiles) {
   const normalize = (s) => s.toLowerCase().replace(/[_-]/g, '');
   const stemHits = sourceFiles.filter((f) => normalize(path.basename(f, path.extname(f))) === normalize(keyword.lower));
-  if (stemHits.length > 0) return stemHits;
+  if (stemHits.length > 0) return preferNonTestSibling(stemHits);
 
-  return sourceFiles.filter((f) => f.toLowerCase().includes(keyword.lower));
+  return preferNonTestSibling(sourceFiles.filter((f) => f.toLowerCase().includes(keyword.lower)));
 }
 
 // Cap on how many prefetched paths ever get injected into one task -- this is meant to
