@@ -64,6 +64,69 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
+# Model-swap-thrashing guard (2026-08-18, Grimmethy: "make sure that all the tasks that
+# the currently loaded model has available to them is completed before switching to the
+# next model" -- a prerequisite for safely experimenting with a local model in the
+# worker-reasoning slot). Ollama keeps effectively one model resident on typical
+# single-GPU hardware (OLLAMA_MAX_LOADED_MODELS effectively 1 -- see ornith-worker.ps1's
+# own comment), so worker-1, worker-reasoning-when-forced-local, and reviewer racing to
+# call DIFFERENT local models causes repeated evict-and-reload instead of real
+# parallelism. These two functions coordinate through one shared state file
+# (instances/.active-local-model.json) rather than a lock: whichever local-model call
+# happens to run records itself as resident; the NEXT daemon wanting a different model
+# checks whether the resident model's own tier still has claimable pending/ work before
+# forcing a swap, yielding (skipping this tick's real work) if so. Fully inert -- always
+# returns "proceed" -- whenever no state file exists yet, or the caller's own target
+# model already matches whatever's resident, which covers the default config (every
+# local-model caller sharing agent-manager.env's one ORNITH_MODEL) with zero overhead
+# beyond one cheap file read.
+#
+# should_yield_for_model_swap <target_model> <target_tier>
+# Echoes "yield" (skip real work this tick, let the resident model's backlog drain first)
+# or "proceed". <target_tier> is the reasoningTierFor() tier this caller's OWN local calls
+# serve -- 'low' for worker-1 and reviewer (reviewer's Ornith calls only ever review
+# low-tier items; high-tier items route straight to Claude inside review-task.js
+# regardless of this guard), 'high' for worker-reasoning when forced local.
+should_yield_for_model_swap() {
+  local target_model="$1" target_tier="$2"
+  local state_path="${INSTANCES_DIR}/.active-local-model.json"
+  [[ -f "$state_path" ]] || { echo proceed; return 0; }
+  local resident_model resident_tier
+  resident_model="$(node -e 'try{const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(d.model||"")}catch(e){}' "$state_path")"
+  if [[ -z "$resident_model" || "$resident_model" == "$target_model" ]]; then
+    echo proceed
+    return 0
+  fi
+  resident_tier="$(node -e 'try{const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(d.tier||"")}catch(e){}' "$state_path")"
+  if [[ -z "$resident_tier" ]]; then
+    echo proceed
+    return 0
+  fi
+  local counts_json pending_count
+  counts_json="$(node "${PACKAGE_SRC_DIR}/task-sources.js" --pending-tier-counts 2>/dev/null)"
+  pending_count="$(node -e 'try{const d=JSON.parse(process.argv[1]||"{}");process.stdout.write(String(d[process.argv[2]]||0))}catch(e){process.stdout.write("0")}' "$counts_json" "$resident_tier")"
+  if [[ "${pending_count:-0}" -gt 0 ]]; then
+    echo yield
+  else
+    echo proceed
+  fi
+}
+
+# record_active_model <instance_id> <model> <tier>
+# Declares this instance's model as Ollama's resident one -- call once per tick right
+# after should_yield_for_model_swap returns "proceed" and before this tick's real claim/
+# draft work, not on a tick that's skipping work entirely, so a stale record can't claim
+# residency for a model this process gave up pursuing ticks ago.
+record_active_model() {
+  local instance_id="$1" model="$2" tier="$3"
+  local state_path="${INSTANCES_DIR}/.active-local-model.json"
+  node -e '
+    const fs = require("fs");
+    const [statePath, instanceId, model, tier] = process.argv.slice(1);
+    fs.writeFileSync(statePath, JSON.stringify({ instanceId, model, tier, updatedAt: new Date().toISOString() }, null, 2));
+  ' "$state_path" "$instance_id" "$model" "$tier"
+}
+
 # Redacts likely-credential substrings from text before it's written to a shared log file
 # (e.g. Ornith Live Log.md, which can live in a synced SecondBrain vault) -- deep_dive/
 # project_search/arch_import embed real third-party content in prompts, and that content

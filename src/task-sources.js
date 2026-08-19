@@ -106,6 +106,37 @@ function pendingReadinessMap() {
   return map;
 }
 
+// CLI mode (`node task-sources.js --pending-tier-counts`, mirrors --pending-readiness):
+// counts how many tasks currently sitting in pending/ resolve to each reasoningTierFor()
+// tier ('low'/'high'). Added 2026-08-18 for the model-swap-thrashing guard (Grimmethy:
+// "make sure that all the tasks that the currently loaded model has available to them is
+// completed before switching to the next model") -- a worker about to swap Ollama's
+// resident model calls this first to check whether the model it would be EVICTING still
+// has claimable work waiting, so it can yield instead of forcing a swap mid-backlog. Same
+// "compute it once in JS, consume it from bash" split pendingReadinessMap() already uses.
+function pendingTierCounts() {
+  const { pipelineDir } = getConfig();
+  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  const counts = { low: 0, high: 0 };
+  let files;
+  try {
+    files = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return counts;
+  }
+  for (const f of files) {
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(path.join(pendingDir, f), 'utf8'));
+    } catch {
+      continue; // malformed file -- doesn't count as claimable work for either tier
+    }
+    const tier = reasoningTierFor(task);
+    counts[tier] = (counts[tier] || 0) + 1;
+  }
+  return counts;
+}
+
 // --- Source: queue/adhoc/, a manually-submitted one-off task (priority 10) --------------
 //
 // Lets a human or an orchestrating agent hand this pipeline a specific task right now,
@@ -1779,6 +1810,13 @@ if (require.main === module) {
   // "compute it once in JS, consume it from PowerShell" split as --priority-map above.
   if (process.argv.includes('--pending-readiness')) {
     console.log(JSON.stringify(pendingReadinessMap()));
+    return;
+  }
+
+  // `node task-sources.js --pending-tier-counts` prints {low: N, high: N} -- see
+  // pendingTierCounts()'s own header comment.
+  if (process.argv.includes('--pending-tier-counts')) {
+    console.log(JSON.stringify(pendingTierCounts()));
     return;
   }
 

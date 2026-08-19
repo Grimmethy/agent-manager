@@ -169,6 +169,31 @@ while :; do                                                                     
     fi
   fi
 
+  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap --
+  # see its own header comment) -- only relevant when THIS tick's real work would call a
+  # LOCAL model: always true for the non-reasoning lane (plain Ornith), and true for the
+  # reasoning lane only when the dashboard override forced it onto a local model too
+  # (AGENT_MANAGER_FORCE_PROVIDER=ornith, set by refresh_active_model above). A Claude-lane
+  # tick calling real Claude never touches Ollama's resident slot, so it's exempt --
+  # exactly like the budget gate above, this only matters once local-in-reasoning is
+  # actually in use, and is a no-op (state file absent, or target already resident) in the
+  # default all-Claude-reasoning config.
+  active_locally="true"
+  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "ornith" ]]; then
+    active_locally="false"
+  fi
+  if [[ "$active_locally" == "true" ]]; then
+    target_tier="low"
+    "$IS_CLAUDE_LANE" && target_tier="high"
+    yield_verdict="$(should_yield_for_model_swap "$ORNITH_MODEL" "$target_tier")"
+    if [[ "$yield_verdict" == "yield" ]]; then
+      printf '[worker-%s] yielding this tick -- resident model still has pending work in the other tier (see should_yield_for_model_swap).\n' "$INSTANCE_ID" >&2
+      sleep "${ORC_TICK_SECS:-30}"
+      continue
+    fi
+    record_active_model "$INSTANCE_ID" "$ORNITH_MODEL" "$target_tier"
+  fi
+
   # GPU headroom check -- before spending any real model call this tick, see whether the
   # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
   # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best
