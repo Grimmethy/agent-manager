@@ -957,95 +957,126 @@ test('observability_review false-positive verdict -> apply is a clean no-op, no 
   assert.equal(fs.existsSync(process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH), false);
 });
 
+// REDIRECTED 2026-08-20, same treatment as nextObservabilityReviewTask's own tests just
+// above ("Do the same for performance_review") -- scans repoRoot directly, so the fixture
+// writes source files straight under the fixture repo dir itself.
 function makePerformanceFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
-  process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
   process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH = path.join(dir, 'performance-coverage.json');
   return dir;
 }
 
-// Real clone dir a fixture deep-dive-coverage.json points at, containing one file with a
-// genuine sync-io-in-loop finding -- exercises performance-scan.js for real, same
-// "test the real scanner, not a stub" approach writeOnboardedProject above uses.
-function writePerformanceOnboardedProject(dir, slug) {
-  const clonePath = path.join(dir, 'clones', slug);
-  fs.mkdirSync(clonePath, { recursive: true });
-  fs.writeFileSync(path.join(clonePath, 'worker.js'), 'for (const f of files) {\n  fs.readFileSync(f);\n}\n');
-  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify({
-    projects: { [slug]: { sourceUrl: `https://example.com/${slug}`, clonePath, clonedAt: new Date(0).toISOString(), communities: [] } },
-  }));
-  return clonePath;
+// Writes a real file with a genuine sync-io-in-loop finding directly under the project
+// root -- exercises performance-scan.js for real, same "test the real scanner, not a
+// stub" approach writeObservabilityFinding above uses.
+function writePerformanceFinding(dir, relPath = 'worker.js', content = 'for (const f of files) {\n  fs.readFileSync(f);\n}\n') {
+  const filePath = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content);
+  return filePath;
 }
 
-test('nextPerformanceReviewTask returns null when deep-dive-coverage.json does not exist', () => {
+test('nextPerformanceReviewTask returns null (and still records lastScannedAt) when the project has no findings', () => {
   const dir = makePerformanceFixtureRepo();
   const { nextPerformanceReviewTask } = freshTaskSources(dir);
   assert.equal(nextPerformanceReviewTask(), null);
+  const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, 'utf8'));
+  assert.ok(coverage.lastScannedAt);
 });
 
-test('nextPerformanceReviewTask scans a newly-onboarded project and returns a triage task for the first finding', () => {
+test('nextPerformanceReviewTask scans the active project and returns a triage task for the first finding', () => {
   const dir = makePerformanceFixtureRepo();
-  writePerformanceOnboardedProject(dir, 'demo-project');
+  writePerformanceFinding(dir);
   const { nextPerformanceReviewTask } = freshTaskSources(dir);
+  const projectTag = path.basename(dir);
 
   const task = nextPerformanceReviewTask();
   assert.ok(task);
   assert.equal(task.source, 'performance_review');
   assert.equal(task.promptContext.rule, 'sync-io-in-loop');
-  assert.equal(task.promptContext.projectSlug, 'demo-project');
+  assert.equal(task.promptContext.projectSlug, projectTag);
   assert.equal(task.promptContext.file, 'worker.js');
   assert.match(task.promptContext.snippet, /readFileSync/);
 
   const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, 'utf8'));
-  assert.ok(coverage.projects['demo-project'].scannedAt);
+  assert.ok(coverage.lastScannedAt);
 
   const flags = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'performance-flags.json'), 'utf8'));
   assert.equal(flags.length, 1);
 });
 
-// See nextObservabilityReviewTask's identical test (2026-08-19) for the full root-cause
-// rationale: a persistent flags.json outlives the scanner fix meant to prevent bad
-// entries from ever reaching it.
-test('nextPerformanceReviewTask skips a stale flag whose target file is now minified, even though the project is already marked scanned', () => {
+test('nextPerformanceReviewTask does not rescan within OBSERVABILITY_RESCAN_INTERVAL_MS', () => {
   const dir = makePerformanceFixtureRepo();
-  const clonePath = writePerformanceOnboardedProject(dir, 'demo-project');
-  fs.writeFileSync(path.join(clonePath, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+  writePerformanceFinding(dir);
+  const { nextPerformanceReviewTask } = freshTaskSources(dir);
+
+  const first = nextPerformanceReviewTask(); // first call scans + queues the one finding
+  const flagsPath = path.join(dir, 'queue', 'performance-flags.json');
+  const flagsAfterFirst = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+
+  const pendingDir = path.join(dir, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, `${first.id}.json`), '{}');
+
+  writePerformanceFinding(dir, 'other.js', 'for (const f of items) {\n  fs.readFileSync(f);\n}\n');
+
+  assert.equal(nextPerformanceReviewTask(), null);
+  const flagsAfterSecond = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(flagsAfterSecond.length, flagsAfterFirst.length); // no rescan happened
+});
+
+test('nextPerformanceReviewTask rescans once the interval elapses, dedupes against already-flagged findings, and prunes flags for a stale projectSlug', () => {
+  const dir = makePerformanceFixtureRepo();
+  writePerformanceFinding(dir, 'stale.js');
+  const { nextPerformanceReviewTask } = freshTaskSources(dir);
+  const projectTag = path.basename(dir);
+
+  // Learn the real finding's line number from a real scan first (avoids hardcoding a
+  // guessed line number -- see the identical observability_review test's own history).
+  fs.writeFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, JSON.stringify({ lastScannedAt: new Date(0).toISOString() }));
+  const probe = nextPerformanceReviewTask();
+  const realLine = probe.promptContext.line;
+  const flagsPath = path.join(dir, 'queue', 'performance-flags.json');
+
+  // Now seed coverage as due again, with the real (matching) flag for stale.js plus one
+  // from a DIFFERENT project (must be pruned regardless of file-existence coincidence).
+  fs.writeFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, JSON.stringify({ lastScannedAt: new Date(0).toISOString() }));
+  fs.writeFileSync(flagsPath, JSON.stringify([
+    { rule: 'sync-io-in-loop', file: 'stale.js', line: realLine, detail: 'already known', projectSlug: projectTag, scannedAt: new Date(0).toISOString() },
+    { rule: 'sync-io-in-loop', file: 'stale.js', line: realLine, detail: 'from a stale external scan', projectSlug: 'some-other-project', scannedAt: new Date(0).toISOString() },
+  ]));
+  writePerformanceFinding(dir, 'fresh.js', 'for (const f of more) {\n  fs.readFileSync(f);\n}\n');
+
+  nextPerformanceReviewTask();
+  const flags = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(flags.filter((f) => f.projectSlug === 'some-other-project').length, 0); // pruned
+  assert.equal(flags.filter((f) => f.file === 'stale.js').length, 1); // not duplicated
+  assert.equal(flags.filter((f) => f.file === 'fresh.js').length, 1); // genuinely new, added
+});
+
+// See nextObservabilityReviewTask's identical test for the full root-cause rationale: a
+// persistent flags.json outlives the scanner fix meant to prevent bad entries.
+test('nextPerformanceReviewTask skips a stale flag whose target file is now minified, even when not due for a rescan', () => {
+  const dir = makePerformanceFixtureRepo();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+  const projectTag = path.basename(dir);
 
   fs.writeFileSync(process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH, JSON.stringify({
-    projects: { 'demo-project': { scannedAt: new Date(0).toISOString() } },
+    lastScannedAt: new Date().toISOString(), // fresh -- not due for a rescan
   }));
   fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'queue', 'performance-flags.json'), JSON.stringify([
-    { rule: 'sequential-await-in-loop', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: 'demo-project', scannedAt: new Date(0).toISOString() },
+    { rule: 'sequential-await-in-loop', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: projectTag, scannedAt: new Date(0).toISOString() },
   ]));
 
   const { nextPerformanceReviewTask } = freshTaskSources(dir);
   assert.equal(nextPerformanceReviewTask(), null);
 });
 
-test('nextPerformanceReviewTask does not rescan a project already marked scanned', () => {
-  const dir = makePerformanceFixtureRepo();
-  writePerformanceOnboardedProject(dir, 'demo-project');
-  const { nextPerformanceReviewTask } = freshTaskSources(dir);
-
-  nextPerformanceReviewTask(); // first call scans + queues the one finding
-  const flagsPath = path.join(dir, 'queue', 'performance-flags.json');
-  const flagsAfterFirst = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
-
-  const pendingDir = path.join(dir, 'queue', 'pending');
-  fs.mkdirSync(pendingDir, { recursive: true });
-  const finding = flagsAfterFirst[0];
-  const taskId = `performance-demo-project-sync-io-in-loop-worker-js-${finding.line}`;
-  fs.writeFileSync(path.join(pendingDir, `${taskId}.json`), '{}');
-
-  assert.equal(nextPerformanceReviewTask(), null); // no re-scan, no duplicate flags, nothing new to offer
-  const flagsAfterSecond = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
-  assert.equal(flagsAfterSecond.length, flagsAfterFirst.length);
-});
-
 test('nextPerformanceReviewTask skips a finding whose task already exists in the queue', () => {
   const dir = makePerformanceFixtureRepo();
-  writePerformanceOnboardedProject(dir, 'demo-project');
+  writePerformanceFinding(dir);
   const { nextPerformanceReviewTask } = freshTaskSources(dir);
 
   const first = nextPerformanceReviewTask();
@@ -1057,6 +1088,53 @@ test('nextPerformanceReviewTask skips a finding whose task already exists in the
   fs.writeFileSync(path.join(pendingDir, `${first.id}.json`), '{}');
 
   assert.equal(nextPerformanceReviewTask(), null);
+});
+
+// performance_fix (2026-08-20): full round trip, mirroring observability_review's own.
+test('performance_review genuine verdict -> apply writes a candidate -> performance_fix offers it as a real task', () => {
+  const dir = makePerformanceFixtureRepo();
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  freshTaskSources(dir); // registers performance_review + performance_fix
+
+  const genuineImplementResponse = [
+    '### AC-001 · Sequential await in a hot loop',
+    'Strength: Strong',
+    'Files: worker.js',
+    '',
+    'Problem:',
+    'Each iteration awaits a network call one at a time instead of in parallel.',
+    '',
+    'Solution:',
+    'Batch the calls with Promise.all.',
+    '',
+    'Benefits:',
+    'Real latency drops from O(n) sequential round-trips to one parallel batch.',
+  ].join('\n');
+
+  const performanceReview = getRegisteredSource('performance_review');
+  const applyResult = performanceReview.apply({ implementResponse: genuineImplementResponse });
+  assert.equal(applyResult.skipped, undefined);
+  assert.equal(applyResult.candidateCount, 1);
+  assert.ok(fs.existsSync(process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH));
+
+  const { nextCandidateFulfillmentTask } = require('./task-sources.js');
+  const fixTask = nextCandidateFulfillmentTask(process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH, 'performance_fix');
+  assert.ok(fixTask);
+  assert.equal(fixTask.source, 'performance_fix');
+  assert.match(fixTask.title, /Sequential await in a hot loop/);
+});
+
+test('performance_review false-positive verdict -> apply is a clean no-op, no candidate written', () => {
+  const dir = makePerformanceFixtureRepo();
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  freshTaskSources(dir);
+
+  const performanceReview = getRegisteredSource('performance_review');
+  const applyResult = performanceReview.apply({ implementResponse: 'False positive: this loop only ever runs a handful of times at startup.' });
+  assert.equal(applyResult.skipped, true);
+  assert.equal(fs.existsSync(process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH), false);
 });
 
 function makeDagFixtureRepo() {

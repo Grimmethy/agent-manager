@@ -367,17 +367,35 @@ function performanceReviewPlanPrompt(task) {
   return assemblePrompt(stable, volatile);
 }
 
-// performance_review's implement pass: same "no real code fix in THIS task" shape as
-// observabilityReviewImplementPrompt -- registered from the start (unlike
-// observability_review's own history), since that gap was already found and fixed once
-// on the sibling source and there's no reason to reintroduce it here.
+// performance_review's implement pass. REDIRECTED 2026-08-20, same treatment/reasoning
+// as observabilityReviewImplementPrompt just above ("Do the same for performance_review"):
+// a genuine verdict now writes a real, fixable candidate consumed by performance_fix
+// (task-sources.js) into an actual code diff, instead of the old dead-end prose-only
+// verdict. False-positive/uncertain still gets the short-prose no-op treatment.
 function performanceReviewImplementPrompt(task, planText) {
   return [
-    'Your plan above is the final REASONED VERDICT for this performance finding -- there is no further code change to make in this task (a genuine issue becomes a separate follow-up task later, the same way an architecture-discovery finding becomes a candidate rather than an immediate fix).',
+    'Your plan above is the final REASONED VERDICT for this performance finding in OUR OWN project.',
     '',
     planText,
     '',
-    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: state whether it was genuine/false-positive/uncertain, and if genuine, what the concrete fix would look like. Plain prose only -- no JSON, no code fence, no "steps".',
+    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Title',
+    'Strength: Strong',
+    `Files: ${task.promptContext.file || '(the file from the finding above)'}`,
+    '',
+    'Problem:',
+    'A paragraph describing the concrete performance cost, grounded in the snippet you were given.',
+    '',
+    'Solution:',
+    'A paragraph describing the specific fix (e.g. batch the I/O, parallelize, cache the result) -- scoped to exactly this finding, nothing broader.',
+    '',
+    'Benefits:',
+    'A paragraph describing what improves once fixed.',
+    '',
+    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
   ].join('\n');
 }
 
@@ -761,6 +779,8 @@ updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, 
 // files, body) from nextCandidateFulfillmentTask as arch_review/arch_import_review --
 // same reuse, no new prompt needed.
 updateTaskSource('observability_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+// performance_fix (2026-08-20): same reuse as observability_fix just above.
+updateTaskSource('performance_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
