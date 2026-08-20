@@ -289,7 +289,11 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // output is bounded by how much of an existing file it's allowed to touch; a spec
       // doc has no such natural ceiling, so it gets a higher one instead of the shared
       // 8000-token cap "bounds worst-case latency/cost" default.
-      const implNumPredictCeiling = task.source === 'product_spec' ? 16000 : 8000;
+      // backlog_decomposition (2026-08-20): same "whole document, no natural ceiling"
+      // class as product_spec right above -- its implement pass writes MULTIPLE full
+      // AC-NNN candidate write-ups (Problem/Solution/Benefits each) in one call, easily
+      // exceeding what a single code diff needs.
+      const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition') ? 16000 : 8000;
       const implNumPredict = hasFixedLiterals
         ? Math.min(implNumPredictCeiling, Math.max(1400, fixedLiteralsChars))
         : Math.min(implNumPredictCeiling, Math.max(2800, planChars * 2));

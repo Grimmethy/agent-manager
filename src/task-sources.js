@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
@@ -1934,6 +1935,69 @@ function nextProductSpecTask() {
 }
 registerTaskSource('product_spec', { priority: taskPriority('product_spec', 15), next: nextProductSpecTask });
 
+// --- Source: backlog_decomposition (2026-08-20, Grimmethy: "Build the backlog-
+// decomposition source") -- the other half of the gap identified when this all started:
+// product_spec answers "what does this product need"; this answers "what order do we
+// build it in." Turns the confirmed spec into an ORDERED, dependency-aware sequence of
+// real feature-implementation tasks instead of leaving a human to manually queue one
+// request at a time.
+//
+// Deliberately does NOT invent a new candidate-doc format or a new fulfillment mechanism:
+// ARCH_REVIEW_CANDIDATES.md's "### AC-NNN · Title / Strength: Strong / Files: .../ Problem:
+// / Solution: / Benefits:" shape, its generic writer (applyArchDiscoveryCandidates,
+// apply-group-a.js), and its generic one-at-a-time consumer (nextCandidateFulfillmentTask,
+// this file) already do exactly what dependency ordering needs: candidates are appended to
+// the doc in the order the drafter emits them, and the consumer scans the doc TOP TO
+// BOTTOM, returning the first not-yet-queued Strong one -- so "list candidates in build
+// order" in the prompt IS the dependency ordering mechanism, no separate scheduler needed.
+// backlog_fulfillment (registered below) reuses arch_review's own
+// buildPlanPrompt/buildImplementPrompt verbatim for the same reason -- turning one AC-NNN
+// candidate into a real diff is the same job regardless of which doc it came from.
+//
+// Idempotency: the task id is derived from a hash of the spec's OWN content, not a
+// separate coverage file -- taskIdExistsInQueue (shared by every source here) already
+// means a given spec version can only ever be decomposed once (the done/ copy sticks
+// around forever, exactly like every other terminal task here), and a REAL spec edit
+// (caught by product_spec's own confirm gate) naturally produces a new hash, allowing a
+// fresh decomposition without any extra bookkeeping.
+function nextBacklogDecompositionTask() {
+  const { productSpecPath, defaultDomain } = getConfig();
+  const specText = readIfExists(productSpecPath);
+  if (!specText || !specText.trim()) return null; // nothing to decompose until a spec exists
+
+  const specHash = crypto.createHash('sha256').update(specText).digest('hex').slice(0, 12);
+  const taskId = `backlog-decomposition-${specHash}`;
+  if (taskIdExistsInQueue(taskId)) return null;
+
+  return {
+    id: taskId,
+    domain: defaultDomain,
+    source: 'backlog_decomposition',
+    title: `Decompose product spec into an ordered backlog (spec ${specHash})`,
+    promptContext: { specText, specHash },
+  };
+}
+registerTaskSource('backlog_decomposition', {
+  priority: taskPriority('backlog_decomposition', 17),
+  next: nextBacklogDecompositionTask,
+  apply: ({ implementResponse }) => {
+    const { backlogCandidatesPath } = getConfig();
+    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: backlogCandidatesPath, docTitle: '# Backlog' });
+  },
+});
+
+// backlog_fulfillment: the consumer half, one candidate at a time, in the document order
+// backlog_decomposition wrote them in. Priority 16 -- lower than backlog_decomposition's
+// 17 (a lower number wins ties), same "every stage's own consumer outranks its own
+// generator" convention arch_review (70, outranking arch_discovery's 80) already
+// establishes -- draining an already-ordered backlog is more valuable than generating a
+// new one when both have eligible work on the same tick. No `apply` key -- falls through
+// to the generic Group-B git-branch-diff path, exactly like arch_review.
+registerTaskSource('backlog_fulfillment', {
+  priority: taskPriority('backlog_fulfillment', 16),
+  next: () => nextCandidateFulfillmentTask(getConfig().backlogCandidatesPath, 'backlog_fulfillment'),
+});
+
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible
 // work and stops there, even when that source's task doesn't match the calling lane's own
@@ -2010,6 +2074,7 @@ module.exports = {
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextProductSpecTask,
+  nextBacklogDecompositionTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

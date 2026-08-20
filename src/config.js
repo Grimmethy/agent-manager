@@ -145,6 +145,13 @@ function getConfig() {
   // archReviewCandidatesPath above.
   const productSpecPath = process.env.AGENT_MANAGER_PRODUCT_SPEC_PATH
     || path.join(repoRoot, 'Docs', 'PRODUCT_SPEC.md');
+  // backlog_decomposition (2026-08-20, the other half of "is agent-manager ready to build
+  // a whole plugin": product_spec answers "what does this product need," this answers
+  // "what order do we build it in") -- same AC-NNN candidate-doc format
+  // ARCH_REVIEW_CANDIDATES.md already uses, so nextCandidateFulfillmentTask (fully
+  // generic, task-sources.js) can consume it for free with zero new consumption code.
+  const backlogCandidatesPath = process.env.AGENT_MANAGER_BACKLOG_CANDIDATES_PATH
+    || path.join(repoRoot, 'Docs', 'BACKLOG_CANDIDATES.md');
 
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
   // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
@@ -220,6 +227,7 @@ function getConfig() {
     selfAuditCoveragePath,
     performanceCoveragePath,
     productSpecPath,
+    backlogCandidatesPath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,
