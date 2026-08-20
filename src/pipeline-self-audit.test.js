@@ -76,21 +76,24 @@ test('findAuditClusters returns the largest cluster first', () => {
   assert.equal(clusters[1].signature, 'deep_dive::empty-degenerate-draft');
 });
 
-test('buildAuditRawText includes example task ids/reasons and states the worktree cannot read queue/', () => {
+test('buildAuditRawText includes example task ids/reasons', () => {
   const tasks = Array.from({ length: 7 }, (_, i) => makeBlocked(`arch-import-x-${i}`, 'arch_import', `blocked reason ${i}`));
   const text = buildAuditRawText({ signature: 'arch_import::empty-degenerate-draft', tasks });
   assert.match(text, /7 tasks/);
   assert.match(text, /arch-import-x-0/);
   assert.match(text, /and 2 more/);
-  assert.match(text, /do not have access to the live queue\/ directory/i);
 });
 
-test('buildAuditTask produces a real adhoc-shaped task with the evidence embedded', () => {
+// 2026-08-20: moved off domain:'adhoc' (Claude-only) onto domain:defaultDomain (the local
+// Ornith model, via the same harness-grounded flow arch_import already uses) -- see
+// pipeline-self-audit.js's own header for why.
+test('buildAuditTask produces a task on the given domain with the evidence embedded', () => {
   const tasks = Array.from({ length: CLUSTER_THRESHOLD }, (_, i) => makeBlocked(`t${i}`, 'project_search', 'fabricated URL'));
-  const task = buildAuditTask({ signature: 'project_search::fabricated-ungrounded-claim', tasks });
-  assert.equal(task.domain, 'adhoc');
+  const task = buildAuditTask({ signature: 'project_search::fabricated-ungrounded-claim', tasks }, 'default');
+  assert.equal(task.domain, 'default');
   assert.equal(task.source, 'pipeline_self_audit');
   assert.match(task.title, /project_search/);
-  assert.ok(task.promptContext.rawText.length > 0);
+  assert.ok(task.promptContext.evidenceText.length > 0);
   assert.equal(task.promptContext.signature, 'project_search::fabricated-ungrounded-claim');
+  assert.equal(task.promptContext.taskCount, CLUSTER_THRESHOLD);
 });

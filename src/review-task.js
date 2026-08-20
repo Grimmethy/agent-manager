@@ -87,7 +87,7 @@ async function waitForOrnithAvailability(instancesDir, maxWaitAttempts = 3, wait
 // "output the empty string if there's nothing real to report" -- an honest empty result is
 // a valid, documented outcome for these, not a failure. Same isEffectivelyEmpty check as
 // apply-group-a.js's own definition.
-const EMPTY_APPROVAL_SOURCES = ['arch_discovery', 'project_search', 'deep_dive', 'arch_import'];
+const EMPTY_APPROVAL_SOURCES = ['arch_discovery', 'project_search', 'deep_dive', 'arch_import', 'pipeline_self_audit'];
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
