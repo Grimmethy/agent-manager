@@ -1767,7 +1767,7 @@ function nextArchImportTask() {
 // exact same real-agentic-Claude-plus-human-confirmation path every other adhoc task
 // does.
 function nextPipelineSelfAuditTask() {
-  const { pipelineDir, selfAuditCoveragePath } = getConfig();
+  const { pipelineDir, selfAuditCoveragePath, defaultDomain } = getConfig();
   const blockedDir = path.join(pipelineDir, 'queue', 'blocked');
 
   let names;
@@ -1797,7 +1797,7 @@ function nextPipelineSelfAuditTask() {
   if (clusters.length === 0) return null;
 
   const cluster = clusters[0];
-  const task = buildAuditTask(cluster);
+  const task = buildAuditTask(cluster, defaultDomain);
   if (taskIdExistsInQueue(task.id)) return null;
 
   // Coverage is recorded by the CLI's markPipelineSelfAuditReported(), AFTER writeTask()
@@ -1805,13 +1805,16 @@ function nextPipelineSelfAuditTask() {
   // report shows 0 tasks done... Has the self audit task been working?"): this used to
   // write coverage unconditionally before returning, but getNextTask()'s tier filter can
   // silently `continue` past (discard) a task whose resolved tier doesn't match the
-  // caller's --tier -- domain:'adhoc' always resolves to 'high', so a --tier=low caller
-  // (worker-1) reaching this source generated a real task, this function marked its
-  // signature "reported" forever, and getNextTask() then threw the task away without ever
-  // calling writeTask(). Confirmed live: all 6 real clusters found 2026-08-20 04:19-04:40
-  // had a coverage entry but no task file anywhere in the queue -- every one silently
-  // burned. Every next() function here is documented as a pure read with no queue-write
-  // side effect (see getNextTask()'s own comment); this now honors that.
+  // caller's --tier -- back when this ran via domain:'adhoc' (always 'high' tier), a
+  // --tier=low caller (worker-1) reaching this source generated a real task, this
+  // function marked its signature "reported" forever, and getNextTask() then threw the
+  // task away without ever calling writeTask(). Confirmed live: all 6 real clusters found
+  // 2026-08-20 04:19-04:40 had a coverage entry but no task file anywhere in the queue --
+  // every one silently burned. Now that this runs via domain:'default' (Ornith, 'low'
+  // tier, see this function's own header for the 2026-08-20 move off Claude), the SAME
+  // discipline still matters -- every next() function here is documented as a pure read
+  // with no queue-write side effect (see getNextTask()'s own comment), and this honors it
+  // regardless of which tier ends up claiming the result.
   return task;
 }
 
@@ -1849,11 +1852,12 @@ registerTaskSource('project_search', { priority: taskPriority('project_search', 
 // registration gap was identical, so fixed for consistency ahead of the scanner ever
 // actually running.
 registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
-// No `apply` key here -- domain:'adhoc' (see buildAuditTask) already resolves to 'adhoc'
-// via resolveSourceName(), so this goes through the exact same real-agentic-implement /
-// awaiting-confirm apply path every other adhoc task uses (task-source-registry.js's
-// resolveSourceName: `task.domain === 'adhoc' ... return 'adhoc'`, checked before
-// task.source at all).
+// No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
+// 2026-08-20 to run on the local Ornith model instead of requiring Claude) means this
+// falls through to the generic Group-B git-branch-diff apply path, same as arch_import
+// right above. apply-task.js's own explicit `task.source === 'pipeline_self_audit'`
+// awaiting-confirm gate (added the same day) still holds any real resulting diff for
+// human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
 
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without

@@ -165,6 +165,30 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
+      // pipeline_self_audit (2026-08-20, moved off Claude -- see pipeline-self-audit.js's
+      // own header): exact same two-call shape as arch_import immediately above, and
+      // literally the SAME archImportFetch -- both search agent-manager's own repo, the
+      // only difference is what's IN promptContext (a failure-pattern's evidence vs. an
+      // external finding's rationale), which lives entirely in the prompt text, not this
+      // harness step.
+      if (task.source === 'pipeline_self_audit') {
+        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+        let harnessHits = [];
+        let harnessFiles = [];
+        if (queries.length > 0) {
+          try {
+            const result = archImportFetch(queries);
+            harnessHits = result.hits || [];
+            harnessFiles = result.files || [];
+          } catch (e) {
+            // Non-fatal -- same try/catch treatment arch_import's own branch above gives.
+          }
+        }
+        task.promptContext.harnessHits = harnessHits;
+        task.promptContext.harnessFiles = harnessFiles;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      }
+
       // adhoc-shaped tasks ("Process now" queues one of these -- see
       // task-source-registry.js's resolveSourceName() for why this checks the SAME
       // resolved name apply-task.js's own writeArtifact() dispatch uses, not a raw
@@ -282,7 +306,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // them is a valid, intended answer, not a failed call, so the degenerate-output
       // detector's 'empty' check must not fire for them (see ornith-client.js's call()
       // comment for the live-confirmed backlog this caused).
-      const allowEmptyImplement = ['arch_discovery', 'deep_dive', 'arch_import', 'project_search'].includes(task.source);
+      const allowEmptyImplement = ['arch_discovery', 'deep_dive', 'arch_import', 'project_search', 'pipeline_self_audit'].includes(task.source);
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
       // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why

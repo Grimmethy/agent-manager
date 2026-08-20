@@ -1365,6 +1365,12 @@ def api_task_confirm_delete(task_id):
         same reasoning as adhocApplyConfirmedAt, arguably higher-stakes since it's
         AI-sourced content that can be confidently wrong entering a permanent personal
         knowledge base, not a discardable git branch.
+      - pipelineSelfFixConfirmedAt: pipeline_self_audit proposed a real diff to this
+        pipeline's OWN code (2026-08-20, moved off requiring a Claude subscription onto
+        the local reasoning model + harness grounding, same as arch_import) -- a self-
+        modifying-behavior change discovered and drafted with no human in the loop until
+        this exact click, so it gets the same explicit confirmation every other real,
+        directly-landing diff in this file already requires.
     apply-task.js's own gates check each field's PRESENCE (not its value) to let a task
     through without holding it again, the same 'ran once, don't re-trigger' idea as
     promotedAt/lastReviewedAt elsewhere in this codebase. Denying instead of confirming
@@ -1382,6 +1388,7 @@ def api_task_confirm_delete(task_id):
     data["deleteConfirmedAt"] = now_iso
     data["adhocApplyConfirmedAt"] = now_iso
     data["researchApplyConfirmedAt"] = now_iso
+    data["pipelineSelfFixConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)

@@ -5,18 +5,30 @@
 // session found 92% of arch_import blocked tasks were dying to the same
 // grep-codebase-tool.js bug). Scans queue/blocked/ for clusters of tasks failing the SAME
 // underlying way and, once a cluster is large enough to be confident it's systemic (not
-// one bad draft), files a real adhoc task describing the evidence and asking a real
-// agentic Claude pass to find the root cause and fix it.
+// one bad draft), files a task describing the evidence and asking a model to find the
+// root cause and fix it.
+//
+// MOVED OFF CLAUDE 2026-08-20 (Grimmethy: "Is pipeline self audit dependent entirely on
+// using the claude subscription? If so, change it to rely on the reasoning model itself,
+// even if local" -- confirmed live: it was, structurally, since domain:'adhoc' always
+// routes to the real agentic Claude Code CLI pass, and a Claude rate-limit that stalled
+// worker-reasoning's whole high-tier lane was directly why self-audit hadn't fired since
+// the prior restart). Now uses the SAME harness-grounded Ornith flow arch_import already
+// runs successfully against this pipeline's own repo (task-sources.js's arch-import-fetch.js
+// via grep-codebase-tool.js): a plan pass proposes search terms from the evidence below,
+// the harness greps this pipeline's OWN repo for real matches, and the implement pass
+// drafts a real Group-B diff grounded ONLY in what was actually found -- see
+// pipelineSelfAuditPlanPrompt/pipelineSelfAuditImplementPrompt (prompts.js) and
+// task-sources.js's harness-search branch for task.source === 'pipeline_self_audit'.
 //
 // This module ONLY detects and describes -- it never edits pipeline code and never
-// touches queue/ files itself. The fix it asks for goes through the exact same real
-// adhoc pipeline every other "Process now" task uses (domain:'adhoc' ->
-// adhoc-agentic-draft.js's real agentic Claude Code CLI pass against an isolated git
-// worktree -> apply-task.js's unconditional awaiting-confirm gate: "a real agentic code
-// diff ready to apply -- held for human confirmation before touching git or disk"). That
-// gate fires regardless of AGENT_MANAGER_INCLUDE_APPLY/approval-mode settings, so this
-// module can never auto-apply a change to the pipeline's own code -- draft-and-propose
-// only, by construction, not by a rule this module has to remember to follow.
+// touches queue/ files itself. apply-task.js's own awaiting-confirm gate (checked on
+// task.source === 'pipeline_self_audit' specifically, not on domain any more, since this
+// no longer runs through the domain:'adhoc' path that used to carry that gate for free)
+// still holds any real resulting diff for explicit human confirmation before it can
+// touch git or disk, regardless of AGENT_MANAGER_INCLUDE_APPLY/approval-mode settings --
+// draft-and-propose only, by construction, not by a rule this module has to remember to
+// follow.
 //
 // Detection is never a verdict that the underlying blocked tasks were WRONG to be
 // blocked -- a human (or the audit task's own drafting pass) judges that. This only
@@ -89,10 +101,12 @@ function findAuditClusters(blockedTasks, coverage = {}) {
   return clusters;
 }
 
-// The isolated git worktree the resulting adhoc task drafts against only contains
-// git-tracked files -- queue/ is gitignored, so the drafting pass CANNOT read
-// queue/blocked/<id>.json itself. Every piece of evidence it needs has to be embedded
-// directly in this text, not referenced by path.
+// Neither the plan pass nor the harness-fetch step below has any access to the live
+// queue/ directory (it's gitignored, not part of what a repo grep or file read can ever
+// see) -- every piece of evidence about the FAILURE PATTERN itself has to be embedded
+// directly in this text. The harness-fetch step does separately provide real access to
+// this pipeline's own SOURCE code (see task-sources.js's harness-search branch), just
+// never to queue/ task-state files.
 function buildAuditRawText(cluster) {
   const { signature, tasks } = cluster;
   const sepIdx = signature.lastIndexOf('::');
@@ -121,19 +135,15 @@ function buildAuditRawText(cluster) {
       'grounding available" -- the individual drafts were not wrong, the tool feeding ' +
       'them was.',
     '',
-    'You do NOT have access to the live queue/ directory from this checkout (it is not ' +
-      'git-tracked) -- the evidence above is everything available about the failure. ' +
-      'Investigate the relevant pipeline source in THIS checkout (src/task-sources.js\'s ' +
-      'generator for this source, any harness-fetch module it calls, and its prompt ' +
-      'builder in src/prompts.js) to find the actual root cause. If you find and fix a ' +
-      'real bug, add or update a test that would have caught it. If you investigate and ' +
-      'conclude the blocked tasks are each independently and correctly blocked (a real ' +
-      'product-decision gap, not a pipeline bug), make no code changes and say so clearly ' +
-      '-- do not force a change onto a working system.',
   ].filter(Boolean).join('\n');
 }
 
-function buildAuditTask(cluster) {
+// domain must be the consumer's real defaultDomain (task-sources.js's getConfig() value,
+// same 'default' key deep_dive/arch_import/observability_review etc. already use) --
+// passed in rather than hardcoded here, matching every other next*Task() builder's own
+// convention of not baking config into pipeline-self-audit.js's otherwise config-free
+// pure functions.
+function buildAuditTask(cluster, domain) {
   const { signature } = cluster;
   const sepIdx = signature.lastIndexOf('::');
   const source = signature.slice(0, sepIdx);
@@ -141,12 +151,13 @@ function buildAuditTask(cluster) {
   const id = `pipeline-self-audit-${source}-${category}-${Date.now()}`;
   return {
     id,
-    domain: 'adhoc',
+    domain,
     source: 'pipeline_self_audit',
     title: `Pipeline self-audit: ${cluster.tasks.length} "${source}" tasks blocked the same way (${category})`,
     promptContext: {
-      rawText: buildAuditRawText(cluster),
+      evidenceText: buildAuditRawText(cluster),
       signature,
+      taskCount: cluster.tasks.length,
     },
   };
 }

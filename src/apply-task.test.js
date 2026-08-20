@@ -372,6 +372,51 @@ test('researchApplyConfirmedAt lets a confirmed research task proceed, writes in
   assert.match(entries[0].resolvedNote, /Researched and filed/);
 });
 
+// --- pipeline_self_audit: same awaiting-confirm gate, but checked on task.source
+// directly rather than domain (2026-08-20, Grimmethy: "change it to rely on the
+// reasoning model itself, even if local") -- this source moved off domain:'adhoc' (which
+// used to carry the adhoc gate above for free) onto domain:'default' so it drafts on the
+// local Ornith model via harness grounding instead of requiring a Claude subscription,
+// but a task that autonomously finds and drafts a fix to THIS PIPELINE'S OWN CODE still
+// needs the same explicit human confirmation regardless of domain -----------------------
+
+test('a pipeline_self_audit task with a real implementResponse is held for confirmation and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default', source: 'pipeline_self_audit',
+    implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'a', replace: 'b' }),
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  assert.match(result.reason, /pipeline_self_audit/);
+  assert.deepEqual(gitRunner.calls, []);
+});
+
+test('a pipeline_self_audit task with an empty implementResponse (nothing groundable found) never hits the confirm gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ domain: 'default', source: 'pipeline_self_audit', implementResponse: '' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.needsConfirmation, undefined);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('commit'), 'nothing to confirm, but also nothing to commit');
+});
+
+test('pipelineSelfFixConfirmedAt lets a previously-held pipeline_self_audit diff proceed past the gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default', source: 'pipeline_self_audit',
+    implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'a', replace: 'b' }),
+    pipelineSelfFixConfirmedAt: '2026-08-20T00:00:00.000Z',
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
+});
+
 test('a fetchMain failure surfaces as a failure with no branch created', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'fetchMain', failMessage: 'network unreachable' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });

@@ -616,6 +616,62 @@ function archImportImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// pipeline_self_audit (2026-08-20, Grimmethy: "Is pipeline self audit dependent entirely
+// on using the claude subscription? If so, change it to rely on the reasoning model
+// itself, even if local"): same two-call shape as arch_import immediately above (plan
+// proposes search terms Ornith can't run itself, the harness greps agent-manager's own
+// repo, implement gets real results) -- but unlike arch_import, this writes a REAL diff
+// directly (groupBJsonInstructions, same as archReviewImplementPrompt) rather than a
+// candidate for a separate fulfillment stage, since the goal here is closing the loop
+// end-to-end on the local model with no second stage and no Claude dependency at all.
+function pipelineSelfAuditPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'A deterministic scan of THIS PIPELINE\'S OWN queue/blocked/ found a cluster of tasks all failing the SAME way -- likely a bug in this pipeline\'s own code (a harness/fetch bug, a prompt gap, a broken tool), not each task independently being a bad idea. See the evidence below.',
+    '',
+    `Failure signature: ${ctx.signature} (${ctx.taskCount} tasks failing this exact way)`,
+    '',
+    ctx.evidenceText,
+    '',
+    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the pipeline code responsible for this failure pattern -- think about which source file generates or processes tasks of the affected type, or which harness/tool the failure signature points at.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function pipelineSelfAuditImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this pipeline\'s own code)';
+  const filesText = files.length > 0
+    ? files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')
+    : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms to find the pipeline code behind this failure pattern:',
+    '',
+    planText,
+    '',
+    `FAILURE SIGNATURE: ${ctx.signature} (${ctx.taskCount} tasks failing this way)`,
+    '',
+    'The harness ran those searches against THIS PIPELINE\'S OWN repo. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'If the real matches above clearly show the root cause, write ONE small, safely-scoped fix for it -- grounded ONLY in the real file content shown above, never a guessed or invented file/line/symbol. Stay inside exactly the bug the evidence points at; do not expand scope to adjacent cleanup even if something else nearby looks wrong. If the searches did not find anything that clearly explains this failure pattern, output the empty string and nothing else -- do not force a change onto files you have not actually seen grounded content for.',
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
+}
+
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -810,6 +866,7 @@ updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanP
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
+updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 

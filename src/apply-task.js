@@ -258,6 +258,27 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       };
     }
 
+    // Same awaiting-confirm gate again, for pipeline_self_audit (2026-08-20, Grimmethy:
+    // "change it to rely on the reasoning model itself, even if local"): moved off the
+    // domain:'adhoc' real-Claude-agentic path (which had its OWN gate above, but only
+    // because that path happens to be Claude-only -- Ornith has no tool-calling access at
+    // all) onto the standard harness-grounded Ornith flow (domain:'default', same shape
+    // arch_import already uses successfully). That move means the adhoc gate above no
+    // longer applies to it at all -- but a task that autonomously finds and drafts a fix
+    // to THIS PIPELINE'S OWN CODE, entirely without a human in the loop until this point,
+    // still deserves the same explicit confirmation every other real, directly-landing
+    // diff in this file already requires, regardless of which model drafted it. Checked
+    // on implementResponse being genuinely non-empty (not the "found nothing groundable"
+    // empty-string outcome, which never touches git either way -- see
+    // pipelineSelfAuditImplementPrompt's own instruction to output nothing in that case).
+    if (task.source === 'pipeline_self_audit' && (task.implementResponse || '').trim() && !task.pipelineSelfFixConfirmedAt) {
+      return {
+        succeeded: false,
+        needsConfirmation: true,
+        reason: 'pipeline_self_audit drafted a real fix to this pipeline\'s own code -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
+      };
+    }
+
     // research's target (a note under secondBrainDir) is outside repoRoot and has nothing
     // to do with the tracked code repo's git state -- same non-git shape as secondbrain/
     // brain_dump_sort/project_search/path_prefetch_resolve above, intercepted here for the
