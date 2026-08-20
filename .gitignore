@@ -19,6 +19,7 @@ deep-dive-coverage.json
 import-coverage.json
 observability-coverage.json
 performance-coverage.json
+self-audit-coverage.json
 dashboard.pid
 .claude/
 brain-dump.json
