@@ -3237,7 +3237,7 @@ TASK_SOURCE_CATALOG = [
     "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
     "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
     "performance_review",
-    "deep_dive", "project_search", "unused_export", "pipeline_self_audit", "observability_fix",
+    "deep_dive", "project_search", "unused_export", "pipeline_self_audit", "observability_fix", "performance_fix",
 ]
 
 # Exempt from any allowlist restriction regardless of stored state -- task-sources.js's
@@ -3267,7 +3267,7 @@ def read_active_job_types() -> set:
 TASK_SOURCE_DEFAULT_PRIORITIES = {
     "adhoc": 10, "research_task": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
     "path_prefetch_resolve": 45,
-    "arch_review": 70, "arch_import_review": 71, "observability_fix": 72,
+    "arch_review": 70, "arch_import_review": 71, "observability_fix": 72, "performance_fix": 73,
     "pipeline_self_audit": 65,
     "arch_discovery": 80, "observability_review": 80,
     "performance_review": 80,
@@ -3350,7 +3350,7 @@ def read_approval_modes() -> dict:
 _SOURCE_TO_DOMAIN_KEY = {
     "trouble_log": "default", "arch_review": "default", "arch_import_review": "default",
     "arch_discovery": "default", "arch_import": "default", "observability_review": "default",
-    "performance_review": "default", "observability_fix": "default",
+    "performance_review": "default", "observability_fix": "default", "performance_fix": "default",
     "unused_export": "default",
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",

@@ -116,11 +116,18 @@ function getConfig() {
   // actually built.
   const observabilityFixCandidatesPath = process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH
     || path.join(repoRoot, 'Docs', 'OBSERVABILITY_FIX_CANDIDATES.md');
-  // performance_review (Brain Dump #94, 2026-08-18) -- same "ride on deep_dive's already-
-  // cloned projects, track which ones this scanner has covered" shape as
-  // observability_review immediately above.
+  // performance_review (Brain Dump #94, 2026-08-18) -- REDIRECTED 2026-08-20, same
+  // reasoning/shape as observability_review's own redirect just above ("Do the same for
+  // performance_review"): 355 done tasks, 297 (84%) false positive, 56 (16%) genuine,
+  // scanning deep_dive's cloned EXTERNAL repos with no follow-up mechanism, zero fixes
+  // ever shipped. Now scans repoRoot directly; tracks a single lastScannedAt instead of
+  // a per-project map.
   const performanceCoveragePath = process.env.AGENT_MANAGER_PERFORMANCE_COVERAGE_PATH
     || path.join(pipelineDir, 'performance-coverage.json');
+  // Where a "genuine issue" verdict lands as a real, fixable candidate -- same mechanism
+  // as observabilityFixCandidatesPath just above.
+  const performanceFixCandidatesPath = process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH
+    || path.join(repoRoot, 'Docs', 'PERFORMANCE_FIX_CANDIDATES.md');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
   // pipeline_self_audit (2026-08-19: "how can we turn this into a self improving
@@ -199,7 +206,7 @@ function getConfig() {
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
-    observabilityFixCandidatesPath,
+    observabilityFixCandidatesPath, performanceFixCandidatesPath,
     selfAuditCoveragePath,
     performanceCoveragePath,
     brainDumpPath,

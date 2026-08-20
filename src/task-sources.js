@@ -1011,33 +1011,27 @@ function nextObservabilityReviewTask() {
   return null;
 }
 
-// --- Source: performance_review -- flags performance-hygiene issues in projects already
-// onboarded by deep_dive (priority 80, alongside arch_discovery/observability_review) ---
+// --- Source: performance_review -- flags performance-hygiene issues in the ACTIVE
+// project itself (priority 80, alongside arch_discovery/observability_review) ----------
 //
-// Brain Dump #94 (2026-08-18: "our pretty little cpu is getting overloaded... we need to
-// develop a performance review job for projects anyways"). Structurally an exact copy of
-// nextObservabilityReviewTask immediately above -- same coverage-file/flags-file/oldest-
-// first/skip-if-queued shape, same reasoning for reusing deep_dive's clonePaths rather
-// than cloning again -- swapped to performance-scan.js's scanner and its own
+// Brain Dump #94 (2026-08-18). REDIRECTED 2026-08-20 (Grimmethy: "Do the same for
+// performance_review" -- same treatment observability_review just got): real numbers
+// showed the identical pattern -- 355 done tasks, 297 (84%) false positive, 56 (16%)
+// genuine, scanning deep_dive's cloned EXTERNAL repos with no follow-up mechanism, zero
+// fixes ever shipped. Exact structural mirror of nextObservabilityReviewTask's own
+// redirect immediately above -- same lastScannedAt/rescan-interval/dedupe/prune shape,
+// same reasoning throughout -- swapped to performance-scan.js's scanner and its own
 // coverage/flags files so the two sources never contend over the same state.
 function nextPerformanceReviewTask() {
-  const { pipelineDir, defaultDomain, deepDiveCoveragePath, performanceCoveragePath } = getConfig();
-
-  let deepDiveCoverage;
-  try {
-    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
-  } catch {
-    deepDiveCoverage = { projects: {} };
-  }
-  const deepDiveProjects = deepDiveCoverage.projects || {};
+  const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
+  const projectTag = path.basename(repoRoot);
 
   let coverage;
   try {
-    coverage = JSON.parse(readIfExists(performanceCoveragePath) || '{"projects":{}}');
+    coverage = JSON.parse(readIfExists(performanceCoveragePath) || '{}');
   } catch {
-    coverage = { projects: {} };
+    coverage = {};
   }
-  if (!coverage.projects) coverage.projects = {};
 
   const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
   let flags;
@@ -1047,23 +1041,38 @@ function nextPerformanceReviewTask() {
     flags = [];
   }
 
-  let coverageChanged = false;
+  const now = Date.now();
+  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
+  const due = Number.isNaN(lastScannedAt) || (now - lastScannedAt) >= OBSERVABILITY_RESCAN_INTERVAL_MS;
+
   let flagsChanged = false;
-  for (const [slug, proj] of Object.entries(deepDiveProjects)) {
-    if (coverage.projects[slug]) continue; // already scanned once
-    if (!proj.clonePath || !fs.existsSync(proj.clonePath)) continue;
+  if (due && fs.existsSync(repoRoot)) {
+    let freshFindings = [];
     try {
-      flags.push(...scanProjectForPerformance(proj.clonePath, slug));
-      flagsChanged = true;
+      freshFindings = scanProjectForPerformance(repoRoot, projectTag);
     } catch (e) {
-      // A scan failure must never crash the worker loop -- same rule
-      // nextObservabilityReviewTask's own try/catch follows.
-      console.error(`performance_review: failed to scan "${slug}": ${e.message}`);
+      console.error(`performance_review: failed to scan "${projectTag}": ${e.message}`);
     }
-    coverage.projects[slug] = { scannedAt: new Date().toISOString() };
-    coverageChanged = true;
-  }
-  if (coverageChanged) {
+
+    // Prune stale flags -- by projectSlug mismatch first (unambiguous signal from before
+    // this redirect; a relative file path can coincidentally "exist" under the new
+    // repoRoot by naming coincidence, so file-existence alone isn't enough -- see
+    // nextObservabilityReviewTask's own prune fix for the confirmed-live incident this
+    // avoids repeating here), then by the file genuinely no longer existing.
+    const beforePrune = flags.length;
+    flags = flags.filter((f) => f.projectSlug === projectTag && (!f.file || fs.existsSync(path.join(repoRoot, f.file))));
+    if (flags.length !== beforePrune) flagsChanged = true;
+
+    const existingKeys = new Set(flags.map((f) => `${f.rule}::${f.file}::${f.line}`));
+    for (const finding of freshFindings) {
+      const key = `${finding.rule}::${finding.file}::${finding.line}`;
+      if (existingKeys.has(key)) continue;
+      flags.push(finding);
+      existingKeys.add(key);
+      flagsChanged = true;
+    }
+
+    coverage = { lastScannedAt: new Date(now).toISOString() };
     fs.mkdirSync(path.dirname(performanceCoveragePath), { recursive: true });
     fs.writeFileSync(performanceCoveragePath, JSON.stringify(coverage, null, 2));
   }
@@ -1074,37 +1083,33 @@ function nextPerformanceReviewTask() {
 
   const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
   for (const finding of sorted) {
-    const taskId = `performance-${slugifyForId(finding.projectSlug)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
+    const taskId = `performance-${slugifyForId(projectTag)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
     if (taskIdExistsInQueue(taskId)) continue;
 
     let snippet = null;
-    const proj = finding.file && deepDiveProjects[finding.projectSlug];
-    if (proj && proj.clonePath) {
-      const content = readIfExists(path.join(proj.clonePath, finding.file));
+    if (finding.file) {
+      const content = readIfExists(path.join(repoRoot, finding.file));
       // Re-check isLikelyMinified against the file's CURRENT content -- see
-      // nextObservabilityReviewTask's identical guard for the full "flags.json is a
-      // persistent queue that outlives the scanner fix that should have prevented these
-      // entries" rationale (2026-08-19).
+      // nextObservabilityReviewTask's identical guard for the full rationale (2026-08-19).
       if (content && isLikelyMinified(content)) continue;
-      if (content) {
-        const lines = content.split('\n');
-        const start = Math.max(0, (finding.line || 1) - 4);
-        const end = Math.min(lines.length, (finding.line || 1) + 3);
-        snippet = lines.slice(start, end).join('\n');
-      }
+      if (!content) continue; // pruned above in the common case, but be defensive regardless
+      const lines = content.split('\n');
+      const start = Math.max(0, (finding.line || 1) - 4);
+      const end = Math.min(lines.length, (finding.line || 1) + 3);
+      snippet = lines.slice(start, end).join('\n');
     }
 
     return {
       id: taskId,
       domain: defaultDomain,
       source: 'performance_review',
-      title: `Performance triage: ${finding.rule} — ${finding.projectSlug}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
+      title: `Performance triage: ${finding.rule} — ${projectTag}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
       promptContext: {
         rule: finding.rule,
         detail: finding.detail,
         file: finding.file,
         line: finding.line,
-        projectSlug: finding.projectSlug,
+        projectSlug: projectTag,
         snippet,
       },
     };
@@ -1588,15 +1593,25 @@ registerTaskSource('observability_fix', {
 });
 
 // performance_review shares observability_review's tier (80) and shape exactly -- same
-// "proactive review of already-scanned projects" reasoning, and the same judgment-verdict-
-// only apply (no real code fix comes out of this task; a genuine finding becomes a
-// separate follow-up, same as observability_review/arch_discovery). See
-// nextPerformanceReviewTask's own header comment for the full design (Brain Dump #94,
-// 2026-08-18).
+// "proactive review of the active project" reasoning after its own 2026-08-20 redirect.
+// See nextPerformanceReviewTask's own header comment for the full design.
 registerTaskSource('performance_review', {
   priority: taskPriority('performance_review', 80),
   next: nextPerformanceReviewTask,
-  apply: applyVerdictOnly,
+  // A "genuine" verdict now writes a real, fixable candidate -- same mechanism as
+  // observability_review's own apply just above (applyArchDiscoveryCandidates is fully
+  // generic). A plain false-positive/uncertain verdict still gets {skipped:true}.
+  apply: ({ implementResponse }) => {
+    const { performanceFixCandidatesPath } = getConfig();
+    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: performanceFixCandidatesPath, docTitle: '# Performance Fix Candidates' });
+  },
+});
+// performance_fix (2026-08-20): the follow-up stage performanceReviewImplementPrompt now
+// promises and actually has -- same mechanism as observability_fix immediately above,
+// against performanceFixCandidatesPath instead.
+registerTaskSource('performance_fix', {
+  priority: taskPriority('performance_fix', 73),
+  next: () => nextCandidateFulfillmentTask(getConfig().performanceFixCandidatesPath, 'performance_fix'),
 });
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
