@@ -280,6 +280,20 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       };
     }
 
+    // Same awaiting-confirm gate again, for product_spec (2026-08-20, see task-sources.js's
+    // nextProductSpecTask header): unlike every other gate above, this one holds a change
+    // to a DOCUMENT, not code -- but it is arguably the single highest-leverage gate in this
+    // file, since every later feature task for the target project gets grounded against
+    // whatever lands here. A bad spec edit that slips through doesn't just break one diff,
+    // it silently miscalibrates everything built on top of it afterward.
+    if (task.source === 'product_spec' && (task.implementResponse || '').trim() && !task.productSpecConfirmedAt) {
+      return {
+        succeeded: false,
+        needsConfirmation: true,
+        reason: 'product_spec drafted a real change to the product spec doc -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
+      };
+    }
+
     // research's target (a note under secondBrainDir) is outside repoRoot and has nothing
     // to do with the tracked code repo's git state -- same non-git shape as secondbrain/
     // brain_dump_sort/project_search/path_prefetch_resolve above, intercepted here for the

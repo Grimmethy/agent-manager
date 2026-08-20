@@ -1860,6 +1860,80 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
 
+// --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
+// is to create an automated systems development suite. It should build its own plugins...
+// Is Agent Manager ready to start automatically building a CRM plugin?") -- the answer was
+// no: every existing source either reacts to a problem already visible in EXISTING code
+// (trouble_log, arch_review, pipeline_self_audit) or drafts one small human-specified diff
+// (adhoc). None of them originate or maintain the one artifact a greenfield, many-feature
+// build actually needs first: a living spec of what the product IS (entities, API shape,
+// decisions already made) that every later feature-drafting task can be grounded against --
+// without it, task #40 quietly reinvents a decision task #3 already made.
+//
+// Shape deliberately mirrors nextAdhocTask() immediately above: a human (or a future
+// backlog-decomposition source) drops a request file into queue/product-spec-requests/,
+// this claims the oldest unclaimed one, oldest-first, same "skip an in-queue id and keep
+// looking" rule every other inbox-style source here already uses. Unlike adhoc, this
+// always runs domain:defaultDomain (Ornith, 'low' tier, same as pipeline_self_audit) --
+// there is no code-repo tool access to justify Claude's agentic path here, only reading the
+// current spec doc and the request text, both handed to the model directly as context, no
+// harness search needed (the "grounding" IS the doc itself, already in hand).
+function nextProductSpecTask() {
+  const { pipelineDir, repoRoot, productSpecPath, defaultDomain } = getConfig();
+  const requestsDir = path.join(pipelineDir, 'queue', 'product-spec-requests');
+  const specRelPath = path.relative(repoRoot, productSpecPath);
+
+  let entries;
+  try {
+    entries = fs.readdirSync(requestsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const files = entries
+    .filter((e) => e.isFile() && e.name.endsWith('.json'))
+    .map((e) => {
+      const full = path.join(requestsDir, e.name);
+      return { full, mtime: fs.statSync(full).mtimeMs };
+    })
+    .sort((a, b) => a.mtime - b.mtime);
+
+  for (const f of files) {
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(f.full, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed.id !== 'string' || !parsed.id.trim() || typeof parsed.requestText !== 'string' || !parsed.requestText.trim()) continue;
+
+    const id = `product-spec-${parsed.id.trim()}`;
+    if (taskIdExistsInQueue(id)) continue;
+
+    // A missing spec doc is the legitimate bootstrap case (this is the FIRST request ever
+    // filed for this project), not an error -- currentSpec is just the empty string and
+    // the implement prompt is told explicitly that it's creating the doc, not editing it.
+    const currentSpec = readIfExists(productSpecPath) || '';
+
+    return {
+      id,
+      domain: defaultDomain,
+      source: 'product_spec',
+      title: parsed.title || `Product spec: ${parsed.id.trim()}`,
+      promptContext: {
+        requestId: parsed.id.trim(),
+        requestText: parsed.requestText,
+        currentSpec,
+        specExists: currentSpec.trim().length > 0,
+        specRelPath,
+      },
+    };
+  }
+
+  return null;
+}
+registerTaskSource('product_spec', { priority: taskPriority('product_spec', 15), next: nextProductSpecTask });
+
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible
 // work and stops there, even when that source's task doesn't match the calling lane's own
@@ -1935,6 +2009,7 @@ module.exports = {
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
+  nextProductSpecTask,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
