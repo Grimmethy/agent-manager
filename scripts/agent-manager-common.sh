@@ -90,49 +90,26 @@ get_model_override() {
 should_yield_for_model_swap() {
   local target_model="$1" target_tier="$2"
 
-  # In-flight check (model-inflight-lock.js) -- a HARD gate, checked before the softer
-  # pending-backlog heuristic below and independent of whether .active-local-model.json
-  # even exists yet. Added 2026-08-19 after finding the backlog check alone has a real
-  # race: it only counts queue/pending/ (unclaimed) work for the resident tier, never
-  # queue/drafting/<instance>/ (a task already claimed and mid-generation). A worker can
-  # claim the LAST pending item for its tier and be actively calling Ollama on it -- at
-  # that exact moment pending-count reads 0, so the backlog check below would say
-  # "proceed" and let a different-model caller fire a competing Ollama request while the
-  # first is still in flight, with no VRAM headroom on this hardware to hold both (~3.5GB
-  # free with one ~20GB model resident, confirmed live). This lock check catches that
-  # window the backlog count can't see.
-  #
-  # Widened same-day (2026-08-19, Grimmethy: "it's still running two jobs at once. We
-  # really need it to do one at a time") from "yield only if a DIFFERENT model is
-  # in-flight" to "yield if ANY lock is held, same model or not". The original,
-  # narrower check was intentional back when worker-1/reviewer/worker-reasoning were
-  # expected to run different tiers on different models -- same-model overlap (e.g.
-  # worker-1 and reviewer both legitimately calling ORNITH_MODEL) was fine to allow
-  # concurrently since Ollama's own single execution slot serializes the actual
-  # generation anyway, no VRAM risk either way. But with all three lanes now pointed at
-  # the SAME model (dashboard-settings.json's workerModelOverrides), that narrower check
-  # let two lanes both claim and start a real Ollama call at once -- harmless to the GPU,
-  # but not what "one job at a time" means operationally, and it's what produced two
-  # simultaneously "working" rows on the dashboard. This is now a strict pipeline-wide
-  # mutex: whoever holds the one lock blocks every other lane's claim this tick,
-  # regardless of which model any of them target.
-  local locks_json any_inflight
-  locks_json="$(node -e '
-    try {
-      const { readActiveLocks } = require(process.argv[1]);
-      process.stdout.write(JSON.stringify(readActiveLocks(process.argv[2])));
-    } catch (e) { process.stdout.write("[]"); }
-  ' "${PACKAGE_SRC_DIR}/model-inflight-lock.js" "$INSTANCES_DIR" 2>/dev/null)"
-  any_inflight="$(node -e '
-    try {
-      const locks = JSON.parse(process.argv[1] || "[]");
-      process.stdout.write(locks.length > 0 ? "true" : "false");
-    } catch (e) { process.stdout.write("false"); }
-  ' "$locks_json")"
-  if [[ "$any_inflight" == "true" ]]; then
-    echo yield
-    return 0
-  fi
+  # REMOVED 2026-08-20 (Grimmethy: "I'm seeing 85 blocked tasks. This hasn't gone down...
+  # Has the self audit task been working?"): the in-flight hard-yield gate that used to
+  # live here -- "yield if ANY model-inflight-lock.js lock is held, same model or not" --
+  # was starving the reviewer outright, not just avoiding GPU thrashing. review-runner.sh
+  # calls this check BEFORE ever attempting to claim a review item, every ~30s tick; with
+  # worker-1 continuously cycling through a real arch_import backlog (release one lock,
+  # claim the next task, re-acquire almost immediately), reviewer's tick landed on "some
+  # lock is held" essentially every single time, so it yielded forever -- confirmed live:
+  # review-runner.log showed 30+ consecutive "yielding this tick" lines, reviewer sitting
+  # idle while queue/review/ grew to 19 items, some multiple DAYS old, nothing ever
+  # reaching blocked/done. This check was ALSO always redundant for actual correctness:
+  # acquire_single_flight_lock (below) is a real kernel flock, called unconditionally
+  # right after this function returns "proceed" in every caller -- it already guarantees
+  # true mutual exclusion with no race window, blocking (not polling/yielding) until the
+  # current holder releases, which is both correct AND fair (FIFO-ish waiter ordering),
+  # unlike this peek-and-bail heuristic. Removing the in-flight gate costs at most a
+  # little wasted claim/prep work on the rare tick where a caller ends up blocking on the
+  # real lock moments later -- far cheaper than indefinite starvation. The softer
+  # different-MODEL heuristic below (genuine VRAM-swap avoidance, not correctness) is
+  # unaffected and stays.
 
   local state_path="${INSTANCES_DIR}/.active-local-model.json"
   [[ -f "$state_path" ]] || { echo proceed; return 0; }
