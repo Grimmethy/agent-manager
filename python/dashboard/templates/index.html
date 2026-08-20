@@ -1766,6 +1766,7 @@ async function renderBranchesTab() {
         pushed ${fmtAge((Date.now() - new Date(b.pushedAt).getTime()) / 1000)} ago
         ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
       </div>
+      ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
         <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}">Merge to ${escapeHtml(b.mainBranch)}</button>
@@ -1835,6 +1836,7 @@ async function renderBranchDetailModal(b) {
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2>`;
   html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
+  if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
   html += `<div class="field-label">Commits (${data.commits.length}, newest first)</div>`;
   if (!data.commits.length) {
     html += `<div class="meta">No commits found ahead of ${escapeHtml(b.mainBranch)}.</div>`;

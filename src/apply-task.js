@@ -45,15 +45,30 @@ ensureRegistered();
 const DIRECT_TO_MAIN_DOMAINS = new Set(['arch_discovery', 'arch_import']);
 
 // task.draftModel (stamped by ornith-draft.js/adhoc-agentic-draft.js at draft time, same
-// "claude:<model>"-or-"ornith" label model-provider.js's labelFor() and the Workers/Models
-// tabs already use) says which backend actually drafted this change -- was previously
-// ignored entirely, hardcoding every commit's Co-Authored-By to Ornith even when e.g. the
-// adhoc agentic pass (Claude Code CLI, never Ornith) produced the diff. Falls back to
-// Ornith for any task queued before draftModel existed, matching the old hardcoded behavior.
+// "claude:<model>"-or-"<real ollama tag>" label model-provider.js's labelFor() and the
+// Workers/Models tabs already use) says which backend actually drafted this change -- was
+// previously ignored entirely, hardcoding every commit's Co-Authored-By to Ornith even
+// when e.g. the adhoc agentic pass (Claude Code CLI, never Ornith) produced the diff.
+// Falls back to Ornith for any task queued before draftModel existed, matching the old
+// hardcoded behavior.
+//
+// FIXED 2026-08-20 (Grimmethy: "It's showing that ornith authored the script which
+// implies that the program is inaccurately representing model used"): the non-Claude
+// branch below used to discard draftModel entirely and always print the bare string
+// "Ornith", even though labelFor() (model-provider.js) already returns the REAL local
+// model tag (process.env.ORNITH_MODEL, e.g. "qwen3.8:27b-q4_K_M" -- not literally
+// "ornith") for exactly this case. Every local-drafted commit in this pipeline's history
+// was crediting a generic brand name instead of the actual model that did the work, while
+// the Claude branch right above it was always specific ("Claude (sonnet)"). Confirmed
+// live: dashboard-settings.json currently pins all three lanes to
+// qwen3.8:27b-q4_K_M -- none of them are literally named "ornith" at all.
 function coAuthorTrailer(task) {
   const draftModel = task.draftModel || '';
   if (draftModel.startsWith('claude:')) {
     return `Co-Authored-By: Claude (${draftModel.slice('claude:'.length)}) <noreply@anthropic.com>`;
+  }
+  if (draftModel && draftModel !== 'ornith') {
+    return `Co-Authored-By: Ornith (${draftModel}) <noreply@ornith.local>`;
   }
   return 'Co-Authored-By: Ornith <noreply@ornith.local>';
 }
