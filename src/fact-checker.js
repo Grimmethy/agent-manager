@@ -25,6 +25,38 @@ function extractFilePaths(text) {
   return [...new Set(matches)];
 }
 
+// Confirmed live 2026-08-20 (first real product_spec bootstrap run against a brand-new
+// crm-plugin repo): a Group B `{"mode":"create", "file":"Docs/PRODUCT_SPEC.md", ...}`
+// draft got auto-rejected in review because checkFilePaths flagged its OWN create target
+// as a "missing file" -- which is exactly correct and expected for a create (the whole
+// point is the file doesn't exist yet), not fabrication. extractFilePaths works on raw
+// text with no notion of the draft's actual structure, so it can't tell "this path is
+// claimed to already exist" (a real fabrication signal) apart from "this path is the
+// thing about to be created" (the normal, common case for arch_review/arch_import/
+// pipeline_self_audit/product_spec extracting or creating a new file, not just
+// brain_dump_sort's secondBrainPath, which already had its own narrower carve-out in
+// buildVerdictPrompt's wording alone -- a prompt-level carve-out doesn't stop the
+// deterministic flag from being generated and handed to the model as "evidence toward
+// fabrication" in the first place). Best-effort JSON parse; any failure (malformed JSON,
+// not Group B shaped at all -- e.g. a brain_dump_sort/research prose draft) just means no
+// targets get excluded, the exact same behavior as before this fix existed.
+function extractCreateModeTargets(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return new Set();
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const targets = new Set();
+  for (const item of items) {
+    if (item && item.mode === 'create' && typeof item.file === 'string' && item.file.trim()) {
+      targets.add(item.file.trim());
+    }
+  }
+  return targets;
+}
+
 // Same skip-list unused-export-scan.js already uses for its own directory walk --
 // deliberately not walking into these regardless of repo size.
 // '.claude' skipped too -- confirmed live 2026-07-21: a stray leftover git worktree at
@@ -217,10 +249,15 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText);
+  const createModeTargets = extractCreateModeTargets(draftText);
 
   const flags = [];
   for (const f of fileChecks) {
-    if (!f.exists) flags.push({ type: 'missing-file', detail: f.claimedPath });
+    // A create mode's own target not existing yet is the normal, correct case, not
+    // fabrication -- see extractCreateModeTargets' own header for the live incident this
+    // fixes. Still recorded in fileChecks (untouched above) for transparency; only the
+    // flag derived from it is suppressed.
+    if (!f.exists && !createModeTargets.has(f.claimedPath)) flags.push({ type: 'missing-file', detail: f.claimedPath });
   }
   for (const r of relationshipChecks) {
     if (r.checked && !r.found) {
@@ -242,6 +279,7 @@ module.exports = {
   checkBlastRadiusBias,
   checkGroundedValues,
   extractFilePaths,
+  extractCreateModeTargets,
   extractClaimedRelationships,
   resolveAgainstRepo,
   findByBasename,
