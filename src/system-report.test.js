@@ -8,7 +8,7 @@ const path = require('path');
 
 const {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting,
-  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary,
   renderMarkdown, generateReport, checkDue, loadSchedule,
 } = require('./system-report.js');
 const { appendSample } = require('./uptime-log.js');
@@ -264,4 +264,79 @@ test('renderMarkdown includes Queue Health, Failure Patterns, and Self-Audit Act
   assert.match(md, /arch_import::harness-search-zero-results.*1\/1/);
   assert.match(md, /## Self-Audit Activity/);
   assert.match(md, /pipeline-self-audit-1/);
+});
+
+// Plain-English period summary (2026-08-20, Grimmethy: "Every time tracking entry should
+// contain a plain english description of the specific benefit and results of that
+// period. This includes hourly, daily and weekly reports").
+
+test('buildPlainEnglishSummary names real task titles for benefit tasks, not just a count', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'hourly',
+    tasks: [
+      { classification: 'benefit', title: 'Fix silent-catch-block in budget-monitor.js' },
+      { classification: 'filtering' },
+      { classification: 'filtering' },
+      { classification: 'junk' },
+    ],
+    byClassification: { benefit: 1, filtering: 2, junk: 1, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 1, totalJunk: 1 },
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+  });
+  assert.match(summary, /This hour, the pipeline completed 4 tasks\./);
+  assert.match(summary, /Fix silent-catch-block in budget-monitor\.js/);
+  assert.match(summary, /2 scanner alerts were correctly identified as false positives/);
+  assert.match(summary, /ran continuously with no detected downtime/);
+});
+
+test('buildPlainEnglishSummary calls out a dominant failure pattern by name', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'daily',
+    tasks: Array.from({ length: 21 }, () => ({ classification: 'junk' })),
+    byClassification: { benefit: 0, filtering: 0, junk: 21, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [{ signature: 'arch_import::harness-search-zero-results', count: 19 }], uncategorized: 2, totalJunk: 21 },
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+  });
+  assert.match(summary, /No task this period shipped a real fix/);
+  assert.match(summary, /90% of which shared the same "arch_import::harness-search-zero-results" failure pattern/);
+  assert.match(summary, /likely one root cause, not 19 independent problems/);
+});
+
+test('buildPlainEnglishSummary reports downtime plainly when it happened', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'weekly',
+    tasks: [{ classification: 'benefit', title: 'Something shipped' }],
+    byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+    downtime: { pipelineDownSec: 3600, pipelineDownIntervals: [], perInstanceDownSec: {} },
+  });
+  assert.match(summary, /was down for 1h during this period/);
+});
+
+test('buildPlainEnglishSummary handles a completely empty period honestly, including downtime as a likely cause', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'hourly',
+    tasks: [],
+    byClassification: { benefit: 0, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+    downtime: { pipelineDownSec: 1800, pipelineDownIntervals: [], perInstanceDownSec: {} },
+  });
+  assert.match(summary, /completed no tasks/);
+  assert.match(summary, /down for 30m during that stretch/);
+});
+
+test('renderMarkdown includes a ## Summary section with the plain-English narrative', () => {
+  const md = renderMarkdown({
+    period: 'daily',
+    startIso: '2026-08-20T00:00:00.000Z',
+    endIso: '2026-08-21T00:00:00.000Z',
+    tasks: [{ id: 't1', source: 'observability_fix', classification: 'benefit', title: 'Fix silent catch in worker.js' }],
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+    timeAccounting: null,
+  });
+  assert.match(md, /## Summary/);
+  assert.match(md, /Fix silent catch in worker\.js/);
+  // Summary section must come before the By Source breakdown -- the narrative is the
+  // headline, not an afterthought at the bottom.
+  assert.ok(md.indexOf('## Summary') < md.indexOf('## By Source'));
 });

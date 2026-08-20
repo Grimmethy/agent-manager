@@ -124,6 +124,11 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
       tasks.push({
         id: task.id, source: task.source, domain: task.domain, at, queueState: state,
         classification: classifyTask(task, state),
+        // title carried through for buildPlainEnglishSummary() below -- naming a real
+        // accomplishment ("...including a fix for silent-catch-block in
+        // budget-monitor.js") is what makes a period's summary specific instead of
+        // generic restated numbers.
+        title: task.title,
         // Carried through for computeBlockedPatterns() below -- signatureForTask() needs
         // the raw blockedReason/history, not just the coarse classification.
         blockedReason: task.blockedReason, history: task.history,
@@ -359,6 +364,65 @@ function fmtDuration(sec) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+// A short (2-5 sentence) plain-English narrative of what THIS PERIOD specifically
+// accomplished -- added 2026-08-20 (Grimmethy: "Every time tracking entry should contain
+// a plain english description of the specific benefit and results of that period. This
+// includes hourly, daily and weekly reports"). Deterministic (template-filled from
+// already-computed numbers/titles), not an LLM call: this module is architecturally the
+// one report-generator in this pipeline with NO LLM involvement by design (see this
+// file's own header comment), and a report that fires automatically every hour shouldn't
+// gain a new failure mode (a stuck/slow/hallucinating model call) or GPU-contention cost
+// just to phrase numbers as sentences -- especially right after this session's own
+// reviewer-starvation incident, caused by exactly that kind of unnecessary GPU
+// contention. Names REAL accomplishments (actual task titles), not just restated counts,
+// so a reader gets something concrete rather than a rephrase of the bullet lists below.
+function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime }) {
+  const periodLabel = period === 'hourly' ? 'This hour' : period === 'daily' ? 'Today' : period === 'weekly' ? 'This week' : 'In this period';
+  const sentences = [];
+
+  if (tasks.length === 0) {
+    let s = `${periodLabel}, the pipeline completed no tasks.`;
+    if (downtime && downtime.pipelineDownSec > 0) s += ` It was down for ${fmtDuration(downtime.pipelineDownSec)} during that stretch, which explains at least part of the gap.`;
+    return s;
+  }
+
+  sentences.push(`${periodLabel}, the pipeline completed ${tasks.length} task${tasks.length === 1 ? '' : 's'}.`);
+
+  const benefitTasks = tasks.filter((t) => t.classification === 'benefit' && t.title);
+  if (benefitTasks.length > 0) {
+    const named = benefitTasks.slice(0, 2).map((t) => `"${t.title.length > 90 ? t.title.slice(0, 87) + '...' : t.title}"`);
+    const remainder = byClassification.benefit - named.length;
+    let s = `${byClassification.benefit} delivered real value -- including ${named.join(' and ')}`;
+    s += remainder > 0 ? `, plus ${remainder} more.` : '.';
+    sentences.push(s);
+  } else if (byClassification.benefit > 0) {
+    sentences.push(`${byClassification.benefit} delivered real value (no task titles available to name specifically).`);
+  } else {
+    sentences.push('No task this period shipped a real fix or confirmed improvement.');
+  }
+
+  if (byClassification.filtering > 0 || byClassification.junk > 0) {
+    let s = `${byClassification.filtering} scanner alert${byClassification.filtering === 1 ? ' was' : 's were'} correctly identified as false positives (saving real review time)`;
+    s += byClassification.junk > 0 ? `, and ${byClassification.junk} ${byClassification.junk === 1 ? 'was a' : 'were'} confirmed non-issue${byClassification.junk === 1 ? '' : 's'} or blocked draft${byClassification.junk === 1 ? '' : 's'}` : '';
+    const topPattern = blockedPatterns && blockedPatterns.patterns[0];
+    if (topPattern && blockedPatterns.totalJunk > 0 && topPattern.count / blockedPatterns.totalJunk >= 0.5) {
+      const pct = Math.round((topPattern.count / blockedPatterns.totalJunk) * 100);
+      s += ` (${pct}% of which shared the same "${topPattern.signature}" failure pattern -- likely one root cause, not ${topPattern.count} independent problems)`;
+    }
+    sentences.push(s + '.');
+  }
+
+  if (downtime) {
+    if (downtime.pipelineDownSec > 0) {
+      sentences.push(`The pipeline was down for ${fmtDuration(downtime.pipelineDownSec)} during this period.`);
+    } else {
+      sentences.push('The pipeline ran continuously with no detected downtime.');
+    }
+  }
+
+  return sentences.join(' ');
+}
+
 function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
   const bySource = {};
   const byClassification = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0 };
@@ -371,6 +435,10 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${startIso} to ${endIso}`);
   lines.push('');
   lines.push(`**Tasks completed:** ${tasks.length}`);
+  lines.push('');
+
+  lines.push('## Summary');
+  lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime }));
   lines.push('');
 
   lines.push('## By Source');
@@ -536,7 +604,7 @@ function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, selfAudit
 
 module.exports = {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, renderMarkdown,
-  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary,
   generateReport, checkDue, loadSchedule, saveSchedule, PERIOD_MS,
 };
 
