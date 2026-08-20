@@ -611,3 +611,43 @@ test('coAuthorTrailer: a task with no draftModel at all (queued before the field
   assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Ornith <noreply@ornith\.local>/);
   assert.doesNotMatch(gitRunner.capturedCommitMessage, /Ornith \(/);
 });
+
+// Auto-drain (2026-08-20, blocked-drain.js -- Grimmethy: "What kind of mechanism can we
+// use to change the reasoning models approach to blocked tasks that allow them to
+// drain?"): once a pipeline_self_audit fix genuinely lands (real branch/commit/push, not
+// the earlier unconfirmed pass and not a no-op), every currently-blocked task sharing the
+// same failure signature gets automatically requeued.
+
+test('a landed pipeline_self_audit fix auto-requeues blocked tasks sharing its signature', () => {
+  const blockedDir = path.join(PIPELINE_DIR, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, 'arch-import-victim-1.json'), JSON.stringify({
+    id: 'arch-import-victim-1', source: 'arch_import',
+    history: [{ stage: 'harness-search', detail: '3 quer(y/ies), 0 hit(s), 0 file(s)' }],
+  }));
+
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    source: 'pipeline_self_audit',
+    promptContext: { signature: 'arch_import::harness-search-zero-results' },
+    pipelineSelfFixConfirmedAt: '2026-08-20T00:00:00.000Z', // past the awaiting-confirm gate
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.ok(result.branch, 'a real fix must have actually landed for the drain to fire at all');
+  assert.equal(fs.existsSync(path.join(blockedDir, 'arch-import-victim-1.json')), false);
+  const pending = JSON.parse(fs.readFileSync(path.join(PIPELINE_DIR, 'queue', 'pending', 'arch-import-victim-1.json'), 'utf8'));
+  assert.equal(pending.status, 'pending');
+
+  fs.rmSync(path.join(PIPELINE_DIR, 'queue'), { recursive: true, force: true });
+});
+
+test('a pipeline_self_audit task with no signature never attempts to drain anything', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ source: 'pipeline_self_audit', promptContext: {}, pipelineSelfFixConfirmedAt: '2026-08-20T00:00:00.000Z' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(fs.existsSync(path.join(PIPELINE_DIR, 'queue', 'pending')), false);
+});

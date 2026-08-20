@@ -19,6 +19,7 @@ const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings,
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -407,6 +408,25 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     }
 
     closeOriginatingBrainDumpEntry(task, brainDumpPath, `Implemented and pushed to branch ${branchName} -- Task: ${task.id}`);
+
+    // Auto-drain (2026-08-20, blocked-drain.js -- see its own header for the full
+    // design): a pipeline_self_audit fix just landed for real (this is the genuine
+    // committed-and-pushed outcome, not the earlier unconfirmed pass and not a "nothing
+    // groundable" no-op, which returns doneMarker instead and never reaches this line) --
+    // requeue every currently-blocked task sharing the same failure signature. Best-
+    // effort: a drain failure must never turn a real, successful apply into a reported
+    // failure; the fix itself already landed regardless.
+    if (task.source === 'pipeline_self_audit' && task.promptContext && task.promptContext.signature) {
+      try {
+        const { requeuedIds } = requeueBlockedTasksForSignature(pipelineDir, task.promptContext.signature);
+        if (requeuedIds.length > 0) {
+          console.error(`[apply-task] auto-requeued ${requeuedIds.length} blocked task(s) sharing signature "${task.promptContext.signature}": ${requeuedIds.join(', ')}`);
+        }
+      } catch (e) {
+        // Non-fatal -- see comment above.
+      }
+    }
+
     return { succeeded: true, branch: branchName, pushed: true };
   } catch (e) {
     const reason = e.stderr ? e.stderr.toString() : e.message;
