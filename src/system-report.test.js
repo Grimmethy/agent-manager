@@ -8,7 +8,7 @@ const path = require('path');
 
 const {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting,
-  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary, fmtLocal,
   renderMarkdown, generateReport, checkDue, loadSchedule,
 } = require('./system-report.js');
 const { appendSample } = require('./uptime-log.js');
@@ -339,4 +339,60 @@ test('renderMarkdown includes a ## Summary section with the plain-English narrat
   // Summary section must come before the By Source breakdown -- the narrative is the
   // headline, not an afterthought at the bottom.
   assert.ok(md.indexOf('## Summary') < md.indexOf('## By Source'));
+});
+
+// Local-timezone rendering (2026-08-20, Grimmethy: "We should change the time readout on
+// time reports to match the systems time zone"). Tests compute their own expected string
+// the same way fmtLocal does (via toLocaleString), not a hardcoded zone abbreviation, so
+// they pass regardless of which timezone the machine running them is actually set to.
+
+function expectedLocal(iso) {
+  return new Date(iso).toLocaleString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZoneName: 'short',
+  });
+}
+
+test('fmtLocal renders an ISO timestamp in the system\'s own local timezone, not raw UTC', () => {
+  const iso = '2026-08-20T18:41:00.023Z';
+  assert.equal(fmtLocal(iso), expectedLocal(iso));
+  // Whatever the local rendering is, it must not just be the bare ISO/Z string passed
+  // through unchanged -- that's the exact bug being fixed.
+  assert.notEqual(fmtLocal(iso), iso);
+});
+
+test('fmtLocal falls back to the raw string for an unparseable timestamp rather than throwing', () => {
+  assert.equal(fmtLocal('not-a-real-timestamp'), 'not-a-real-timestamp');
+});
+
+test('renderMarkdown\'s header renders start/end in local time, not raw UTC ISO strings', () => {
+  const startIso = '2026-08-20T17:00:00.000Z';
+  const endIso = '2026-08-20T18:00:00.000Z';
+  const md = renderMarkdown({
+    period: 'hourly', startIso, endIso,
+    tasks: [], downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} }, timeAccounting: null,
+  });
+  assert.match(md, new RegExp(`# Hourly Report — ${expectedLocal(startIso).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} to ${expectedLocal(endIso).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.doesNotMatch(md, /2026-08-20T17:00:00\.000Z/);
+});
+
+test('renderMarkdown renders a downtime interval and self-audit activity timestamp in local time too', () => {
+  const md = renderMarkdown({
+    period: 'hourly',
+    startIso: '2026-08-20T17:00:00.000Z',
+    endIso: '2026-08-20T18:00:00.000Z',
+    tasks: [],
+    downtime: {
+      pipelineDownSec: 600,
+      pipelineDownIntervals: [{ from: '2026-08-20T17:10:00.000Z', to: '2026-08-20T17:20:00.000Z' }],
+      perInstanceDownSec: {},
+    },
+    timeAccounting: null,
+    selfAuditActivity: [{ signature: 'arch_import::harness-search-zero-results', taskId: 'pipeline-self-audit-1', reportedAt: '2026-08-20T17:05:00.000Z' }],
+  });
+  assert.match(md, new RegExp(expectedLocal('2026-08-20T17:10:00.000Z').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(md, new RegExp(expectedLocal('2026-08-20T17:05:00.000Z').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(md, /2026-08-20T17:10:00\.000Z/);
+  assert.doesNotMatch(md, /2026-08-20T17:05:00\.000Z/);
 });
