@@ -136,6 +136,16 @@ function getConfig() {
   // new audit task every tick once it's been reported once.
   const selfAuditCoveragePath = process.env.AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH
     || path.join(pipelineDir, 'self-audit-coverage.json');
+  // product_spec (Grimmethy, 2026-08-20: "it should build its own plugins... is agent-
+  // manager ready to start automatically building a CRM plugin?") -- the living spec doc a
+  // greenfield target project's feature work is grounded against, same "one doc, versioned
+  // with the code, read as real content before every draft" shape ARCH_REVIEW_CANDIDATES.md
+  // already proves for candidates. Lives in repoRoot (not pipelineDir) so it travels with
+  // the target project's own git history, same reasoning as troubleLogPath/
+  // archReviewCandidatesPath above.
+  const productSpecPath = process.env.AGENT_MANAGER_PRODUCT_SPEC_PATH
+    || path.join(repoRoot, 'Docs', 'PRODUCT_SPEC.md');
+
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
   // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
   // both languages on purpose; there is no other link between them.
@@ -209,6 +219,7 @@ function getConfig() {
     observabilityFixCandidatesPath, performanceFixCandidatesPath,
     selfAuditCoveragePath,
     performanceCoveragePath,
+    productSpecPath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,

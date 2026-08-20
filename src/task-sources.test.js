@@ -1479,6 +1479,71 @@ test('nextAdhocTask still carries preDrafted/implementResponse/planResponse thro
 // (now a pure read again, like every other next*Task()) into markPipelineSelfAuditReported(),
 // called by the CLI only after writeTask() actually persists the task.
 
+// product_spec (2026-08-20, see task-sources.js's nextProductSpecTask header): the first
+// task source that originates and maintains a living spec doc rather than reacting to a
+// problem already visible in existing code.
+function writeProductSpecRequest(dir, filename, contents) {
+  const requestsDir = path.join(dir, 'queue', 'product-spec-requests');
+  fs.mkdirSync(requestsDir, { recursive: true });
+  fs.writeFileSync(path.join(requestsDir, filename), JSON.stringify(contents));
+}
+
+test('nextProductSpecTask on the very first request (no spec doc yet) returns specExists:false and empty currentSpec, not an error', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecRequest(dir, 'req-1.json', { id: 'bootstrap-1', requestText: 'A CRM needs Contacts and Companies as top-level entities.' });
+
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.ok(task);
+  assert.equal(task.id, 'product-spec-bootstrap-1');
+  assert.equal(task.source, 'product_spec');
+  assert.equal(task.promptContext.specExists, false);
+  assert.equal(task.promptContext.currentSpec, '');
+  assert.equal(task.promptContext.requestText, 'A CRM needs Contacts and Companies as top-level entities.');
+});
+
+test('nextProductSpecTask on a later request reads the real current spec doc content as grounding', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'Docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'Docs', 'PRODUCT_SPEC.md'), '## Entities\n\n- Contact\n- Company\n');
+  writeProductSpecRequest(dir, 'req-2.json', { id: 'add-deals', requestText: 'Add a Deal entity linked to a Contact and a Company.' });
+
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.ok(task);
+  assert.equal(task.promptContext.specExists, true);
+  assert.match(task.promptContext.currentSpec, /- Contact/);
+  assert.equal(task.promptContext.specRelPath, path.join('Docs', 'PRODUCT_SPEC.md'));
+});
+
+test('nextProductSpecTask skips a request whose id already exists somewhere in the queue', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecRequest(dir, 'req-1.json', { id: 'already-done', requestText: 'Add Deals.' });
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, 'product-spec-already-done.json'), JSON.stringify({ id: 'product-spec-already-done' }));
+
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  assert.equal(nextProductSpecTask(), null);
+});
+
+test('nextProductSpecTask processes requests oldest-first and skips a malformed one', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecRequest(dir, 'a-malformed.json', { id: 'bad' }); // missing requestText -- must be skipped, not crash
+  writeProductSpecRequest(dir, 'b-real.json', { id: 'real-one', requestText: 'Add a Pipeline Stages board.' });
+
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.ok(task);
+  assert.equal(task.id, 'product-spec-real-one');
+});
+
+test('nextProductSpecTask on an empty/missing requests dir returns null, not a throw', () => {
+  const dir = makeAdhocFixtureRepo();
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  assert.doesNotThrow(() => assert.equal(nextProductSpecTask(), null));
+});
+
 function makeBlockedFixtureRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-selfaudit-test-'));
 }

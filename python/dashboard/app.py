@@ -1371,6 +1371,11 @@ def api_task_confirm_delete(task_id):
         modifying-behavior change discovered and drafted with no human in the loop until
         this exact click, so it gets the same explicit confirmation every other real,
         directly-landing diff in this file already requires.
+      - productSpecConfirmedAt: product_spec proposed a real change to the target
+        project's product spec doc (2026-08-20) -- every later feature task for that
+        project gets grounded against whatever lands here, so this gets the same
+        explicit confirmation as the others even though the artifact is a document,
+        not code.
     apply-task.js's own gates check each field's PRESENCE (not its value) to let a task
     through without holding it again, the same 'ran once, don't re-trigger' idea as
     promotedAt/lastReviewedAt elsewhere in this codebase. Denying instead of confirming
@@ -1389,6 +1394,7 @@ def api_task_confirm_delete(task_id):
     data["adhocApplyConfirmedAt"] = now_iso
     data["researchApplyConfirmedAt"] = now_iso
     data["pipelineSelfFixConfirmedAt"] = now_iso
+    data["productSpecConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)

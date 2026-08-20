@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const fs = require('fs');
 const path = require('path');
-const { buildCritiquePrompt, buildPlanPrompt } = require('./prompts.js');
+const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt } = require('./prompts.js');
 
 // Real failing content, not synthetic: this is the actual blocked task found live
 // 2026-07-21 (deep-dive-autogen-microsoft-20, still sitting in queue/blocked/ at the time
@@ -63,4 +63,44 @@ test('buildPlanPrompt tells the model a self-referential note belongs to selfPro
 test('buildPlanPrompt omits the selfProjectLabel carve-out entirely when this package is not itself a tracked project', () => {
   const prompt = buildPlanPrompt(brainDumpSortTask({ selfProjectLabel: null }));
   assert.doesNotMatch(prompt, /THIS pipeline's own source/);
+});
+
+// product_spec (2026-08-20) -- see task-sources.js's nextProductSpecTask header for the
+// full motivation.
+function productSpecTask(promptContextOverrides = {}) {
+  return {
+    domain: 'default', source: 'product_spec', title: 't',
+    promptContext: {
+      requestId: 'add-deals', requestText: 'Add a Deal entity linked to a Contact and a Company.',
+      currentSpec: '## Entities\n\n- Contact\n- Company\n', specExists: true, specRelPath: 'Docs/PRODUCT_SPEC.md',
+      ...promptContextOverrides,
+    },
+  };
+}
+
+test('buildPlanPrompt tells the model to treat the current spec as settled and surface real conflicts explicitly', () => {
+  const prompt = buildPlanPrompt(productSpecTask());
+  assert.match(prompt, /treat everything in it as settled/);
+  assert.match(prompt, /- Contact/);
+  assert.match(prompt, /Add a Deal entity/);
+  assert.match(prompt, /do not silently pick one side/);
+});
+
+test('buildPlanPrompt tells the model it is creating (not editing) the doc when no spec exists yet', () => {
+  const prompt = buildPlanPrompt(productSpecTask({ currentSpec: '', specExists: false }));
+  assert.match(prompt, /this is the first request filed for this project/);
+  assert.doesNotMatch(prompt, /treat everything in it as settled/);
+});
+
+test('buildImplementPrompt tells the model the exact spec file path and to prefer a small edit over a full rewrite', () => {
+  const prompt = buildImplementPrompt(productSpecTask(), 'PLAN: add a Deal section');
+  assert.match(prompt, /Docs\/PRODUCT_SPEC\.md/);
+  assert.match(prompt, /Prefer "edit" mode/);
+  assert.match(prompt, /groupBJsonInstructions|mode.*create.*edit.*delete|"mode": "edit"/);
+});
+
+test('buildImplementPrompt tells the model to use create mode when no spec doc exists yet', () => {
+  const prompt = buildImplementPrompt(productSpecTask({ currentSpec: '', specExists: false }), 'PLAN: create the doc');
+  assert.match(prompt, /write the FIRST version of the document/);
+  assert.match(prompt, /mode "create"/);
 });

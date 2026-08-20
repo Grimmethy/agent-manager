@@ -672,6 +672,61 @@ function pipelineSelfAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// product_spec (2026-08-20, see task-sources.js's nextProductSpecTask header for the full
+// motivation): no harness search, unlike pipeline_self_audit/arch_import right above --
+// the request text and the current spec doc ARE the grounding, both handed over directly.
+// The one thing this prompt insists on that a plain "write me a doc" prompt wouldn't:
+// flag a real conflict with an EXISTING decision explicitly rather than silently
+// overwriting it. A spec is the one artifact every later feature task gets grounded
+// against -- a silently-resolved contradiction here is far more expensive than the same
+// mistake in one throwaway code diff, since it propagates into everything built on top of
+// it before anyone notices.
+function productSpecPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'You are maintaining the product specification document for a software project this pipeline is building.',
+    '',
+    ctx.specExists
+      ? 'CURRENT SPEC (the only decisions already made -- treat everything in it as settled unless the new request explicitly changes it):'
+      : 'CURRENT SPEC: (none yet -- this is the first request filed for this project. You are creating the document, not editing one.)',
+    '',
+    ctx.specExists ? ctx.currentSpec : '(empty)',
+    '',
+    `NEW REQUEST: ${ctx.requestText}`,
+    '',
+    'Write a numbered PLAN (no doc text yet) for how the spec should change to incorporate this request. ' +
+      'If the request contradicts something already in the current spec, say so explicitly and propose how ' +
+      'to resolve it -- do not silently pick one side. If the request is genuinely ambiguous (multiple ' +
+      'reasonable interpretations that would produce different specs), say UNKNOWN and list the ' +
+      'interpretations rather than guessing one.',
+  ].join('\n');
+}
+
+function productSpecImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  return [
+    'Earlier you wrote this PLAN for updating the product spec:',
+    '',
+    planText,
+    '',
+    ctx.specExists
+      ? 'CURRENT SPEC (full current content -- any "find" text in your JSON output below must be an exact substring of this):'
+      : 'CURRENT SPEC: (none yet -- write the FIRST version of the document.)',
+    '',
+    ctx.specExists ? ctx.currentSpec : '(empty)',
+    '',
+    `The request being incorporated: ${ctx.requestText}`,
+    '',
+    `The spec doc's path (use exactly this for "file" below): ${ctx.specRelPath}`,
+    '',
+    ctx.specExists
+      ? 'Now write ONLY the JSON change to the spec doc. Prefer "edit" mode with a small, precisely-anchored find/replace over rewriting the whole document -- an edit that only touches the section the request actually concerns is easier for a human to review and confirm than a full rewrite.'
+      : 'Now write ONLY the JSON change to create the spec doc (mode "create"), with clear section headings a later request can find and edit against (e.g. "## Entities", "## API", "## Decisions").',
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
+}
+
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -867,6 +922,7 @@ updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, b
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
+updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 

@@ -417,6 +417,48 @@ test('pipelineSelfFixConfirmedAt lets a previously-held pipeline_self_audit diff
   assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
 });
 
+// --- product_spec: same awaiting-confirm gate shape as pipeline_self_audit, but the
+// artifact is a document, not code (2026-08-20, see task-sources.js's nextProductSpecTask
+// header) -- every later feature task for the target project gets grounded against
+// whatever lands here, so it gets the same explicit human confirmation. ---------------
+
+test('a product_spec task with a real implementResponse is held for confirmation and never touches git', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default', source: 'product_spec',
+    implementResponse: JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '## Entities\n\n- Contact\n' }),
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  assert.match(result.reason, /product_spec/);
+  assert.deepEqual(gitRunner.calls, []);
+});
+
+test('a product_spec task with an empty implementResponse never hits the confirm gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ domain: 'default', source: 'product_spec', implementResponse: '' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.needsConfirmation, undefined);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('commit'), 'nothing to confirm, but also nothing to commit');
+});
+
+test('productSpecConfirmedAt lets a previously-held product_spec change proceed past the gate', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default', source: 'product_spec',
+    implementResponse: JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '## Entities\n\n- Contact\n' }),
+    productSpecConfirmedAt: '2026-08-20T00:00:00.000Z',
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
+});
+
 test('a fetchMain failure surfaces as a failure with no branch created', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'fetchMain', failMessage: 'network unreachable' });
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
