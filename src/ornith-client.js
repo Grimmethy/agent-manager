@@ -11,6 +11,9 @@
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
+const gpuCapacity = require('./gpu-capacity.js');
+const gpuVram = require('./gpu-vram.js');
+const ornithThroughput = require('./ornith-throughput.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -60,8 +63,55 @@ function detectDegenerate(text, { allowEmpty = false } = {}) {
   return null;
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192, numPredict = 1200, repeatPenalty, format, model }) {
-  const options = { num_ctx: numCtx, num_predict: numPredict, temperature };
+// Live GPU-capacity snapshot, refreshed at most once per CAPACITY_TTL_MS -- nvidia-smi/
+// /api/ps are cheap but not free, and every real call already pays a multi-second-plus
+// network round trip, so a few minutes of staleness on the sizing inputs costs nothing while
+// still tracking real changes (a different model loaded, more/less VRAM free) far faster than
+// a human editing a constant ever would. Any failure anywhere in this chain resolves to
+// `null` and every caller below falls back to this module's pre-existing fixed defaults.
+const CAPACITY_TTL_MS = 5 * 60 * 1000;
+let capacityCache = { snapshot: null, refreshedAt: 0 };
+
+async function getCapacitySnapshot() {
+  const now = Date.now();
+  if (capacityCache.snapshot && (now - capacityCache.refreshedAt) < CAPACITY_TTL_MS) {
+    return capacityCache.snapshot;
+  }
+  let snapshot = null;
+  try {
+    const vram = gpuVram.queryVram();
+    const modelInfo = vram ? await gpuVram.queryLoadedModel(OLLAMA_URL, MODEL) : null;
+    if (vram && modelInfo && modelInfo.numCtx > 0) {
+      snapshot = gpuCapacity.computeMaxSafeNumCtx({
+        totalVramMiB: vram.totalVramMiB,
+        usedVramMiB: vram.usedVramMiB,
+        modelWeightMiB: modelInfo.modelWeightMiB,
+        currentNumCtx: modelInfo.numCtx,
+      });
+    }
+  } catch {
+    snapshot = null;
+  }
+  capacityCache = { snapshot, refreshedAt: now };
+  return snapshot;
+}
+
+function estimateTokens(text) {
+  return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
+}
+
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs }) {
+  const promptTokens = estimateTokens(prompt);
+
+  let resolvedNumCtx = numCtx;
+  if (!resolvedNumCtx) {
+    const capacity = await getCapacitySnapshot();
+    resolvedNumCtx = capacity
+      ? gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict, maxSafeNumCtx: capacity.maxSafeNumCtx })
+      : gpuCapacity.DEFAULT_NUM_CTX;
+  }
+
+  const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
 
   const body = { model: model || MODEL, prompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
@@ -85,21 +135,38 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx = 8192
   const instancesDir = resolveInstancesDir();
   const lockModel = model || MODEL;
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
+  const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir });
   try {
-    return await postJson(`${OLLAMA_URL}/api/generate`, body, REQUEST_TIMEOUT_MS);
+    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs);
+    ornithThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
+    return result;
   } finally {
     inflightLock.release(lockPath);
   }
 }
 
-// 4 minutes is a deliberate overtime-fail line, not a safety margin around the worst call
-// ever seen (5.3 min as of 2026-07-18, well above this) -- a call running this long is
-// treated as a basic requirement violation in its own right, regardless of whether it
-// might eventually succeed. A timeout here crashes the worker process (no per-iteration
-// try/catch in ornith-worker.ps1's main loop), which makes queue-watchdog.ps1's existing
-// dead-process check (PID gone) fire on its next poll, instead of waiting on a
-// heartbeat-staleness check that never triggers while the PID is still alive.
-const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
+// PER_CALL_TIMEOUT_CEILING_MS stays at the pipeline's pre-existing 4-minute ceiling, not
+// ollama-http.js's full 5-minute hard ceiling -- dead-process-check.js's
+// WORKER_ZOMBIE_THRESHOLD_SECONDS (20 min) was sized against "up to 4 sequential
+// ornithCall()s per task, each individually bounded by 240s -- worst case ~960s" with
+// deliberate slack to 1200s. Letting a single call float all the way to 300s would erase
+// that slack (4*300s = 1200s, exactly the zombie threshold, zero margin) without anyone
+// having revisited that math -- so a computed timeout here can come in BELOW 240s for cheap
+// calls (failing faster, freeing a stuck lane sooner) but never above it. An explicit
+// ORNITH_TIMEOUT_MS still overrides everything below, same as before this module existed.
+const PER_CALL_TIMEOUT_CEILING_MS = 240_000;
+const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.ORNITH_TIMEOUT_MS) || null;
+
+function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
+  if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
+  const tokensPerSecond = ornithThroughput.getTokensPerSecond(instancesDir);
+  return gpuCapacity.resolveTimeoutMs({
+    promptTokens,
+    numPredict,
+    tokensPerSecond,
+    ceilingMs: PER_CALL_TIMEOUT_CEILING_MS,
+  });
+}
 
 // Calls Ornith once, retrying up to maxRetries times if the degenerate-output detector
 // fires — per the doc, degeneracy is usually a transient inference-state glitch that
