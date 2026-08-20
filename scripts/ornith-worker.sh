@@ -142,10 +142,48 @@ process_drafting_file() {
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
     printf '[worker-%s] ready for review: %s\n' "$INSTANCE_ID" "$task_id"
   else
-    # Draft call itself failed (e.g. Ollama unreachable) -- leave the file in drafting/
-    # rather than lose it; the leftover-drafting resume pass at the top of the NEXT tick
-    # retries it automatically.
+    # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
+    # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
+    # of the NEXT tick, but NOT forever: bounded by DRAFT_FAILURE_RETRY_LIMIT, same
+    # "bounded retries, then hold for a human" shape reject-retry-check.js's own
+    # MaxOrnithRejectRetries already uses for review-stage rejections. Confirmed live
+    # 2026-08-20: a single candidate stuck on repeated 240s Ollama timeouts retried every
+    # tick for hours with no cap -- and because task-sources.js's hasDraftingWork counts
+    # ANY file sitting in drafting/ as backlog regardless of why it's stuck there, this
+    # one persistently-failing task silently starved this entire lane's future task
+    # generation (including pipeline_self_audit, which only runs when this lane has
+    # nothing else to do) the whole time, with no error anywhere that looked like the
+    # real cause.
     printf '[worker-%s] draft call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
+    failure_count="$(node -e '
+      const fs = require("fs");
+      const p = process.argv[1];
+      try {
+        const o = JSON.parse(fs.readFileSync(p, "utf8"));
+        o.draftFailureCount = (o.draftFailureCount || 0) + 1;
+        fs.writeFileSync(p, JSON.stringify(o, null, 2));
+        console.log(o.draftFailureCount);
+      } catch (e) { console.log(1); }
+    ' "$wpath")"
+    if [[ "${failure_count:-1}" -ge "${DRAFT_FAILURE_RETRY_LIMIT:-5}" ]]; then
+      reason="draft call failed ${failure_count} times in a row (most recent: ${draft_result}) -- giving up rather than retrying every tick forever and starving this lane"
+      node -e '
+        const fs = require("fs");
+        const p = process.argv[1];
+        const reason = process.argv[2];
+        try {
+          const o = JSON.parse(fs.readFileSync(p, "utf8"));
+          o.blockedStage = "draft";
+          o.blockedReason = reason;
+          o.history = o.history || [];
+          o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+        } catch (e) { /* best-effort -- the mv below still frees the lane either way */ }
+      ' "$wpath" "$reason"
+      mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
+      printf '[worker-%s] giving up on %s after %s failed draft attempts -- moved to blocked/\n' "$INSTANCE_ID" "$task_id" "$failure_count" >&2
+    fi
   fi
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
 }
