@@ -774,122 +774,187 @@ test('nextPathPrefetchResolveTask processes held tasks oldest-file-first, skippi
   assert.equal(task.promptContext.heldTaskId, 'held-target');
 });
 
+// REDIRECTED 2026-08-20 (Grimmethy: "What tangible benefits are we getting from the huge
+// number of observability review tasks?" -> "Make sure it's fixing our project."):
+// observability_review now scans repoRoot (the active project) directly instead of
+// deep_dive's cloned external repos, so the fixture writes source files straight under
+// the fixture repo dir itself -- freshTaskSources() already points AGENT_MANAGER_REPO_ROOT
+// there.
 function makeObservabilityFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
-  process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH = path.join(dir, 'deep-dive-coverage.json');
   process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH = path.join(dir, 'observability-coverage.json');
   return dir;
 }
 
-// Real clone dir a fixture deep-dive-coverage.json points at, containing one file with
-// a genuine silent-catch-block finding -- exercises observability-scan.js for real
-// (no mocking), same "test the real scanner behavior, not a stub" approach the rest of
-// this suite uses for its other file-based sources.
-function writeOnboardedProject(dir, slug) {
-  const clonePath = path.join(dir, 'clones', slug);
-  fs.mkdirSync(clonePath, { recursive: true });
-  fs.writeFileSync(path.join(clonePath, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
-  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify({
-    projects: { [slug]: { sourceUrl: `https://example.com/${slug}`, clonePath, clonedAt: new Date(0).toISOString(), communities: [] } },
-  }));
-  return clonePath;
+// Writes a real file with a genuine silent-catch-block finding directly under the
+// project root -- exercises observability-scan.js for real (no mocking), same "test the
+// real scanner behavior, not a stub" approach the rest of this suite uses.
+function writeObservabilityFinding(dir, relPath = 'worker.js', content = 'try {\n  risky();\n} catch {}\n') {
+  const filePath = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content);
+  return filePath;
 }
 
-test('nextObservabilityReviewTask returns null when deep-dive-coverage.json does not exist', () => {
+test('nextObservabilityReviewTask returns null (and still records lastScannedAt) when the project has no findings', () => {
   const dir = makeObservabilityFixtureRepo();
   const { nextObservabilityReviewTask } = freshTaskSources(dir);
   assert.equal(nextObservabilityReviewTask(), null);
+  const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, 'utf8'));
+  assert.ok(coverage.lastScannedAt);
 });
 
-test('nextObservabilityReviewTask scans a newly-onboarded project and returns a triage task for the first finding', () => {
+test('nextObservabilityReviewTask scans the active project and returns a triage task for the first finding', () => {
   const dir = makeObservabilityFixtureRepo();
-  writeOnboardedProject(dir, 'demo-project');
+  writeObservabilityFinding(dir);
   const { nextObservabilityReviewTask } = freshTaskSources(dir);
+  const projectTag = path.basename(dir);
 
   const task = nextObservabilityReviewTask();
   assert.ok(task);
   assert.equal(task.source, 'observability_review');
   assert.equal(task.promptContext.rule, 'silent-catch-block');
-  assert.equal(task.promptContext.projectSlug, 'demo-project');
+  assert.equal(task.promptContext.projectSlug, projectTag);
   assert.equal(task.promptContext.file, 'worker.js');
   assert.match(task.promptContext.snippet, /risky\(\)/);
 
   const coverage = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, 'utf8'));
-  assert.ok(coverage.projects['demo-project'].scannedAt);
+  assert.ok(coverage.lastScannedAt);
 
   const flags = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'observability-flags.json'), 'utf8'));
   assert.equal(flags.length, 1);
 });
 
-test('nextObservabilityReviewTask does not rescan a project already marked scanned', () => {
+test('nextObservabilityReviewTask does not rescan within OBSERVABILITY_RESCAN_INTERVAL_MS', () => {
   const dir = makeObservabilityFixtureRepo();
-  writeOnboardedProject(dir, 'demo-project');
+  writeObservabilityFinding(dir);
   const { nextObservabilityReviewTask } = freshTaskSources(dir);
+  const projectTag = path.basename(dir);
 
-  nextObservabilityReviewTask(); // first call scans + queues the one finding
+  const first = nextObservabilityReviewTask(); // first call scans + queues the one finding
   const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
   const flagsAfterFirst = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
 
   // Simulate the first finding's task now sitting in pending/ so the next call must move on.
   const pendingDir = path.join(dir, 'queue', 'pending');
   fs.mkdirSync(pendingDir, { recursive: true });
-  const finding = flagsAfterFirst[0];
-  const taskId = `observability-demo-project-silent-catch-block-worker-js-${finding.line}`;
-  fs.writeFileSync(path.join(pendingDir, `${taskId}.json`), '{}');
-
-  assert.equal(nextObservabilityReviewTask(), null); // no re-scan, no duplicate flags, nothing new to offer
-  const flagsAfterSecond = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
-  assert.equal(flagsAfterSecond.length, flagsAfterFirst.length);
-});
-
-test('nextObservabilityReviewTask skips a finding whose task already exists in the queue', () => {
-  const dir = makeObservabilityFixtureRepo();
-  writeOnboardedProject(dir, 'demo-project');
-  const { nextObservabilityReviewTask } = freshTaskSources(dir);
-
-  // Pre-scan once to learn the real finding's line number, then pre-seed its task id.
-  const first = nextObservabilityReviewTask();
-  fs.unlinkSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH); // force a fresh run below to re-hit the same finding
-  fs.unlinkSync(path.join(dir, 'queue', 'observability-flags.json'));
-
-  const pendingDir = path.join(dir, 'queue', 'pending');
-  fs.mkdirSync(pendingDir, { recursive: true });
   fs.writeFileSync(path.join(pendingDir, `${first.id}.json`), '{}');
 
+  // A SECOND finding appears on disk, but the coverage timestamp is fresh (just written
+  // above), so this must not be due for a rescan yet -- it should stay invisible until
+  // the interval elapses, same "don't hammer the same tree every tick" reasoning the
+  // daily interval exists for.
+  writeObservabilityFinding(dir, 'other.js', 'try {\n  risky2();\n} catch {}\n');
+
   assert.equal(nextObservabilityReviewTask(), null);
+  const flagsAfterSecond = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  assert.equal(flagsAfterSecond.length, flagsAfterFirst.length); // no rescan happened
+});
+
+test('nextObservabilityReviewTask rescans once the interval elapses, dedupes against already-flagged findings, and prunes flags for deleted files', () => {
+  const dir = makeObservabilityFixtureRepo();
+  const staleFilePath = writeObservabilityFinding(dir, 'stale.js');
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+  const projectTag = path.basename(dir);
+
+  // Seed coverage as scanned long enough ago that a rescan is due, with a pre-existing
+  // flag matching stale.js's real finding (so the rescan's dedupe must not double it)
+  // plus a second flag for a file that's about to be deleted (so the rescan's prune must
+  // drop it).
+  fs.writeFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, JSON.stringify({
+    lastScannedAt: new Date(0).toISOString(),
+  }));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const flagsPath = path.join(dir, 'queue', 'observability-flags.json');
+  fs.writeFileSync(flagsPath, JSON.stringify([
+    { rule: 'silent-catch-block', file: 'stale.js', line: 3, detail: 'already known', projectSlug: projectTag, scannedAt: new Date(0).toISOString() },
+    { rule: 'silent-catch-block', file: 'deleted.js', line: 5, detail: 'file about to be removed', projectSlug: projectTag, scannedAt: new Date(0).toISOString() },
+  ]));
+  fs.unlinkSync(staleFilePath); // stale.js itself is gone too, but its flag line matches what scanProject would find on a fresh copy below
+  writeObservabilityFinding(dir, 'stale.js'); // re-write with the SAME content so the real scan re-finds the identical (file, line, rule)
+  writeObservabilityFinding(dir, 'fresh.js', 'try {\n  riskyFresh();\n} catch {}\n'); // a genuinely new finding
+
+  nextObservabilityReviewTask();
+  const flags = JSON.parse(fs.readFileSync(flagsPath, 'utf8'));
+  const keys = flags.map((f) => `${f.file}:${f.line}`).sort();
+  assert.deepEqual(keys, ['fresh.js:3', 'stale.js:3']); // deleted.js pruned, stale.js not duplicated, fresh.js added
 });
 
 // 2026-08-19, Grimmethy: "I'm seeing a lot of performance triage in blocked ... look for
-// a permanent fix." Root cause: queue/observability-flags.json (and its performance
-// twin below) is a persistent, append-only queue -- a project is scanned once ever (see
-// the "already scanned once" skip in nextObservabilityReviewTask itself), so a flag
-// written by an OLDER scanner run stays queueable forever even after scanProject's own
-// isLikelyMinified skip is fixed. Confirmed live: 082346c added that scan-time skip, but
-// flags.json already held stale entries from before the fix, and they kept draining into
-// new, still-unfixable-by-design tasks for a full day afterward. This test seeds exactly
-// that stale-flag shape directly (bypassing the scanner) to prove the CONSUMER now
-// re-validates isLikelyMinified against current file content, closing the gap regardless
-// of how or when a bad flag entered the file.
-test('nextObservabilityReviewTask skips a stale flag whose target file is now minified, even though the project is already marked scanned', () => {
+// a permanent fix." Root cause: queue/observability-flags.json is a persistent queue, so
+// a flag written before a scanner fix landed could stay queueable forever. This test
+// seeds exactly that stale-flag shape directly (bypassing the scanner, and with a fresh
+// lastScannedAt so no rescan/prune runs first) to prove the CONSUMER still re-validates
+// isLikelyMinified against current file content regardless of how or when a bad flag
+// entered the file.
+test('nextObservabilityReviewTask skips a stale flag whose target file is now minified, even when not due for a rescan', () => {
   const dir = makeObservabilityFixtureRepo();
-  const clonePath = writeOnboardedProject(dir, 'demo-project');
-  fs.writeFileSync(path.join(clonePath, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'bundle.js'), 'x'.repeat(3000)); // one line > MINIFIED_LINE_LENGTH_THRESHOLD (2000)
+  const projectTag = path.basename(dir);
 
-  // Simulate the project already being marked scanned (as it would be, hours or days
-  // after the real scan ran) with a stale flag already sitting in the queue for the now-
-  // minified file -- scanProject is never called again for an already-scanned project, so
-  // this flag would otherwise sit there forever regardless of what scanProject itself
-  // would say about bundle.js today.
   fs.writeFileSync(process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH, JSON.stringify({
-    projects: { 'demo-project': { scannedAt: new Date(0).toISOString() } },
+    lastScannedAt: new Date().toISOString(), // fresh -- not due for a rescan, so the stale flag survives untouched by prune/dedupe
   }));
   fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'queue', 'observability-flags.json'), JSON.stringify([
-    { rule: 'silent-catch-block', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: 'demo-project', scannedAt: new Date(0).toISOString() },
+    { rule: 'silent-catch-block', file: 'bundle.js', line: 1, detail: 'stale pre-fix flag', projectSlug: projectTag, scannedAt: new Date(0).toISOString() },
   ]));
 
   const { nextObservabilityReviewTask } = freshTaskSources(dir);
   assert.equal(nextObservabilityReviewTask(), null);
+});
+
+// observability_fix (2026-08-20): the follow-up stage a "genuine" observability_review
+// verdict now actually reaches -- full round trip: observability_review's registered
+// apply() writes a candidate to observabilityFixCandidatesPath, then observability_fix's
+// own next() (nextCandidateFulfillmentTask against that same path) picks it up as a real
+// fixable task, exactly mirroring arch_discovery -> arch_review's already-working pair.
+test('observability_review genuine verdict -> apply writes a candidate -> observability_fix offers it as a real task', () => {
+  const dir = makeObservabilityFixtureRepo();
+  process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = path.join(dir, 'OBSERVABILITY_FIX_CANDIDATES.md');
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  freshTaskSources(dir); // registers observability_review + observability_fix
+
+  const genuineImplementResponse = [
+    '### AC-001 · Silent catch swallows fetch errors',
+    'Strength: Strong',
+    'Files: worker.js',
+    '',
+    'Problem:',
+    'The catch block hides network failures from the user.',
+    '',
+    'Solution:',
+    'Log the error and surface a visible failure state.',
+    '',
+    'Benefits:',
+    'Real errors are debuggable instead of silently vanishing.',
+  ].join('\n');
+
+  const observabilityReview = getRegisteredSource('observability_review');
+  const applyResult = observabilityReview.apply({ implementResponse: genuineImplementResponse });
+  assert.equal(applyResult.skipped, undefined); // NOT the no-op path -- a real candidate was written
+  assert.equal(applyResult.candidateCount, 1);
+  assert.ok(fs.existsSync(process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH));
+
+  const { nextCandidateFulfillmentTask } = require('./task-sources.js');
+  const fixTask = nextCandidateFulfillmentTask(process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH, 'observability_fix');
+  assert.ok(fixTask);
+  assert.equal(fixTask.source, 'observability_fix');
+  assert.match(fixTask.title, /Silent catch swallows fetch errors/);
+  assert.deepEqual(fixTask.promptContext.files, ['worker.js']);
+});
+
+test('observability_review false-positive verdict -> apply is a clean no-op, no candidate written', () => {
+  const dir = makeObservabilityFixtureRepo();
+  process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = path.join(dir, 'OBSERVABILITY_FIX_CANDIDATES.md');
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  freshTaskSources(dir);
+
+  const observabilityReview = getRegisteredSource('observability_review');
+  const applyResult = observabilityReview.apply({ implementResponse: 'False positive: this catch intentionally no-ops for a known-safe case.' });
+  assert.equal(applyResult.skipped, true);
+  assert.equal(fs.existsSync(process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH), false);
 });
 
 function makePerformanceFixtureRepo() {

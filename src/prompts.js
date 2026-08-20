@@ -300,26 +300,40 @@ function observabilityReviewPlanPrompt(task) {
   return assemblePrompt(stable, volatile);
 }
 
-// observability_review's implement pass (fix, 2026-07-26): this source registered ONLY a
-// buildPlanPrompt, no buildImplementPrompt/apply -- so its implement pass silently fell
-// through to genericFallbackImplementPrompt ("write the concrete next step of that plan"),
-// which does not fit a judgment-verdict plan (there IS no "step 1" to implement) at all.
-// Confirmed live 2026-07-26 on a real blocked task: the plan was a correct, well-reasoned
-// FALSE POSITIVE verdict, and Ornith's implement response was a perfectly sensible "there
-// are no numbered steps in this plan... nothing remains to implement" -- Ornith did the
-// right thing given a mismatched prompt; the bug was never an Ornith reliability issue.
-// This task type never produces a real code fix (that would be a separate follow-up task,
-// same as arch_discovery filing a candidate rather than fixing it immediately) -- the
-// implement pass just needs a short prose summary of the plan's verdict, not JSON or a
-// diff, so there's one fewer parsing failure mode than a structured-output requirement
-// would add.
+// observability_review's implement pass. REDIRECTED 2026-08-20 (Grimmethy: "What
+// tangible benefits are we getting from the huge number of observability review tasks?"
+// -> "Make sure it's fixing our project"): a genuine verdict now writes a real, fixable
+// candidate in the SAME format arch_discovery's own implement pass uses
+// (archDiscoveryImplementPrompt below), consumed by observability_fix
+// (task-sources.js) into an actual code diff -- closing the gap the old prompt merely
+// promised ("a genuine issue becomes a separate follow-up task later") but never had a
+// mechanism for. A false-positive/uncertain verdict still gets the original short-prose
+// treatment (2026-07-26 fix's own reasoning still applies: no numbered "steps" to
+// implement for a non-finding, so don't ask for JSON/a diff on that path).
 function observabilityReviewImplementPrompt(task, planText) {
   return [
-    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding -- there is no further code change to make in this task (a genuine issue becomes a separate follow-up task later, the same way an architecture-discovery finding becomes a candidate rather than an immediate fix).',
+    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding in OUR OWN project.',
     '',
     planText,
     '',
-    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: state whether it was genuine/false-positive/uncertain, and if genuine, what the concrete fix would look like. Plain prose only -- no JSON, no code fence, no "steps".',
+    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Title',
+    'Strength: Strong',
+    `Files: ${task.promptContext.file || '(the file from the finding above)'}`,
+    '',
+    'Problem:',
+    'A paragraph describing the concrete observability gap, grounded in the snippet you were given.',
+    '',
+    'Solution:',
+    'A paragraph describing the specific fix (e.g. what to log, what to rethrow, what health signal to add) -- scoped to exactly this finding, nothing broader.',
+    '',
+    'Benefits:',
+    'A paragraph describing what improves once fixed.',
+    '',
+    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
   ].join('\n');
 }
 
@@ -743,6 +757,10 @@ updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildIm
 // duplicate copy that would just drift, same reasoning as
 // nextCandidateFulfillmentTask() itself being parameterized instead of copy-pasted.
 updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+// observability_fix (2026-08-20): identical promptContext shape (candidateId, title,
+// files, body) from nextCandidateFulfillmentTask as arch_review/arch_import_review --
+// same reuse, no new prompt needed.
+updateTaskSource('observability_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });

@@ -98,12 +98,24 @@ function getConfig() {
   // repo any more than INDEX.md itself is.
   const deepDiveCoveragePath = process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH
     || path.join(pipelineDir, 'deep-dive-coverage.json');
-  // observability_review (project idea "OpenTelemetry-Observability-Idea", 2026-07-26)
-  // rides on deep_dive's already-cloned projects (deepDiveCoveragePath) rather than
-  // cloning its own copies -- this just tracks which of THOSE projects have already been
-  // scanned by observability-scan.js, so a project is scanned exactly once, not every tick.
+  // observability_review -- REDIRECTED 2026-08-20 (Grimmethy: "What tangible benefits are
+  // we getting from the huge number of observability review tasks?" -> "Make sure it's
+  // fixing our project.") from scanning deep_dive's cloned EXTERNAL repos to scanning
+  // repoRoot (the active project) itself: findings in someone else's unmaintained clone,
+  // with no fix mechanism at all, were pure triage cost with zero shipped value (2,025
+  // real Ollama calls / ~5.6h wall-clock over 5 days, 313 "genuine" verdicts, 0 fixes).
+  // Unlike a frozen external clone, repoRoot changes constantly (real commits landing),
+  // so "scan once, never again" no longer fits -- this now tracks a single lastScannedAt
+  // (re-scan once per OBSERVABILITY_RESCAN_INTERVAL_MS) instead of a per-project map.
   const observabilityCoveragePath = process.env.AGENT_MANAGER_OBSERVABILITY_COVERAGE_PATH
     || path.join(pipelineDir, 'observability-coverage.json');
+  // Where a "genuine issue" verdict now actually lands as a real, fixable candidate --
+  // same format/consumer machinery as ARCH_REVIEW_CANDIDATES.md (nextCandidateFulfillmentTask
+  // is fully generic), reused rather than reinvented. This closes the gap the prompt used
+  // to promise ("a genuine issue becomes a separate follow-up task later") but never
+  // actually built.
+  const observabilityFixCandidatesPath = process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH
+    || path.join(repoRoot, 'Docs', 'OBSERVABILITY_FIX_CANDIDATES.md');
   // performance_review (Brain Dump #94, 2026-08-18) -- same "ride on deep_dive's already-
   // cloned projects, track which ones this scanner has covered" shape as
   // observability_review immediately above.
@@ -187,6 +199,7 @@ function getConfig() {
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
+    observabilityFixCandidatesPath,
     selfAuditCoveragePath,
     performanceCoveragePath,
     brainDumpPath,
