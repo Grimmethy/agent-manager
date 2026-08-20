@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { checkFilePaths, resolveAgainstRepo, findByBasename } = require('./fact-checker.js');
+const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets } = require('./fact-checker.js');
 
 function makeRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
@@ -157,4 +157,52 @@ test('replaying the real deep-dive-plan-cascade-18 draft against the actual clon
   for (const c of checks) {
     assert.equal(c.exists, true, `${c.claimedPath} should resolve via the basename-search fallback`);
   }
+});
+
+// --- Replay of the THIRD real incident: product_spec's first-ever live run (2026-08-20,
+// against a brand-new crm-plugin repo) auto-rejected in review because a Group B
+// `mode:"create"` draft's OWN target got flagged as a "missing file" -- exactly correct
+// and expected for a create (the file isn't supposed to exist yet), not fabrication. ---
+
+test('extractCreateModeTargets finds a single create-mode object\'s own target', () => {
+  const draft = JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '# Spec' });
+  const targets = extractCreateModeTargets(draft);
+  assert.ok(targets.has('Docs/PRODUCT_SPEC.md'));
+});
+
+test('extractCreateModeTargets finds create-mode targets inside a multi-file array, ignoring edit/delete entries', () => {
+  const draft = JSON.stringify([
+    { mode: 'create', file: 'src/new-thing.js', content: '...' },
+    { mode: 'edit', file: 'src/existing.js', find: 'a', replace: 'b' },
+    { mode: 'delete', file: 'src/old.js' },
+  ]);
+  const targets = extractCreateModeTargets(draft);
+  assert.deepEqual([...targets], ['src/new-thing.js']);
+});
+
+test('extractCreateModeTargets returns an empty set for non-Group-B prose (e.g. a brain_dump_sort/research draft), not a throw', () => {
+  assert.deepEqual([...extractCreateModeTargets('This is plain prose, not JSON.')], []);
+});
+
+test('checkDraft does not flag a create-mode draft\'s own target as a missing-file fabrication signal (the live 2026-08-20 product_spec incident)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const draft = JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '# Product Spec\n\n## Entities\n' });
+
+  const result = checkDraft(draft, dir);
+  assert.deepEqual(result.flags.filter((f) => f.type === 'missing-file'), []);
+  // Still recorded in fileChecks for transparency -- only the derived flag is suppressed.
+  const check = result.fileChecks.find((c) => c.claimedPath === 'Docs/PRODUCT_SPEC.md');
+  assert.equal(check.exists, false);
+});
+
+test('checkDraft still flags a genuinely fabricated path referenced by an edit/delete (not the create target) as missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const draft = JSON.stringify([
+    { mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '# Spec' },
+    { mode: 'edit', file: 'src/does-not-exist.js', find: 'a', replace: 'b' },
+  ]);
+
+  const result = checkDraft(draft, dir);
+  const missing = result.flags.filter((f) => f.type === 'missing-file').map((f) => f.detail);
+  assert.deepEqual(missing, ['src/does-not-exist.js']);
 });
