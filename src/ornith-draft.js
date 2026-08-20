@@ -279,9 +279,20 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // real-world cutoffs above; floor keeps the 2800 that already worked for
       // small/medium tasks, ceiling bounds worst-case latency/cost.
       const planChars = (task.planResponse || '').length;
+      // product_spec (confirmed live 2026-08-20, romance-plugin's first bootstrap run):
+      // this source's implement pass produces a whole standalone document (entities,
+      // relationships, a state machine, an API table, decisions) rather than a bounded
+      // code diff -- the SAME planChars*2 scaling that comfortably covers "8 files changed"
+      // for a code task genuinely undershoots "write the full spec," and got caught mid-
+      // document by review's truncation check (correctly -- the alternative is a silently
+      // incomplete spec landing as though it were complete). Every OTHER Group B source's
+      // output is bounded by how much of an existing file it's allowed to touch; a spec
+      // doc has no such natural ceiling, so it gets a higher one instead of the shared
+      // 8000-token cap "bounds worst-case latency/cost" default.
+      const implNumPredictCeiling = task.source === 'product_spec' ? 16000 : 8000;
       const implNumPredict = hasFixedLiterals
-        ? Math.min(8000, Math.max(1400, fixedLiteralsChars))
-        : Math.min(8000, Math.max(2800, planChars * 2));
+        ? Math.min(implNumPredictCeiling, Math.max(1400, fixedLiteralsChars))
+        : Math.min(implNumPredictCeiling, Math.max(2800, planChars * 2));
       // think:false when fixedLiterals are present -- num_predict is a cap on TOTAL
       // generated tokens, thinking trace included, so a "think" pass spent reasoning
       // about a plain transcription task eats directly into the same budget the actual
