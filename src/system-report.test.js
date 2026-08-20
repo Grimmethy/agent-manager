@@ -8,6 +8,7 @@ const path = require('path');
 
 const {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns,
   renderMarkdown, generateReport, checkDue, loadSchedule,
 } = require('./system-report.js');
 const { appendSample } = require('./uptime-log.js');
@@ -175,4 +176,92 @@ test('checkDue: generates only the periods whose interval has elapsed since last
   const schedule = loadSchedule(instancesDir);
   assert.equal(schedule.hourly.lastGeneratedAt, oneHourLater.toISOString());
   assert.equal(schedule.daily.lastGeneratedAt, '2026-08-19T10:00:00.000Z'); // untouched
+});
+
+// Queue Health / Self-Audit Activity / Failure Patterns (2026-08-20, Grimmethy: "We need
+// to build this sort of analysis into the daily report" -- after a manual investigation
+// found a multi-day review-runner stall the report's own task-count numbers had no way to
+// show, since nothing had reached a terminal state to be counted).
+
+test('computeQueueHealth counts every live queue state, including nested drafting/<instance>/', () => {
+  const dir = tempDir();
+  writeTask(path.join(dir, 'queue', 'pending'), 'p1', {});
+  writeTask(path.join(dir, 'queue', 'review'), 'r1', {});
+  writeTask(path.join(dir, 'queue', 'review'), 'r2', {});
+  writeTask(path.join(dir, 'queue', 'drafting', 'worker-1'), 'd1', {});
+  writeTask(path.join(dir, 'queue', 'blocked'), 'b1', {});
+
+  const health = computeQueueHealth(dir, new Date('2026-08-20T12:00:00.000Z'));
+  assert.equal(health.counts.pending, 1);
+  assert.equal(health.counts.review, 2);
+  assert.equal(health.counts.drafting, 1);
+  assert.equal(health.counts.blocked, 1);
+  assert.equal(health.counts.approved, 0);
+});
+
+test('computeQueueHealth reports the oldest review/pending item age in seconds', () => {
+  const dir = tempDir();
+  const reviewDir = path.join(dir, 'queue', 'review');
+  fs.mkdirSync(reviewDir, { recursive: true });
+  fs.writeFileSync(path.join(reviewDir, 'old.json'), '{}');
+  const oldTime = new Date('2026-08-17T00:00:00.000Z');
+  fs.utimesSync(path.join(reviewDir, 'old.json'), oldTime, oldTime);
+
+  const health = computeQueueHealth(dir, new Date('2026-08-20T00:00:00.000Z'));
+  assert.equal(health.oldestReviewAgeSec, 3 * 24 * 60 * 60);
+  assert.equal(health.oldestPendingAgeSec, null); // no pending/ dir at all
+});
+
+test('computeSelfAuditActivity only returns entries whose reportedAt falls in the window', () => {
+  const dir = tempDir();
+  const coveragePath = path.join(dir, 'self-audit-coverage.json');
+  fs.writeFileSync(coveragePath, JSON.stringify({
+    'arch_import::harness-search-zero-results': { reportedAt: '2026-08-20T05:00:00.000Z', taskId: 'pipeline-self-audit-1' },
+    'project_search::fabricated-ungrounded-claim': { reportedAt: '2026-08-19T05:00:00.000Z', taskId: 'pipeline-self-audit-2' },
+  }));
+
+  const activity = computeSelfAuditActivity(coveragePath, '2026-08-20T00:00:00.000Z', '2026-08-21T00:00:00.000Z');
+  assert.equal(activity.length, 1);
+  assert.equal(activity[0].taskId, 'pipeline-self-audit-1');
+});
+
+test('computeSelfAuditActivity on a missing coverage file returns an empty array, not a throw', () => {
+  assert.deepEqual(computeSelfAuditActivity('/does/not/exist.json', '2026-08-20T00:00:00.000Z', '2026-08-21T00:00:00.000Z'), []);
+});
+
+test('computeBlockedPatterns groups junk tasks by the same signature pipeline-self-audit.js clusters on', () => {
+  const tasks = [
+    { classification: 'junk', source: 'arch_import', history: [{ stage: 'harness-search', detail: '3 quer(y/ies), 0 hit(s), 0 file(s)' }] },
+    { classification: 'junk', source: 'arch_import', history: [{ stage: 'harness-search', detail: '2 quer(y/ies), 0 hit(s), 0 file(s)' }] },
+    { classification: 'junk', source: 'manual', blockedReason: 'The draft fabricates a repo that does not exist.' },
+    { classification: 'benefit', source: 'manual' }, // not junk -- excluded
+  ];
+  const result = computeBlockedPatterns(tasks);
+  assert.equal(result.totalJunk, 3);
+  assert.deepEqual(result.patterns, [
+    { signature: 'arch_import::harness-search-zero-results', count: 2 },
+    { signature: 'manual::fabricated-ungrounded-claim', count: 1 },
+  ]);
+  assert.equal(result.uncategorized, 0);
+});
+
+test('renderMarkdown includes Queue Health, Failure Patterns, and Self-Audit Activity sections when given the data', () => {
+  const md = renderMarkdown({
+    period: 'hourly',
+    startIso: '2026-08-20T10:00:00.000Z',
+    endIso: '2026-08-20T11:00:00.000Z',
+    tasks: [{ id: 't1', source: 'arch_import', classification: 'junk', history: [{ stage: 'harness-search', detail: '0 hit(s), 0 file(s)' }] }],
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+    timeAccounting: null,
+    queueHealth: { counts: { pending: 0, drafting: 0, review: 5, approved: 0, 'awaiting-confirm': 0, 'needs-clarification': 0, blocked: 10 }, oldestReviewAgeSec: 4 * 3600, oldestPendingAgeSec: null },
+    selfAuditActivity: [{ signature: 'arch_import::harness-search-zero-results', taskId: 'pipeline-self-audit-1', reportedAt: '2026-08-20T10:30:00.000Z' }],
+    blockedPatterns: { patterns: [{ signature: 'arch_import::harness-search-zero-results', count: 1 }], uncategorized: 0, totalJunk: 1 },
+  });
+  assert.match(md, /## Queue Health/);
+  assert.match(md, /review: 5/);
+  assert.match(md, /unusually old/); // 4h oldest review item should trip the warning
+  assert.match(md, /## Failure Patterns/);
+  assert.match(md, /arch_import::harness-search-zero-results.*1\/1/);
+  assert.match(md, /## Self-Audit Activity/);
+  assert.match(md, /pipeline-self-audit-1/);
 });
