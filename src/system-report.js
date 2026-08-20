@@ -356,6 +356,26 @@ function computeBlockedPatterns(tasks) {
   return { patterns, uncategorized, totalJunk: junkTasks.length };
 }
 
+// Renders an ISO timestamp in the SYSTEM's own local timezone (Grimmethy, 2026-08-20:
+// "We should change the time readout on time reports to match the systems time zone") --
+// every timestamp this module computes WITH (window boundaries, downtime gaps, schedule
+// state) stays UTC/ISO internally, since that's what's actually correct for date-math
+// across a DST transition; this only affects how a timestamp is DISPLAYED in the
+// rendered report text. Intl.DateTimeFormat's default timeZone already resolves to the
+// OS's own configured zone (confirmed live: America/Denver on this box) with no
+// hardcoded zone name and no extra config -- correct automatically if this pipeline ever
+// runs somewhere else. Falls back to the raw ISO string for a genuinely unparseable
+// input rather than throwing.
+function fmtLocal(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZoneName: 'short',
+  });
+}
+
 function fmtDuration(sec) {
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.round(sec / 60)}m`;
@@ -432,7 +452,7 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   }
 
   const lines = [];
-  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${startIso} to ${endIso}`);
+  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${fmtLocal(startIso)} to ${fmtLocal(endIso)}`);
   lines.push('');
   lines.push(`**Tasks completed:** ${tasks.length}`);
   lines.push('');
@@ -497,7 +517,7 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
 
   if (selfAuditActivity && selfAuditActivity.length > 0) {
     lines.push('## Self-Audit Activity (pipeline_self_audit)');
-    for (const a of selfAuditActivity) lines.push(`- \`${a.signature}\` reported at ${a.reportedAt} → ${a.taskId}`);
+    for (const a of selfAuditActivity) lines.push(`- \`${a.signature}\` reported at ${fmtLocal(a.reportedAt)} → ${a.taskId}`);
     lines.push('');
   }
 
@@ -505,7 +525,7 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   lines.push(`- Total pipeline downtime: ${fmtDuration(downtime.pipelineDownSec)} (out of ${fmtDuration((new Date(endIso) - new Date(startIso)) / 1000)} in this period)`);
   if (downtime.pipelineDownIntervals.length) {
     lines.push('- Down intervals:');
-    for (const iv of downtime.pipelineDownIntervals) lines.push(`  - ${iv.from} → ${iv.to}`);
+    for (const iv of downtime.pipelineDownIntervals) lines.push(`  - ${fmtLocal(iv.from)} → ${fmtLocal(iv.to)}`);
   }
   const perInstance = Object.entries(downtime.perInstanceDownSec);
   if (perInstance.length) {
@@ -604,7 +624,7 @@ function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, selfAudit
 
 module.exports = {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, renderMarkdown,
-  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary, fmtLocal,
   generateReport, checkDue, loadSchedule, saveSchedule, PERIOD_MS,
 };
 
