@@ -104,3 +104,57 @@ test('buildImplementPrompt tells the model to use create mode when no spec doc e
   assert.match(prompt, /write the FIRST version of the document/);
   assert.match(prompt, /mode "create"/);
 });
+
+// backlog_decomposition (2026-08-20) -- see task-sources.js's nextBacklogDecompositionTask
+// header for the full motivation.
+function backlogDecompositionTask(promptContextOverrides = {}) {
+  return {
+    domain: 'default', source: 'backlog_decomposition', title: 't',
+    promptContext: {
+      specText: '## Entities\n\n- Contact\n- Company\n- Deal\n',
+      specHash: 'abc123def456',
+      ...promptContextOverrides,
+    },
+  };
+}
+
+test('buildPlanPrompt tells the model to order steps schema-first, then operations, then dependents', () => {
+  const prompt = buildPlanPrompt(backlogDecompositionTask());
+  assert.match(prompt, /data model \/ schema first/);
+  assert.match(prompt, /- Contact/);
+  assert.match(prompt, /IN BUILD ORDER/);
+});
+
+test('buildPlanPrompt tells the model not to plan a step for something the spec left as an open question', () => {
+  const prompt = buildPlanPrompt(backlogDecompositionTask());
+  assert.match(prompt, /do not plan a step for it/);
+});
+
+test('buildImplementPrompt for backlog_decomposition emits the same AC-NNN candidate format arch_review\'s consumer already parses, and insists on preserving plan order', () => {
+  const prompt = buildImplementPrompt(backlogDecompositionTask(), 'PLAN:\n1. Schema\n2. API');
+  assert.match(prompt, /### AC-NNN · Title/);
+  assert.match(prompt, /Strength: Strong/);
+  assert.match(prompt, /IN THE SAME ORDER/);
+  assert.match(prompt, /whatever comes first in your output gets built first/);
+});
+
+// backlog_fulfillment reuses arch_review's own prompt builders verbatim -- these tests
+// just confirm the registration actually wires that reuse up, not the prompt content
+// itself (already covered by arch_review's own behavior).
+function backlogFulfillmentTask(promptContextOverrides = {}) {
+  return {
+    domain: 'default', source: 'backlog_fulfillment', title: 't',
+    promptContext: {
+      candidateId: 'AC-001', title: 'Set up Contact schema', files: [],
+      body: 'Problem:\nNo schema exists yet.\n\nSolution:\nAdd a Contact table.\n\nBenefits:\nUnblocks everything downstream.',
+      ...promptContextOverrides,
+    },
+  };
+}
+
+test('backlog_fulfillment is registered to reuse arch_review\'s own plan/implement prompt builders', () => {
+  const prompt = buildPlanPrompt(backlogFulfillmentTask());
+  assert.match(prompt, /AC-001/);
+  assert.match(prompt, /Set up Contact schema/);
+  assert.match(prompt, /No schema exists yet/);
+});

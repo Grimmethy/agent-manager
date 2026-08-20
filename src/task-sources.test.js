@@ -1592,3 +1592,63 @@ test('markPipelineSelfAuditReported writes coverage only when explicitly called,
   const next = nextPipelineSelfAuditTask();
   assert.equal(next, null);
 });
+
+// backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
+// header): turns a confirmed product spec into an ordered backlog. Idempotency is via a
+// spec-content hash baked into the task id (not a separate coverage file), checked
+// against taskIdExistsInQueue like every other source here.
+function writeProductSpecDoc(dir, content) {
+  fs.mkdirSync(path.join(dir, 'Docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'Docs', 'PRODUCT_SPEC.md'), content);
+}
+
+test('nextBacklogDecompositionTask returns null when no product spec exists yet', () => {
+  const dir = makeAdhocFixtureRepo();
+  const { nextBacklogDecompositionTask } = freshTaskSources(dir);
+  assert.equal(nextBacklogDecompositionTask(), null);
+});
+
+test('nextBacklogDecompositionTask returns a task carrying the full spec text once a spec exists', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecDoc(dir, '## Entities\n\n- Contact\n- Company\n');
+
+  const { nextBacklogDecompositionTask } = freshTaskSources(dir);
+  const task = nextBacklogDecompositionTask();
+  assert.ok(task);
+  assert.equal(task.source, 'backlog_decomposition');
+  assert.match(task.promptContext.specText, /- Contact/);
+  assert.match(task.id, /^backlog-decomposition-[0-9a-f]{12}$/);
+});
+
+test('nextBacklogDecompositionTask does not re-propose the same spec version once its task already exists in the queue', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecDoc(dir, '## Entities\n\n- Contact\n');
+
+  const { nextBacklogDecompositionTask } = freshTaskSources(dir);
+  const first = nextBacklogDecompositionTask();
+  assert.ok(first);
+
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, `${first.id}.json`), JSON.stringify({ id: first.id }));
+
+  assert.equal(nextBacklogDecompositionTask(), null);
+});
+
+test('nextBacklogDecompositionTask proposes a fresh task once the spec content actually changes', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeProductSpecDoc(dir, '## Entities\n\n- Contact\n');
+  const { nextBacklogDecompositionTask } = freshTaskSources(dir);
+  const first = nextBacklogDecompositionTask();
+
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, `${first.id}.json`), JSON.stringify({ id: first.id }));
+
+  // A genuine spec edit (e.g. a later product_spec task landing) changes the hash, so a
+  // NEW decomposition task is eligible even though the old spec version's is done.
+  writeProductSpecDoc(dir, '## Entities\n\n- Contact\n- Company\n- Deal\n');
+  const second = nextBacklogDecompositionTask();
+  assert.ok(second);
+  assert.notEqual(second.id, first.id);
+});

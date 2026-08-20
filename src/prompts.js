@@ -727,6 +727,62 @@ function productSpecImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
+// header): turns the confirmed spec into an ORDERED, dependency-aware sequence of real
+// feature-implementation candidates -- same two-call shape as arch_discovery (plan
+// identifies WHAT, implement writes the final AC-NNN candidate write-up(s)), reusing that
+// exact candidate format so nextCandidateFulfillmentTask can consume the result with zero
+// new code. The one thing this prompt insists on beyond arch_discovery's own instructions:
+// ORDER matters here in a way it doesn't for arch_discovery's independent friction points --
+// candidates must come out schema/data-model first, then core operations, then anything
+// that depends on those, because the consumer drains them strictly top-to-bottom.
+function backlogDecompositionPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'You are breaking a confirmed product specification down into an ORDERED backlog of real, buildable implementation steps.',
+    '',
+    'PRODUCT SPEC:',
+    '',
+    ctx.specText,
+    '',
+    'Write a numbered PLAN (no code, no candidate write-ups yet) listing the concrete implementation steps this spec calls for, IN BUILD ORDER: ' +
+      'data model / schema first (the entities and their relationships), then core operations on that data (create/read/update, key business rules), ' +
+      'then anything that depends on those (higher-level features, integrations, UI). Each step should be small enough to implement as one focused change, ' +
+      'not "build the whole system." Do not invent requirements the spec does not state; if the spec leaves something as an explicit open question or ' +
+      'deferred decision, do not plan a step for it -- note that it is blocked on a decision instead. Aim for the minimum ordered sequence that actually ' +
+      'gets from nothing to the spec being real, not an exhaustive wish list.',
+  ].join('\n');
+}
+
+function backlogDecompositionImplementPrompt(task, planText) {
+  return [
+    'Earlier you wrote this ordered PLAN for building out the product spec:',
+    '',
+    planText,
+    '',
+    'Now write ONLY the final candidate write-up(s) for each step in your plan, IN THE SAME ORDER -- this order is not cosmetic, ' +
+      'whatever comes first in your output gets built first. Do not reorder, skip, or merge steps from your plan without a reason stated in the write-up itself.',
+    '',
+    'Each candidate MUST use exactly this format (this must match the project\'s backlog-candidates doc convention exactly, or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Title',
+    'Strength: Strong',
+    'Files: comma, separated, file, paths (leave blank if this creates brand-new files with no existing path to name)',
+    '',
+    'Problem:',
+    'What part of the spec this step implements, and why it belongs at this point in the build order (what it depends on, if anything).',
+    '',
+    'Solution:',
+    'A paragraph describing the concrete change -- specific enough that a later drafting pass can implement it without re-reading the whole spec.',
+    '',
+    'Benefits:',
+    'What becomes possible once this step lands.',
+    '',
+    '(Strength may instead be "Worth exploring" or "Speculative" if you are less confident a step is correctly scoped or ordered.) ' +
+      'Use AC-001, AC-002, ... in your own draft -- the real numbering is assigned when this is written to the doc, so collisions do not matter here.',
+  ].join('\n');
+}
+
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -923,6 +979,12 @@ updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplem
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
+updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositionPlanPrompt, buildImplementPrompt: backlogDecompositionImplementPrompt });
+// backlog_fulfillment reuses arch_review's own prompt builders verbatim -- turning one
+// AC-NNN candidate (candidateId/title/files/body) into a real diff is the same job
+// regardless of which candidates doc it came from; see task-sources.js's
+// registerTaskSource('backlog_fulfillment', ...) header for the full reasoning.
+updateTaskSource('backlog_fulfillment', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 
