@@ -115,7 +115,25 @@ done
 #
 # Fix: sweep by COMMAND PATTERN, not pidfile, for exactly the two restart-eligible
 # scripts, and kill anything matching that this script didn't already account for.
-stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh' 2>/dev/null || true)"
+#
+# python/dashboard/app.py joined this same sweep (2026-08-20, confirmed live: a dashboard
+# process from a PRIOR, unrelated session -- pid alive since a previous day, never in any
+# pidfile this script or launch.sh ever wrote -- silently squatted the dashboard port for
+# days across many stop.sh/launch.sh cycles in between. Every subsequent launch.sh dashboard
+# start attempt failed to bind the already-held port and exited immediately, so "restart the
+# daemons" silently never actually restarted the dashboard component at all, while stop.sh
+# kept reporting "dashboard not running (stale pidfile)" -- true only of the pidfile it
+# happened to be tracking, not of the real long-lived squatter). Flask's own reloader
+# (app.run(..., use_reloader=True)) then compounds this: it re-execs a CHILD python process
+# under the same squatting parent, so the pidfile-tracked kill above can miss BOTH halves of
+# that pair even when the tracked pid IS the true parent. `pgrep -f` matches both the
+# reloader and its re-exec'd child (same cmdline), same as --keep-dashboard is honored below
+# by simply not adding this pattern when that flag is set.
+if [[ "$KEEP_DASHBOARD" != true ]]; then
+  stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh|python/dashboard/app\.py' 2>/dev/null || true)"
+else
+  stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh' 2>/dev/null || true)"
+fi
 for stray_pid in $stray_pids; do
   already_handled=false
   for pid in "${pids[@]}"; do
