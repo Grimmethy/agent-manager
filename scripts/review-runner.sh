@@ -71,16 +71,25 @@ while :; do                                                                     
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as ornith-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(ls -1 "$review_dir" 2>/dev/null)
+  done < <(ls -1tr "$review_dir" 2>/dev/null)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
-  # Iterate each item currently sitting in review/, oldest-name-first (task ids embed a
-  # creation timestamp, so lexical `ls` order is already chronological) -- same
-  # "drain the whole backlog before the next tick" choice ornith-worker.sh's claim loop
-  # makes, rather than review-runner.ps1's one-per-invocation pacing (that script relies on
-  # its OWN outer loop calling Invoke-ReviewPass again immediately after an 'approved'
-  # result; this script's single `while :; do ... sleep 30; done` loop has no equivalent
-  # fast-repeat path, so processing the whole snapshot per tick is what keeps a backlog
-  # from taking N*30s longer than it needs to).
+  # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
+  # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
+  # -- the new Queue Health section immediately caught 3 research_task items that had sat
+  # in review/ untouched since 2026-08-17, three days, well after the reviewer-starvation
+  # fix landed and was confirmed working. Root cause: this used to sort by plain `ls -1`
+  # lexical filename order on the theory that "task ids embed a creation timestamp, so
+  # lexical order is already chronological" -- true only WITHIN one source's own id
+  # scheme, false across different source prefixes: "observability-*" sorts before
+  # "research-*" alphabetically regardless of actual age, so a steady stream of newer
+  # observability_review items (55 in the last 11h alone) perpetually pushed the 3 much
+  # older research items to the back of every single tick's scan. mtime is a real,
+  # source-agnostic ordering.) Same "drain the whole backlog before the next tick" choice
+  # ornith-worker.sh's claim loop makes, rather than review-runner.ps1's one-per-invocation
+  # pacing (that script relies on its OWN outer loop calling Invoke-ReviewPass again
+  # immediately after an 'approved' result; this script's single `while :; do ... sleep
+  # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
+  # per tick is what keeps a backlog from taking N*30s longer than it needs to).
   for name in "${items[@]}"; do
     file="${review_dir}/${name}"
     [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check ornith-worker.sh's claim loop uses.

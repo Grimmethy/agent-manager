@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { readSamplesInWindow } = require('./uptime-log.js');
+const { signatureForTask } = require('./pipeline-self-audit.js');
 
 const PERIOD_MS = { hourly: 60 * 60 * 1000, daily: 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
 
@@ -120,7 +121,13 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
       if (!at) continue;
       const t = new Date(at).getTime();
       if (Number.isNaN(t) || t < start || t >= end) continue;
-      tasks.push({ id: task.id, source: task.source, domain: task.domain, at, queueState: state, classification: classifyTask(task, state) });
+      tasks.push({
+        id: task.id, source: task.source, domain: task.domain, at, queueState: state,
+        classification: classifyTask(task, state),
+        // Carried through for computeBlockedPatterns() below -- signatureForTask() needs
+        // the raw blockedReason/history, not just the coarse classification.
+        blockedReason: task.blockedReason, history: task.history,
+      });
     }
   }
   return tasks;
@@ -224,6 +231,126 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   return { bucketSec: Object.fromEntries(Object.entries(bucketMs).map(([k, v]) => [k, Math.round(v / 1000)])), bucketCalls };
 }
 
+const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 'needs-clarification', 'blocked'];
+
+function oldestFileAgeSec(dir, now) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return null;
+  }
+  if (entries.length === 0) return null;
+  let oldestMtime = null;
+  for (const name of entries) {
+    try {
+      const mtime = fs.statSync(path.join(dir, name)).mtimeMs;
+      if (oldestMtime === null || mtime < oldestMtime) oldestMtime = mtime;
+    } catch {
+      // skip an unreadable file rather than let it abort the whole scan
+    }
+  }
+  return oldestMtime === null ? null : Math.round((now.getTime() - oldestMtime) / 1000);
+}
+
+// Live snapshot of queue depth/age at report-generation time -- deliberately NOT windowed
+// like scanTaskActivity above ("what happened in the period" vs. "how healthy is the
+// pipeline RIGHT NOW"). Added 2026-08-20 (Grimmethy: "We need to build this sort of
+// analysis into the daily report") after a real multi-day review-runner stall
+// (queue/review/ items sitting untouched since 2026-08-17, invisible to every report
+// generated during that stretch) went completely unnoticed by the pipeline itself -- the
+// task-COUNT numbers looked fine because nothing had reached a terminal state yet to be
+// counted at all; only live queue depth/age would have shown a backlog quietly not
+// moving. oldestReviewAgeSec/oldestPendingAgeSec are the two states most likely to
+// silently stall (a claimed-but-abandoned task, a starved reviewer) without an obvious
+// symptom anywhere else.
+function computeQueueHealth(pipelineDir, now = new Date()) {
+  const queueDir = path.join(pipelineDir, 'queue');
+  const counts = {};
+  for (const state of LIVE_QUEUE_STATES) {
+    try {
+      counts[state] = fs.readdirSync(path.join(queueDir, state)).filter((f) => f.endsWith('.json')).length;
+    } catch {
+      counts[state] = 0;
+    }
+  }
+
+  // drafting/ is one level deeper (per-instance subfolders) -- same walk task-sources.js's
+  // own hasDraftingWork uses.
+  let draftingCount = 0;
+  try {
+    const draftingDir = path.join(queueDir, 'drafting');
+    for (const entry of fs.readdirSync(draftingDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      try {
+        draftingCount += fs.readdirSync(path.join(draftingDir, entry.name)).filter((f) => f.endsWith('.json')).length;
+      } catch {
+        // skip an unreadable instance subfolder
+      }
+    }
+  } catch {
+    // no drafting dir at all -- 0 is correct
+  }
+  counts.drafting = draftingCount;
+
+  return {
+    counts,
+    oldestReviewAgeSec: oldestFileAgeSec(path.join(queueDir, 'review'), now),
+    oldestPendingAgeSec: oldestFileAgeSec(path.join(queueDir, 'pending'), now),
+  };
+}
+
+// Surfaces what pipeline_self_audit (see pipeline-self-audit.js) actually found and
+// reported during this window -- closes the loop between the two systems built the same
+// day: the self-improvement detector's findings now show up in the same report a human
+// already reads regularly, instead of only being visible by hand-inspecting
+// self-audit-coverage.json.
+function computeSelfAuditActivity(selfAuditCoveragePath, startIso, endIso) {
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(selfAuditCoveragePath, 'utf8'));
+  } catch {
+    return [];
+  }
+  const start = new Date(startIso).getTime();
+  const end = new Date(endIso).getTime();
+  const activity = [];
+  for (const [signature, entry] of Object.entries(coverage || {})) {
+    const at = entry && entry.reportedAt ? new Date(entry.reportedAt).getTime() : NaN;
+    if (Number.isNaN(at) || at < start || at >= end) continue;
+    activity.push({ signature, taskId: entry.taskId, reportedAt: entry.reportedAt });
+  }
+  activity.sort((a, b) => new Date(a.reportedAt) - new Date(b.reportedAt));
+  return activity;
+}
+
+// Breaks the window's blocked/archived ("junk") tasks down by the SAME failure signature
+// pipeline-self-audit.js clusters on, reused directly rather than re-implemented --
+// surfaces which failure pattern actually dominates a period's junk count (e.g. "18 of
+// 21 arch_import blocks this window were the same harness-search-zero-results pattern")
+// instead of just a flat blocked count, the exact kind of breakdown that took a manual
+// investigation to produce on 2026-08-20 before this existed. Independent of whether any
+// pattern has crossed pipeline_self_audit's own CLUSTER_THRESHOLD -- this reports on
+// EVERY pattern seen, however small, since a report reader benefits from seeing a pattern
+// start forming even before it's large enough for the automated detector to act on it.
+function computeBlockedPatterns(tasks) {
+  const junkTasks = tasks.filter((t) => t.classification === 'junk');
+  const counts = new Map();
+  let uncategorized = 0;
+  for (const task of junkTasks) {
+    const signature = signatureForTask(task);
+    if (!signature) {
+      uncategorized += 1;
+      continue;
+    }
+    counts.set(signature, (counts.get(signature) || 0) + 1);
+  }
+  const patterns = [...counts.entries()]
+    .map(([signature, count]) => ({ signature, count }))
+    .sort((a, b) => b.count - a.count);
+  return { patterns, uncategorized, totalJunk: junkTasks.length };
+}
+
 function fmtDuration(sec) {
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.round(sec / 60)}m`;
@@ -232,7 +359,7 @@ function fmtDuration(sec) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
-function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting }) {
+function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
   const bySource = {};
   const byClassification = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0 };
   for (const t of tasks) {
@@ -275,6 +402,37 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     lines.push('');
   }
 
+  if (blockedPatterns && blockedPatterns.totalJunk > 0) {
+    lines.push('## Failure Patterns (within junk/blocked)');
+    if (blockedPatterns.patterns.length === 0) {
+      lines.push(`_${blockedPatterns.totalJunk} junk task(s) this period, none sharing a recognized failure signature -- each looks like an independent one-off._`);
+    } else {
+      for (const { signature, count } of blockedPatterns.patterns) {
+        const pct = Math.round((count / blockedPatterns.totalJunk) * 100);
+        lines.push(`- \`${signature}\`: ${count}/${blockedPatterns.totalJunk} (${pct}%)`);
+      }
+      if (blockedPatterns.uncategorized) lines.push(`- (uncategorized/one-off): ${blockedPatterns.uncategorized}/${blockedPatterns.totalJunk}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('## Queue Health (live snapshot, not windowed to this period)');
+  if (queueHealth) {
+    const c = queueHealth.counts;
+    lines.push(`- pending: ${c.pending} · drafting: ${c.drafting} · review: ${c.review} · approved: ${c.approved} · awaiting-confirm: ${c['awaiting-confirm']} · needs-clarification: ${c['needs-clarification']} · blocked: ${c.blocked}`);
+    if (queueHealth.oldestReviewAgeSec !== null) lines.push(`- Oldest item in review/: ${fmtDuration(queueHealth.oldestReviewAgeSec)} old${queueHealth.oldestReviewAgeSec > 3 * 3600 ? ' ⚠ unusually old -- worth checking whether the reviewer is stuck' : ''}`);
+    if (queueHealth.oldestPendingAgeSec !== null) lines.push(`- Oldest item in pending/: ${fmtDuration(queueHealth.oldestPendingAgeSec)} old${queueHealth.oldestPendingAgeSec > 3 * 3600 ? ' ⚠ unusually old -- worth checking whether a worker is stuck' : ''}`);
+  } else {
+    lines.push('_queue state unavailable._');
+  }
+  lines.push('');
+
+  if (selfAuditActivity && selfAuditActivity.length > 0) {
+    lines.push('## Self-Audit Activity (pipeline_self_audit)');
+    for (const a of selfAuditActivity) lines.push(`- \`${a.signature}\` reported at ${a.reportedAt} → ${a.taskId}`);
+    lines.push('');
+  }
+
   lines.push('## Downtime');
   lines.push(`- Total pipeline downtime: ${fmtDuration(downtime.pipelineDownSec)} (out of ${fmtDuration((new Date(endIso) - new Date(startIso)) / 1000)} in this period)`);
   if (downtime.pipelineDownIntervals.length) {
@@ -308,18 +466,23 @@ function reportFilename(period, endIso) {
   return `${d.toISOString().slice(0, 10)}-week-ending.md`;
 }
 
-function generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir }) {
+function generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir, selfAuditCoveragePath }) {
   const tasks = scanTaskActivity(pipelineDir, startIso, endIso);
   const downtime = computeDowntime(instancesDir, startIso, endIso);
   const timeAccounting = computeTimeAccounting(dbPath, tasks, startIso, endIso);
-  const markdown = renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting });
+  const queueHealth = computeQueueHealth(pipelineDir);
+  const blockedPatterns = computeBlockedPatterns(tasks);
+  const selfAuditActivity = selfAuditCoveragePath
+    ? computeSelfAuditActivity(selfAuditCoveragePath, startIso, endIso)
+    : [];
+  const markdown = renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns });
 
   const dir = reportDir(secondBrainDir, period);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, reportFilename(period, endIso));
   fs.writeFileSync(filePath, markdown);
 
-  return { filePath, taskCount: tasks.length, downtime, timeAccounting };
+  return { filePath, taskCount: tasks.length, downtime, timeAccounting, queueHealth, blockedPatterns, selfAuditActivity };
 }
 
 // --- Scheduling: instances/.report-schedule.json tracks lastGeneratedAt per period -----
@@ -346,7 +509,7 @@ function saveSchedule(instancesDir, schedule) {
 // period's lastGeneratedAt to `now` WITHOUT generating a report -- an immediate backfill
 // over the pipeline's entire history would be both huge and not what "hourly/daily/
 // weekly" implies; real reports start accruing from whenever this feature first ran.
-function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, now = new Date() }) {
+function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, selfAuditCoveragePath, now = new Date() }) {
   const schedule = loadSchedule(instancesDir);
   const generated = [];
   let changed = false;
@@ -361,7 +524,7 @@ function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, now = new
     const elapsedMs = now.getTime() - new Date(last).getTime();
     if (elapsedMs < PERIOD_MS[period]) continue;
 
-    const result = generateReport({ period, startIso: last, endIso: now.toISOString(), pipelineDir, instancesDir, dbPath, secondBrainDir });
+    const result = generateReport({ period, startIso: last, endIso: now.toISOString(), pipelineDir, instancesDir, dbPath, secondBrainDir, selfAuditCoveragePath });
     generated.push({ period, ...result });
     schedule[period] = { lastGeneratedAt: now.toISOString() };
     changed = true;
@@ -373,6 +536,7 @@ function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, now = new
 
 module.exports = {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, renderMarkdown,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns,
   generateReport, checkDue, loadSchedule, saveSchedule, PERIOD_MS,
 };
 
@@ -383,7 +547,7 @@ if (require.main === module) {
     return i === -1 ? null : args[i + 1];
   };
 
-  const { pipelineDir, secondBrainDir } = getConfig();
+  const { pipelineDir, secondBrainDir, selfAuditCoveragePath } = getConfig();
   const instancesDir = path.join(pipelineDir, 'instances');
   const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
 
@@ -392,7 +556,7 @@ if (require.main === module) {
       console.error('system-report: SECOND_BRAIN_DIR is not set -- skipping (nowhere to write reports).');
       process.exit(0);
     }
-    const generated = checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir });
+    const generated = checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, selfAuditCoveragePath });
     for (const g of generated) console.log(`[system-report] wrote ${g.period} report (${g.taskCount} tasks): ${g.filePath}`);
     process.exit(0);
   }
@@ -409,6 +573,6 @@ if (require.main === module) {
     console.error('system-report: SECOND_BRAIN_DIR is not set.');
     process.exit(1);
   }
-  const result = generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir });
+  const result = generateReport({ period, startIso, endIso, pipelineDir, instancesDir, dbPath, secondBrainDir, selfAuditCoveragePath });
   console.log(`wrote ${result.filePath} (${result.taskCount} tasks)`);
 }
