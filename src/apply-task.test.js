@@ -527,3 +527,42 @@ test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needs
   assert.equal(stage, 'awaiting-confirm');
   assert.equal(task.blockedStage, undefined);
 });
+
+// coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script
+// which implies that the program is inaccurately representing model used"): the
+// commit-message Co-Authored-By trailer must name the REAL model that drafted the
+// change, not a generic "Ornith" brand name that discards task.draftModel's actual tag.
+function gitRunnerCapturingCommitMessage() {
+  const base = createFakeGitRunner();
+  let commitMessage = null;
+  return {
+    ...base,
+    commit: (messageFilePath) => {
+      commitMessage = fs.readFileSync(messageFilePath, 'utf8');
+      return base.commit(messageFilePath);
+    },
+    get capturedCommitMessage() { return commitMessage; },
+  };
+}
+
+test('coAuthorTrailer: a local (non-Claude) draftModel credits the SPECIFIC model tag, not a bare "Ornith"', () => {
+  const gitRunner = gitRunnerCapturingCommitMessage();
+  applyTask(baseTask({ draftModel: 'qwen3.8:27b-q4_K_M' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Ornith \(qwen3\.8:27b-q4_K_M\) <noreply@ornith\.local>/);
+});
+
+test('coAuthorTrailer: a Claude draftModel still credits Claude with its specific model name (no regression)', () => {
+  const gitRunner = gitRunnerCapturingCommitMessage();
+  applyTask(baseTask({ draftModel: 'claude:sonnet' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Claude \(sonnet\) <noreply@anthropic\.com>/);
+});
+
+test('coAuthorTrailer: a task with no draftModel at all (queued before the field existed) falls back to the bare generic label', () => {
+  const gitRunner = gitRunnerCapturingCommitMessage();
+  applyTask(baseTask({ draftModel: undefined }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Ornith <noreply@ornith\.local>/);
+  assert.doesNotMatch(gitRunner.capturedCommitMessage, /Ornith \(/);
+});

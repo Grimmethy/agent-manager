@@ -2910,8 +2910,67 @@ def _check_merge_conflict(repo_root, main_branch, branch):
     return {"willConflict": None, "conflictFiles": [], "checked": False}
 
 
+_RESOLUTION_LINE_RE = re.compile(r"RESOLUTION:\s*(?:implemented|no-changes-needed)\b", re.IGNORECASE)
+_CANDIDATE_METADATA_LINE_RE = re.compile(r"^(?:###.*|Strength:.*|Files?:.*|Source:.*)$", re.MULTILINE)
+_DESCRIPTION_MAX_CHARS = 600
+
+
+def _describe_change(data: dict) -> str | None:
+    """Best-effort plain-English description of what a branch's task actually changed
+    (Grimmethy, 2026-08-20: "I'd also like the unmerged branch reports to include a plain
+    english description of the fix or change"). Tries strategies in order of how likely
+    they are to already BE real prose written for exactly this purpose, rather than
+    parsing a diff or guessing:
+
+    1. adhoc's real agentic Claude pass always ends its own final message with a short
+       plain-English summary right after its own RESOLUTION: sentinel line
+       (adhoc-agentic-draft.js's prompt asks for this explicitly) -- use it verbatim.
+    2. A candidate-fulfillment task (arch_review/observability_fix/performance_fix/etc.,
+       via nextCandidateFulfillmentTask) carries the ORIGINAL candidate's own
+       Problem/Solution/Benefits write-up in promptContext.body -- real prose written for
+       a human, unlike implementResponse itself for this task shape (raw Group-B JSON
+       diff instructions, no natural language at all).
+    3. A verdict-only source (observability_review/performance_review triage after their
+       2026-08-20 redirect, arch_discovery's own candidate write-up, etc.) already has
+       plain-prose implementResponse -- use it directly if it doesn't look like JSON,
+       stripping the same AC-NNN/Strength/Files header lines if it's in candidate format
+       (a genuine verdict IS a candidate write-up now, not just fulfillment tasks).
+    4. Fall back to planResponse (still real prose, just less specific).
+    """
+    def strip_candidate_metadata(text: str) -> str:
+        cleaned = _CANDIDATE_METADATA_LINE_RE.sub("", text).strip()
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    implement = (data.get("implementResponse") or "").strip()
+
+    m = _RESOLUTION_LINE_RE.search(implement)
+    if m:
+        after = implement[m.end():].strip()
+        if after:
+            return after[:_DESCRIPTION_MAX_CHARS]
+
+    prompt_context = data.get("promptContext") or {}
+    body = (prompt_context.get("body") or "").strip()
+    if body:
+        cleaned = strip_candidate_metadata(body)
+        if cleaned:
+            return cleaned[:_DESCRIPTION_MAX_CHARS]
+
+    if implement and not implement.startswith(("{", "[")):
+        text = strip_candidate_metadata(implement) if implement.startswith("###") else implement
+        if text:
+            return text[:_DESCRIPTION_MAX_CHARS]
+
+    plan = (data.get("planResponse") or "").strip()
+    if plan:
+        return plan[:_DESCRIPTION_MAX_CHARS]
+
+    return None
+
+
 def _label_for_branch(task_id, pipeline_dir, subject):
-    """Best-effort human label: the originating task's own title/domain/source if a
+    """Best-effort human label: the originating task's own title/domain/source (plus a
+    plain-English description of what it actually changed, see _describe_change) if a
     matching queue file can still be found (checked across every terminal-ish state a
     merge-worthy branch's task could be sitting in), else the branch tip's own commit
     subject line -- never just the raw branch name, which is an opaque id nobody but this
@@ -2926,8 +2985,9 @@ def _label_for_branch(task_id, pipeline_dir, subject):
                     "domain": data.get("domain"),
                     "source": data.get("source"),
                     "matchedTaskState": state,
+                    "description": _describe_change(data),
                 }
-    return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None}
+    return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
 def _list_unmerged_branches_uncached():
@@ -2981,6 +3041,7 @@ def _list_unmerged_branches_uncached():
             "domain": label["domain"],
             "source": label["source"],
             "matchedTaskState": label["matchedTaskState"],
+            "description": label["description"],
             "subject": subject.strip(),
             "pushedAt": pushed_at,
             "ahead": ahead,
