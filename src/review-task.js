@@ -10,8 +10,20 @@
 // actually execute; it never pushes/writes anything itself.
 //
 // Trimmed to the domains task-domains.json actually wires up on Linux (deep_dive,
-// project_search, brain_dump_sort, secondbrain, default, adhoc) -- the arch_discovery-only
-// missing-file fact-check filter is left out since that source can't reach this script.
+// project_search, brain_dump_sort, secondbrain, default, adhoc, research) -- the
+// arch_discovery-only missing-file fact-check filter is left out since that source can't
+// reach this script.
+//
+// 'research' (Grimmethy, 2026-08-20: "Last hours report shows 0 tasks done. Please
+// investigate"): task-domains.json never had a research_task entry at all, even though
+// ornith-draft.js has had a real domain==='research' agentic-drafting branch since
+// research_task shipped -- every research_task draft that ever reached review hard-failed
+// here with "Unknown task domain: research", permanently, not just during a rate-limit
+// window. Confirmed live: 3 research_task items sat in queue/review/ since 2026-08-17,
+// review-runner.log showing that exact error on every attempt. This is a per-deployment
+// task-domains.json config gap (that file is gitignored, "a file YOU own" per README), not
+// a code bug -- getDomainConfig() itself was always domain-agnostic. Documented here so a
+// fresh deployment's task-domains.json doesn't silently omit it the same way.
 //
 // CLI: node review-task.js <review.json>
 // Writes ONE line of JSON to stdout:

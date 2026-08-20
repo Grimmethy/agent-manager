@@ -1323,3 +1323,64 @@ test('nextAdhocTask still carries preDrafted/implementResponse/planResponse thro
   assert.equal(task.implementResponse, 'the real diff');
   assert.equal(task.planResponse, 'the real plan');
 });
+
+// pipeline_self_audit coverage-timing regression (2026-08-20, Grimmethy: "Last hours
+// report shows 0 tasks done... Has the self audit task been working?"): nextPipelineSelf
+// AuditTask() used to write self-audit-coverage.json unconditionally before returning,
+// but getNextTask()'s tier filter can silently discard a mismatched-tier task without
+// ever calling writeTask() -- domain:'adhoc' always resolves to 'high' tier, so a
+// --tier=low caller reaching this source would generate a real cluster, mark it
+// "reported" forever, and then have the task thrown away, never persisted anywhere.
+// Confirmed live: all 6 real clusters found 2026-08-20 had a coverage entry but no task
+// file anywhere in the queue. Fixed by moving the coverage write out of the generator
+// (now a pure read again, like every other next*Task()) into markPipelineSelfAuditReported(),
+// called by the CLI only after writeTask() actually persists the task.
+
+function makeBlockedFixtureRepo() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-selfaudit-test-'));
+}
+
+function writeBlockedTask(dir, id, source, blockedReason) {
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, `${id}.json`), JSON.stringify({ id, source, blockedReason }));
+}
+
+test('nextPipelineSelfAuditTask no longer writes coverage as a side effect -- calling it twice with nothing marking coverage returns the SAME task both times', () => {
+  const dir = makeBlockedFixtureRepo();
+  for (let i = 0; i < 5; i++) {
+    writeBlockedTask(dir, `arch-import-x-${i}`, 'arch_import', 'The draft refuses to implement, no code provided.');
+  }
+
+  const { nextPipelineSelfAuditTask } = freshTaskSources(dir);
+  const first = nextPipelineSelfAuditTask();
+  assert.ok(first);
+  assert.equal(fs.existsSync(path.join(dir, 'self-audit-coverage.json')), false);
+
+  const second = nextPipelineSelfAuditTask();
+  assert.ok(second);
+  // Same cluster proposed again (ids differ -- each call mints a fresh Date.now()
+  // suffix -- but the signature, the real identity coverage keys on, matches).
+  assert.equal(second.promptContext.signature, first.promptContext.signature);
+});
+
+test('markPipelineSelfAuditReported writes coverage only when explicitly called, keyed by the task\'s signature', () => {
+  const dir = makeBlockedFixtureRepo();
+  for (let i = 0; i < 5; i++) {
+    writeBlockedTask(dir, `arch-import-y-${i}`, 'arch_import', 'The draft refuses to implement, no code provided.');
+  }
+
+  const { nextPipelineSelfAuditTask, markPipelineSelfAuditReported } = freshTaskSources(dir);
+  const task = nextPipelineSelfAuditTask();
+  assert.ok(task);
+
+  markPipelineSelfAuditReported(task);
+  const coveragePath = path.join(dir, 'self-audit-coverage.json');
+  assert.ok(fs.existsSync(coveragePath));
+  const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  assert.equal(coverage[task.promptContext.signature].taskId, task.id);
+
+  // Now that it's genuinely covered, the same cluster is not proposed again.
+  const next = nextPipelineSelfAuditTask();
+  assert.equal(next, null);
+});

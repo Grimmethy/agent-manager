@@ -1754,11 +1754,37 @@ function nextPipelineSelfAuditTask() {
   const task = buildAuditTask(cluster);
   if (taskIdExistsInQueue(task.id)) return null;
 
-  coverage[cluster.signature] = { reportedAt: new Date().toISOString(), taskId: task.id, clusterSize: cluster.tasks.length };
+  // Coverage is recorded by the CLI's markPipelineSelfAuditReported(), AFTER writeTask()
+  // actually persists this task -- not here. Fixed 2026-08-20 (Grimmethy: "Last hours
+  // report shows 0 tasks done... Has the self audit task been working?"): this used to
+  // write coverage unconditionally before returning, but getNextTask()'s tier filter can
+  // silently `continue` past (discard) a task whose resolved tier doesn't match the
+  // caller's --tier -- domain:'adhoc' always resolves to 'high', so a --tier=low caller
+  // (worker-1) reaching this source generated a real task, this function marked its
+  // signature "reported" forever, and getNextTask() then threw the task away without ever
+  // calling writeTask(). Confirmed live: all 6 real clusters found 2026-08-20 04:19-04:40
+  // had a coverage entry but no task file anywhere in the queue -- every one silently
+  // burned. Every next() function here is documented as a pure read with no queue-write
+  // side effect (see getNextTask()'s own comment); this now honors that.
+  return task;
+}
+
+// Called once from the CLI, only after writeTask() has actually persisted a
+// pipeline_self_audit task to pending/ -- see nextPipelineSelfAuditTask()'s own comment
+// for why the write moved here instead of living inside the generator.
+function markPipelineSelfAuditReported(task) {
+  const { selfAuditCoveragePath } = getConfig();
+  const signature = task.promptContext && task.promptContext.signature;
+  if (!signature) return;
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(selfAuditCoveragePath) || '{}');
+  } catch {
+    coverage = {};
+  }
+  coverage[signature] = { reportedAt: new Date().toISOString(), taskId: task.id };
   fs.mkdirSync(path.dirname(selfAuditCoveragePath), { recursive: true });
   fs.writeFileSync(selfAuditCoveragePath, JSON.stringify(coverage, null, 2));
-
-  return task;
 }
 registerTaskSource('arch_import', {
   priority: taskPriority('arch_import', 81),
@@ -1858,6 +1884,7 @@ module.exports = {
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
+  nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
@@ -2081,6 +2108,7 @@ if (require.main === module) {
     } else {
       const file = writeTask(task);
       console.log(`queued: ${file}`);
+      if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.domain === 'adhoc') {
         try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}
       }
