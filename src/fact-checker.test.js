@@ -193,6 +193,23 @@ test('checkDraft does not flag a create-mode draft\'s own target as a missing-fi
   // Still recorded in fileChecks for transparency -- only the derived flag is suppressed.
   const check = result.fileChecks.find((c) => c.claimedPath === 'Docs/PRODUCT_SPEC.md');
   assert.equal(check.exists, false);
+  // isCreateTarget stamped onto the raw fileChecks entry too, not just used to filter
+  // `flags` -- the reviewer MODEL reads this raw JSON directly (see review-task.js's
+  // buildVerdictPrompt), so the explanation has to travel with the data itself, not just
+  // live in the derived flags list the model never sees on its own.
+  assert.equal(check.isCreateTarget, true);
+});
+
+test('checkDraft does NOT stamp isCreateTarget on a path that merely happens to share a name with an unrelated create target', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const draft = JSON.stringify([
+    { mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '# Spec' },
+    { mode: 'edit', file: 'Docs/OTHER_MISSING.md', find: 'a', replace: 'b' },
+  ]);
+
+  const result = checkDraft(draft, dir);
+  const other = result.fileChecks.find((c) => c.claimedPath === 'Docs/OTHER_MISSING.md');
+  assert.equal(other.isCreateTarget, undefined);
 });
 
 test('checkDraft still flags a genuinely fabricated path referenced by an edit/delete (not the create target) as missing', () => {

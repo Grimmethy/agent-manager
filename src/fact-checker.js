@@ -245,19 +245,31 @@ function checkGroundedValues(draftText, sourceText) {
 // draft is correct. `sourceText` (optional) is the material Ornith was actually given for
 // this task; when provided, the grounded-value check runs against it.
 function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
-  const fileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
+  const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText);
   const createModeTargets = extractCreateModeTargets(draftText);
 
+  // isCreateTarget is stamped onto fileChecks itself (not just used to filter `flags`
+  // below) because buildVerdictPrompt (review-task.js) hands the REVIEWER MODEL the raw
+  // fileChecks JSON directly, not just the derived flags -- confirmed live 2026-08-20,
+  // second incident of the same day: with only `flags` fixed, a create-mode draft still
+  // got rejected because the model read the raw `"exists": false` entry itself and
+  // (correctly, per its own instructions at the time) treated it as fabrication evidence,
+  // unaware that suppression already happened one layer up. The field name doubles as the
+  // reviewer-prompt's own explanation for why this particular exists:false isn't suspicious.
+  const fileChecks = rawFileChecks.map((f) => (
+    createModeTargets.has(f.claimedPath) ? { ...f, isCreateTarget: true } : f
+  ));
+
   const flags = [];
   for (const f of fileChecks) {
     // A create mode's own target not existing yet is the normal, correct case, not
     // fabrication -- see extractCreateModeTargets' own header for the live incident this
-    // fixes. Still recorded in fileChecks (untouched above) for transparency; only the
-    // flag derived from it is suppressed.
-    if (!f.exists && !createModeTargets.has(f.claimedPath)) flags.push({ type: 'missing-file', detail: f.claimedPath });
+    // fixes. Still recorded in fileChecks (now flagged isCreateTarget) for transparency;
+    // only the flag derived from it is suppressed.
+    if (!f.exists && !f.isCreateTarget) flags.push({ type: 'missing-file', detail: f.claimedPath });
   }
   for (const r of relationshipChecks) {
     if (r.checked && !r.found) {
