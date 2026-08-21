@@ -21,12 +21,29 @@ All counters are cached; counting is microseconds after first load.
 from __future__ import annotations
 
 import functools
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-ASSETS = Path(__file__).resolve().parent.parent.parent / "assets" / "tokenizers"
+# Fixed 2026-08-21 (agent-manager integration, found live: every real /api/generate call
+# through the proxy crashed with a 500 the moment this ran from a genuinely pip-installed
+# package instead of an uninstalled source checkout). The parent.parent.parent walk below
+# assumes this file sits at <checkout>/tokenfold/tokenizers/registry.py with a SIBLING
+# <checkout>/assets/ directory -- true when running directly against a source tree
+# (python -m tokenfold.cli from the repo), but a normal `pip install <path>` only bundles
+# the tokenfold* package itself (pyproject.toml's packages.find only discovers Python
+# packages, not this out-of-tree data directory), so an installed copy under site-packages
+# has no such sibling at all and this Tokenizer.from_file() call fails outright.
+#
+# TOKENFOLD_ASSETS_DIR lets the launcher point this at the real assets directory it
+# already has on disk (the vendored/checked-out source tree, not the installed copy)
+# without needing to restructure the package or duplicate ~2.7M lines of tokenizer JSON
+# into every venv. Falls through to the original source-tree-relative guess when unset,
+# so running directly from an uninstalled checkout is unaffected.
+_env_assets = os.environ.get("TOKENFOLD_ASSETS_DIR")
+ASSETS = Path(_env_assets) if _env_assets else Path(__file__).resolve().parent.parent.parent / "assets" / "tokenizers"
 
 
 @dataclass(frozen=True)
