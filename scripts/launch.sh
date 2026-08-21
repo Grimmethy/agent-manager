@@ -116,6 +116,8 @@ fi
 if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"
 
+  bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_REPO_ROOT" >/dev/null 2>&1 || true
+
   start_bg "worker-1" "${PID_DIR}/worker-1.pid" "${LOG_DIR}/worker-1.log" \
     bash "${SCRIPT_DIR}/ornith-worker.sh" worker-1
 
