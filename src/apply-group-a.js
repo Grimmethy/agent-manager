@@ -625,6 +625,10 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         title: adhocTask.title,
         rawText,
         graphPathOverride: resolveGraphPath(matchedProject.repoRoot),
+        // uiVocabHubFiles (2026-08-20, see path-prefetch.js's UI_VOCAB header): opt-in
+        // per project in projects.json -- a project with no UI hub file(s) declared here
+        // simply never triggers the fallback, same behavior as before this existed.
+        uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
       });
       let adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
       let heldReason = null;

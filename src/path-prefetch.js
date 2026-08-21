@@ -38,6 +38,32 @@ const STOPWORDS = new Set([
   'agent', 'manager',
 ]);
 
+// Confirmed live 2026-08-20 (a real stuck needs-clarification sweep): "I'd like a
+// tooltip for each tab that activates on hover..." produces keywords like window/tabs/
+// tooltip/hover/paragraph -- none of which are ever a SUBSTRING of a real filename
+// (index.html, app.py), so this legitimate, unambiguous, well-scoped UI request hits
+// 'no-match' every single time, structurally, regardless of phrasing quality. The
+// filename-substring approach above only ever catches requests that literally NAME a
+// file/symbol; it has no way to catch "describes UI behavior in plain English" at all.
+//
+// This word list is deliberately generic (reusable across any consumer project), NOT
+// project-specific -- what IS project-specific is which file(s) count as the answer,
+// which is why that part comes from the caller (see resolveAnchors' uiVocabHubFiles
+// param), not hardcoded here. A project with no UI hub file configured simply never
+// triggers this fallback (empty array in, no match out) -- this is opt-in per project,
+// not a default behavior change.
+const UI_VOCAB = new Set([
+  'ui', 'tab', 'tabs', 'tooltip', 'button', 'hover', 'click', 'sidebar', 'panel', 'modal',
+  'dropdown', 'toggle', 'icon', 'color', 'layout', 'style', 'css', 'dashboard', 'page',
+  'screen', 'window', 'view', 'widget', 'menu', 'popup', 'banner', 'badge', 'tooltip',
+  'scroll', 'resize', 'theme', 'font', 'spacing', 'alignment', 'checkbox', 'slider',
+]);
+
+function looksLikeUiRequest(text) {
+  const words = (text || '').toLowerCase().match(/[a-z]+/g) || [];
+  return words.some((w) => UI_VOCAB.has(w));
+}
+
 // Pulls candidate anchor keywords out of a task's title/text. Identifier-shaped tokens
 // (snake_case, kebab-case, camelCase, or a path/dotted segment) are ranked first --
 // they're far more likely to be real file/symbol names than ordinary prose -- but a
@@ -138,7 +164,25 @@ const MAX_PREFETCHED_PATHS = 12;
 //   { status: 'matched', paths: [...] }                      -- every matched keyword
 //                                                                resolved to exactly one
 //                                                                real, on-disk file.
-function resolveAnchors({ repoRoot, title, rawText, graphPathOverride }) {
+function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHubFiles = [] }) {
+  const combinedText = `${title || ''} ${rawText || ''}`;
+
+  // Last-resort fallback before any 'no-match' return below -- see UI_VOCAB's own header
+  // for the live incident this fixes. Only fires when the caller configured at least one
+  // real hub file (opt-in per project, see apply-group-a.js/projects.json) AND that file
+  // still exists on disk; otherwise behaves exactly as if this param were never added.
+  function uiVocabFallback() {
+    if (uiVocabHubFiles.length === 0 || !looksLikeUiRequest(combinedText)) return null;
+    const existing = uiVocabHubFiles.filter((p) => {
+      try {
+        return fs.statSync(path.join(repoRoot, p)).isFile();
+      } catch {
+        return false;
+      }
+    });
+    return existing.length > 0 ? { status: 'matched', paths: existing.slice(0, MAX_PREFETCHED_PATHS) } : null;
+  }
+
   const graphPath = graphPathOverride || path.join(repoRoot, 'graphify-out', 'graph.json');
   const graph = loadGraph(graphPath);
   if (!graph) return { status: 'greenfield' };
@@ -146,8 +190,8 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride }) {
   const sourceFiles = [...new Set(graph.nodes.map((n) => n.source_file).filter(Boolean))];
   if (sourceFiles.length === 0) return { status: 'greenfield' };
 
-  const keywords = extractKeywords(`${title || ''} ${rawText || ''}`);
-  if (keywords.length === 0) return { status: 'no-match' };
+  const keywords = extractKeywords(combinedText);
+  if (keywords.length === 0) return uiVocabFallback() || { status: 'no-match' };
 
   const matchedPaths = new Set();
   const ambiguous = {};
@@ -164,7 +208,7 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride }) {
     }
   }
 
-  if (!anyMatch) return { status: 'no-match' };
+  if (!anyMatch) return uiVocabFallback() || { status: 'no-match' };
 
   // Validate every unambiguously-matched path still exists on disk -- the graph can be
   // stale (files renamed/deleted since it was last built) even when the keyword match
@@ -181,9 +225,9 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride }) {
   if (Object.keys(ambiguous).length > 0) {
     return { status: 'ambiguous', candidates: ambiguous, paths: validPaths };
   }
-  if (validPaths.length === 0) return { status: 'no-match' };
+  if (validPaths.length === 0) return uiVocabFallback() || { status: 'no-match' };
 
   return { status: 'matched', paths: validPaths.slice(0, MAX_PREFETCHED_PATHS) };
 }
 
-module.exports = { extractKeywords, resolveAnchors, MAX_PREFETCHED_PATHS };
+module.exports = { extractKeywords, resolveAnchors, looksLikeUiRequest, MAX_PREFETCHED_PATHS };
