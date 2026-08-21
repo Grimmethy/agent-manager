@@ -206,3 +206,16 @@ Replace the bare `catch { return []; }` with a handler that (1) logs the failure
 
 Benefits:
 An on-call engineer investigating an incident will see a timestamped log line with the full stack trace instead of a silent `0 anomalies` reading. A metrics alert can fire when `observability_scan_errors` exceeds a threshold, decoupling detection from human log-scraping. The original error context (which upstream endpoint, which timeout, which permission) is preserved in the log rather than lost in a discarded binding, making root-cause analysis a grep instead of a guess.
+
+### AC-16 · Silent search-fetch failure is unobservable
+Strength: Strong
+Files: src/ornith-draft.js
+
+Problem:
+The `catch` block around `projectSearchFetch` contains only a comment. When the fetch fails (auth rotation, backend 500, transient DNS), `searchResults` stays empty and the downstream prompt renders "(no results …)" with no log line, counter, or structured event. In a fan-out agent pipeline the operator has zero signal that search is degraded until end-user answer quality drops.
+
+Solution:
+Replace the comment-only catch body with a single `console.warn` (or the project's existing logger, e.g. `logger.warn`) that includes the error message: `console.warn('[ornith-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e)`. Control flow is unchanged—`searchResults` remains `[]` and execution falls through. If a metrics sink (Prometheus, Datadog, etc.) is already wired, increment a `search_fetch_errors` counter in the same block.
+
+Benefits:
+Every silent degradation becomes a greppable, alertable log line. On-call can correlate a spike in `projectSearchFetch failed` warnings with the underlying cause (auth, DNS, 500) within seconds instead of waiting for user complaints. The fix is additive; no behavioral or API change, so regression risk is nil.
