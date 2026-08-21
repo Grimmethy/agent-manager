@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: tokenfold
+Version: 0.1.0
+Summary: Transparent token-compression middleware for LLM communication
+Requires-Python: >=3.11
+Requires-Dist: tiktoken
+Requires-Dist: tokenizers
+Requires-Dist: httpx
+Requires-Dist: fastapi
+Requires-Dist: uvicorn

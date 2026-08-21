@@ -21,6 +21,7 @@ fi
 STATE_DIR="${HOME}/.local/state/agent-manager"
 LOG_DIR="${STATE_DIR}/logs"
 PID_DIR="${STATE_DIR}/pids"
+mkdir -p "$LOG_DIR" "$PID_DIR"
 
 AGENT_MANAGER_DASHBOARD_PORT="${AGENT_MANAGER_DASHBOARD_PORT:-7420}"
 
@@ -44,6 +45,62 @@ start_bg() {
   echo $! > "$pidfile"
   printf '[launch] started %s (pid %s), logging to %s\n' "$name" "$!" "$logfile"
 }
+
+# --- TokenFold (optional token-compression proxy, github.com same-owner tokenfold repo) ---
+# When a TokenFold checkout is present (default: a sibling of this repo) and not disabled
+# via AGENT_MANAGER_TOKENFOLD=false, start its proxy in front of Ollama and reroute
+# OLLAMA_URL through it BEFORE any pipeline daemon starts, so every /api/generate and
+# /api/chat call the workers/reviewers make is transparently encoded/decoded. Savings are
+# visible live at http://localhost:<port>/tokenfold/dashboard. The reroute only happens
+# after a positive /healthz check -- a missing venv or a proxy that fails to come up means
+# the pipeline runs direct-to-Ollama exactly as before, never half-routed.
+# Source resolution, first match wins: an explicit TOKENFOLD_DIR, a standalone checkout
+# next to this repo, then the vendored snapshot at vendor/tokenfold (present in every
+# clone of this repo, so TokenFold works with no second download). A checkout's own
+# linux/.venv is used when it has one; otherwise (the vendored copy, or a fresh checkout)
+# a venv is provisioned once under the state dir and reused thereafter.
+TOKENFOLD_PORT="${TOKENFOLD_PORT:-9339}"
+TOKENFOLD_DIR="${TOKENFOLD_DIR:-}"
+if [[ -z "$TOKENFOLD_DIR" ]]; then
+  for cand in "${REPO_DIR%/*}/tokenfold" "${REPO_DIR}/vendor/tokenfold"; do
+    [[ -f "${cand}/core/pyproject.toml" ]] && TOKENFOLD_DIR="$cand" && break
+  done
+fi
+TOKENFOLD_PY="${TOKENFOLD_DIR}/linux/.venv/bin/python"
+if [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" && -n "$TOKENFOLD_DIR" && ! -x "$TOKENFOLD_PY" ]]; then
+  TOKENFOLD_VENV="${STATE_DIR}/tokenfold-venv"
+  if [[ ! -x "${TOKENFOLD_VENV}/bin/python" ]]; then
+    printf '[launch] provisioning TokenFold venv at %s (first launch only)...\n' "$TOKENFOLD_VENV"
+    if python3 -m venv "$TOKENFOLD_VENV" \
+        && "${TOKENFOLD_VENV}/bin/pip" install -q "${TOKENFOLD_DIR}/core"; then
+      printf '[launch] TokenFold venv ready.\n'
+    else
+      printf '[launch] TokenFold venv provisioning failed -- running direct to Ollama this launch.\n'
+      rm -rf "$TOKENFOLD_VENV"
+    fi
+  fi
+  [[ -x "${TOKENFOLD_VENV}/bin/python" ]] && TOKENFOLD_PY="${TOKENFOLD_VENV}/bin/python"
+fi
+if [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" && -x "$TOKENFOLD_PY" ]]; then
+  TF_UPSTREAM="${OLLAMA_URL:-http://localhost:11434}"
+  start_bg "tokenfold" "${PID_DIR}/tokenfold.pid" "${LOG_DIR}/tokenfold.log" \
+    "$TOKENFOLD_PY" -m tokenfold.cli serve --port "$TOKENFOLD_PORT" \
+    --upstream "${TF_UPSTREAM%/}/v1"
+  tf_ok=false
+  for i in $(seq 1 20); do
+    curl -s -o /dev/null "http://localhost:${TOKENFOLD_PORT}/healthz" && tf_ok=true && break
+    sleep 0.25
+  done
+  if [[ "$tf_ok" == true ]]; then
+    export OLLAMA_URL="http://localhost:${TOKENFOLD_PORT}"
+    printf '[launch] TokenFold up -- OLLAMA_URL rerouted through http://localhost:%s (upstream %s). Savings: http://localhost:%s/tokenfold/dashboard\n' \
+      "$TOKENFOLD_PORT" "$TF_UPSTREAM" "$TOKENFOLD_PORT"
+  else
+    printf '[launch] TokenFold did not answer /healthz within 5s -- leaving OLLAMA_URL direct (see %s/tokenfold.log)\n' "$LOG_DIR"
+  fi
+elif [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" ]]; then
+  printf '[launch] No usable TokenFold source found (vendor/tokenfold missing?) -- running direct to Ollama.\n'
+fi
 
 if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"

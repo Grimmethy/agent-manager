@@ -168,6 +168,7 @@ const TABS = [
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
+  { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { group: 'Job Status', children: [
     { key: 'drafting', label: 'Drafting', description: 'Jobs where an agent is currently writing the initial implementation.' },
@@ -2225,6 +2226,29 @@ async function renderReportsTab() {
   });
 }
 
+// TokenFold Savings tab: read-only view of the compression proxy's lifetime numbers,
+// fetched through the dashboard's own /api/tokenfold/stats (same-origin proxy -- see
+// app.py). The full TokenFold dashboard (per-representation tables, latency detail)
+// stays TokenFold's own page; the button below opens it on this host's TOKENFOLD_PORT.
+async function renderTokenfoldTab() {
+  const main = document.getElementById('main');
+  const data = await fetchJson('/api/tokenfold/stats');
+  const openBtn = (port) => `<button onclick="window.open('http://' + location.hostname + ':${port}/tokenfold/dashboard', '_blank')">Open full TokenFold dashboard ↗</button>`;
+  if (!data.available) {
+    main.innerHTML = `<div class="empty">TokenFold proxy is not running on port ${escapeHtml(String(data.port))} -- it starts automatically with scripts/launch.sh when a tokenfold checkout is installed next to this repo (set AGENT_MANAGER_TOKENFOLD=false to turn that off).</div>`;
+    return;
+  }
+  const s = data.stats || {};
+  const modelRows = (s.by_model || []).map(m => `
+    <tr><td>${escapeHtml(m.model || '')}</td><td>${(m.n ?? 0).toLocaleString()}</td>
+    <td>${(m.saved ?? 0).toLocaleString()}</td><td>${m.avg_pct ?? 0}%</td></tr>`).join('');
+  main.innerHTML = `
+    <div class="row" style="margin-bottom:12px">${openBtn(escapeAttr(String(data.port)))}</div>
+    <div style="font-size:2rem;font-weight:700">${(s.saved ?? 0).toLocaleString()} tokens saved${s.reduction_pct != null ? ` (${s.reduction_pct}%)` : ''}</div>
+    <div class="meta" style="margin:6px 0 16px">${(s.n ?? 0).toLocaleString()} requests · original ${(s.orig ?? 0).toLocaleString()} → encoded ${(s.enc ?? 0).toLocaleString()} tokens${s.avg_latency != null ? ` · avg encode ${Number(s.avg_latency).toFixed(1)} ms` : ''}${s.fallback_pct != null ? ` · fallback rate ${Number(s.fallback_pct).toFixed(1)}%` : ''}</div>
+    ${modelRows ? `<table><thead><tr><th>Model</th><th>Requests</th><th>Tokens saved</th><th>Avg %</th></tr></thead><tbody>${modelRows}</tbody></table>` : '<div class="empty">No model calls have gone through the proxy yet -- numbers appear as soon as the pipeline makes its first call.</div>'}`;
+}
+
 async function renderMain() {
   try {
     if (activeTab === 'workers') await renderWorkers();
@@ -2233,6 +2257,7 @@ async function renderMain() {
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
+    else if (activeTab === 'tokenfold') await renderTokenfoldTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
