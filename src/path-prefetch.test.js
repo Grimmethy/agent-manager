@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { extractKeywords, resolveAnchors, MAX_PREFETCHED_PATHS } = require('./path-prefetch.js');
+const { extractKeywords, resolveAnchors, looksLikeUiRequest, MAX_PREFETCHED_PATHS } = require('./path-prefetch.js');
 
 function makeRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'path-prefetch-test-'));
@@ -188,4 +188,84 @@ test('resolveAnchors respects graphPathOverride instead of the default repoRoot/
   fs.writeFileSync(altGraphPath, JSON.stringify({ nodes: [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }], links: [] }));
   const result = resolveAnchors({ repoRoot, title: 'Fix budget_guard', rawText: '', graphPathOverride: altGraphPath });
   assert.deepEqual(result, { status: 'matched', paths: ['src/budget_guard.ts'] });
+});
+
+// uiVocabHubFiles fallback (2026-08-20): a real stuck needs-clarification sweep found
+// "I'd like a tooltip for each tab that activates on hover..." hit no-match every time --
+// none of that plain-English UI vocabulary is ever a substring of a real filename. See
+// path-prefetch.js's UI_VOCAB header for the full incident.
+
+test('looksLikeUiRequest recognizes common UI vocabulary', () => {
+  assert.equal(looksLikeUiRequest("I'd like a tooltip for each tab that activates on hover"), true);
+  assert.equal(looksLikeUiRequest('Fix the budget calculation logic'), false);
+});
+
+test('resolveAnchors falls back to the configured UI hub file(s) when normal keyword matching finds nothing, but only if the text actually looks UI-related', () => {
+  const repoRoot = makeRepo();
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+  writeSourceFile(repoRoot, 'python/dashboard/templates/index.html');
+
+  const uiResult = resolveAnchors({
+    repoRoot,
+    title: 'Window tabs',
+    rawText: "I'd like a tooltip for each tab that activates on hover with a brief description.",
+    uiVocabHubFiles: ['python/dashboard/templates/index.html'],
+  });
+  assert.deepEqual(uiResult, { status: 'matched', paths: ['python/dashboard/templates/index.html'] });
+
+  // Non-UI prose with no vocabulary hit still correctly falls through to no-match --
+  // this fallback is a targeted patch for UI-phrased requests, not a catch-all.
+  const nonUiResult = resolveAnchors({
+    repoRoot,
+    title: 'Quarterly numbers',
+    rawText: 'We should reconcile the ledger totals against last month.',
+    uiVocabHubFiles: ['python/dashboard/templates/index.html'],
+  });
+  assert.equal(nonUiResult.status, 'no-match');
+});
+
+test('resolveAnchors never applies the UI fallback when no hub files are configured (opt-in, not a default behavior change)', () => {
+  const repoRoot = makeRepo();
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+  writeSourceFile(repoRoot, 'python/dashboard/templates/index.html');
+
+  const result = resolveAnchors({
+    repoRoot,
+    title: 'Window tabs',
+    rawText: "I'd like a tooltip for each tab that activates on hover.",
+  });
+  assert.equal(result.status, 'no-match');
+});
+
+test('resolveAnchors\' UI fallback only offers a hub file that actually exists on disk', () => {
+  const repoRoot = makeRepo();
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+  // Deliberately NOT writing python/dashboard/templates/index.html to disk here.
+
+  const result = resolveAnchors({
+    repoRoot,
+    title: 'Window tabs',
+    rawText: "I'd like a tooltip for each tab that activates on hover.",
+    uiVocabHubFiles: ['python/dashboard/templates/index.html'],
+  });
+  assert.equal(result.status, 'no-match');
+});
+
+test('resolveAnchors\' UI fallback never overrides a genuinely ambiguous real match', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/tab-panel-a.ts');
+  writeSourceFile(repoRoot, 'src/tab-panel-b.ts');
+  writeSourceFile(repoRoot, 'python/dashboard/templates/index.html');
+  writeGraph(repoRoot, [
+    { id: 0, community: 0, source_file: 'src/tab-panel-a.ts' },
+    { id: 1, community: 0, source_file: 'src/tab-panel-b.ts' },
+  ]);
+
+  const result = resolveAnchors({
+    repoRoot,
+    title: 'tab-panel needs a hover tooltip',
+    rawText: '',
+    uiVocabHubFiles: ['python/dashboard/templates/index.html'],
+  });
+  assert.equal(result.status, 'ambiguous');
 });

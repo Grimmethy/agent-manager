@@ -65,6 +65,27 @@ test('buildPlanPrompt omits the selfProjectLabel carve-out entirely when this pa
   assert.doesNotMatch(prompt, /THIS pipeline's own source/);
 });
 
+// New-standalone-plugin misclassification fix (2026-08-20): a real incident where "Agent
+// Manager plugin > credit manager: I'd like to build a plugin that..." got classified
+// belongsToProject:'agent-manager' and queued as an adhoc code-edit task against
+// agent-manager's own repo -- doomed from the start, since nothing about a brand-new
+// plugin's vocabulary can ever match agent-manager's existing files. Same root shape hit
+// twice more the same session (romance-plugin, and this credit-manager one).
+test('buildPlanPrompt tells the model a note naming a tracked project can still be a new-standalone-plugin idea, not an in-repo feature', () => {
+  const prompt = buildPlanPrompt(brainDumpSortTask({
+    rawText: "Agent Manager plugin > credit manager: I'd like to build a plugin that manages the user's credit and payments.",
+    projectLabels: ['agent-manager'],
+  }));
+  assert.match(prompt, /CRITICAL distinction/);
+  assert.match(prompt, /standalone product or plugin/);
+  assert.match(prompt, /does not exist yet and cannot be created by an ordinary code-edit task/);
+});
+
+test('buildImplementPrompt\'s belongsToProject field instruction explains the same new-standalone-plugin exception, not just the plan', () => {
+  const prompt = buildImplementPrompt(brainDumpSortTask(), 'PLAN: ...');
+  assert.match(prompt, /null even if a tracked project's name appears in the note's own title/);
+});
+
 // product_spec (2026-08-20) -- see task-sources.js's nextProductSpecTask header for the
 // full motivation.
 function productSpecTask(promptContextOverrides = {}) {
