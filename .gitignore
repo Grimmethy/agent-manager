@@ -28,3 +28,4 @@ projects.json
 runs/
 .agent-manager-discuss-sessions.json
 dashboard-settings.json
+vendor/tokenfold/core/build/
