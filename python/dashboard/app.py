@@ -701,6 +701,25 @@ def task_summary(data: dict, filename: str) -> dict:
     }
 
 
+@app.route("/api/tokenfold/stats")
+def api_tokenfold_stats():
+    # Thin same-origin proxy to the TokenFold proxy's own stats endpoint (launch.sh starts
+    # TokenFold on TOKENFOLD_PORT, default 9339) -- the dashboard page can't fetch the
+    # 9339 origin directly without CORS. "available": False (never an HTTP error) when the
+    # proxy isn't running, so the tab can render a quiet "not running" state instead of
+    # tripping the generic error path.
+    import urllib.request
+
+    port = os.environ.get("TOKENFOLD_PORT", "9339")
+    try:
+        with urllib.request.urlopen(
+                f"http://localhost:{port}/tokenfold/stats", timeout=3) as r:
+            data = json.loads(r.read().decode())
+        return jsonify({"available": True, "port": port, "stats": data})
+    except Exception:
+        return jsonify({"available": False, "port": port})
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
