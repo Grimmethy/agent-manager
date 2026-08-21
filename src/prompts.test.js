@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const fs = require('fs');
 const path = require('path');
-const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt } = require('./prompts.js');
+const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt, formatFileContents } = require('./prompts.js');
 
 // Real failing content, not synthetic: this is the actual blocked task found live
 // 2026-07-21 (deep-dive-autogen-microsoft-20, still sitting in queue/blocked/ at the time
@@ -178,4 +178,34 @@ test('backlog_fulfillment is registered to reuse arch_review\'s own plan/impleme
   assert.match(prompt, /AC-001/);
   assert.match(prompt, /Set up Contact schema/);
   assert.match(prompt, /No schema exists yet/);
+});
+
+// formatFileContents fences real file content in a code block (2026-08-21): a live
+// TokenFold compression-proxy test found unfenced file content gets treated as ordinary
+// prose and silently loses exact whitespace/wording -- code_fence is the ONE region
+// TokenFold's own protection mechanism recognizes. This matters regardless of whether
+// TokenFold specifically is in front of Ollama; any compression/preprocessing layer is
+// more likely to respect a real markdown code fence than raw embedded text.
+test('formatFileContents wraps each file\'s content in a real code fence', () => {
+  const out = formatFileContents([{ path: 'src/foo.js', content: 'const x = 1;' }]);
+  assert.equal(out, '--- src/foo.js ---\n```\nconst x = 1;\n```');
+});
+
+test('formatFileContents joins multiple files with a blank line between them, each independently fenced', () => {
+  const out = formatFileContents([
+    { path: 'a.js', content: 'const a = 1;' },
+    { path: 'b.js', content: 'const b = 2;' },
+  ]);
+  assert.equal(out, '--- a.js ---\n```\nconst a = 1;\n```\n\n--- b.js ---\n```\nconst b = 2;\n```');
+});
+
+test('formatFileContents returns an empty string for no files, not a throw', () => {
+  assert.equal(formatFileContents([]), '');
+  assert.equal(formatFileContents(undefined), '');
+});
+
+test('buildImplementPrompt fences the current spec doc for product_spec, since its own edit mode depends on exact substring matches against it', () => {
+  const prompt = buildImplementPrompt(productSpecTask(), 'PLAN: add a Deal section');
+  assert.match(prompt, /```\n## Entities/);
+  assert.match(prompt, /```\n\nThe request being incorporated/);
 });
