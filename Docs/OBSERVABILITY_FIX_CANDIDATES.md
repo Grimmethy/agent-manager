@@ -193,3 +193,16 @@ Accumulate failures in a `skipped` array inside the catch (`skipped.push({ file,
 
 Benefits:
 The scan output becomes self-describing: an operator or CI gate can distinguish "zero reserved attributes found across all 12 files" from "zero found across 7 of 12 files; 5 unreadable." This closes the observability gap in the observability tool itself, makes the gate decision auditable, and costs zero on the happy path (empty `skipped` array, no extra I/O).
+
+### AC-15 · Silent catch swallows scan failure in observability module
+Strength: Strong
+Files: src/observability-scan.js
+
+Problem:
+The `catch { return []; }` block at line 48 of `src/observability-scan.js` discards the error object entirely—no `console.error`, no logger call, no `process.emitWarning`, no rethrow, no metric increment. A network timeout, a 500 from the upstream API, or a permission error all collapse into the same `[]` that a legitimate zero-event scan would produce. Downstream consumers (dashboards, alerting rules, on-call runbooks) interpret `[]` as "zero anomalies detected" and conclude the system is healthy, when in fact the scan itself never completed. In an observability module specifically, this is the highest-impact form of silent failure: the tool whose job is to surface problems is itself hiding its own problems.
+
+Solution:
+Replace the bare `catch { return []; }` with a handler that (1) logs the failure at minimum `warn` level including the function name, `err.message`, and `err.stack` so the original call site is preserved in the log, (2) optionally increments a counter metric (`observability_scan_errors`) so a metrics pipeline can alert on repeated scan failures, and (3) still returns `[]` to preserve the existing return-type contract for callers that branch on array length. Example: `catch (err) { console.error('[observability-scan] scan failed:', err.message, err.stack); return []; }`. No signature change, no new dependency, no caller migration required.
+
+Benefits:
+An on-call engineer investigating an incident will see a timestamped log line with the full stack trace instead of a silent `0 anomalies` reading. A metrics alert can fire when `observability_scan_errors` exceeds a threshold, decoupling detection from human log-scraping. The original error context (which upstream endpoint, which timeout, which permission) is preserved in the log rather than lost in a discarded binding, making root-cause analysis a grep instead of a guess.
