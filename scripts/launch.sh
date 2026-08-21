@@ -83,6 +83,17 @@ if [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" && -n "$TOKENFOLD_DIR" && ! 
 fi
 if [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" && -x "$TOKENFOLD_PY" ]]; then
   TF_UPSTREAM="${OLLAMA_URL:-http://localhost:11434}"
+  # Fixed 2026-08-21: a plain `pip install "${TOKENFOLD_DIR}/core"` (the provisioning
+  # step above) never bundles core/assets/tokenizers/*.json -- pyproject.toml's
+  # packages.find only discovers the tokenfold* Python package, and this data directory
+  # sits OUTSIDE it in the source tree. Confirmed live: every real /api/generate call
+  # crashed with a 500 the moment a freshly-provisioned venv tried to load a Qwen
+  # tokenizer profile, because the installed copy has no such directory at all.
+  # TOKENFOLD_ASSETS_DIR (tokenizers/registry.py, same date) points the running server at
+  # the real assets this checkout already has on disk instead -- no copying, no
+  # restructuring the vendored snapshot (which would just get overwritten by the next
+  # `rsync ... && commit` sync from upstream anyway).
+  export TOKENFOLD_ASSETS_DIR="${TOKENFOLD_DIR}/core/assets/tokenizers"
   start_bg "tokenfold" "${PID_DIR}/tokenfold.pid" "${LOG_DIR}/tokenfold.log" \
     "$TOKENFOLD_PY" -m tokenfold.cli serve --port "$TOKENFOLD_PORT" \
     --upstream "${TF_UPSTREAM%/}/v1"
