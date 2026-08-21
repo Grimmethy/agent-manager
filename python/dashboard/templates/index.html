@@ -161,23 +161,23 @@
 
 <script>
 const TABS = [
-  { key: 'project', label: 'Project' },
-  { key: 'workers', label: 'Workers' },
-  { key: 'models', label: 'Models' },
-  { key: 'joblist', label: 'Job List' },
-  { key: 'deepdive', label: 'Scouted Repos' },
-  { key: 'brain-dump', label: 'Brain Dump' },
-  { key: 'reports', label: '🕒 Time Tracking' },
-  { key: 'branches', label: '🌿 Unmerged Branches' },
+  { key: 'project', label: 'Project', description: 'Pick the target repo and grep dirs, then start, stop, or force-stop the pipeline against it and watch its live run status.' },
+  { key: 'workers', label: 'Workers', description: 'See every running agent instance across the ornith and reasoning lanes, with per-instance status and model selection.' },
+  { key: 'models', label: 'Models', description: 'Configure which models are used for each pipeline stage, review implement-pass quality and usage stats, and run reasoning benchmarks.' },
+  { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted.' },
+  { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
+  { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
+  { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
+  { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { group: 'Job Status', children: [
-    { key: 'drafting', label: 'Drafting' },
-    { key: 'pending', label: 'Pending' },
-    { key: 'review', label: 'Review' },
-    { key: 'approved', label: 'Approved' },
-    { key: 'blocked', label: 'Blocked' },
-    { key: 'needs-clarification', label: '⚠ Needs Clarification' },
-    { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm' },
-    { key: 'done', label: 'Done' },
+    { key: 'drafting', label: 'Drafting', description: 'Jobs where an agent is currently writing the initial implementation.' },
+    { key: 'pending', label: 'Pending', description: 'Jobs queued and waiting for an agent to pick them up.' },
+    { key: 'review', label: 'Review', description: 'Jobs with a draft implementation waiting on review before they can proceed.' },
+    { key: 'approved', label: 'Approved', description: 'Jobs that passed review and are approved to move forward.' },
+    { key: 'blocked', label: 'Blocked', description: 'Jobs that cannot proceed until something outside the pipeline is resolved.' },
+    { key: 'needs-clarification', label: '⚠ Needs Clarification', description: 'Jobs paused because the agent needs a human decision or missing information before it can continue.' },
+    { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm', description: 'Jobs finished and awaiting a human decision on whether to keep or discard the result.' },
+    { key: 'done', label: 'Done', description: 'Jobs that have completed the full pipeline.' },
   ] },
 ];
 let activeTab = 'project';
@@ -386,6 +386,7 @@ function severityForTab(tabKey, count) {
 function renderTabButton(tab, indent) {
   const btn = document.createElement('button');
   btn.className = tab.key === activeTab ? 'active' : '';
+  if (tab.description) btn.title = tab.description;
   if (indent) btn.style.paddingLeft = '36px';
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
