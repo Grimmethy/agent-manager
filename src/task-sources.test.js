@@ -825,6 +825,53 @@ test('nextObservabilityReviewTask scans the active project and returns a triage 
   assert.equal(flags.length, 1);
 });
 
+// Regression, 2026-08-21 (Grimmethy, via the dashboard's Queue tab: found the same real
+// task id sitting as two different files, one in done/ and one in
+// done/_archived_no_action/). observability-flags.json is a persistent queue -- a flag is
+// never pruned just because a task was already generated and completed for it (see
+// nextObservabilityReviewTask's own header comment) -- so taskIdExistsInQueue() is the
+// ONLY thing standing between an archived task and an exact duplicate on the very next
+// call. Before the fix this test pins, that check never looked in
+// done/_archived_no_action/ at all, so archiving a task made its id available again
+// immediately, not eventually.
+test('nextObservabilityReviewTask does not regenerate a duplicate once the original task has been archived', () => {
+  const dir = makeObservabilityFixtureRepo();
+  writeObservabilityFinding(dir);
+  const { nextObservabilityReviewTask } = freshTaskSources(dir);
+
+  const first = nextObservabilityReviewTask();
+  assert.ok(first, 'first call produces the real task');
+
+  // Simulate the dashboard's archive action (api_task_archive, app.py): the task file
+  // moves out of done/ into the nested done/_archived_no_action/ pseudo-state, under the
+  // exact same id -- not deleted, not renamed.
+  const archivedDir = path.join(dir, 'queue', 'done', '_archived_no_action');
+  fs.mkdirSync(archivedDir, { recursive: true });
+  fs.writeFileSync(path.join(archivedDir, `${first.id}.json`), JSON.stringify(first));
+
+  const second = nextObservabilityReviewTask();
+  assert.equal(second, null, 'the archived task\'s id must still be seen as already-queued, not regenerated as a duplicate');
+});
+
+// Same gap, the other two real-but-previously-unchecked queue states (both real
+// directories confirmed live under queue/, both missing from the old QUEUE_STATES list).
+test('nextObservabilityReviewTask does not regenerate a duplicate for a task sitting in needs-clarification/ or awaiting-confirm/', () => {
+  for (const state of ['needs-clarification', 'awaiting-confirm']) {
+    const dir = makeObservabilityFixtureRepo();
+    writeObservabilityFinding(dir);
+    const { nextObservabilityReviewTask } = freshTaskSources(dir);
+    const first = nextObservabilityReviewTask();
+    assert.ok(first, `first call produces the real task (state under test: ${state})`);
+
+    const stateDir = path.join(dir, 'queue', state);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, `${first.id}.json`), JSON.stringify(first));
+
+    const second = nextObservabilityReviewTask();
+    assert.equal(second, null, `a task sitting in ${state}/ must not be duplicated`);
+  }
+});
+
 test('nextObservabilityReviewTask does not rescan within OBSERVABILITY_RESCAN_INTERVAL_MS', () => {
   const dir = makeObservabilityFixtureRepo();
   writeObservabilityFinding(dir);
