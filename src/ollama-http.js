@@ -37,8 +37,16 @@ const http = require('http');
  *   under the 5-min ceiling documented above) via their own REQUEST_TIMEOUT_MS constants --
  *   kept as separate named constants per caller rather than one shared value here, so each
  *   call site's reasoning stays visible next to it.
+ * @param {object} [extraHeaders] - Additional headers merged into the request. Used to pass
+ *   X-TokenFold-Session (see ornith-client.js) -- without it, TokenFold's registry.py-adjacent
+ *   proxy hashes each call's own prompt into a fresh, one-off session_id, so its dictionary
+ *   bootstrap can never amortize across calls (see encoder.py: "One-shot requests stay at face
+ *   value") and nearly every request loses more to the bootstrap tax than it gains from
+ *   aliasing, falling back to representation="original". Confirmed live 2026-08-21: with no
+ *   session header, 273 real requests netted 0.27% total savings and 198/273 fell back to
+ *   "original".
  */
-function postJson(urlString, bodyObj, timeoutMs) {
+function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
   const url = new URL(urlString);
   const payload = JSON.stringify(bodyObj);
   return new Promise((resolve, reject) => {
@@ -47,7 +55,10 @@ function postJson(urlString, bodyObj, timeoutMs) {
       port: url.port || 80,
       path: url.pathname,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      headers: Object.assign(
+        { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        extraHeaders || {}
+      ),
       timeout: timeoutMs,
     }, (res) => {
       let data = '';
