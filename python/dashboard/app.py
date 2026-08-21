@@ -3708,6 +3708,31 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     # process's lifetime, matching what the Project tab visibly promises.
     os.environ["AGENT_MANAGER_REPO_ROOT"] = raw_path
 
+    # Fix, 2026-08-20 (Grimmethy: "I'm still only seeing the agent manager and it's clone
+    # [in the Project tab] -- we should be able to select from any of the projects"):
+    # AGENT_MANAGER_PIPELINE_DIR/AGENT_MANAGER_DOMAINS_PATH were NEVER written here at
+    # all -- only REPO_ROOT/INCLUDE_APPLY/SKIP_PUSH were -- so switching to a project with
+    # its own dedicated pipeline dir (several new plugin repos this session each got one,
+    # separate from repoRoot so pipeline internals don't land inside the tracked git repo)
+    # silently kept whatever pipelineDir the PREVIOUSLY active project left behind in the
+    # shared .env, real risk of one project's tasks landing in a completely different
+    # project's live queue. If this repoRoot was already registered (via a prior Start
+    # Pipeline, or set up directly -- see record_project_registry_entry), honor ITS
+    # pipelineDir/domainsPath instead of leaving the stale previous value in place; a
+    # genuinely first-time repo still falls through to the old raw_path-based default
+    # below, unchanged.
+    normalized_raw_path = os.path.normpath(raw_path)
+    existing_registration = next(
+        (e for e in read_project_registry() if os.path.normpath(e.get("repoRoot", "")) == normalized_raw_path),
+        None,
+    )
+    if existing_registration and existing_registration.get("pipelineDir"):
+        write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_PIPELINE_DIR", existing_registration["pipelineDir"])
+        os.environ["AGENT_MANAGER_PIPELINE_DIR"] = existing_registration["pipelineDir"]
+        if existing_registration.get("domainsPath"):
+            write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_DOMAINS_PATH", existing_registration["domainsPath"])
+            os.environ["AGENT_MANAGER_DOMAINS_PATH"] = existing_registration["domainsPath"]
+
     env_overrides = read_env_file(ENV_FILE_PATH)
     env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
     child_env = {**os.environ, **env_overrides}
