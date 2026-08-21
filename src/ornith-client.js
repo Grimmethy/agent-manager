@@ -41,6 +41,18 @@ const KEEP_ALIVE = process.env.ORNITH_KEEP_ALIVE || '30m';
 function detectDegenerate(text, { allowEmpty = false } = {}) {
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
+  // Ornith sometimes writes the literal two-character JSON-style empty-string
+  // representation ('""' or "''") instead of a genuinely empty response -- review-task.js's
+  // own isEffectivelyEmpty() already treats these the same as a real empty string for its
+  // review-stage check. Without the same handling here, this quirk skips the check above
+  // entirely (text.trim().length is 2, not 0) and burns a full critique+revision cycle on
+  // two characters. Treated identically to a genuinely empty response, respecting the same
+  // allowEmpty escape hatch: a source explicitly told to output nothing when there's
+  // nothing real to report can legitimately produce this quirky two-char form instead of a
+  // truly empty string.
+  const trimmed = text.trim();
+  if (trimmed === '""' || trimmed === "''") return allowEmpty ? null : 'empty';
+
   // Repeated-character garbage (e.g. a literal run of "000000..." was observed for 20
   // straight calls in one documented overnight run).
   const charCounts = {};
