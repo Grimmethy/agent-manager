@@ -466,11 +466,24 @@ class Encoder:
         return noalias_best, alias_best, best_rep, best_conf, best_fails
 
     # ------------------------------------------------------------------
+    _CODE_TOKEN_RE = _re.compile(r"\bK\d+\b")
+
+    # Bug (found live, agent-manager integration 2026-08-21): a naive per-code
+    # str.replace loop corrupts output the moment the dictionary holds more than 9
+    # codes. "K4" is a literal substring of "K40"..."K49", "K400"..."K499", etc., so
+    # replacing K4 first (dict iteration follows insertion/mint order, so short codes
+    # always come first) mangles every longer code that hasn't had its own turn yet --
+    # "K400" becomes "<K4's expansion>00", not "<K400's expansion>". Confirmed live: a
+    # real request decoded to unrelated seed-phrase text with stray digit fragments
+    # ("...after changes00 preserve existing behavior82..."), which the verifier
+    # correctly caught and rejected -- so no corrupted prompt ever reached a model, but
+    # essentially every alias-eligible request silently fell back to uncompressed
+    # "original" once the dictionary grew past single digits. Decoder.decode()
+    # (decoder.py) already does this correctly (one word-bounded regex pass); this
+    # brings _expand_codes in line instead of leaving it as the one divergent copy.
     @staticmethod
     def _expand_codes(text: str, expansions: dict[str, str], session: Session) -> str:
-        out = text
-        for code, exp in expansions.items():
-            out = out.replace(code, exp)
+        out = Encoder._CODE_TOKEN_RE.sub(lambda m: expansions.get(m.group(0), m.group(0)), text)
         for e in session.entities.values():
             out = out.replace(e.code, e.name)
         return out
