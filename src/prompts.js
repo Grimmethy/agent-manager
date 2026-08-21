@@ -472,14 +472,35 @@ function projectSearchPlanPrompt(task) {
 // branch -- it falls through to the generic fallback, so it intentionally gets NO
 // buildImplementPrompt registered below) ----
 
+// Grounding fix (2026-08-21, see task-sources.js's nextCandidateFulfillmentTask header for
+// the full incident this closes): fetchedFiles is real, freshly-read file content for
+// every path the candidate's own "Files:" line named -- a file that doesn't exist (a
+// candidate proposing something brand-new, or a stale path) is simply absent from the
+// list, not an error. Before this, the implement pass for arch_review/arch_import_review/
+// observability_fix/performance_fix/backlog_fulfillment had NOTHING but the candidate's
+// own prose write-up to work from -- confirmed live: a real task fabricated a plausible-
+// looking `find` string that matched nothing in the actual file, because it was never
+// shown the file at all.
 function archReviewImplementPrompt(task, planText) {
   const ctx = task.promptContext;
+  const fetched = ctx.fetchedFiles || [];
+  const namedButMissing = (ctx.files || []).filter((f) => !fetched.some((ff) => ff.path === f));
   return [
     'Earlier you wrote this PLAN for a narrow architecture-improvement change:',
     '',
     planText,
     '',
     `The corrected plan is for: ${ctx.candidateId} -- ${ctx.title}.`,
+    '',
+    fetched.length > 0
+      ? `Real, current content of the file(s) this candidate named (this is the ONLY source of truth for what the file actually contains right now -- the plan/candidate write-up above may be stale or approximate; this is not):\n\n${formatFileContents(fetched)}`
+      : '(none of the file(s) this candidate named could be read -- see the note below before assuming why.)',
+    '',
+    namedButMissing.length > 0
+      ? `NOTE: ${namedButMissing.join(', ')} named by this candidate could not be read (does not exist at that path, or is outside the repo). If your plan calls for creating this file, use mode "create". If your plan assumed this file already exists and you cannot proceed without seeing its real content, output the empty string instead of guessing at content you were never shown.`
+      : '',
+    '',
+    'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up. If the real content above does not actually contain what the plan assumed, the plan was wrong about the file\'s current state; do not force a `find` that only approximately matches.',
     '',
     groupBJsonInstructions,
   ].join('\n');

@@ -1652,3 +1652,79 @@ test('nextBacklogDecompositionTask proposes a fresh task once the spec content a
   assert.ok(second);
   assert.notEqual(second.id, first.id);
 });
+
+// nextCandidateFulfillmentTask's grounding fix (2026-08-21): confirmed live,
+// observability-fix-ac-5 fabricated a `find` string matching nothing in the real file,
+// because this shared consumer (arch_review/arch_import_review/observability_fix/
+// performance_fix/backlog_fulfillment) never read real file content -- only the
+// candidate's own prose write-up. See this function's own header comment for the full
+// incident.
+function writeCandidatesDocWithFiles(dir, candidatesRelPath, filesLine) {
+  const candidatesPath = path.join(dir, candidatesRelPath);
+  fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
+  fs.writeFileSync(candidatesPath, [
+    '### AC-1 · A real finding',
+    'Strength: Strong',
+    `Files: ${filesLine}`,
+    '',
+    'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.',
+  ].join('\n'));
+  return candidatesPath;
+}
+
+test('nextCandidateFulfillmentTask fetches real, current content for a file that actually exists on disk', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'worker.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task);
+  assert.equal(task.promptContext.fetchedFiles.length, 1);
+  assert.equal(task.promptContext.fetchedFiles[0].path, 'worker.js');
+  assert.equal(task.promptContext.fetchedFiles[0].content, 'try {\n  risky();\n} catch {}\n');
+});
+
+test('nextCandidateFulfillmentTask does not throw and returns an empty fetchedFiles for a named file that does not exist', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'does/not/exist.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task);
+  assert.deepEqual(task.promptContext.fetchedFiles, []);
+  assert.deepEqual(task.promptContext.files, ['does/not/exist.js']);
+});
+
+test('nextCandidateFulfillmentTask refuses to read a path that escapes the repo root', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', '../../../etc/passwd');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task);
+  assert.deepEqual(task.promptContext.fetchedFiles, []);
+});
+
+test('nextCandidateFulfillmentTask truncates an individually oversized fetched file rather than sending it all', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'huge.js'), 'x'.repeat(20000));
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'huge.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task.promptContext.fetchedFiles[0].content.length < 20000);
+  assert.match(task.promptContext.fetchedFiles[0].content, /\[truncated\]/);
+});
+
+test('nextCandidateFulfillmentTask fetches multiple named files, skipping only the ones that fail', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'a.js'), 'const a = 1;');
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'a.js, b.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.equal(task.promptContext.fetchedFiles.length, 1);
+  assert.equal(task.promptContext.fetchedFiles[0].path, 'a.js');
+  assert.deepEqual(task.promptContext.files, ['a.js', 'b.js']);
+});
