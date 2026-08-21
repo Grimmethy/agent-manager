@@ -18,6 +18,24 @@ function truncate(str, max) {
   return str.length > max ? `${str.slice(0, max)}\n...[truncated]` : str;
 }
 
+// Real, byte-exact file content embedded into a prompt for the model to read/quote/
+// find-replace against (arch_discovery, deep_dive, arch_import, pipeline_self_audit) --
+// centralized here (2026-08-21) both to de-duplicate the identical inline expression this
+// replaced at 4 call sites, and to fence each file's content in a real markdown code
+// block. The fence isn't cosmetic: a live TokenFold compression-proxy test the same night
+// found that content embedded WITHOUT a fence gets treated as ordinary prose and silently
+// loses exact whitespace/wording (confirmed: "AT APPLY TIME from what was actually on
+// disk" became "...from what was on disk", real code lost all indentation) -- TokenFold's
+// own protected-region detector only recognizes fenced code blocks, nothing else. This
+// pipeline's exact-match apply path (apply-group-b.js's find/replace) has zero tolerance
+// for that kind of loss regardless of whether TokenFold or any other prompt-compression
+// layer is in front of Ollama, so fencing real file content is worth doing unconditionally
+// -- it costs nothing when no compression proxy is in the path, and is the one thing that
+// actually protects this content when one is.
+function formatFileContents(files) {
+  return (files || []).map((f) => `--- ${f.path} ---\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n');
+}
+
 // Shared by every "real code change" source (arch_review, trouble_log, adhoc/manual): the
 // apply step is a fully deterministic script (apply-group-b.js) with no LLM involved -- it
 // consumes JSON shaped like exactly one of create/edit/delete, applied via a grammar-
@@ -82,7 +100,7 @@ function archReviewPlanPrompt(task) {
 function archDiscoveryPlanPrompt(task) {
   const ctx = task.promptContext;
   const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
-  const fileContents = ctx.files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+  const fileContents = formatFileContents(ctx.files);
   return [
     'You are looking for real architectural friction in ONE community of files from this project.',
     '',
@@ -508,7 +526,7 @@ function archDiscoveryImplementPrompt(task, planText) {
 function deepDivePlanPrompt(task) {
   const ctx = task.promptContext;
   const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
-  const fileContents = ctx.files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+  const fileContents = formatFileContents(ctx.files);
   return [
     `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, Ornith-based workers, majority-vote review gates).`,
     '',
@@ -579,7 +597,7 @@ function archImportImplementPrompt(task, planText) {
     ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
     : '(no matches -- the searches found nothing in agent-manager\'s own code)';
   const filesText = files.length > 0
-    ? files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')
+    ? formatFileContents(files)
     : '(no file content fetched)';
   return [
     `Earlier you proposed search terms to find where this deep-dive finding applies in agent-manager's own code:`,
@@ -651,7 +669,7 @@ function pipelineSelfAuditImplementPrompt(task, planText) {
     ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
     : '(no matches -- the searches found nothing in this pipeline\'s own code)';
   const filesText = files.length > 0
-    ? files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')
+    ? formatFileContents(files)
     : '(no file content fetched)';
   return [
     'Earlier you proposed search terms to find the pipeline code behind this failure pattern:',
@@ -692,7 +710,7 @@ function productSpecPlanPrompt(task) {
       ? 'CURRENT SPEC (the only decisions already made -- treat everything in it as settled unless the new request explicitly changes it):'
       : 'CURRENT SPEC: (none yet -- this is the first request filed for this project. You are creating the document, not editing one.)',
     '',
-    ctx.specExists ? ctx.currentSpec : '(empty)',
+    ctx.specExists ? `\`\`\`\n${ctx.currentSpec}\n\`\`\`` : '(empty)',
     '',
     `NEW REQUEST: ${ctx.requestText}`,
     '',
@@ -715,7 +733,7 @@ function productSpecImplementPrompt(task, planText) {
       ? 'CURRENT SPEC (full current content -- any "find" text in your JSON output below must be an exact substring of this):'
       : 'CURRENT SPEC: (none yet -- write the FIRST version of the document.)',
     '',
-    ctx.specExists ? ctx.currentSpec : '(empty)',
+    ctx.specExists ? `\`\`\`\n${ctx.currentSpec}\n\`\`\`` : '(empty)',
     '',
     `The request being incorporated: ${ctx.requestText}`,
     '',
@@ -1085,7 +1103,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
   ].join('\n');
 }
 
-module.exports = { buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions };
+module.exports = { buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, formatFileContents };
 
 if (require.main === module) {
   const fs = require('fs');
