@@ -440,6 +440,36 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
       filesArray = filesMatch[1].split(',').map((f) => f.trim());
     }
 
+    // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
+    // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing
+    // in the real file, because this candidate's own implement pass was never shown real
+    // file content, only its own prose write-up from whenever the candidate was originally
+    // drafted, possibly hours or days earlier by a different pass entirely. Every OTHER
+    // fulfillment-style source (arch_import, pipeline_self_audit) grounds its implement
+    // pass in real, freshly-read file content; this generic consumer -- shared by
+    // arch_review, arch_import_review, observability_fix, performance_fix, and
+    // backlog_fulfillment all at once -- never did. Unlike arch_import's own harness
+    // grounding (which has to SEARCH for candidate files because it doesn't know them yet),
+    // this already knows exactly which files from the candidate's own "Files:" line, so no
+    // search step is needed -- just read them, best-effort. A file that doesn't exist
+    // (a candidate proposing a brand-new file, or a stale/illustrative path) is not an
+    // error -- see fetchedFiles' own promptContext field, which the implement prompt is
+    // told explicitly means "ground a create, or flag the mismatch, don't invent content."
+    const { repoRoot } = getConfig();
+    const MAX_FETCHED_FILE_CHARS = 8000;
+    const fetchedFiles = filesArray
+      .map((relPath) => {
+        try {
+          const full = path.resolve(repoRoot, relPath);
+          if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
+          const content = fs.readFileSync(full, 'utf8');
+          return { path: relPath, content: content.length > MAX_FETCHED_FILE_CHARS ? `${content.slice(0, MAX_FETCHED_FILE_CHARS)}\n...[truncated]` : content };
+        } catch {
+          return null; // doesn't exist / unreadable -- not an error, see comment above
+        }
+      })
+      .filter(Boolean);
+
     return {
       id: taskId,
       domain: defaultDomain,
@@ -449,6 +479,7 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
         candidateId,
         title: titleText,
         files: filesArray,
+        fetchedFiles,
         body: section,
       },
     };

@@ -321,7 +321,15 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // them is a valid, intended answer, not a failed call, so the degenerate-output
       // detector's 'empty' check must not fire for them (see ornith-client.js's call()
       // comment for the live-confirmed backlog this caused).
-      const allowEmptyImplement = ['arch_discovery', 'deep_dive', 'arch_import', 'project_search', 'pipeline_self_audit'].includes(task.source);
+      // arch_review/arch_import_review/observability_fix/performance_fix/backlog_fulfillment
+      // (2026-08-21, see task-sources.js's nextCandidateFulfillmentTask header): now grounded
+      // in real fetched file content, and explicitly told to output empty rather than fabricate
+      // a find/replace when the named file(s) couldn't be read -- that's a legitimate, expected
+      // outcome now, same reasoning as arch_import's own empty-on-no-match case just below.
+      const allowEmptyImplement = [
+        'arch_discovery', 'deep_dive', 'arch_import', 'project_search', 'pipeline_self_audit',
+        'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
+      ].includes(task.source);
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
       // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why

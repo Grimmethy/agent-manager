@@ -209,3 +209,42 @@ test('buildImplementPrompt fences the current spec doc for product_spec, since i
   assert.match(prompt, /```\n## Entities/);
   assert.match(prompt, /```\n\nThe request being incorporated/);
 });
+
+// archReviewImplementPrompt's grounding fix (2026-08-21) -- shared by arch_review,
+// arch_import_review, observability_fix, performance_fix, and backlog_fulfillment. See
+// task-sources.js's nextCandidateFulfillmentTask header for the live incident this closes.
+function archReviewFulfillmentTask(promptContextOverrides = {}) {
+  return {
+    domain: 'default', source: 'arch_review', title: 't',
+    promptContext: {
+      candidateId: 'AC-5', title: 'Silent domain-file load failure hides guardrail loss',
+      files: ['src/apply-group-a.js'],
+      fetchedFiles: [{ path: 'src/apply-group-a.js', content: '  try {\n    coverage = JSON.parse(...);\n  } catch {\n    coverage = { projects: {} };\n  }' }],
+      body: '### AC-5 · ...',
+      ...promptContextOverrides,
+    },
+  };
+}
+
+test('buildImplementPrompt embeds real fetched file content, fenced, and tells the model to ground find in it rather than the plan', () => {
+  const prompt = buildImplementPrompt(archReviewFulfillmentTask(), 'PLAN: add a log line to the catch');
+  assert.match(prompt, /```\n  try \{\n    coverage = JSON\.parse/);
+  assert.match(prompt, /Ground every "find" value in the real file content shown above/);
+  assert.match(prompt, /the ONLY source of truth/);
+});
+
+test('buildImplementPrompt tells the model to output empty rather than guess when a named file could not be fetched', () => {
+  const prompt = buildImplementPrompt(archReviewFulfillmentTask({ files: ['src/missing.js'], fetchedFiles: [] }), 'PLAN: ...');
+  assert.match(prompt, /src\/missing\.js.*could not be read/);
+  assert.match(prompt, /output the empty string instead of guessing/);
+  assert.doesNotMatch(prompt, /```\n  try \{/); // no stale fetched content leaking through
+});
+
+test('buildImplementPrompt only flags the files that actually failed to fetch, not ones that succeeded', () => {
+  const prompt = buildImplementPrompt(archReviewFulfillmentTask({
+    files: ['src/apply-group-a.js', 'src/missing.js'],
+    fetchedFiles: [{ path: 'src/apply-group-a.js', content: 'const x = 1;' }],
+  }), 'PLAN: ...');
+  assert.match(prompt, /NOTE: src\/missing\.js/);
+  assert.doesNotMatch(prompt, /NOTE: src\/apply-group-a\.js/);
+});
