@@ -28,6 +28,12 @@ from .folding import AbstractiveFolder, dedup_blob, fold_turn
 from .session import Session, session_id_for
 from ..tokenizers.registry import profile_for
 
+import re as _re
+# Semicolon OR sentence-final punctuation followed by whitespace -- see the learning
+# block below for why sentence boundaries were added alongside the original semicolon-only
+# split.
+_CLAUSE_SPLIT = _re.compile(r"[;]|(?<=[.!?])\s+")
+
 TERSE_STYLE = "Reply terse, no preamble/summary. Code/paths/numbers exact."
 
 
@@ -438,9 +444,21 @@ class Encoder:
                 alias_best, alias_tok = restored, tok
                 best_rep, best_conf, best_fails = rep, v.confidence, v.failures
 
-        # learning: feed recurring clauses to the nursery
+        # learning: feed recurring clauses to the nursery. Fixed 2026-08-21
+        # (agent-manager integration, confirmed live): semicolon-only splitting means a
+        # phrase can NEVER be recognized as recurring content unless it is written as a
+        # semicolon-separated imperative -- FoldLang's own documented target style, per
+        # docs/foldlang.md ("Clauses separated by ;"). A consumer whose real repeated
+        # boilerplate is written as normal grammatical prose (complete sentences, no
+        # semicolons at all) gets zero observations no matter how many times that exact
+        # text repeats -- reproduced directly: 40 identical repeats of a real ~1500-char
+        # instructional block in one session, nursery count never moved from its starting
+        # value. _CLAUSE_SPLIT below adds sentence-boundary splitting (the same regex
+        # shape folding.py's own fold_turn() already uses for a related purpose) alongside
+        # the original semicolon split, so a real repeated SENTENCE gets a chance to be
+        # observed too, not just a repeated semicolon-joined clause.
         if role in ("user", "system"):
-            for clause in [c.strip() for c in terse_skel.split(";") if len(c.strip()) > 15]:
+            for clause in [c.strip() for c in _CLAUSE_SPLIT.split(terse_skel) if len(c.strip()) > 15]:
                 if "⟦" not in clause:
                     self.dict.observe(clause, prof.count(clause))
             self.dict.save()
