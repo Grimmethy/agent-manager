@@ -103,3 +103,16 @@ Inside the existing `catch` block, add a single `console.warn` call that include
 
 Benefits:
 Operators and CI logs now receive a one-line diagnostic the moment the coverage file is unreadable or malformed, eliminating the ambiguity between "file not yet produced" and "file corrupted." No behavioral change, no new dependency, no risk to callers — the fix is a single statement that converts a silent failure into a visible, greppable warning while preserving the existing best-effort semantics.
+
+### AC-9 · Silent catch in requeue loop loses all diagnostic context
+Strength: Strong
+Files: src/reject-retry-check.js
+
+Problem:
+The `catch (e)` block in the per-task requeue loop increments `summary.errors++` and discards `e` entirely. No `e.message`, `e.code`, `filePath`, or task id is emitted anywhere. An operator seeing `summary.errors: 3` cannot distinguish a transient `EACCES` lock, an `ENOSPC` disk-full that left the original file intact with the task stranded, or a post-write `unlinkSync` failure that produced a duplicate task file. In a reject/retry pipeline a failed requeue means the task is in limbo with zero diagnostic trail.
+
+Solution:
+Replace the bare `summary.errors++` with a structured log line that captures `filePath` (or `task?.id`), `e.message`, and `e.code`, then increment the counter. Do not rethrow — the loop is per-task and one failure must not abort the batch. If the project uses a structured logger (pino, winston, etc.), emit `log.warn({ filePath, task: task?.id, err: e }, 'requeue failed')`; otherwise fall back to `console.error('[reject-retry-check] requeue failed for ' + filePath + ': ' + e.message, e.code)`. Keep `summary.errors++` for aggregate dashboards.
+
+Benefits:
+Operators can immediately identify which task and which file path failed, the OS-level error code (ENOSPC vs EACCES vs EBUSY), and the human-readable message, enabling correct triage (free disk space, fix permissions, or investigate duplicate-task risk) instead of guessing from an opaque counter. The aggregate `summary.errors` counter is preserved for existing dashboards and alerting thresholds.
