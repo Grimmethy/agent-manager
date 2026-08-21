@@ -142,3 +142,28 @@ Bind the error in the catch clause and emit it to an observable channel before r
 
 Benefits:
 Operators can distinguish "no matches in this subtree" from "couldn't read this subtree (permission denied / fd exhaustion)." Transient `EMFILE` truncation becomes visible in logs or the returned diagnostics array instead of silently producing an incomplete result set. The tool's output contract ("grep the codebase") is now honest: partial results are flagged as partial, matching the behavior users expect from `grep -r` and `find`.
+
+### AC-12 · Log errno on lock-acquire failure instead of swallowing the error
+Strength: Strong
+Files: src/model-inflight-lock.js
+
+Problem:
+The `catch` block in `acquireLock` discards the `Error` object and returns `null` with no log line. A systemic fault such as `EACCES` after a uid change, `ENOSPC`, or a missing lock directory silently converts every subsequent call into "lock not acquired." Operators see duplicate model instances or resource contention in downstream metrics but have zero log line at the lock layer, and the `errno`—the single most useful diagnostic for "why did locking stop working?"—is unrecoverable after the catch.
+
+Solution:
+Replace the bare `catch { return null; }` with:
+
+```js
+catch (err) {
+  console.warn(
+    '[inflight-lock] acquire failed',
+    { model, instanceId, code: err.code, message: err.message },
+  );
+  return null;
+}
+```
+
+`console.warn` requires no import (the file currently binds only `path`, `fs`, `crypto`). The `null`-return contract is preserved exactly; no rethrow, no control-flow change. The only addition is a single structured log line carrying `model`, `instanceId`, `err.code`, and `err.message` so the failure is attributable and greppable.
+
+Benefits:
+When a lock layer silently degrades, the operator now has a timestamped, structured log line with the exact `errno` and model identifier, reducing MTTR from "hunt through downstream symptoms" to "grep for `inflight-lock acquire failed`." No behavioral change for callers; the fix is purely additive observability.
