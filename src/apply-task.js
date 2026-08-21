@@ -34,16 +34,33 @@ ensureRegistered();
 // unused_export, etc.) never touches applyGroupB at all, so the delete gate has nothing to
 // check for those; only a source with no custom apply falls through to the generic Group B
 // JSON-change-object path.
-// arch_discovery/arch_import's apply is a low-risk, additive-only append to a
-// candidates-tracking doc -- never real application code (the actual code-writing
-// follow-up, arch_review/arch_import_review, goes through the normal branch+review
-// flow below like everything else). Confirmed live 2026-08-16: with every domain going
-// through the same throwaway agent/<task.id> branch + skipPush's "commit locally, stop
-// there" mode, these two domains' commits had nowhere durable to land -- ~311 such
-// branches were created over time, only 10 ever survived to be reviewed, and NONE had
-// ever reached main. See applyTask()'s own comment at the git-branch-diff flow for how
-// this set changes the sequence.
-const DIRECT_TO_MAIN_DOMAINS = new Set(['arch_discovery', 'arch_import']);
+// arch_discovery/arch_import/observability_review/performance_review's apply is a
+// low-risk, additive-only append to a candidates-tracking doc -- never real application
+// code (the actual code-writing follow-up -- arch_review, arch_import_review,
+// observability_fix, performance_fix -- goes through the normal branch+review flow below
+// like everything else). Confirmed live 2026-08-16: with every domain going through the
+// same throwaway agent/<task.id> branch + skipPush's "commit locally, stop there" mode,
+// these commits had nowhere durable to land -- ~311 such branches were created over
+// time, only 10 ever survived to be reviewed, and NONE had ever reached main.
+//
+// BUG FIXED 2026-08-21 (Grimmethy: "observability review seems to be requiring a branch
+// merge before observability fix -- is this necessary?"): this set was checked against
+// task.domain, but every task built by these four sources stamps domain: defaultDomain
+// (near-always the literal string "default" -- see config.js) and carries the actual
+// source name in task.source instead (the field every OTHER per-source gate in this
+// file already checks -- see the pipeline_self_audit/product_spec gates above). So
+// DIRECT_TO_MAIN_DOMAINS.has(task.domain) was comparing "default" against
+// {"arch_discovery","arch_import"} and NEVER matched -- confirmed live via git history:
+// every arch_discovery/arch_import commit has a corresponding "Merge ... (via
+// dashboard)" commit, meaning the direct-to-main fast path this comment describes had
+// been dead code since the day it was written; these two sources went through the exact
+// same slow branch+review+merge cycle as real code changes the whole time, and so did
+// observability_review/performance_review once they shipped in the same shape. Checking
+// task.source instead is what actually makes this fast path fire, for all four sources
+// this note originally meant to cover.
+const DIRECT_TO_MAIN_SOURCES = new Set([
+  'arch_discovery', 'arch_import', 'observability_review', 'performance_review',
+]);
 
 // task.draftModel (stamped by ornith-draft.js/adhoc-agentic-draft.js at draft time, same
 // "claude:<model>"-or-"<real ollama tag>" label model-provider.js's labelFor() and the
@@ -313,10 +330,10 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     gitRunner.fetchMain();
     gitRunner.resetToMain();
 
-    // commitsDirectlyToMain domains skip the branch entirely (branchName stays null) --
-    // see DIRECT_TO_MAIN_DOMAINS' own header comment for why. Everything else keeps the
+    // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) --
+    // see DIRECT_TO_MAIN_SOURCES' own header comment for why. Everything else keeps the
     // normal throwaway agent/<id> branch.
-    const commitsDirectlyToMain = DIRECT_TO_MAIN_DOMAINS.has(task.domain);
+    const commitsDirectlyToMain = DIRECT_TO_MAIN_SOURCES.has(task.source);
     const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
     if (branchName) gitRunner.createBranch(branchName);
 
