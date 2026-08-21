@@ -219,3 +219,16 @@ Replace the comment-only catch body with a single `console.warn` (or the project
 
 Benefits:
 Every silent degradation becomes a greppable, alertable log line. On-call can correlate a spike in `projectSearchFetch failed` warnings with the underlying cause (auth, DNS, 500) within seconds instead of waiting for user complaints. The fix is additive; no behavioral or API change, so regression risk is nil.
+
+### AC-17 · Empty catch on coverage write swallows fs.writeFileSync failure with no observability
+Strength: Strong
+Files: src/reject-retry-check.js
+
+Problem:
+The catch block around `fs.writeFileSync` for the `deepDiveCoverage` artifact is empty, yet the adjacent comment claims "log and move on." No `console.warn`, no `process.emitWarning`, no metric counter is emitted. The sentinel `entry.actionItemCount = -1` is assigned before the write, so in-memory state is consistent, but the on-disk file is silently absent. In a pipeline that audits agent coverage, a missing `deepDiveCoverage` file with zero log output is indistinguishable from "coverage was never computed," making the failure unobservable in production.
+
+Solution:
+Add a single `console.warn` (or the project's structured logger, e.g. `logger.warn`) inside the existing catch block that includes the error message and the target path, e.g. `console.warn('[reject-retry-check] coverage write failed:', e.message)`. No rethrow, no sentinel change, no new dependency — the control flow and in-memory state remain identical; the only change is that the failure is now visible in stdout/logs.
+
+Benefits:
+Operators can now grep logs for `coverage write failed` to distinguish "write attempted and failed (EACCES/ENOSPC/EROFS)" from "coverage was never computed." The comment and code now agree, removing the trap for the next maintainer who would otherwise assume a log already exists and skip adding one. No behavior change, no new failure mode, one line of diff.
