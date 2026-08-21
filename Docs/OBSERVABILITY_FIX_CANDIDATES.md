@@ -245,3 +245,28 @@ Replace the bare `summary.errors++` with a structured log line that captures `fi
 
 Benefits:
 Operators can immediately identify which task and which file path failed, the OS-level error code (ENOSPC vs EACCES vs EBUSY), and the human-readable message, enabling correct triage (free disk space, fix permissions, or investigate duplicate-task risk) instead of guessing from an opaque counter. The aggregate `summary.errors` counter is preserved for existing dashboards and alerting thresholds.
+
+### AC-19 · Log non-fatal archImportFetch failure in catch block
+Strength: Strong
+Files: src/ornith-draft.js
+
+Problem:
+At `src/ornith-draft.js:157` the `catch` block for `archImportFetch` swallows the exception entirely—no `console.*` call, no metric, no rethrow. A throw here signals a network timeout, auth expiry, 500, or parse error, yet the pipeline proceeds with an empty hits list and leaves zero log line in the entire run. In a batch/agent context that is the only observable trace of *why* the search step contributed nothing, and the existing comment documents the intent to proceed without hits but provides no diagnostic signal.
+
+Solution:
+Insert a single `console.debug` line as the first statement inside the existing `catch (e)` block at line 157, before the implicit fall-through to the empty-hits path. The exact change:
+
+```js
+// src/ornith-draft.js:157  (the catch block)
+} catch (e) {
+  console.debug(`[ornith-draft] archImportFetch non-fatal failure: ${e?.message ?? e}`);
+  // Non-fatal -- implement proceeds with no hits (its own prompt already handles
+  // an empty hits list: "(no matches -- the searches found nothing ...)"), same
+  // try/catch treatment project_search's branch above gives its own fetch call.
+}
+```
+
+`console.debug` (not `warn`) keeps stdout clean in normal operation; surface it via `NODE_DEBUG` or a log-level flag when diagnosing. `e?.message ?? e` handles both `Error` instances and non-Error throws. No rethrow, no metric—preserves the existing "proceed with empty hits" contract and the `project_search` parity the comment references.
+
+Benefits:
+Once fixed, any operator or agent diagnosing a run where the search step returned nothing can enable debug logging and immediately see the concrete failure reason (timeout, 401, 500, JSON parse error) instead of staring at a silent empty result. The one-line addition changes no runtime behaviour, adds no new dependency, and satisfies the scanner's "no log/rethrow/metric" condition by providing the minimal observable trace the finding requires.
