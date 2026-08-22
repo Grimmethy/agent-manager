@@ -167,6 +167,7 @@ const TABS = [
   { key: 'models', label: 'Models', description: 'Configure which models are used for each pipeline stage, review implement-pass quality and usage stats, and run reasoning benchmarks.' },
   { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted.' },
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
+  { key: 'discovery', label: 'Discovery', description: 'Watch the architecture-discovery job work through the project\'s code communities, and read the candidate write-ups it has produced.' },
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
@@ -2224,6 +2225,148 @@ async function openDeepDiveDetail(slug, selectedIdx = null) {
   wireDeepDiveDetailHandlers(slug, selectedIdx);
 }
 
+// --- Discovery tab -------------------------------------------------------------------
+// arch_discovery ran for weeks with its only visible trace being generic queue rows
+// scattered across the Job Status tabs (2026-08-22, Gypsy: "Discovery task is dopamine
+// deprived"). The readouts already exist on each task (planResponse/implementResponse --
+// the same detail modal every queue tab uses renders them via openTaskAnywhere), and the
+// job's output already lands as AC-N blocks in the candidates doc; this tab just puts
+// that existing state on one screen: which community the job is chewing on, which is
+// next in rotation, what each run concluded, and the candidate write-ups produced.
+let discoveryCandidatesCache = []; // last /api/discovery candidates -- the modal reads a block from here by id
+// Survives the generic 5s re-render (module-level, same reasoning as queueSourceFilter):
+// a graphify run yields a LOT of communities (186 on TaxHarvest), nearly all of them
+// never-reviewed -- the full table would bury the runs/candidates sections this tab
+// exists for, so the never-touched tail stays collapsed unless explicitly expanded.
+let discoveryShowAllCommunities = false;
+
+async function renderDiscoveryTab() {
+  const d = await fetchJson('/api/discovery');
+  discoveryCandidatesCache = d.candidates || [];
+  const main = document.getElementById('main');
+  if (!d.available) {
+    main.innerHTML = '<div class="empty">No discovery state found for the active project -- community-coverage.json and the candidates doc appear once the project graph is built and arch_discovery has run.</div>';
+    return;
+  }
+
+  const reviewed = d.communities.filter(c => c.lastReviewedAt).length;
+  const inFlight = d.tasks.filter(t => t.state !== 'done');
+  const doneRuns = d.tasks.filter(t => t.state === 'done');
+  const nextCommunity = d.communities.find(c => c.id === d.nextCommunityId);
+  const stats = `
+    <div class="stat-row">
+      <div class="stat"><strong>${reviewed} / ${d.communities.length}</strong>communities reviewed</div>
+      <div class="stat"><strong>${inFlight.length}</strong>runs in flight</div>
+      <div class="stat"><strong>${doneRuns.length}</strong>runs completed</div>
+      <div class="stat"><strong>${d.candidates.length}</strong>candidates produced</div>
+      <div class="stat"><strong>${nextCommunity ? escapeHtml(nextCommunity.name) : '--'}</strong>next up</div>
+    </div>`;
+
+  // Same order the job itself works in (nextArchDiscoveryTask's oldest-first rotation,
+  // never-reviewed before any real timestamp), so the top of the table is always "what
+  // discovery cares about right now".
+  const sortedCommunities = [...d.communities].sort((a, b) =>
+    (a.lastReviewedAt || '').localeCompare(b.lastReviewedAt || ''));
+  // Only rows with something to say (in queue, next up, or actually reviewed) show by
+  // default; the untouched tail collapses to a one-line count.
+  const interesting = sortedCommunities.filter(c =>
+    c.inFlightState || c.id === d.nextCommunityId || c.lastReviewedAt);
+  const communities = discoveryShowAllCommunities ? sortedCommunities : interesting;
+  const hiddenCount = sortedCommunities.length - communities.length;
+  const communityRows = communities.map(c => {
+    const status = c.inFlightState
+      ? `<span class="badge warn">in queue: ${escapeHtml(c.inFlightState)}</span>`
+      : c.id === d.nextCommunityId
+        ? '<span class="badge ok">next up</span>'
+        : c.lastReviewedAt
+          ? '<span class="badge idle">reviewed</span>'
+          : '<span class="badge idle">never reviewed</span>';
+    return `<tr>
+      <td>#${c.id} ${escapeHtml(c.name || '')}</td>
+      <td>${status}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : ''}</td>
+      <td>${c.lastCandidateCount ?? ''}</td>
+    </tr>`;
+  }).join('');
+
+  const stateBadge = (s) => {
+    const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+      : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+    return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+  };
+  const runRows = d.tasks.map(t => {
+    // Whichever field carries the run's actual outcome -- same signal priority as
+    // _adhoc_task_excerpt server-side.
+    const result = t.blockedReason
+      ? `<span style="color:var(--bad)">${escapeHtml(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
+      : t.doneMarker
+        ? escapeHtml(t.doneMarker)
+        : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
+    return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout (plan, draft, review verdicts)">
+      <td>${escapeHtml(t.title)}</td>
+      <td>${stateBadge(t.state)}</td>
+      <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
+      <td class="meta">${result}</td>
+    </tr>`;
+  }).join('');
+  const runsTable = d.tasks.length === 0
+    ? '<div class="empty">No arch-discovery runs in the queue yet.</div>'
+    : `<table><thead><tr><th>Run</th><th>State</th><th>Created</th><th>Result</th></tr></thead><tbody>${runRows}</tbody></table>`;
+
+  const candidateRows = d.candidates.map(c => `
+    <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
+      <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
+      <td>${escapeHtml(c.title)}</td>
+      <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
+      <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
+    </tr>`).join('');
+  const candidatesTable = d.candidates.length === 0
+    ? '<div class="empty">No candidates written yet.</div>'
+    : `<table><thead><tr><th>ID</th><th>Candidate</th><th>Strength</th><th>Files</th></tr></thead><tbody>${candidateRows}</tbody></table>`;
+
+  const communityToggle = (discoveryShowAllCommunities || hiddenCount > 0)
+    ? `<div style="margin:8px 0 0"><button class="secondary" id="discovery-show-all">${
+        discoveryShowAllCommunities
+          ? 'Show active communities only'
+          : `Show all ${sortedCommunities.length} communities (${hiddenCount} never reviewed hidden)`
+      }</button></div>`
+    : '';
+
+  // Runs and candidates first -- they're what this tab exists to surface; the (large)
+  // community rotation table is reference material below them.
+  main.innerHTML = stats
+    + `<div class="field-label">Discovery Runs</div>` + runsTable
+    + `<div class="field-label">Candidates Produced${d.candidatesPath ? ` <span style="text-transform:none;letter-spacing:0">(${escapeHtml(d.candidatesPath)})</span>` : ''}</div>`
+    + candidatesTable
+    + `<div class="field-label">Communities (rotation order)</div>`
+    + `<table><thead><tr><th>Community</th><th>Status</th><th>Last Reviewed</th><th>Candidates Last Run</th></tr></thead><tbody>${communityRows}</tbody></table>`
+    + communityToggle;
+
+  main.querySelectorAll('tr[data-task-id]').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
+  main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
+    row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+  const toggleBtn = document.getElementById('discovery-show-all');
+  if (toggleBtn) toggleBtn.onclick = () => {
+    discoveryShowAllCommunities = !discoveryShowAllCommunities;
+    renderDiscoveryTab();
+  };
+}
+
+// Same borrow-the-task-modal-DOM pattern as renderCaseInfoModal -- one shared backdrop,
+// closeDetail() closes everything.
+function openDiscoveryCandidate(id) {
+  const c = discoveryCandidatesCache.find(x => x.id === id);
+  if (!c) return;
+  const content = document.getElementById('modal-content');
+  content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button>`
+    + `<h2>AC-${String(c.id).padStart(3, '0')} · ${escapeHtml(c.title)}</h2>`
+    + `<pre>${escapeHtml(c.content)}</pre>`;
+  document.getElementById('modal-backdrop').classList.add('open');
+}
+
 // Time Tracking tab (2026-08-19 brain dump: hourly/daily/weekly reports showing
 // downtime and junk-vs-benefit time accounting, generated by system-report.js and filed
 // into SecondBrain/Agent Manager Reports/<period>/). Own fetch + render, same
@@ -2334,6 +2477,7 @@ async function renderMain() {
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
+    else if (activeTab === 'discovery') await renderDiscoveryTab();
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
     else if (activeTab === 'tokenfold') await renderTokenfoldTab();

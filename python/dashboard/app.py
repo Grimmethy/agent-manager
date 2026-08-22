@@ -157,7 +157,24 @@ def api_alerts():
                 "body": f"Actioned entry's task is {e.get('taskStatus')} -- needs a look.",
             })
 
-    return jsonify({"alerts": alerts})
+    # National-backfill event feed (progress-report.js writes alerts.json; see
+    # alerts_path()). Was its own duplicate @app.route("/api/alerts") definition after
+    # the 2026-08-22 master merge landed both this queue-derived feed (2c66a17) and the
+    # file-based one (6de654c) -- Flask refuses to even start with two routes on one
+    # rule, so the two sources are merged into this single endpoint instead. File
+    # entries already carry their own stable ids ({id, at, level, title, body}), so the
+    # client's id-based dedupe works unchanged across both sources.
+    generated_at = None
+    p = alerts_path()
+    if p and p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            generated_at = data.get("generatedAt")
+            alerts.extend(data.get("alerts") or [])
+        except Exception:
+            pass  # unreadable feed file -- queue-derived alerts still go out
+
+    return jsonify({"generatedAt": generated_at, "alerts": alerts})
 
 
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
@@ -626,6 +643,24 @@ def get_pipeline_dir() -> Path | None:
 def queue_dir() -> Path | None:
     d = get_pipeline_dir()
     return (d / "queue") if d else None
+
+
+def alerts_path() -> Path | None:
+    """Alert feed for the companion app's background poller. Explicit override first;
+    otherwise the national backfill loop's conventional location relative to the pipeline
+    dir (<pipeline>/../../national-coverage/alerts.json — see NATIONAL-BACKFILL-LOOP.md
+    in the TaxHarvest repo). None when neither exists: /api/alerts then returns an empty
+    feed rather than 404, so the app's poller needs no per-server capability check."""
+    override = os.environ.get("AGENT_MANAGER_ALERTS_PATH") or read_env_file(ENV_FILE_PATH).get(
+        "AGENT_MANAGER_ALERTS_PATH"
+    )
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    if not d:
+        return None
+    candidate = d.parent.parent / "national-coverage" / "alerts.json"
+    return candidate if candidate.exists() else None
 
 
 def instances_dir() -> Path | None:
@@ -1804,6 +1839,167 @@ def api_adhoc_tasks():
 
     tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
     return jsonify({"tasks": tasks})
+
+
+def arch_candidates_path() -> Path | None:
+    """Mirrors src/config.js's archReviewCandidatesPath resolution (env override, else
+    <repoRoot>/Docs/ARCH_REVIEW_CANDIDATES.md) -- the dashboard reads the same doc the
+    Node side's applyArchDiscoveryCandidates() writes."""
+    override = os.environ.get("AGENT_MANAGER_ARCH_CANDIDATES_PATH") or read_env_file(
+        ENV_FILE_PATH
+    ).get("AGENT_MANAGER_ARCH_CANDIDATES_PATH")
+    if override:
+        return Path(override)
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        return None
+    return Path(repo_root) / "Docs" / "ARCH_REVIEW_CANDIDATES.md"
+
+
+def community_coverage_path() -> Path | None:
+    """Mirrors src/config.js's communityCoveragePath resolution (env override, else
+    <pipelineDir>/community-coverage.json)."""
+    override = os.environ.get("AGENT_MANAGER_COMMUNITY_COVERAGE_PATH") or read_env_file(
+        ENV_FILE_PATH
+    ).get("AGENT_MANAGER_COMMUNITY_COVERAGE_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "community-coverage.json") if d else None
+
+
+# Same heading convention candidates-doc-merge.js declares as HEADING_RE -- one parser
+# per language, both reading the exact format applyArchDiscoveryCandidates() writes.
+ARCH_CANDIDATE_HEADING_RE = re.compile(r"^#{1,6}\s*AC-(\d+)\b[^\S\n]*[·\-:]?[^\S\n]*(.*)$", re.M)
+
+
+def parse_arch_candidates(text: str) -> list[dict]:
+    """Splits a *_CANDIDATES.md doc into its '### AC-N · Title' blocks. Returns
+    [{id, title, strength, files, content}] in doc order; preamble (everything before
+    the first AC heading) is dropped -- it's boilerplate about the format itself."""
+    entries = []
+    blocks = re.split(r"(?=^#{1,6}\s*AC-\d+)", text.replace("\r\n", "\n"), flags=re.M)
+    for block in blocks:
+        block = block.strip()
+        m = ARCH_CANDIDATE_HEADING_RE.match(block)
+        if not m:
+            continue
+        strength = None
+        files = None
+        for line in block.splitlines()[1:8]:  # metadata lines sit right under the heading
+            if line.startswith("Strength:"):
+                strength = line[len("Strength:"):].strip()
+            elif line.startswith("Files:"):
+                files = [p.strip() for p in line[len("Files:"):].split(",") if p.strip()]
+        entries.append({
+            "id": int(m.group(1)),
+            "title": m.group(2).strip() or f"AC-{m.group(1)}",
+            "strength": strength,
+            "files": files or [],
+            "content": block,
+        })
+    return entries
+
+
+@app.route("/api/discovery")
+def api_discovery():
+    """Everything the Discovery tab shows in one call: arch_discovery's community
+    coverage (what the job is working through), every arch-discovery task currently in
+    the queue (including done/ -- located by the filename convention
+    'arch-discovery-community-<id>.json' rather than reading all ~4k done files, the
+    exact trap api_adhoc_tasks' includeDone comment documents), and the AC-N candidate
+    entries the job has produced so far."""
+    result = {
+        "available": False,
+        "communities": [],
+        "nextCommunityId": None,
+        "tasks": [],
+        "candidates": [],
+        "candidatesPath": None,
+    }
+
+    coverage_file = community_coverage_path()
+    coverage = read_json_safe(coverage_file) if coverage_file else None
+    if coverage and isinstance(coverage.get("communities"), list):
+        result["available"] = True
+        result["communities"] = [
+            {
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "lastReviewedAt": c.get("lastReviewedAt"),
+                "lastCandidateCount": c.get("lastCandidateCount"),
+            }
+            for c in coverage["communities"]
+        ]
+
+    qdir = queue_dir()
+    in_flight_by_community = {}
+    if qdir:
+        found = []  # (state, path) pairs; filename IS the task id for these
+        drafting_root = qdir / "drafting"
+        if drafting_root.is_dir():
+            for f in drafting_root.rglob("arch-discovery-*.json"):
+                found.append(("drafting", f))
+        for state in QUEUE_STATES:
+            state_dir = qdir / state
+            if state_dir.is_dir():
+                for f in state_dir.glob("arch-discovery-*.json"):
+                    found.append((state, f))
+        for state, f in found:
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            community_id = None
+            m = re.match(r"arch-discovery-community-(\d+)$", task_id)
+            if m:
+                community_id = int(m.group(1))
+                if state not in ("done",):
+                    in_flight_by_community[community_id] = state
+            result["available"] = True
+            result["tasks"].append({
+                "id": task_id,
+                "title": data.get("title") or task_id,
+                "state": state,
+                "communityId": community_id,
+                "createdAt": data.get("createdAt"),
+                "draftedAt": data.get("draftedAt"),
+                "appliedAt": data.get("appliedAt"),
+                "doneMarker": data.get("doneMarker"),
+                "blockedReason": data.get("blockedReason"),
+                "ornithRejectCount": data.get("ornithRejectCount"),
+                # Cheap "is there anything to read yet" signals for the list view --
+                # the click-through detail modal (api_task_anywhere) carries the full
+                # readouts, same split task_summary() uses.
+                "hasPlan": bool(data.get("planResponse")),
+                "hasImplement": bool((data.get("implementResponse") or "").strip()),
+            })
+        result["tasks"].sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+
+    # Which community nextArchDiscoveryTask() would pick next: oldest lastReviewedAt
+    # first (never-reviewed sorts before any real timestamp), skipping communities that
+    # already have a non-done task in the queue -- same rule as the Node side.
+    eligible = [
+        c for c in result["communities"]
+        if c.get("id") is not None and c["id"] not in in_flight_by_community
+    ]
+    if eligible:
+        eligible.sort(key=lambda c: c.get("lastReviewedAt") or "")
+        result["nextCommunityId"] = eligible[0]["id"]
+    for c in result["communities"]:
+        c["inFlightState"] = in_flight_by_community.get(c.get("id"))
+
+    cand_file = arch_candidates_path()
+    if cand_file and cand_file.is_file():
+        try:
+            text = cand_file.read_text(encoding="utf-8", errors="replace")
+            result["candidates"] = parse_arch_candidates(text)
+            result["candidatesPath"] = str(cand_file)
+            result["available"] = True
+        except OSError:
+            pass  # doc unreadable -- tab still renders coverage/tasks
+
+    return jsonify(result)
 
 
 @app.route("/api/summary")

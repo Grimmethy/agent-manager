@@ -340,3 +340,70 @@ Replace the bare `catch { return; }` with a discriminating handler: check `err.c
 
 Benefits:
 Real I/O or permission failures now produce a one-line entry in the process log (journald, stdout capture, whatever the agent-manager ships), so an operator or alerting pipeline can detect the outage within seconds instead of discovering it days later on a dashboard. The stable `[]` return eliminates a class of subtle `TypeError` in callers that assumed an array. The ENOENT fast-path stays quiet, so no log noise is introduced during normal startup before the instances directory is created.
+
+### AC-25 · Silent duplicate-taskId skip has zero observability
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+At `src/task-sources.js:1024` the guard `if (taskIdExistsInQueue(taskId)) continue;` drops a finding with no log line, no metric increment, and no console output. Because `taskId` is derived from `slugifyForId(projectTag, finding.rule, finding.file, finding.line)`, two genuinely distinct findings—both carrying valid, non-zero `finding.line` values—can produce the same slug when their raw fields differ only in characters that `slugifyForId` normalises away (e.g. `silent-catch-block` vs `silent_catch_block`, or `src/a-b.js` vs `src/a_b.js`). The second finding hits the guard and is silently discarded; the operator has no signal that a finding was suppressed, no way to distinguish a true duplicate from a slugification collision, and no metric to alert on the rate of such skips.
+
+Solution:
+Replace the bare `continue` at line 1024 with a structured warning log and a metric increment before the `continue`:
+
+```js
+if (taskIdExistsInQueue(taskId)) {
+  log.warn('task-source: skipping duplicate taskId', {
+    taskId,
+    rule: finding.rule,
+    file: finding.file,
+    line: finding.line,
+    project: projectTag,
+  });
+  metrics.increment('task_source.duplicate_skip', {
+    project: projectTag,
+    rule: finding.rule,
+  });
+  continue;
+}
+```
+
+The log line carries the raw `rule`, `file`, and `line` fields so an operator can grep for the `taskId` and compare against the already-queued entry to determine whether the collision is a true duplicate or a lossy-slugification artifact. The metric gives a dashboard/alertable signal for the skip rate per project and rule.
+
+Benefits:
+Every suppressed finding becomes auditable: the operator can search logs for a specific `taskId` or `rule` to confirm whether a skip was expected, and can inspect the raw fields to detect slugification collisions. The `task_source.duplicate_skip` metric enables alerting when the skip rate spikes (indicating a systemic slugification bug or a misconfigured dedup key) rather than silently losing findings in production triage.
+
+### AC-26 · Silent catch in brain-dump task-shaping drops entries with no diagnostic
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+The catch block at line 1271 in the brain-dump sort function swallows every exception from the try block (lines 1255–1270) that builds a task descriptor from a chosen entry. When `chosen` is null, `chosen.rawText` is undefined, or `slice` throws on a non-string, the function returns null with no console.warn, no logger call, no counter increment, and no rethrow. In a batch of N brain-dump entries, a single malformed record vanishes silently; the caller interprets null as "no task" and moves on. There is no log line, stack trace, or metric recording which entry failed or why, making the failure undiagnosable in production without adding temporary instrumentation.
+
+Solution:
+Replace the bare `catch (err) { return null; }` at line 1271 with a two-line body that emits a diagnostic before returning. Use `console.warn('[brain-dump-sort] skipped entry (id=' + (chosen && chosen.id != null ? chosen.id : 'unknown') + '): ' + err.message);` followed by `return null;`. If the project already imports a structured logger (e.g. `pino`, `winston`), substitute `logger.warn({ entryId: chosen?.id, err })` for the console.warn call. No other lines in the function change; the happy path and return shape are untouched.
+
+Benefits:
+Any malformed or partially-written brain-dump entry now produces a single line on stderr (or in the log pipeline) identifying the entry id and the exception message at the moment of failure. Operators can grep for `[brain-dump-sort]` to find dropped entries without adding temporary console.log calls. The fix is two lines, introduces no new dependency, changes no return value, and has zero effect on the success path.
+
+### AC-27 · Narrow silent catch on optional adhoc directory listing
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+Line 156 uses a bare `catch { }` (or `catch (e) { }`) around `fs.readdirSync(path.join(root, 'queue', 'adhoc'))`. While the ENOENT case is expected (the directory is created lazily on first manual submission), the catch as written also silently absorbs `EACCES`, `EPERM`, `EMFILE`, and any future runtime error, leaving no log line, no counter, and no rethrow. An operator who later hits a permissions regression on that path sees zero adhoc tasks in the tier count with no diagnostic signal anywhere in the process.
+
+Solution:
+Replace the bare catch with a code-guarded handler that rethrows anything other than ENOENT and leaves a one-line comment explaining the expected case. Concretely, change the block at line 156 from `catch { /* … */ }` (or `catch (e) {}`) to:
+
+```js
+} catch (err) {
+  if (err.code !== 'ENOENT') throw err;
+  // queue/adhoc/ is created on first submission; absence is a valid empty state
+}
+```
+
+No new dependency, no logger import, no structural change — just the `err.code` guard and the explanatory comment.
+
+Benefits:
+Genuine filesystem faults (permission loss, fd exhaustion, a race where the path is replaced by a file) now propagate to the caller's existing error handling instead of being silently converted to "zero adhoc tasks." The ENOENT path remains a clean no-op with a human-readable rationale, so future readers of the file understand the intent without guessing. The tier-count aggregate stays correct in the expected case while gaining a hard failure signal in every unexpected case.
