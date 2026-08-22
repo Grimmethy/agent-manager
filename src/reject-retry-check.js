@@ -57,7 +57,8 @@ function stampDeepDiveExhausted(task, deepDiveCoveragePath) {
       fs.writeFileSync(deepDiveCoveragePath, JSON.stringify(coverage, null, 2));
     }
   } catch (e) {
-    // Non-fatal -- same "log and move on" treatment the reference gives this stamp.
+    // Non-fatal -- same "warn and move on" treatment the reference gives this stamp.
+    console.warn('[reject-retry-check] coverage write failed:', e.message);
   }
 }
 
