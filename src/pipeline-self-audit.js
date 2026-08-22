@@ -164,6 +164,7 @@ function buildAuditTask(cluster, domain) {
 
 module.exports = {
   CLUSTER_THRESHOLD,
+  REASON_CATEGORIES,
   hasZeroHitHarnessSearch,
   categorizeBlockedReason,
   signatureForTask,

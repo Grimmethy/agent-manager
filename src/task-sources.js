@@ -24,6 +24,7 @@ const { scanProject: scanProjectForPerformance } = require('./performance-scan.j
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
+const { findStalenessCandidates, buildStalenessAuditTask } = require('./staleness-audit.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1927,6 +1928,73 @@ function markPipelineSelfAuditReported(task) {
   fs.mkdirSync(path.dirname(selfAuditCoveragePath), { recursive: true });
   fs.writeFileSync(selfAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
+
+// staleness_audit (2026-08-22, see staleness-audit.js's own header for the full design):
+// per-task counterpart to nextPipelineSelfAuditTask() right above -- reads queue/blocked/
+// and queue/needs-clarification/ fresh every call (same "no persistent flags file that
+// can outlive the thing it's flagging" reasoning), files a real task once an individual
+// stale/likely-fabricated task survives staleness-audit.js's deterministic filter, so the
+// premise-recheck goes through the same harness-grounded local-model path
+// pipeline_self_audit's own fix-drafting already proves works end-to-end without Claude.
+function nextStalenessAuditTask() {
+  const { pipelineDir, stalenessAuditCoveragePath, defaultDomain } = getConfig();
+
+  const candidateTasks = [];
+  for (const dirName of ['blocked', 'needs-clarification']) {
+    const dir = path.join(pipelineDir, 'queue', dirName);
+    let names;
+    try {
+      names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      try {
+        candidateTasks.push(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')));
+      } catch {
+        // an unreadable/malformed task file is not itself evidence of staleness -- skip it.
+      }
+    }
+  }
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(stalenessAuditCoveragePath) || '{}');
+  } catch {
+    coverage = {};
+  }
+
+  const candidates = findStalenessCandidates(candidateTasks, coverage);
+  if (candidates.length === 0) return null;
+
+  const task = buildStalenessAuditTask(candidates[0], defaultDomain);
+  if (taskIdExistsInQueue(task.id)) return null;
+
+  // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
+  // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
+  // and the same reason: every next() function here is a pure read with no queue-write
+  // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
+  // task must not have already marked it reported.
+  return task;
+}
+
+// Called once from the CLI, only after writeTask() has actually persisted a
+// staleness_audit task to pending/ -- see nextStalenessAuditTask()'s own comment for why.
+function markStalenessAuditReported(task) {
+  const { stalenessAuditCoveragePath } = getConfig();
+  const originalTaskId = task.promptContext && task.promptContext.originalTaskId;
+  if (!originalTaskId) return;
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(stalenessAuditCoveragePath) || '{}');
+  } catch {
+    coverage = {};
+  }
+  coverage[originalTaskId] = { reportedAt: new Date().toISOString(), taskId: task.id };
+  fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
+  fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
+}
+
 registerTaskSource('arch_import', {
   priority: taskPriority('arch_import', 81),
   next: nextArchImportTask,
@@ -1951,6 +2019,11 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
+// apply: applyVerdictOnly -- same reasoning as unused_export/observability_review's own:
+// this source's implement pass writes an advisory report, never a diff (see
+// stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's JSON-diff
+// parser to apply and no branch to keep.
+registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyVerdictOnly });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...
@@ -2164,6 +2237,7 @@ module.exports = {
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
+  nextStalenessAuditTask, markStalenessAuditReported,
   nextProductSpecTask,
   nextBacklogDecompositionTask,
 };
@@ -2390,6 +2464,7 @@ if (require.main === module) {
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
+      if (task.source === 'staleness_audit') markStalenessAuditReported(task);
       if (task.domain === 'adhoc') {
         try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}
       }

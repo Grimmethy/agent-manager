@@ -226,6 +226,29 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
+      // staleness_audit (2026-08-22, see staleness-audit.js's own header): same
+      // harness-grounded two-call shape as pipeline_self_audit/arch_import right above --
+      // the premise recheck this source exists for genuinely needs to see CURRENT real
+      // repo content, not just the frozen evidence embedded in promptContext at filing
+      // time, exactly the same reasoning pipeline_self_audit's own branch documents.
+      if (task.source === 'staleness_audit') {
+        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+        let harnessHits = [];
+        let harnessFiles = [];
+        if (queries.length > 0) {
+          try {
+            const result = archImportFetch(queries);
+            harnessHits = result.hits || [];
+            harnessFiles = result.files || [];
+          } catch (e) {
+            // Non-fatal -- same try/catch treatment pipeline_self_audit's own branch above gives.
+          }
+        }
+        task.promptContext.harnessHits = harnessHits;
+        task.promptContext.harnessFiles = harnessFiles;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      }
+
       // adhoc-shaped tasks ("Process now" queues one of these -- see
       // task-source-registry.js's resolveSourceName() for why this checks the SAME
       // resolved name apply-task.js's own writeArtifact() dispatch uses, not a raw
