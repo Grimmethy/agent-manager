@@ -39,7 +39,8 @@ function listSourceFiles(dir, extensions) {
       }
     }
     return result;
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[unused-export-scan] scan failed: ${err?.message ?? err}\n`);
     return [];
   }
 }

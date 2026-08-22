@@ -344,32 +344,49 @@ check_budget_healthy() {
 }
 
 check_instance_liveness() {
-  local instance_id="$1" tick_secs="${2:-30}"
+  local instance_id="$1"
   local hb_path="${INSTANCES_DIR}/${instance_id}.json"
   [[ -f "$hb_path" ]] || return 0
 
-  local stale_secs=$(( tick_secs * 3 ))
+  # Pure PID liveness -- NOT heartbeat freshness. Confirmed live 2026-08-22: the original
+  # version of this function ALSO required the recorded heartbeat to be within
+  # tick_secs*3 (90s at the default 30s tick) of now, on top of the pid being confirmed
+  # alive via kill(pid,0) -- but write_heartbeat_file only fires at "queued"/"working"/
+  # "idle" TRANSITIONS, not continuously while a real call is in flight, and a real
+  # draft/review call can legitimately sit in "working" for minutes (adhoc's own
+  # ADHOC_TIMEOUT_MS allows up to 900s) without ever touching its heartbeat again. That
+  # 90s staleness requirement made this gate WRONGLY treat a process that was still
+  # genuinely alive and mid a normal-length real call as gone, letting a second live
+  # process start under the SAME instanceId -- confirmed live: two worker-reasoning and
+  # two reviewer processes running simultaneously, each independently claiming from the
+  # same drafting/<instance>/ folder, which is exactly the fragmented "6 tasks partially
+  # drafted instead of one at a time" symptom this was supposed to prevent in the first
+  # place. If the recorded pid is confirmed alive, that alone is sufficient reason to
+  # refuse a duplicate start here -- deciding whether an alive-but-stuck process should be
+  # killed and replaced is dead-process-check.js's own, more careful job (its
+  # WORKER_ZOMBIE_THRESHOLD_SECONDS=1200 is deliberately calibrated above the real
+  # worst-case call chain, and it SIGKILLs the old pid before spawning a replacement,
+  # never leaving two alive at once) -- this function racing ahead with its own,
+  # shorter-fused staleness opinion is exactly what caused the duplication.
   local other_pid
   other_pid="$(node -e '
     const fs = require("fs");
-    const [hbPath, myPid, staleSecs] = process.argv.slice(1);
+    const [hbPath, myPid] = process.argv.slice(1);
     let hb;
     try { hb = JSON.parse(fs.readFileSync(hbPath, "utf8")); } catch { process.exit(0); }
     if (!hb || !hb.pid || String(hb.pid) === myPid) process.exit(0);
     let alive = true;
     try { process.kill(hb.pid, 0); } catch { alive = false; }
     if (!alive) process.exit(0);
-    const ageMs = Date.now() - new Date(hb.lastHeartbeat || 0).getTime();
-    if (!(ageMs <= Number(staleSecs) * 1000)) process.exit(0);
-    // Still alive and recently heard from -- print its pid (stdout) and signal via exit 1.
+    // Still alive -- print its pid (stdout) and signal via exit 1.
     console.log(hb.pid);
     process.exit(1);
-  ' "$hb_path" "$$" "$stale_secs")"
+  ' "$hb_path" "$$")"
   local rc=$?
 
   if [[ $rc -ne 0 ]]; then
-    printf '[%s] refusing to start: instances/%s.json is already claimed by live pid %s (heartbeat within %ss) -- exiting instead of duplicating it. If that process is actually gone (e.g. the machine crashed without cleanup), delete %s and retry.\n' \
-      "$instance_id" "$instance_id" "$other_pid" "$stale_secs" "$hb_path" >&2
+    printf '[%s] refusing to start: instances/%s.json is already claimed by live pid %s -- exiting instead of duplicating it. If that process is actually gone (e.g. the machine crashed without cleanup), delete %s and retry.\n' \
+      "$instance_id" "$instance_id" "$other_pid" "$hb_path" >&2
     return 1
   fi
   return 0

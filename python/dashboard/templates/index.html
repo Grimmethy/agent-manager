@@ -61,6 +61,7 @@
   th.sortable:hover { color: var(--text); }
   tr.top-row td:first-child { border-left: 2px solid var(--ok); }
   tr.needs-clarification-row td:first-child { border-left: 2px solid var(--warn); }
+  tr.adhoc-awaiting-confirm-row td:first-child { border-left: 2px solid var(--bad); }
   .bar-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 2px; }
   .benchmark-check-grid { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; }
@@ -170,6 +171,7 @@ const TABS = [
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
+  { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
     { key: 'drafting', label: 'Drafting', description: 'Jobs where an agent is currently writing the initial implementation.' },
     { key: 'pending', label: 'Pending', description: 'Jobs queued and waiting for an agent to pick them up.' },
@@ -374,6 +376,9 @@ const TAB_COUNT_SEVERITY_THRESHOLDS = {
   // specifically, not just an ambiguous path match, so it deserves the same "don't
   // silently sit forever" urgency as blocked, any count at all.
   'awaiting-confirm': { bad: 1 },
+  // 'adhoc' isn't in this table -- it renders two separate numbers (in-progress/
+  // blocked) with their own fixed colors instead of a single severity-driven count, see
+  // renderTabButton()'s own special-case for that tab.
   // Orange, same reasoning as 'needs-clarification': a pushed-but-unmerged branch isn't
   // broken, it's already-reviewed work just sitting invisible until someone merges it --
   // exactly the "sandbox" gap this tab exists to surface (2026-08-18).
@@ -393,6 +398,27 @@ function renderTabButton(tab, indent) {
   btn.className = tab.key === activeTab ? 'active' : '';
   if (tab.description) btn.title = tab.description;
   if (indent) btn.style.paddingLeft = '36px';
+  if (tab.key === 'adhoc') {
+    // Two numbers, not one folded-together count (Grimmethy, 2026-08-22: "It's just as
+    // important to know how many in process there are so that we know how much work
+    // the system already has to work on") -- grey for in-progress (backlog size, not a
+    // problem), red for blocked (needs a human decision, same urgency 'blocked'/
+    // 'awaiting-confirm' already get elsewhere in this nav).
+    const inProgress = counts.adhocInProgress ?? 0;
+    const blocked = counts.adhocBlocked ?? 0;
+    btn.innerHTML = `<span>${tab.label}</span><span class="count">`
+      + `<span style="color:var(--muted)">${inProgress}</span>`
+      + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
+      + `</span>`;
+    btn.onclick = () => {
+      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
+      if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
+      activeTab = tab.key;
+      renderNav();
+      renderMain();
+    };
+    return btn;
+  }
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
@@ -1404,6 +1430,55 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// State -> .badge severity class, same ok/warn/bad/idle vocabulary the Workers/Models
+// tabs already use (see .badge CSS) -- reusing it here rather than inventing a second
+// color language for what's still just "where is this task in the pipeline."
+function adhocStateBadgeClass(state) {
+  if (state === 'blocked' || state === 'awaiting-confirm') return 'bad';
+  if (state === 'needs-clarification') return 'warn';
+  if (state === 'approved' || state === 'done') return 'ok';
+  return 'idle'; // adhoc (unclaimed), pending, drafting:*, review
+}
+
+function adhocStateLabel(state) {
+  if (state.startsWith('drafting:')) return `Drafting (${state.slice('drafting:'.length)})`;
+  if (state === 'adhoc') return 'Queued (unclaimed)';
+  return state.charAt(0).toUpperCase() + state.slice(1).replace(/-/g, ' ');
+}
+
+async function renderAdhocTasksTab() {
+  const main = document.getElementById('main');
+  let tasks;
+  try {
+    const resp = await fetchJson('/api/adhoc-tasks');
+    tasks = resp.tasks;
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error loading adhoc tasks: ${e.message}</div>`;
+    return;
+  }
+  if (tasks.length === 0) {
+    main.innerHTML = '<div class="empty">No adhoc tasks right now.</div>';
+    return;
+  }
+  const rows = tasks.map(t => {
+    const isAwaitingConfirm = t.state === 'awaiting-confirm';
+    const rowClass = isAwaitingConfirm ? 'clickable adhoc-awaiting-confirm-row' : 'clickable';
+    const badgeClass = adhocStateBadgeClass(t.state);
+    const when = t.createdAt ? new Date(t.createdAt).toLocaleString() : '';
+    const excerptHtml = t.excerpt ? `<div class="meta">${escapeHtml(t.excerpt)}</div>` : '';
+    return `<tr class="${rowClass}" data-id="${escapeAttr(t.id)}">
+      <td>${escapeHtml(t.title)}${excerptHtml}</td>
+      <td><span class="badge ${badgeClass}">${escapeHtml(adhocStateLabel(t.state))}</span>${isAwaitingConfirm ? ' <strong>-- needs your review</strong>' : ''}</td>
+      <td>${escapeHtml(when)}</td>
+    </tr>`;
+  }).join('');
+  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} adhoc task${tasks.length === 1 ? '' : 's'}.</div>`;
+  main.innerHTML = `<table><thead><tr><th>Title</th><th>State</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>${footer}`;
+  main.querySelectorAll('tr.clickable').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.id);
+  });
+}
+
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
@@ -2262,6 +2337,7 @@ async function renderMain() {
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
     else if (activeTab === 'tokenfold') await renderTokenfoldTab();
+    else if (activeTab === 'adhoc') await renderAdhocTasksTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
