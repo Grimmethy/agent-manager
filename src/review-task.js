@@ -309,6 +309,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     n: 3,
     minAgreeing: 2,
     temperature: 0.2,
+    source: task.source,
   });
 
   const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real`;
