@@ -132,16 +132,21 @@ function localDateParts(instantMs, timeZone) {
   return { year: +parts.year, month: +parts.month, day: +parts.day };
 }
 
-// Parses "You've hit your session limit · resets 7:10pm (America/Denver)"-shaped text.
-// Returns a real Date the reset lands on, using the event's own timestamp to pick the
-// right calendar day (a reset time is always in the future relative to the hit).
+// Parses "You've hit your session limit · resets 7:10pm (America/Denver)"-shaped text --
+// and also the bare-hour form "resets 6pm (America/Denver)" (no ":MM"), confirmed live
+// 2026-08-22: Claude's own rate-limit message doesn't always include minutes, and the
+// original ":(\d{2})" requirement made the whole match fail on that form -- returning
+// null left isBudgetHealthy() stuck on its most conservative "unparsed hit, no confirmed
+// usage since" branch, which never self-clears by time alone, so worker-reasoning sat
+// idle well past the real reset with no way to resume on its own (found live: the actual
+// message was "resets 6pm", the lane was still gated hours later).
 function parseResetTime(text, eventTs) {
-  const match = /resets?\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(([^)]+)\)/i.exec(text || '');
+  const match = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)/i.exec(text || '');
   if (!match) return null;
 
   let hour = parseInt(match[1], 10) % 12;
   if (/pm/i.test(match[3])) hour += 12;
-  const minute = parseInt(match[2], 10);
+  const minute = match[2] ? parseInt(match[2], 10) : 0;
   const timeZone = match[4];
 
   const { year, month, day } = localDateParts(eventTs, timeZone);
