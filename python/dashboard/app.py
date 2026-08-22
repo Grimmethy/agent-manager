@@ -92,6 +92,74 @@ def api_ping():
     return jsonify({"app": "agent-manager", "name": socket.gethostname(), "version": "1"})
 
 
+_NEEDS_CLARIFICATION_REASON_TEXT = {
+    "no-match": "No matching file found for this change.",
+    "ambiguous": "Multiple candidate files found -- needs a human pick.",
+}
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    """Companion app's notification-bell feed (Android: AlertPoller.kt polls this every
+    ~15 min while a machine's bell is on). Surfaces exactly the "needs a human" states
+    the dashboard's own nav badges already flag -- blocked/needs-clarification/
+    awaiting-confirm queue tasks, plus a stuck-actioned Brain Dump entry
+    (BRAIN_DUMP_NEEDS_ATTENTION_STATES, the same set _brain_dump_needs_attention_count
+    already uses) -- as individually-id'd alerts.
+
+    Always returns the CURRENT full set, not a delta: the client already owns
+    de-duplication and backlog suppression (a freshly-linked machine swallows existing
+    history silently, only notifies from the next genuinely-new id onward -- see
+    AlertPoller.pollAll's own comment), so this endpoint just needs to be an honest,
+    stable-id snapshot of what's actually outstanding right now. Read-only, never gated
+    (see lan_mutation_gate above -- GET is always ungated regardless of caller)."""
+    alerts = []
+    qdir = queue_dir()
+    if qdir:
+        for state, level in (
+            ("blocked", "error"),
+            ("needs-clarification", "warn"),
+            ("awaiting-confirm", "error"),
+        ):
+            state_dir = qdir / state
+            if not state_dir.is_dir():
+                continue
+            for f in state_dir.glob("*.json"):
+                data = read_json_safe(f)
+                if not data:
+                    continue
+                task_id = data.get("id", f.stem)
+                title = (data.get("title") or task_id)[:120]
+                if state == "blocked":
+                    body = data.get("blockedReason") or "Blocked -- see dashboard for details."
+                elif state == "needs-clarification":
+                    reason = (data.get("needsClarification") or {}).get("reason")
+                    body = _NEEDS_CLARIFICATION_REASON_TEXT.get(
+                        reason, "Needs clarification -- see dashboard for details.")
+                else:
+                    body = "A delete-containing change is held for confirmation."
+                alerts.append({
+                    "id": f"task:{state}:{task_id}",
+                    "title": title,
+                    "level": level,
+                    "body": body[:200],
+                })
+
+    for e in _brain_dump_entries_with_task_status():
+        if e.get("status") == "actioned" and e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES:
+            entry_id = e.get("id")
+            if not entry_id:
+                continue
+            alerts.append({
+                "id": f"brain-dump:{entry_id}",
+                "title": (e.get("rawText") or "Brain dump entry")[:120],
+                "level": "warn",
+                "body": f"Actioned entry's task is {e.get('taskStatus')} -- needs a look.",
+            })
+
+    return jsonify({"alerts": alerts})
+
+
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
 
 # dashboard/ -> python/ -> package root (where agent-manager.env, launch.bat, and src/ live).
