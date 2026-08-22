@@ -148,8 +148,13 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   const lockModel = model || MODEL;
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
   const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir });
+  // Stable per-worker-lane session id (not per-call) so TokenFold sees these as a
+  // continuing session instead of hashing each distinct prompt into its own one-off
+  // session -- see postJson's extraHeaders doc for why that continuity is what lets its
+  // dictionary bootstrap cost amortize at all across this pipeline's calls.
+  const tokenFoldHeaders = { 'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}` };
   try {
-    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs);
+    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
     ornithThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
     return result;
   } finally {

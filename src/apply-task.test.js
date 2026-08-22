@@ -107,15 +107,20 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'checkoutMain', 'deleteBranch']);
 });
 
-// --- arch_discovery/arch_import: direct-to-main path (no throwaway branch) --------------
+// --- arch_discovery/arch_import/observability_review/performance_review: direct-to-main
+// path (no throwaway branch) --------------------------------------------------------
 // Confirmed live 2026-08-16: the old branch-per-task flow left ~301 of ~311 real applied
-// candidates stranded on branches nobody ever merged. These two domains commit straight
-// onto main instead and push immediately, ignoring skipPush -- see DIRECT_TO_MAIN_DOMAINS'
-// own header comment in apply-task.js for the full reasoning.
+// candidates stranded on branches nobody ever merged. These four sources commit straight
+// onto main instead and push immediately, ignoring skipPush -- see DIRECT_TO_MAIN_SOURCES'
+// own header comment in apply-task.js for the full reasoning, including the 2026-08-21
+// fix (this file's own tests set domain: 'arch_discovery' below, matching the OLD
+// task.domain-based check -- real tasks always carry domain: 'default' with the real
+// distinguishing name in task.source, which is why that check never actually fired
+// against real traffic despite these tests passing the whole time).
 
 function archDiscoveryTask(overrides = {}) {
   return baseTask({
-    domain: 'arch_discovery',
+    domain: 'default',
     source: 'arch_discovery',
     implementResponse: [
       '### AC-1 · Example candidate',
@@ -181,7 +186,7 @@ test('arch_import: a genuinely thrown write error resets main again for cleanup 
   // No promptContext at all -> applyArchImportCandidate's destructuring of
   // task.promptContext throws a real TypeError, distinct from the "no candidates,
   // cleanly skipped" case covered by the arch_discovery test above.
-  const task = baseTask({ domain: 'arch_import', source: 'arch_import', implementResponse: '### AC-1 · X\nStrength: Strong\n\nbody' });
+  const task = baseTask({ domain: 'default', source: 'arch_import', implementResponse: '### AC-1 · X\nStrength: Strong\n\nbody' });
   delete task.promptContext;
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
@@ -190,16 +195,65 @@ test('arch_import: a genuinely thrown write error resets main again for cleanup 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'resetToMain']);
 });
 
-test('arch_import: same direct-to-main shape as arch_discovery (both domains share DIRECT_TO_MAIN_DOMAINS)', () => {
+test('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
-    domain: 'arch_import',
+    domain: 'default',
     source: 'arch_import',
     promptContext: { itemId: 'item-1', sourceProject: 'some-external-repo' },
     implementResponse: [
       '### AC-1 · Example import candidate',
       'Strength: Strong',
       'Source: some-external-repo',
+      'Files: foo.js',
+      '',
+      'Problem: ...',
+      'Solution: ...',
+    ].join('\n'),
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.pushed, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+});
+
+// Regression, 2026-08-21: real observability_review/performance_review tasks -- like
+// every source above -- stamp domain: 'default' (defaultDomain, config.js) and carry
+// their real identity in task.source alone. Exercising that exact realistic shape (not
+// domain: 'observability_review', which no real task ever has) is what would have
+// caught the task.domain-vs-task.source bug that made the fast path dead code.
+test('observability_review: real task shape (domain: default, source: observability_review) takes the direct-to-main path', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default',
+    source: 'observability_review',
+    implementResponse: [
+      '### AC-1 · Example observability candidate',
+      'Strength: Strong',
+      'Files: foo.js',
+      '',
+      'Problem: ...',
+      'Solution: ...',
+    ].join('\n'),
+  });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.pushed, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+});
+
+test('performance_review: same direct-to-main shape (domain: default, source: performance_review)', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({
+    domain: 'default',
+    source: 'performance_review',
+    implementResponse: [
+      '### AC-1 · Example performance candidate',
+      'Strength: Strong',
       'Files: foo.js',
       '',
       'Problem: ...',

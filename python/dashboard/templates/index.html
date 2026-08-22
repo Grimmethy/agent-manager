@@ -238,6 +238,10 @@ let projectHistory = [];
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
 let brainDumpEntriesInterval = null;
+// '' (Unprocessed, /api/brain-dump's own default) | 'actioned' (Processed) | 'all' --
+// mirrors the ?status= values api_brain_dump() (app.py) already accepts; not persisted
+// to localStorage, same as queueSourceFilter's per-tab-visit reset (queue-source-filter).
+let brainDumpStatusFilter = '';
 
 // Single choke point for every place that changes which project is active (typed input,
 // History panel, Browse panel, and the server-sync in refreshPipelineStatus). grepDirs is
@@ -2678,7 +2682,14 @@ function renderBrainDumpShell() {
     </div>
     <div class="split-pane">
       <div>
-        <div class="field-label">Unprocessed</div>
+        <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
+          <span>Entries</span>
+          <select id="bd-status-filter" style="text-transform:none; letter-spacing:normal; font-size:12px;">
+            <option value="" ${brainDumpStatusFilter === '' ? 'selected' : ''}>Unprocessed</option>
+            <option value="actioned" ${brainDumpStatusFilter === 'actioned' ? 'selected' : ''}>Processed</option>
+            <option value="all" ${brainDumpStatusFilter === 'all' ? 'selected' : ''}>All</option>
+          </select>
+        </div>
         <div id="bd-entries"><div class="empty">Loading...</div></div>
       </div>
       <div>
@@ -2723,6 +2734,11 @@ function renderBrainDumpShell() {
   };
   document.getElementById('bd-capture-btn').onclick = submit;
   input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+
+  document.getElementById('bd-status-filter').onchange = (e) => {
+    brainDumpStatusFilter = e.target.value;
+    refreshBrainDumpEntries(true);
+  };
 
   document.getElementById('bd-sync-github-btn').onclick = async (e) => {
     const btn = e.target;
@@ -3067,14 +3083,18 @@ async function refreshBrainDumpEntries(force = false) {
   if (!el) return;
   let entries;
   try {
-    entries = await fetchJson('/api/brain-dump');
+    const qs = brainDumpStatusFilter ? `?status=${encodeURIComponent(brainDumpStatusFilter)}` : '';
+    entries = await fetchJson('/api/brain-dump' + qs);
   } catch (e) {
     el.innerHTML = `<div class="empty">Could not load: ${e.message}</div>`;
     return;
   }
 
   if (entries.length === 0) {
-    el.innerHTML = '<div class="empty">Nothing captured yet.</div>';
+    const msg = brainDumpStatusFilter === 'actioned' ? 'No processed entries yet.'
+      : brainDumpStatusFilter === 'all' ? 'Nothing captured yet.'
+      : 'Nothing unprocessed -- everything captured so far has been actioned.';
+    el.innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
 

@@ -28,13 +28,10 @@
 #      from the repo itself so pipeline internals never land inside the tracked git repo,
 #      same split agent-manager's own repoRoot/pipelineDir already uses.
 #   4. Optionally seed the first product-spec-request.
-#   5. Register in projects.json -- lets the dashboard's Start Pipeline correctly resolve
-#      THIS project's own pipelineDir instead of reusing whatever was last active
-#      (see app.py's _start_pipeline fix, 2026-08-20).
-#   6. Register in Second Brain (Projects/GitHub/<name>.md + the link index) -- this is
-#      the ACTUAL source the Project tab's visible dropdown reads from
-#      (/api/second-brain/projects), separate from projects.json above. Both matter;
-#      skipping either one silently breaks a different part of the dashboard.
+#   5-6. Register in projects.json + Second Brain, via register-project.sh (shared with
+#      adopt-existing-project.sh -- the equivalent path for a repo that already exists
+#      rather than one this provisions from scratch, e.g. a third-party dependency we
+#      have contributor access to).
 set -euo pipefail
 
 NAME="${1:-}"
@@ -61,8 +58,6 @@ PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECTS_BASE="${AGENT_MANAGER_PLUGIN_PROJECTS_BASE:-/media/wok/model-cache}"
 REPO_DIR="$PROJECTS_BASE/$NAME"
 PIPELINE_DIR="$PROJECTS_BASE/${NAME}-pipeline"
-PROJECTS_JSON="$PACKAGE_ROOT/projects.json"
-SECOND_BRAIN_DIR="${SECOND_BRAIN_DIR:-/media/wok/model-cache/SecondBrain}"
 GH_OWNER="${AGENT_MANAGER_GH_OWNER:-Grimmethy}"
 ORNITH_MODEL_DEFAULT="${ORNITH_MODEL:-qwen3.8:27b-q4_K_M}"
 
@@ -121,58 +116,7 @@ else
   echo "[provision] no seed request given -- file one in $PIPELINE_DIR/queue/product-spec-requests/ before running product_spec"
 fi
 
-echo "[provision] registering in projects.json"
-python3 - "$PROJECTS_JSON" "$REPO_DIR" "$PIPELINE_DIR" "$NAME" <<'PYEOF'
-import json, sys, os
-
-projects_json, repo_dir, pipeline_dir, name = sys.argv[1:5]
-try:
-    with open(projects_json) as f:
-        entries = json.load(f)
-    if not isinstance(entries, list):
-        entries = []
-except (FileNotFoundError, json.JSONDecodeError):
-    entries = []
-
-norm = os.path.normpath(repo_dir)
-entries = [e for e in entries if os.path.normpath(e.get("repoRoot", "")) != norm]
-entries.insert(0, {
-    "repoRoot": repo_dir,
-    "pipelineDir": pipeline_dir,
-    "domainsPath": f"{pipeline_dir}/task-domains.json",
-    "label": name,
-})
-
-with open(projects_json, "w") as f:
-    json.dump(entries, f, indent=2)
-print(f"  registered {name} -> {projects_json}")
-PYEOF
-
-echo "[provision] registering in Second Brain (this is what the Project tab dropdown actually reads)"
-mkdir -p "$SECOND_BRAIN_DIR/Projects/GitHub"
-NOTE_PATH="$SECOND_BRAIN_DIR/Projects/GitHub/$NAME.md"
-if [[ ! -f "$NOTE_PATH" ]]; then
-  printf '# %s\n\n**Repo path:** `%s`\n' "$NAME" "$REPO_DIR" > "$NOTE_PATH"
-fi
-LINKS_PATH="$SECOND_BRAIN_DIR/.agent-manager-project-links.json"
-python3 - "$LINKS_PATH" "$NAME" "$REPO_DIR" <<'PYEOF'
-import json, sys
-
-links_path, name, repo_dir = sys.argv[1:4]
-try:
-    with open(links_path) as f:
-        links = json.load(f)
-    if not isinstance(links, dict):
-        links = {}
-except (FileNotFoundError, json.JSONDecodeError):
-    links = {}
-
-links[f"Projects/GitHub/{name}.md"] = repo_dir
-
-with open(links_path, "w") as f:
-    json.dump(links, f, indent=2)
-print(f"  linked Projects/GitHub/{name}.md -> {repo_dir}")
-PYEOF
+bash "$SCRIPT_DIR/register-project.sh" "$NAME" "$REPO_DIR" "$PIPELINE_DIR"
 
 echo
 echo "[provision] done. $NAME is now:"
