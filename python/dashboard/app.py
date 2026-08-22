@@ -157,7 +157,24 @@ def api_alerts():
                 "body": f"Actioned entry's task is {e.get('taskStatus')} -- needs a look.",
             })
 
-    return jsonify({"alerts": alerts})
+    # National-backfill event feed (progress-report.js writes alerts.json; see
+    # alerts_path()). Was its own duplicate @app.route("/api/alerts") definition after
+    # the 2026-08-22 master merge landed both this queue-derived feed (2c66a17) and the
+    # file-based one (6de654c) -- Flask refuses to even start with two routes on one
+    # rule, so the two sources are merged into this single endpoint instead. File
+    # entries already carry their own stable ids ({id, at, level, title, body}), so the
+    # client's id-based dedupe works unchanged across both sources.
+    generated_at = None
+    p = alerts_path()
+    if p and p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            generated_at = data.get("generatedAt")
+            alerts.extend(data.get("alerts") or [])
+        except Exception:
+            pass  # unreadable feed file -- queue-derived alerts still go out
+
+    return jsonify({"generatedAt": generated_at, "alerts": alerts})
 
 
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
@@ -644,24 +661,6 @@ def alerts_path() -> Path | None:
         return None
     candidate = d.parent.parent / "national-coverage" / "alerts.json"
     return candidate if candidate.exists() else None
-
-
-@app.route("/api/alerts")
-def api_alerts():
-    """Read-only (never token-gated, like every read here): the alert feed the companion
-    app polls to raise phone notifications. Shape: {"generatedAt": iso|None, "alerts":
-    [{id, at, level, title, body}]} — ids are stable, so the app dedupes on id."""
-    p = alerts_path()
-    if not p or not p.exists():
-        return jsonify({"generatedAt": None, "alerts": []})
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return jsonify({"generatedAt": None, "alerts": []})
-    return jsonify({
-        "generatedAt": data.get("generatedAt"),
-        "alerts": data.get("alerts") or [],
-    })
 
 
 def instances_dir() -> Path | None:
