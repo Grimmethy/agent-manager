@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -100,6 +100,21 @@ function writeArtifact(task, repoRoot, pipelineDir) {
   if (!usesGroupB(task)) {
     const source = getRegisteredSource(resolveSourceName(task));
     return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
+  }
+  // Confirmed live 2026-08-22: several Group B sources (arch_review, observability_fix,
+  // performance_fix, pipeline_self_audit, ...) are explicitly told to output the empty
+  // string when there's genuinely nothing to change (see prompts.js's own instructions,
+  // and review-task.js's EMPTY_APPROVAL_SOURCES, which already treats this exact case as
+  // a legitimate approved outcome at REVIEW time) -- but this apply stage had no matching
+  // check of its own, so an approved-empty task reached applyGroupB's JSON.parse
+  // unconditionally and threw "Invalid JSON in Group B implementResponse: Unexpected end
+  // of JSON input", landing the task in blocked/ instead of a clean, correct skip. Found
+  // as a real 6-task cluster in queue/blocked/ this same session -- invisible to
+  // pipeline_self_audit's own detector besides, since that error text matches none of its
+  // REASON_CATEGORIES keywords. Same {skipped, reason} shape apply-group-a.js's own
+  // applyVerdictOnly already uses for "nothing to write, that's a legitimate outcome."
+  if (isEffectivelyEmptyResponse(task.implementResponse)) {
+    return { skipped: true, reason: 'no code change needed (empty implement response, already approved at review)' };
   }
   return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
 }
