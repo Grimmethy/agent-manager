@@ -63,6 +63,19 @@ test('buildVerdictPrompt keeps the generic code-review framing for a real code-c
   assert.doesNotMatch(prompt, /CLASSIFICATION task/);
 });
 
+test('buildVerdictPrompt gives adhoc (source: manual) tasks a grounded-deviation carve-out, not plan-scope-as-authoritative', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'manual',
+    planResponse: '1. Add a null check in foo.js.',
+    implementResponse: 'Investigated and the real bug was in bar.js, not foo.js.\n\n=== DIFF ===\ndiff --git a/bar.js b/bar.js\n...\nRESOLUTION: implemented',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /PLAN above was drafted BLIND/);
+  assert.match(prompt, /do NOT reject the implement draft merely because it touches different files/);
+  assert.doesNotMatch(prompt, /CLASSIFICATION task/);
+});
+
 test('buildVerdictPrompt does not fabricate a carve-out for a source with none defined', () => {
   const task = baseTask({ domain: 'default', source: 'unused_export' });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
