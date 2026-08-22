@@ -52,6 +52,35 @@ test('postJson sends extraHeaders alongside the standard ones', async () => {
   );
 });
 
+// Regression, 2026-08-22: Node's http.globalAgent defaults to keepAlive:true, pooling
+// connections across calls made from the same process -- local-draft.js's draftTask()
+// makes several sequential Ollama calls (plan, critique, revision) with the single-flight
+// lock released in between each, so a pooled connection can sit idle for however long
+// another worker's real generation call takes (often 1-3+ minutes) before being reused.
+// Confirmed live as the root cause of a recurring "write EPIPE" pattern across multiple
+// task sources: a stale pooled socket dies server-side during that gap, and the next
+// write reuses it before Node's own pruning catches it. postJson now passes agent:false
+// to force a fresh connection every call, eliminating this race by construction.
+test('postJson opens a FRESH connection every call, never reusing a pooled keep-alive socket', async () => {
+  const remotePorts = new Set();
+  await withServer(
+    (req, res) => {
+      remotePorts.add(req.socket.remotePort);
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    },
+    async (base) => {
+      await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+      await postJson(`${base}/api/generate`, { a: 2 }, 5000);
+      await postJson(`${base}/api/generate`, { a: 3 }, 5000);
+      assert.equal(remotePorts.size, 3, 'each call must use a distinct client-side port -- a reused keep-alive connection would show the same port for all three');
+    }
+  );
+});
+
 test('postJson works with no extraHeaders (backward compatible)', async () => {
   let receivedHeaders = null;
   await withServer(

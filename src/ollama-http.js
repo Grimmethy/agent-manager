@@ -60,6 +60,24 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
         extraHeaders || {}
       ),
       timeout: timeoutMs,
+      // agent: false -- confirmed live 2026-08-22: Node's http.globalAgent defaults to
+      // keepAlive:true (as of this Node version), pooling TCP connections across calls
+      // made from the SAME process. A single draftTask() call makes several SEQUENTIAL
+      // Ollama calls (plan, critique, revision) with the single-flight lock released in
+      // between each -- during that gap another worker can hold the lock for a real
+      // generation call lasting 1-3+ minutes, leaving THIS process's pooled connection
+      // to TokenFold idle for an unbounded, often-long duration. That's the textbook
+      // stale-pooled-socket race: the server (or an intermediate proxy) can close its
+      // side of an idle keep-alive connection at any point during that gap, and Node's
+      // own client-side pruning doesn't always detect it before the next write reuses
+      // it -- surfacing as "write EPIPE" on a call that has nothing wrong with it,
+      // confirmed live as a real, recurring pattern across multiple task sources (not
+      // reproducible with a short artificial idle gap, but consistent with the actual
+      // multi-minute gaps this pipeline's own lock contention produces). Forcing a fresh
+      // connection per call (agent:false, same effect as keepAlive:false) costs a
+      // negligible extra TCP handshake on localhost and eliminates this whole class of
+      // race by construction, rather than chasing a hard-to-pin-down window.
+      agent: false,
     }, (res) => {
       let data = '';
       res.on('data', (c) => { data += c; });
