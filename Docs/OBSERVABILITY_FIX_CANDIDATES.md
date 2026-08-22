@@ -327,3 +327,16 @@ Do not rethrow (callers expect an array), do not change the return shape, do not
 
 Benefits:
 A real scan failure becomes visible in CI logs and local terminal output, eliminating the silent false-clean where broken code passes because the scanner never completed. The return type and caller expectations are unchanged, so no downstream type errors or semantic shifts are introduced. The one-line stderr write has zero runtime cost on the success path and no new dependencies.
+
+### AC-24 · Uptime-log readdir catch swallows all errors and returns undefined
+Strength: Strong
+Files: src/uptime-log.js
+
+Problem:
+The `catch { return; }` block around `fs.readdirSync(instancesDir)` treats every failure identically to the expected "directory not yet created" case. A real `EACCES`, `EIO`, or a `TypeError` thrown inside the `.filter` callback is silently swallowed with no log line, no metric, no event. The function also returns `undefined` rather than an empty array, so the caller receives a falsy value with zero signal. In a long-running agent-manager process the uptime log can go dark for hours or days and the failure is invisible until someone manually inspects the dashboard.
+
+Solution:
+Replace the bare `catch { return; }` with a discriminating handler: check `err.code !== 'ENOENT'` and, for any other error, emit a single `console.error('[uptime-log] failed to read <instancesDir>:', err.message)` line before returning `[]`. The `ENOENT` path remains silent (directory not yet provisioned is expected). Returning `[]` instead of `undefined` removes the falsy-ambiguity for the caller and keeps the downstream `.length` / `.map` / `.reduce` chains safe without a guard clause.
+
+Benefits:
+Real I/O or permission failures now produce a one-line entry in the process log (journald, stdout capture, whatever the agent-manager ships), so an operator or alerting pipeline can detect the outage within seconds instead of discovering it days later on a dashboard. The stable `[]` return eliminates a class of subtle `TypeError` in callers that assumed an array. The ENOENT fast-path stays quiet, so no log noise is introduced during normal startup before the instances directory is created.
