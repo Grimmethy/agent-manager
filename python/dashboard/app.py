@@ -1723,6 +1723,97 @@ def api_task_anywhere(task_id):
     abort(404, description=f"task {task_id} not found in any queue state")
 
 
+def _adhoc_task_excerpt(data):
+    """Short status-relevant snippet for the Adhoc Tasks list -- whichever field
+    actually carries the human-relevant signal for wherever the task currently sits,
+    same fields api_alerts() already reads for the same reason."""
+    if data.get("blockedReason"):
+        return data["blockedReason"][:200]
+    if data.get("ornithVerdict"):
+        return data["ornithVerdict"][:200]
+    return None
+
+
+@app.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
+    whichever queue state it's currently sitting in -- the cross-cutting view
+    api_task_anywhere already has the right traversal shape for (drafting/ first,
+    per-instance, then every other QUEUE_STATES dir), generalized here from 'find one
+    task by id' to 'collect every adhoc task found along the way'. Also checks
+    queue/adhoc/ itself, the one real state api_task_anywhere never had to check --
+    task-sources.js's own nextAdhocTask() reads directly from there, before a claimed
+    task ever reaches pending/, so a task sitting there unclaimed would otherwise be
+    invisible to this view.
+
+    An 'adhoc' task is identified by domain=='adhoc' OR an id starting with 'adhoc-'
+    (queue-adhoc-task.js's own id convention, also used by the Brain Dump tab's
+    'Process Now' button injection) -- domain alone isn't reliable since a caller can
+    omit --domain (queue-adhoc-task.js then falls back to the first key in
+    task-domains.json, not necessarily 'adhoc')."""
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+
+    def is_adhoc(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    tasks = []
+
+    adhoc_dir = qdir / "adhoc"
+    if adhoc_dir.is_dir():
+        for f in adhoc_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc(data, f.stem):
+                tasks.append({
+                    "id": data.get("id", f.stem),
+                    "title": data.get("title") or f.stem,
+                    "state": "adhoc",
+                    "createdAt": data.get("createdAt"),
+                    "excerpt": _adhoc_task_excerpt(data),
+                })
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            lane = f.parent.name
+            tasks.append({
+                "id": task_id,
+                "title": data.get("title") or task_id,
+                "state": f"drafting:{lane}",
+                "createdAt": data.get("createdAt"),
+                "excerpt": _adhoc_task_excerpt(data),
+            })
+
+    for state in QUEUE_STATES:
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append({
+                "id": task_id,
+                "title": data.get("title") or task_id,
+                "state": state,
+                "createdAt": data.get("createdAt"),
+                "excerpt": _adhoc_task_excerpt(data),
+            })
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+
+
 @app.route("/api/summary")
 def api_summary():
     qdir = queue_dir()
@@ -1750,6 +1841,21 @@ def api_summary():
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
+    # Adhoc Tasks nav badge: specifically the awaiting-confirm count, not every adhoc
+    # task in flight -- that's the one state meaning "a human needs to act on this now",
+    # same reasoning as the elevated severity the 'blocked' tab's count already gets.
+    # Cheap by construction: only scans awaiting-confirm/, not the full cross-state
+    # traversal /api/adhoc-tasks does for its actual listing.
+    awaiting_confirm_dir = qdir / "awaiting-confirm"
+    if awaiting_confirm_dir.is_dir():
+        adhoc_awaiting = 0
+        for f in awaiting_confirm_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and (data.get("domain") == "adhoc" or data.get("id", f.stem).startswith("adhoc-")):
+                adhoc_awaiting += 1
+        counts["adhoc"] = adhoc_awaiting
+    else:
+        counts["adhoc"] = 0
     return jsonify(counts)
 
 
