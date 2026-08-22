@@ -112,7 +112,7 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # way a brand-new claim does, not a second, drifted copy of this logic.
 process_drafting_file() {
   local wpath="$1"
-  local name task_id draft_result draft_succeeded draft_blocked draft_label
+  local name task_id draft_result draft_succeeded draft_blocked draft_label draft_display_model
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
 
@@ -137,6 +137,31 @@ process_drafting_file() {
   # "protect the plan pass" without one).
   draft_label="$(node -e 'try{require(process.argv[1]);const {labelFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync(process.argv[3],"utf8"));console.log(labelFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
 
+  # Heartbeat's OWN displayed model -- deliberately NOT the same value as draft_label
+  # above. Grimmethy, 2026-08-22, after being surprised Claude was rate-limited despite
+  # every lane's dashboard override showing a local model: "How is claude getting rate
+  # limited? It's not selected as a model to be used at all?" ... "If claude is being used
+  # in the background we need to be able to see that." draft_label (labelFor() alone) is
+  # right for the LOCK decision (reflects the PLAN pass, the part that can genuinely
+  # contend for the local GPU) but WRONG for what a human should see here: an adhoc/
+  # research task's real, expensive IMPLEMENT call always goes through Claude regardless
+  # of any local-model override (local-draft.js's resolveSourceName()==='adhoc'/domain
+  # 'research' bypass -- see that file's own comment), and that's exactly the spend this
+  # heartbeat needs to surface, not the override that only ever governed the cheaper plan
+  # pass. Recomputed fresh (not derived from draft_label) so it can never silently drift
+  # from what draftAdhocImplement/draftResearchImplement will actually do.
+  draft_display_model="$(node -e '
+    try {
+      require(process.argv[1]);
+      const { resolveSourceName } = require(process.argv[2]);
+      const { labelFor } = require(process.argv[3]);
+      const t = JSON.parse(require("fs").readFileSync(process.argv[4], "utf8"));
+      const alwaysClaude = resolveSourceName(t) === "adhoc" || t.domain === "research";
+      console.log(alwaysClaude ? `claude:${process.env.CLAUDE_MODEL || "sonnet"}` : labelFor(t));
+    } catch (e) { /* leave stdout empty -- the bash fallback just below covers this */ }
+  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
+  [[ -n "$draft_display_model" ]] || draft_display_model="$HEARTBEAT_MODEL"
+
   # "queued" until the single-flight lock is actually held, then "working" -- 2026-08-19,
   # Grimmethy: "add the distinct queued status. The current is too unclear" (a claimed
   # task waiting its turn behind another lane's real Ollama call used to show "working"
@@ -153,11 +178,11 @@ process_drafting_file() {
   # 2026-08-22: "worker-1 and reasoning are taking turns... as is with local only we are
   # losing priority" -- see review-runner.sh's matching fix for the review-stage half of
   # this same bug.
-  write_heartbeat_file "$INSTANCE_ID" "queued" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
+  write_heartbeat_file "$INSTANCE_ID" "queued" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   if [[ "$draft_label" != claude:* ]]; then
     acquire_single_flight_lock
   fi
-  write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
+  write_heartbeat_file "$INSTANCE_ID" "working" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
   if [[ "$draft_label" != claude:* ]]; then
     release_single_flight_lock
