@@ -775,6 +775,72 @@ function stalenessAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// adhoc harness-search tier (2026-08-22, Grimmethy: "expand the tooling capabilities so
+// that the local reasoning model can handle the work... I'd like to see the automated
+// work being handled entirely locally"): a FIRST, cheap attempt at an adhoc-domain task
+// using the same proven harness-grounded pattern pipeline_self_audit/arch_import already
+// use, tried before the existing real Claude agentic path (adhoc-agentic-draft.js). NOT
+// registered via updateTaskSource('adhoc', ...) -- that registration is already taken by
+// adhocPlanPrompt/adhocImplementPrompt just below (a different, ungrounded generic dispatch
+// target with no live callers), and this tier is invoked directly by
+// adhoc-harness-draft.js, not through buildPlanPrompt/buildImplementPrompt's registry
+// dispatch. Output is groupBJsonInstructions (same as adhocImplementPrompt) because
+// adhoc-harness-draft.js turns that into a real diff via group-b-worktree-diff.js, the
+// exact same contract adhoc-agentic-draft.js's own Claude call already produces
+// (task.rawDiff via applyAdhocDiff) -- this tier is a drop-in ALTERNATIVE producer of that
+// same shape, not a new apply path.
+function adhocHarnessSearchPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'A human or an orchestrating agent submitted this one-off task directly.',
+    '',
+    `Title: ${task.title || ''}`,
+    '',
+    ctx.rawText || truncate(JSON.stringify(ctx), 4000),
+    '',
+    'Before anything else, propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the exact code this task is about in THIS repo -- think about which file(s) the task\'s own wording points at.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function adhocHarnessSearchImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this repo)';
+  const filesText = files.length > 0
+    ? formatFileContents(files)
+    : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms to find the code this task is about:',
+    '',
+    planText,
+    '',
+    `Title: ${task.title || ''}`,
+    '',
+    ctx.rawText || truncate(JSON.stringify(ctx), 4000),
+    '',
+    'The harness ran those searches against THIS repo\'s real, current content. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'If the real matches above clearly show you everything you need to make a small, safely-scoped fix, write it -- grounded ONLY in the real file content shown above, never a guessed or invented file/line/symbol. Stay inside exactly what the task asked for.',
+    '',
+    'If the searches did NOT find enough to confidently ground a real change -- e.g. this genuinely needs reading multiple files and reasoning across them, not just a keyword match, or it is not a code change at all -- output the empty string and nothing else. This is a legitimate outcome, not a failure: a deeper investigation pass will take over next.',
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
+}
+
 // product_spec (2026-08-20, see task-sources.js's nextProductSpecTask header for the full
 // motivation): no harness search, unlike pipeline_self_audit/arch_import right above --
 // the request text and the current spec doc ARE the grounding, both handed over directly.
@@ -1187,7 +1253,10 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
   ].join('\n');
 }
 
-module.exports = { buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, formatFileContents };
+module.exports = {
+  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, formatFileContents,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt,
+};
 
 if (require.main === module) {
   const fs = require('fs');
