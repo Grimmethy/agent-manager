@@ -55,6 +55,16 @@ function spyLock() {
   return { calls, withLockFn };
 }
 
+// Both new local tiers (adhoc-harness-draft.js, local-agentic-draft.js -- 2026-08-22, see
+// local-draft.js's own dispatch comment) are injectable the same way draftAdhocImplementFn
+// already was; every test below that isn't specifically exercising them declines
+// immediately so the pre-existing Claude-fallback behavior these tests were written
+// against is unchanged.
+function declineLocalTiers() {
+  const decline = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
+  return { draftAdhocViaHarnessSearchFn: decline, draftAdhocViaLocalAgenticFn: decline };
+}
+
 test('an adhoc task with NO local-model override never locks at all (plan and implement both resolve to Claude)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();
@@ -63,13 +73,14 @@ test('an adhoc task with NO local-model override never locks at all (plan and im
     await draftTask(task, {
       ornithCall: fakeOrnithCall('no real match -- nothing plausible'),
       withLockFn,
+      ...declineLocalTiers(),
       draftAdhocImplementFn: async (t) => {
         t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
         return { succeeded: true, blocked: false };
       },
     });
 
-    assert.deepEqual(calls, [], 'no override active -> adhoc resolves to Claude for both plan and implement -> never needs this lock');
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end'], 'the two declined local tiers each lock around their own attempt; no override active -> Claude fallback needs no lock of its own');
   });
 });
 
@@ -81,8 +92,10 @@ test('an adhoc task with a local-model override (the real bug scenario) locks ar
 
     const draftAdhocImplementFn = async (t) => {
       // The real Claude call happening HERE must NOT be wrapped in a lock -- the plan
-      // call's lock cycle must already be fully closed before this runs.
-      assert.deepEqual(calls, ['start', 'end'], 'plan-stage lock must already be released before the real Claude implement call starts');
+      // call's and both declined local tiers' own lock cycles must already be fully
+      // closed before this runs (plan locks too here since FORCE_PROVIDER=local makes
+      // resolvedCallIsLocal true for the plan pass specifically).
+      assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end'], 'plan + both declined local tiers\' locks must already be released before the real Claude implement call starts');
       t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
       return { succeeded: true, blocked: false };
     };
@@ -90,11 +103,64 @@ test('an adhoc task with a local-model override (the real bug scenario) locks ar
     const result = await draftTask(task, {
       ornithCall: fakeOrnithCall('confident match: none -- no real match'),
       withLockFn,
+      ...declineLocalTiers(),
       draftAdhocImplementFn,
     });
 
     assert.equal(result.succeeded, true);
-    assert.deepEqual(calls, ['start', 'end'], 'exactly one lock cycle -- the plan call -- not one per call site');
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end'], 'one lock cycle for the plan call plus one per declined local tier');
+  });
+});
+
+test('an adhoc task where the harness-search tier applies a change -- never reaches local-agentic or Claude at all', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { calls, withLockFn } = spyLock();
+    const task = { id: 'adhoc-test-3', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    const draftAdhocViaHarnessSearchFn = async (t) => {
+      t.implementResponse = 'harness-search tier result';
+      t.adhocResolution = 'implemented';
+      t.rawDiff = 'fake diff';
+      t.draftModel = 'test-local-model';
+      return { applied: true, succeeded: true };
+    };
+    const draftAdhocViaLocalAgenticFn = async () => { throw new Error('must not be called when harness-search already applied'); };
+    const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when harness-search already applied'); };
+
+    const result = await draftTask(task, {
+      ornithCall: fakeOrnithCall('confident match: none -- no real match'),
+      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+    });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.status, 'needs-review');
+    assert.deepEqual(calls, ['start', 'end'], 'exactly one lock cycle -- the applied harness-search tier');
+  });
+});
+
+test('an adhoc task where harness-search declines but local-agentic applies -- never reaches Claude', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { withLockFn } = spyLock();
+    const task = { id: 'adhoc-test-4', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
+    const draftAdhocViaLocalAgenticFn = async (t) => {
+      t.implementResponse = 'local-agentic tier result';
+      t.adhocResolution = 'implemented';
+      t.rawDiff = 'fake diff';
+      t.draftModel = 'test-local-model';
+      return { applied: true, succeeded: true };
+    };
+    const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when local-agentic already applied'); };
+
+    const result = await draftTask(task, {
+      ornithCall: fakeOrnithCall('confident match: none -- no real match'),
+      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+    });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(task.adhocResolution, 'implemented');
   });
 });
 

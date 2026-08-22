@@ -382,7 +382,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { reviewTask, buildVerdictPrompt };
+module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS };
 
 if (require.main === module) {
   main();

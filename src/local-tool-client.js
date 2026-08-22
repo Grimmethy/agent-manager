@@ -12,6 +12,78 @@ const { grepCodebase } = require('./grep-codebase-tool.js');
 const { getConfig } = require('./config.js');
 const { postJson } = require('./ollama-http.js');
 
+// Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
+// capabilities so that the local reasoning model can handle the work... I'd like to see
+// the automated work being handled entirely locally") -- read_file/list_directory,
+// alongside the pre-existing grep_codebase above. Deliberately READ-ONLY: no write_file,
+// edit_file, or shell-execution tool exists here, and none should be added to this loop --
+// a local model is materially less reliable at agentic tool use than Claude (real
+// documented incident: a tool-calling call once stalled 13+ minutes with no progress, see
+// docs/pipeline-incident-2026-07-19.md and ornith-worker.ps1's own comment on why this
+// whole mechanism was disabled), so direct file-mutation/shell power here is a materially
+// bigger risk than read-only exploration. Any real file change a caller of this loop
+// produces still goes through the EXISTING, already-audited apply pipeline (see
+// group-b-worktree-diff.js) -- never a tool that writes to disk or executes commands.
+
+// Same repo-root escape guard task-sources.js's nextCandidateFulfillmentTask() already
+// uses for its own fetchedFiles -- reused rather than a second, possibly-inconsistent
+// guard (both this file's own header and that function's comment insist on this).
+function resolveInsideRepo(repoRoot, relPath) {
+  const rootResolved = path.resolve(repoRoot);
+  const full = path.resolve(repoRoot, relPath || '');
+  if (full !== rootResolved && !full.startsWith(rootResolved + path.sep)) return null;
+  return full;
+}
+
+// Same cap/truncation-suffix convention as nextCandidateFulfillmentTask()'s own
+// MAX_FETCHED_FILE_CHARS -- one huge file must not blow the model's context or the /api/chat
+// response payload.
+const MAX_READ_FILE_CHARS = 8000;
+
+function readFileTool({ path: relPath }) {
+  const { repoRoot } = getConfig();
+  if (typeof relPath !== 'string' || !relPath.trim()) {
+    return { error: 'read_file requires a non-empty "path" argument' };
+  }
+  const full = resolveInsideRepo(repoRoot, relPath);
+  if (!full) {
+    return { error: `path escapes the repo root, refusing to read: ${relPath}` };
+  }
+  let content;
+  try {
+    content = fs.readFileSync(full, 'utf8');
+  } catch (e) {
+    return { error: `could not read ${relPath}: ${e.message}` };
+  }
+  const truncated = content.length > MAX_READ_FILE_CHARS;
+  return {
+    path: relPath,
+    content: truncated ? `${content.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated]` : content,
+    truncated,
+  };
+}
+
+function listDirectoryTool({ path: relPath }) {
+  const { repoRoot } = getConfig();
+  const target = typeof relPath === 'string' && relPath.trim() ? relPath : '.';
+  const full = resolveInsideRepo(repoRoot, target);
+  if (!full) {
+    return { error: `path escapes the repo root, refusing to list: ${target}` };
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(full, { withFileTypes: true });
+  } catch (e) {
+    return { error: `could not list ${target}: ${e.message}` };
+  }
+  // Names and kind only -- deliberately not a recursive full-tree dump (see this file's
+  // own header: keep this simple, list_directory is one shallow level per call).
+  return {
+    path: target,
+    entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+  };
+}
+
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // No hardcoded fallback tag -- see local-client.js's matching comment. An unset
 // LOCAL_MODEL now surfaces as a real Ollama "model not found" error, not a guessed name.
@@ -46,7 +118,41 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read the full content of a real file, given a path relative to the repo root. Content over ~8000 characters is truncated. Read-only -- cannot write or edit.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to the repo root, e.g. "src/task-sources.js".' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_directory',
+      description: 'List the files and subdirectories directly inside a given path (one level, not recursive), relative to the repo root.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Directory path relative to the repo root, e.g. "src". Omit or use "." for the repo root itself.' },
+        },
+        required: [],
+      },
+    },
+  },
 ];
+
+const TOOL_HANDLERS = {
+  grep_codebase: (args) => grepCodebase({ query: args.query, dir: args.dir }),
+  read_file: (args) => readFileTool({ path: args.path }),
+  list_directory: (args) => listDirectoryTool({ path: args.path }),
+};
 
 async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
   const { pipelineDir } = getConfig();
@@ -89,9 +195,25 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
 
     messages.push(message);
     for (const toolCall of toolCalls) {
+      const name = toolCall.function && toolCall.function.name;
       const args = (toolCall.function && toolCall.function.arguments) || {};
-      const result = grepCodebase({ query: args.query, dir: args.dir });
-      toolCallLog.push({ tool: 'grep_codebase', args: { query: args.query, dir: args.dir }, result });
+      const handler = TOOL_HANDLERS[name];
+      // A malformed/unknown tool call (bad name, missing/wrong-typed args, an escaping
+      // path) must degrade gracefully -- a clear error STRING back to the model as the
+      // tool result, so it can see it made a mistake and try again, not a thrown
+      // exception that kills the whole loop (see this file's own header: one bad tool
+      // call from the model should never crash the entire draft attempt).
+      let result;
+      if (!handler) {
+        result = { error: `unknown tool: ${name}` };
+      } else {
+        try {
+          result = handler(args);
+        } catch (e) {
+          result = { error: `tool ${name} failed: ${e.message}` };
+        }
+      }
+      toolCallLog.push({ tool: name, args, result });
       messages.push({ role: 'tool', content: JSON.stringify(result) });
     }
   }
@@ -101,7 +223,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
   return { response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false };
 }
 
-module.exports = { runPlanWithTools };
+module.exports = { runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS };
 
 // CLI: node ornith-tool-client.js <request.json>
 // request.json: { prompt, maxTurns, source? }  (source: task type, keys the

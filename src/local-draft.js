@@ -45,6 +45,8 @@ const { providerFor, labelFor } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
+const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
+const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName } = require('./task-source-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
@@ -66,7 +68,13 @@ function writeTaskJson(taskPath, task) {
  *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
-async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement, draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock } = {}) {
+async function draftTask(task, {
+  ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
+  draftAdhocImplementFn = draftAdhocImplement,
+  draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
+  draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
+  draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
+} = {}) {
   // Resolved here rather than as a static default param: the right backend depends on the
   // task's reasoning tier (model-provider.js's reasoningTierFor()), which isn't known
   // until the task object itself is in hand -- passing the whole task (not just
@@ -266,6 +274,38 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // line-based format; a freeform rewrite is not a safe way to edit one) -- this
       // branch returns directly instead.
       if (resolveSourceName(task) === 'adhoc') {
+        // Tiered escalation (2026-08-22, Grimmethy: "expand the tooling capabilities so
+        // that the local reasoning model can handle the work... I'd like to see the
+        // automated work being handled entirely locally" -- see adhoc-harness-draft.js's
+        // and local-agentic-draft.js's own headers for the full design): harness-search
+        // (cheap, single-shot, proven) tried first; local-agentic (multi-turn, opt-in,
+        // newest/least-proven) tried next; only if BOTH decline does this fall through to
+        // the existing real Claude agentic path below, exactly as it always has. Both
+        // local tiers always run the local model (never gated on resolvedCallIsLocal --
+        // adhoc is registered high-tier so that would always read false here), so both
+        // are unconditionally lock-wrapped, same reasoning the abOrnithCall branch above
+        // already documents for the same "always local regardless of resolvedCallIsLocal" case.
+        const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task));
+        if (!harnessResult.applied && harnessResult.succeeded === false) {
+          return { succeeded: false, reason: harnessResult.reason };
+        }
+
+        let localTierApplied = harnessResult.applied;
+        if (!localTierApplied) {
+          const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task));
+          if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
+            return { succeeded: false, reason: localAgenticResult.reason };
+          }
+          localTierApplied = localAgenticResult.applied;
+        }
+
+        if (localTierApplied) {
+          appendHistoryEvent(task, 'implement-done', `local tier, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
+          task.status = 'needs-review';
+          appendHistoryEvent(task, 'needs-review');
+          return { succeeded: true, blocked: false };
+        }
+
         const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
         if (!agenticResult.succeeded) {
           return { succeeded: false, reason: agenticResult.reason };
