@@ -333,7 +333,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
       // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
-      // this had zero real callers on Linux until now). ORNITH_AB_MODELS is a
+      // this had zero real callers on Linux until now). LOCAL_AB_MODELS is a
       // comma-separated list, each entry either a bare Ollama model tag, a
       // model-strategies.js registry name, or a "claude:<model>" entry (new: this is the
       // extension that lets an A/B run directly compare a local model against Claude,
@@ -344,7 +344,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       // normal tier-based routing rather than deferring to it -- the whole point of a
       // cross-provider A/B entry is to run BOTH sides against the same real tasks
       // regardless of which tier/provider that task would have used by default.
-      const abCandidates = (process.env.ORNITH_AB_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const abCandidates = (process.env.LOCAL_AB_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
       const abCandidateName = selectAbModel(task.id, abCandidates);
       const abStrategy = abCandidateName ? resolveStrategy(abCandidateName) : null;
       const abModel = abStrategy ? abStrategy.model : null;
@@ -354,7 +354,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
         const { call: abClaudeCall } = require('./claude-client.js');
         implResult = await abClaudeCall({ prompt: implPrompt, model: abModel.slice('claude:'.length), maxTurns: 1, permissionMode: 'dontAsk' });
       } else if (abModel) {
-        const { call: abOrnithCall } = require('./ornith-client.js');
+        const { call: abOrnithCall } = require('./local-client.js');
         implResult = await abOrnithCall({
           prompt: implPrompt,
           think: abStrategy.think != null ? abStrategy.think : !hasFixedLiterals,

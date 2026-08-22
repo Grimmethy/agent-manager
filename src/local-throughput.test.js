@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { recordSample, getTokensPerSecond, DEFAULT_TPS } = require('./ornith-throughput.js');
+const { recordSample, getTokensPerSecond, DEFAULT_TPS } = require('./local-throughput.js');
 
 function tempInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ornith-throughput-test-'));

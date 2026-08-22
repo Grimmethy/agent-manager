@@ -16,7 +16,7 @@
 // means every source stays on Ornith -- i.e. this integration is fully opt-in per
 // source, never a silent default switch.
 
-const ornith = require('./ornith-client.js');
+const local = require('./local-client.js');
 const claude = require('./claude-client.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 
@@ -58,7 +58,7 @@ function reasoningTierFor(task) {
   return 'low';
 }
 
-// AGENT_MANAGER_FORCE_PROVIDER ('ornith'|'claude'): per-process override set by
+// AGENT_MANAGER_FORCE_PROVIDER ('local'|'claude'): per-process override set by
 // ornith-worker.sh's refresh_active_model() when the Workers tab's worker-reasoning
 // dropdown picks a local model instead of a Claude one (2026-08-18, Grimmethy: "reasoning
 // is set to only show subscription models -- I need to be able to select from both
@@ -74,27 +74,30 @@ function reasoningTierFor(task) {
 // only ever reaches the generic, non-agentic call/majorityVote path.
 function forcedProvider() {
   const forced = process.env.AGENT_MANAGER_FORCE_PROVIDER;
-  if (forced === 'ornith') return ornith;
+  if (forced === 'local') return local;
   if (forced === 'claude') return claude;
   return null;
 }
 
 function providerFor(sourceOrTask) {
-  return forcedProvider() || (reasoningTierFor(sourceOrTask) === 'high' ? claude : ornith);
+  return forcedProvider() || (reasoningTierFor(sourceOrTask) === 'high' ? claude : local);
 }
 
 // Display/stats label for whichever backend providerFor(source) actually picked --
 // used for model-stats.db's `model` column (see model-stats-client.js) so a call
-// routed to Claude is recorded as such instead of the previous hardcoded 'ornith',
+// routed to Claude is recorded as such instead of a generic local-backend label,
 // which would have silently mislabeled every Claude-served call once this routing
 // existed. Separate from providerFor() itself (rather than attaching `.label` to the
-// ornith/claude module objects) so providerFor()'s return value stays exactly the
+// local/claude module objects) so providerFor()'s return value stays exactly the
 // required module -- model-provider.test.js asserts identity against it.
+// No hardcoded fallback tag if LOCAL_MODEL is unset -- see local-client.js's own comment
+// for why (2026-08-22, Grimmethy: "models should be fully interchangeable and their
+// names should not be hardcoded anywhere").
 function labelFor(sourceOrTask) {
   const forced = process.env.AGENT_MANAGER_FORCE_PROVIDER;
-  if (forced === 'ornith') return process.env.ORNITH_MODEL || 'ornith';
+  if (forced === 'local') return process.env.LOCAL_MODEL;
   if (forced === 'claude') return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
-  if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.ORNITH_MODEL || 'ornith';
+  if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.LOCAL_MODEL;
   return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 }
 

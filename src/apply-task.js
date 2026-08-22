@@ -74,7 +74,7 @@ const DIRECT_TO_MAIN_SOURCES = new Set([
 // implies that the program is inaccurately representing model used"): the non-Claude
 // branch below used to discard draftModel entirely and always print the bare string
 // "Ornith", even though labelFor() (model-provider.js) already returns the REAL local
-// model tag (process.env.ORNITH_MODEL, e.g. "qwen3.8:27b-q4_K_M" -- not literally
+// model tag (process.env.LOCAL_MODEL, e.g. "qwen3.8:27b-q4_K_M" -- not literally
 // "ornith") for exactly this case. Every local-drafted commit in this pipeline's history
 // was crediting a generic brand name instead of the actual model that did the work, while
 // the Claude branch right above it was always specific ("Claude (sonnet)"). Confirmed

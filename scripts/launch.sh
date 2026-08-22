@@ -119,7 +119,7 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_REPO_ROOT" >/dev/null 2>&1 || true
 
   start_bg "worker-1" "${PID_DIR}/worker-1.pid" "${LOG_DIR}/worker-1.log" \
-    bash "${SCRIPT_DIR}/ornith-worker.sh" worker-1
+    bash "${SCRIPT_DIR}/local-worker.sh" worker-1
 
   # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17) -- claims ONLY
   # adhoc-shaped tasks (see ornith-worker.sh's own IS_CLAUDE_LANE comment), running
@@ -129,7 +129,7 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   # subscription configured shouldn't spin up a lane that can only fail every tick.
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     start_bg "worker-reasoning" "${PID_DIR}/worker-reasoning.pid" "${LOG_DIR}/worker-reasoning.log" \
-      bash "${SCRIPT_DIR}/ornith-worker.sh" worker-reasoning
+      bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning
   else
     printf '[launch] CLAUDE_CODE_OAUTH_TOKEN is not set -- skipping the parallel Claude worker lane (adhoc tasks still get processed by worker-1, just serially).\n'
   fi

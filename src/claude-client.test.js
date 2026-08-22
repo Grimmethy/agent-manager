@@ -29,7 +29,7 @@ const REAL_EXEC_FILE_SYNC = child_process.execFileSync;
 
 function requireFreshClaudeClient() {
   delete require.cache[require.resolve('./claude-client.js')];
-  delete require.cache[require.resolve('./ornith-client.js')];
+  delete require.cache[require.resolve('./local-client.js')];
   return require('./claude-client.js');
 }
 

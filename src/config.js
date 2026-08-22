@@ -4,7 +4,7 @@
 // project sets these in its own environment/launcher before invoking any
 // script in this package -- there is no per-project config FILE the package loads itself,
 // matching the env-var style already established by ornith-client.js's OLLAMA_URL/
-// ORNITH_MODEL and review-runner.ps1's SECOND_BRAIN_DIR, rather than inventing a second
+// LOCAL_MODEL and review-runner.ps1's SECOND_BRAIN_DIR, rather than inventing a second
 // config mechanism alongside it.
 //
 // REPO_ROOT is the one REQUIRED setting -- there is no sensible package-relative default

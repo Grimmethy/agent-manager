@@ -1,7 +1,7 @@
 'use strict';
 
 // Node port of ornith-worker.ps1's Select-AbModel -- the Linux/bash side never had this at
-// all (ORNITH_AB_MODELS was a PowerShell-only mechanism; model-strategies.js's own
+// all (LOCAL_AB_MODELS was a PowerShell-only mechanism; model-strategies.js's own
 // resolveStrategy() shipped fully built alongside it but had zero real callers on this
 // port either, see its own header). Added 2026-08-19 to extend the mechanism to also cover
 // worker-reasoning's local-vs-Claude choice (Grimmethy: "extend the live A/B mechanism"),

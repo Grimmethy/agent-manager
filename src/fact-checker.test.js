@@ -79,13 +79,15 @@ test('checkFilePaths tries multiple extraRoots in order, not just the first', ()
 
 // --- Replay of the real incident, verbatim ---
 
-test('replaying the real community-0 draft: a claim about ornith-client.js/ornith-tool-client.js is no longer misreported as fabricated', () => {
+test('replaying the real community-0 draft: a claim about local-client.js/local-tool-client.js is no longer misreported as fabricated', () => {
   // This repo's own real src/ files -- the actual fix target, not a synthetic fixture.
+  // Renamed 2026-08-22 from ornith-client.js/ornith-tool-client.js -- same real files,
+  // this replay just needs to name whatever they're actually called today.
   const repoRoot = path.join(__dirname, '..');
   const draftExcerpt = [
-    'Files: ornith-client.js, ornith-tool-client.js',
+    'Files: local-client.js, local-tool-client.js',
     '',
-    'Problem: Both `ornith-client.js` and `ornith-tool-client.js` define their own local',
+    'Problem: Both `local-client.js` and `local-tool-client.js` define their own local',
     'constant instead of reading it from a shared config or module.',
   ].join('\n');
 

@@ -1,7 +1,7 @@
 'use strict';
 
 // Unit tests for model-strategies.js -- the load-bearing guarantee here is backward
-// compatibility: an unregistered name (the exact pre-existing ORNITH_AB_MODELS=ornith:9b,
+// compatibility: an unregistered name (the exact pre-existing LOCAL_AB_MODELS=ornith:9b,
 // hermes3:8b bare-tag usage) must resolve to zero overrides, byte-identical to before this
 // registry existed.
 //

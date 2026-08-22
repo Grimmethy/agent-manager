@@ -29,7 +29,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { detectDegenerate } = require('./ornith-client.js');
+const { detectDegenerate } = require('./local-client.js');
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';

@@ -13,7 +13,7 @@ const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const gpuVram = require('./gpu-vram.js');
-const ornithThroughput = require('./ornith-throughput.js');
+const ornithThroughput = require('./local-throughput.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -29,7 +29,14 @@ function resolveInstancesDir() {
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const MODEL = process.env.ORNITH_MODEL || 'ornith';
+// No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
+// should be fully interchangeable and their names should not be hardcoded anywhere") --
+// this used to fall back to the bare literal string 'ornith', which isn't a real Ollama
+// model tag at all (real tags are versioned, e.g. "ornith:35b"/"qwen3.8:27b-q4_K_M") and
+// would have silently sent a bogus model name to Ollama's real API instead of failing
+// clearly. An unset LOCAL_MODEL now surfaces as a real, loud Ollama "model not found"
+// error at call time instead of a plausible-looking wrong one.
+const MODEL = process.env.LOCAL_MODEL;
 // Without this, Ollama falls back to its own default unload window between calls --
 // observed live 2026-07-18 paying a ~38-40s cold-load penalty on the very next call
 // whenever a gap (between passes, or between tasks) outlasted it. Free to set generously

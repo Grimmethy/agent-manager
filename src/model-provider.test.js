@@ -10,7 +10,7 @@ const assert = require('node:assert/strict');
 function freshModelProvider() {
   delete require.cache[require.resolve('./model-provider.js')];
   delete require.cache[require.resolve('./claude-client.js')];
-  delete require.cache[require.resolve('./ornith-client.js')];
+  delete require.cache[require.resolve('./local-client.js')];
   return require('./model-provider.js');
 }
 
@@ -34,7 +34,7 @@ function withEnv(overrides, fn) {
 test('providerFor defaults every source to ornith-client.js when AGENT_MANAGER_CLAUDE_SOURCES is unset -- opt-in, never a silent default switch', () => {
   withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: undefined }, () => {
     const { providerFor } = freshModelProvider();
-    const ornith = require('./ornith-client.js');
+    const ornith = require('./local-client.js');
     assert.equal(providerFor('arch_import'), ornith);
     assert.equal(providerFor('observability_review'), ornith);
   });
@@ -43,7 +43,7 @@ test('providerFor defaults every source to ornith-client.js when AGENT_MANAGER_C
 test('providerFor routes exactly the listed sources to claude-client.js, leaves others on ornith', () => {
   withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: 'arch_import, deep_dive' }, () => {
     const { providerFor } = freshModelProvider();
-    const ornith = require('./ornith-client.js');
+    const ornith = require('./local-client.js');
     const claude = require('./claude-client.js');
     assert.equal(providerFor('arch_import'), claude);
     assert.equal(providerFor('deep_dive'), claude);

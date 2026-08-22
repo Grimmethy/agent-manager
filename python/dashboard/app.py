@@ -991,7 +991,7 @@ def api_models_usage():
 # need to be able to manually select which model to use for each worker type"). Lives in
 # dashboard-settings.json alongside claudeDefaultModel/claudeDefaultEffort -- same "takes
 # effect without a pipeline restart" shape those already have, since agent-manager.env's
-# ORNITH_MODEL/CLAUDE_MODEL only apply at daemon launch. ornith-worker.sh/review-runner.sh
+# LOCAL_MODEL/CLAUDE_MODEL only apply at daemon launch. local-worker.sh/review-runner.sh
 # re-read this file once per tick (get_model_override in agent-manager-common.sh) so a
 # change here reaches a running worker within one tick, no restart needed. watchdog has no
 # entry -- it never calls a model at all (queue-watcher.sh always heartbeats model="").
@@ -1017,7 +1017,7 @@ def api_worker_models():
 @app.route("/api/worker-models/<instance_id>", methods=["POST"])
 def api_set_worker_model(instance_id):
     """model: "" or omitted clears the override, reverting that instance to its
-    agent-manager.env default (ORNITH_MODEL or CLAUDE_MODEL) on its next tick."""
+    agent-manager.env default (LOCAL_MODEL or CLAUDE_MODEL) on its next tick."""
     body = request.get_json(silent=True) or {}
     model = (body.get("model") or "").strip()
     overrides = dict(read_dashboard_settings().get("workerModelOverrides", {}))
@@ -3173,8 +3173,12 @@ def _run_build(path_str: str, grep_dirs: list[str]):
 
     try:
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-        ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
-        result = build_graph.build_graph_data(Path(path_str), grep_dirs, ollama_url, ornith_model, progress=progress)
+        # No hardcoded model tag fallback -- see src/local-client.js's matching comment
+        # (2026-08-22, Grimmethy: "models should be fully interchangeable and their names
+        # should not be hardcoded anywhere"). An unset LOCAL_MODEL surfaces as a real
+        # Ollama "model not found" error instead of a guessed name.
+        local_model = os.environ.get("LOCAL_MODEL")
+        result = build_graph.build_graph_data(Path(path_str), grep_dirs, ollama_url, local_model, progress=progress)
 
         cache = resolve_writable_cache(path_str, grep_dirs)
         cache["graph"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")

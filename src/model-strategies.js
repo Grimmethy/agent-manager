@@ -1,7 +1,7 @@
 'use strict';
 
 // Named model-strategy registry (chatdev's ThinkingRegistration pattern, adapted
-// 2026-07-26) -- extends the existing ORNITH_AB_MODELS A/B mechanism (ornith-worker.ps1's
+// 2026-07-26) -- extends the existing LOCAL_AB_MODELS A/B mechanism (ornith-worker.ps1's
 // Select-AbModel, in place well before this file existed) with per-model GENERATION
 // PARAMETERS, not just a different model tag. Every pass today uses one fixed
 // temperature/numPredict/think regardless of which model is actually running -- if a
@@ -27,14 +27,14 @@ const MODEL_STRATEGIES = {
   },
 };
 
-// Resolves a name from ORNITH_AB_MODELS (or any other candidate list) to
+// Resolves a name from LOCAL_AB_MODELS (or any other candidate list) to
 // {model, temperature, numPredict, think, summary}. A registered strategy NAME returns its
 // full entry (temperature/numPredict/think present only if that strategy actually
 // overrides them). Anything else is treated as a bare Ollama model tag -- the exact
-// pre-existing ORNITH_AB_MODELS=ornith:9b,hermes3:8b usage -- and resolves to
+// pre-existing LOCAL_AB_MODELS=ornith:9b,hermes3:8b usage -- and resolves to
 // {model: <the tag itself>, summary: null}, no overrides, byte-identical to today's
 // behavior. This is the load-bearing backward-compatibility guarantee: an unset or
-// bare-tag-only ORNITH_AB_MODELS must never change behavior.
+// bare-tag-only LOCAL_AB_MODELS must never change behavior.
 function resolveStrategy(nameOrModelTag) {
   if (nameOrModelTag in MODEL_STRATEGIES) {
     return { ...MODEL_STRATEGIES[nameOrModelTag] };
