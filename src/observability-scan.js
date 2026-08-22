@@ -45,7 +45,8 @@ function listSourceFiles(dir, extensions) {
       }
     }
     return result;
-  } catch {
+  } catch (err) {
+    console.error('[observability-scan] scan failed:', err.message, err.stack);
     return [];
   }
 }
