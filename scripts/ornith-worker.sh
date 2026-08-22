@@ -112,9 +112,33 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # way a brand-new claim does, not a second, drifted copy of this logic.
 process_drafting_file() {
   local wpath="$1"
-  local name task_id draft_result draft_succeeded draft_blocked
+  local name task_id draft_result draft_succeeded draft_blocked draft_will_touch_local_gpu
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
+
+  # Which backend this call will ACTUALLY hit. NOT just labelFor()/reasoningTierFor() --
+  # confirmed live 2026-08-22 that labelFor() alone is WRONG for this: dashboard-settings.json
+  # can carry a workerModelOverrides entry (e.g. "worker-reasoning": "ollama:...") that makes
+  # AGENT_MANAGER_FORCE_PROVIDER=ornith true for the whole lane, so labelFor() reports
+  # "ornith" -- but ornith-draft.js's OWN dispatch (resolveSourceName(task)==='adhoc', or
+  # task.domain==='research') sends adhoc-shaped and research tasks through a REAL agentic
+  # Claude Code CLI call UNCONDITIONALLY, ignoring that override entirely (see
+  # adhoc-agentic-draft.js/research-agentic-draft.js -- neither goes through providerFor()
+  # at all). Checking labelFor() alone made this lock-skip a no-op for exactly the adhoc
+  # lane it was meant to fix: it kept locking real Claude calls it mistakenly thought were
+  # local. draft_will_touch_local_gpu replicates ornith-draft.js's actual dispatch order
+  # (adhoc/research bypass checked FIRST, tier-based labelFor() as the fallback for
+  # everything else) so this can never disagree with what really happens.
+  draft_will_touch_local_gpu="$(node -e '
+    try {
+      require(process.argv[1]);
+      const { resolveSourceName } = require(process.argv[2]);
+      const { labelFor } = require(process.argv[3]);
+      const t = JSON.parse(require("fs").readFileSync(process.argv[4], "utf8"));
+      const alwaysClaude = resolveSourceName(t) === "adhoc" || t.domain === "research";
+      console.log(alwaysClaude || labelFor(t).startsWith("claude:") ? "false" : "true");
+    } catch (e) { console.log("true"); }
+  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
 
   # "queued" until the single-flight lock is actually held, then "working" -- 2026-08-19,
   # Grimmethy: "add the distinct queued status. The current is too unclear" (a claimed
@@ -125,11 +149,22 @@ process_drafting_file() {
   # not before this function, so claiming/GPU-guard/task-generation upstream still run
   # freely across lanes; only the real Ollama-consuming call is serialized, and only the
   # WAIT for that is what "queued" represents.
+  #
+  # ONLY for a low-tier (local Ornith) call -- a high-tier task's real call routes to
+  # Claude in the cloud, no local GPU contention at all, so worker-reasoning no longer
+  # waits its turn behind worker-1's local calls (or vice versa) here. Grimmethy,
+  # 2026-08-22: "worker-1 and reasoning are taking turns... as is with local only we are
+  # losing priority" -- see review-runner.sh's matching fix for the review-stage half of
+  # this same bug.
   write_heartbeat_file "$INSTANCE_ID" "queued" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
-  acquire_single_flight_lock
+  if [[ "$draft_will_touch_local_gpu" != "false" ]]; then
+    acquire_single_flight_lock
+  fi
   write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/ornith-draft.js" "$wpath" 2>>"$LOG_FILE")"
-  release_single_flight_lock
+  if [[ "$draft_will_touch_local_gpu" != "false" ]]; then
+    release_single_flight_lock
+  fi
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
 
