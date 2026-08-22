@@ -75,8 +75,10 @@ function readActiveLocks(instancesDir) {
   let names;
   try {
     names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return [];
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    console.error('[inflight-lock] readdir(' + dir + ') failed:', err);
+    throw err;
   }
   const now = Date.now();
   const active = [];
