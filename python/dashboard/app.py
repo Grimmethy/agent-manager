@@ -1783,6 +1783,36 @@ def api_adhoc_tasks():
     def is_adhoc(data, task_id):
         return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
 
+    # dependsOn visibility (2026-08-22, Grimmethy: "systematic way to prioritize what
+    # order adhoc tasks get completed in") -- mirrors task-sources.js's own
+    # isDependencySatisfied() exactly (satisfied only once mergedAt is stamped on the
+    # dependency's queue/done/ record, not just done -- see that function's comment for
+    # why reaching done/ alone isn't enough), so a human looking at this list sees the
+    # SAME "is this actually unblocked" answer the claim logic itself uses.
+    def dependency_status(depends_on):
+        if not depends_on:
+            return None
+        out = []
+        for dep_id in depends_on:
+            satisfied = False
+            for candidate in (qdir / "done" / f"{dep_id}.json", qdir / "done" / "_archived_no_action" / f"{dep_id}.json"):
+                dep_data = read_json_safe(candidate)
+                if dep_data and dep_data.get("mergedAt"):
+                    satisfied = True
+                    break
+            out.append({"id": dep_id, "satisfied": satisfied})
+        return out
+
+    def task_row(data, task_id, state):
+        return {
+            "id": task_id,
+            "title": data.get("title") or task_id,
+            "state": state,
+            "createdAt": data.get("createdAt"),
+            "excerpt": _adhoc_task_excerpt(data),
+            "dependsOn": dependency_status(data.get("dependsOn")),
+        }
+
     tasks = []
 
     adhoc_dir = qdir / "adhoc"
@@ -1790,13 +1820,7 @@ def api_adhoc_tasks():
         for f in adhoc_dir.glob("*.json"):
             data = read_json_safe(f)
             if data and is_adhoc(data, f.stem):
-                tasks.append({
-                    "id": data.get("id", f.stem),
-                    "title": data.get("title") or f.stem,
-                    "state": "adhoc",
-                    "createdAt": data.get("createdAt"),
-                    "excerpt": _adhoc_task_excerpt(data),
-                })
+                tasks.append(task_row(data, data.get("id", f.stem), "adhoc"))
 
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
@@ -1807,14 +1831,7 @@ def api_adhoc_tasks():
             task_id = data.get("id", f.stem)
             if not is_adhoc(data, task_id):
                 continue
-            lane = f.parent.name
-            tasks.append({
-                "id": task_id,
-                "title": data.get("title") or task_id,
-                "state": f"drafting:{lane}",
-                "createdAt": data.get("createdAt"),
-                "excerpt": _adhoc_task_excerpt(data),
-            })
+            tasks.append(task_row(data, task_id, f"drafting:{f.parent.name}"))
 
     for state in QUEUE_STATES:
         if state == "done" and not include_done:
@@ -1829,13 +1846,7 @@ def api_adhoc_tasks():
             task_id = data.get("id", f.stem)
             if not is_adhoc(data, task_id):
                 continue
-            tasks.append({
-                "id": task_id,
-                "title": data.get("title") or task_id,
-                "state": state,
-                "createdAt": data.get("createdAt"),
-                "excerpt": _adhoc_task_excerpt(data),
-            })
+            tasks.append(task_row(data, task_id, state))
 
     tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
     return jsonify({"tasks": tasks})
@@ -3743,6 +3754,33 @@ def api_git_merge_branch(branch):
 
     _invalidate_branch_cache()
     live_sync = _sync_live_checkout(main_branch)
+
+    # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
+    # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
+    # with dependencies on new adhoc tasks are absolutely going to need to be done after
+    # the dependency is completed") -- this is the real "is this dependency satisfied"
+    # signal task-sources.js's nextAdhocTask() checks before letting a dependent task
+    # claim. Reaching queue/done/ alone isn't enough: a task there is only pushed to its
+    # OWN branch, not merged, and every adhoc draft's git worktree starts from
+    # origin/<mainBranch> -- a dependency's fix isn't actually visible to a dependent
+    # task's fresh checkout until it's merged, confirmed live by the exact failure this
+    # feature exists to prevent (a dependent task's diff going stale against code the
+    # dependency hadn't landed yet). Best-effort: a task record not found (already
+    # archived, or this merge came from some other source than the normal apply flow)
+    # must never fail the merge itself, which already fully succeeded above.
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        for candidate in (qdir / "done" / f"{task_id}.json", qdir / "done" / "_archived_no_action" / f"{task_id}.json"):
+            if candidate.is_file():
+                data = read_json_safe(candidate)
+                if data is not None:
+                    data["mergedAt"] = datetime.now(timezone.utc).isoformat()
+                    try:
+                        candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
+                break
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
 

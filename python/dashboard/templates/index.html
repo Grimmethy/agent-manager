@@ -1467,8 +1467,14 @@ async function renderAdhocTasksTab() {
     const badgeClass = adhocStateBadgeClass(t.state);
     const when = t.createdAt ? new Date(t.createdAt).toLocaleString() : '';
     const excerptHtml = t.excerpt ? `<div class="meta">${escapeHtml(t.excerpt)}</div>` : '';
+    // dependsOn (2026-08-22): each entry's `satisfied` mirrors task-sources.js's own
+    // isDependencySatisfied() -- merged, not just done -- so this reads the same
+    // "actually unblocked" answer the claim logic itself uses, not a looser guess.
+    const dependsHtml = (t.dependsOn && t.dependsOn.length)
+      ? `<div class="meta" style="color:var(--warn)">⏳ depends on: ${t.dependsOn.map((d) => `${escapeHtml(d.id)}${d.satisfied ? ' (merged)' : ' (not yet merged)'}`).join(', ')}</div>`
+      : '';
     return `<tr class="${rowClass}" data-id="${escapeAttr(t.id)}">
-      <td>${escapeHtml(t.title)}${excerptHtml}</td>
+      <td>${escapeHtml(t.title)}${excerptHtml}${dependsHtml}</td>
       <td><span class="badge ${badgeClass}">${escapeHtml(adhocStateLabel(t.state))}</span>${isAwaitingConfirm ? ' <strong>-- needs your review</strong>' : ''}</td>
       <td>${escapeHtml(when)}</td>
     </tr>`;

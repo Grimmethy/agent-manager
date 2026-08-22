@@ -54,6 +54,40 @@ function readIfExists(filePath) {
 const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done',
   'needs-clarification', 'awaiting-confirm'];
 
+// Dependency ordering for queue/adhoc/ (2026-08-22, Grimmethy: "We need some systematic
+// way to prioritize what order adhoc tasks get completed in. Those with dependencies on
+// new adhoc tasks are absolutely going to need to be done after the dependency is
+// completed" -- confirmed live, twice in one session: an adhoc task's diff going stale
+// because a DIFFERENT adhoc task's fix landed on the same file after it was drafted, and
+// a separate adhoc task repeatedly blocking on exactly the infra-failure class another
+// already-queued adhoc task exists to fix).
+//
+// "Satisfied" means MERGED, not just done -- reaching queue/done/ only means a task's
+// branch was pushed, not merged; every adhoc draft's git worktree starts from
+// origin/<mainBranch> (adhoc-agentic-draft.js), so a dependency's real code change isn't
+// actually visible to a dependent task's fresh checkout until a human merges it (the
+// dashboard's Unmerged Branches tab, api_git_merge_branch -- which stamps mergedAt on the
+// dependency's own task record the moment that happens; see its own comment). Checking
+// queue/done/ alone would let a dependent task draft against code that doesn't have the
+// dependency's fix yet, reproducing the exact staleness bug this feature exists to
+// prevent.
+function isDependencySatisfied(pipelineDir, depId) {
+  const trimmed = (depId || '').trim();
+  if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
+  for (const candidate of [
+    path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
+    path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
+  ]) {
+    try {
+      const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      if (data && data.mergedAt) return true;
+    } catch {
+      // not found here, or unparseable -- try the next candidate location / fall through to unsatisfied
+    }
+  }
+  return false;
+}
+
 // A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
 // directly (a per-instance claim subfolder) -- every task source shares this function, so a
 // task actively being drafted is correctly seen as already-queued, not regenerated.
@@ -194,6 +228,16 @@ function nextAdhocTask() {
 
     const id = parsed.id.trim();
     if (taskIdExistsInQueue(id)) continue;
+
+    // dependsOn (see isDependencySatisfied's own comment for the full design): skip past
+    // this candidate -- do NOT block the whole lane on it -- if any declared dependency
+    // hasn't been merged yet. Oldest-first mtime ordering means a later, unblocked
+    // candidate still gets picked up this same call instead of the lane sitting idle
+    // behind one that genuinely can't proceed yet.
+    if (Array.isArray(parsed.dependsOn) && parsed.dependsOn.length > 0) {
+      const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
+      if (unmet.length > 0) continue;
+    }
 
     // Spread the WHOLE file through, then force only the fields this source's contract
     // actually requires -- id/domain/source/title default -- rather than rebuilding a
