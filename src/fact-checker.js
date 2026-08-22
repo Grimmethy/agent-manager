@@ -44,7 +44,8 @@ function extractCreateModeTargets(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
-  } catch {
+  } catch (err) {
+    console.warn('[fact-checker] failed to parse targets input', err);
     return new Set();
   }
   const items = Array.isArray(parsed) ? parsed : [parsed];
