@@ -41,7 +41,7 @@ function runEvent(event, payload) {
 // fresh callId to store on the task (as task.abCallId) so a later outcome (review verdict,
 // watchdog requeue) can be joined back to this same row.
 //
-// candidates (2026-08-19): the raw ORNITH_AB_MODELS list this call was chosen from, or
+// candidates (2026-08-19): the raw LOCAL_AB_MODELS list this call was chosen from, or
 // null when no A/B mechanism is active for this call -- model-stats-db.js's schema already
 // had this column (the PowerShell reference always populated it), it just had no way to
 // reach it through this JS wrapper until ab-model-select.js gave ornith-draft.js a real

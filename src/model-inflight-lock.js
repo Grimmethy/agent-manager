@@ -14,7 +14,7 @@
 //
 // One file per in-flight call (not a single boolean in .active-local-model.json) so
 // concurrent calls to the SAME model never race each other's lock lifecycle -- worker-1
-// and reviewer both call ORNITH_MODEL directly and legitimately overlap; a single
+// and reviewer both call LOCAL_MODEL directly and legitimately overlap; a single
 // set/clear flag would have process A's `finally` clear the lock while process B's
 // identical-model call is still running, reopening exactly the window this exists to
 // close. should_yield_for_model_swap only cares whether ANY held lock names a model

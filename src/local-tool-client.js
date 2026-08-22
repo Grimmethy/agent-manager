@@ -13,7 +13,9 @@ const { getConfig } = require('./config.js');
 const { postJson } = require('./ollama-http.js');
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const MODEL = process.env.ORNITH_MODEL || 'ornith';
+// No hardcoded fallback tag -- see local-client.js's matching comment. An unset
+// LOCAL_MODEL now surfaces as a real Ollama "model not found" error, not a guessed name.
+const MODEL = process.env.LOCAL_MODEL;
 
 // Matches ornith-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
 // reasoning that a tool-calling turn can legitimately run longer than a plain generation
@@ -50,7 +52,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
   const { pipelineDir } = getConfig();
   const killSwitchPath = path.join(pipelineDir, 'queue', '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
-    const { call } = require('./ornith-client.js');
+    const { call } = require('./local-client.js');
     const result = await call({ prompt, think: true });
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }

@@ -45,7 +45,7 @@ const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId ag
 // literal worker-1 already handles via the worker- prefix check below.
 function restartTargetFor(instanceId) {
   if (instanceId.startsWith('worker-')) {
-    return { script: 'ornith-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid` };
+    return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid` };
   }
   if (instanceId === 'reviewer') {
     return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };

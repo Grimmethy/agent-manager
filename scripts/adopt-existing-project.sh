@@ -41,7 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECTS_BASE="${AGENT_MANAGER_PLUGIN_PROJECTS_BASE:-/media/wok/model-cache}"
 REPO_DIR="$PROJECTS_BASE/$NAME"
 PIPELINE_DIR="$PROJECTS_BASE/${NAME}-pipeline"
-ORNITH_MODEL_DEFAULT="${ORNITH_MODEL:-qwen3.8:27b-q4_K_M}"
+LOCAL_MODEL_DEFAULT="${LOCAL_MODEL:-qwen3.8:27b-q4_K_M}"
 
 if [[ -e "$REPO_DIR" ]]; then
   echo "error: $REPO_DIR already exists -- refusing to overwrite. Pick a different name, or remove it first if this was a failed attempt." >&2
@@ -64,7 +64,7 @@ JSONEOF
 cat > "$PIPELINE_DIR/.env" <<EOF
 export AGENT_MANAGER_REPO_ROOT=$REPO_DIR
 export AGENT_MANAGER_PIPELINE_DIR=$PIPELINE_DIR
-export ORNITH_MODEL=$ORNITH_MODEL_DEFAULT
+export LOCAL_MODEL=$LOCAL_MODEL_DEFAULT
 EOF
 
 bash "$SCRIPT_DIR/register-project.sh" "$NAME" "$REPO_DIR" "$PIPELINE_DIR"

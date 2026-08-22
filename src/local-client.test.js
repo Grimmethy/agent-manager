@@ -9,7 +9,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectDegenerate } = require('./ornith-client.js');
+const { detectDegenerate } = require('./local-client.js');
 
 test('detectDegenerate flags a genuinely empty response as "empty"', () => {
   assert.equal(detectDegenerate(''), 'empty');

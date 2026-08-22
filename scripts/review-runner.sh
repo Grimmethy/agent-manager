@@ -26,21 +26,21 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
 # Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
-# dropdown, 2026-08-18) -- exports ORNITH_MODEL for this tick so every write_heartbeat_file
+# dropdown, 2026-08-18) -- exports LOCAL_MODEL for this tick so every write_heartbeat_file
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
 # Reviewer is always Ornith (never Claude), unlike ornith-worker.sh's two lanes, so this is
 # the simpler single-model version of that script's refresh_active_model.
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
-  [[ -n "$override" ]] && ORNITH_MODEL="$override"
-  export ORNITH_MODEL
+  [[ -n "$override" ]] && LOCAL_MODEL="$override"
+  export LOCAL_MODEL
 }
 
 while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
-  write_heartbeat_file "$INSTANCE_ID" "idle" "${ORNITH_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
+  write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
 
   review_dir="${QUEUE_DIR}/review"                          # queue/review/ -- the real stage name from task-sources.js's QUEUE_STATES, and where ornith-worker.sh's own draft pass now files a task once it's ready (status "needs-review"). Was previously scanning queue/drafting/<instance>/ for a needs-review flag ornith-worker.sh never actually set there -- see git history for that dead end.
 
@@ -50,15 +50,15 @@ while :; do                                                                     
   # same guard ornith-worker.sh's worker-1 lane uses, tier='low' for the same reason: this
   # daemon's own Ornith calls only ever review low-tier items (a high-tier item's vote
   # routes straight to Claude inside review-task.js's own providerFor(task) call,
-  # independent of ORNITH_MODEL). No-op when reviewer already shares worker-1's model, the
+  # independent of LOCAL_MODEL). No-op when reviewer already shares worker-1's model, the
   # default and common case.
-  yield_verdict="$(should_yield_for_model_swap "${ORNITH_MODEL:-}" "low")"
+  yield_verdict="$(should_yield_for_model_swap "${LOCAL_MODEL:-}" "low")"
   if [[ "$yield_verdict" == "yield" ]]; then
     printf '[review-%s] yielding this tick -- resident model still has pending work in the other tier.\n' "$INSTANCE_ID" >&2
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
-  record_active_model "$INSTANCE_ID" "${ORNITH_MODEL:-}" "low"
+  record_active_model "$INSTANCE_ID" "${LOCAL_MODEL:-}" "low"
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
   # (n=3 votes per item), same starvation risk ornith-worker.sh's tick guards against;
@@ -124,7 +124,7 @@ while :; do                                                                     
     # "queued" until the single-flight lock is actually held, then "working" -- see
     # ornith-worker.sh's process_drafting_file for the full rationale (2026-08-19,
     # Grimmethy: "add the distinct queued status. The current is too unclear").
-    write_heartbeat_file "$INSTANCE_ID" "queued" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
+    write_heartbeat_file "$INSTANCE_ID" "queued" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
     # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
     # own header) -- ONLY for a low-tier item, whose review vote calls local Ornith and
@@ -141,7 +141,7 @@ while :; do                                                                     
     if [[ "$resolved_label" != claude:* ]]; then
       acquire_single_flight_lock
     fi
-    write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
+    write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
     review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
     if [[ "$resolved_label" != claude:* ]]; then
       release_single_flight_lock
@@ -163,7 +163,7 @@ while :; do                                                                     
       # ornith-worker.sh's own "leave claimed work in place on an unhandled error" choice.
       printf '[review-%s] review call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
     fi
-    write_heartbeat_file "$INSTANCE_ID" "idle" "${ORNITH_MODEL:-}" "" "" "$STARTED_AT"
+    write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"
     did_work=true
   done
 

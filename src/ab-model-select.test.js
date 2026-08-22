@@ -2,7 +2,7 @@
 
 // Unit tests for ab-model-select.js. The load-bearing guarantees: (1) fewer than 2
 // candidates is always a no-op (null), matching resolveStrategy's own backward-
-// compatibility guarantee for an unset/single-entry ORNITH_AB_MODELS; (2) selection is
+// compatibility guarantee for an unset/single-entry LOCAL_AB_MODELS; (2) selection is
 // deterministic per taskId, so a redraft/retry of the same task keeps comparing against
 // the same candidate rather than a fresh coin flip each time.
 //

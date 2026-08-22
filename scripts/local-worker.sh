@@ -32,7 +32,7 @@ esac
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
-# Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
+# Every write_heartbeat_file call below used to hardcode "${LOCAL_MODEL:-}" as the
 # reported model regardless of which lane was actually running -- confirmed live
 # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
 # even though it only ever claims adhoc tasks and never calls Ornith at all. Same
@@ -40,7 +40,7 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 # Models tab, so the two stay consistent.
 #
 # Re-run once per tick (not just once at startup, 2026-08-18: Workers tab per-instance
-# model dropdown) -- exports ORNITH_MODEL/CLAUDE_MODEL for this tick from
+# model dropdown) -- exports LOCAL_MODEL/CLAUDE_MODEL for this tick from
 # dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
 # instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
 # call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
@@ -59,9 +59,9 @@ refresh_active_model() {
   if "$IS_CLAUDE_LANE"; then
     case "$override" in
       ollama:*)
-        ORNITH_MODEL="${override#ollama:}"
-        export ORNITH_MODEL AGENT_MANAGER_FORCE_PROVIDER=ornith
-        HEARTBEAT_MODEL="$ORNITH_MODEL"
+        LOCAL_MODEL="${override#ollama:}"
+        export LOCAL_MODEL AGENT_MANAGER_FORCE_PROVIDER=local
+        HEARTBEAT_MODEL="$LOCAL_MODEL"
         ;;
       claude:*)
         CLAUDE_MODEL="${override#claude:}"
@@ -76,9 +76,9 @@ refresh_active_model() {
     esac
   else
     unset AGENT_MANAGER_FORCE_PROVIDER
-    [[ -n "$override" ]] && ORNITH_MODEL="$override"
-    export ORNITH_MODEL
-    HEARTBEAT_MODEL="${ORNITH_MODEL:-}"
+    [[ -n "$override" ]] && LOCAL_MODEL="$override"
+    export LOCAL_MODEL
+    HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
   fi
 }
 refresh_active_model
@@ -158,7 +158,7 @@ process_drafting_file() {
     acquire_single_flight_lock
   fi
   write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
-  draft_result="$(node "${PACKAGE_SRC_DIR}/ornith-draft.js" "$wpath" 2>>"$LOG_FILE")"
+  draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
   if [[ "$draft_label" != claude:* ]]; then
     release_single_flight_lock
   fi
@@ -256,25 +256,25 @@ while :; do                                                                     
   # see its own header comment) -- only relevant when THIS tick's real work would call a
   # LOCAL model: always true for the non-reasoning lane (plain Ornith), and true for the
   # reasoning lane only when the dashboard override forced it onto a local model too
-  # (AGENT_MANAGER_FORCE_PROVIDER=ornith, set by refresh_active_model above). A Claude-lane
+  # (AGENT_MANAGER_FORCE_PROVIDER=local, set by refresh_active_model above). A Claude-lane
   # tick calling real Claude never touches Ollama's resident slot, so it's exempt --
   # exactly like the budget gate above, this only matters once local-in-reasoning is
   # actually in use, and is a no-op (state file absent, or target already resident) in the
   # default all-Claude-reasoning config.
   active_locally="true"
-  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "ornith" ]]; then
+  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
     active_locally="false"
   fi
   if [[ "$active_locally" == "true" ]]; then
     target_tier="low"
     "$IS_CLAUDE_LANE" && target_tier="high"
-    yield_verdict="$(should_yield_for_model_swap "$ORNITH_MODEL" "$target_tier")"
+    yield_verdict="$(should_yield_for_model_swap "$LOCAL_MODEL" "$target_tier")"
     if [[ "$yield_verdict" == "yield" ]]; then
       printf '[worker-%s] yielding this tick -- resident model still has pending work in the other tier (see should_yield_for_model_swap).\n' "$INSTANCE_ID" >&2
       sleep "${ORC_TICK_SECS:-30}"
       continue
     fi
-    record_active_model "$INSTANCE_ID" "$ORNITH_MODEL" "$target_tier"
+    record_active_model "$INSTANCE_ID" "$LOCAL_MODEL" "$target_tier"
   fi
 
   # GPU headroom check -- before spending any real model call this tick, see whether the

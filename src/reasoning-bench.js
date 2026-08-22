@@ -51,11 +51,15 @@
 
 const fs = require('fs');
 const path = require('path');
-const ornith = require('./ornith-client.js');
+const local = require('./local-client.js');
 const { postJson } = require('./ollama-http.js');
 const { CASES } = require('./reasoning-bench-cases.js');
 
-const DEFAULT_MODELS = ['ornith:35b', 'qwen3.8:27b-q4_K_M'];
+// No hardcoded model tags -- see local-client.js's own comment (2026-08-22, Grimmethy:
+// "models should be fully interchangeable and their names should not be hardcoded
+// anywhere"). Defaults to whichever local model is actually configured (LOCAL_MODEL);
+// callers wanting a specific comparison should pass --models explicitly.
+const DEFAULT_MODELS = [process.env.LOCAL_MODEL].filter(Boolean);
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 
 function parseArgs(argv) {
@@ -216,7 +220,7 @@ async function runCase(model, kase, runIndex, judgeModel, judgeClient) {
     // raised well above ornith-draft.js's typical passes -- several cases (the logic
     // grid, the code trace) need real multi-step working, and truncating mid-reasoning
     // would fail them for a harness reason, not a model-quality one.
-    callResult = await ornith.call({ prompt: kase.prompt, model, think: true, temperature: 0.2, numPredict: 1800 }, 1);
+    callResult = await local.call({ prompt: kase.prompt, model, think: true, temperature: 0.2, numPredict: 1800 }, 1);
   } catch (e) {
     callResult = { response: '', thinking: '', degenerate: `call-error: ${e.message}`, attempts: 1 };
   }

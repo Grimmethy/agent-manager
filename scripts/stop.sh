@@ -130,9 +130,9 @@ done
 # reloader and its re-exec'd child (same cmdline), same as --keep-dashboard is honored below
 # by simply not adding this pattern when that flag is set.
 if [[ "$KEEP_DASHBOARD" != true ]]; then
-  stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh|python/dashboard/app\.py' 2>/dev/null || true)"
+  stray_pids="$(pgrep -f 'scripts/(local-worker|review-runner)\.sh|python/dashboard/app\.py' 2>/dev/null || true)"
 else
-  stray_pids="$(pgrep -f 'scripts/(ornith-worker|review-runner)\.sh' 2>/dev/null || true)"
+  stray_pids="$(pgrep -f 'scripts/(local-worker|review-runner)\.sh' 2>/dev/null || true)"
 fi
 for stray_pid in $stray_pids; do
   already_handled=false
