@@ -342,26 +342,39 @@ test('a source with its own registered apply (e.g. brain_dump_sort) never hits t
 // queue/approved/ unconditionally, so without this gate a real code change would land
 // and push with no human click at all -----------------------------------------------
 
-test('an adhoc task with a real rawDiff is held for confirmation and never touches git', () => {
+// --- adhoc/research_task/pipeline_self_audit/product_spec: these four used to each hold
+// in queue/awaiting-confirm/ for an explicit confirm click (adhocApplyConfirmedAt/
+// researchApplyConfirmedAt/pipelineSelfFixConfirmedAt/productSpecConfirmedAt) before a
+// real diff could even reach a pushed branch. REMOVED 2026-08-22 (Grimmethy: "I'd like to
+// skip the confirm step. We already have a manual step for merge to main. This extra
+// step is unnecessary friction.") -- the merge-to-main step (api_git_merge_branch) is
+// still always a separate, manual dashboard action; these tasks now proceed straight to
+// that same pushed-but-unmerged state a confirmed task used to reach. The *ConfirmedAt
+// fields are simply ignored now (harmless if still present on an old task record).
+// Delete-mode's own awaiting-confirm gate above is UNCHANGED -- see its own comment.
+
+test('an adhoc task with a real rawDiff proceeds directly to the real git-branch-diff flow', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({ domain: 'adhoc', source: 'manual', rawDiff: 'diff --git a/x b/x\n', implementResponse: 'summary\n\n=== DIFF ===\ndiff --git a/x b/x\n' });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  assert.equal(result.succeeded, false);
-  assert.equal(result.needsConfirmation, true);
-  assert.match(result.reason, /agentic/);
-  assert.deepEqual(gitRunner.calls, []);
+  // No confirm gate to hold it -- resetToMain/createBranch ran immediately. (Fails at the
+  // real `git apply` step since REPO_ROOT here isn't a real git repo/matching diff --
+  // applyAdhocDiff.test.js covers that path against real git.)
+  assert.equal(result.needsConfirmation, undefined);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'no gate holding it back from the real git-branch-diff flow');
 });
 
-test('an adhoc task with an empty rawDiff (no-changes-needed) never hits the confirm gate', () => {
+test('an adhoc task with an empty rawDiff (no-changes-needed) never commits or pushes', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({ domain: 'adhoc', source: 'manual', rawDiff: '', adhocResolution: 'no-changes-needed', implementResponse: 'already resolved' });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  // Falls through to applyAdhocDiff's own {skipped} branch instead -- nothing to confirm.
-  // The normal git-branch-diff sequence still runs fetch/reset/branch BEFORE writeArtifact
-  // is called (same as every other {skipped} outcome on a non-special-cased domain), then
-  // cleans the throwaway branch back up once it sees {skipped} -- no commit/push, though.
+  // Falls through to applyAdhocDiff's own {skipped} branch -- the normal git-branch-diff
+  // sequence still runs fetch/reset/branch BEFORE writeArtifact is called (same as every
+  // other {skipped} outcome on a non-special-cased domain), then cleans the throwaway
+  // branch back up once it sees {skipped} -- no commit/push, though.
   assert.equal(result.needsConfirmation, undefined);
   assert.equal(result.succeeded, true);
   const names = gitRunner.calls.map((c) => c.name);
@@ -369,38 +382,7 @@ test('an adhoc task with an empty rawDiff (no-changes-needed) never hits the con
   assert.ok(!names.includes('push'), 'a skipped (no-op) outcome must never push');
 });
 
-test('adhocApplyConfirmedAt lets a previously-held adhoc diff proceed past the gate', () => {
-  const gitRunner = createFakeGitRunner();
-  const task = baseTask({
-    domain: 'adhoc', source: 'manual', rawDiff: 'diff --git a/x b/x\n', implementResponse: 'summary',
-    adhocApplyConfirmedAt: '2026-08-17T00:00:00.000Z',
-  });
-  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-
-  // Past the confirm gate now -- resetToMain/createBranch ran, proving the gate didn't
-  // hold it again. (Fails at the real `git apply` step since REPO_ROOT here isn't a real
-  // git repo/matching diff -- applyAdhocDiff.test.js covers that path against real git.)
-  const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
-});
-
-// --- research tasks: same awaiting-confirm gate, but never touch git at all (Brain Dump
-// #1 follow-up, 2026-08-17) -- SecondBrain is outside repoRoot, so a confirmed research
-// task must be intercepted BEFORE the git-branch-diff flow's fetch/reset/branch, not just
-// gated the same way adhoc is -------------------------------------------------------
-
-test('a research task with a real researchDoc is held for confirmation and never touches git', () => {
-  const gitRunner = createFakeGitRunner();
-  const task = baseTask({ domain: 'research', source: 'research_task', researchDoc: '# x\n\nfindings', promptContext: { secondBrainPath: 'x.md' } });
-  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-
-  assert.equal(result.succeeded, false);
-  assert.equal(result.needsConfirmation, true);
-  assert.match(result.reason, /research/);
-  assert.deepEqual(gitRunner.calls, []);
-});
-
-test('researchApplyConfirmedAt lets a confirmed research task proceed, writes into SecondBrain, and never touches git', () => {
+test('a research task with a real researchDoc proceeds, writes into SecondBrain, and never touches git', () => {
   const gitRunner = createFakeGitRunner();
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-research-test-'));
   const secondBrainDir = path.join(scratchDir, 'secondbrain');
@@ -411,12 +393,12 @@ test('researchApplyConfirmedAt lets a confirmed research task proceed, writes in
     domain: 'research', source: 'research_task',
     researchDoc: '# goblinnib\n\nReal findings.',
     promptContext: { secondBrainPath: 'references/goblinnib.md', brainDumpEntryId: 'bd-1' },
-    researchApplyConfirmedAt: '2026-08-17T00:00:00.000Z',
   });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
 
   assert.equal(result.succeeded, true);
-  assert.deepEqual(gitRunner.calls, [], 'research never touches git, confirmed or not');
+  assert.equal(result.needsConfirmation, undefined);
+  assert.deepEqual(gitRunner.calls, [], 'research never touches git');
 
   const noteText = fs.readFileSync(path.join(secondBrainDir, 'references/goblinnib.md'), 'utf8');
   assert.match(noteText, /Real findings\./);
@@ -426,15 +408,7 @@ test('researchApplyConfirmedAt lets a confirmed research task proceed, writes in
   assert.match(entries[0].resolvedNote, /Researched and filed/);
 });
 
-// --- pipeline_self_audit: same awaiting-confirm gate, but checked on task.source
-// directly rather than domain (2026-08-20, Grimmethy: "change it to rely on the
-// reasoning model itself, even if local") -- this source moved off domain:'adhoc' (which
-// used to carry the adhoc gate above for free) onto domain:'default' so it drafts on the
-// local Ornith model via harness grounding instead of requiring a Claude subscription,
-// but a task that autonomously finds and drafts a fix to THIS PIPELINE'S OWN CODE still
-// needs the same explicit human confirmation regardless of domain -----------------------
-
-test('a pipeline_self_audit task with a real implementResponse is held for confirmation and never touches git', () => {
+test('a pipeline_self_audit task with a real implementResponse proceeds directly to the real git-branch-diff flow', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
     domain: 'default', source: 'pipeline_self_audit',
@@ -442,41 +416,22 @@ test('a pipeline_self_audit task with a real implementResponse is held for confi
   });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  assert.equal(result.succeeded, false);
-  assert.equal(result.needsConfirmation, true);
-  assert.match(result.reason, /pipeline_self_audit/);
-  assert.deepEqual(gitRunner.calls, []);
+  assert.equal(result.needsConfirmation, undefined);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'no gate holding it back from the real git-branch-diff flow');
 });
 
-test('a pipeline_self_audit task with an empty implementResponse (nothing groundable found) never hits the confirm gate', () => {
+test('a pipeline_self_audit task with an empty implementResponse (nothing groundable found) never commits', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({ domain: 'default', source: 'pipeline_self_audit', implementResponse: '' });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
   assert.equal(result.needsConfirmation, undefined);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(!names.includes('commit'), 'nothing to confirm, but also nothing to commit');
+  assert.ok(!names.includes('commit'), 'nothing to commit');
 });
 
-test('pipelineSelfFixConfirmedAt lets a previously-held pipeline_self_audit diff proceed past the gate', () => {
-  const gitRunner = createFakeGitRunner();
-  const task = baseTask({
-    domain: 'default', source: 'pipeline_self_audit',
-    implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'a', replace: 'b' }),
-    pipelineSelfFixConfirmedAt: '2026-08-20T00:00:00.000Z',
-  });
-  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-
-  const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
-});
-
-// --- product_spec: same awaiting-confirm gate shape as pipeline_self_audit, but the
-// artifact is a document, not code (2026-08-20, see task-sources.js's nextProductSpecTask
-// header) -- every later feature task for the target project gets grounded against
-// whatever lands here, so it gets the same explicit human confirmation. ---------------
-
-test('a product_spec task with a real implementResponse is held for confirmation and never touches git', () => {
+test('a product_spec task with a real implementResponse proceeds directly to the real git-branch-diff flow', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
     domain: 'default', source: 'product_spec',
@@ -484,33 +439,19 @@ test('a product_spec task with a real implementResponse is held for confirmation
   });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  assert.equal(result.succeeded, false);
-  assert.equal(result.needsConfirmation, true);
-  assert.match(result.reason, /product_spec/);
-  assert.deepEqual(gitRunner.calls, []);
+  assert.equal(result.needsConfirmation, undefined);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('resetToMain'), 'no gate holding it back from the real git-branch-diff flow');
 });
 
-test('a product_spec task with an empty implementResponse never hits the confirm gate', () => {
+test('a product_spec task with an empty implementResponse never commits', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({ domain: 'default', source: 'product_spec', implementResponse: '' });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
   assert.equal(result.needsConfirmation, undefined);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(!names.includes('commit'), 'nothing to confirm, but also nothing to commit');
-});
-
-test('productSpecConfirmedAt lets a previously-held product_spec change proceed past the gate', () => {
-  const gitRunner = createFakeGitRunner();
-  const task = baseTask({
-    domain: 'default', source: 'product_spec',
-    implementResponse: JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '## Entities\n\n- Contact\n' }),
-    productSpecConfirmedAt: '2026-08-20T00:00:00.000Z',
-  });
-  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-
-  const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(names.includes('resetToMain'), 'gate let it through to the real git-branch-diff flow');
+  assert.ok(!names.includes('commit'), 'nothing to commit');
 });
 
 test('a fetchMain failure surfaces as a failure with no branch created', () => {

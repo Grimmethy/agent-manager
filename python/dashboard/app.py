@@ -1477,38 +1477,22 @@ def api_task_archive(state, task_id):
 
 @app.route("/api/task/awaiting-confirm/<task_id>/confirm", methods=["POST"])
 def api_task_confirm_delete(task_id):
-    """The other half of the awaiting-confirm gate (src/apply-task.js): a human explicitly
-    confirming a held task, moving it from queue/awaiting-confirm/ back into
-    queue/approved/ so the next apply-task.sh pass re-runs it for real. Two DIFFERENT
-    gates route here and are both satisfied by one click -- stamping a field the held
-    task doesn't need is harmless, so one endpoint covers both rather than needing the
-    dashboard to know which gate held a given task:
-      - deleteConfirmedAt: a delete-containing Group B batch (original gate).
-      - adhocApplyConfirmedAt: an adhoc task with a real, agentic-drafted code diff ready
-        to land (Brain Dump #67, 2026-08-17) -- the "require a human Apply click" gate
-        the agentic implement path needs precisely because it's real Bash/Edit/Write
-        access, not the earlier blind JSON-diff guesser.
-      - researchApplyConfirmedAt: a research task with a real, agentic web-research
-        write-up ready to file into SecondBrain (Brain Dump #1 follow-up, 2026-08-17) --
-        same reasoning as adhocApplyConfirmedAt, arguably higher-stakes since it's
-        AI-sourced content that can be confidently wrong entering a permanent personal
-        knowledge base, not a discardable git branch.
-      - pipelineSelfFixConfirmedAt: pipeline_self_audit proposed a real diff to this
-        pipeline's OWN code (2026-08-20, moved off requiring a Claude subscription onto
-        the local reasoning model + harness grounding, same as arch_import) -- a self-
-        modifying-behavior change discovered and drafted with no human in the loop until
-        this exact click, so it gets the same explicit confirmation every other real,
-        directly-landing diff in this file already requires.
-      - productSpecConfirmedAt: product_spec proposed a real change to the target
-        project's product spec doc (2026-08-20) -- every later feature task for that
-        project gets grounded against whatever lands here, so this gets the same
-        explicit confirmation as the others even though the artifact is a document,
-        not code.
-    apply-task.js's own gates check each field's PRESENCE (not its value) to let a task
-    through without holding it again, the same 'ran once, don't re-trigger' idea as
-    promotedAt/lastReviewedAt elsewhere in this codebase. Denying instead of confirming
-    is just the existing generic archive action above (state='awaiting-confirm') -- no
-    separate deny endpoint needed."""
+    """Confirms a delete-containing Group B batch (src/apply-task.js's remaining
+    awaiting-confirm gate), moving it from queue/awaiting-confirm/ back into
+    queue/approved/ so the next apply-task.sh pass re-runs it for real. Denying instead
+    of confirming is just the existing generic archive action above (state='awaiting-
+    confirm') -- no separate deny endpoint needed.
+
+    REMOVED 2026-08-22 (Grimmethy: "I'd like to skip the confirm step. We already have a
+    manual step for merge to main. This extra step is unnecessary friction."): this
+    endpoint used to also stamp adhocApplyConfirmedAt/researchApplyConfirmedAt/
+    pipelineSelfFixConfirmedAt/productSpecConfirmedAt, the confirm gates for adhoc/
+    research_task/pipeline_self_audit/product_spec real-diff tasks -- apply-task.js no
+    longer holds any of those, so none of them should reach queue/awaiting-confirm/ in
+    the first place going forward. Left this endpoint's own behavior otherwise unchanged
+    (still moves whatever's actually sitting in awaiting-confirm/ back to approved/) so
+    it stays correct for the delete-mode gate, and harmless for any already-queued task
+    that still happens to carry one of the old fields."""
     qdir = queue_dir()
     if not qdir:
         abort(404)
@@ -1519,10 +1503,6 @@ def api_task_confirm_delete(task_id):
 
     now_iso = datetime.now(timezone.utc).isoformat()
     data["deleteConfirmedAt"] = now_iso
-    data["adhocApplyConfirmedAt"] = now_iso
-    data["researchApplyConfirmedAt"] = now_iso
-    data["pipelineSelfFixConfirmedAt"] = now_iso
-    data["productSpecConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)
