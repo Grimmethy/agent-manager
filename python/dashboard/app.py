@@ -3810,7 +3810,7 @@ TASK_SOURCE_CATALOG = [
     "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
     "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
     "performance_review",
-    "deep_dive", "project_search", "unused_export", "pipeline_self_audit", "observability_fix", "performance_fix",
+    "deep_dive", "project_search", "unused_export", "pipeline_self_audit", "staleness_audit", "observability_fix", "performance_fix",
 ]
 
 # Exempt from any allowlist restriction regardless of stored state -- task-sources.js's
@@ -3845,6 +3845,7 @@ TASK_SOURCE_DEFAULT_PRIORITIES = {
     "arch_discovery": 80, "observability_review": 80,
     "performance_review": 80,
     "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,
+    "staleness_audit": 91,
 }
 
 
@@ -3928,6 +3929,7 @@ _SOURCE_TO_DOMAIN_KEY = {
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
     "path_prefetch_resolve": "path_prefetch_resolve", "pipeline_self_audit": "adhoc",
+    "staleness_audit": "default",
 }
 
 _DOMAIN_DEFAULTS_TO_ENSURE = {

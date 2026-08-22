@@ -713,6 +713,68 @@ function pipelineSelfAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// staleness_audit (2026-08-22, Grimmethy: "Build it now" -- see staleness-audit.js's own
+// header for the full spec): same two-call harness-grounded shape as pipeline_self_audit
+// immediately above (plan proposes search terms, the harness greps agent-manager's own
+// repo, implement gets real results) -- but the goal here is different: pipeline_self_audit
+// writes a real diff to FIX a systemic bug; this writes an ADVISORY REPORT recommending
+// whether a specific stale/likely-fabricated blocked task is still worth pursuing. No
+// groupBJsonInstructions -- there is no diff to produce, and apply-task.js's own
+// applyVerdictOnly (same as unused_export/observability_review) is what actually "applies"
+// this: it never writes anything, just records the verdict text and marks the task done.
+function stalenessAuditPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    `A deterministic scan flagged an OLDER blocked/needs-clarification task (${ctx.originalTaskId}) as possibly stale -- either it has sat untouched for a long time, or it was rejected repeatedly for fabricating claims. See the evidence below.`,
+    '',
+    `Flagged because: ${(ctx.reasons || []).join(', ')}`,
+    '',
+    ctx.evidenceText,
+    '',
+    'Propose 1 to 3 SHORT search terms (function/file/config names, or a few-word phrase) likely to confirm whether the CONCERN described above still holds against the CURRENT state of this repo -- e.g. does the file/function it worried about still look the way it described, or has other work since changed that.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function stalenessAuditImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this repo)';
+  const filesText = files.length > 0
+    ? formatFileContents(files)
+    : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms to check whether an old blocked task\'s concern still holds:',
+    '',
+    planText,
+    '',
+    `ORIGINAL FLAGGED TASK (${ctx.originalTaskId}), flagged because: ${(ctx.reasons || []).join(', ')}`,
+    '',
+    ctx.evidenceText,
+    '',
+    'The harness ran those searches against THIS repo\'s CURRENT real content. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'Write a short advisory report (a few sentences, not a diff) covering exactly these three things, grounded ONLY in the real evidence above -- never a guessed or invented file/line/claim:',
+    '1. Does the original concern still hold against current repo state, or has it already been resolved by other work?',
+    '2. If the original task was flagged for repeated fabrication, does the evidence above suggest its claims were genuinely ungrounded, or does it hold up after all?',
+    '3. An explicit RECOMMENDATION: either "archive" (the concern is resolved or was never grounded) or "worth a fresh investigation" (the concern still looks real and unaddressed) -- with one sentence of reasoning.',
+    '',
+    'This is advisory only -- a human decides and acts, using the existing archive button on the Blocked/Needs-Clarification tabs. Write this as "here is what I found, you decide," never as an instruction that something should definitely be archived. If the searches found nothing useful either way, say so plainly rather than guessing.',
+  ].join('\n');
+}
+
 // product_spec (2026-08-20, see task-sources.js's nextProductSpecTask header for the full
 // motivation): no harness search, unlike pipeline_self_audit/arch_import right above --
 // the request text and the current spec doc ARE the grounding, both handed over directly.
@@ -1019,6 +1081,7 @@ updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, b
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
+updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositionPlanPrompt, buildImplementPrompt: backlogDecompositionImplementPrompt });
 // backlog_fulfillment reuses arch_review's own prompt builders verbatim -- turning one

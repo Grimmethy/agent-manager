@@ -1726,6 +1726,67 @@ test('markPipelineSelfAuditReported writes coverage only when explicitly called,
   assert.equal(next, null);
 });
 
+// staleness_audit (2026-08-22, see staleness-audit.js's own header): per-task counterpart
+// to pipeline_self_audit right above -- same coverage-timing discipline (a pure read,
+// coverage written only by markStalenessAuditReported() after writeTask() persists it).
+function writeStaleBlockedTask(dir, id, extra = {}) {
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, `${id}.json`), JSON.stringify({
+    id,
+    title: `stale task ${id}`,
+    source: 'manual',
+    history: [{ stage: 'blocked', at: '2020-01-01T00:00:00.000Z' }], // far enough in the past to always be stale
+    ...extra,
+  }));
+}
+
+test('nextStalenessAuditTask no longer writes coverage as a side effect -- calling it twice with nothing marking coverage returns the SAME original task both times', () => {
+  const dir = makeBlockedFixtureRepo();
+  writeStaleBlockedTask(dir, 'stale-target-1');
+
+  const { nextStalenessAuditTask } = freshTaskSources(dir);
+  const first = nextStalenessAuditTask();
+  assert.ok(first);
+  assert.equal(first.source, 'staleness_audit');
+  assert.equal(fs.existsSync(path.join(dir, 'staleness-audit-coverage.json')), false);
+
+  const second = nextStalenessAuditTask();
+  assert.ok(second);
+  assert.equal(second.promptContext.originalTaskId, first.promptContext.originalTaskId);
+});
+
+test('markStalenessAuditReported writes coverage keyed by the ORIGINAL task id, so it is not proposed again within the cooldown window', () => {
+  const dir = makeBlockedFixtureRepo();
+  writeStaleBlockedTask(dir, 'stale-target-2');
+
+  const { nextStalenessAuditTask, markStalenessAuditReported } = freshTaskSources(dir);
+  const task = nextStalenessAuditTask();
+  assert.ok(task);
+
+  markStalenessAuditReported(task);
+  const coveragePath = path.join(dir, 'staleness-audit-coverage.json');
+  assert.ok(fs.existsSync(coveragePath));
+  const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  assert.equal(coverage['stale-target-2'].taskId, task.id);
+
+  assert.equal(nextStalenessAuditTask(), null);
+});
+
+test('nextStalenessAuditTask returns null when nothing in queue/blocked or queue/needs-clarification is actually stale', () => {
+  const dir = makeBlockedFixtureRepo();
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, 'fresh.json'), JSON.stringify({
+    id: 'fresh',
+    source: 'manual',
+    history: [{ stage: 'blocked', at: new Date().toISOString() }],
+  }));
+
+  const { nextStalenessAuditTask } = freshTaskSources(dir);
+  assert.equal(nextStalenessAuditTask(), null);
+});
+
 // backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
 // header): turns a confirmed product spec into an ordered backlog. Idempotency is via a
 // spec-content hash baked into the task id (not a separate coverage file), checked

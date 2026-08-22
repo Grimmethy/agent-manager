@@ -136,6 +136,14 @@ function getConfig() {
   // new audit task every tick once it's been reported once.
   const selfAuditCoveragePath = process.env.AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH
     || path.join(pipelineDir, 'self-audit-coverage.json');
+  // staleness_audit (2026-08-22, see staleness-audit.js's own header) -- tracks which
+  // individual blocked/needs-clarification task IDs have already had a staleness-audit
+  // task filed for them, keyed by task id (not a failure signature like selfAuditCoveragePath
+  // above, since staleness is a per-task property). Unlike self-audit's own coverage, a
+  // covered entry is re-eligible after a cooldown (see staleness-audit.js's cooldownMs())
+  // rather than suppressed forever.
+  const stalenessAuditCoveragePath = process.env.AGENT_MANAGER_STALENESS_AUDIT_COVERAGE_PATH
+    || path.join(pipelineDir, 'staleness-audit-coverage.json');
   // product_spec (Grimmethy, 2026-08-20: "it should build its own plugins... is agent-
   // manager ready to start automatically building a CRM plugin?") -- the living spec doc a
   // greenfield target project's feature work is grounded against, same "one doc, versioned
@@ -225,6 +233,7 @@ function getConfig() {
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
     observabilityFixCandidatesPath, performanceFixCandidatesPath,
     selfAuditCoveragePath,
+    stalenessAuditCoveragePath,
     performanceCoveragePath,
     productSpecPath,
     backlogCandidatesPath,
