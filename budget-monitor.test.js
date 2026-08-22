@@ -150,6 +150,25 @@ function writeTranscript(dir, lines) {
   fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 }
 
+test('parseResetTime handles the bare-hour form ("resets 6pm"), not just "resets 6:10pm"', () => {
+  // Confirmed live 2026-08-22: Claude's own rate-limit message doesn't always include
+  // minutes ("You've hit your session limit · resets 6pm (America/Denver)") -- the
+  // original regex required ":(\d{2})" and returned null on this real message, leaving
+  // isBudgetHealthy() stuck unparsed (never self-clears by time alone) well past the
+  // actual reset.
+  const hitAt = Date.parse('2026-08-22T20:24:03.112Z');
+  const resetsAt = parseResetTime("You've hit your session limit · resets 6pm (America/Denver)", hitAt);
+  assert.ok(resetsAt, 'bare-hour form must parse, not return null');
+  assert.equal(resetsAt.toISOString(), '2026-08-23T00:00:00.000Z'); // 6pm MDT (UTC-6) = 00:00 UTC next day
+});
+
+test('parseResetTime still handles the "H:MMam/pm" form (no regression from the bare-hour fix)', () => {
+  const hitAt = Date.parse('2026-08-22T05:00:00.000Z');
+  const resetsAt = parseResetTime("You've hit your session limit · resets 6:10am (America/Denver)", hitAt);
+  assert.ok(resetsAt);
+  assert.equal(resetsAt.toISOString(), '2026-08-22T12:10:00.000Z'); // 6:10am MDT (UTC-6) = 12:10 UTC
+});
+
 test('isBudgetHealthy: sinceLastLimit excludes usage from BEFORE the last reset, unlike a trailing-5h lookback would', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-monitor-test-'));
   try {
