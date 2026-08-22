@@ -372,3 +372,16 @@ The log line carries the raw `rule`, `file`, and `line` fields so an operator ca
 
 Benefits:
 Every suppressed finding becomes auditable: the operator can search logs for a specific `taskId` or `rule` to confirm whether a skip was expected, and can inspect the raw fields to detect slugification collisions. The `task_source.duplicate_skip` metric enables alerting when the skip rate spikes (indicating a systemic slugification bug or a misconfigured dedup key) rather than silently losing findings in production triage.
+
+### AC-26 · Silent catch in brain-dump task-shaping drops entries with no diagnostic
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+The catch block at line 1271 in the brain-dump sort function swallows every exception from the try block (lines 1255–1270) that builds a task descriptor from a chosen entry. When `chosen` is null, `chosen.rawText` is undefined, or `slice` throws on a non-string, the function returns null with no console.warn, no logger call, no counter increment, and no rethrow. In a batch of N brain-dump entries, a single malformed record vanishes silently; the caller interprets null as "no task" and moves on. There is no log line, stack trace, or metric recording which entry failed or why, making the failure undiagnosable in production without adding temporary instrumentation.
+
+Solution:
+Replace the bare `catch (err) { return null; }` at line 1271 with a two-line body that emits a diagnostic before returning. Use `console.warn('[brain-dump-sort] skipped entry (id=' + (chosen && chosen.id != null ? chosen.id : 'unknown') + '): ' + err.message);` followed by `return null;`. If the project already imports a structured logger (e.g. `pino`, `winston`), substitute `logger.warn({ entryId: chosen?.id, err })` for the console.warn call. No other lines in the function change; the happy path and return shape are untouched.
+
+Benefits:
+Any malformed or partially-written brain-dump entry now produces a single line on stderr (or in the log pipeline) identifying the entry id and the exception message at the moment of failure. Operators can grep for `[brain-dump-sort]` to find dropped entries without adding temporary console.log calls. The fix is two lines, introduces no new dependency, changes no return value, and has zero effect on the success path.
