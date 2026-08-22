@@ -107,6 +107,21 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'checkoutMain', 'deleteBranch']);
 });
 
+// Regression, 2026-08-22: an empty implementResponse (several Group B sources are
+// explicitly told to output this when there's nothing to change -- see
+// review-task.js's EMPTY_APPROVAL_SOURCES, which already approves this exact shape at
+// review time) used to reach applyGroupB's JSON.parse unconditionally and throw "Invalid
+// JSON in Group B implementResponse: Unexpected end of JSON input", landing the task in
+// blocked/ instead of a clean skip -- found as a real 6-task cluster in queue/blocked/.
+test('an empty implementResponse (an approved no-changes-needed outcome) skips cleanly instead of throwing a JSON parse error', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ source: 'arch_review', implementResponse: '' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.match(result.doneMarker, /no code change needed/);
+});
+
 // --- arch_discovery/arch_import/observability_review/performance_review: direct-to-main
 // path (no throwaway branch) --------------------------------------------------------
 // Confirmed live 2026-08-16: the old branch-per-task flow left ~301 of ~311 real applied
