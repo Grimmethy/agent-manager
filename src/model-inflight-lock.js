@@ -49,7 +49,8 @@ function acquire(instancesDir, model, instanceId) {
     const lockPath = path.join(dir, `${Date.now()}-${crypto.randomUUID()}.json`);
     fs.writeFileSync(lockPath, JSON.stringify({ model, instanceId: instanceId || null, pid: process.pid, startedAt: new Date().toISOString() }));
     return lockPath;
-  } catch {
+  } catch (err) {
+    console.warn('[inflight-lock] acquire failed', { model, instanceId, code: err.code, message: err.message });
     return null;
   }
 }
