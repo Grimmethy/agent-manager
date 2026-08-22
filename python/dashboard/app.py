@@ -1750,10 +1750,20 @@ def api_adhoc_tasks():
     (queue-adhoc-task.js's own id convention, also used by the Brain Dump tab's
     'Process Now' button injection) -- domain alone isn't reliable since a caller can
     omit --domain (queue-adhoc-task.js then falls back to the first key in
-    task-domains.json, not necessarily 'adhoc')."""
+    task-domains.json, not necessarily 'adhoc').
+
+    done/ is SKIPPED by default (?includeDone=1 opts in) -- confirmed live 2026-08-22
+    this endpoint was timing out (reported "timed out after 8s" from the dashboard
+    itself) once queue/done/ grew to ~3900 files: reading+parsing every one of them on
+    every single poll of this tab, on Flask's single-threaded dev server, starved
+    concurrent requests (nav badge polling, other tabs, the phone app) regardless of
+    how fast any one request actually was in isolation. done/ tasks aren't what this
+    view exists to track anyway -- the whole point is active (in-progress) and stuck
+    (blocked) work, both already excluded from that giant folder."""
     qdir = queue_dir()
     if not qdir:
         return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
 
     def is_adhoc(data, task_id):
         return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
@@ -1792,6 +1802,8 @@ def api_adhoc_tasks():
             })
 
     for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
         state_dir = qdir / state
         if not state_dir.is_dir():
             continue
@@ -4115,4 +4127,13 @@ if __name__ == "__main__":
     # Pipeline state (_pipeline_running() etc.) is read fresh from instances/*.json on
     # every call, never held in Python memory across requests, so a reloader-triggered
     # restart can't lose track of anything.
-    app.run(host=host, port=port, debug=False, use_reloader=True)
+    # threaded=True (2026-08-22): Flask's dev server is single-request-at-a-time by
+    # default, which meant the continuous 5s nav-badge poll (plus any other open tab, or
+    # a second client like the phone app) could starve a slower request behind it purely
+    # by arrival order -- confirmed live as the direct cause of "/api/adhoc-tasks -> timed
+    # out after 8s" (a real request that took ~1s in isolation) once queue/done/ grew
+    # large enough to make ANY request briefly slower. Every route here already reads
+    # state fresh from disk on each call (see the comment just above -- no shared
+    # in-memory state to race on), so allowing overlapping requests is safe, not just a
+    # speed hack.
+    app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True)
