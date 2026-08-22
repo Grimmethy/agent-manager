@@ -376,10 +376,9 @@ const TAB_COUNT_SEVERITY_THRESHOLDS = {
   // specifically, not just an ambiguous path match, so it deserves the same "don't
   // silently sit forever" urgency as blocked, any count at all.
   'awaiting-confirm': { bad: 1 },
-  // Same reasoning as 'awaiting-confirm' above -- this badge is specifically the count
-  // of adhoc tasks sitting in awaiting-confirm (see api_summary()'s counts['adhoc']),
-  // not every adhoc task in flight, so any count here means a human needs to act now.
-  adhoc: { bad: 1 },
+  // 'adhoc' isn't in this table -- it renders two separate numbers (in-progress/
+  // blocked) with their own fixed colors instead of a single severity-driven count, see
+  // renderTabButton()'s own special-case for that tab.
   // Orange, same reasoning as 'needs-clarification': a pushed-but-unmerged branch isn't
   // broken, it's already-reviewed work just sitting invisible until someone merges it --
   // exactly the "sandbox" gap this tab exists to surface (2026-08-18).
@@ -399,6 +398,27 @@ function renderTabButton(tab, indent) {
   btn.className = tab.key === activeTab ? 'active' : '';
   if (tab.description) btn.title = tab.description;
   if (indent) btn.style.paddingLeft = '36px';
+  if (tab.key === 'adhoc') {
+    // Two numbers, not one folded-together count (Grimmethy, 2026-08-22: "It's just as
+    // important to know how many in process there are so that we know how much work
+    // the system already has to work on") -- grey for in-progress (backlog size, not a
+    // problem), red for blocked (needs a human decision, same urgency 'blocked'/
+    // 'awaiting-confirm' already get elsewhere in this nav).
+    const inProgress = counts.adhocInProgress ?? 0;
+    const blocked = counts.adhocBlocked ?? 0;
+    btn.innerHTML = `<span>${tab.label}</span><span class="count">`
+      + `<span style="color:var(--muted)">${inProgress}</span>`
+      + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
+      + `</span>`;
+    btn.onclick = () => {
+      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
+      if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
+      activeTab = tab.key;
+      renderNav();
+      renderMain();
+    };
+    return btn;
+  }
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';

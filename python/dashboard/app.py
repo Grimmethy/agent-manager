@@ -1841,21 +1841,40 @@ def api_summary():
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
-    # Adhoc Tasks nav badge: specifically the awaiting-confirm count, not every adhoc
-    # task in flight -- that's the one state meaning "a human needs to act on this now",
-    # same reasoning as the elevated severity the 'blocked' tab's count already gets.
-    # Cheap by construction: only scans awaiting-confirm/, not the full cross-state
-    # traversal /api/adhoc-tasks does for its actual listing.
-    awaiting_confirm_dir = qdir / "awaiting-confirm"
-    if awaiting_confirm_dir.is_dir():
-        adhoc_awaiting = 0
-        for f in awaiting_confirm_dir.glob("*.json"):
+    # Adhoc Tasks nav badge: two separate counts, not one folded-together number
+    # (Grimmethy, 2026-08-22: "It's just as important to know how many in process there
+    # are so that we know how much work the system already has to work on" -- the badge
+    # used to be JUST the awaiting-confirm count, which read as a flat "0" any time
+    # nothing needed a confirm click even while real work was actively blocked or
+    # in flight, exactly the "inaccurately showing 0" complaint this replaces).
+    # adhocBlocked: blocked + needs-clarification + awaiting-confirm -- every state that
+    # means a human's attention is the thing standing between this task and progress,
+    # same states api_task_archive() already treats as one bucket for that reason.
+    # adhocInProgress: everything else still moving on its own (queue/adhoc/ itself,
+    # unclaimed; pending; drafting; review; approved) -- not a problem, just backlog size.
+    def is_adhoc_record(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    def count_adhoc_in(dir_path):
+        if not dir_path.is_dir():
+            return 0
+        n = 0
+        for f in dir_path.glob("*.json"):
             data = read_json_safe(f)
-            if data and (data.get("domain") == "adhoc" or data.get("id", f.stem).startswith("adhoc-")):
-                adhoc_awaiting += 1
-        counts["adhoc"] = adhoc_awaiting
-    else:
-        counts["adhoc"] = 0
+            if data and is_adhoc_record(data, data.get("id", f.stem)):
+                n += 1
+        return n
+
+    adhoc_blocked = sum(count_adhoc_in(qdir / s) for s in ("blocked", "needs-clarification", "awaiting-confirm"))
+    adhoc_in_progress = sum(count_adhoc_in(qdir / s) for s in ("pending", "review", "approved")) \
+        + count_adhoc_in(qdir / "adhoc")
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc_record(data, data.get("id", f.stem)):
+                adhoc_in_progress += 1
+    counts["adhocBlocked"] = adhoc_blocked
+    counts["adhocInProgress"] = adhoc_in_progress
     return jsonify(counts)
 
 
