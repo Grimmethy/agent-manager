@@ -385,3 +385,25 @@ Replace the bare `catch (err) { return null; }` at line 1271 with a two-line bod
 
 Benefits:
 Any malformed or partially-written brain-dump entry now produces a single line on stderr (or in the log pipeline) identifying the entry id and the exception message at the moment of failure. Operators can grep for `[brain-dump-sort]` to find dropped entries without adding temporary console.log calls. The fix is two lines, introduces no new dependency, changes no return value, and has zero effect on the success path.
+
+### AC-27 · Narrow silent catch on optional adhoc directory listing
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+Line 156 uses a bare `catch { }` (or `catch (e) { }`) around `fs.readdirSync(path.join(root, 'queue', 'adhoc'))`. While the ENOENT case is expected (the directory is created lazily on first manual submission), the catch as written also silently absorbs `EACCES`, `EPERM`, `EMFILE`, and any future runtime error, leaving no log line, no counter, and no rethrow. An operator who later hits a permissions regression on that path sees zero adhoc tasks in the tier count with no diagnostic signal anywhere in the process.
+
+Solution:
+Replace the bare catch with a code-guarded handler that rethrows anything other than ENOENT and leaves a one-line comment explaining the expected case. Concretely, change the block at line 156 from `catch { /* … */ }` (or `catch (e) {}`) to:
+
+```js
+} catch (err) {
+  if (err.code !== 'ENOENT') throw err;
+  // queue/adhoc/ is created on first submission; absence is a valid empty state
+}
+```
+
+No new dependency, no logger import, no structural change — just the `err.code` guard and the explanatory comment.
+
+Benefits:
+Genuine filesystem faults (permission loss, fd exhaustion, a race where the path is replaced by a file) now propagate to the caller's existing error handling instead of being silently converted to "zero adhoc tasks." The ENOENT path remains a clean no-op with a human-readable rationale, so future readers of the file understand the intent without guessing. The tier-count aggregate stays correct in the expected case while gaining a hard failure signal in every unexpected case.
