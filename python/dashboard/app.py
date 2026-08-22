@@ -560,6 +560,42 @@ def queue_dir() -> Path | None:
     return (d / "queue") if d else None
 
 
+def alerts_path() -> Path | None:
+    """Alert feed for the companion app's background poller. Explicit override first;
+    otherwise the national backfill loop's conventional location relative to the pipeline
+    dir (<pipeline>/../../national-coverage/alerts.json — see NATIONAL-BACKFILL-LOOP.md
+    in the TaxHarvest repo). None when neither exists: /api/alerts then returns an empty
+    feed rather than 404, so the app's poller needs no per-server capability check."""
+    override = os.environ.get("AGENT_MANAGER_ALERTS_PATH") or read_env_file(ENV_FILE_PATH).get(
+        "AGENT_MANAGER_ALERTS_PATH"
+    )
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    if not d:
+        return None
+    candidate = d.parent.parent / "national-coverage" / "alerts.json"
+    return candidate if candidate.exists() else None
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    """Read-only (never token-gated, like every read here): the alert feed the companion
+    app polls to raise phone notifications. Shape: {"generatedAt": iso|None, "alerts":
+    [{id, at, level, title, body}]} — ids are stable, so the app dedupes on id."""
+    p = alerts_path()
+    if not p or not p.exists():
+        return jsonify({"generatedAt": None, "alerts": []})
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return jsonify({"generatedAt": None, "alerts": []})
+    return jsonify({
+        "generatedAt": data.get("generatedAt"),
+        "alerts": data.get("alerts") or [],
+    })
+
+
 def instances_dir() -> Path | None:
     d = get_pipeline_dir()
     return (d / "instances") if d else None
