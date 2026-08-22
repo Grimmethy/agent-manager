@@ -283,3 +283,16 @@ Add a single `console.warn` inside the existing `catch (err)` body: `console.war
 
 Benefits:
 An operator can `grep 'grounding-source retrieval failed'` in structured logs to detect the silent-degradation path immediately. The empty-catch scanner heuristic is satisfied, removing a recurring false-alarm class for this file. A future reader sees the warn-log and understands the catch is intentional best-effort, not an oversight, without needing a separate comment.
+
+### AC-21 · Silent skip of unreadable report dirs leaves zero diagnostic signal
+Strength: Strong
+Files: src/system-report.js
+
+Problem:
+The directory-scan loop wraps each `fs.readdir` (or equivalent) in `try { … } catch { continue; }`. When every directory in the caller-supplied list is unreadable—wrong base path, permission regression, missing container mount—the loop exits with an empty array and no side-effect of any kind: no `console.warn`, no `state: "skipped"` annotation on the entry, no error counter, no rethrow. The caller receives `[]`, which is byte-for-byte identical to the "no reports exist" response, so the failure is indistinguishable from a legitimate empty result and produces a blank report with zero diagnostic signal.
+
+Solution:
+Replace the bare `catch { continue; }` with a collection pattern: declare `const skipped = []` before the loop, and in the catch block push `{ dir, reason: err.code ?? err.message }` into `skipped` before `continue`. After the loop, attach the array to the report object (e.g. `report.skipped = skipped`) or return `{ names, skipped }` so the caller can surface it in a UI, log aggregator, or health-check endpoint. No stdout writes, no new dependency.
+
+Benefits:
+A blank report now carries a `skipped` array that names each unreadable directory and the OS-level reason (`EACCES`, `ENOENT`, `ENOTDIR`, etc.), turning a "why is the report empty?" debugging session into a one-field inspection. Downstream consumers (dashboards, alerting, log shippers) can count or threshold on `skipped.length` without parsing stdout, and the fix is a single-scope change that cannot alter the happy-path output shape for callers that ignore the new field.
