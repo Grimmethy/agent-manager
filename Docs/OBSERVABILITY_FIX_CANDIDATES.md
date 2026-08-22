@@ -270,3 +270,16 @@ Insert a single `console.debug` line as the first statement inside the existing 
 
 Benefits:
 Once fixed, any operator or agent diagnosing a run where the search step returned nothing can enable debug logging and immediately see the concrete failure reason (timeout, 401, 500, JSON parse error) instead of staring at a silent empty result. The one-line addition changes no runtime behaviour, adds no new dependency, and satisfies the scanner's "no log/rethrow/metric" condition by providing the minimal observable trace the finding requires.
+
+### AC-20 · Silent catch on grounding-source retrieval
+Strength: Strong
+Files: src/review-task.js
+
+Problem:
+The `catch` block surrounding the grounding-source retrieval (the `try` that populates `let groundingText = ''`) is completely empty — no `console.warn`, no `debug` log, no metric emission, no explanatory comment. If `get-grounding-source.js` is deleted, a transitive dependency breaks, or `os.tmpdir()` becomes unwritable, every review task silently degrades to zero grounding context with no operator-visible signal. The failure is invisible until a human notices output-quality drift.
+
+Solution:
+Add a single `console.warn` inside the existing `catch (err)` body: `console.warn('[review-task] grounding-source retrieval failed for task ' + task.id + ': ' + err.message);`. Do not rethrow — the `groundingText = ''` fallback is the correct best-effort behavior and must remain. No other changes to the surrounding logic.
+
+Benefits:
+An operator can `grep 'grounding-source retrieval failed'` in structured logs to detect the silent-degradation path immediately. The empty-catch scanner heuristic is satisfied, removing a recurring false-alarm class for this file. A future reader sees the warn-log and understands the catch is intentional best-effort, not an oversight, without needing a separate comment.
