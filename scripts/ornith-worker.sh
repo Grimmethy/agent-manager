@@ -88,7 +88,7 @@ refresh_active_model
 # restart racing queue-watchdog's automatic one produces, confirmed live this session (an
 # EPIPE crash auto-restarted worker-1 while a second worker-1 was also started manually,
 # both racing to claim from the same drafting/worker-1/ folder).
-check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-30}" || exit 1
+check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Graceful stop: bash defers a trapped signal until the current foreground command
 # (e.g. the node ornith-draft.js call below) returns control to the shell, so this exits
@@ -112,33 +112,30 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # way a brand-new claim does, not a second, drifted copy of this logic.
 process_drafting_file() {
   local wpath="$1"
-  local name task_id draft_result draft_succeeded draft_blocked draft_will_touch_local_gpu
+  local name task_id draft_result draft_succeeded draft_blocked draft_label
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
 
-  # Which backend this call will ACTUALLY hit. NOT just labelFor()/reasoningTierFor() --
-  # confirmed live 2026-08-22 that labelFor() alone is WRONG for this: dashboard-settings.json
-  # can carry a workerModelOverrides entry (e.g. "worker-reasoning": "ollama:...") that makes
-  # AGENT_MANAGER_FORCE_PROVIDER=ornith true for the whole lane, so labelFor() reports
-  # "ornith" -- but ornith-draft.js's OWN dispatch (resolveSourceName(task)==='adhoc', or
-  # task.domain==='research') sends adhoc-shaped and research tasks through a REAL agentic
-  # Claude Code CLI call UNCONDITIONALLY, ignoring that override entirely (see
-  # adhoc-agentic-draft.js/research-agentic-draft.js -- neither goes through providerFor()
-  # at all). Checking labelFor() alone made this lock-skip a no-op for exactly the adhoc
-  # lane it was meant to fix: it kept locking real Claude calls it mistakenly thought were
-  # local. draft_will_touch_local_gpu replicates ornith-draft.js's actual dispatch order
-  # (adhoc/research bypass checked FIRST, tier-based labelFor() as the fallback for
-  # everything else) so this can never disagree with what really happens.
-  draft_will_touch_local_gpu="$(node -e '
-    try {
-      require(process.argv[1]);
-      const { resolveSourceName } = require(process.argv[2]);
-      const { labelFor } = require(process.argv[3]);
-      const t = JSON.parse(require("fs").readFileSync(process.argv[4], "utf8"));
-      const alwaysClaude = resolveSourceName(t) === "adhoc" || t.domain === "research";
-      console.log(alwaysClaude || labelFor(t).startsWith("claude:") ? "false" : "true");
-    } catch (e) { console.log("true"); }
-  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
+  # Which backend this call will touch. labelFor() ALONE -- confirmed live 2026-08-22 this
+  # has to stay labelFor()-only, NOT also checking resolveSourceName()==='adhoc'/domain
+  # 'research' the way an earlier version of this fix briefly did: ornith-draft.js's
+  # draftTask() runs its PLAN pass via providerFor(task).call for EVERY task including
+  # adhoc/research ones (see draftTask()'s `resolvedOrnithCall = ornithCall ||
+  # providerFor(task).call`, BEFORE it ever reaches the adhoc/research dispatch branch) --
+  # only the IMPLEMENT half of an adhoc/research task unconditionally bypasses providerFor()
+  # for a real Claude call. Treating the whole call as lock-free because the drafting
+  # dispatch bypasses the local model live-fire caused real, observed Ollama contention
+  # ("Ollama request timed out after ~130s" errors across multiple lanes, all racing the
+  # local GPU with no lock protecting the plan pass anymore) as soon as a dashboard
+  # workerModelOverrides entry forced this lane onto local Ollama (AGENT_MANAGER_FORCE_PROVIDER
+  # respected by providerFor(), which labelFor() reads). labelFor() alone correctly reflects
+  # what the PLAN pass -- the part that actually needs this lock -- will do, with or without
+  # that override: no override -> adhoc's registered high tier resolves to Claude normally
+  # (lock correctly skipped); override active -> plan pass genuinely hits local Ornith
+  # (lock correctly held, same as before this whole fix, until a real plan/implement lock
+  # split exists -- queued separately, this bash-level check can't safely do better than
+  # "protect the plan pass" without one).
+  draft_label="$(node -e 'try{require(process.argv[1]);const {labelFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync(process.argv[3],"utf8"));console.log(labelFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
 
   # "queued" until the single-flight lock is actually held, then "working" -- 2026-08-19,
   # Grimmethy: "add the distinct queued status. The current is too unclear" (a claimed
@@ -157,12 +154,12 @@ process_drafting_file() {
   # losing priority" -- see review-runner.sh's matching fix for the review-stage half of
   # this same bug.
   write_heartbeat_file "$INSTANCE_ID" "queued" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
-  if [[ "$draft_will_touch_local_gpu" != "false" ]]; then
+  if [[ "$draft_label" != claude:* ]]; then
     acquire_single_flight_lock
   fi
   write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/ornith-draft.js" "$wpath" 2>>"$LOG_FILE")"
-  if [[ "$draft_will_touch_local_gpu" != "false" ]]; then
+  if [[ "$draft_label" != claude:* ]]; then
     release_single_flight_lock
   fi
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"

@@ -18,7 +18,7 @@ readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:Inst
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 # Applies to the watchdog's OWN identity here -- distinct from (and unrelated to) the
 # dead-PROCESS restart logic this same daemon runs later in its loop for the OTHER daemons.
-check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-60}" || exit 1
+check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Graceful stop: same reasoning as the other daemons' traps -- deferred until the current
 # foreground tick (dead-process check / reject-retry check / stale scan) returns, so this

@@ -10,7 +10,7 @@ export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                 
 
 # Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
-check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-30}" || exit 1
+check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Graceful stop: same reasoning as ornith-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
