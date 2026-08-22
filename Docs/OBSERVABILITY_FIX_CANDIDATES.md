@@ -309,3 +309,21 @@ Add a single `console.warn` (or `log.debug` if the project uses a structured log
 
 Benefits:
 The all-files-fail scenario becomes diagnosable at the console/log level without altering control flow. An operator can immediately distinguish a permissions or path error from a genuinely empty directory. The single-line addition keeps the best-effort enumeration contract intact while closing the silent-failure observability gap.
+
+### AC-23 · Silent catch in unused-export-scan hides scan failure from CI
+Strength: Strong
+Files: src/unused-export-scan.js
+
+Problem:
+The `catch` block in the unused-export scan function swallows every error (syntax error in a target file, permission denied, circular-import crash in the AST walker) and returns `[]` with no diagnostic output. The return type stays `string[]` so no caller breaks, but the failure is indistinguishable from a legitimate "zero unused exports" result. In a CI gate this means a broken import or unreadable file produces a green build with no signal that the scan never actually ran.
+
+Solution:
+Two edits inside the existing catch block:
+
+1. Change the optional catch binding `catch {` to `catch (err) {` so the thrown value is available.
+2. Before the `return []`, write a single diagnostic line to `process.stderr`: `` `[unused-export-scan] scan failed: ${err?.message ?? err}\n` ``.
+
+Do not rethrow (callers expect an array), do not change the return shape, do not add a dependency on a logger. One stderr line is sufficient for a dev-tool utility and is visible in any CI log without altering the public API contract.
+
+Benefits:
+A real scan failure becomes visible in CI logs and local terminal output, eliminating the silent false-clean where broken code passes because the scanner never completed. The return type and caller expectations are unchanged, so no downstream type errors or semantic shifts are introduced. The one-line stderr write has zero runtime cost on the success path and no new dependencies.
