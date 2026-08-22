@@ -87,13 +87,14 @@ class Encoder:
 
     # ------------------------------------------------------------------
     def encode(self, messages: list[dict], model: str,
-               session_id: str | None = None) -> tuple[list[dict], EncodeReport]:
+               session_id: str | None = None,
+               provider: str = "") -> tuple[list[dict], EncodeReport]:
         t0 = time.perf_counter()
         prof = profile_for(model)
         report = EncodeReport(session_id="", model=model, profile=prof.name,
                               exact_tokenizer=prof.exact)
         try:
-            return self._encode(messages, model, prof, report, t0, session_id)
+            return self._encode(messages, model, prof, report, t0, session_id, provider)
         except Exception as exc:
             # FAILURE BEHAVIOR: passthrough, always — but never silently:
             # a real error is a bug to find, not a statistic to shrug at.
@@ -121,7 +122,8 @@ class Encoder:
     # ------------------------------------------------------------------
     def _encode(self, messages: list[dict], model: str, prof,
                 report: EncodeReport, t0: float,
-                session_id: str | None = None) -> tuple[list[dict], EncodeReport]:
+                session_id: str | None = None,
+                provider: str = "") -> tuple[list[dict], EncodeReport]:
         cfg = self.cfg
         sid = session_id or session_id_for(messages)
         report.session_id = sid
@@ -358,8 +360,27 @@ class Encoder:
         from .session import content_hash
         block_hash = content_hash(block) if block else ""
         eff_overhead = overhead
-        if block and (block_hash == session.last_inject_hash
-                      or session.turn >= 2):
+        # Bug (found live against real agent-manager traffic, 2026-08-21, on top of the
+        # decision/invariant-agreement fix above): the "invest once, amortize forever"
+        # discount this block applies is only real for a provider with actual
+        # prompt-prefix caching (Anthropic's cache_control is the one real example in
+        # this codebase). Ollama -- this pipeline's entire real traffic -- re-reads the
+        # full injection block byte-for-byte on EVERY call regardless of session.turn or
+        # whether the exact block was sent before; nothing is ever actually amortized.
+        # Once decision and invariant agree (the fix just above), that stops being a
+        # wasted-attempt bug and becomes a genuine one: the alias path now reliably SHIPS
+        # once turn>=2, honestly reporting a negative `saved` (real bytes sent DID exceed
+        # the original) while `saved_effective` shows a discount-assuming "win" that
+        # never happens on the wire. Confirmed live: a real observability_fix prompt
+        # matching 9 established codes shipped at 1663 raw tokens against a 1574-token
+        # original -- an 89-token real increase, sent on every single occurrence, not
+        # just a one-time "priced-in investment" the way it would be for a provider that
+        # actually remembers the glossary between calls. Gating on provider != "ollama"
+        # keeps every other caller's behavior (including this file's own tests, which
+        # never pass a provider) identical; only the one provider we know for certain
+        # never caches stops getting an unbacked optimism bonus.
+        if block and provider != "ollama" and (block_hash == session.last_inject_hash
+                                                or session.turn >= 2):
             # already-cached block, or a proven multi-turn session where the
             # one-time send amortizes over future turns: judge at steady-state
             # (discounted) cost. One-shot requests stay at face value.
