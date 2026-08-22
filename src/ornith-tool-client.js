@@ -46,7 +46,7 @@ const TOOLS = [
   },
 ];
 
-async function runPlanWithTools({ prompt, maxTurns = 5 }) {
+async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
   const { pipelineDir } = getConfig();
   const killSwitchPath = path.join(pipelineDir, 'queue', '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
@@ -54,6 +54,14 @@ async function runPlanWithTools({ prompt, maxTurns = 5 }) {
     const result = await call({ prompt, think: true });
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }
+
+  // Same TokenFold session/scope headers ornith-client.js sends on /api/generate.
+  // Without the session header every /api/chat call hashed into its own one-off
+  // TokenFold session, so the dictionary bootstrap's one-time cost could never
+  // amortize across the tool loop's turns -- the exact traffic shape (one prompt
+  // re-sent with growing history each turn) where session continuity pays most.
+  const tokenFoldHeaders = { 'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}` };
+  if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
 
   const messages = [{ role: 'user', content: prompt }];
   const toolCallLog = [];
@@ -67,7 +75,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5 }) {
       messages,
       tools: TOOLS,
       stream: false,
-    }, REQUEST_TIMEOUT_MS);
+    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
 
     const message = res.message || {};
     lastMessage = message;
@@ -94,7 +102,8 @@ async function runPlanWithTools({ prompt, maxTurns = 5 }) {
 module.exports = { runPlanWithTools };
 
 // CLI: node ornith-tool-client.js <request.json>
-// request.json: { prompt, maxTurns }
+// request.json: { prompt, maxTurns, source? }  (source: task type, keys the
+// per-task-type TokenFold dictionary -- same meaning as ornith-client.js's source)
 // Writes the JSON result to stdout.
 if (require.main === module) {
   const requestPath = process.argv[2];
