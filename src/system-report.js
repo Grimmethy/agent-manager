@@ -116,7 +116,8 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
       let task;
       try {
         task = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-      } catch {
+      } catch (err) {
+        console.warn(`[system-report] skipping ${name}: ${err.message}`);
         continue;
       }
       const at = terminalTimestamp(task);

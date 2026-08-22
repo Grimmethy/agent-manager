@@ -92,6 +92,74 @@ def api_ping():
     return jsonify({"app": "agent-manager", "name": socket.gethostname(), "version": "1"})
 
 
+_NEEDS_CLARIFICATION_REASON_TEXT = {
+    "no-match": "No matching file found for this change.",
+    "ambiguous": "Multiple candidate files found -- needs a human pick.",
+}
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    """Companion app's notification-bell feed (Android: AlertPoller.kt polls this every
+    ~15 min while a machine's bell is on). Surfaces exactly the "needs a human" states
+    the dashboard's own nav badges already flag -- blocked/needs-clarification/
+    awaiting-confirm queue tasks, plus a stuck-actioned Brain Dump entry
+    (BRAIN_DUMP_NEEDS_ATTENTION_STATES, the same set _brain_dump_needs_attention_count
+    already uses) -- as individually-id'd alerts.
+
+    Always returns the CURRENT full set, not a delta: the client already owns
+    de-duplication and backlog suppression (a freshly-linked machine swallows existing
+    history silently, only notifies from the next genuinely-new id onward -- see
+    AlertPoller.pollAll's own comment), so this endpoint just needs to be an honest,
+    stable-id snapshot of what's actually outstanding right now. Read-only, never gated
+    (see lan_mutation_gate above -- GET is always ungated regardless of caller)."""
+    alerts = []
+    qdir = queue_dir()
+    if qdir:
+        for state, level in (
+            ("blocked", "error"),
+            ("needs-clarification", "warn"),
+            ("awaiting-confirm", "error"),
+        ):
+            state_dir = qdir / state
+            if not state_dir.is_dir():
+                continue
+            for f in state_dir.glob("*.json"):
+                data = read_json_safe(f)
+                if not data:
+                    continue
+                task_id = data.get("id", f.stem)
+                title = (data.get("title") or task_id)[:120]
+                if state == "blocked":
+                    body = data.get("blockedReason") or "Blocked -- see dashboard for details."
+                elif state == "needs-clarification":
+                    reason = (data.get("needsClarification") or {}).get("reason")
+                    body = _NEEDS_CLARIFICATION_REASON_TEXT.get(
+                        reason, "Needs clarification -- see dashboard for details.")
+                else:
+                    body = "A delete-containing change is held for confirmation."
+                alerts.append({
+                    "id": f"task:{state}:{task_id}",
+                    "title": title,
+                    "level": level,
+                    "body": body[:200],
+                })
+
+    for e in _brain_dump_entries_with_task_status():
+        if e.get("status") == "actioned" and e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES:
+            entry_id = e.get("id")
+            if not entry_id:
+                continue
+            alerts.append({
+                "id": f"brain-dump:{entry_id}",
+                "title": (e.get("rawText") or "Brain dump entry")[:120],
+                "level": "warn",
+                "body": f"Actioned entry's task is {e.get('taskStatus')} -- needs a look.",
+            })
+
+    return jsonify({"alerts": alerts})
+
+
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
 
 # dashboard/ -> python/ -> package root (where agent-manager.env, launch.bat, and src/ live).
@@ -1691,6 +1759,109 @@ def api_task_anywhere(task_id):
     abort(404, description=f"task {task_id} not found in any queue state")
 
 
+def _adhoc_task_excerpt(data):
+    """Short status-relevant snippet for the Adhoc Tasks list -- whichever field
+    actually carries the human-relevant signal for wherever the task currently sits,
+    same fields api_alerts() already reads for the same reason."""
+    if data.get("blockedReason"):
+        return data["blockedReason"][:200]
+    if data.get("ornithVerdict"):
+        return data["ornithVerdict"][:200]
+    return None
+
+
+@app.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
+    whichever queue state it's currently sitting in -- the cross-cutting view
+    api_task_anywhere already has the right traversal shape for (drafting/ first,
+    per-instance, then every other QUEUE_STATES dir), generalized here from 'find one
+    task by id' to 'collect every adhoc task found along the way'. Also checks
+    queue/adhoc/ itself, the one real state api_task_anywhere never had to check --
+    task-sources.js's own nextAdhocTask() reads directly from there, before a claimed
+    task ever reaches pending/, so a task sitting there unclaimed would otherwise be
+    invisible to this view.
+
+    An 'adhoc' task is identified by domain=='adhoc' OR an id starting with 'adhoc-'
+    (queue-adhoc-task.js's own id convention, also used by the Brain Dump tab's
+    'Process Now' button injection) -- domain alone isn't reliable since a caller can
+    omit --domain (queue-adhoc-task.js then falls back to the first key in
+    task-domains.json, not necessarily 'adhoc').
+
+    done/ is SKIPPED by default (?includeDone=1 opts in) -- confirmed live 2026-08-22
+    this endpoint was timing out (reported "timed out after 8s" from the dashboard
+    itself) once queue/done/ grew to ~3900 files: reading+parsing every one of them on
+    every single poll of this tab, on Flask's single-threaded dev server, starved
+    concurrent requests (nav badge polling, other tabs, the phone app) regardless of
+    how fast any one request actually was in isolation. done/ tasks aren't what this
+    view exists to track anyway -- the whole point is active (in-progress) and stuck
+    (blocked) work, both already excluded from that giant folder."""
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
+
+    def is_adhoc(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    tasks = []
+
+    adhoc_dir = qdir / "adhoc"
+    if adhoc_dir.is_dir():
+        for f in adhoc_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc(data, f.stem):
+                tasks.append({
+                    "id": data.get("id", f.stem),
+                    "title": data.get("title") or f.stem,
+                    "state": "adhoc",
+                    "createdAt": data.get("createdAt"),
+                    "excerpt": _adhoc_task_excerpt(data),
+                })
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            lane = f.parent.name
+            tasks.append({
+                "id": task_id,
+                "title": data.get("title") or task_id,
+                "state": f"drafting:{lane}",
+                "createdAt": data.get("createdAt"),
+                "excerpt": _adhoc_task_excerpt(data),
+            })
+
+    for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append({
+                "id": task_id,
+                "title": data.get("title") or task_id,
+                "state": state,
+                "createdAt": data.get("createdAt"),
+                "excerpt": _adhoc_task_excerpt(data),
+            })
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+
+
 @app.route("/api/summary")
 def api_summary():
     qdir = queue_dir()
@@ -1718,6 +1889,40 @@ def api_summary():
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
+    # Adhoc Tasks nav badge: two separate counts, not one folded-together number
+    # (Grimmethy, 2026-08-22: "It's just as important to know how many in process there
+    # are so that we know how much work the system already has to work on" -- the badge
+    # used to be JUST the awaiting-confirm count, which read as a flat "0" any time
+    # nothing needed a confirm click even while real work was actively blocked or
+    # in flight, exactly the "inaccurately showing 0" complaint this replaces).
+    # adhocBlocked: blocked + needs-clarification + awaiting-confirm -- every state that
+    # means a human's attention is the thing standing between this task and progress,
+    # same states api_task_archive() already treats as one bucket for that reason.
+    # adhocInProgress: everything else still moving on its own (queue/adhoc/ itself,
+    # unclaimed; pending; drafting; review; approved) -- not a problem, just backlog size.
+    def is_adhoc_record(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    def count_adhoc_in(dir_path):
+        if not dir_path.is_dir():
+            return 0
+        n = 0
+        for f in dir_path.glob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc_record(data, data.get("id", f.stem)):
+                n += 1
+        return n
+
+    adhoc_blocked = sum(count_adhoc_in(qdir / s) for s in ("blocked", "needs-clarification", "awaiting-confirm"))
+    adhoc_in_progress = sum(count_adhoc_in(qdir / s) for s in ("pending", "review", "approved")) \
+        + count_adhoc_in(qdir / "adhoc")
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc_record(data, data.get("id", f.stem)):
+                adhoc_in_progress += 1
+    counts["adhocBlocked"] = adhoc_blocked
+    counts["adhocInProgress"] = adhoc_in_progress
     return jsonify(counts)
 
 
@@ -3958,4 +4163,13 @@ if __name__ == "__main__":
     # Pipeline state (_pipeline_running() etc.) is read fresh from instances/*.json on
     # every call, never held in Python memory across requests, so a reloader-triggered
     # restart can't lose track of anything.
-    app.run(host=host, port=port, debug=False, use_reloader=True)
+    # threaded=True (2026-08-22): Flask's dev server is single-request-at-a-time by
+    # default, which meant the continuous 5s nav-badge poll (plus any other open tab, or
+    # a second client like the phone app) could starve a slower request behind it purely
+    # by arrival order -- confirmed live as the direct cause of "/api/adhoc-tasks -> timed
+    # out after 8s" (a real request that took ~1s in isolation) once queue/done/ grew
+    # large enough to make ANY request briefly slower. Every route here already reads
+    # state fresh from disk on each call (see the comment just above -- no shared
+    # in-memory state to race on), so allowing overlapping requests is safe, not just a
+    # speed hack.
+    app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True)

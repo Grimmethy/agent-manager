@@ -10,7 +10,7 @@ export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                 
 
 # Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
-check_instance_liveness "$INSTANCE_ID" "${ORC_TICK_SECS:-30}" || exit 1
+check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Graceful stop: same reasoning as ornith-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
@@ -104,8 +104,14 @@ while :; do                                                                     
     # review vote also calls Claude. Skip (don't consume) just this item and leave it in
     # review/ for a later tick if Claude's rate-limited; low-tier items keep reviewing
     # normally regardless, since they never touch Claude.
-    resolved_tier="$(node -e 'try{require(process.argv[2]);const {reasoningTierFor}=require(process.argv[3]);const t=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(reasoningTierFor(t))}catch(e){}' "$file" "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
-    if [[ "$resolved_tier" == "high" ]]; then
+    # labelFor(), not reasoningTierFor() alone -- AGENT_MANAGER_FORCE_PROVIDER (this
+    # script's own refresh_active_model dashboard-override hook) can force a high-tier
+    # item onto local Ornith or a low-tier item onto Claude regardless of its registered
+    # tier; only labelFor() accounts for that override, so it's the one accurate source
+    # for both "will this touch Claude's budget" and "will this touch the local GPU"
+    # below.
+    resolved_label="$(node -e 'try{require(process.argv[2]);const {labelFor}=require(process.argv[3]);const t=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(labelFor(t))}catch(e){}' "$file" "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
+    if [[ "$resolved_label" == claude:* ]]; then
       budget_reason="$(check_budget_healthy)"
       budget_rc=$?
       if [[ $budget_rc -ne 0 ]]; then
@@ -121,15 +127,25 @@ while :; do                                                                     
     write_heartbeat_file "$INSTANCE_ID" "queued" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
     # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
-    # own header) -- also taken for a review-task.js call that turns out to route to
-    # Claude internally (high-tier items), not just local Ornith ones: this script can't
-    # cheaply know which way a given item will route without duplicating review-task.js's
-    # own tier logic, and a Claude call briefly waiting behind a local one is a bounded
-    # cost, not a correctness problem, so it's simplest to always serialize here.
-    acquire_single_flight_lock
+    # own header) -- ONLY for a low-tier item, whose review vote calls local Ornith and
+    # genuinely needs to serialize against every other local GPU call. A high-tier item's
+    # review vote routes to Claude (the cloud, no local GPU contention at all) -- taking
+    # this lock for it used to mean a Claude review vote sat waiting behind whatever local
+    # Ornith call worker-1 happened to be running, and vice versa, purely because they
+    # shared one lock with no regard for which physical resource each call actually used.
+    # Grimmethy, 2026-08-22: "With the current setup worker-1 and reasoning are taking
+    # turns... as is with local only we are losing priority" -- adhoc/high-tier work's
+    # priority ranking governs which task a lane picks up, not whether it then has to wait
+    # its turn behind unrelated local work once picked. $resolved_label is already
+    # computed just above for the budget gate, so this costs nothing extra to check.
+    if [[ "$resolved_label" != claude:* ]]; then
+      acquire_single_flight_lock
+    fi
     write_heartbeat_file "$INSTANCE_ID" "working" "${ORNITH_MODEL:-}" "$task_id" "review" "$STARTED_AT"
     review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
-    release_single_flight_lock
+    if [[ "$resolved_label" != claude:* ]]; then
+      release_single_flight_lock
+    fi
     review_succeeded="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
     review_verdict="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.verdict||"")}catch(e){console.log("")}')"
 
