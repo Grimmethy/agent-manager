@@ -356,6 +356,47 @@ def test_boilerplate_session_adopts_aliases():
     assert rep.saved > rep.original_tokens * 0.5   # >50% by turn 4
 
 
+def test_ollama_provider_never_ships_more_raw_tokens_than_original():
+    # Regression (found live against real agent-manager traffic, 2026-08-21, layered on
+    # top of the decision/invariant-agreement fix from earlier the same day): once
+    # decision and invariant agree on the SAME (discounted) eff_overhead, the alias path
+    # reliably ships -- correct for a provider with real prompt-prefix caching, where the
+    # discount reflects genuine amortized cost. Ollama has no such mechanism: it re-reads
+    # the full injection block byte-for-byte on every call. Confirmed live: a real
+    # multi-code observability_fix prompt shipped 1663 raw tokens against a 1574-token
+    # original once turn>=2 unlocked the discount -- an 89-token real increase, not a
+    # one-time investment, since nothing is ever actually amortized for this provider.
+    # provider="ollama" must keep the decision honest at every turn, matching what a
+    # provider with zero memory of past calls actually experiences.
+    from tokenfold.core.seed import seed
+    enc = Encoder(_cfg(inject_bootstrap=True))
+    seed(enc.dict)
+    boiler = ("Do not break existing functionality, run the tests before "
+              "finishing, preserve all public APIs, update the documentation "
+              "whenever behavior changes, and never modify files that are "
+              "unrelated to the current task. ")
+    for i in range(4):
+        msgs = [{"role": "user", "content": boiler + f"Do task number {i}."}]
+        out, rep = enc.encode(msgs, "gpt-4o", session_id="ollama-turns", provider="ollama")
+        assert rep.encoded_tokens + rep.dictionary_overhead <= rep.original_tokens, \
+            f"turn {i}: shipped more raw tokens than the original for provider=ollama"
+
+    # The same repeated boilerplate through a provider that DOES have real caching must
+    # still reach the documented amortized win (unchanged behavior, not weakened by the
+    # gate above) -- same content, same turn count, only the declared provider differs.
+    enc2 = Encoder(_cfg(inject_bootstrap=True))
+    seed(enc2.dict)
+    last_rep = None
+    for i in range(4):
+        msgs = [{"role": "user", "content": boiler + f"Do task number {i}."}]
+        _, last_rep = enc2.encode(msgs, "gpt-4o", session_id="anthropic-turns", provider="anthropic")
+    # saved (face value) can still be negative here -- the DICT block's real byte cost
+    # doesn't vanish just because a caching provider would bill/process it cheaply.
+    # saved_effective is the number that's supposed to turn positive once the discount
+    # is legitimately in play, which is exactly what this asserts stayed true.
+    assert last_rep.saved_effective > 0
+
+
 # ------------------------------------------------- expansion + tool folding
 def test_pending_expansion_ships_original_once():
     from tokenfold.core.session import Session, content_hash
