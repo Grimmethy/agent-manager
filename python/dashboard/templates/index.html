@@ -2898,7 +2898,7 @@ function renderBrainDumpShell() {
   document.getElementById('main').innerHTML = `
     <div class="capture-row">
       <input id="bd-capture-input" placeholder="Brain dump -- capture anything" autocomplete="off">
-      <button class="action" id="bd-capture-btn">Capture</button>
+      <button class="action" id="bd-capture-btn" title="Save this note as a new Brain Dump entry">Capture</button>
     </div>
     <div class="split-pane">
       <div>
@@ -2915,7 +2915,7 @@ function renderBrainDumpShell() {
       <div>
         <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
           <span>Second Brain</span>
-          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 10px;">Sync GitHub Projects</button>
+          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 10px;" title="Scan GitHub for your repos and create Second Brain notes for any that aren't linked yet">Sync GitHub Projects</button>
         </div>
         <div class="browser-panel" id="bd-browser" style="max-height:220px"><div class="empty">Loading...</div></div>
         <div id="bd-file-panel"></div>
@@ -3012,8 +3012,8 @@ function renderBrainDumpEditCard(entry) {
       <div class="row" style="margin-top:8px">
         <span></span>
         <span>
-          <button class="action" data-save="${escapeAttr(entry.id)}">Save</button>
-          <button class="secondary" data-cancel-edit="${escapeAttr(entry.id)}">Cancel</button>
+          <button class="action" data-save="${escapeAttr(entry.id)}" title="Save the edited text for this entry">Save</button>
+          <button class="secondary" data-cancel-edit="${escapeAttr(entry.id)}" title="Discard these edits and go back to the entry as it was">Cancel</button>
         </span>
       </div>
     </div>
@@ -3372,7 +3372,7 @@ function renderBrainDumpCard(entry) {
     : '<span class="badge idle">captured</span>';
   const queuedBadge = entry.queuedTaskId ? taskStatusBadgeHtml(entry.queuedTaskId, entry.taskStatus) : '';
   const reopenBtn = entry.taskStatus === 'archived'
-    ? `<button class="secondary" data-reopen="${escapeAttr(entry.queuedTaskId)}">Reopen</button>`
+    ? `<button class="secondary" data-reopen="${escapeAttr(entry.queuedTaskId)}" title="Requeue this entry's task for a fresh draft, resetting its retry history">Reopen</button>`
     : '';
   const jump = sort && sort.secondBrainPath
     ? `<a class="jump" data-jump="${escapeAttr(sort.secondBrainPath)}" href="#">open &rarr;</a>`
@@ -3394,12 +3394,12 @@ function renderBrainDumpCard(entry) {
       <div class="row" style="margin-top:8px">
         <span>${queuedBadge}</span>
         <span>
-          <button class="secondary" data-prioritize="${escapeAttr(entry.id)}">Process now</button>
-          <button class="secondary" data-discuss="${escapeAttr(entry.id)}">Discuss</button>
+          <button class="secondary" data-prioritize="${escapeAttr(entry.id)}" title="Queue this entry for drafting right away instead of waiting on the normal sort/priority order">Process now</button>
+          <button class="secondary" data-discuss="${escapeAttr(entry.id)}" title="Start (or resume) an open-ended conversation to add context to this entry before it gets sorted">Discuss</button>
           ${renderProviderToggle('bd-discuss-provider-' + escapeAttr(entry.id))}
-          <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}">Copy</button>
-          <button class="secondary" data-edit="${escapeAttr(entry.id)}">Edit</button>
-          <button class="secondary" data-delete="${escapeAttr(entry.id)}">Delete</button>
+          <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}" title="Copy this entry's raw text to the clipboard">Copy</button>
+          <button class="secondary" data-edit="${escapeAttr(entry.id)}" title="Edit this entry's raw text">Edit</button>
+          <button class="secondary" data-delete="${escapeAttr(entry.id)}" title="Delete this brain dump entry">Delete</button>
           ${reopenBtn}
         </span>
       </div>
@@ -3418,7 +3418,7 @@ function renderBrainDumpDiscussCard(entry, session) {
     return `
       <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
         <div class="row"><span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span></div>
-        <div class="row" style="margin-top:8px"><span class="empty">Starting conversation...</span><button type="button" class="secondary" data-discuss-cancel="${escapeAttr(entry.id)}">Cancel</button></div>
+        <div class="row" style="margin-top:8px"><span class="empty">Starting conversation...</span><button type="button" class="secondary" data-discuss-cancel="${escapeAttr(entry.id)}" title="Abort starting this conversation">Cancel</button></div>
       </div>
     `;
   }
@@ -3428,12 +3428,12 @@ function renderBrainDumpDiscussCard(entry, session) {
       (session.summary
         ? `<div class="grill-enriched-badge">Added to entry ✓: ${escapeHtml(session.summary)}</div>`
         : `<div class="meta" style="margin-top:8px">Ended with nothing said -- entry unchanged.</div>`) +
-      `<div class="row" style="margin-top:10px"><span></span><button type="button" class="secondary" data-discuss-close="${escapeAttr(entry.id)}">Close</button></div>`
+      `<div class="row" style="margin-top:10px"><span></span><button type="button" class="secondary" data-discuss-close="${escapeAttr(entry.id)}" title="Close this ended conversation and go back to the entry list">Close</button></div>`
     : `${transcriptHtml}` +
       `<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea>` +
       `<div class="row" style="margin-top:8px">` +
-      `<button type="button" class="secondary" data-discuss-end="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">End Discussion</button>` +
-      `<button type="button" class="action" data-discuss-send="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}">Send</button>` +
+      `<button type="button" class="secondary" data-discuss-end="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}" title="End this conversation and fold any new context into the entry">End Discussion</button>` +
+      `<button type="button" class="action" data-discuss-send="${escapeAttr(session.id)}" data-entry="${escapeAttr(entry.id)}" title="Send this message">Send</button>` +
       `</div>`;
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
