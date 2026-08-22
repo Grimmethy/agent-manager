@@ -74,7 +74,8 @@ function recordArchDiscoveryStructFailure(communityCoveragePath, communityId) {
   let coverage;
   try {
     coverage = JSON.parse(fs.readFileSync(communityCoveragePath, 'utf8'));
-  } catch {
+  } catch (e) {
+    console.warn(`[structcheck] failed to read community coverage at ${communityCoveragePath}: ${e.message}`);
     return { exhausted: false, failCount: 0 };
   }
   if (!coverage || !Array.isArray(coverage.communities)) return { exhausted: false, failCount: 0 };

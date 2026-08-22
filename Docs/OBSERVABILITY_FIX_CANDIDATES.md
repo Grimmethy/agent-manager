@@ -103,3 +103,170 @@ Inside the existing `catch` block, add a single `console.warn` call that include
 
 Benefits:
 Operators and CI logs now receive a one-line diagnostic the moment the coverage file is unreadable or malformed, eliminating the ambiguity between "file not yet produced" and "file corrupted." No behavioral change, no new dependency, no risk to callers — the fix is a single statement that converts a silent failure into a visible, greppable warning while preserving the existing best-effort semantics.
+
+### AC-9 · Silent catch in dead-process heartbeat sweep discards error context
+Strength: Strong
+Files: src/dead-process-check.js
+
+Problem:
+The per-item `catch (e)` block in the heartbeat-file sweep contains only a comment and no log, metric, or rethrow. The error object (which carries the filename, errno, and message) is discarded. If the underlying failure is persistent—bad mount, permission regression, disk full—every pass silently skips every heartbeat file. The dead-process detector goes dark with zero log line, zero metric, zero alert, and an operator investigating "why isn't the reaper firing?" has nothing to grep.
+
+Solution:
+Replace the bare comment inside the catch with a single `console.warn` (or project logger at `warn` level) that interpolates `e.message` and the in-scope file path. Example: `console.warn(\`[dead-process-check] skipping unreadable heartbeat: ${filePath} -- ${e.message}\`)`. No control-flow change; the loop still continues to the next file. If the project exposes a metrics bus, additionally increment a `dead_proc_check_skipped_total` counter in the same block.
+
+Benefits:
+A persistent read failure now produces a greppable, timestamped log line per pass (or a monotonically increasing counter), so the dead-process detector's silence is diagnosable within one log search. Operators can distinguish "all heartbeats healthy" from "all heartbeats unreadable" without adding a new alert rule. The fix is one line, zero behavior change, and preserves the existing skip-and-retry-next-pass semantics.
+
+### AC-10 · Silent fail-open on targets parse in fact-checker
+Strength: Strong
+Files: src/fact-checker.js
+
+Problem:
+The `catch { return new Set(); }` at `src/fact-checker.js:50` swallows any parse or deserialization error (JSON.parse, structuredClone, type-coercion on external input) and returns an empty `Set`, which is indistinguishable from a legitimate "zero targets" result. Downstream pipeline stages treat the empty set as "nothing to verify" and proceed as if the payload was valid. No log line, no metric, no rethrow is emitted, so a truncated or malformed payload silently produces a no-op check that is invisible in production traces and post-incident review.
+
+Solution:
+Replace the bare `catch { return new Set(); }` with `catch (err) { console.warn('[fact-checker] failed to parse targets input', err); return new Set(); }` (or route through the project's structured logger if one is already in use). This preserves the fail-open "don't crash the pipeline" intent while emitting a single, greppable warning that names the module, the operation, and the underlying error, giving operators a signal in logs and traces that the input was malformed rather than genuinely empty.
+
+Benefits:
+A malformed or truncated targets payload now produces a visible, searchable log line at the point of failure, eliminating the silent no-op. Operators can distinguish "input was empty" from "input was unparseable" in production traces, reducing mean-time-to-diagnose for fact-checker pipeline incidents, and the warning provides a natural hook for alerting or metric emission if the project later adds structured observability.
+
+### AC-11 · Silent partial-walk in recursive directory grep
+Strength: Strong
+Files: src/grep-codebase-tool.js
+
+Problem:
+The recursive walker's `catch { return; }` clause discards the error object entirely (no binding, no side-effect). `fs.readdirSync` can throw `EACCES`, `EPERM`, `EMFILE`, or `ENFILE` in addition to `ENOENT`; all of these are indistinguishable from "directory was empty" to the caller. A transient `EMFILE` under heavy concurrent tool execution truncates the walk mid-tree, the agent-manager receives a partial file list and acts on it as complete, and the user sees a missing file with zero error signal anywhere in the output. GNU `grep -r` prints `Permission denied` to stderr for the identical case; this tool does not.
+
+Solution:
+Bind the error in the catch clause and emit it to an observable channel before returning. Minimal form: `catch (err) { console.warn(`[grep-codebase] skipping ${current}: ${err.code ?? err.message}`); return; }`. If the project already collects diagnostics, push `{ path: current, code: err.code }` into a shared `warnings` array that the top-level caller returns alongside results. Either way the error must leave the catch block in some channel the operator or caller can inspect.
+
+Benefits:
+Operators can distinguish "no matches in this subtree" from "couldn't read this subtree (permission denied / fd exhaustion)." Transient `EMFILE` truncation becomes visible in logs or the returned diagnostics array instead of silently producing an incomplete result set. The tool's output contract ("grep the codebase") is now honest: partial results are flagged as partial, matching the behavior users expect from `grep -r` and `find`.
+
+### AC-12 · Log errno on lock-acquire failure instead of swallowing the error
+Strength: Strong
+Files: src/model-inflight-lock.js
+
+Problem:
+The `catch` block in `acquireLock` discards the `Error` object and returns `null` with no log line. A systemic fault such as `EACCES` after a uid change, `ENOSPC`, or a missing lock directory silently converts every subsequent call into "lock not acquired." Operators see duplicate model instances or resource contention in downstream metrics but have zero log line at the lock layer, and the `errno`—the single most useful diagnostic for "why did locking stop working?"—is unrecoverable after the catch.
+
+Solution:
+Replace the bare `catch { return null; }` with:
+
+```js
+catch (err) {
+  console.warn(
+    '[inflight-lock] acquire failed',
+    { model, instanceId, code: err.code, message: err.message },
+  );
+  return null;
+}
+```
+
+`console.warn` requires no import (the file currently binds only `path`, `fs`, `crypto`). The `null`-return contract is preserved exactly; no rethrow, no control-flow change. The only addition is a single structured log line carrying `model`, `instanceId`, `err.code`, and `err.message` so the failure is attributable and greppable.
+
+Benefits:
+When a lock layer silently degrades, the operator now has a timestamped, structured log line with the exact `errno` and model identifier, reducing MTTR from "hunt through downstream symptoms" to "grep for `inflight-lock acquire failed`." No behavioral change for callers; the fix is purely additive observability.
+
+### AC-13 · Unscoped catch in inflight-lock readdir swallows non-ENOENT errors
+Strength: Strong
+Files: src/model-inflight-lock.js
+
+Problem:
+The `fs.readdirSync(dir)` call inside the lock-listing helper is wrapped in a bare `catch` that unconditionally returns `[]`. This conflates "lock directory does not exist yet" (legitimate empty state) with `EACCES`, `EIO`, `ENOSPC`, or any other filesystem failure. In an in-flight-lock context the caller interprets `[]` as "no model slot is held" and dispatches a second concurrent run against the same slot, producing double-execution and potential data corruption. Because no log line or rethrow occurs, an operator has zero signal that the lock subsystem is degraded.
+
+Solution:
+Replace the bare `catch` with a code-checked branch: if `err.code === 'ENOENT'` return `[]` (preserving the "dir absent → no locks" idiom); for every other code, emit `console.error('[inflight-lock] readdir(' + dir + ') failed:', err)` and rethrow the error so the caller's error path (or the process-level unhandled-rejection handler) surfaces the fault. No structural change to the function signature or return type is needed.
+
+Benefits:
+A permission fault, transient I/O error, or disk-full condition now propagates to the caller instead of masquerading as an empty lock set, eliminating the silent double-dispatch path. The single `console.error` line gives operators an immediate, greppable signal in logs that the lock directory is unreadable, turning an invisible corruption risk into a visible, actionable alert. The "no directory yet" fast path is preserved exactly as before.
+
+### AC-14 · Silent read-failure swallow in observability scan loop
+Strength: Strong
+Files: src/observability-scan.js
+
+Problem:
+The `for` loop that iterates over candidate files wraps `fs.readFileSync` in a bare `catch { continue; }`. Every read failure—ENOENT from a race, EACCES, a stale symlink, a path that was never valid—falls into that single catch and is discarded. No `skipped` array, no `process.emitWarning`, no stderr write, no flag on the return value. The caller receives a `found` set that is indistinguishable from a complete scan, so a gate that checks "no reserved attributes present → proceed" can pass on a result that silently omitted half the files it was supposed to read.
+
+Solution:
+Accumulate failures in a `skipped` array inside the catch (`skipped.push({ file, err: err.code ?? err.message })`), then return `{ found: [...found], skipped }` (or, for a void/CLI entry point, write a one-line stderr summary `scan: skipped N file(s)` and exit 0). The `continue` is preserved so one bad file still does not abort the bulk scan; the only change is that the caller now has a concrete, inspectable list of which files were missed and the errno or message that caused the miss.
+
+Benefits:
+The scan output becomes self-describing: an operator or CI gate can distinguish "zero reserved attributes found across all 12 files" from "zero found across 7 of 12 files; 5 unreadable." This closes the observability gap in the observability tool itself, makes the gate decision auditable, and costs zero on the happy path (empty `skipped` array, no extra I/O).
+
+### AC-15 · Silent catch swallows scan failure in observability module
+Strength: Strong
+Files: src/observability-scan.js
+
+Problem:
+The `catch { return []; }` block at line 48 of `src/observability-scan.js` discards the error object entirely—no `console.error`, no logger call, no `process.emitWarning`, no rethrow, no metric increment. A network timeout, a 500 from the upstream API, or a permission error all collapse into the same `[]` that a legitimate zero-event scan would produce. Downstream consumers (dashboards, alerting rules, on-call runbooks) interpret `[]` as "zero anomalies detected" and conclude the system is healthy, when in fact the scan itself never completed. In an observability module specifically, this is the highest-impact form of silent failure: the tool whose job is to surface problems is itself hiding its own problems.
+
+Solution:
+Replace the bare `catch { return []; }` with a handler that (1) logs the failure at minimum `warn` level including the function name, `err.message`, and `err.stack` so the original call site is preserved in the log, (2) optionally increments a counter metric (`observability_scan_errors`) so a metrics pipeline can alert on repeated scan failures, and (3) still returns `[]` to preserve the existing return-type contract for callers that branch on array length. Example: `catch (err) { console.error('[observability-scan] scan failed:', err.message, err.stack); return []; }`. No signature change, no new dependency, no caller migration required.
+
+Benefits:
+An on-call engineer investigating an incident will see a timestamped log line with the full stack trace instead of a silent `0 anomalies` reading. A metrics alert can fire when `observability_scan_errors` exceeds a threshold, decoupling detection from human log-scraping. The original error context (which upstream endpoint, which timeout, which permission) is preserved in the log rather than lost in a discarded binding, making root-cause analysis a grep instead of a guess.
+
+### AC-16 · Silent search-fetch failure is unobservable
+Strength: Strong
+Files: src/ornith-draft.js
+
+Problem:
+The `catch` block around `projectSearchFetch` contains only a comment. When the fetch fails (auth rotation, backend 500, transient DNS), `searchResults` stays empty and the downstream prompt renders "(no results …)" with no log line, counter, or structured event. In a fan-out agent pipeline the operator has zero signal that search is degraded until end-user answer quality drops.
+
+Solution:
+Replace the comment-only catch body with a single `console.warn` (or the project's existing logger, e.g. `logger.warn`) that includes the error message: `console.warn('[ornith-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e)`. Control flow is unchanged—`searchResults` remains `[]` and execution falls through. If a metrics sink (Prometheus, Datadog, etc.) is already wired, increment a `search_fetch_errors` counter in the same block.
+
+Benefits:
+Every silent degradation becomes a greppable, alertable log line. On-call can correlate a spike in `projectSearchFetch failed` warnings with the underlying cause (auth, DNS, 500) within seconds instead of waiting for user complaints. The fix is additive; no behavioral or API change, so regression risk is nil.
+
+### AC-17 · Empty catch on coverage write swallows fs.writeFileSync failure with no observability
+Strength: Strong
+Files: src/reject-retry-check.js
+
+Problem:
+The catch block around `fs.writeFileSync` for the `deepDiveCoverage` artifact is empty, yet the adjacent comment claims "log and move on." No `console.warn`, no `process.emitWarning`, no metric counter is emitted. The sentinel `entry.actionItemCount = -1` is assigned before the write, so in-memory state is consistent, but the on-disk file is silently absent. In a pipeline that audits agent coverage, a missing `deepDiveCoverage` file with zero log output is indistinguishable from "coverage was never computed," making the failure unobservable in production.
+
+Solution:
+Add a single `console.warn` (or the project's structured logger, e.g. `logger.warn`) inside the existing catch block that includes the error message and the target path, e.g. `console.warn('[reject-retry-check] coverage write failed:', e.message)`. No rethrow, no sentinel change, no new dependency — the control flow and in-memory state remain identical; the only change is that the failure is now visible in stdout/logs.
+
+Benefits:
+Operators can now grep logs for `coverage write failed` to distinguish "write attempted and failed (EACCES/ENOSPC/EROFS)" from "coverage was never computed." The comment and code now agree, removing the trap for the next maintainer who would otherwise assume a log already exists and skip adding one. No behavior change, no new failure mode, one line of diff.
+
+### AC-18 · Silent catch in requeue loop loses all diagnostic context
+Strength: Strong
+Files: src/reject-retry-check.js
+
+Problem:
+The `catch (e)` block in the per-task requeue loop increments `summary.errors++` and discards `e` entirely. No `e.message`, `e.code`, `filePath`, or task id is emitted anywhere. An operator seeing `summary.errors: 3` cannot distinguish a transient `EACCES` lock, an `ENOSPC` disk-full that left the original file intact with the task stranded, or a post-write `unlinkSync` failure that produced a duplicate task file. In a reject/retry pipeline a failed requeue means the task is in limbo with zero diagnostic trail.
+
+Solution:
+Replace the bare `summary.errors++` with a structured log line that captures `filePath` (or `task?.id`), `e.message`, and `e.code`, then increment the counter. Do not rethrow — the loop is per-task and one failure must not abort the batch. If the project uses a structured logger (pino, winston, etc.), emit `log.warn({ filePath, task: task?.id, err: e }, 'requeue failed')`; otherwise fall back to `console.error('[reject-retry-check] requeue failed for ' + filePath + ': ' + e.message, e.code)`. Keep `summary.errors++` for aggregate dashboards.
+
+Benefits:
+Operators can immediately identify which task and which file path failed, the OS-level error code (ENOSPC vs EACCES vs EBUSY), and the human-readable message, enabling correct triage (free disk space, fix permissions, or investigate duplicate-task risk) instead of guessing from an opaque counter. The aggregate `summary.errors` counter is preserved for existing dashboards and alerting thresholds.
+
+### AC-19 · Log non-fatal archImportFetch failure in catch block
+Strength: Strong
+Files: src/ornith-draft.js
+
+Problem:
+At `src/ornith-draft.js:157` the `catch` block for `archImportFetch` swallows the exception entirely—no `console.*` call, no metric, no rethrow. A throw here signals a network timeout, auth expiry, 500, or parse error, yet the pipeline proceeds with an empty hits list and leaves zero log line in the entire run. In a batch/agent context that is the only observable trace of *why* the search step contributed nothing, and the existing comment documents the intent to proceed without hits but provides no diagnostic signal.
+
+Solution:
+Insert a single `console.debug` line as the first statement inside the existing `catch (e)` block at line 157, before the implicit fall-through to the empty-hits path. The exact change:
+
+```js
+// src/ornith-draft.js:157  (the catch block)
+} catch (e) {
+  console.debug(`[ornith-draft] archImportFetch non-fatal failure: ${e?.message ?? e}`);
+  // Non-fatal -- implement proceeds with no hits (its own prompt already handles
+  // an empty hits list: "(no matches -- the searches found nothing ...)"), same
+  // try/catch treatment project_search's branch above gives its own fetch call.
+}
+```
+
+`console.debug` (not `warn`) keeps stdout clean in normal operation; surface it via `NODE_DEBUG` or a log-level flag when diagnosing. `e?.message ?? e` handles both `Error` instances and non-Error throws. No rethrow, no metric—preserves the existing "proceed with empty hits" contract and the `project_search` parity the comment references.
+
+Benefits:
+Once fixed, any operator or agent diagnosing a run where the search step returned nothing can enable debug logging and immediately see the concrete failure reason (timeout, 401, 500, JSON parse error) instead of staring at a silent empty result. The one-line addition changes no runtime behaviour, adds no new dependency, and satisfies the scanner's "no log/rethrow/metric" condition by providing the minimal observable trace the finding requires.

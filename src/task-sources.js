@@ -37,7 +37,22 @@ function readIfExists(filePath) {
   }
 }
 
-const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done'];
+// BUG FIXED 2026-08-21 (Grimmethy, via the dashboard's Queue tab: found the SAME task id
+// sitting as two genuinely different files, one in done/ and one in
+// done/_archived_no_action/): this list used to omit 'needs-clarification',
+// 'awaiting-confirm', and the nested done/_archived_no_action/ pseudo-state entirely, so
+// taskIdExistsInQueue (below) was blind to a task that had reached any of those three
+// locations. For a source like observability_review that re-derives the SAME id from the
+// SAME (rule, file, line) on every worker tick as long as the underlying flag is still in
+// queue/observability-flags.json (findings are never pruned just for having already
+// produced a task -- see nextObservabilityReviewTask's own comment), this was not a rare
+// coincidence: the tick right after any of its tasks got archived would mint a brand-new
+// task under the identical id, guaranteed, every time. system-report.js already treats
+// done/_archived_no_action/ as its own 'archived' pseudo-state for exactly this reason
+// (scanning "what actually got done"); this brings the dedup check in line with that
+// instead of leaving it as the one place still blind to it.
+const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done',
+  'needs-clarification', 'awaiting-confirm'];
 
 // A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
 // directly (a per-instance claim subfolder) -- every task source shares this function, so a
@@ -45,6 +60,7 @@ const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'd
 function taskIdExistsInQueue(id) {
   const { pipelineDir } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
+  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
   return QUEUE_STATES.some((state) => {
     if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
 

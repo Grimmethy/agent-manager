@@ -1829,11 +1829,27 @@ def api_brain_dump():
     as under the old flat "queued" badge. A genuinely still-in-progress or successfully
     completed actioned entry stays hidden by default -- only ?status=actioned/all
     surfaces those -- since there's nothing for a human to act on there.
-    ?status=<value> narrows to one status, ?status=all returns the full history."""
+    ?status=<value> narrows to one status, ?status=all returns the full history.
+
+    BUG FIXED 2026-08-21 (Grimmethy: "Entry #129 is visible in both the processed and
+    unprocessed tabs ... If an entry is not fully resolved it shouldn't be 'processed'"):
+    ?status=actioned used to mean only "status field says actioned," which counts an
+    entry whose downstream task is blocked/needs-clarification/awaiting-confirm as
+    Processed even though it's simultaneously showing up in the default (Unprocessed)
+    view for the exact opposite reason -- it still needs a human. "Processed" now means
+    the same thing the default view's own inverse already implies: actioned AND not
+    stuck waiting on a human, so an entry is in exactly one of Unprocessed/Processed,
+    never both, and "not fully resolved" (this session's own words for it) can never
+    read as processed."""
     entries = _brain_dump_entries_with_task_status()
 
     status_filter = request.args.get("status", "").strip()
-    if status_filter and status_filter != "all":
+    if status_filter == "actioned":
+        entries = [
+            e for e in entries
+            if e.get("status") == "actioned" and e.get("taskStatus") not in BRAIN_DUMP_NEEDS_ATTENTION_STATES
+        ]
+    elif status_filter and status_filter != "all":
         entries = [e for e in entries if e.get("status") == status_filter]
     elif not status_filter:
         entries = [
