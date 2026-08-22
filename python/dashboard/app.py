@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import string
 import subprocess
@@ -49,6 +50,46 @@ def handle_http_exception(e):
     # handler a 400/404/etc surfaces to the user as "Unexpected token '<'" instead of
     # the actual description passed to abort().
     return jsonify(description=e.description), e.code
+
+
+# --- LAN access (companion app) -------------------------------------------------------
+# Historically this server bound 127.0.0.1 and loopback WAS the trust boundary: every
+# write endpoint (including the claude-token setter) assumes anyone reaching the port is
+# the owner. AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0 opts into LAN binding for the Android
+# companion app -- and because that widens who can reach the port, mutating verbs from
+# NON-loopback callers then REQUIRE a shared secret (AGENT_MANAGER_DASHBOARD_TOKEN as
+# "Authorization: Bearer <token>"). Loopback keeps working untouched either way, and
+# GET/HEAD/OPTIONS are never gated (reads only). With no token configured, non-loopback
+# mutating requests are refused outright rather than silently allowed -- the historical
+# trust boundary is preserved, never weakened by the host flag alone.
+LAN_TOKEN = (os.environ.get("AGENT_MANAGER_DASHBOARD_TOKEN") or "").strip()
+
+
+def _is_loopback_caller() -> bool:
+    ip = request.remote_addr or ""
+    return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "")
+
+
+@app.before_request
+def lan_mutation_gate():
+    if request.method in ("GET", "HEAD", "OPTIONS") or _is_loopback_caller():
+        return None
+    supplied = request.headers.get("Authorization", "")
+    if LAN_TOKEN and supplied == f"Bearer {LAN_TOKEN}":
+        return None
+    if not LAN_TOKEN:
+        abort(403, description=(
+            "Mutating requests from other machines need AGENT_MANAGER_DASHBOARD_TOKEN "
+            "set on the dashboard and supplied as a Bearer token."
+        ))
+    abort(401, description="Bad or missing Bearer token.")
+
+
+@app.route("/api/ping")
+def api_ping():
+    # Identity endpoint for the companion app's server-list health check. Shape mirrors
+    # TheAgent's /api/ping ({app, name, version}) so one client convention covers both.
+    return jsonify({"app": "agent-manager", "name": socket.gethostname(), "version": "1"})
 
 
 QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
@@ -3865,6 +3906,9 @@ def api_pipeline_stop():
 
 if __name__ == "__main__":
     port = int(os.environ.get("AGENT_MANAGER_DASHBOARD_PORT", "7420"))
+    # Default stays loopback-only; AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0 opts into LAN
+    # access for the companion app (see lan_mutation_gate above for what that changes).
+    host = os.environ.get("AGENT_MANAGER_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
     active = get_active_repo_root()
     print(f"Dashboard reading pipeline dir: {get_pipeline_dir() if active else '(none configured yet -- use the Project tab)'}")
     print(f"Open http://localhost:{port}")
@@ -3878,4 +3922,4 @@ if __name__ == "__main__":
     # Pipeline state (_pipeline_running() etc.) is read fresh from instances/*.json on
     # every call, never held in Python memory across requests, so a reloader-triggered
     # restart can't lose track of anything.
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=True)
+    app.run(host=host, port=port, debug=False, use_reloader=True)
