@@ -337,20 +337,53 @@ while :; do                                                                     
     done < <(ls -1 "$drafting_instance_dir" 2>/dev/null)
   fi
 
-  # Read pending/ directory listing for work items to claim — equivalent logic of PowerShell's `Get-ChildItem -Path $PENDING_DIR -Filter "*.json" | Where-Object { $_.LastWriteTime > $cutoff }` filter (we keep it simpler by reading all .json entries since our pending/ folder should only contain valid draft-state JSON files anyway; if someone dropped non-.json content that's a separate bug).
-  # array to collect pending/ file names matching our claim criteria — bash arrays declared via `local items=()` and populated by appending with ${items+=...} syntax. Each entry is just basename (no path) since we'll reconstruct full path inside the loop below using "$PENDING/$name" pattern for the same reason PowerShell's foreach ($item in $files){ ... } iterates over base-name entries not full paths.
+  # Read pending/ directory listing for work items to claim, PRIORITY-SORTED (fix,
+  # 2026-08-22, Grimmethy: "I have it set to priority 65 [staleness_audit]... Staleness
+  # audit should be running right now"): task-sources.js's `priority` value (whatever
+  # registerTaskSource() was called with, including any AGENT_MANAGER_TASK_PRIORITIES
+  # override) had ALWAYS only governed which next*Task() generator runs first when
+  # producing a NEW pending/ task -- it had zero effect on the order this claim loop
+  # consumes files ALREADY sitting in pending/, which used to be a plain `ls -1`
+  # (alphabetical) listing. Normally invisible (pending/ usually holds ~1 item at a time,
+  # generated one per tick), but confirmed live the moment pending/ actually held a real
+  # backlog (22 tasks, from a bulk requeue): a priority-64 staleness_audit task sat dead
+  # last behind priority-81 performance_review tasks purely because
+  # "staleness-audit-..." alphabetically sorts after "performance-...". Sorted here by
+  # each file's OWN task's resolved source priority (ascending -- lower number = higher
+  # priority, same convention task-sources.js's own getRegisteredSources() sort already
+  # uses), falling back to mtime (oldest first) to keep FIFO fairness within one priority
+  # tier, and Infinity for any file whose task/source can't be resolved (parse failure,
+  # unregistered source) -- unsortable is worst-case priority, not silently dropped.
   items=()                                                                      # no `local` here because we're at script scope (not function), so declare without keyword — PowerShell would use just `$items = @()` directly with no type keyword either.
   pdir="$QUEUE_DIR/pending"                                                    # compute pending dir once — matches task-sources.js's own writeTask() destination (queue/pending), not the old bare "pending/" this script used to read from (which task-sources.js never wrote to, so this claim loop always found nothing).
 
   if [[ -r "$pdir" ]]; then                                                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
-    while IFS= read -r name; do                                                # IFS= strips only the TRIMMING of whitespace bash would otherwise apply to each line via `read`'s default field-splitting behavior — we want raw base-names from directory listing even if they somehow have leading/trailing ws (unlikely but not impossible in pathological case).
-      [[ "$name" == *.json ]]                                                || continue    # only process JSON files — matches PowerShell's `Where-Object { $_.Extension -eq '.json' }` filter on Get-ChildItem output; non-.json entries could be binary state files / README.md / anything else user or external consumer dropped there that should be left alone (and we'd silently corrupt if we tried to parse as JSON).
-      # (Previously also required filenames to match ^draft-[a-f0-9-]+$ -- but task-sources.js's
-      # writeTask() names files after the task source, e.g. deep-dive-<slug>-<id>.json or
-      # brain_dump_sort-<n>.json, never "draft-...". That regex matched nothing real, so every
-      # pending task was silently skipped regardless of how the rest of this loop was wired.)
-      items+=("$name")                                                          # append basename (no path) to our collected list — same as adding element via `$drafts += $item.Name` in PowerShell foreach block since we need an array we can iterate over in next step. Bash arrays use ${items[@]} for expansion; populated by += operator which is bash-intrinsic for this purpose.
-    done < <(ls -1 "$pdir" 2>/dev/null)                                       # `< <(...)` is process substitution: runs `ls` command and feeds its output line-by-line into stdin of our while-read loop (so we don't spin up a subshell or temporary file for the ls output — cleaner than redirect-or-pipe alternatives). Error-redirect stderr from ls so any 'permission denied' reading files there doesn't show operator error noise in normal operation.
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && items+=("$name")
+    done < <(node -e '
+      try {
+        require(process.argv[1]);
+        const { getRegisteredSource, resolveSourceName } = require(process.argv[2]);
+        const fs = require("fs");
+        const path = require("path");
+        const dir = process.argv[3];
+        const names = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+        const ranked = names.map((name) => {
+          let priority = Infinity;
+          let mtimeMs = 0;
+          try {
+            const full = path.join(dir, name);
+            mtimeMs = fs.statSync(full).mtimeMs;
+            const task = JSON.parse(fs.readFileSync(full, "utf8"));
+            const source = getRegisteredSource(resolveSourceName(task));
+            if (source && typeof source.priority === "number") priority = source.priority;
+          } catch (e) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
+          return { name, priority, mtimeMs };
+        });
+        ranked.sort((a, b) => (a.priority - b.priority) || (a.mtimeMs - b.mtimeMs));
+        ranked.forEach((r) => console.log(r.name));
+      } catch (e) { /* fall through to empty listing -- caller already handles that safely */ }
+    ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "$pdir" 2>/dev/null)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".
