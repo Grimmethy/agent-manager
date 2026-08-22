@@ -296,3 +296,16 @@ Replace the bare `catch { continue; }` with a collection pattern: declare `const
 
 Benefits:
 A blank report now carries a `skipped` array that names each unreadable directory and the OS-level reason (`EACCES`, `ENOENT`, `ENOTDIR`, etc.), turning a "why is the report empty?" debugging session into a one-field inspection. Downstream consumers (dashboards, alerting, log shippers) can count or threshold on `skipped.length` without parsing stdout, and the fix is a single-scope change that cannot alter the happy-path output shape for callers that ignore the new field.
+
+### AC-22 · Silent catch in task-file enumeration swallows all-failure case
+Strength: Strong
+Files: src/system-report.js
+
+Problem:
+The `try/catch` around `readFileSync` + `JSON.parse` for each task file in the enumeration loop catches every error type (`ENOENT`, `EACCES`, `SyntaxError`, `ERR_FS_EISDIR`) and executes only `continue;`. When every file in the directory is unreadable or malformed, the loop exits with `task` never assigned, the caller receives an empty report, and no log line, warning, or stderr trace is emitted. An operator sees "0 tasks" with zero diagnostic signal to distinguish "directory is empty" from "directory is inaccessible" or "all files are corrupt."
+
+Solution:
+Add a single `console.warn` (or `log.debug` if the project uses a structured logger) inside the catch body before `continue;`, interpolating the filename and `err.message`. Example: `console.warn(\`[system-report] skipping ${name}: ${err.message}\`);`. The `continue` semantics are unchanged; the happy path is unaffected. No new imports, no API change, no accumulation array needed.
+
+Benefits:
+The all-files-fail scenario becomes diagnosable at the console/log level without altering control flow. An operator can immediately distinguish a permissions or path error from a genuinely empty directory. The single-line addition keeps the best-effort enumeration contract intact while closing the silent-failure observability gap.
