@@ -239,85 +239,27 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       };
     }
 
-    // Same awaiting-confirm gate as the delete-mode one above, for a different reason:
-    // adhoc's agentic implement pass (adhoc-agentic-draft.js, Brain Dump #67) has real
-    // Read/Grep/Glob/Edit/Write/Bash access and produces a real, working diff -- a
-    // meaningfully bigger consequence than the blind JSON-diff guesser adhoc used before,
-    // which usually failed to parse and rarely did anything real. Confirmed live
-    // 2026-08-17 testing this exact feature: apply-task.sh applies EVERYTHING sitting in
-    // queue/approved/ unconditionally -- the three-tier approval-mode machinery in
-    // config.js/task-sources.js is only ever consumed by the unported Windows
-    // apply-runner.ps1, not this deployment's actual bash driver -- so without an explicit
-    // gate here, a real agentic code change lands and pushes with no human click at all.
-    // Only fires when there's an actual diff to land -- the no-changes-needed outcome
-    // (applyAdhocDiff's own {skipped} branch, checked below) never touches git either way,
-    // so it doesn't need this same checkpoint.
-    if (resolveSourceName(task) === 'adhoc' && (task.rawDiff || '').trim() && !task.adhocApplyConfirmedAt) {
-      return {
-        succeeded: false,
-        needsConfirmation: true,
-        reason: 'real agentic code diff ready to apply -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
-      };
-    }
-
-    // Same awaiting-confirm gate again, for research_task (Brain Dump #1 follow-up,
-    // 2026-08-17): a real web-research write-up, produced by an agentic Claude call that
-    // can be confidently wrong -- an arguably HIGHER misinformation-risk category than a
-    // "no fix needed" code verdict, since this becomes permanent content in a personal
-    // knowledge base rather than a discardable git branch. Own confirm field
-    // (researchApplyConfirmedAt), not adhocApplyConfirmedAt -- different content type,
-    // same mechanism (see python/dashboard/app.py's confirm endpoint, which stamps both
-    // unconditionally on one click).
-    if (task.domain === 'research' && (task.researchDoc || '').trim() && !task.researchApplyConfirmedAt) {
-      return {
-        succeeded: false,
-        needsConfirmation: true,
-        reason: 'real web research write-up ready to apply -- held in queue/awaiting-confirm/ for human confirmation before it enters SecondBrain',
-      };
-    }
-
-    // Same awaiting-confirm gate again, for pipeline_self_audit (2026-08-20, Grimmethy:
-    // "change it to rely on the reasoning model itself, even if local"): moved off the
-    // domain:'adhoc' real-Claude-agentic path (which had its OWN gate above, but only
-    // because that path happens to be Claude-only -- Ornith has no tool-calling access at
-    // all) onto the standard harness-grounded Ornith flow (domain:'default', same shape
-    // arch_import already uses successfully). That move means the adhoc gate above no
-    // longer applies to it at all -- but a task that autonomously finds and drafts a fix
-    // to THIS PIPELINE'S OWN CODE, entirely without a human in the loop until this point,
-    // still deserves the same explicit confirmation every other real, directly-landing
-    // diff in this file already requires, regardless of which model drafted it. Checked
-    // on implementResponse being genuinely non-empty (not the "found nothing groundable"
-    // empty-string outcome, which never touches git either way -- see
-    // pipelineSelfAuditImplementPrompt's own instruction to output nothing in that case).
-    if (task.source === 'pipeline_self_audit' && (task.implementResponse || '').trim() && !task.pipelineSelfFixConfirmedAt) {
-      return {
-        succeeded: false,
-        needsConfirmation: true,
-        reason: 'pipeline_self_audit drafted a real fix to this pipeline\'s own code -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
-      };
-    }
-
-    // Same awaiting-confirm gate again, for product_spec (2026-08-20, see task-sources.js's
-    // nextProductSpecTask header): unlike every other gate above, this one holds a change
-    // to a DOCUMENT, not code -- but it is arguably the single highest-leverage gate in this
-    // file, since every later feature task for the target project gets grounded against
-    // whatever lands here. A bad spec edit that slips through doesn't just break one diff,
-    // it silently miscalibrates everything built on top of it afterward.
-    if (task.source === 'product_spec' && (task.implementResponse || '').trim() && !task.productSpecConfirmedAt) {
-      return {
-        succeeded: false,
-        needsConfirmation: true,
-        reason: 'product_spec drafted a real change to the product spec doc -- held in queue/awaiting-confirm/ for human confirmation before touching git or disk',
-      };
-    }
-
+    // REMOVED 2026-08-22 (Grimmethy: "I'd like to skip the confirm step. We already have
+    // a manual step for merge to main. This extra step is unnecessary friction."): adhoc/
+    // research_task/pipeline_self_audit/product_spec each used to hold here for an
+    // explicit confirm click (adhocApplyConfirmedAt/researchApplyConfirmedAt/
+    // pipelineSelfFixConfirmedAt/productSpecConfirmedAt) before a real diff could even
+    // reach a pushed branch. That checkpoint's original purpose -- making sure a real
+    // agentic-drafted change never lands with zero human awareness -- is still fully
+    // covered downstream: nothing here merges to main on its own (git-branch-diff below
+    // always stops at a pushed, unmerged agent/<id> branch; the actual merge is its own
+    // separate, always-manual dashboard action, api_git_merge_branch). Holding a SECOND
+    // gate in front of that first one was redundant, not additional safety -- every one
+    // of these still needs the same human review at merge time regardless. The delete-
+    // mode Group B gate just above this is UNCHANGED and deliberately not touched by this
+    // removal: an irreversible delete is a different risk category than a revertable git
+    // branch, and stays held for its own explicit confirm.
     // research's target (a note under secondBrainDir) is outside repoRoot and has nothing
     // to do with the tracked code repo's git state -- same non-git shape as secondbrain/
     // brain_dump_sort/project_search/path_prefetch_resolve above, intercepted here for the
     // same reason: the git-branch-diff flow below unconditionally fetches/resets/branches
     // the tracked repo for anything that reaches it, which would be actively wrong to run
-    // for a task that never touches that repo at all. Reached only once the confirm gate
-    // just above has already passed (researchApplyConfirmedAt set).
+    // for a task that never touches that repo at all.
     if (task.domain === 'research') {
       const result = applyResearchTask({ task, secondBrainDir });
       if (result.skipped) return { succeeded: true, doneMarker: result.reason };
