@@ -47,8 +47,11 @@ function appendSample(instancesDir, now = new Date()) {
   let names = [];
   try {
     names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
-  } catch {
-    return;
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      console.error('[uptime-log] failed to read ' + instancesDir + ': ' + err.message);
+    }
+    return [];
   }
 
   const instances = {};
