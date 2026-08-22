@@ -96,7 +96,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400 });
+      planResult = await resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source });
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
@@ -365,7 +365,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
           model: abModel,
         });
       } else {
-        implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement });
+        implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source });
       }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -413,7 +413,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
     const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900 });
+    const critiqueResult = await resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source });
 
     if (critiqueResult.degenerate) {
       task.critiqueOutcome = 'critique-degenerate';
@@ -422,7 +422,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
     } else {
       task.critiqueOutcome = 'issues-flagged';
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400 });
+      const reviseResult = await resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source });
       if (!reviseResult.degenerate) {
         task.implementResponse = reviseResult.response;
         task.revisionApplied = true;

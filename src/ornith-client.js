@@ -112,7 +112,7 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs }) {
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source }) {
   const promptTokens = estimateTokens(prompt);
 
   let resolvedNumCtx = numCtx;
@@ -153,6 +153,15 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // session -- see postJson's extraHeaders doc for why that continuity is what lets its
   // dictionary bootstrap cost amortize at all across this pipeline's calls.
   const tokenFoldHeaders = { 'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}` };
+  // Per-task-type dictionary (Grimmethy, 2026-08-21: "Each job type could have it's own
+  // folded dictionary") -- one worker lane's session bounces between many different
+  // task sources (observability_review, arch_discovery, ...) whose PROMPT TEMPLATES
+  // (prompts.js) are each internally consistent but very different from each other;
+  // sharing one dictionary across all of them diluted every template's own real
+  // repetition into a single mixed pool. `source` is optional (some callers, e.g. the
+  // A/B eval harness, don't have a real task) -- falls through to TokenFold's own
+  // default/global scope when omitted, same as it always did before this existed.
+  if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
     const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
     ornithThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
@@ -215,10 +224,10 @@ async function call(opts, maxRetries = 2) {
 // agreeing REAL (non-degenerate) votes (`minAgreeing`), not a relative comparison of
 // two buckets that can both be small — that relative-comparison bug once let 1 genuine
 // verdict + 2 degenerate "unclear" votes pass as a confident 1-0 consensus.
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2 }) {
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source }) {
   const votes = [];
   for (let i = 0; i < n; i++) {
-    const result = await call({ prompt, think: false, temperature }, 1);
+    const result = await call({ prompt, think: false, temperature, source }, 1);
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response });
