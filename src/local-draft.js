@@ -35,12 +35,15 @@
 // apply-task.js leaves file-moving to its own caller.
 
 const fs = require('fs');
+const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor } = require('./model-provider.js');
+const { getConfig } = require('./config.js');
+const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName } = require('./task-source-registry.js');
@@ -59,9 +62,11 @@ function writeTaskJson(taskPath, task) {
  * @param {function} [deps.ornithCall] - Defaults to model-provider.js's per-task-source
  *   pick (ornith-client.js's call() unless task.source is listed in
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
+ * @param {function} [deps.withLockFn] - Defaults to single-flight-lock.js's real withLock.
+ *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
  */
-async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement, draftResearchImplementFn = draftResearchImplement } = {}) {
+async function draftTask(task, { ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall, draftAdhocImplementFn = draftAdhocImplement, draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock } = {}) {
   // Resolved here rather than as a static default param: the right backend depends on the
   // task's reasoning tier (model-provider.js's reasoningTierFor()), which isn't known
   // until the task object itself is in hand -- passing the whole task (not just
@@ -71,6 +76,38 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
   // production code leaves (ornith-draft.js's own main() calls draftTask(task) with no
   // second argument at all).
   const resolvedOrnithCall = ornithCall || providerFor(task).call;
+
+  // Real plan/implement lock split (2026-08-22, Grimmethy: "build it now" -- see
+  // single-flight-lock.js's own header for the full incident this fixes). Every real
+  // resolvedOrnithCall() invocation below -- plan, the non-A/B implement branch, critique,
+  // revision -- shares the SAME resolved backend for one draftTask() call (it's computed
+  // once, above), so this is computed once too rather than re-checked at each call site.
+  // Deliberately based on labelFor(task) ALONE, not on whether ornithCall was injected --
+  // an earlier version of this gated on `!ornithCall` too (skip locking whenever a test
+  // supplies a mock call), but that conflated "is this call actually local" with "are we
+  // in a test," which meant a test asserting real locking behavior for a normal task
+  // would have to leave ornithCall unset and make a real Ollama/Claude call to exercise
+  // it. A real flock acquire/release is single-digit milliseconds (confirmed live) --
+  // cheap enough that tests just inject withLockFn as a lightweight in-memory spy instead
+  // (see local-draft.test.js), and production behavior stays exactly what labelFor(task)
+  // says regardless of how a test wires the rest of this function. Only ACTUALLY matters
+  // for adhoc/research tasks, whose real IMPLEMENT call bypasses resolvedOrnithCall
+  // entirely for a Claude call that never touches the local GPU
+  // (draftAdhocImplementFn/draftResearchImplementFn below) -- for every other task, plan
+  // and implement always resolve to the SAME backend, so locking around each call
+  // individually (rather than one lock spanning the whole function) costs a few extra
+  // real flock round-trips in exchange for never holding the lock across a Claude call by
+  // construction, not by remembering to release early in exactly the right place.
+  // labelFor(task) can genuinely return undefined now (LOCAL_MODEL has no hardcoded
+  // fallback string as of the earlier fix today -- see local-client.js's own comment) --
+  // treat that the same safe-default way as everywhere else in this codebase treats an
+  // unresolved label ("assume local, lock" rather than risk skipping a real local call's
+  // protection): `(label || '')` so `.startsWith` never throws on undefined, and an empty
+  // string correctly fails the 'claude:' prefix check.
+  const resolvedCallIsLocal = !(labelFor(task) || '').startsWith('claude:');
+  const instancesDir = path.join(getConfig().pipelineDir, 'instances');
+  const maybeLocked = (isLocal, fn) => (isLocal ? withLockFn(instancesDir, fn) : fn());
+
   try {
     appendHistoryEvent(task, 'draft-started', task.ornithRejectCount ? `retry ${task.ornithRejectCount}` : undefined);
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
@@ -96,7 +133,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source });
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
@@ -352,10 +389,15 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
       let implResult;
       if (abModel && abModel.startsWith('claude:')) {
         const { call: abClaudeCall } = require('./claude-client.js');
+        // Never local -- a claude: A/B candidate never touches the local GPU, so no lock.
         implResult = await abClaudeCall({ prompt: implPrompt, model: abModel.slice('claude:'.length), maxTurns: 1, permissionMode: 'dontAsk' });
       } else if (abModel) {
         const { call: abOrnithCall } = require('./local-client.js');
-        implResult = await abOrnithCall({
+        // Always local -- this branch only exists because abModel resolved to a bare
+        // Ollama tag, not a "claude:" one, so it always needs the real lock (unlike
+        // resolvedCallIsLocal above, this doesn't depend on whether ornithCall was
+        // test-injected, since this branch never calls resolvedOrnithCall at all).
+        implResult = await maybeLocked(true, () => abOrnithCall({
           prompt: implPrompt,
           think: abStrategy.think != null ? abStrategy.think : !hasFixedLiterals,
           temperature: abStrategy.temperature != null ? abStrategy.temperature : 0.4,
@@ -363,9 +405,9 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
           numCtx: implNumCtx,
           allowEmpty: allowEmptyImplement,
           model: abModel,
-        });
+        }));
       } else {
-        implResult = await resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source });
+        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
       }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -413,7 +455,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
     const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source });
+    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source }));
 
     if (critiqueResult.degenerate) {
       task.critiqueOutcome = 'critique-degenerate';
@@ -422,7 +464,7 @@ async function draftTask(task, { ornithCall = null, projectSearchFetch = runSear
     } else {
       task.critiqueOutcome = 'issues-flagged';
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source });
+      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (!reviseResult.degenerate) {
         task.implementResponse = reviseResult.response;
         task.revisionApplied = true;

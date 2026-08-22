@@ -112,30 +112,9 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # way a brand-new claim does, not a second, drifted copy of this logic.
 process_drafting_file() {
   local wpath="$1"
-  local name task_id draft_result draft_succeeded draft_blocked draft_label draft_display_model
+  local name task_id draft_result draft_succeeded draft_blocked draft_display_model
   name="$(basename "$wpath")"
   task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$wpath" 2>/dev/null)"
-
-  # Which backend this call will touch. labelFor() ALONE -- confirmed live 2026-08-22 this
-  # has to stay labelFor()-only, NOT also checking resolveSourceName()==='adhoc'/domain
-  # 'research' the way an earlier version of this fix briefly did: ornith-draft.js's
-  # draftTask() runs its PLAN pass via providerFor(task).call for EVERY task including
-  # adhoc/research ones (see draftTask()'s `resolvedOrnithCall = ornithCall ||
-  # providerFor(task).call`, BEFORE it ever reaches the adhoc/research dispatch branch) --
-  # only the IMPLEMENT half of an adhoc/research task unconditionally bypasses providerFor()
-  # for a real Claude call. Treating the whole call as lock-free because the drafting
-  # dispatch bypasses the local model live-fire caused real, observed Ollama contention
-  # ("Ollama request timed out after ~130s" errors across multiple lanes, all racing the
-  # local GPU with no lock protecting the plan pass anymore) as soon as a dashboard
-  # workerModelOverrides entry forced this lane onto local Ollama (AGENT_MANAGER_FORCE_PROVIDER
-  # respected by providerFor(), which labelFor() reads). labelFor() alone correctly reflects
-  # what the PLAN pass -- the part that actually needs this lock -- will do, with or without
-  # that override: no override -> adhoc's registered high tier resolves to Claude normally
-  # (lock correctly skipped); override active -> plan pass genuinely hits local Ornith
-  # (lock correctly held, same as before this whole fix, until a real plan/implement lock
-  # split exists -- queued separately, this bash-level check can't safely do better than
-  # "protect the plan pass" without one).
-  draft_label="$(node -e 'try{require(process.argv[1]);const {labelFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync(process.argv[3],"utf8"));console.log(labelFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
 
   # Heartbeat's OWN displayed model -- deliberately NOT the same value as draft_label
   # above. Grimmethy, 2026-08-22, after being surprised Claude was rate-limited despite
@@ -162,31 +141,29 @@ process_drafting_file() {
   ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
   [[ -n "$draft_display_model" ]] || draft_display_model="$HEARTBEAT_MODEL"
 
-  # "queued" until the single-flight lock is actually held, then "working" -- 2026-08-19,
-  # Grimmethy: "add the distinct queued status. The current is too unclear" (a claimed
-  # task waiting its turn behind another lane's real Ollama call used to show "working"
-  # the whole time, indistinguishable from actually being mid-call -- confirmed live: the
-  # dashboard showed all three lanes "working" simultaneously even after the single-flight
-  # lock made only one of them genuinely active). acquire_single_flight_lock blocks here,
-  # not before this function, so claiming/GPU-guard/task-generation upstream still run
-  # freely across lanes; only the real Ollama-consuming call is serialized, and only the
-  # WAIT for that is what "queued" represents.
+  # No bash-level single-flight lock around this call anymore (2026-08-22, Grimmethy:
+  # "build [a real plan/implement lock split] now") -- local-draft.js's draftTask() now
+  # acquires/releases the SAME real lock itself, per real local-model call, via
+  # src/single-flight-lock.js (a Node-native flock fully interoperable with this script's
+  # own acquire_single_flight_lock/release_single_flight_lock -- see that module's header
+  # for how, and confirmed live via cross-process tests). This is not optional: if bash
+  # ALSO held the lock here while the node child tries to acquire the SAME lock itself,
+  # the child would deadlock waiting on a lock its own parent holds and won't release
+  # until the child exits. Locking now happens ONLY inside JS, scoped to exactly the real
+  # local-model calls (plan/implement/critique/revision individually) instead of the
+  # whole draft call -- which is what actually fixes the original bug (an adhoc/research
+  # task's long real Claude implement call no longer holds this lock at all, since only
+  # its plan pass ever touches local Ornith).
   #
-  # ONLY for a low-tier (local Ornith) call -- a high-tier task's real call routes to
-  # Claude in the cloud, no local GPU contention at all, so worker-reasoning no longer
-  # waits its turn behind worker-1's local calls (or vice versa) here. Grimmethy,
-  # 2026-08-22: "worker-1 and reasoning are taking turns... as is with local only we are
-  # losing priority" -- see review-runner.sh's matching fix for the review-stage half of
-  # this same bug.
-  write_heartbeat_file "$INSTANCE_ID" "queued" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
-  if [[ "$draft_label" != claude:* ]]; then
-    acquire_single_flight_lock
-  fi
+  # This does mean the "queued" (waiting on the lock) vs "working" (actively computing)
+  # heartbeat distinction added 2026-08-19 is coarser now for this call specifically --
+  # bash itself no longer blocks on anything before starting the node process, so real
+  # lock-wait time now happens INSIDE the "working" state instead of a separate "queued"
+  # one. Accepted tradeoff: the actual wait is now much shorter and more targeted (only
+  # around the one real local sub-call that needs it, not the whole draft), so precisely
+  # distinguishing it matters less than it did when the whole call used to sit behind it.
   write_heartbeat_file "$INSTANCE_ID" "working" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
-  if [[ "$draft_label" != claude:* ]]; then
-    release_single_flight_lock
-  fi
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
 
