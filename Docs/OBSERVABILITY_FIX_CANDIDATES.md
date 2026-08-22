@@ -407,3 +407,16 @@ No new dependency, no logger import, no structural change — just the `err.code
 
 Benefits:
 Genuine filesystem faults (permission loss, fd exhaustion, a race where the path is replaced by a file) now propagate to the caller's existing error handling instead of being silently converted to "zero adhoc tasks." The ENOENT path remains a clean no-op with a human-readable rationale, so future readers of the file understand the intent without guessing. The tier-count aggregate stays correct in the expected case while gaining a hard failure signal in every unexpected case.
+
+### AC-28 · Silent catch swallows writeTask I/O failure
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+The catch block at line 2096 wraps `fs.writeFileSync(file, JSON.stringify(task, null, 2))` inside `writeTask`. On a transient I/O error (ENOSPC, EACCES, NFS timeout) the exception is caught and discarded with no log line, no rethrow, and no sentinel return. The caller proceeds as if the task was enqueued, the worker never sees `${task.id}.json` in `queue/pending/`, and there is no audit trail. In a pipeline that auto-approves work against a target, this is a silent loss of a deployment step.
+
+Solution:
+Replace the empty catch body with a `console.error` call that includes the task id and the error message, then `throw err` so the caller's existing retry/abort path fires. Concretely, the catch becomes: `console.error('[task-sources] writeTask failed for ' + task.id + ':', err.message); throw err;`. If the surrounding design is best-effort enqueue with caller-side retry, the minimum is the `console.error` plus `return false` (or a sentinel the caller checks) instead of a bare fall-through. Either way the catch must produce an observable side-effect before the function returns.
+
+Benefits:
+Every failed enqueue now emits a single log line containing the task id and the OS error, giving operators a grep-able trace. The rethrow (or falsy return) lets the caller's retry loop or abort path engage, so a transient ENOSPC is retried rather than lost. The queue invariant—"every task that entered `writeTask` either exists in `queue/pending/` or the failure is recorded"—is restored, closing the silent-loss gap in the deployment pipeline.
