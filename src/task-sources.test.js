@@ -1514,6 +1514,92 @@ test('nextAdhocTask still carries preDrafted/implementResponse/planResponse thro
   assert.equal(task.planResponse, 'the real plan');
 });
 
+// dependsOn (2026-08-22, Grimmethy: "We need some systematic way to prioritize what
+// order adhoc tasks get completed in. Those with dependencies on new adhoc tasks are
+// absolutely going to need to be done after the dependency is completed") -- satisfied
+// only once the dependency is actually MERGED (mergedAt set on its queue/done/ record by
+// api_git_merge_branch), not just done, since a dependent task's fresh git worktree
+// starts from origin/<mainBranch> and would draft against code that doesn't have an
+// unmerged dependency's fix yet.
+function writeDoneFile(dir, id, contents) {
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, `${id}.json`), JSON.stringify(contents));
+}
+
+test('nextAdhocTask skips a candidate whose dependency has not been merged (dependency missing entirely)', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-blocked-1',
+    title: 'Depends on a fix that has not landed at all',
+    dependsOn: ['adhoc-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('nextAdhocTask skips a candidate whose dependency reached done/ but was never merged', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', title: 'prereq', branch: 'agent/adhoc-prereq-1' }); // no mergedAt
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-blocked-1',
+    title: 'Depends on a fix that is pushed but not merged yet',
+    dependsOn: ['adhoc-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('nextAdhocTask claims a candidate once its dependency is actually merged', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', title: 'prereq', branch: 'agent/adhoc-prereq-1', mergedAt: '2026-08-22T00:00:00.000Z' });
+  writeAdhocFile(dir, 'unblocked.json', {
+    id: 'adhoc-unblocked-1',
+    title: 'Depends on a fix that already merged',
+    dependsOn: ['adhoc-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-unblocked-1');
+});
+
+test('nextAdhocTask skips past a blocked candidate to claim a later, unblocked one instead of stalling the whole lane', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Older mtime -- would be picked first if not for its unmet dependency.
+  writeAdhocFile(dir, 'a-blocked.json', {
+    id: 'adhoc-still-blocked-1',
+    title: 'Still waiting on its prereq',
+    dependsOn: ['adhoc-never-landed-1'],
+  });
+  writeAdhocFile(dir, 'b-ready.json', {
+    id: 'adhoc-ready-1',
+    title: 'No dependency, ready to go',
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-ready-1');
+});
+
+test('nextAdhocTask requires EVERY dependency to be merged, not just one of several', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-merged', { id: 'adhoc-prereq-merged', mergedAt: '2026-08-22T00:00:00.000Z' });
+  writeDoneFile(dir, 'adhoc-prereq-unmerged', { id: 'adhoc-prereq-unmerged' }); // no mergedAt
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-blocked-2',
+    title: 'One dependency merged, one not',
+    dependsOn: ['adhoc-prereq-merged', 'adhoc-prereq-unmerged'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
 // pipeline_self_audit coverage-timing regression (2026-08-20, Grimmethy: "Last hours
 // report shows 0 tasks done... Has the self audit task been working?"): nextPipelineSelf
 // AuditTask() used to write self-audit-coverage.json unconditionally before returning,

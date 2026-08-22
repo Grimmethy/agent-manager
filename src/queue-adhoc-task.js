@@ -13,7 +13,7 @@ function slugify(str) {
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
-    if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain') && argv[i + 1]) {
+    if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain' || argv[i] === '--depends-on') && argv[i + 1]) {
       args[argv[i]] = argv[++i];
     }
   }
@@ -25,7 +25,7 @@ if (require.main === module) {
   const parsed = parseArgs(rawArgs);
 
   if (!parsed['--title'] || !parsed['--prompt-context-file']) {
-    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>]');
+    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2]');
     process.exit(1);
   }
 
@@ -52,7 +52,15 @@ if (require.main === module) {
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
 
-  const record = { id, domain, source: 'manual', title: parsed['--title'], promptContext };
+  // dependsOn (2026-08-22): other adhoc task ids this one must not be drafted before --
+  // see task-sources.js's nextAdhocTask()/isDependencySatisfied() for the enforcement
+  // (satisfied only once a dependency is actually MERGED, not just done, since a fresh
+  // draft's git worktree starts from origin/<mainBranch> and won't see an unmerged fix).
+  const dependsOn = parsed['--depends-on']
+    ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
+    : undefined;
+
+  const record = { id, domain, source: 'manual', title: parsed['--title'], promptContext, ...(dependsOn && dependsOn.length ? { dependsOn } : {}) };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
 
