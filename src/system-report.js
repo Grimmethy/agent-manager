@@ -103,11 +103,13 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
   ];
 
   const tasks = [];
+  const skipped = [];
   for (const { dir, state } of dirs) {
     let names;
     try {
       names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
-    } catch {
+    } catch (err) {
+      skipped.push({ dir, reason: err.code ?? err.message });
       continue;
     }
     for (const name of names) {
@@ -135,6 +137,7 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
       });
     }
   }
+  tasks.skipped = skipped;
   return tasks;
 }
 
