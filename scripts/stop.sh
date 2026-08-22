@@ -37,6 +37,28 @@ for arg in "$@"; do
   esac
 done
 
+# kill_tree: SIGKILL a pid AND every descendant, not just the top-level daemon script.
+# Added 2026-08-22 (Grimmethy: "Everything is showing stale in the workers tab") --
+# confirmed live: a plain `kill -KILL "$pid"` on the daemon's own bash wrapper does NOT
+# touch its already-spawned children (local-worker.sh -> node local-draft.js -> a real
+# `claude -p` agentic call, or a `flock 200` subprocess still blocked waiting for the
+# single-flight lock). Those children survive, get reparented to init, and keep running/
+# waiting completely disconnected from any bash script that will ever process their
+# result or release anything on their behalf -- found a literal pile of 7 such orphans
+# (accumulated across this session's several restarts) all still fighting over the same
+# lock, which is exactly what made every real daemon's heartbeat go stale: they were
+# genuinely, correctly waiting on a lock a ghost process from a PREVIOUS restart cycle
+# still held. Kills leaves-first (children before the parent) via pgrep -P, since a
+# parent already gone doesn't strand a child that's about to die anyway -- pure paranoia
+# against a pid being reused mid-walk, not a correctness requirement here.
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null
+}
+
 if [[ ! -d "$PID_DIR" ]]; then
   printf '[stop] nothing to do: %s does not exist.\n' "$PID_DIR"
   exit 0
@@ -61,8 +83,8 @@ for pidfile in "${pidfiles[@]}"; do
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     if [[ "$FORCE" == true ]]; then
-      kill -KILL "$pid" 2>/dev/null
-      printf '[stop] force-killed %s (pid %s)\n' "$name" "$pid"
+      kill_tree "$pid"
+      printf '[stop] force-killed %s (pid %s) and its process tree\n' "$name" "$pid"
     else
       kill -TERM "$pid" 2>/dev/null
       printf '[stop] sent SIGTERM to %s (pid %s)\n' "$name" "$pid"
@@ -88,8 +110,8 @@ done
 for i in "${!pids[@]}"; do
   pid="${pids[$i]}"; name="${names[$i]}"
   if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null
-    printf '[stop] %s (pid %s) still alive after %ss grace -- force-killed.\n' "$name" "$pid" "$GRACE_SEC"
+    kill_tree "$pid"
+    printf '[stop] %s (pid %s) still alive after %ss grace -- force-killed (with its process tree).\n' "$name" "$pid" "$GRACE_SEC"
   else
     printf '[stop] %s (pid %s) exited cleanly.\n' "$name" "$pid"
   fi
