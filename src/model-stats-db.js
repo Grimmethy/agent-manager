@@ -60,6 +60,17 @@ try {
     db.exec(`ALTER TABLE model_calls ADD COLUMN cost_usd REAL`)
   }
 
+  // instance_id (2026-08-23, same request: "Where else would it make sense to track
+  // it?" -> Workers tab, per-instance cumulative cost). AGENT_MANAGER_INSTANCE_ID is
+  // already a real env var in every worker's process tree (local-worker.sh exports it
+  // for exactly this kind of attribution -- see model-inflight-lock.js's own use of it),
+  // it just never reached this table. Same ALTER-guarded-by-pragma migration shape as
+  // cost_usd above.
+  const hasInstanceColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'instance_id'`).get().c > 0
+  if (!hasInstanceColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN instance_id TEXT`)
+  }
+
   const [event, payloadPath] = process.argv.slice(2)
   if (!event || (event !== 'cost-summary' && !payloadPath)) {
     console.error('Usage: node model-stats-db.js <record-call|record-outcome> <payloadPath>')
@@ -82,6 +93,10 @@ try {
       SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS totalCost, COUNT(*) AS calls
       FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
     `).all()
+    const byInstance = db.prepare(`
+      SELECT COALESCE(instance_id, '(unknown)') AS instanceId, COALESCE(SUM(cost_usd), 0) AS totalCost, COUNT(*) AS calls
+      FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY instanceId ORDER BY totalCost DESC
+    `).all()
     const freeRow = db.prepare(`SELECT COUNT(*) AS calls FROM model_calls WHERE cost_usd IS NULL`).get()
     console.log(JSON.stringify({
       totalCostUsd: totalRow.total,
@@ -89,6 +104,7 @@ try {
       freeCalls: freeRow.calls,
       byModel,
       byDay,
+      byInstance,
     }))
     db.close()
     process.exit(0)
@@ -100,10 +116,10 @@ try {
     db.prepare(`
       INSERT INTO model_calls (
         call_id, task_id, stage, model, candidates, started_at, latency_ms,
-        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd
+        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id
       ) VALUES (
         @callId, @taskId, @stage, @model, @candidates, @startedAt, @latencyMs,
-        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd
+        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId
       )
     `).run({
       callId: payload.callId,
@@ -120,6 +136,7 @@ try {
       degenerate: payload.degenerate != null ? payload.degenerate : null,
       callError: payload.callError != null ? payload.callError : null,
       costUsd: payload.costUsd != null ? payload.costUsd : null,
+      instanceId: payload.instanceId != null ? payload.instanceId : null,
     })
   } else if (event === 'record-outcome') {
     if (!payload.callId) {

@@ -517,11 +517,18 @@ async function setWorkerModel(instanceId, model) {
 }
 
 async function renderWorkers() {
-  const [instances, workerModels] = await Promise.all([
+  const [instances, workerModels, costSummary] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
+    fetchJson('/api/models/cost-summary'),
   ]);
   const overrides = workerModels.overrides || {};
+  // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
+  // sense to track it?" -> Workers tab): AGENT_MANAGER_INSTANCE_ID is stamped onto every
+  // real model_calls row now (see model-stats-client.js's own recordCall) -- keyed here
+  // by instanceId so each worker-card can show its own running total, same "estimate,
+  // not a bill" framing as the Models tab's own widget.
+  const costByInstance = Object.fromEntries((costSummary.byInstance || []).map((i) => [i.instanceId, i.totalCost]));
   const main = document.getElementById('main');
   const fetchedAt = Date.now();
   instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
@@ -569,6 +576,7 @@ async function renderWorkers() {
       <div class="meta">
         pid ${inst.pid} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
         ${inst.currentTaskId ? ' · working on <strong>' + inst.currentTaskId + '</strong>' + (inst.currentPass ? ' (' + inst.currentPass + ')' : '') : ''}
+        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
     </div>
   `).join(''));
@@ -1516,6 +1524,20 @@ function renderTaskDetailModal(task) {
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  // Estimated Anthropic API cost for this ONE task (2026-08-23, Grimmethy: "We should
+  // include estimated cost tracking in the job page itself") -- api_task_detail/
+  // api_task_anywhere sum every model_calls row for this task_id server-side (a task can
+  // carry several real calls: plan, implement, critique, revision), since task.abCallId
+  // on the task itself only ever holds the MOST RECENT one. _costSummary is null (not a
+  // zeroed object) when the db/column isn't available or no calls exist yet for this
+  // task at all -- shown only when there's something real to show.
+  if (task._costSummary) {
+    const cs = task._costSummary;
+    const label = cs.totalCostUsd > 0
+      ? `${fmtUsd(cs.totalCostUsd)} est. (${cs.callsWithCost}/${cs.totalCalls} call(s) via Claude)`
+      : `Free -- all ${cs.totalCalls} call(s) local`;
+    html += `<div class="field-label">Estimated API Cost</div><div>${label}</div>`;
+  }
   // task.title is truncated to 120 chars at creation time (see app.py's brain-dump
   // ingestion) -- the full original text lives in promptContext.rawText and was never
   // surfaced anywhere in this modal, leaving anyone deciding a needs-clarification task
