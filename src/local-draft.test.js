@@ -274,6 +274,85 @@ test('a task with fixedLiterals but NO file field falls through to the normal im
   });
 });
 
+// Regression, 2026-08-23: caught live -- observability-fix-ac-27's implement pass wrote
+// a plausible-but-fabricated `find` string that matched nothing in the real fetched file
+// content it was given, and this only surfaced downstream at apply time after a full
+// review cycle had already been spent on a draft that was never going to apply.
+test('findUnverifiedEdit catches a find string that does not appear in the fetched file content', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const fetchedFiles = [{ path: 'src/task-sources.js', content: 'function real() {\n  return 1;\n}\n' }];
+
+  const bad = JSON.stringify({ mode: 'edit', file: 'src/task-sources.js', find: 'this text is not in the file', replace: 'x' });
+  assert.deepEqual(findUnverifiedEdit(bad, fetchedFiles), { file: 'src/task-sources.js', find: 'this text is not in the file' });
+
+  const good = JSON.stringify({ mode: 'edit', file: 'src/task-sources.js', find: 'return 1;', replace: 'return 2;' });
+  assert.equal(findUnverifiedEdit(good, fetchedFiles), null);
+});
+
+test('findUnverifiedEdit does not flag effectively-empty, malformed JSON, create-mode, or files with no fetched content', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const fetchedFiles = [{ path: 'x.js', content: 'real content' }];
+  assert.equal(findUnverifiedEdit('', fetchedFiles), null);
+  assert.equal(findUnverifiedEdit('""', fetchedFiles), null);
+  assert.equal(findUnverifiedEdit('not json at all', fetchedFiles), null, 'malformed JSON is a separate, pre-existing failure mode');
+  assert.equal(findUnverifiedEdit(JSON.stringify({ mode: 'create', file: 'new.js', content: 'x' }), fetchedFiles), null);
+  assert.equal(findUnverifiedEdit(JSON.stringify({ mode: 'edit', file: 'unfetched.js', find: 'anything', replace: 'x' }), fetchedFiles), null, 'no fetched content for this file -- not this checks job');
+});
+
+test('draftTask retries the implement call once when a candidate-fulfillment source writes an unverifiable find, and accepts the corrected retry', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-test-1', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-1', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'fabricated text not in file', replace: 'x' }), degenerate: null, attempts: 1 }; // implement, bad find
+      if (callCount === 3) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 }; // retry, good find
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+
+    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 4, 'plan, bad implement, retried implement, critique -- no infinite loop');
+    const parsed = JSON.parse(task.implementResponse);
+    assert.equal(parsed.find, 'return 1;', 'the corrected retry response must win, not the original fabricated one');
+    assert.match(task.history.find((h) => h.stage === 'implement-done').detail, /retried once/);
+  });
+});
+
+test('draftTask does not retry a candidate-fulfillment source whose find string verifies correctly the first time', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-test-2', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-2', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+
+    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 3, 'plan, implement, critique -- correct on the first try, no retry burned');
+  });
+});
+
 test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local, not a crash', async () => {
   await withFixtureRepo(async (draftTask) => {
     delete process.env.LOCAL_MODEL; // the exact edge case local-client.js's own fallback-removal fix made newly possible

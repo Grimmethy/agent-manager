@@ -51,9 +51,51 @@ const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName } = require('./task-source-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
+const { parseJsonMaybeFenced } = require('./json-fence.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+}
+
+// task-sources.js's nextCandidateFulfillmentTask() -- the shared candidate-consumer these
+// five sources all use, each fetching real file content (fetchedFiles) for the exact
+// files their own candidate names, so their implement pass always has real content to
+// ground a find/replace in.
+const CANDIDATE_FULFILLMENT_SOURCES = ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment'];
+
+// 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
+// given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
+// a plausible-but-fabricated `find` string that matched nothing in the real file --
+// confirmed on observability-fix-ac-27, where the fetched 8000-char excerpt of a large
+// file simply didn't happen to contain the section the candidate actually concerned, and
+// the model guessed instead of reporting that gap. This previously surfaced only at
+// APPLY time (apply-group-b.js's own "find string not found" error), well after a full,
+// real review cycle had already been spent on a draft that was never going to apply.
+// Verifies the SAME thing apply-group-b.js will eventually check, just immediately after
+// implement instead of after a wasted review -- returns the first mismatch found, or
+// null if every edit-mode item's find string genuinely appears in its named file's
+// fetched content (a `create` item, or a file fetchedFiles doesn't have -- fetch failed,
+// or it's a legitimate new file -- is not checked here; only a verifiable claim is).
+function findUnverifiedEdit(implementResponse, fetchedFiles) {
+  const trimmed = (implementResponse || '').trim();
+  if (!trimmed || trimmed === '""' || trimmed === "''") return null; // effectively empty -- nothing to verify
+  let parsed;
+  try {
+    parsed = parseJsonMaybeFenced(trimmed);
+  } catch {
+    return null; // malformed JSON is a separate, pre-existing failure mode -- not this check's job
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const byPath = new Map((fetchedFiles || []).map((f) => [f.path, f.content]));
+  for (const item of items) {
+    if (!item || item.mode !== 'edit' || typeof item.find !== 'string' || !item.find) continue;
+    const content = byPath.get(item.file);
+    if (content == null) continue; // no fetched content to verify against -- not this check's job
+    if (!content.includes(item.find)) {
+      return { file: item.file, find: item.find };
+    }
+  }
+  return null;
 }
 
 /**
@@ -563,7 +605,30 @@ async function draftTask(task, {
         };
       }
       task.implementResponse = implResult.response;
-      appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+
+      // Deterministic find-verification retry (see findUnverifiedEdit's own header) --
+      // ONLY for the five candidate-fulfillment sources, which are the only ones with
+      // fetchedFiles to verify against. Bounded to a single retry, same "one real second
+      // chance, then let the existing downstream gates catch it" shape as the adhoc
+      // turn-budget retry -- a find string that's still wrong on a second, explicitly-
+      // warned attempt is a genuine mismatch (stale/truncated fetched content, a
+      // candidate whose Problem no longer matches current code, etc.), not something a
+      // third guess would likely fix either.
+      if (CANDIDATE_FULFILLMENT_SOURCES.includes(task.source)) {
+        const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
+        if (unverified) {
+          const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
+          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: retryPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+          if (!retryResult.degenerate) {
+            task.implementResponse = retryResult.response;
+          }
+          appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (retried once: find "${unverified.find.slice(0, 80)}" did not verify against real file content)`);
+        } else {
+          appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+        }
+      } else {
+        appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+      }
     }
 
     // Critique + revision: a second, independent model call reviews the drafter's own
@@ -625,7 +690,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask };
+module.exports = { draftTask, findUnverifiedEdit };
 
 if (require.main === module) {
   main();
