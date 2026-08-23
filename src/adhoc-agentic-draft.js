@@ -116,28 +116,56 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   }
 
   try {
-    const startedAt = new Date().toISOString();
-    const startMs = Date.now();
-    const result = await claudeCall({
-      prompt: buildAgenticPrompt(task),
-      cwd: worktreeDir,
-      allowedTools: 'Read,Grep,Glob,Edit,Write,Bash',
-      maxTurns: ADHOC_MAX_TURNS,
-      permissionMode: 'dontAsk',
-      timeoutMs: ADHOC_TIMEOUT_MS,
-    });
+    const prompt = buildAgenticPrompt(task);
+    let totalCostUsd = 0;
+    let attemptTurns = ADHOC_MAX_TURNS;
+    let retriedForTurnBudget = false;
+    let result;
 
-    task.abCallId = recordModelCall({
-      taskId: task.id,
-      model: DRAFT_MODEL_LABEL,
-      startedAt,
-      latencyMs: Date.now() - startMs,
-      result,
-    });
-    task.draftModel = DRAFT_MODEL_LABEL;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const startedAt = new Date().toISOString();
+      const startMs = Date.now();
+      result = await claudeCall({
+        prompt,
+        cwd: worktreeDir,
+        allowedTools: 'Read,Grep,Glob,Edit,Write,Bash',
+        maxTurns: attemptTurns,
+        permissionMode: 'dontAsk',
+        timeoutMs: ADHOC_TIMEOUT_MS,
+      });
+      totalCostUsd += result.costUsd || 0;
+
+      task.abCallId = recordModelCall({
+        taskId: task.id,
+        model: DRAFT_MODEL_LABEL,
+        startedAt,
+        latencyMs: Date.now() - startMs,
+        result,
+      });
+      task.draftModel = DRAFT_MODEL_LABEL;
+
+      // 2026-08-23, Grimmethy: "Fix: Claude agentic adhoc drafts that exhaust their turn
+      // budget get blindly retried at the same budget, wasting real spend" -- caught
+      // live: a task's OWN outer retry (reject-retry-check.js requeuing a blocked task)
+      // just re-ran this exact function from scratch at the exact same ADHOC_MAX_TURNS,
+      // burning a full ~31-turn session again with no reason to expect a different
+      // outcome. stop_reason:'tool_use' with no RESOLUTION line is Claude Code CLI's own
+      // signal that it was still mid-investigation/edit when the turn budget ran out --
+      // NOT a degenerate/malformed response (claude-client.js's call() already retries
+      // those on its own) and not a case where the task is unfixable, just under-budgeted
+      // for THIS attempt. Retried here, inside the SAME worktree (any partial edits
+      // Claude already made carry over rather than being thrown away) with a bumped
+      // budget, but only ONCE -- a task that exhausts twice in a row is a genuine size/
+      // scope problem a bigger number won't fix, and this must never become an unbounded
+      // doubling loop.
+      const ranOutOfTurns = result.stopReason === 'tool_use' && !RESOLUTION_RE.test(result.response || '');
+      if (!ranOutOfTurns || attempt === 1) break;
+      retriedForTurnBudget = true;
+      attemptTurns = Math.round(ADHOC_MAX_TURNS * 1.5);
+    }
 
     if (result.degenerate) {
-      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass degenerate: ${result.degenerate}` };
+      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass degenerate: ${result.degenerate} (total_cost_usd=${totalCostUsd.toFixed(4)}${retriedForTurnBudget ? ', retried once at a larger turn budget' : ''})` };
     }
 
     const summary = result.response || '';
@@ -148,7 +176,10 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
       // Claude didn't follow the required sentinel format -- treat as a degenerate
       // response rather than silently guessing which outcome was intended (same "fail
       // loud, don't guess" reasoning as this pipeline's other deterministic gates).
-      return { succeeded: true, blocked: true, blockedReason: 'Adhoc agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome' };
+      const budgetNote = retriedForTurnBudget
+        ? ` (ran out of turns twice in a row -- retried once already at ${attemptTurns}, a larger budget alone will not fix this; total_cost_usd=${totalCostUsd.toFixed(4)})`
+        : ` (total_cost_usd=${totalCostUsd.toFixed(4)})`;
+      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}` };
     }
 
     let rawDiff = '';

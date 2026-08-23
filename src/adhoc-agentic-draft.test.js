@@ -124,3 +124,66 @@ test('draftAdhocImplement cleans up the worktree even when the agentic call thro
   const worktreeList = git(['worktree', 'list'], repoDir);
   assert.equal(worktreeList.split('\n').filter(Boolean).length, 1, 'worktree must be cleaned up even on failure');
 });
+
+// Regression, 2026-08-23: caught live -- a task that ran out of its turn budget mid-
+// investigation (stop_reason:'tool_use', no RESOLUTION line) got blocked immediately,
+// then the OUTER task-retry mechanism re-ran this whole function from scratch at the
+// exact same ADHOC_MAX_TURNS, wasting a full expensive session with no reason to expect
+// a different outcome.
+test('draftAdhocImplement retries ONCE at a larger turn budget when the first attempt runs out of turns mid-investigation', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-6', title: 'Big task', promptContext: { rawText: 'a large task' } };
+
+  const seenMaxTurns = [];
+  let call = 0;
+  const claudeCall = async ({ cwd, maxTurns }) => {
+    seenMaxTurns.push(maxTurns);
+    call += 1;
+    if (call === 1) {
+      // Ran out of turns mid-investigation -- no RESOLUTION line, stop_reason:'tool_use'.
+      return { response: 'Still investigating the second half of this...', stopReason: 'tool_use', costUsd: 0.5 };
+    }
+    fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'v2\n');
+    return { response: 'Finished on the retry.\n\nRESOLUTION: implemented', stopReason: 'end_turn', costUsd: 0.8 };
+  };
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.blocked, false);
+  assert.equal(task.adhocResolution, 'implemented');
+  assert.equal(seenMaxTurns.length, 2, 'must call claudeCall exactly twice -- original attempt plus one retry');
+  assert.ok(seenMaxTurns[1] > seenMaxTurns[0], `retry's maxTurns (${seenMaxTurns[1]}) must be meaningfully larger than the original (${seenMaxTurns[0]})`);
+});
+
+test('draftAdhocImplement gives up (does not retry a second time) when turns are exhausted twice in a row, and surfaces the combined cost', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-7', title: 'Very big task', promptContext: { rawText: 'a very large task' } };
+
+  const seenMaxTurns = [];
+  const claudeCall = async ({ maxTurns }) => {
+    seenMaxTurns.push(maxTurns);
+    return { response: 'Still investigating...', stopReason: 'tool_use', costUsd: 0.5 };
+  };
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.blocked, true);
+  assert.equal(seenMaxTurns.length, 2, 'must not retry a third time -- two exhaustions in a row means a bigger budget alone will not fix it');
+  assert.match(result.blockedReason, /ran out of turns twice/);
+  assert.match(result.blockedReason, /total_cost_usd=1\.0000/);
+});
+
+test('draftAdhocImplement does NOT retry when the response is degenerate rather than turn-exhausted', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-8', title: 'x', promptContext: { rawText: 'x' } };
+
+  let calls = 0;
+  const claudeCall = async () => { calls += 1; return { response: '', degenerate: 'empty', stopReason: 'end_turn' }; };
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.blocked, true);
+  assert.equal(calls, 1, 'a genuinely degenerate (not turn-exhausted) response must not trigger the turn-budget retry');
+});
