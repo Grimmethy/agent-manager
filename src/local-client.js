@@ -172,6 +172,22 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   try {
     const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
     ornithThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
+    // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
+    // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
+    // own response already carries this exact breakdown (load_duration -- time spent
+    // loading/reloading the model, e.g. a context-size swap, BEFORE any generation even
+    // starts -- separate from prompt_eval_duration and eval_duration), but callOnce()
+    // silently discarded it; only reasoning-bench.js's own offline benchmark ever read
+    // it. Diagnosing the real Ollama-timeout root cause this session required
+    // reconstructing this same signal after the fact from journalctl/ps aux archaeology
+    // across a dozen ollama restarts -- this makes it visible directly in the caller's
+    // own log (worker-1.log/review-runner.log, via their existing 2>>"$LOG_FILE"
+    // redirect) for every real call going forward, no reconstruction needed next time.
+    const loadMs = result.load_duration != null ? Math.round(result.load_duration / 1e6) : null;
+    const promptEvalMs = result.prompt_eval_duration != null ? Math.round(result.prompt_eval_duration / 1e6) : null;
+    const evalMs = result.eval_duration != null ? Math.round(result.eval_duration / 1e6) : null;
+    const totalMs = result.total_duration != null ? Math.round(result.total_duration / 1e6) : null;
+    console.error(`[local-client] call timing: model=${body.model} source=${source || 'none'} numCtx=${resolvedNumCtx} loadMs=${loadMs} promptEvalMs=${promptEvalMs} evalMs=${evalMs} totalMs=${totalMs}`);
     return result;
   } finally {
     inflightLock.release(lockPath);
