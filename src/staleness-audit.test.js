@@ -228,6 +228,33 @@ test('buildStalenessAuditTask exposes the original task\'s dates as structured, 
   assert.equal(result.promptContext.originalLastActivityAt, '2026-01-05T00:00:00.000Z');
 });
 
+// Regression, 2026-08-23: staleness-fastpath.js's deterministic recheck needs the
+// ORIGINAL flagged task's source/rule/file to re-run its scanner rule without a second
+// queue read (see that file's own header) -- these must be stamped at filing time, same
+// self-contained-task-JSON principle every other promptContext field here already follows.
+test('buildStalenessAuditTask stamps the original task\'s source/rule/file for staleness-fastpath.js\'s deterministic recheck', () => {
+  const task = makeTask({
+    id: 'observability-x-silent-catch-block-worker-js-3',
+    title: 'Observability triage: silent-catch-block',
+    source: 'observability_review',
+    promptContext: { rule: 'silent-catch-block', file: 'worker.js', line: 3 },
+  });
+  const candidate = { task, reasons: ['possibly-resolved'], lastActivityTs: Date.now() };
+  const result = buildStalenessAuditTask(candidate, 'default');
+  assert.equal(result.promptContext.originalSource, 'observability_review');
+  assert.equal(result.promptContext.originalRule, 'silent-catch-block');
+  assert.equal(result.promptContext.originalFile, 'worker.js');
+});
+
+test('buildStalenessAuditTask leaves originalRule/originalFile null for a task with no rule/file promptContext (e.g. adhoc)', () => {
+  const task = makeTask({ id: 'adhoc-x-1', title: 'do a thing', source: 'adhoc', promptContext: { rawText: 'do a thing' } });
+  const candidate = { task, reasons: ['stale-age'], lastActivityTs: Date.now() };
+  const result = buildStalenessAuditTask(candidate, 'default');
+  assert.equal(result.promptContext.originalSource, 'adhoc');
+  assert.equal(result.promptContext.originalRule, null);
+  assert.equal(result.promptContext.originalFile, null);
+});
+
 test('DEFAULT_STALENESS_THRESHOLD_DAYS is a sane positive default', () => {
   assert.ok(DEFAULT_STALENESS_THRESHOLD_DAYS >= 1);
 });

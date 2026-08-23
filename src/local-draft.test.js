@@ -274,6 +274,93 @@ test('a task with fixedLiterals but NO file field falls through to the normal im
   });
 });
 
+// Regression, 2026-08-23: caught live -- a staleness_audit task auditing a scanner-
+// originated finding burned all 3 infra-requeue rounds on real local-model timeouts and
+// permanently blocked, needing a human to manually re-derive an answer a regex could give
+// with certainty (see staleness-fastpath.js's own header). This proves the plan+implement
+// calls are bypassed entirely for a staleness_audit task whose original finding names a
+// rule this pipeline can re-run deterministically.
+test('a staleness_audit task for a still-live scanner finding skips the model entirely and reports "worth a fresh investigation"', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
+    const task = {
+      id: 'staleness-audit-test-1', domain: 'default', source: 'staleness_audit', title: 'test',
+      promptContext: {
+        originalTaskId: 'observability-x-silent-catch-block-worker-js-1',
+        originalSource: 'observability_review',
+        originalRule: 'silent-catch-block',
+        originalFile: 'worker.js',
+        reasons: ['possibly-resolved'],
+        evidenceText: 'test evidence',
+      },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(callCount, 0, 'no model call should have happened at all -- the rescan is fully deterministic');
+    assert.match(task.implementResponse, /RECOMMENDATION: worth a fresh investigation/);
+    assert.equal(task.promptContext.harnessHits.length, 1);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('a staleness_audit task for a resolved scanner finding skips the model entirely and reports "archive"', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch (e) {\n  logger.error(e);\n}\n');
+    const task = {
+      id: 'staleness-audit-test-2', domain: 'default', source: 'staleness_audit', title: 'test',
+      promptContext: {
+        originalTaskId: 'observability-x-silent-catch-block-worker-js-1',
+        originalSource: 'observability_review',
+        originalRule: 'silent-catch-block',
+        originalFile: 'worker.js',
+        reasons: ['possibly-resolved'],
+        evidenceText: 'test evidence',
+      },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.match(task.implementResponse, /RECOMMENDATION: archive/);
+    assert.equal(callCount, 0);
+  });
+});
+
+test('a staleness_audit task for an unsupported original source (e.g. adhoc) falls through to the normal harness-grounded path, not the deterministic short-circuit', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'staleness-audit-test-3', domain: 'default', source: 'staleness_audit', title: 'test',
+      promptContext: {
+        originalTaskId: 'adhoc-x-1',
+        originalSource: 'adhoc',
+        originalRule: null,
+        originalFile: null,
+        reasons: ['stale-age'],
+        evidenceText: 'test evidence',
+      },
+    };
+
+    const ornithCall = async () => ({ response: 'QUERY: something', degenerate: null, attempts: 1 });
+
+    // Only asserting the short-circuit did NOT fire -- not exercising the full harness
+    // path (needs real registered prompt builders/harness fetch this fixture doesn't set
+    // up), same scope every other test in this file keeps to.
+    await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+
+    const deterministicEvent = (task.history || []).find((h) => (h.detail || '').includes('deterministic recheck'));
+    assert.equal(deterministicEvent, undefined, 'an unsupported originalSource must never trigger the deterministic short-circuit');
+  });
+});
+
 // Regression, 2026-08-23: caught live -- observability-fix-ac-27's implement pass wrote
 // a plausible-but-fabricated `find` string that matched nothing in the real fetched file
 // content it was given, and this only surfaced downstream at apply time after a full
