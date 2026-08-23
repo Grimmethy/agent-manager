@@ -43,6 +43,7 @@ const { providerFor } = require('./model-provider.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { getRegisteredSource } = require('./task-source-registry.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -83,43 +84,32 @@ async function waitForOrnithAvailability(instancesDir, maxWaitAttempts = 3, wait
   }
 }
 
-// Deterministic empty-approve: several sources' implement prompts explicitly instruct
-// "output the empty string if there's nothing real to report" -- an honest empty result is
-// a valid, documented outcome for these, not a failure. Same isEffectivelyEmpty check as
-// apply-group-a.js's own definition.
-// arch_review/arch_import_review/observability_fix/performance_fix/backlog_fulfillment
-// (2026-08-21): joined this list alongside local-draft.js's own allowEmptyImplement update
-// -- see task-sources.js's nextCandidateFulfillmentTask header for the grounding fix this
-// is part of.
-const EMPTY_APPROVAL_SOURCES = [
-  'arch_discovery', 'project_search', 'deep_dive', 'arch_import', 'pipeline_self_audit',
-  'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
-  'function_length_fix',
-];
-
-// staleness_audit (2026-08-22, caught live: a real advisory report got rejected by the
-// deterministic non-implementation gate below) -- deliberately NOT added to
-// EMPTY_APPROVAL_SOURCES above: unlike those sources, an empty implementResponse is
-// never a valid outcome for staleness_audit (its own prompt always asks for a report,
-// even a short "found nothing either way" one -- see stalenessAuditImplementPrompt,
-// prompts.js), so a genuinely empty response here should still be treated as a real
-// degenerate failure, not auto-approved. This list ONLY exempts staleness_audit from the
-// isNonImplementation gate (NON_IMPL_PATTERNS / the <80-char-no-code-fence heuristic)
-// below, which was written assuming every draft is code -- a short, valid "nothing new
-// to add here" advisory report would otherwise trip the same false-positive.
-// observability_review/performance_review (2026-08-23, Grimmethy: "Fix: observability_
-// review/performance_review false-positive verdicts wrongly blocked instead of accepted"
-// -- confirmed live: their own implement prompts (observabilityReviewImplementPrompt/
-// performanceReviewImplementPrompt, prompts.js) explicitly ask for "ONE short paragraph
-// (2-4 sentences)... Plain prose only" on a FALSE POSITIVE/UNCERTAIN verdict, the exact
-// same "genuine short advisory prose, not a refusal" shape staleness_audit's own entry
-// above already carves out -- but a real false-positive paragraph easily lands under the
-// <80-char/no-code-fence heuristic below, and neither source was ever added here, so a
-// correct false-positive verdict was getting blocked as "not a real implementation
-// attempt" before ever reaching apply() -- which (applyArchDiscoveryCandidates, task-
-// sources.js) already treats a plain prose verdict as a documented no-op, proving the
-// intent was always for this prose to pass review, not be rejected by it.
-const ADVISORY_PROSE_SOURCES = ['staleness_audit', 'observability_review', 'performance_review', 'function_length_review'];
+// Deterministic empty-approve: several task sources' implement prompts explicitly ask for
+// the empty string when there's genuinely nothing to change (see prompts.js), a legitimate
+// approved outcome at review time -- and (2026-08-22/23) some are further exempted from
+// the isNonImplementation gate below (NON_IMPL_PATTERNS / the <80-char-no-code-fence
+// heuristic, written assuming every draft is code) because their OWN valid deliverable
+// can be a short advisory prose verdict instead -- a real "false positive, here's why"
+// paragraph, or staleness_audit's own short "nothing new to add here" report, would
+// otherwise trip the same false-positive-for-refusal heuristic.
+//
+// 2026-08-23 (Grimmethy: "What else needs to be moved in order to properly modularize
+// the maintenance tasks?"): both used to be hardcoded arrays here, duplicated ALMOST
+// verbatim as local-draft.js's own allowEmptyImplement/CANDIDATE_FULFILLMENT_SOURCES --
+// confirmed live, EMPTY_APPROVAL_SOURCES and allowEmptyImplement were the exact same 11
+// names, a duplicate-list bug class waiting to happen (add a source to one, forget the
+// other). Now read directly off each source's own registerTaskSource() entry
+// (emptyApproval/advisoryProse flags) instead -- the actual prerequisite a plugin needed
+// to add a new maintenance source without editing this file at all; see
+// function-length-review.js's own registration for the pattern.
+function isEmptyApprovalSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.emptyApproval);
+}
+function isAdvisoryProseSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.advisoryProse);
+}
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
@@ -287,7 +277,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   const trimmedImplResponse = (task.implementResponse || '').trim();
   const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
 
-  if (EMPTY_APPROVAL_SOURCES.includes(task.source) && effectivelyEmpty) {
+  if (isEmptyApprovalSource(task.source) && effectivelyEmpty) {
     task.reviewedAt = new Date().toISOString();
     task.reviewProvider = 'deterministic-empty-approve';
     task.ornithVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no Ornith vote spent -- this is deterministic, not a judgment call)`;
@@ -303,7 +293,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       isNonImplementation = true;
     }
   }
-  if (isNonImplementation && !EMPTY_APPROVAL_SOURCES.includes(task.source) && !ADVISORY_PROSE_SOURCES.includes(task.source)) {
+  if (isNonImplementation && !isEmptyApprovalSource(task.source) && !isAdvisoryProseSource(task.source)) {
     const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).';
     task.reviewProvider = 'deterministic-non-implementation';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });

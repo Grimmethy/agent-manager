@@ -27,6 +27,17 @@ const path = require('path');
 // run prints a real uncaught-exception stack trace to stderr for no benefit. A
 // throwaway value matches apply-task.test.js's own identical reasoning for the same var.
 process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || require('os').tmpdir();
+process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
+
+// 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
+// each source's emptyApproval/advisoryProse flag off the shared task-source-registry
+// (see that file's own comment) instead of a hardcoded local array -- which means the
+// real registrations (task-sources.js's own registerTaskSource calls) have to have
+// actually run before this test file's assertions about staleness_audit/
+// observability_review/performance_review mean anything. Production always loads
+// task-sources.js first; this test file didn't, so it's required here too, matching
+// real load order rather than a standalone fixture.
+require('./task-sources.js');
 
 const { reviewTask, buildVerdictPrompt } = require('./review-task.js');
 
