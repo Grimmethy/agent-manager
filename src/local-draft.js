@@ -342,6 +342,26 @@ async function draftTask(task, {
         return { succeeded: true, blocked: false };
       }
 
+      // 2026-08-23, Grimmethy: "Investigate: arch_review/arch_import drafts hedge instead
+      // of grounding in real source" -- confirmed live: even with archImportImplementPrompt's
+      // explicit "if the searches found nothing... output the empty string" instruction,
+      // the model frequently fabricated a plausible-looking candidate anyway (invented
+      // file paths, classes, APIs) rather than reliably following it -- caught by fact-
+      // check/review every time (so nothing wrong ever shipped), but burning a real call
+      // and a full review cycle on a draft that was doomed from the moment harness search
+      // came back empty. Skipping the implement call entirely on a genuine zero-hit
+      // search removes the temptation altogether -- deterministic, not a prompt tweak the
+      // model can still ignore. arch_import is in EMPTY_APPROVAL_SOURCES (review-task.js),
+      // so this empty implementResponse auto-approves with zero further Ornith spend, the
+      // exact outcome a compliant model would have produced anyway.
+      if (task.source === 'arch_import' && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
+        task.implementResponse = '';
+        appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
+        task.status = 'needs-review';
+        appendHistoryEvent(task, 'needs-review');
+        return { succeeded: true, blocked: false };
+      }
+
       const implPrompt = buildImplementPrompt(task, task.planResponse);
       const implStartedAt = new Date().toISOString();
       const implStartMs = Date.now();
