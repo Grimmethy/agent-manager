@@ -187,6 +187,36 @@ test('a non-adhoc/research task locks around EVERY real call (plan, implement, c
   });
 });
 
+// Regression, 2026-08-23: caught live -- arch_import drafts routinely fabricated
+// plausible-looking file paths/APIs even when archImportImplementPrompt explicitly told
+// the model to output the empty string on a genuine zero-hit search. Since queries with
+// no "QUERY:" lines in the plan response never even call archImportFetch (harnessHits
+// stays the default []), this test triggers the deterministic skip without needing to
+// mock the real grep-based fetch at all.
+test('arch_import skips the implement call entirely (deterministic empty, not left to the model) when the plan proposes zero search queries', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-import-test-1', domain: 'default', source: 'arch_import',
+      title: 'test', promptContext: { sourceProject: 'other-repo', rating: 'Strong', itemTitle: 'x', itemRationale: 'y' },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => {
+      callCount += 1;
+      if (callCount > 1) throw new Error('implement must never be called when harnessHits is empty -- the whole point of the deterministic skip');
+      return { response: 'no useful search terms come to mind for this one', degenerate: null, attempts: 1 }; // plan -- deliberately zero QUERY: lines
+    };
+
+    const result = await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.implementResponse, '');
+    assert.equal(callCount, 1, 'only the plan call should have happened');
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
 test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local, not a crash', async () => {
   await withFixtureRepo(async (draftTask) => {
     delete process.env.LOCAL_MODEL; // the exact edge case local-client.js's own fallback-removal fix made newly possible
