@@ -132,6 +132,37 @@ test('computeTimeAccounting: a db with no cost_usd column at all reports zero co
   assert.equal(result.totalCostUsd, 0);
   assert.equal(result.callsWithCost, 0);
   assert.deepEqual(result.costBySource, []);
+  assert.equal(result.totalHypotheticalCostUsd, 0);
+  assert.equal(result.callsWithHypotheticalCost, 0);
+  assert.deepEqual(result.hypotheticalCostBySource, []);
+});
+
+// 2026-08-23, Grimmethy: "I'd like estimates for if we had used the API. Even if we used
+// the local models." -- hypothetical_cost_usd is populated for EVERY call (real Claude
+// AND local), unlike cost_usd (real spend, null for a local call).
+test('computeTimeAccounting: sums hypothetical_cost_usd for BOTH real Claude calls and local-model calls', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dir = tempDir();
+  const dbPath = path.join(dir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT, task_id TEXT, started_at TEXT, latency_ms INTEGER, cost_usd REAL, hypothetical_cost_usd REAL)');
+  // A real Claude call: cost_usd and hypothetical_cost_usd are the same real number.
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms, cost_usd, hypothetical_cost_usd) VALUES (?, ?, ?, ?, ?, ?)').run('c1', 'task-a', '2026-08-19T10:10:00.000Z', 5000, 0.30, 0.30);
+  // A local call: cost_usd is null (free), but hypothetical_cost_usd is a real token-based estimate.
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms, cost_usd, hypothetical_cost_usd) VALUES (?, ?, ?, ?, ?, ?)').run('c2', 'task-b', '2026-08-19T10:15:00.000Z', 2000, null, 0.02);
+  db.close();
+
+  const tasks = [
+    { id: 'task-a', source: 'manual', classification: 'benefit' },
+    { id: 'task-b', source: 'brain_dump_sort', classification: 'housekeeping' },
+  ];
+  const result = computeTimeAccounting(dbPath, tasks, '2026-08-19T10:00:00.000Z', '2026-08-19T11:00:00.000Z');
+  assert.ok(Math.abs(result.totalCostUsd - 0.30) < 1e-9, 'real spend only counts the real Claude call');
+  assert.ok(Math.abs(result.totalHypotheticalCostUsd - 0.32) < 1e-9, 'hypothetical covers both calls');
+  assert.equal(result.callsWithHypotheticalCost, 2);
+  assert.ok(Math.abs(result.bucketHypotheticalCostUsd.housekeeping - 0.02) < 1e-9, 'the all-local bucket still shows a real hypothetical estimate');
+  const local = result.hypotheticalCostBySource.find((s) => s.source === 'brain_dump_sort');
+  assert.ok(Math.abs(local.costUsd - 0.02) < 1e-9);
 });
 
 test('computeTimeAccounting: sums cost_usd per classification bucket AND per task source', () => {
@@ -315,7 +346,7 @@ test('renderMarkdown includes Queue Health, Failure Patterns, and Self-Audit Act
 
 // Estimated Anthropic API Cost section (2026-08-23, Grimmethy: "We should track it in the
 // hourly/daily/weekly logs").
-test('renderMarkdown includes an Estimated Anthropic API Cost section with a source breakdown', () => {
+test('renderMarkdown includes an Estimated API Cost by Source section using the hypothetical (real + local-estimate) figure', () => {
   const md = renderMarkdown({
     period: 'hourly',
     startIso: '2026-08-20T10:00:00.000Z',
@@ -325,12 +356,14 @@ test('renderMarkdown includes an Estimated Anthropic API Cost section with a sou
     timeAccounting: {
       bucketSec: { benefit: 60 }, bucketCalls: { benefit: 1 },
       bucketCostUsd: { benefit: 0.42, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
-      totalCostUsd: 0.42, callsWithCost: 1,
-      costBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
+      totalCostUsd: 0.42, callsWithCost: 1, costBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
+      bucketHypotheticalCostUsd: { benefit: 0.42, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
+      totalHypotheticalCostUsd: 0.42, callsWithHypotheticalCost: 1,
+      hypotheticalCostBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
     },
     queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
   });
-  assert.match(md, /## Estimated Anthropic API Cost by Source/);
+  assert.match(md, /## Estimated API Cost by Source \(if every call had used the API\)/);
   assert.match(md, /\$0\.4200/);
   assert.match(md, /manual: \$0\.4200 \(1 call\(s\)\)/);
 });
@@ -338,7 +371,10 @@ test('renderMarkdown includes an Estimated Anthropic API Cost section with a sou
 // 2026-08-23, Grimmethy: "I'd like the main time tracking data frame to also include an
 // estimated token cost for that period" -- cost belongs INLINE in the wall-clock-time
 // bucket line itself, not only in a separate section repeating the same buckets.
-test('renderMarkdown folds estimated cost directly into the wall-clock-time bucket line, not just a separate section', () => {
+// Clarified same day: "I'd like estimates for if we had used the API. Even if we used
+// the local models" -- so the inline figure is the HYPOTHETICAL one (covers a bucket
+// that ran entirely on local models too), not real-spend-only.
+test('renderMarkdown folds the hypothetical (real + local-estimate) cost directly into the wall-clock-time bucket line', () => {
   const md = renderMarkdown({
     period: 'hourly',
     startIso: '2026-08-20T10:00:00.000Z',
@@ -347,55 +383,77 @@ test('renderMarkdown folds estimated cost directly into the wall-clock-time buck
     downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
     timeAccounting: {
       bucketSec: { benefit: 60, junk: 30 }, bucketCalls: { benefit: 1, junk: 2 },
-      bucketCostUsd: { benefit: 0.42, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
-      totalCostUsd: 0.42, callsWithCost: 1,
-      costBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
+      bucketCostUsd: { benefit: 0.30, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
+      totalCostUsd: 0.30, callsWithCost: 1, costBySource: [{ source: 'manual', costUsd: 0.30, calls: 1 }],
+      // Junk's bucket is entirely LOCAL-model driven (no real Claude spend, cost_usd=0)
+      // but still has a real hypothetical estimate -- this is exactly the case that used
+      // to render as nothing at all before this feature.
+      bucketHypotheticalCostUsd: { benefit: 0.30, junk: 0.05, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
+      totalHypotheticalCostUsd: 0.35, callsWithHypotheticalCost: 3,
+      hypotheticalCostBySource: [{ source: 'manual', costUsd: 0.35, calls: 3 }],
     },
     queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
   });
   const timeSection = md.split('## Junk vs. Benefit (by real wall-clock time')[1].split('## ')[0];
-  assert.match(timeSection, /Benefit: 1m \(1 call\(s\), \$0\.4200 est\.\)/);
-  // A bucket with zero cost must NOT show a misleading "$0.0000 est." tacked on.
-  assert.match(timeSection, /Junk: 30s \(2 call\(s\)\)/);
-  assert.doesNotMatch(timeSection, /Junk:.*est\./);
-  assert.match(timeSection, /\*\*Total estimated cost: \$0\.4200\*\*/);
+  assert.match(timeSection, /Benefit: 1m \(1 call\(s\), \$0\.3000 est\. if API\)/);
+  // Junk ran entirely on local models (no real Claude spend) but must STILL show its
+  // hypothetical estimate -- this is the exact gap the "even if local" clarification closed.
+  assert.match(timeSection, /Junk: 30s \(2 call\(s\), \$0\.0500 est\. if API\)/);
+  assert.match(timeSection, /\*\*Total if every call this period had used the Anthropic API: \$0\.3500\*\*/);
+  assert.match(timeSection, /of which \$0\.3000 was REAL spend/);
 });
 
-test('renderMarkdown reports "no Claude calls" plainly when timeAccounting exists but nothing cost anything', () => {
+test('renderMarkdown reports plainly when no model calls have a usable cost estimate at all this period', () => {
   const md = renderMarkdown({
     period: 'hourly',
     startIso: '2026-08-20T10:00:00.000Z',
     endIso: '2026-08-20T11:00:00.000Z',
     tasks: [],
     downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
-    timeAccounting: { bucketSec: {}, bucketCalls: {}, bucketCostUsd: {}, totalCostUsd: 0, callsWithCost: 0, costBySource: [] },
+    timeAccounting: {
+      bucketSec: {}, bucketCalls: {}, bucketCostUsd: {}, totalCostUsd: 0, callsWithCost: 0, costBySource: [],
+      bucketHypotheticalCostUsd: {}, totalHypotheticalCostUsd: 0, callsWithHypotheticalCost: 0, hypotheticalCostBySource: [],
+    },
     queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
   });
-  assert.match(md, /## Estimated Anthropic API Cost/);
-  assert.match(md, /every real model call ran locally, free/);
+  assert.match(md, /## Estimated API Cost by Source \(if every call had used the API\)/);
+  assert.match(md, /No model calls with a usable token\/cost estimate this period/);
 });
 
-test('buildPlainEnglishSummary mentions the real Anthropic API cost estimate when Claude calls happened', () => {
+test('buildPlainEnglishSummary mentions the hypothetical (if-API) cost estimate, distinguishing real spend from local-call estimate', () => {
   const summary = buildPlainEnglishSummary({
     period: 'hourly',
     tasks: [{ classification: 'benefit', title: 'Ship a real fix' }],
     byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
     blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
     downtime: { pipelineDownSec: 0 },
-    timeAccounting: { totalCostUsd: 0.42, callsWithCost: 1 },
+    timeAccounting: { totalCostUsd: 0.30, callsWithCost: 1, totalHypotheticalCostUsd: 0.35, callsWithHypotheticalCost: 3 },
   });
-  assert.match(summary, /\$0\.4200/);
-  assert.match(summary, /never billed per-token/);
+  assert.match(summary, /\$0\.3500/);
+  assert.match(summary, /\$0\.3000 of that was REAL Claude spend/);
 });
 
-test('buildPlainEnglishSummary says nothing about cost when no Claude calls happened this period', () => {
+test('buildPlainEnglishSummary describes an all-local period honestly (real spend $0, but a real hypothetical estimate)', () => {
   const summary = buildPlainEnglishSummary({
     period: 'hourly',
     tasks: [{ classification: 'benefit', title: 'Ship a real fix' }],
     byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
     blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
     downtime: { pipelineDownSec: 0 },
-    timeAccounting: { totalCostUsd: 0, callsWithCost: 0 },
+    timeAccounting: { totalCostUsd: 0, callsWithCost: 0, totalHypotheticalCostUsd: 0.05, callsWithHypotheticalCost: 2 },
+  });
+  assert.match(summary, /\$0\.0500/);
+  assert.match(summary, /actually ran locally, free/);
+});
+
+test('buildPlainEnglishSummary says nothing about cost when there is no usable token/cost data at all this period', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'hourly',
+    tasks: [{ classification: 'benefit', title: 'Ship a real fix' }],
+    byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+    downtime: { pipelineDownSec: 0 },
+    timeAccounting: { totalCostUsd: 0, callsWithCost: 0, totalHypotheticalCostUsd: 0, callsWithHypotheticalCost: 0 },
   });
   assert.doesNotMatch(summary, /Anthropic API/);
 });

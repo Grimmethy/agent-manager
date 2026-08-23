@@ -17,6 +17,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { estimateApiCostUsd } = require('./anthropic-pricing.js');
 
 const SCRIPT_PATH = path.join(__dirname, 'model-stats-db.js');
 
@@ -73,6 +74,23 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
     // module's result shape has no costUsd field at all), which is exactly what should
     // happen: a null cost_usd row means "free local call," not "unknown cost."
     costUsd: result && result.costUsd != null ? result.costUsd : null,
+    // hypotheticalCostUsd (2026-08-23, Grimmethy: "Clarification on the anthropic costs.
+    // I'd like estimates for if we had used the API. Even if we used the local models.")
+    // -- costUsd above is real spend for an ACTUAL Claude call and null for a local one;
+    // this is "what would THIS call have cost on the API regardless of what actually ran
+    // it" -- the real costUsd when this genuinely was a Claude call (no token-count
+    // fields exist on that result shape to estimate from, and the real number is already
+    // exact), or a token-based estimate (anthropic-pricing.js, against real
+    // prompt_eval_count/eval_count Ollama already reports) for a local call. Always
+    // populated (never null) so SUM(hypothetical_cost_usd) alone answers "what if
+    // everything this period had gone through the API," while SUM(cost_usd) still
+    // answers "what did we actually spend" -- two different, both real, questions.
+    hypotheticalCostUsd: result && result.costUsd != null
+      ? result.costUsd
+      : estimateApiCostUsd({
+        promptTokens: result && result.prompt_eval_count != null ? result.prompt_eval_count : 0,
+        completionTokens: result && result.eval_count != null ? result.eval_count : 0,
+      }),
     attempts: result && result.attempts != null ? result.attempts : null,
     degenerate: result && result.degenerate != null ? result.degenerate : null,
   });

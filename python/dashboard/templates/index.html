@@ -942,14 +942,23 @@ async function renderModelsTab() {
   // under a Claude subscription, never pay-per-token, so this is what the SAME work
   // would have cost on the API, not what was actually charged.
   const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  // hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // totalCostUsd above (real spend, only real Claude calls contribute), this covers
+  // EVERY call, local ones included (a token-based estimate via anthropic-pricing.js for
+  // those) -- see api_models_cost_summary's own docstring.
+  const hyp = costSummary.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
   const costWidget = `
     <div class="grill-session" style="margin-bottom:16px">
       <div class="field-label">Estimated Anthropic API Cost</div>
       <div class="row" style="gap:24px;margin-top:6px">
-        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>total (all time)</div>
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>real spend (all time)</div>
         <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
         <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
         ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What EVERY call this pipeline has ever made -- including the ones that ran locally, free -- would have cost had it gone through the Anthropic API instead. Real Claude calls use their real cost; local calls are a token-based estimate."><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if every call had used the API (${hyp.totalCalls} call(s))</div>
       </div>
     </div>`;
 
@@ -1533,10 +1542,16 @@ function renderTaskDetailModal(task) {
   // task at all -- shown only when there's something real to show.
   if (task._costSummary) {
     const cs = task._costSummary;
-    const label = cs.totalCostUsd > 0
-      ? `${fmtUsd(cs.totalCostUsd)} est. (${cs.callsWithCost}/${cs.totalCalls} call(s) via Claude)`
-      : `Free -- all ${cs.totalCalls} call(s) local`;
-    html += `<div class="field-label">Estimated API Cost</div><div>${label}</div>`;
+    // hypotheticalCostUsd (2026-08-23, Grimmethy: "Clarification on the anthropic
+    // costs. I'd like estimates for if we had used the API. Even if we used the local
+    // models.") -- unlike totalCostUsd (real spend, $0 for an all-local task), this is
+    // always a real number: what THIS task would have cost had every one of its calls,
+    // local or not, gone through the API.
+    const realLabel = cs.totalCostUsd > 0
+      ? `${fmtUsd(cs.totalCostUsd)} real (${cs.callsWithCost}/${cs.totalCalls} call(s) via Claude)`
+      : `$0 real -- all ${cs.totalCalls} call(s) ran locally`;
+    const hLabel = cs.hypotheticalCostUsd != null ? ` · ${fmtUsd(cs.hypotheticalCostUsd)} est. if every call had used the API` : '';
+    html += `<div class="field-label">Estimated API Cost</div><div>${realLabel}${hLabel}</div>`;
   }
   // task.title is truncated to 120 chars at creation time (see app.py's brain-dump
   // ingestion) -- the full original text lives in promptContext.rawText and was never
