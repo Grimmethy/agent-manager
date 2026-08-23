@@ -162,6 +162,71 @@ while :; do                                                                     
       # file in review/ rather than lose it; it's picked up again next tick. Matches
       # ornith-worker.sh's own "leave claimed work in place on an unhandled error" choice.
       printf '[review-%s] review call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
+
+      # 2026-08-23, Grimmethy: "build it" -- same gap local-worker.sh's own draft-call
+      # path had before tonight's DRAFT_FAILURE_RETRY_LIMIT fix, just discovered live on
+      # the review side: leaving a failed item in review/ forever (with no counter, no
+      # bound) means a task whose review call genuinely never succeeds -- not just a
+      # transient Ollama blip, but something pathological about THIS task's prompt --
+      # retries every single tick, indefinitely, burning a real 3-vote majority attempt
+      # each time with no eventual outcome and no visibility. The retry-in-place itself
+      # is fine and stays (a transient Ollama timeout SHOULD just succeed on a later
+      # tick) -- what was missing is a bound and an eventual give-up, mirroring the
+      # draft-call fix's same infra-vs-not distinction and requeue-round budget.
+      review_failure_count="$(node -e '
+        const fs = require("fs");
+        const p = process.argv[1];
+        try {
+          const o = JSON.parse(fs.readFileSync(p, "utf8"));
+          o.reviewFailureCount = (o.reviewFailureCount || 0) + 1;
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log(o.reviewFailureCount);
+        } catch (e) { console.log(1); }
+      ' "$file")"
+
+      if [[ "${review_failure_count:-1}" -ge "${REVIEW_FAILURE_RETRY_LIMIT:-5}" ]]; then
+        action="$(node -e '
+          const fs = require("fs");
+          const p = process.argv[1];
+          const reviewResult = process.argv[2];
+          const failureCount = process.argv[3];
+          const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
+          const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
+          let o;
+          try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
+          const isInfra = INFRA_FAILURE_PATTERN.test(reviewResult || "");
+          const infraRequeueCount = o.reviewInfraRequeueCount || 0;
+          o.history = o.history || [];
+          if (isInfra && infraRequeueCount < infraRequeueLimit) {
+            o.reviewInfraRequeueCount = infraRequeueCount + 1;
+            o.reviewFailureCount = 0;
+            o.history.push({
+              stage: "requeued",
+              at: new Date().toISOString(),
+              detail: `review call failed ${failureCount} times in a row on an apparent infra outage (most recent: ${reviewResult}) -- staying in review/ for another round (survived outage round ${o.reviewInfraRequeueCount}/${infraRequeueLimit}) instead of retrying forever unbounded`,
+            });
+            fs.writeFileSync(p, JSON.stringify(o, null, 2));
+            console.log("continue");
+          } else {
+            const reason = isInfra
+              ? `review call failed on an apparent infra outage that did not clear even after ${infraRequeueCount} requeue round(s) -- giving up rather than retrying forever (most recent: ${reviewResult})`
+              : `review call failed ${failureCount} times in a row (most recent: ${reviewResult}) -- giving up rather than retrying every tick forever`;
+            o.blockedStage = "review";
+            o.blockedReason = reason;
+            o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
+            fs.writeFileSync(p, JSON.stringify(o, null, 2));
+            console.log("block");
+          }
+        ' "$file" "$review_result" "$review_failure_count" "${REVIEW_INFRA_REQUEUE_LIMIT:-3}")"
+
+        if [[ "$action" == "block" ]]; then
+          mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
+          mv -n "$file" "${QUEUE_DIR}/blocked/${name}"
+          printf '[review-%s] giving up on %s after %s failed review attempts -- moved to blocked/\n' "$INSTANCE_ID" "$task_id" "$review_failure_count" >&2
+        fi
+        # action == "continue": stays in review/, counter reset -- next tick's normal
+        # retry-in-place already picks it up again, nothing more to do here.
+      fi
     fi
     write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"
     did_work=true
