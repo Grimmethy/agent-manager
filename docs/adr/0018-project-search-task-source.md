@@ -19,8 +19,8 @@ auto-promotes a finding into fulfillment work. A human decides what happens to a
 ### Why the harness does the searching, not Ornith
 
 Confirmed during design: Ornith has no internet access in either of its call paths.
-`src/ornith-client.js`'s `/api/generate` call has no `tools` field at all; `/api/chat`
-(`src/ornith-tool-client.js`) supports Ollama's `tools` array in principle but the only
+`src/local-client.js`'s `/api/generate` call has no `tools` field at all; `/api/chat`
+(`src/local-tool-client.js`) supports Ollama's `tools` array in principle but the only
 tool wired up is `grep_codebase` — read-only, local, no network. Every existing source
 (`arch_discovery`, `arch_review`, `secondbrain`, `trouble_log`) is codebase-internal for
 the same reason. `project_search` extends the established "harness fetches, Ornith

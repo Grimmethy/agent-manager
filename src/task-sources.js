@@ -557,7 +557,7 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
 // can drain it. The model has no filesystem access, so every real file this needs is read
 // here and embedded verbatim into promptContext.
 // Was 60000, same bug and same fix as DEEP_DIVE_CONTEXT_BUDGET_CHARS below (see its
-// comment) -- nearly double ornith-client.js's num_ctx=8192 default, which arch_discovery's
+// comment) -- nearly double local-client.js's num_ctx=8192 default, which arch_discovery's
 // plan call never overrides. Hadn't yet triggered a live degenerate-empty failure the way
 // deep_dive's did, but the same overflow risk existed regardless.
 const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 24000;
@@ -654,7 +654,7 @@ function nextArchDiscoveryTask() {
 // already-known leads happens via the INDEX.md content embedded below, read by Ornith
 // itself when proposing queries and synthesizing findings.
 function nextProjectSearchTask() {
-  // Real GitHub/HuggingFace search happens later, in ornith-draft.js's harness-fetch step
+  // Real GitHub/HuggingFace search happens later, in local-draft.js's harness-fetch step
   // (project-search-fetch.js) -- but that's AFTER a plan+implement pass has already been
   // spent drafting this task. Checking connectivity here, before the task is even
   // generated, is what actually stops the "ton of blocked repo search jobs" (offline
@@ -696,7 +696,7 @@ function nextProjectSearchTask() {
 // leads takes priority over finding more of them.
 //
 // Was 60000 (~15K tokens) -- confirmed live 2026-07-21 this was nearly double
-// ornith-client.js's num_ctx=8192 default, which deep_dive's plan/implement calls never
+// local-client.js's num_ctx=8192 default, which deep_dive's plan/implement calls never
 // override. A community anywhere near the old ceiling had literally no room left in the
 // context window for a response, regardless of thinking mode -- the no-think retry
 // fallback (ornith-worker.ps1) helps the THINKING-budget-exhaustion failure mode, but
@@ -768,7 +768,7 @@ function onboardDeepDiveProject(lead, clonesDir) {
     // dashboard: PACKAGE_ROOT/.venv/bin/python) -- that's where build_graph.py's actual
     // dependencies (networkx, per python/requirements.txt) are installed. Falls back to a
     // bare python3/python off PATH for a consumer without this exact venv layout. Two
-    // stacked bugs found live 2026-08-14, both silent until now (ornith-worker.sh only
+    // stacked bugs found live 2026-08-14, both silent until now (local-worker.sh only
     // recently started keeping task-sources.js's stderr instead of discarding it to
     // /dev/null): (1) the original hardcoded 'python' is a Windows-ism -- most Linux
     // distros, this one included, only ever install a 'python3' binary, no 'python' alias,
@@ -1582,9 +1582,9 @@ function taskPriority(name, def) {
 // exact feature: drafting/review worked (both go through prompts.js), but apply fell
 // through to the generic Group B JSON-diff path and failed parsing a real unified diff
 // as JSON, every time, until this was moved here.
-// reasoningTier: 'high' -- feeds ornith-worker.sh's worker-lane claim filter (via
+// reasoningTier: 'high' -- feeds local-worker.sh's worker-lane claim filter (via
 // model-provider.js's reasoningTierFor()) so worker-reasoning* claims adhoc tasks, matching
-// what ornith-draft.js's own resolveSourceName()==='adhoc' branch already hardcodes
+// what local-draft.js's own resolveSourceName()==='adhoc' branch already hardcodes
 // regardless of this registration -- kept here so the two can't drift apart (Brain Dump
 // #77's generalized tier filter, replacing the earlier adhoc-hardcoded bash check).
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high' });
@@ -2192,7 +2192,7 @@ registerTaskSource('backlog_fulfillment', {
 // retry (priority 69, beats arch_discovery/arch_import/observability_review at 79/80/79)
 // having a real 20+ item backlog, worker-1's generation calls kept returning a high-tier
 // retry task every single tick, which worker-1 then correctly declined to CLAIM (see
-// ornith-worker.sh's tier filter) -- but never got far enough down the ladder to generate
+// local-worker.sh's tier filter) -- but never got far enough down the ladder to generate
 // any LOW-tier work for itself either, so worker-1 sat idle while worker-reasoning did
 // everything. A mismatched-tier task is skipped (not returned) and the ladder keeps
 // walking to the next source instead of stopping -- safe because every next() function
@@ -2335,7 +2335,7 @@ if (require.main === module) {
   const researchDir = path.join(pipelineDir, 'queue', 'research');
   // Checked pendingDir only until 2026-08-14 -- a claimed task moves OUT of pending/ into
   // drafting/<instanceId>/ within the same worker tick that claims it (see
-  // ornith-worker.sh), well before the real plan/implement/critique work behind it is
+  // local-worker.sh), well before the real plan/implement/critique work behind it is
   // done, so pending/ alone reads "empty" almost immediately after every claim regardless
   // of how deep the real backlog sitting in drafting/ already is. Confirmed live: 15+
   // project_search tasks piled up in drafting/ while this throttle kept seeding a new one

@@ -61,7 +61,7 @@ CLAUDE_DISCUSS_MAX_TURNS = 8
 # giving it real grounding means the HARNESS decides what to search for (via a cheap,
 # separate proposal call, see _ornith_harness_context below) and greps on the model's
 # behalf, then hands back real content as part of the actual prompt. Same two-call shape
-# ornith-draft.js's own arch_import plan->implement step already uses in production
+# local-draft.js's own arch_import plan->implement step already uses in production
 # (propose search terms, harness runs grep-codebase-tool.js, implement pass gets real
 # hits) -- this is that same pattern's Discuss-side twin, via grep_fetch_client.py.
 QUERY_LINE_RE = re.compile(r'^QUERY:\s*(.+)$', re.MULTILINE)
@@ -167,7 +167,7 @@ def _ornith_harness_context(subject_text: str, transcript: list, repo_root: str,
         fetched = grep_fetch_client.fetch_for_queries(_expand_grep_terms(queries), repo_root, grep_dirs)
     except grep_fetch_client.GrepFetchError:
         # Best-effort -- a broken search must never break the actual conversation turn,
-        # same "non-fatal, fall through" treatment ornith-draft.js's own harness-search
+        # same "non-fatal, fall through" treatment local-draft.js's own harness-search
         # branches give a failed archImportFetch() call.
         return None
 

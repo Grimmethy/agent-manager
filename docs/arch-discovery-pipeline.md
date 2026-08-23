@@ -3,7 +3,7 @@
 Design reached via `/grill-me` on 2026-07-12; decision recorded in
 [ADR-0017](../adr/0017-arch-discovery-pipeline.md). This doc is the implementation
 reference — update it as the pattern changes, same convention as
-`Docs/agents/ornith-delegation.md`.
+`Docs/agents/local-delegation.md`.
 
 **Status as of 2026-07-12: designed, not built.** Nothing below exists in the codebase yet.
 This is the spec the implementation should match.

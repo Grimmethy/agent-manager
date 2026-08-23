@@ -122,7 +122,7 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
     bash "${SCRIPT_DIR}/local-worker.sh" worker-1
 
   # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17) -- claims ONLY
-  # adhoc-shaped tasks (see ornith-worker.sh's own IS_CLAUDE_LANE comment), running
+  # adhoc-shaped tasks (see local-worker.sh's own IS_CLAUDE_LANE comment), running
   # independently of worker-1 so a multi-minute agentic Claude call never blocks Ornith's
   # own throughput. Conditioned on CLAUDE_CODE_OAUTH_TOKEN the same way the apply loop
   # below is conditioned on AGENT_MANAGER_INCLUDE_APPLY -- a deployment with no Claude

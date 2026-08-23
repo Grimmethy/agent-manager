@@ -37,7 +37,7 @@ function main() {
       }
     }
     // toolCallLog lives directly on the task object, not inside promptContext -- it's
-    // added by a plan pass that used a tool (see ornith-tool-client.js), not pre-fetched
+    // added by a plan pass that used a tool (see local-tool-client.js), not pre-fetched
     // deterministically like the fields above. Without this, a plan pass that used a tool
     // correctly and found something real would still get rejected as "unverifiable".
     if (task.toolCallLog && task.toolCallLog.length > 0) {
