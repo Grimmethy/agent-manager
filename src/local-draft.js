@@ -257,6 +257,37 @@ async function draftTask(task, {
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
+      // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" --
+      // caught live via a Grill-skills adhoc task exhausting both retries because the
+      // model couldn't reliably reproduce a 4362-char fixedLiterals block character-for-
+      // character in a JSON string, despite the exact find text AND the exact replace
+      // content both already being fully specified in the task itself -- there was never
+      // any real judgment call for a model to make, only a copy-accuracy risk). When a
+      // task's promptContext gives file+find+exactly-one-fixedLiterals-block all fully
+      // spelled out, the correct groupBJsonInstructions edit directive is 100%
+      // determined already -- constructing it directly in code guarantees an exact
+      // match every time and skips a model call (and its failure mode) entirely. Domain/
+      // source-agnostic and placed before the adhoc branch below so an adhoc-shaped task
+      // authored this way never even reaches the expensive Claude agentic tiers for
+      // something that needed zero real reasoning.
+      const literalEditLiterals = (task.promptContext && Array.isArray(task.promptContext.fixedLiterals))
+        ? task.promptContext.fixedLiterals
+        : [];
+      if (task.promptContext && typeof task.promptContext.file === 'string' && task.promptContext.file
+        && typeof task.promptContext.find === 'string' && task.promptContext.find
+        && literalEditLiterals.length === 1 && typeof literalEditLiterals[0].content === 'string' && literalEditLiterals[0].content) {
+        task.implementResponse = JSON.stringify({
+          mode: 'edit',
+          file: task.promptContext.file,
+          find: task.promptContext.find,
+          replace: literalEditLiterals[0].content,
+        });
+        appendHistoryEvent(task, 'implement-done', 'deterministic find/replace (file, find, and the single fixedLiterals block were all fully specified in the task -- constructed directly instead of asking the model to reproduce content it was already handed verbatim)');
+        task.status = 'needs-review';
+        appendHistoryEvent(task, 'needs-review');
+        return { succeeded: true, blocked: false };
+      }
+
       // adhoc-shaped tasks ("Process now" queues one of these -- see
       // task-source-registry.js's resolveSourceName() for why this checks the SAME
       // resolved name apply-task.js's own writeArtifact() dispatch uses, not a raw
