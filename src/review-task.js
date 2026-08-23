@@ -106,7 +106,19 @@ const EMPTY_APPROVAL_SOURCES = [
 // isNonImplementation gate (NON_IMPL_PATTERNS / the <80-char-no-code-fence heuristic)
 // below, which was written assuming every draft is code -- a short, valid "nothing new
 // to add here" advisory report would otherwise trip the same false-positive.
-const ADVISORY_PROSE_SOURCES = ['staleness_audit'];
+// observability_review/performance_review (2026-08-23, Grimmethy: "Fix: observability_
+// review/performance_review false-positive verdicts wrongly blocked instead of accepted"
+// -- confirmed live: their own implement prompts (observabilityReviewImplementPrompt/
+// performanceReviewImplementPrompt, prompts.js) explicitly ask for "ONE short paragraph
+// (2-4 sentences)... Plain prose only" on a FALSE POSITIVE/UNCERTAIN verdict, the exact
+// same "genuine short advisory prose, not a refusal" shape staleness_audit's own entry
+// above already carves out -- but a real false-positive paragraph easily lands under the
+// <80-char/no-code-fence heuristic below, and neither source was ever added here, so a
+// correct false-positive verdict was getting blocked as "not a real implementation
+// attempt" before ever reaching apply() -- which (applyArchDiscoveryCandidates, task-
+// sources.js) already treats a plain prose verdict as a documented no-op, proving the
+// intent was always for this prose to pass review, not be rejected by it.
+const ADVISORY_PROSE_SOURCES = ['staleness_audit', 'observability_review', 'performance_review'];
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }

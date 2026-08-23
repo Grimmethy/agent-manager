@@ -119,6 +119,32 @@ test('a short staleness_audit report is NOT auto-rejected by the deterministic n
   assert.equal(captured.length, 1, 'a short-but-legitimate advisory report must reach the real reviewer vote, not get auto-rejected before it');
 });
 
+// Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/
+// performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence
+// prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in
+// ADVISORY_PROSE_SOURCES, so a real, correct false-positive verdict routinely tripped
+// the <80-char/no-code-fence heuristic and got blocked as "not a real implementation
+// attempt" -- even though applyArchDiscoveryCandidates (task-sources.js) already treats
+// a plain prose verdict as a documented no-op once it reaches apply().
+for (const source of ['observability_review', 'performance_review']) {
+  test(`a short ${source} false-positive verdict is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead`, async () => {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = {
+      id: `${source}-test-1`, domain: 'default', source,
+      title: `${source}: test finding`,
+      planResponse: 'False positive -- this loop only runs once at startup.',
+      implementResponse: 'False positive -- runs once at startup, not a hot path.', // short, no code fence -- would trip the <80-char heuristic for any other source
+    };
+    const captured = [];
+    const result = await reviewTask(task, {
+      repoRoot, domainsPath, ornithMajorityVote: fakeApprove(captured),
+    });
+    assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'a short-but-legitimate false-positive verdict must reach the real reviewer vote, not get auto-rejected before it');
+  });
+}
+
 function makeFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-test-'));
   const repoRoot = path.join(dir, 'repo');
