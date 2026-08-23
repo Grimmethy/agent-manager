@@ -304,6 +304,15 @@ function buildStalenessAuditTask(candidate, domain) {
       originalTitle: task.title || null,
       originalCreatedAt: task.createdAt || null,
       originalLastActivityAt: lastTs != null ? new Date(lastTs).toISOString() : null,
+      // Stamped so local-draft.js's deterministic-recheck short-circuit (see
+      // staleness-fastpath.js's own header) can re-run the ORIGINAL scanner rule against
+      // current file content without a second queue read -- every task JSON this package
+      // writes is meant to be self-contained (see task-sources.js's own header), and this
+      // is exactly the same "embed what a later step needs, don't make it re-fetch"
+      // principle every other promptContext field here already follows.
+      originalSource: task.source || null,
+      originalRule: (task.promptContext && task.promptContext.rule) || null,
+      originalFile: (task.promptContext && task.promptContext.file) || null,
       reasons,
       evidenceText: buildStalenessEvidenceText(candidate),
     },

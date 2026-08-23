@@ -171,6 +171,49 @@ async function draftTask(task, {
 
   try {
     appendHistoryEvent(task, 'draft-started', task.ornithRejectCount ? `retry ${task.ornithRejectCount}` : undefined);
+
+    // Deterministic staleness-recheck short-circuit (2026-08-23, Grimmethy: "How do we
+    // systematically solve this issue in the future. We need to harden the system so
+    // that we don't have to keep manually following up on these" -- see
+    // staleness-fastpath.js's own header for the incident this fixes: a staleness_audit
+    // task for a scanner-originated finding burned all 3 infra-requeue rounds on real
+    // local-model timeouts over ~2 hours and permanently blocked, needing a human to
+    // manually re-derive an answer a regex could give with certainty). When the ORIGINAL
+    // flagged task came from a scanner rule this pipeline can re-run directly
+    // (observability_review/performance_review -- see staleness-fastpath.js's
+    // RULE_DETECTORS), skip the plan+implement local-model calls ENTIRELY and report the
+    // real, current re-scan result instead -- same "the answer is already 100%
+    // determined, construct it directly" reasoning the deterministic find/replace
+    // short-circuit below already applies to a different case. Populates harnessHits the
+    // same shape the existing harness-grounded branch would have, so
+    // stalenessAuditImplementPrompt/review-task.js's own evidence-consistency checks see
+    // real, true evidence either way -- this still goes through the SAME critique-skip-
+    // then-review pipeline as every other staleness_audit report, preserving the
+    // "archive only takes effect after an independent review vote" safety property
+    // staleness-auto-archive.js depends on; only the two calls that were actually timing
+    // out are removed.
+    if (task.source === 'staleness_audit') {
+      const { deterministicRecheck } = require('./staleness-fastpath.js');
+      const verdict = deterministicRecheck(task, getConfig().repoRoot);
+      if (verdict) {
+        task.planResponse = 'Deterministic recheck: the original finding came from a scanner rule this pipeline can re-run directly against the file\'s current content -- no search terms or model judgment needed.';
+        appendHistoryEvent(task, 'plan-done', 'deterministic recheck, no model call');
+        task.promptContext.harnessHits = verdict.hits;
+        task.promptContext.harnessFiles = [];
+        appendHistoryEvent(task, 'harness-search', `deterministic re-scan, ${verdict.hits.length} hit(s)`);
+        task.implementResponse = verdict.reportText;
+        appendHistoryEvent(task, 'implement-done', `deterministic recheck: ${verdict.recommendation}`);
+        task.critiqueOutcome = 'no-issues';
+        appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic report, nothing for a critique pass to add)');
+        task.status = 'needs-review';
+        appendHistoryEvent(task, 'needs-review');
+        return { succeeded: true, blocked: false };
+      }
+      // else: not a rule this file knows how to re-run deterministically (adhoc,
+      // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
+      // existing harness-grounded local-model path below, completely unchanged.
+    }
+
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact
     // implementResponse -- skips plan+implement entirely, straight to critique. Matches
