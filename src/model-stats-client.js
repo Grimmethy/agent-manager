@@ -59,6 +59,14 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
     evalDurationNs: result && result.eval_duration != null ? result.eval_duration : null,
     promptEvalCount: result && result.prompt_eval_count != null ? result.prompt_eval_count : null,
     evalCount: result && result.eval_count != null ? result.eval_count : null,
+    // costUsd (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
+    // tasks would cost using anthropic API?"): claude-client.js's call() has always
+    // computed this (Claude Code CLI's own total_cost_usd, a client-side estimate
+    // against real Anthropic API pricing, independent of subscription billing) -- it
+    // just never reached this far. Undefined/null for every Ornith result (that
+    // module's result shape has no costUsd field at all), which is exactly what should
+    // happen: a null cost_usd row means "free local call," not "unknown cost."
+    costUsd: result && result.costUsd != null ? result.costUsd : null,
     attempts: result && result.attempts != null ? result.attempts : null,
     degenerate: result && result.degenerate != null ? result.degenerate : null,
   });
@@ -70,4 +78,21 @@ function recordOutcome({ callId, outcome, outcomeStage, outcomeReason }) {
   runEvent('record-outcome', { callId, outcome, outcomeStage, outcomeReason });
 }
 
-module.exports = { recordCall, recordOutcome };
+// Reads back the running Anthropic-API-equivalent cost total (2026-08-23, see
+// recordCall's own costUsd comment). Unlike runEvent() above (fire-and-forget,
+// stdio:'pipe', built for record-call/record-outcome's write-only shape), this
+// captures and parses real stdout -- model-stats-db.js's own `cost-summary` event
+// prints JSON: { totalCostUsd, callsWithCost, freeCalls, byModel: [...], byDay: [...] }.
+// Same best-effort philosophy as the rest of this file: returns null on any failure
+// (missing db, no calls recorded yet) rather than throwing -- a cost dashboard widget
+// failing to render is not worth breaking whatever page/report is asking for it.
+function getCostSummary() {
+  try {
+    const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'cost-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
+    return JSON.parse(stdout);
+  } catch (e) {
+    return null;
+  }
+}
+
+module.exports = { recordCall, recordOutcome, getCostSummary };

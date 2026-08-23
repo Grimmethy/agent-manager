@@ -45,11 +45,53 @@ try {
     CREATE INDEX IF NOT EXISTS idx_model_calls_model ON model_calls(model);
   `)
 
+  // Migration (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
+  // tasks would cost using anthropic API?"): claude-client.js's call() has computed a
+  // real per-call cost estimate (Claude Code CLI's own total_cost_usd -- a client-side
+  // estimate against real Anthropic API pricing, independent of subscription billing)
+  // on every single Claude call this whole time, and nothing downstream ever stored it.
+  // CREATE TABLE IF NOT EXISTS above is a no-op against an already-existing table (SQLite
+  // doesn't retroactively add columns that way), so an explicit ALTER is needed for
+  // every database created before this column existed. ALTER TABLE ADD COLUMN has no
+  // native "IF NOT EXISTS" guard in SQLite, so this checks pragma_table_info first --
+  // safe to run on every invocation, matching this file's own existing best-effort style.
+  const hasCostColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'`).get().c > 0
+  if (!hasCostColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN cost_usd REAL`)
+  }
+
   const [event, payloadPath] = process.argv.slice(2)
-  if (!event || !payloadPath) {
-    console.error('Usage: node model-stats-db.js <event> <payloadPath>')
+  if (!event || (event !== 'cost-summary' && !payloadPath)) {
+    console.error('Usage: node model-stats-db.js <record-call|record-outcome> <payloadPath>')
+    console.error('       node model-stats-db.js cost-summary')
     db.close()
     process.exit(1)
+  }
+
+  // cost-summary (2026-08-23, see the migration comment above): read-only, no payload
+  // file needed -- prints JSON to stdout, unlike record-call/record-outcome which are
+  // fire-and-forget through model-stats-client.js's stdio:'pipe' wrapper. Meant to be
+  // called directly (or via system-report.js/the dashboard), not through that wrapper.
+  if (event === 'cost-summary') {
+    const totalRow = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS total, COUNT(*) AS callsWithCost FROM model_calls WHERE cost_usd IS NOT NULL`).get()
+    const byModel = db.prepare(`
+      SELECT model, COALESCE(SUM(cost_usd), 0) AS totalCost, COUNT(*) AS calls
+      FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY model ORDER BY totalCost DESC
+    `).all()
+    const byDay = db.prepare(`
+      SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS totalCost, COUNT(*) AS calls
+      FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
+    `).all()
+    const freeRow = db.prepare(`SELECT COUNT(*) AS calls FROM model_calls WHERE cost_usd IS NULL`).get()
+    console.log(JSON.stringify({
+      totalCostUsd: totalRow.total,
+      callsWithCost: totalRow.callsWithCost,
+      freeCalls: freeRow.calls,
+      byModel,
+      byDay,
+    }))
+    db.close()
+    process.exit(0)
   }
 
   const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'))
@@ -58,10 +100,10 @@ try {
     db.prepare(`
       INSERT INTO model_calls (
         call_id, task_id, stage, model, candidates, started_at, latency_ms,
-        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error
+        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd
       ) VALUES (
         @callId, @taskId, @stage, @model, @candidates, @startedAt, @latencyMs,
-        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError
+        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd
       )
     `).run({
       callId: payload.callId,
@@ -77,6 +119,7 @@ try {
       attempts: payload.attempts != null ? payload.attempts : null,
       degenerate: payload.degenerate != null ? payload.degenerate : null,
       callError: payload.callError != null ? payload.callError : null,
+      costUsd: payload.costUsd != null ? payload.costUsd : null,
     })
   } else if (event === 'record-outcome') {
     if (!payload.callId) {
