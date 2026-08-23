@@ -1507,6 +1507,25 @@ function renderTaskDetailModal(task) {
   if (task.promptContext && task.promptContext.prefetchedPaths && task.promptContext.prefetchedPaths.length) {
     html += `<div class="field-label">Prefetched Paths</div><div>${task.promptContext.prefetchedPaths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
   }
+  // staleness_audit (2026-08-22, Grimmethy: "I don't have information in the task page
+  // about when it was actually set up. The pipeline history only shows the newest
+  // staleness audit. All previous steps are missing.") -- this task's OWN
+  // task.history[] only ever covers its own short life (created -> drafted -> reviewed);
+  // the thing a human actually needs to judge "is this really stale" is the ORIGINAL
+  // flagged task's own dates, which staleness-audit.js now stamps as structured fields
+  // (originalTitle/originalCreatedAt/originalLastActivityAt) specifically so this can
+  // render them directly instead of leaving them buried in evidenceText's prose (which
+  // only the drafting MODEL ever reads).
+  if (task.source === 'staleness_audit' && task.promptContext && task.promptContext.originalTaskId) {
+    const pc = task.promptContext;
+    html += `<div class="field-label">Original Flagged Task</div><div>`
+      + `<code>${escapeHtml(pc.originalTaskId)}</code>`
+      + (pc.originalTitle ? `<br>${escapeHtml(pc.originalTitle)}` : '')
+      + `<br><span class="meta">Created: ${pc.originalCreatedAt ? new Date(pc.originalCreatedAt).toLocaleString() : 'unknown'}`
+      + ` &middot; Last activity: ${pc.originalLastActivityAt ? new Date(pc.originalLastActivityAt).toLocaleString() : 'unknown'}</span>`
+      + (pc.reasons && pc.reasons.length ? `<br><span class="meta">Flagged: ${pc.reasons.map(escapeHtml).join(', ')}</span>` : '')
+      + `</div>`;
+  }
   if (task.needsClarification) html += renderClarificationPicker(task);
   // Pipeline History: task.history[] (task-history.js's appendHistoryEvent -- see that
   // module for the schema). Was written correctly the whole time this session but never

@@ -123,11 +123,22 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
   const { task, reasons, lastActivityTs: lastTs } = candidate;
   const ageDays = lastTs != null ? formatAgeDays(now - lastTs) : null;
   const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '(no title/rawText recorded)';
+  // Absolute dates alongside the relative day-count (2026-08-22, Grimmethy: "I don't have
+  // information in the task page about when it was actually set up" -- caught live, the
+  // dashboard task detail page only ever showed the STALENESS-AUDIT task's own short
+  // history, never the ORIGINAL flagged task's real creation/last-activity dates) --
+  // "5 days old" stops being self-explanatory the moment someone reads this later than
+  // the moment it was generated; an absolute date never does.
+  const createdAtIso = task.createdAt || null;
+  const lastActivityIso = lastTs != null ? new Date(lastTs).toISOString() : null;
   const lines = [
     `Original task ID: ${task.id}`,
     `Original title: ${task.title || '(none)'}`,
     `Original source: ${task.source || 'unknown'}`,
-    ageDays != null ? `Days since last forward progress: ${ageDays}` : 'Days since last forward progress: unknown (no usable timestamp)',
+    `Original task created: ${createdAtIso || 'unknown (no createdAt recorded)'}`,
+    lastActivityIso
+      ? `Last forward progress: ${lastActivityIso} (${ageDays} day(s) ago)`
+      : 'Last forward progress: unknown (no usable timestamp)',
     `Flagged because: ${reasons.join(', ')}`,
     `ornithRejectCount: ${task.ornithRejectCount != null ? task.ornithRejectCount : 0}`,
     '',
@@ -147,7 +158,7 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
 // passed in rather than hardcoded here -- same convention buildAuditTask (pipeline-self-
 // audit.js) already follows.
 function buildStalenessAuditTask(candidate, domain) {
-  const { task, reasons } = candidate;
+  const { task, reasons, lastActivityTs: lastTs } = candidate;
   const id = `staleness-audit-${task.id}-${Date.now()}`;
   return {
     id,
@@ -156,6 +167,13 @@ function buildStalenessAuditTask(candidate, domain) {
     title: `Staleness audit: "${task.title || task.id}" (${reasons.join(', ')})`,
     promptContext: {
       originalTaskId: task.id,
+      // Structured, dashboard-renderable fields (2026-08-22, Grimmethy: "I don't have
+      // information in the task page about when it was actually set up") -- alongside
+      // evidenceText's prose version below (what the MODEL reads), so the dashboard can
+      // show the original task's real dates directly without parsing prose.
+      originalTitle: task.title || null,
+      originalCreatedAt: task.createdAt || null,
+      originalLastActivityAt: lastTs != null ? new Date(lastTs).toISOString() : null,
       reasons,
       evidenceText: buildStalenessEvidenceText(candidate),
     },
