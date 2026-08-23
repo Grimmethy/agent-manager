@@ -3,7 +3,7 @@
 // Draft step: runs a claimed task through plan -> implement -> critique -> (revision)
 // against the local Ornith model, then files the result into queue/review/ (success) or
 // queue/blocked/ (degenerate response at any pass). No file-moving is done here -- the
-// caller (ornith-worker.sh) owns claim/move, same division of labor as apply-task.js vs.
+// caller (local-worker.sh) owns claim/move, same division of labor as apply-task.js vs.
 // apply-task.sh.
 //
 // This is a straight port of the plan/implement/critique/revision sequence in
@@ -25,7 +25,7 @@
 // apply-group-a.js's parser found zero real findings in EVERY one of 17+ completed
 // project_search tasks despite several genuinely listing real-sounding projects.
 //
-// CLI: node ornith-draft.js <draft.json>
+// CLI: node local-draft.js <draft.json>
 // Writes ONE line of JSON to stdout:
 //   { succeeded: true, blocked: false }
 //   { succeeded: true, blocked: true, blockedReason: '...', blockedStage?: '...' }
@@ -104,7 +104,7 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
  * @param {object} task - The parsed task record (mutated in place with pass results).
  * @param {object} [deps]
  * @param {function} [deps.ornithCall] - Defaults to model-provider.js's per-task-source
- *   pick (ornith-client.js's call() unless task.source is listed in
+ *   pick (local-client.js's call() unless task.source is listed in
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @param {function} [deps.withLockFn] - Defaults to single-flight-lock.js's real withLock.
  *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
@@ -123,7 +123,7 @@ async function draftTask(task, {
   // task.source) lets a per-instance task.reasoningTier override take effect, e.g. Brain
   // Dump #77's automatic high-reasoning retry for a needs-clarification task. Explicit
   // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
-  // production code leaves (ornith-draft.js's own main() calls draftTask(task) with no
+  // production code leaves (local-draft.js's own main() calls draftTask(task) with no
   // second argument at all).
   const resolvedOrnithCall = ornithCall || providerFor(task).call;
 
@@ -512,7 +512,7 @@ async function draftTask(task, {
       // These four sources' implement prompts explicitly tell Ornith to output the empty
       // string when nothing genuinely applies (see prompts.js) -- an empty response from
       // them is a valid, intended answer, not a failed call, so the degenerate-output
-      // detector's 'empty' check must not fire for them (see ornith-client.js's call()
+      // detector's 'empty' check must not fire for them (see local-client.js's call()
       // comment for the live-confirmed backlog this caused).
       // arch_review/arch_import_review/observability_fix/performance_fix/backlog_fulfillment
       // (2026-08-21, see task-sources.js's nextCandidateFulfillmentTask header): now grounded
@@ -665,7 +665,7 @@ async function draftTask(task, {
 async function main() {
   const taskPath = process.argv[2];
   if (!taskPath) {
-    process.stdout.write(JSON.stringify({ succeeded: false, reason: 'usage: node ornith-draft.js <draft.json>' }));
+    process.stdout.write(JSON.stringify({ succeeded: false, reason: 'usage: node local-draft.js <draft.json>' }));
     return;
   }
 

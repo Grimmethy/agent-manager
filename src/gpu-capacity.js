@@ -7,7 +7,7 @@
 // than setting a specific threshold... flexible instead of rigid."
 //
 // Pure math only -- no GPU/network access here (see gpu-vram.js for the live query side and
-// ornith-throughput.js for the rolling per-machine throughput calibration this consumes).
+// local-throughput.js for the rolling per-machine throughput calibration this consumes).
 // Every function degrades to a safe, previously-hardcoded-equivalent value when its inputs
 // are missing, matching the rest of this pipeline's "a capability check failing must never
 // block the tick" rule (agent-manager-common.sh's check_budget_healthy, gpu-guard.js).
@@ -70,7 +70,7 @@ function resolveTimeoutMs({
   safetyFactor = 2.5,
   ceilingMs = HARD_TIMEOUT_CEILING_MS,
 }) {
-  const tps = tokensPerSecond > 0 ? tokensPerSecond : 15; // conservative floor for a cold/unmeasured machine -- replaced by real measurements after the first few calls (ornith-throughput.js).
+  const tps = tokensPerSecond > 0 ? tokensPerSecond : 15; // conservative floor for a cold/unmeasured machine -- replaced by real measurements after the first few calls (local-throughput.js).
   const prefillMs = (promptTokens / prefillTokensPerSecond) * 1000;
   const genMs = (numPredict / tps) * 1000;
   const computed = baseOverheadMs + (prefillMs + genMs) * safetyFactor;

@@ -12,7 +12,7 @@
 // as unverifiable, triggered a Revision pass -- and the REVISION pass itself then produced
 // fluent, on-topic English refusing to verify the draft ("I cannot verify this draft
 // against the provided inputs...") instead of either fixing it or outputting nothing.
-// That's coherent prose, not gibberish/empty/repeated-character, so ornith-client.js's
+// That's coherent prose, not gibberish/empty/repeated-character, so local-client.js's
 // generic detectDegenerate() never flags it -- it sailed through a 2/3 APPROVE review
 // vote and would have landed in the real architecture-candidates doc via
 // apply-group-a.js's applyArchDiscoveryCandidates.

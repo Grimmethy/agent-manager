@@ -1,11 +1,11 @@
 'use strict';
 
-// Unit tests for ornith-client.js's detectDegenerate() -- pure and easy to test in
+// Unit tests for local-client.js's detectDegenerate() -- pure and easy to test in
 // isolation, unlike call()/callOnce() which need real (or heavily mocked) HTTP/GPU-
 // capacity/throughput plumbing. No test file existed for this module before; scoped to
 // just this function rather than building out a full harness for the rest.
 //
-// Run: node --test src/ornith-client.test.js  (or `npm test`)
+// Run: node --test src/local-client.test.js  (or `npm test`)
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -23,7 +23,7 @@ test('detectDegenerate respects allowEmpty for a genuinely empty response', () =
 
 // Re-applied fresh 2026-08-21 (originally drafted on the now-9-days-stale
 // review-pipeline-hardening branch, which had diverged too far from current
-// ornith-client.js to merge cleanly -- see this session's branch-conflict investigation).
+// local-client.js to merge cleanly -- see this session's branch-conflict investigation).
 test('detectDegenerate flags the literal two-character JSON-style empty-string quirk ("" or \'\') the same as genuine emptiness', () => {
   assert.equal(detectDegenerate('""'), 'empty');
   assert.equal(detectDegenerate("''"), 'empty');

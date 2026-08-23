@@ -6,7 +6,7 @@ Ornith has no tool-calling path at all in this pipeline -- ollama_client.generat
 bare Ollama /api/generate completion call, nothing more (unlike the Claude provider,
 which reaches for real files itself via claude-client.js's CLI --allowedTools). So giving
 Ornith comparable grounding means the HARNESS runs the search on the model's behalf and
-hands back real content, exactly the shape ornith-draft.js's own arch_import plan->
+hands back real content, exactly the shape local-draft.js's own arch_import plan->
 implement step already uses (propose search terms, harness greps, implement pass gets
 real hits) -- see discuss_sessions.py's _ornith_harness_context for the Discuss-side
 version of that same pattern.

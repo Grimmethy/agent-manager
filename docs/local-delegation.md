@@ -49,7 +49,7 @@ model emits a few tokens into `thinking` and nothing into the constrained channe
 + `think:false` returns clean, fence-free, first-try parseable JSON (`done_reason: stop`,
 `degenerate: null`). So: **constrained-JSON passes must use `think:false`.** That's fine for a
 mechanical pass (corrected-plan → JSON needs no reasoning trace); keep `think:true` only for
-prose/reasoning passes, which stay unconstrained. `ornith-client.js`'s `callOnce` now takes a
+prose/reasoning passes, which stay unconstrained. `local-client.js`'s `callOnce` now takes a
 `format` passthrough; `ornith-worker.ps1` sets `format:'json' + Think:$false` for the
 `state_targets` implement pass only.
 
@@ -429,7 +429,7 @@ mirostat_eta=0.5` — Ollama's actual `mirostat` option is an integer (`0` off, 
 boolean, so that specific line is not usable as written. Everything else it proposed checked out
 against real Ollama options: chunked generation with explicit `=== CHUNK N/4 ===` delimiters for
 large files, majority-voting plus a repeated-character/non-ASCII-ratio guard for the silent-
-degenerate-output bug (both already implemented in `ornith-client.js`'s `detectDegenerate`), an
+degenerate-output bug (both already implemented in `local-client.js`'s `detectDegenerate`), an
 explicit numbered-enumeration step before counting instead of counting in prose, seed-pinning for
 reproducibility on judgment calls, and a "check for an existing barrel/shared import file before
 proposing a refactor" pre-check for the false-positive design-proposal problem.
@@ -478,7 +478,7 @@ no `write_file` yet, per the read-only-first recommendation.
    rejected too. Directory-as-file, nonexistent-file, and nonexistent-dir cases all returned the
    right typed errors.
 2. **Live end-to-end test through the real Ollama tool-calling endpoint** (no DB/Prisma
-   involved): asked Ornith to list `Docs/`, read `Docs/agents/ornith-delegation.md`, and summarize
+   involved): asked Ornith to list `Docs/`, read `Docs/agents/local-delegation.md`, and summarize
    its opening paragraph. It called `list_dir` then `read_file` with correct arguments in
    sequence, then produced an accurate one-sentence summary matching the real document content —
    no fabrication, no repetition loop, no degenerate output, first attempt.
@@ -824,12 +824,12 @@ deliberate follow-up rather than done unattended.
 
 ## Update 2026-07-12 (same day): review provider is now swappable, defaults to Ornith — and why that splits review from apply
 
-**Why:** `review-runner.ps1` hardcoded `& claude -p $reviewPrompt` — every single task review spent real Claude API tokens and was rate-limited, even though task-generation/drafting was already free (Ornith). The fix isn't a simple model swap: `claude -p` does two jobs in one call today — it **reviews** the draft *and*, if it approves, it **applies** the change itself (commits/pushes a branch, or writes a vault note + marker). Ornith via `ornith-client.js` is a plain text completion with **no tool access** in this pipeline — it cannot run git, cannot write files. So making Ornith the reviewer necessarily means splitting review from apply into two separate steps.
+**Why:** `review-runner.ps1` hardcoded `& claude -p $reviewPrompt` — every single task review spent real Claude API tokens and was rate-limited, even though task-generation/drafting was already free (Ornith). The fix isn't a simple model swap: `claude -p` does two jobs in one call today — it **reviews** the draft *and*, if it approves, it **applies** the change itself (commits/pushes a branch, or writes a vault note + marker). Ornith via `local-client.js` is a plain text completion with **no tool access** in this pipeline — it cannot run git, cannot write files. So making Ornith the reviewer necessarily means splitting review from apply into two separate steps.
 
 **What shipped:**
 
 - `$ReviewProvider` (env var `REVIEW_PROVIDER`, `ornith` | `claude`, **defaults to `ornith`**) in `review-runner.ps1`. The `claude` path is byte-for-byte the old behavior (one call, review+apply combined) — nothing changes if you set `REVIEW_PROVIDER=claude`.
-- The `ornith` path sends a **verdict-only** prompt (plan + implement draft + fact-check results, explicit "you cannot run commands, produce APPROVE or REJECT: <reason> and nothing else"), via the same `req-file → node ornith-client.js → JSON response` bridge `ornith-worker.ps1` already uses (`Invoke-OrnithClient`, copied pattern, not reinvented). No `Push-Location`/git call happens on this path at all — a rejected verdict routes straight to `blocked/`, same as before.
+- The `ornith` path sends a **verdict-only** prompt (plan + implement draft + fact-check results, explicit "you cannot run commands, produce APPROVE or REJECT: <reason> and nothing else"), via the same `req-file → node local-client.js → JSON response` bridge `ornith-worker.ps1` already uses (`Invoke-OrnithClient`, copied pattern, not reinvented). No `Push-Location`/git call happens on this path at all — a rejected verdict routes straight to `blocked/`, same as before.
 - An **APPROVE** verdict does **not** push or write anything. The task moves to a new `queue/approved/` folder instead of `queue/done/`, tagged `reviewProvider: 'ornith'` and the raw verdict text.
 - **`backend/agent-pipeline/apply-runner.ps1` is new** — a third always-on loop, same shape as `review-runner.ps1`, that drains `queue/approved/` and does the actual execution: still `claude -p`, always, regardless of `REVIEW_PROVIDER` — it's the only component with real git/file-write capability. Its prompt is narrower than the old review prompt ("this was already judged and approved, your job is to apply it, do a quick sanity check against current repo state, don't re-litigate whether it's a good idea"). Reuses the exact same `Get-DomainConfig`/`Get-WorkDir`/success-check-dispatch/defensive-`catch` machinery from the task-domains fix above — same safety guarantees, same non-crashing behavior on a bad task.
 - `budget-monitor.js` (reads Claude Code's own rate-limit transcript history) is now only consulted on the `claude` review path — gating a free local Ornith call on Claude's rate-limit schedule made no sense and would have needlessly throttled it.
@@ -855,7 +855,7 @@ unstable judgment call (see "qualitative judgment calls are also not stable" abo
 prompts at low temperature have flipped verdicts before). `review-runner.ps1`'s Ornith path
 now uses a new `Invoke-OrnithMajorityVote` helper — same request-file bridge as
 `Invoke-OrnithClient`, but sets `mode: 'majority-vote'` and `classifyMarkers: ['APPROVE',
-'REJECT']` so `ornith-client.js`'s existing (already-built, not reinvented) `majorityVote`
+'REJECT']` so `local-client.js`'s existing (already-built, not reinvented) `majorityVote`
 does the work: 3 calls at `temperature: 0.2`, requires an absolute count of 2+ agreeing real
 (non-degenerate) votes, not a relative comparison.
 

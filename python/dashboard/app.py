@@ -1771,7 +1771,7 @@ def api_task_resolve_clarification(task_id):
     """Moves a held task from queue/needs-clarification/ into queue/adhoc/ (NOT
     queue/pending/ -- unlike requeue above, this is an adhoc-domain task, and
     nextAdhocTask() only ever scans queue/adhoc/; landing it in pending/ the way requeue
-    does would silently orphan it) so ornith-worker.sh can finally claim and draft it.
+    does would silently orphan it) so local-worker.sh can finally claim and draft it.
     Body: {"paths": [...]}  -- the file path(s) the user picked (from the 'ambiguous'
     candidates, or hand-typed for a 'no-match' case) become promptContext.prefetchedPaths;
     an empty/omitted paths list means "proceed with no prefetch at all," a deliberate
