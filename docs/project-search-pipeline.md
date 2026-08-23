@@ -80,7 +80,7 @@ keyword extraction — e.g. recognizing a Godot tutorial project's real gap migh
 - Results (repo/model name, URL, description, stars/downloads if available) get
   embedded into `promptContext` for the implement pass, same mechanism
   `get-grounding-source.js` already uses for local file content — mind the ~24K-token
-  budget documented in `docs/ornith-delegation.md` when sizing what's embedded.
+  budget documented in `docs/local-delegation.md` when sizing what's embedded.
 - **Stretch goal, not built in v1:** a general web search API, for leads that are a blog
   post, HN thread, or paper rather than a structured repo/model listing. Explicitly
   deferred, not silently dropped — see ADR-0018.

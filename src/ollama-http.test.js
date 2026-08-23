@@ -1,6 +1,6 @@
 'use strict';
 
-// Unit tests for postJson()'s extraHeaders param -- the mechanism ornith-client.js uses
+// Unit tests for postJson()'s extraHeaders param -- the mechanism local-client.js uses
 // to send a stable X-TokenFold-Session header (see its own comment for why: without one,
 // TokenFold hashes each call's own prompt into a fresh session and can never amortize its
 // dictionary bootstrap cost, confirmed live 2026-08-21 at 0.27% real savings).

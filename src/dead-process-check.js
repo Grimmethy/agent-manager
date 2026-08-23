@@ -23,11 +23,11 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 
-const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above ornith-client.js's 4-min REQUEST_TIMEOUT_MS per-call ceiling.
+const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above local-client.js's 4-min REQUEST_TIMEOUT_MS per-call ceiling.
 // worker-only: pid alive but heartbeat stale this long means a hung call, not a slow one.
-// draftTask() (ornith-draft.js) chains up to 4 sequential ornithCall()s per task -- plan,
+// draftTask() (local-draft.js) chains up to 4 sequential ornithCall()s per task -- plan,
 // implement, critique, and (if critique flags issues) revise -- each individually bounded
-// by ornith-client.js's REQUEST_TIMEOUT_MS (240s default), with no heartbeat write between
+// by local-client.js's REQUEST_TIMEOUT_MS (240s default), with no heartbeat write between
 // passes. Worst case is therefore ~4*240s=960s of legitimate, non-hung work between the
 // "working" heartbeat at claim time and the "idle" heartbeat at completion. The old 300s
 // value only covered a single call and was killing every multi-pass task mid-flight,

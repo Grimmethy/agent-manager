@@ -62,7 +62,7 @@ const DIRECT_TO_MAIN_SOURCES = new Set([
   'arch_discovery', 'arch_import', 'observability_review', 'performance_review',
 ]);
 
-// task.draftModel (stamped by ornith-draft.js/adhoc-agentic-draft.js at draft time, same
+// task.draftModel (stamped by local-draft.js/adhoc-agentic-draft.js at draft time, same
 // "claude:<model>"-or-"<real ollama tag>" label model-provider.js's labelFor() and the
 // Workers/Models tabs already use) says which backend actually drafted this change -- was
 // previously ignored entirely, hardcoding every commit's Co-Authored-By to Ornith even
@@ -478,7 +478,7 @@ function main() {
   // blocked/ after this step carried no record it was ever applied: no timestamp, no
   // branch/commit info, no failure reason if apply itself failed. apply-task.sh (the
   // caller) moves the SAME file afterward, so writing it back here in place -- same
-  // pattern ornith-draft.js/review-task.js already use -- lands before that move.
+  // pattern local-draft.js/review-task.js already use -- lands before that move.
   const applyStage = recordApplyOutcome(task, result);
   try {
     fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));

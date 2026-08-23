@@ -40,7 +40,7 @@ stopped appearing.
 
 **Diagnosing "is this duplicate genuinely working or a stale zombie":** check for a
 live `node.exe` child process under the candidate pid (`ornith-worker.ps1` shells out to
-`node ornith-client.js ...` for every Ollama call). A duplicate with a live node child
+`node local-client.js ...` for every Ollama call). A duplicate with a live node child
 is genuinely mid-task — killing it destroys real, unrecoverable progress (nothing is
 persisted to disk between plan/implement/critique passes). A duplicate with no node
 child AND no claimed file in the shared drafting folder is safe to retire. **A mistake
@@ -81,10 +81,10 @@ night. `pipeline-doctor.ps1` now checks for this automatically.
 ### 3. Crash-loop tasks (4 confirmed tonight)
 
 A task can crash the same worker repeatedly — 5 to 9 times each, roughly every 6-7
-minutes — always failing at the same point. Root cause: `ornith-client.js`'s
+minutes — always failing at the same point. Root cause: `local-client.js`'s
 `REQUEST_TIMEOUT_MS` (4 minutes) crashes the whole worker process when it fires (a
 deliberate, documented design choice — see the comment block above
-`nextArchDiscoveryTask` context-prefetch logic and `ornith-client.js` itself). Because no
+`nextArchDiscoveryTask` context-prefetch logic and `local-client.js` itself). Because no
 pass's output is persisted to disk until the task reaches `queue/review/`, every restart
 redoes the entire plan→implement→critique sequence from scratch and can hit the same
 wall again.

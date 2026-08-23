@@ -1,7 +1,7 @@
 'use strict';
 
 // Read-only, dependency-free codebase search for a plan pass to call as a tool (see
-// ornith-tool-client.js). Same style/pattern as a hand-rolled synchronous directory walk:
+// local-tool-client.js). Same style/pattern as a hand-rolled synchronous directory walk:
 // no npm packages, hard match cap. repoRoot and the allowed search dirs come from
 // config.js (AGENT_MANAGER_REPO_ROOT / AGENT_MANAGER_GREP_DIRS), not hardcoded.
 

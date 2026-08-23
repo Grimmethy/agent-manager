@@ -1,7 +1,7 @@
 'use strict';
 
 // Unit tests for model-provider.js's providerFor() -- the per-task-source backend
-// selection that wires claude-client.js into ornith-draft.js/review-task.js. See
+// selection that wires claude-client.js into local-draft.js/review-task.js. See
 // AGENT_MANAGER_CLAUDE_SOURCES in that module's own header for the env var contract.
 
 const test = require('node:test');
@@ -31,7 +31,7 @@ function withEnv(overrides, fn) {
   }
 }
 
-test('providerFor defaults every source to ornith-client.js when AGENT_MANAGER_CLAUDE_SOURCES is unset -- opt-in, never a silent default switch', () => {
+test('providerFor defaults every source to local-client.js when AGENT_MANAGER_CLAUDE_SOURCES is unset -- opt-in, never a silent default switch', () => {
   withEnv({ AGENT_MANAGER_CLAUDE_SOURCES: undefined }, () => {
     const { providerFor } = freshModelProvider();
     const ornith = require('./local-client.js');
@@ -60,7 +60,7 @@ test('providerFor tolerates stray whitespace in the env var list', () => {
   });
 });
 
-test('each provider exposes call and majorityVote (the two injection-point shapes ornith-draft.js/review-task.js rely on)', () => {
+test('each provider exposes call and majorityVote (the two injection-point shapes local-draft.js/review-task.js rely on)', () => {
   const { providerFor } = freshModelProvider();
   for (const provider of [providerFor('anything'), providerFor('')]) {
     assert.equal(typeof provider.call, 'function');
