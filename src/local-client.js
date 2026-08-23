@@ -231,14 +231,41 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
 // "Implement pass degenerate: empty" -- confirmed live 2026-08-16: 64 of 181 blocked
 // tasks, the single largest group in queue/blocked/, were exactly this -- Ornith
 // following its own instructions, not a model or resource problem.
+// 2026-08-23, Grimmethy: "Why are 17 tasks sitting in review instead of being processed
+// fully?" -- traced to review-runner's majorityVote() aborting its ENTIRE 3-vote call the
+// instant the FIRST vote's callOnce() throws (a real network/timeout error, not a
+// degenerate-content retry, which this loop already handled) -- confirmed live: 59 of the
+// last 62 review attempts failed this way, each report showing only ONE timeout even
+// though up to 3 votes were supposed to run, because the very first one killed the whole
+// attempt before the other two ever got a chance. This loop already retries maxRetries
+// times for a bad-content (degenerate) response; a hard network failure got zero retry
+// benefit at all, propagating immediately on attempt 0 regardless of maxRetries. Now a
+// hard failure is retried exactly the same as a degenerate one -- lastError is tracked
+// separately from lastDegenerate so, if every attempt hard-fails with no usable response
+// at all, the real error still propagates (existing callers -- draft's infra-requeue
+// regex match, review-runner's own equivalent -- depend on receiving a real thrown Error
+// with the actual message, e.g. "Ollama request timed out...", not a swallowed one).
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
+  let lastError = null;
+  let gotAnyResponse = false;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await callOnce(opts);
+    let result;
+    try {
+      result = await callOnce(opts);
+    } catch (e) {
+      lastError = e;
+      continue;
+    }
+    gotAnyResponse = true;
     const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
   }
+  // Only propagate the hard error if NO attempt ever got a real response, degenerate or
+  // not -- a degenerate response on an earlier attempt followed by a hard failure on a
+  // later retry is still a real, legitimate degenerate outcome, not an infra failure.
+  if (!gotAnyResponse && lastError) throw lastError;
   return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
 }
 
@@ -249,11 +276,34 @@ async function call(opts, maxRetries = 2) {
 // verdict + 2 degenerate "unclear" votes pass as a confident 1-0 consensus.
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source }) {
   const votes = [];
+  const voteErrors = [];
   for (let i = 0; i < n; i++) {
-    const result = await call({ prompt, think: false, temperature, source }, 1);
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source }, 1);
+    } catch (e) {
+      // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
+      // retry above) -- must not abort the other n-1 votes, which may well succeed under
+      // exactly the same slow-but-not-dead conditions. See this function's own 2026-08-23
+      // header note: 59 of the last 62 real review attempts failed this way, each
+      // discarding whatever votes DID land because the first failure killed the whole
+      // majorityVote() call outright.
+      voteErrors.push(e.message);
+      continue;
+    }
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response });
+  }
+
+  // Only when EVERY vote hard-failed (zero real responses of any kind, not even a
+  // degenerate one) is this a genuine infra failure rather than a legitimate "no
+  // consensus reached" outcome -- rethrow so the caller's existing infra-requeue
+  // detection (the same real-error-message match draft's own path already relies on)
+  // still catches it, instead of silently reporting a false "inconclusive" verdict for
+  // what was actually zero real votes cast.
+  if (voteErrors.length === n) {
+    throw new Error(voteErrors[voteErrors.length - 1]);
   }
 
   const tally = {};
@@ -274,6 +324,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     votes,
     realVoteCount: votes.length,
     requestedVotes: n,
+    voteErrors,
   };
 }
 
