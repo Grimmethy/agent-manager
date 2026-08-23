@@ -61,7 +61,7 @@ function writeTaskJson(taskPath, task) {
 // five sources all use, each fetching real file content (fetchedFiles) for the exact
 // files their own candidate names, so their implement pass always has real content to
 // ground a find/replace in.
-const CANDIDATE_FULFILLMENT_SOURCES = ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment'];
+const CANDIDATE_FULFILLMENT_SOURCES = ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment', 'function_length_fix'];
 
 // 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
 // given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
@@ -522,6 +522,7 @@ async function draftTask(task, {
       const allowEmptyImplement = [
         'arch_discovery', 'deep_dive', 'arch_import', 'project_search', 'pipeline_self_audit',
         'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
+        'function_length_fix',
       ].includes(task.source);
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
