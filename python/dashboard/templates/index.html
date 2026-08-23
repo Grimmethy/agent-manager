@@ -636,7 +636,10 @@ const MODELS_COLUMNS = [
   { key: 'avgLatencyMs', label: 'Avg Latency (ms)', sortable: true },
   { key: 'degenerateCount', label: 'Degenerate', sortable: true },
   { key: 'errorCount', label: 'Errors', sortable: true },
+  { key: 'totalCostUsd', label: 'Est. API Cost', sortable: true },
 ];
+
+function fmtUsd(x) { return x == null ? '-' : '$' + Number(x).toFixed(4); }
 
 function renderBarCell(value, max, colorVar, fmt) {
   const label = fmt(value);
@@ -864,9 +867,10 @@ async function renderModelsTab() {
   // FINAL position after that flash had already been visible). Fetching everything first
   // and writing main.innerHTML exactly once eliminates the intermediate empty states
   // entirely, so there is nothing left to flash.
-  const [models, usageRows, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
     fetchJson('/api/models'),
     fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
     renderClaudeSettingsPanel(),
     renderClaudeUsagePanel(),
     benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
@@ -914,12 +918,32 @@ async function renderModelsTab() {
       <td>${fmtNum(m.avgLatencyMs, 0)}</td>
       <td>${m.degenerateCount}</td>
       <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
     </tr>
   `).join('');
 
   const implementTable = models.length === 0
     ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
     : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
+  // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
+  // has always computed a real per-call cost estimate (Claude Code CLI's own
+  // total_cost_usd, against real Anthropic API pricing) but nothing stored or surfaced
+  // it until now. Explicitly labeled "estimate, not a bill" -- every real call here runs
+  // under a Claude subscription, never pay-per-token, so this is what the SAME work
+  // would have cost on the API, not what was actually charged.
+  const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  const costWidget = `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Estimated Anthropic API Cost</div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>total (all time)</div>
+        <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
+        <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
+        ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+    </div>`;
 
   const usageTableRows = usageRows.map(r => `
     <tr>
@@ -941,7 +965,7 @@ async function renderModelsTab() {
   // window.scrollY keeps their reading position stable across a background refresh they
   // didn't ask for, even though the write itself no longer has an empty intermediate state.
   const scrollY = window.scrollY;
-  main.innerHTML = settingsPanel + usagePanel + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+  main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
     + benchmarkPanelHtml;
   wireClaudeSettingsPanel();
   main.querySelectorAll('th.sortable').forEach(th => {

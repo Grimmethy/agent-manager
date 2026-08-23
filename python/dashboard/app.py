@@ -705,6 +705,17 @@ def model_stats_db_path() -> Path | None:
     return (d / "model-stats.db") if d else None
 
 
+def _has_cost_usd_column(conn: sqlite3.Connection) -> bool:
+    """cost_usd (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
+    tasks would cost using anthropic API?") -- model-stats-db.js's own ALTER TABLE
+    migration only runs the next time a real recordCall() fires from the Node side; this
+    Python reader can be hit BEFORE that ever happens (a fresh db, or an old one nobody's
+    written to yet today), so every query touching cost_usd guards on this first rather
+    than crashing with 'no such column' the moment someone opens the Models tab."""
+    row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'").fetchone()
+    return bool(row and row[0])
+
+
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
     kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
@@ -911,7 +922,9 @@ def api_models():
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        rows = conn.execute("""
+        has_cost = _has_cost_usd_column(conn)
+        cost_select = "SUM(cost_usd) AS total_cost_usd," if has_cost else "NULL AS total_cost_usd,"
+        rows = conn.execute(f"""
             SELECT model,
                    COUNT(*) AS call_count,
                    SUM(CASE WHEN outcome = 'approved' THEN 1 ELSE 0 END) AS approved,
@@ -924,7 +937,9 @@ def api_models():
                    MAX(CASE WHEN eval_count IS NOT NULL AND eval_duration_ns > 0
                             THEN eval_count * 1.0 / (eval_duration_ns / 1e9) END) AS max_tokens_per_sec,
                    SUM(CASE WHEN degenerate IS NOT NULL THEN 1 ELSE 0 END) AS degenerate_count,
-                   SUM(CASE WHEN call_error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
+                   SUM(CASE WHEN call_error IS NOT NULL THEN 1 ELSE 0 END) AS error_count,
+                   {cost_select}
+                   1 AS _dummy
             FROM model_calls
             WHERE stage = 'implement'
             GROUP BY model
@@ -934,7 +949,7 @@ def api_models():
         conn.close()
 
     results = []
-    for model, call_count, approved, rejected, avg_latency_ms, avg_tok_s, min_tok_s, max_tok_s, degenerate_count, error_count in rows:
+    for model, call_count, approved, rejected, avg_latency_ms, avg_tok_s, min_tok_s, max_tok_s, degenerate_count, error_count, total_cost_usd, _dummy in rows:
         decided = (approved or 0) + (rejected or 0)
         results.append({
             "model": model,
@@ -948,8 +963,55 @@ def api_models():
             "maxTokensPerSec": max_tok_s,
             "degenerateCount": degenerate_count or 0,
             "errorCount": error_count or 0,
+            "totalCostUsd": total_cost_usd,
         })
     return jsonify(results)
+
+
+@app.route("/api/models/cost-summary")
+def api_models_cost_summary():
+    """Anthropic-API-equivalent cost estimate, aggregated across EVERY stage (not just
+    'implement' -- a review-pass majority vote can be a real Claude call too). Same
+    underlying data model-stats-db.js's own `cost-summary` CLI event exposes, queried
+    directly here (read-only sqlite connection, same pattern every other endpoint in this
+    file already uses against this db) rather than shelling out to Node for a page load.
+    Grimmethy, 2026-08-23: "Do we have any way of knowing how much these tasks would cost
+    using anthropic API?" -- claude-client.js's call() had always computed this
+    (Claude Code CLI's own total_cost_usd, a client-side estimate against real Anthropic
+    API pricing, independent of subscription billing); nothing ever stored or surfaced it
+    until now."""
+    db_path = model_stats_db_path()
+    if not db_path or not db_path.is_file():
+        return jsonify({"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": 0, "byModel": [], "byDay": []})
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        if not _has_cost_usd_column(conn):
+            total_calls = conn.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0]
+            return jsonify({"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": total_calls, "byModel": [], "byDay": []})
+
+        total_row = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM model_calls WHERE cost_usd IS NOT NULL"
+        ).fetchone()
+        free_calls = conn.execute("SELECT COUNT(*) FROM model_calls WHERE cost_usd IS NULL").fetchone()[0]
+        by_model = conn.execute("""
+            SELECT model, COALESCE(SUM(cost_usd), 0) AS total_cost, COUNT(*) AS calls
+            FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY model ORDER BY total_cost DESC
+        """).fetchall()
+        by_day = conn.execute("""
+            SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS total_cost, COUNT(*) AS calls
+            FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
+        """).fetchall()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "totalCostUsd": total_row[0],
+        "callsWithCost": total_row[1],
+        "freeCalls": free_calls,
+        "byModel": [{"model": m, "totalCost": c, "calls": n} for m, c, n in by_model],
+        "byDay": [{"day": d, "totalCost": c, "calls": n} for d, c, n in by_day],
+    })
 
 
 @app.route("/api/models/usage")
