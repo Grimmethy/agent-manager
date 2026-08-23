@@ -119,7 +119,7 @@ test('buildStalenessEvidenceText includes the original task id, reasons, and raw
   assert.match(text, /stale-1/);
   assert.match(text, /stale-age/);
   assert.match(text, /why is the widget broken/);
-  assert.match(text, /Days since last forward progress: 31/);
+  assert.match(text, /Last forward progress: 2026-01-01T00:00:00\.000Z \(31 day\(s\) ago\)/);
 });
 
 test('buildStalenessAuditTask produces a task on the given domain with the evidence embedded', () => {
@@ -132,6 +132,20 @@ test('buildStalenessAuditTask produces a task on the given domain with the evide
   assert.equal(result.promptContext.originalTaskId, 'stale-1');
   assert.deepEqual(result.promptContext.reasons, ['stale-age']);
   assert.ok(result.promptContext.evidenceText.length > 0);
+});
+
+// Regression, 2026-08-22: caught live -- the dashboard task detail page had no way to
+// show WHEN the original flagged task was actually created or last touched, since that
+// information only ever lived inside evidenceText's prose (fed to the model, never
+// rendered in the UI). These structured fields let the dashboard show it directly.
+test('buildStalenessAuditTask exposes the original task\'s dates as structured, dashboard-renderable fields', () => {
+  const lastActivityTs = Date.parse('2026-01-05T00:00:00.000Z');
+  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug', createdAt: '2025-12-01T00:00:00.000Z' });
+  const candidate = { task, reasons: ['stale-age'], lastActivityTs };
+  const result = buildStalenessAuditTask(candidate, 'default');
+  assert.equal(result.promptContext.originalTitle, 'Investigate the widget bug');
+  assert.equal(result.promptContext.originalCreatedAt, '2025-12-01T00:00:00.000Z');
+  assert.equal(result.promptContext.originalLastActivityAt, '2026-01-05T00:00:00.000Z');
 });
 
 test('DEFAULT_STALENESS_THRESHOLD_DAYS is a sane positive default', () => {
