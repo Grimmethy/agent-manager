@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const {
   lastActivityTs, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, findStalenessCandidates,
   buildStalenessEvidenceText, buildStalenessAuditTask, DEFAULT_STALENESS_THRESHOLD_DAYS,
-  candidateFilePaths, findFilesTouchedSince,
+  candidateFilePaths, findFilesTouchedSince, pickFairCandidate,
 } = require('./staleness-audit.js');
 const os = require('os');
 const path = require('path');
@@ -315,4 +315,53 @@ test('buildStalenessEvidenceText includes the touched-files evidence when presen
   const text = buildStalenessEvidenceText(candidate);
   assert.match(text, /Real commits landed AFTER this task was created/);
   assert.match(text, /src\/widget\.js/);
+});
+
+// pickFairCandidate: 2026-08-23, Grimmethy: "So why then does adhoc tasks still show 35
+// blocked? It hasn't gone down" -- found live that plain oldest-first let one domain
+// (project_search) monopolize every tick even though 28 real adhoc candidates existed.
+function makeCandidate(id, domain, lastActivityTs) {
+  return { task: makeTask({ id, domain }), reasons: ['stale-age'], lastActivityTs, touchedFiles: [] };
+}
+
+test('pickFairCandidate prefers a domain that has never been reported, even over an older candidate in an already-covered domain', () => {
+  const candidates = [
+    makeCandidate('ps-1', 'project_search', 1000), // globally oldest
+    makeCandidate('adhoc-1', 'adhoc', 5000),
+  ];
+  const coverage = {
+    'ps-old-1': { reportedAt: '2026-01-01T00:00:00.000Z', taskId: 'x', domain: 'project_search' },
+    // adhoc has no coverage entries at all -- never reported.
+  };
+  const picked = pickFairCandidate(candidates, coverage);
+  assert.equal(picked.task.id, 'adhoc-1');
+});
+
+test('pickFairCandidate prefers the domain reported longest ago when every domain has some coverage history', () => {
+  const candidates = [
+    makeCandidate('ps-1', 'project_search', 1000),
+    makeCandidate('adhoc-1', 'adhoc', 1000),
+  ];
+  const coverage = {
+    a: { reportedAt: '2026-01-10T00:00:00.000Z', taskId: 'a', domain: 'project_search' },
+    b: { reportedAt: '2026-01-01T00:00:00.000Z', taskId: 'b', domain: 'adhoc' }, // longer ago
+  };
+  const picked = pickFairCandidate(candidates, coverage);
+  assert.equal(picked.task.id, 'adhoc-1');
+});
+
+test('pickFairCandidate falls back to oldest-first within the same domain tier', () => {
+  const candidates = [
+    makeCandidate('adhoc-2', 'adhoc', 9000),
+    makeCandidate('adhoc-1', 'adhoc', 1000), // older -- should win
+  ];
+  const picked = pickFairCandidate(candidates, {});
+  assert.equal(picked.task.id, 'adhoc-1');
+});
+
+test('pickFairCandidate handles an empty candidate list and missing/malformed coverage entries without throwing', () => {
+  assert.equal(pickFairCandidate([], {}), null);
+  const candidates = [makeCandidate('t1', 'adhoc', 1000)];
+  const coverage = { a: null, b: {}, c: { reportedAt: 'not-a-date', domain: 'adhoc' } };
+  assert.doesNotThrow(() => pickFairCandidate(candidates, coverage));
 });
