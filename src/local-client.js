@@ -12,7 +12,6 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
-const gpuVram = require('./gpu-vram.js');
 const ornithThroughput = require('./local-throughput.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
@@ -82,39 +81,20 @@ function detectDegenerate(text, { allowEmpty = false } = {}) {
   return null;
 }
 
-// Live GPU-capacity snapshot, refreshed at most once per CAPACITY_TTL_MS -- nvidia-smi/
-// /api/ps are cheap but not free, and every real call already pays a multi-second-plus
-// network round trip, so a few minutes of staleness on the sizing inputs costs nothing while
-// still tracking real changes (a different model loaded, more/less VRAM free) far faster than
-// a human editing a constant ever would. Any failure anywhere in this chain resolves to
-// `null` and every caller below falls back to this module's pre-existing fixed defaults.
-const CAPACITY_TTL_MS = 5 * 60 * 1000;
-let capacityCache = { snapshot: null, refreshedAt: 0 };
-
-async function getCapacitySnapshot() {
-  const now = Date.now();
-  if (capacityCache.snapshot && (now - capacityCache.refreshedAt) < CAPACITY_TTL_MS) {
-    return capacityCache.snapshot;
-  }
-  let snapshot = null;
-  try {
-    const vram = gpuVram.queryVram();
-    const modelInfo = vram ? await gpuVram.queryLoadedModel(OLLAMA_URL, MODEL) : null;
-    if (vram && modelInfo && modelInfo.numCtx > 0) {
-      snapshot = gpuCapacity.computeMaxSafeNumCtx({
-        totalVramMiB: vram.totalVramMiB,
-        usedVramMiB: vram.usedVramMiB,
-        modelWeightMiB: modelInfo.modelWeightMiB,
-        currentNumCtx: modelInfo.numCtx,
-      });
-    }
-  } catch {
-    snapshot = null;
-  }
-  capacityCache = { snapshot, refreshedAt: now };
-  return snapshot;
-}
-
+// 2026-08-23: this used to call getCapacitySnapshot() here -- a LIVE nvidia-smi + /api/ps
+// read on every call, feeding gpuCapacity.computeMaxSafeNumCtx() to clamp num_ctx --
+// removed after confirming live that it was the actual cause of the "pin num_ctx to one
+// stable value" fix (gpu-capacity.js's own PINNED_NUM_CTX) not holding in practice: every
+// real pipeline call is a FRESH node subprocess (no cross-process cache; capacityCache
+// only ever helped within a single process's own lifetime, which no caller here has), so
+// under concurrent GPU load (multiple worker/reviewer lanes, each spawning their own
+// subprocess) the live VRAM reading is genuinely noisy call to call -- watched it directly:
+// three consecutive model loads landed at three different context sizes (7168, 4096,
+// 7168) purely from this clamp fluctuating, each triggering Ollama's own severe
+// slow-reprocessing behavior for a context change. PINNED_NUM_CTX was already verified
+// safe for this box's real VRAM headroom (see gpu-capacity.js's own comment) -- there is
+// no remaining reason to re-derive a safety ceiling from a noisy per-call reading when the
+// pinned value's own safety was already established once, not per call.
 function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
@@ -122,13 +102,7 @@ function estimateTokens(text) {
 async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source }) {
   const promptTokens = estimateTokens(prompt);
 
-  let resolvedNumCtx = numCtx;
-  if (!resolvedNumCtx) {
-    const capacity = await getCapacitySnapshot();
-    resolvedNumCtx = capacity
-      ? gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict, maxSafeNumCtx: capacity.maxSafeNumCtx })
-      : gpuCapacity.DEFAULT_NUM_CTX;
-  }
+  const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;

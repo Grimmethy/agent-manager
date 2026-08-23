@@ -24,11 +24,12 @@ const http = require('node:http');
 
 function withServer(handler, fn) {
   return new Promise((resolve, reject) => {
-    // getCapacitySnapshot() (local-client.js) fires a real GET /api/ps against
-    // OLLAMA_URL before every callOnce() when nvidia-smi is available (it is, in this
-    // sandbox) -- routed away from `handler` entirely so it never perturbs a test's own
-    // POST /api/generate request-count expectations. Its content doesn't matter
-    // (queryLoadedModel's own parse failure just resolves to null capacity, a no-op).
+    // GET /api/ps is routed away from `handler` as a harmless no-op in case anything
+    // ever probes it again -- local-client.js no longer makes this call itself (removed
+    // 2026-08-23 alongside the num_ctx pin: see gpu-capacity.js's PINNED_NUM_CTX and
+    // local-client.js's own comment on why a per-call live VRAM read was actively
+    // harmful), kept here only so a future caller of it doesn't silently perturb a
+    // test's own POST /api/generate request-count expectations.
     const server = http.createServer((req, res) => {
       if (req.method === 'GET' && req.url === '/api/ps') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
