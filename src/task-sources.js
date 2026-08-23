@@ -19,8 +19,6 @@ const { reasoningTierFor } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
-const { scanProject, isLikelyMinified } = require('./observability-scan.js');
-const { scanProject: scanProjectForPerformance } = require('./performance-scan.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
@@ -970,248 +968,6 @@ function nextUnusedExportTask() {
   return null;
 }
 
-// --- Source: observability_review -- flags observability-hygiene issues in the ACTIVE
-// project itself (priority 80, alongside arch_discovery) --------------------------------
-//
-// REDIRECTED 2026-08-20 (Grimmethy: "What tangible benefits are we getting from the huge
-// number of observability review tasks?" -> real numbers showed 2,025 real Ollama calls /
-// ~5.6h wall-clock over 5 days scanning deep_dive's cloned EXTERNAL repos, 313 "genuine"
-// verdicts, ZERO fixes ever shipped -- there was no follow-up mechanism at all, and even
-// a fix would have landed in someone else's unmaintained clone, not this project. "Make
-// sure it's fixing our project": now scans repoRoot directly, and a genuine verdict
-// becomes a real candidate (observabilityFixCandidatesPath) consumed by observability_fix
-// below into an actual code fix -- see that source's own comment.
-//
-// Unlike a frozen external clone (scan once, coverage done forever), repoRoot changes
-// constantly as real commits land, so this tracks a single lastScannedAt and re-scans
-// every OBSERVABILITY_RESCAN_INTERVAL_MS instead. Findings still accumulate in
-// queue/observability-flags.json and are handed to Ornith one at a time, oldest first --
-// same shape nextUnusedExportTask() uses for dead-code candidates -- but each rescan now
-// dedupes against what's already flagged (else the SAME unfixed line would get re-flagged
-// every single rescan) and prunes any flag whose file no longer exists (deleted/renamed
-// since it was flagged -- guaranteed noise on a project that keeps changing, unlike a
-// static external clone).
-const OBSERVABILITY_RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-function nextObservabilityReviewTask() {
-  const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
-  const projectTag = path.basename(repoRoot);
-
-  let coverage;
-  try {
-    coverage = JSON.parse(readIfExists(observabilityCoveragePath) || '{}');
-  } catch {
-    coverage = {};
-  }
-
-  const flagsPath = path.join(pipelineDir, 'queue', 'observability-flags.json');
-  let flags;
-  try {
-    flags = JSON.parse(readIfExists(flagsPath) || '[]');
-  } catch {
-    flags = [];
-  }
-
-  const now = Date.now();
-  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
-  const due = Number.isNaN(lastScannedAt) || (now - lastScannedAt) >= OBSERVABILITY_RESCAN_INTERVAL_MS;
-
-  let flagsChanged = false;
-  if (due && fs.existsSync(repoRoot)) {
-    let freshFindings = [];
-    try {
-      freshFindings = scanProject(repoRoot, projectTag);
-    } catch (e) {
-      // A scan failure (unreadable file, scanner bug on unusual input) must never crash
-      // the worker loop -- same rule onboardDeepDiveProject's own try/catch follows.
-      console.error(`observability_review: failed to scan "${projectTag}": ${e.message}`);
-    }
-
-    // Prune flags that are stale for either of two reasons:
-    //  1. projectSlug doesn't match the CURRENT active project -- an unambiguous signal
-    //     from before the 2026-08-20 redirect off deep_dive's external clones, when every
-    //     flag carried an external repo's own slug. Checked before the file-existence
-    //     test below, deliberately: a flag's relative file path (e.g. "src/index.js",
-    //     "package.json") can coincidentally exist under the NEW repoRoot too, purely by
-    //     naming coincidence with an unrelated project -- confirmed live 2026-08-20, the
-    //     file-existence check alone left all 163 pre-redirect flags in place.
-    //  2. the file genuinely no longer exists under repoRoot (deleted/renamed since
-    //     flagged) -- self-healing for a project that keeps changing, same reasoning as
-    //     the isLikelyMinified re-check below.
-    const beforePrune = flags.length;
-    flags = flags.filter((f) => f.projectSlug === projectTag && (!f.file || fs.existsSync(path.join(repoRoot, f.file))));
-    if (flags.length !== beforePrune) flagsChanged = true;
-
-    const existingKeys = new Set(flags.map((f) => `${f.rule}::${f.file}::${f.line}`));
-    for (const finding of freshFindings) {
-      const key = `${finding.rule}::${finding.file}::${finding.line}`;
-      if (existingKeys.has(key)) continue; // already flagged and not yet fixed -- don't re-flag every rescan
-      flags.push(finding);
-      existingKeys.add(key);
-      flagsChanged = true;
-    }
-
-    // Replace wholesale, not merge -- a pre-redirect coverage.json carries an orphaned
-    // `projects: {...}` map (the old per-external-project shape) that nothing here reads
-    // any more; keeping it around forever as dead weight serves no purpose.
-    coverage = { lastScannedAt: new Date(now).toISOString() };
-    fs.mkdirSync(path.dirname(observabilityCoveragePath), { recursive: true });
-    fs.writeFileSync(observabilityCoveragePath, JSON.stringify(coverage, null, 2));
-  }
-  if (flagsChanged) {
-    fs.mkdirSync(path.dirname(flagsPath), { recursive: true });
-    fs.writeFileSync(flagsPath, JSON.stringify(flags, null, 2));
-  }
-
-  const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
-  for (const finding of sorted) {
-    const taskId = `observability-${slugifyForId(projectTag)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
-    if (taskIdExistsInQueue(taskId)) continue;
-
-    // Attach a small surrounding-source snippet for context, same reasoning as
-    // nextUnusedExportTask's callSites: a bare rule/file/line claim is exactly the kind of
-    // "unverified claim" a triage judgment shouldn't be asked to trust blindly.
-    let snippet = null;
-    if (finding.file) {
-      const content = readIfExists(path.join(repoRoot, finding.file));
-      // Re-check isLikelyMinified against the file's CURRENT content, not just at scan
-      // time -- flags.json is a persistent queue (see task-sources.js's own history: a
-      // stale minified-file flag survived a scan-time fix for a full day in 2026-08-19),
-      // so this self-healing check stays even though findings are now deduped per-rescan.
-      if (content && isLikelyMinified(content)) continue;
-      if (!content) continue; // pruned above in the common case, but be defensive regardless
-      const lines = content.split('\n');
-      const start = Math.max(0, (finding.line || 1) - 4);
-      const end = Math.min(lines.length, (finding.line || 1) + 3);
-      snippet = lines.slice(start, end).join('\n');
-    }
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'observability_review',
-      title: `Observability triage: ${finding.rule} — ${projectTag}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
-      promptContext: {
-        rule: finding.rule,
-        detail: finding.detail,
-        file: finding.file,
-        line: finding.line,
-        projectSlug: projectTag,
-        snippet,
-      },
-    };
-  }
-
-  return null;
-}
-
-// --- Source: performance_review -- flags performance-hygiene issues in the ACTIVE
-// project itself (priority 80, alongside arch_discovery/observability_review) ----------
-//
-// Brain Dump #94 (2026-08-18). REDIRECTED 2026-08-20 (Grimmethy: "Do the same for
-// performance_review" -- same treatment observability_review just got): real numbers
-// showed the identical pattern -- 355 done tasks, 297 (84%) false positive, 56 (16%)
-// genuine, scanning deep_dive's cloned EXTERNAL repos with no follow-up mechanism, zero
-// fixes ever shipped. Exact structural mirror of nextObservabilityReviewTask's own
-// redirect immediately above -- same lastScannedAt/rescan-interval/dedupe/prune shape,
-// same reasoning throughout -- swapped to performance-scan.js's scanner and its own
-// coverage/flags files so the two sources never contend over the same state.
-function nextPerformanceReviewTask() {
-  const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
-  const projectTag = path.basename(repoRoot);
-
-  let coverage;
-  try {
-    coverage = JSON.parse(readIfExists(performanceCoveragePath) || '{}');
-  } catch {
-    coverage = {};
-  }
-
-  const flagsPath = path.join(pipelineDir, 'queue', 'performance-flags.json');
-  let flags;
-  try {
-    flags = JSON.parse(readIfExists(flagsPath) || '[]');
-  } catch {
-    flags = [];
-  }
-
-  const now = Date.now();
-  const lastScannedAt = coverage.lastScannedAt ? Date.parse(coverage.lastScannedAt) : NaN;
-  const due = Number.isNaN(lastScannedAt) || (now - lastScannedAt) >= OBSERVABILITY_RESCAN_INTERVAL_MS;
-
-  let flagsChanged = false;
-  if (due && fs.existsSync(repoRoot)) {
-    let freshFindings = [];
-    try {
-      freshFindings = scanProjectForPerformance(repoRoot, projectTag);
-    } catch (e) {
-      console.error(`performance_review: failed to scan "${projectTag}": ${e.message}`);
-    }
-
-    // Prune stale flags -- by projectSlug mismatch first (unambiguous signal from before
-    // this redirect; a relative file path can coincidentally "exist" under the new
-    // repoRoot by naming coincidence, so file-existence alone isn't enough -- see
-    // nextObservabilityReviewTask's own prune fix for the confirmed-live incident this
-    // avoids repeating here), then by the file genuinely no longer existing.
-    const beforePrune = flags.length;
-    flags = flags.filter((f) => f.projectSlug === projectTag && (!f.file || fs.existsSync(path.join(repoRoot, f.file))));
-    if (flags.length !== beforePrune) flagsChanged = true;
-
-    const existingKeys = new Set(flags.map((f) => `${f.rule}::${f.file}::${f.line}`));
-    for (const finding of freshFindings) {
-      const key = `${finding.rule}::${finding.file}::${finding.line}`;
-      if (existingKeys.has(key)) continue;
-      flags.push(finding);
-      existingKeys.add(key);
-      flagsChanged = true;
-    }
-
-    coverage = { lastScannedAt: new Date(now).toISOString() };
-    fs.mkdirSync(path.dirname(performanceCoveragePath), { recursive: true });
-    fs.writeFileSync(performanceCoveragePath, JSON.stringify(coverage, null, 2));
-  }
-  if (flagsChanged) {
-    fs.mkdirSync(path.dirname(flagsPath), { recursive: true });
-    fs.writeFileSync(flagsPath, JSON.stringify(flags, null, 2));
-  }
-
-  const sorted = [...flags].sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
-  for (const finding of sorted) {
-    const taskId = `performance-${slugifyForId(projectTag)}-${slugifyForId(finding.rule)}-${slugifyForId(finding.file || 'repo')}-${finding.line || 0}`;
-    if (taskIdExistsInQueue(taskId)) continue;
-
-    let snippet = null;
-    if (finding.file) {
-      const content = readIfExists(path.join(repoRoot, finding.file));
-      // Re-check isLikelyMinified against the file's CURRENT content -- see
-      // nextObservabilityReviewTask's identical guard for the full rationale (2026-08-19).
-      if (content && isLikelyMinified(content)) continue;
-      if (!content) continue; // pruned above in the common case, but be defensive regardless
-      const lines = content.split('\n');
-      const start = Math.max(0, (finding.line || 1) - 4);
-      const end = Math.min(lines.length, (finding.line || 1) + 3);
-      snippet = lines.slice(start, end).join('\n');
-    }
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'performance_review',
-      title: `Performance triage: ${finding.rule} — ${projectTag}${finding.file ? ` (${finding.file}:${finding.line})` : ''}`,
-      promptContext: {
-        rule: finding.rule,
-        detail: finding.detail,
-        file: finding.file,
-        line: finding.line,
-        projectSlug: projectTag,
-        snippet,
-      },
-    };
-  }
-
-  return null;
-}
-
 // --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
 // (priority 42, right after secondbrain's 40) -----------------------------------------
 //
@@ -1655,65 +1411,9 @@ registerTaskSource('arch_discovery', {
   emptyApproval: true,
 });
 
-// observability_review shares arch_discovery's tier (80) deliberately -- it's the same
-// kind of proactive review of already-scanned projects, not pure speculative cleanup like
-// unused_export (90). See nextObservabilityReviewTask's own header comment for the full
-// design and its 2026-08-20 redirect to scanning the active project instead of external
-// clones.
-registerTaskSource('observability_review', {
-  priority: taskPriority('observability_review', 80),
-  next: nextObservabilityReviewTask,
-  // A "genuine" verdict now writes a real, fixable candidate (same AC-NNN format/parser
-  // arch_discovery uses -- applyArchDiscoveryCandidates is fully generic, reused as-is,
-  // exact same pattern as arch_discovery's own apply just above) rather than the old
-  // dead-end applyVerdictOnly (2026-07-26 fix, still correct for a plain prose
-  // false-positive/uncertain verdict: applyArchDiscoveryCandidates already returns
-  // {skipped:true} when the response has no AC-NNN block, same no-op shape
-  // applyVerdictOnly gave every verdict before).
-  apply: ({ implementResponse }) => {
-    const { observabilityFixCandidatesPath } = getConfig();
-    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: observabilityFixCandidatesPath, docTitle: '# Observability Fix Candidates' });
-  },
-  advisoryProse: true,
-});
-// observability_fix (2026-08-20): the follow-up stage observabilityReviewImplementPrompt
-// always promised but never had -- consumes a "Strong" candidate from
-// observabilityFixCandidatesPath the same way arch_review consumes ARCH_REVIEW_CANDIDATES.md
-// (nextCandidateFulfillmentTask is fully generic; archReviewPlanPrompt/
-// archReviewImplementPrompt's wording -- "a narrow architecture-improvement change" --
-// reads correctly for a scoped observability fix too, no new prompt needed). Priority 72,
-// alongside arch_review (70) / arch_import_review (71): same "consume an already-vetted
-// candidate into a real fix" tier, not competing with observability_review's own
-// discovery-tier 80.
-registerTaskSource('observability_fix', {
-  priority: taskPriority('observability_fix', 72),
-  next: () => nextCandidateFulfillmentTask(getConfig().observabilityFixCandidatesPath, 'observability_fix'),
-  emptyApproval: true, candidateFulfillment: true,
-});
-
-// performance_review shares observability_review's tier (80) and shape exactly -- same
-// "proactive review of the active project" reasoning after its own 2026-08-20 redirect.
-// See nextPerformanceReviewTask's own header comment for the full design.
-registerTaskSource('performance_review', {
-  priority: taskPriority('performance_review', 80),
-  next: nextPerformanceReviewTask,
-  // A "genuine" verdict now writes a real, fixable candidate -- same mechanism as
-  // observability_review's own apply just above (applyArchDiscoveryCandidates is fully
-  // generic). A plain false-positive/uncertain verdict still gets {skipped:true}.
-  apply: ({ implementResponse }) => {
-    const { performanceFixCandidatesPath } = getConfig();
-    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: performanceFixCandidatesPath, docTitle: '# Performance Fix Candidates' });
-  },
-  advisoryProse: true,
-});
-// performance_fix (2026-08-20): the follow-up stage performanceReviewImplementPrompt now
-// promises and actually has -- same mechanism as observability_fix immediately above,
-// against performanceFixCandidatesPath instead.
-registerTaskSource('performance_fix', {
-  priority: taskPriority('performance_fix', 73),
-  next: () => nextCandidateFulfillmentTask(getConfig().performanceFixCandidatesPath, 'performance_fix'),
-  emptyApproval: true, candidateFulfillment: true,
-});
+// observability_review/observability_fix, performance_review/performance_fix -- moved
+// to src/maintenance/observability-review.js and src/maintenance/performance-review.js
+// (2026-08-23), registered near the bottom of this file alongside function_length_review.
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
 // agent-manager-grounded architecture candidate (priority 81, ADR-0020,
@@ -2205,6 +1905,17 @@ require('./maintenance/function-length-review.js').register({
   getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
 });
 
+// observability_review / observability_fix, performance_review / performance_fix
+// (2026-08-23, Grimmethy: "Move the observability/performance scanners into
+// src/maintenance/ next") -- moved out of this file the same way, same injected-
+// dependency shape as function_length_review just above.
+require('./maintenance/observability-review.js').register({
+  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
+});
+require('./maintenance/performance-review.js').register({
+  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
+});
+
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible
 // work and stops there, even when that source's task doesn't match the calling lane's own
@@ -2273,8 +1984,7 @@ module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
-  nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask, nextObservabilityReviewTask,
-  nextPerformanceReviewTask,
+  nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,

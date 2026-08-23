@@ -12,10 +12,11 @@
 // labor that keeps performance_review calibrated well rather than noisy.
 //
 // Deliberately kept in its own src/maintenance/ directory with the narrowest possible
-// dependency on the rest of this package (only observability-scan.js's generic,
-// non-observability-specific utilities: extractBraceBody, listSourceFiles,
-// isLikelyMinified, lineOfIndex) -- everything else here is self-contained, so a future
-// extraction to a standalone npm package only has to resolve that one small utility
+// dependency on the rest of this package (only scan-utils.js's generic, rule-agnostic
+// utilities: extractBraceBody, listSourceFiles, isLikelyMinified, lineOfIndex, shared
+// with observability-scan.js/performance-scan.js) -- everything else here is self-
+// contained, so a future extraction to a standalone npm package only has to resolve
+// that one small utility
 // dependency, not untangle this module from the rest of the pipeline.
 //
 // Regex-based function-boundary detection, not a real parser -- same accepted tradeoff
@@ -27,7 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, listSourceFiles, isLikelyMinified, lineOfIndex } = require('../observability-scan.js');
+const { extractBraceBody, listSourceFiles, isLikelyMinified, lineOfIndex } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
 

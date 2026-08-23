@@ -293,131 +293,6 @@ function unusedExportPlanPrompt(task) {
   return assemblePrompt(stable, volatile);
 }
 
-// observability_review's plan pass (project idea "OpenTelemetry-Observability-Idea",
-// 2026-07-26): same "judgment call, not a code-change" framing as unusedExportPlanPrompt
-// above, since observability-scan.js's rules are heuristics (brace-matching, keyword
-// windows), not a real parser -- every flagged `rule` is a candidate for Ornith to
-// confirm or reject, not an assumed-true fact.
-function observabilityReviewPlanPrompt(task) {
-  const ctx = task.promptContext;
-  const stable = [
-    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible observability-hygiene issue in a project this pipeline is reviewing (rule/project/file/snippet given below). Determine whether it is a GENUINE issue or a false positive.',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuine issue — here\'s the concrete risk (e.g. a real background-task error swallowed silently) and a proposed fix"',
-    '- "false positive — here\'s why (e.g. the catch intentionally no-ops for a known-safe case, or the loop\'s health signal is emitted elsewhere the scanner\'s window missed)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
-    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a parser, and false positives are expected.',
-  ];
-  const volatile = [
-    `Rule flagged: ${ctx.rule}`,
-    `Project: ${ctx.projectSlug}`,
-    ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
-    `Scanner detail: ${ctx.detail}`,
-    '',
-    'SURROUNDING SOURCE (if available):',
-    ctx.snippet || '(no snippet available for this finding)',
-  ];
-  return assemblePrompt(stable, volatile);
-}
-
-// observability_review's implement pass. REDIRECTED 2026-08-20 (Grimmethy: "What
-// tangible benefits are we getting from the huge number of observability review tasks?"
-// -> "Make sure it's fixing our project"): a genuine verdict now writes a real, fixable
-// candidate in the SAME format arch_discovery's own implement pass uses
-// (archDiscoveryImplementPrompt below), consumed by observability_fix
-// (task-sources.js) into an actual code diff -- closing the gap the old prompt merely
-// promised ("a genuine issue becomes a separate follow-up task later") but never had a
-// mechanism for. A false-positive/uncertain verdict still gets the original short-prose
-// treatment (2026-07-26 fix's own reasoning still applies: no numbered "steps" to
-// implement for a non-finding, so don't ask for JSON/a diff on that path).
-function observabilityReviewImplementPrompt(task, planText) {
-  return [
-    'Your plan above is the final REASONED VERDICT for this observability-hygiene finding in OUR OWN project.',
-    '',
-    planText,
-    '',
-    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
-    '',
-    'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
-    '',
-    '### AC-NNN · Title',
-    'Strength: Strong',
-    `Files: ${task.promptContext.file || '(the file from the finding above)'}`,
-    '',
-    'Problem:',
-    'A paragraph describing the concrete observability gap, grounded in the snippet you were given.',
-    '',
-    'Solution:',
-    'A paragraph describing the specific fix (e.g. what to log, what to rethrow, what health signal to add) -- scoped to exactly this finding, nothing broader.',
-    '',
-    'Benefits:',
-    'A paragraph describing what improves once fixed.',
-    '',
-    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
-  ].join('\n');
-}
-
-// performance_review's plan pass (Brain Dump #94, 2026-08-18: "our pretty little cpu is
-// getting overloaded... we need to develop a performance review job for projects
-// anyways"). Identical framing to observabilityReviewPlanPrompt above, same reason:
-// performance-scan.js's rules are heuristics (brace-matching, keyword windows around a
-// loop body), not real profiling -- a flagged sync-io-in-loop or sequential-await could
-// easily be a false positive (a loop that only ever runs once, a deliberately
-// rate-limited sequence), so every finding is a candidate for Ornith to judge, not an
-// assumed-true fact.
-function performanceReviewPlanPrompt(task) {
-  const ctx = task.promptContext;
-  const stable = [
-    'This is a judgment call, NOT a code-change task (yet). A deterministic scanner flagged a possible performance issue in a project this pipeline is reviewing (rule/project/file/snippet given below). Determine whether it is a GENUINE issue or a false positive.',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuine issue — here\'s the concrete performance cost (e.g. blocking I/O per loop iteration, needless sequential network calls) and a proposed fix"',
-    '- "false positive — here\'s why (e.g. the loop only ever runs a handful of times, the sequence is deliberately rate-limited/ordered, the sync call runs once at startup not in a hot path)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here (e.g. real call frequency, profiling data)"',
-    'Do not assume the scanner is right just because it flagged something -- it is a heuristic, not a profiler, and false positives are expected.',
-  ];
-  const volatile = [
-    `Rule flagged: ${ctx.rule}`,
-    `Project: ${ctx.projectSlug}`,
-    ctx.file ? `File: ${ctx.file}:${ctx.line}` : '(repo-wide finding, not tied to one file)',
-    `Scanner detail: ${ctx.detail}`,
-    '',
-    'SURROUNDING SOURCE (if available):',
-    ctx.snippet || '(no snippet available for this finding)',
-  ];
-  return assemblePrompt(stable, volatile);
-}
-
-// performance_review's implement pass. REDIRECTED 2026-08-20, same treatment/reasoning
-// as observabilityReviewImplementPrompt just above ("Do the same for performance_review"):
-// a genuine verdict now writes a real, fixable candidate consumed by performance_fix
-// (task-sources.js) into an actual code diff, instead of the old dead-end prose-only
-// verdict. False-positive/uncertain still gets the short-prose no-op treatment.
-function performanceReviewImplementPrompt(task, planText) {
-  return [
-    'Your plan above is the final REASONED VERDICT for this performance finding in OUR OWN project.',
-    '',
-    planText,
-    '',
-    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
-    '',
-    'If the verdict is GENUINE: write ONE fix candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
-    '',
-    '### AC-NNN · Title',
-    'Strength: Strong',
-    `Files: ${task.promptContext.file || '(the file from the finding above)'}`,
-    '',
-    'Problem:',
-    'A paragraph describing the concrete performance cost, grounded in the snippet you were given.',
-    '',
-    'Solution:',
-    'A paragraph describing the specific fix (e.g. batch the I/O, parallelize, cache the result) -- scoped to exactly this finding, nothing broader.',
-    '',
-    'Benefits:',
-    'A paragraph describing what improves once fixed.',
-    '',
-    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
-  ].join('\n');
-}
 
 // unused_export's implement pass has the identical gap observability_review's just had
 // fixed (2026-07-26) -- registered only a buildPlanPrompt, so it silently fell through to
@@ -1111,12 +986,9 @@ updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildIm
 // duplicate copy that would just drift, same reasoning as
 // nextCandidateFulfillmentTask() itself being parameterized instead of copy-pasted.
 updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
-// observability_fix (2026-08-20): identical promptContext shape (candidateId, title,
-// files, body) from nextCandidateFulfillmentTask as arch_review/arch_import_review --
-// same reuse, no new prompt needed.
-updateTaskSource('observability_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
-// performance_fix (2026-08-20): same reuse as observability_fix just above.
-updateTaskSource('performance_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+// observability_fix/performance_fix -- moved to src/maintenance/observability-review.js
+// and src/maintenance/performance-review.js (2026-08-23), each with its own small
+// plan/implement prompt pair now instead of reaching for archReviewPlanPrompt here.
 updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
@@ -1141,8 +1013,8 @@ updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementProm
 // just above. Only the mandatory plan stage needs a real template here.
 updateTaskSource('research_task', { buildPlanPrompt: researchPlanPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
-updateTaskSource('observability_review', { buildPlanPrompt: observabilityReviewPlanPrompt, buildImplementPrompt: observabilityReviewImplementPrompt });
-updateTaskSource('performance_review', { buildPlanPrompt: performanceReviewPlanPrompt, buildImplementPrompt: performanceReviewImplementPrompt });
+// observability_review/performance_review -- moved to src/maintenance/ (2026-08-23),
+// each with its own plan/implement prompt pair now instead of living here.
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });

@@ -21,6 +21,7 @@ observability-coverage.json
 performance-coverage.json
 self-audit-coverage.json
 staleness-audit-coverage.json
+function-length-coverage.json
 dashboard.pid
 .claude/
 brain-dump.json

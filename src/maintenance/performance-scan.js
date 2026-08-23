@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractBraceBody, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./observability-scan.js');
+const { extractBraceBody, listSourceFiles, lineOfIndex, isLikelyMinified } = require('./scan-utils.js');
 
 const SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx'];
 const LOOP_START_RE = /\bfor\s*\([^)]*\)\s*\{|\bwhile\s*\([^)]*\)\s*\{/g;

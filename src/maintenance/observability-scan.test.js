@@ -15,7 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   scanProject, findSilentCatchBlocks, findUnguardedLoops, findOtelNamingViolations,
-  findMissingReservedAttributes, hasOtelDependency, isValidOtelName, extractBraceBody,
+  findMissingReservedAttributes, hasOtelDependency, isValidOtelName,
 } = require('./observability-scan.js');
 
 function makeTempRepo() {
@@ -28,24 +28,6 @@ function writeFixture(repoRoot, relPath, content) {
   fs.writeFileSync(full, content);
   return full;
 }
-
-test('extractBraceBody returns the body between matching braces', () => {
-  const text = 'function f() { return 1; }';
-  const body = extractBraceBody(text, text.indexOf('{'));
-  assert.equal(body, ' return 1; ');
-});
-
-test('extractBraceBody ignores braces inside string and comment content', () => {
-  const text = 'function f() { const s = "{ not a brace }"; /* { also not } */ return 1; }';
-  const body = extractBraceBody(text, text.indexOf('{'));
-  assert.equal(body.trim().startsWith('const s ='), true);
-  assert.equal(body.includes('return 1;'), true);
-});
-
-test('extractBraceBody returns null for an unbalanced (truncated) body', () => {
-  const text = 'function f() { return 1;';
-  assert.equal(extractBraceBody(text, text.indexOf('{')), null);
-});
 
 test('findSilentCatchBlocks flags a truly empty catch block', () => {
   const text = 'try {\n  risky();\n} catch {}\n';
