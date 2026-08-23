@@ -48,7 +48,7 @@ const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
 const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
-const { resolveSourceName } = require('./task-source-registry.js');
+const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -57,11 +57,22 @@ function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
 }
 
-// task-sources.js's nextCandidateFulfillmentTask() -- the shared candidate-consumer these
-// five sources all use, each fetching real file content (fetchedFiles) for the exact
-// files their own candidate names, so their implement pass always has real content to
-// ground a find/replace in.
-const CANDIDATE_FULFILLMENT_SOURCES = ['arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment', 'function_length_fix'];
+// task-sources.js's nextCandidateFulfillmentTask() -- the shared candidate-consumer every
+// candidateFulfillment: true source uses, each fetching real file content (fetchedFiles)
+// for the exact files their own candidate names, so their implement pass always has real
+// content to ground a find/replace in. 2026-08-23: was a hardcoded array here (a near-
+// duplicate of allowEmptyImplement just below, and of review-task.js's own now-removed
+// EMPTY_APPROVAL_SOURCES) -- now reads the flag straight off each source's own
+// registerTaskSource() entry instead, so a plugin's own registration is the only place
+// that needs to say so. See function-length-review.js's registration for the pattern.
+function isCandidateFulfillmentSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.candidateFulfillment);
+}
+function isEmptyApprovalSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.emptyApproval);
+}
 
 // 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
 // given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
@@ -509,21 +520,19 @@ async function draftTask(task, {
       // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
       // output budget plus a fixed margin for the thinking trace.
       const implNumCtx = Math.min(32768, Math.max(8192, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
-      // These four sources' implement prompts explicitly tell Ornith to output the empty
+      // Several sources' implement prompts explicitly tell Ornith to output the empty
       // string when nothing genuinely applies (see prompts.js) -- an empty response from
       // them is a valid, intended answer, not a failed call, so the degenerate-output
       // detector's 'empty' check must not fire for them (see local-client.js's call()
-      // comment for the live-confirmed backlog this caused).
-      // arch_review/arch_import_review/observability_fix/performance_fix/backlog_fulfillment
-      // (2026-08-21, see task-sources.js's nextCandidateFulfillmentTask header): now grounded
-      // in real fetched file content, and explicitly told to output empty rather than fabricate
-      // a find/replace when the named file(s) couldn't be read -- that's a legitimate, expected
-      // outcome now, same reasoning as arch_import's own empty-on-no-match case just below.
-      const allowEmptyImplement = [
-        'arch_discovery', 'deep_dive', 'arch_import', 'project_search', 'pipeline_self_audit',
-        'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
-        'function_length_fix',
-      ].includes(task.source);
+      // comment for the live-confirmed backlog this caused). The candidateFulfillment
+      // ones (arch_review/arch_import_review/observability_fix/performance_fix/
+      // backlog_fulfillment/...) are grounded in real fetched file content and explicitly
+      // told to output empty rather than fabricate a find/replace when the named file(s)
+      // couldn't be read -- a legitimate, expected outcome, same reasoning as arch_import's
+      // own empty-on-no-match case. isEmptyApprovalSource() reads this straight off each
+      // source's own registerTaskSource() entry now (see its own comment above) instead of
+      // a hardcoded array.
+      const allowEmptyImplement = isEmptyApprovalSource(task.source);
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
       // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
@@ -615,7 +624,7 @@ async function draftTask(task, {
       // warned attempt is a genuine mismatch (stale/truncated fetched content, a
       // candidate whose Problem no longer matches current code, etc.), not something a
       // third guess would likely fix either.
-      if (CANDIDATE_FULFILLMENT_SOURCES.includes(task.source)) {
+      if (isCandidateFulfillmentSource(task.source)) {
         const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
         if (unverified) {
           const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;

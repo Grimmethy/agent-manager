@@ -241,6 +241,13 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
         || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
       return applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle: '# Function Length Decomposition Candidates' });
     },
+    // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
+    // the registry entry instead of a hardcoded array a plugin author would otherwise
+    // have to go edit inside those files -- the actual prerequisite this family's
+    // extraction needed. advisoryProse: a short prose false-positive verdict is the
+    // EXPECTED deliverable here, not a refusal. See review-task.js's own ADVISORY_PROSE_
+    // SOURCES-turned-flag comment for the full history.
+    advisoryProse: true,
   });
   updateTaskSource('function_length_review', { buildPlanPrompt: functionLengthReviewPlanPrompt, buildImplementPrompt: functionLengthReviewImplementPrompt });
 
@@ -252,6 +259,10 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
         || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
       return nextCandidateFulfillmentTask(candidatesPath, 'function_length_fix');
     },
+    // emptyApproval: a false-positive-adjacent candidate can legitimately resolve to "no
+    // real decomposition here after all" once the fix stage sees real file content.
+    // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
+    emptyApproval: true, candidateFulfillment: true,
   });
   updateTaskSource('function_length_fix', { buildPlanPrompt: functionLengthFixPlanPrompt, buildImplementPrompt: functionLengthFixImplementPrompt });
 }

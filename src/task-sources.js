@@ -1628,6 +1628,7 @@ registerTaskSource('path_prefetch_resolve', {
 registerTaskSource('arch_review', {
   priority: taskPriority('arch_review', 70),
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
+  emptyApproval: true, candidateFulfillment: true,
 });
 // arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
 // against arch_import's own candidates doc instead of arch_discovery's. Priority 71 --
@@ -1637,6 +1638,7 @@ registerTaskSource('arch_review', {
 registerTaskSource('arch_import_review', {
   priority: taskPriority('arch_import_review', 71),
   next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
+  emptyApproval: true, candidateFulfillment: true,
 });
 // apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
 // markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
@@ -1650,6 +1652,7 @@ registerTaskSource('arch_discovery', {
     const { archReviewCandidatesPath } = getConfig();
     return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
   },
+  emptyApproval: true,
 });
 
 // observability_review shares arch_discovery's tier (80) deliberately -- it's the same
@@ -1671,6 +1674,7 @@ registerTaskSource('observability_review', {
     const { observabilityFixCandidatesPath } = getConfig();
     return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: observabilityFixCandidatesPath, docTitle: '# Observability Fix Candidates' });
   },
+  advisoryProse: true,
 });
 // observability_fix (2026-08-20): the follow-up stage observabilityReviewImplementPrompt
 // always promised but never had -- consumes a "Strong" candidate from
@@ -1684,6 +1688,7 @@ registerTaskSource('observability_review', {
 registerTaskSource('observability_fix', {
   priority: taskPriority('observability_fix', 72),
   next: () => nextCandidateFulfillmentTask(getConfig().observabilityFixCandidatesPath, 'observability_fix'),
+  emptyApproval: true, candidateFulfillment: true,
 });
 
 // performance_review shares observability_review's tier (80) and shape exactly -- same
@@ -1699,6 +1704,7 @@ registerTaskSource('performance_review', {
     const { performanceFixCandidatesPath } = getConfig();
     return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: performanceFixCandidatesPath, docTitle: '# Performance Fix Candidates' });
   },
+  advisoryProse: true,
 });
 // performance_fix (2026-08-20): the follow-up stage performanceReviewImplementPrompt now
 // promises and actually has -- same mechanism as observability_fix immediately above,
@@ -1706,6 +1712,7 @@ registerTaskSource('performance_review', {
 registerTaskSource('performance_fix', {
   priority: taskPriority('performance_fix', 73),
   next: () => nextCandidateFulfillmentTask(getConfig().performanceFixCandidatesPath, 'performance_fix'),
+  emptyApproval: true, candidateFulfillment: true,
 });
 
 // --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
@@ -2021,10 +2028,11 @@ registerTaskSource('arch_import', {
     const { archImportCandidatesPath, importCoveragePath } = getConfig();
     return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
   },
+  emptyApproval: true,
 });
 
-registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask });
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true });
 // apply: applyVerdictOnly -- fix, 2026-07-26, same reasoning as observability_review's own
 // (see unusedExportImplementPrompt's header comment, prompts.js). Never actually confirmed
 // live (dead-code-flags.json has never existed in this pipeline's real history), but the
@@ -2037,7 +2045,7 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // right above. apply-task.js's own explicit `task.source === 'pipeline_self_audit'`
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
-registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
+registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true });
 // apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
 // part of that step") -- this source's implement pass writes an advisory report, never a
 // diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
@@ -2046,7 +2054,7 @@ registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_sel
 // explicit RECOMMENDATION: archive, moving the ORIGINAL flagged task to
 // done/_archived_no_action/ automatically once the report has cleared review. See
 // staleness-auto-archive.js's own header for the full reasoning and safety scoping.
-registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict });
+registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...
@@ -2183,6 +2191,7 @@ registerTaskSource('backlog_decomposition', {
 registerTaskSource('backlog_fulfillment', {
   priority: taskPriority('backlog_fulfillment', 16),
   next: () => nextCandidateFulfillmentTask(getConfig().backlogCandidatesPath, 'backlog_fulfillment'),
+  emptyApproval: true, candidateFulfillment: true,
 });
 
 // function_length_review / function_length_fix (2026-08-23, Grimmethy: "Let's start with
