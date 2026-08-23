@@ -111,6 +111,43 @@ should_yield_for_model_swap() {
   # different-MODEL heuristic below (genuine VRAM-swap avoidance, not correctness) is
   # unaffected and stays.
 
+  # Live-residency short-circuit (2026-08-23, Grimmethy: dashboard-settings.json's
+  # workerModelOverrides let reviewer diverge onto a genuinely different, independently-
+  # resident model (e.g. qwen2.5:1.5b) from worker-1/worker-reasoning's shared model --
+  # this whole guard predates that per-instance-override feature and was only ever
+  # designed for "one shared resident model" (see this function's own comment above: "No-
+  # op when reviewer already shares worker-1's model, the default and common case").
+  # Caught live: worker-1 and worker-reasoning both yielded to EACH OTHER every single
+  # tick once reviewer's recorded model diverged, indefinitely -- because the guard below
+  # only ever consults a STALE single-value state file, never asking Ollama whether a
+  # swap would actually happen. Confirmed via `ollama ps` that both models were already
+  # sitting resident simultaneously (17GB + 1.4GB, comfortably inside VRAM) -- no swap
+  # was ever actually at risk, yet the guard kept yielding anyway. If target_model is
+  # ALREADY resident right now, this call cannot possibly evict/starve anything by
+  # proceeding -- skip the whole stale-state heuristic below and just go.
+  local ollama_url="${OLLAMA_URL:-http://localhost:11434}"
+  local already_resident
+  already_resident="$(node -e '
+    const http = require("http");
+    const [url, model] = process.argv.slice(1);
+    const req = http.get(`${url}/api/ps`, { timeout: 3000 }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => {
+        try {
+          const models = (JSON.parse(data).models || []);
+          process.stdout.write(models.some((m) => m.name === model || m.model === model) ? "yes" : "no");
+        } catch (e) { process.stdout.write("no"); }
+      });
+    });
+    req.on("error", () => process.stdout.write("no"));
+    req.on("timeout", () => { req.destroy(); process.stdout.write("no"); });
+  ' "$ollama_url" "$target_model" 2>/dev/null)"
+  if [[ "$already_resident" == "yes" ]]; then
+    echo proceed
+    return 0
+  fi
+
   local state_path="${INSTANCES_DIR}/.active-local-model.json"
   [[ -f "$state_path" ]] || { echo proceed; return 0; }
   local resident_model resident_tier
