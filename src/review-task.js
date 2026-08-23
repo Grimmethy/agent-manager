@@ -95,6 +95,18 @@ const EMPTY_APPROVAL_SOURCES = [
   'arch_discovery', 'project_search', 'deep_dive', 'arch_import', 'pipeline_self_audit',
   'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
 ];
+
+// staleness_audit (2026-08-22, caught live: a real advisory report got rejected by the
+// deterministic non-implementation gate below) -- deliberately NOT added to
+// EMPTY_APPROVAL_SOURCES above: unlike those sources, an empty implementResponse is
+// never a valid outcome for staleness_audit (its own prompt always asks for a report,
+// even a short "found nothing either way" one -- see stalenessAuditImplementPrompt,
+// prompts.js), so a genuinely empty response here should still be treated as a real
+// degenerate failure, not auto-approved. This list ONLY exempts staleness_audit from the
+// isNonImplementation gate (NON_IMPL_PATTERNS / the <80-char-no-code-fence heuristic)
+// below, which was written assuming every draft is code -- a short, valid "nothing new
+// to add here" advisory report would otherwise trip the same false-positive.
+const ADVISORY_PROSE_SOURCES = ['staleness_audit'];
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
@@ -157,6 +169,18 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push('This is a brain-dump CLASSIFICATION task, not a code-change task: the implement draft is a JSON metadata object (category/secondBrainPath/tags/actionable/rationale/belongsToProject) that files a note into a personal vault -- do not reject it for lacking implementation code or for being "just documentation," that was never the ask. secondBrainPath names the note file to create or append to; it commonly does NOT exist yet -- filing something brand new is the normal, most common, correct outcome, so a "missing-file" fact-check flag on secondBrainPath ALONE is expected and is NOT evidence of fabrication (unlike a missing-file flag on a claimed source-code reference elsewhere, which would be). Reject only if: the JSON itself is malformed or missing a required field, category is not one of task/reference/idea/journal/question, secondBrainPath is an obviously wrong or nonsensical destination given what the note is actually about, or belongsToProject names a project that plainly was not among the tracked projects listed in the PLAN above.');
   } else if (task.source === 'manual') {
     lines.push("This is an adhoc task: the PLAN above was drafted BLIND, with no real repo access -- a guess at what the fix might involve, written before anyone actually looked at the code. The IMPLEMENT draft, in contrast, comes from a real agentic pass that ran Read/Grep/Glob/Bash against the actual repo and produced the real `git diff` shown (see the DIFF section of the implement draft). Grounded investigation is frequently more accurate than the blind plan that preceded it -- do NOT reject the implement draft merely because it touches different files, a different number of files, or a narrower/broader scope than the plan named; that is the expected, normal outcome of the plan being wrong about something the real investigation then corrected, not a sign of an over-broad or off-task draft. Judge the diff against the TASK's actual request and the real repo state (fact-check/grounding above), not against the plan's stated scope. Reject only if the diff itself is wrong given the real repo state, contradicts the task's actual ask, or the draft's own RESOLUTION/summary text is inconsistent with what the diff actually does.");
+  } else if (task.source === 'staleness_audit') {
+    // Fix, 2026-08-22 (Grimmethy: caught this live -- a real staleness_audit report got
+    // rejected as "meta-commentary and hedging... rather than providing the requested
+    // implementation") -- staleness_audit's implement draft is DELIBERATELY an advisory
+    // prose report, never code (see stalenessAuditImplementPrompt, prompts.js: "Write a
+    // short advisory report... not a diff"). This is the ONE source whose entire
+    // contract is the exact language pattern the generic instruction above tells a
+    // reviewer to reject on sight ("here's what I found, you decide," hedged language
+    // about what's confirmed vs. unconfirmed) -- without this carve-out, EVERY correctly-
+    // written staleness_audit report is structurally guaranteed to be rejected by the
+    // generic hedging rule, regardless of how accurate its analysis actually is.
+    lines.push('This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), or it fabricates a claim about the original flagged task not present in the evidence text it was given.');
   }
   const completenessQuestion = task.source === 'brain_dump_sort'
     // Deliberately NOT "does it contain real, complete code" -- confirmed live
@@ -166,7 +190,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     // was one of two compounding causes behind every brain_dump_sort draft getting
     // rejected regardless of how correct the classification actually was.
     ? 'Does it contain a complete, valid classification JSON (not a bare tool-call request, not meta-commentary, not a truncated/partial JSON fragment)?'
-    : 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
+    : task.source === 'staleness_audit'
+      // Same reasoning as the brain_dump_sort carve-out just above -- "real, complete
+      // code" directly contradicts this source's own advisory-prose carve-out.
+      ? 'Does it contain a genuine three-part analysis (does the concern still hold, was the original fabrication finding genuine, and an explicit RECOMMENDATION), grounded in the real harness search results shown above rather than invented?'
+      : 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
   lines.push(`Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? ${completenessQuestion} Does anything in it contradict the real grounding source or fact-check above?`);
   lines.push('Respond with EXACTLY one of these two forms, nothing else. BOTH require a concrete, specific reason -- cite an actual file name, field name, or line of the draft. A reason that just restates the verdict word ("looks correct", "seems fine", "meets requirements") is not acceptable and will be discarded as unreasoned.');
   lines.push('APPROVE: <one-sentence reason citing the specific requirement(s) you verified are met>');
@@ -262,7 +290,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       isNonImplementation = true;
     }
   }
-  if (isNonImplementation && !EMPTY_APPROVAL_SOURCES.includes(task.source)) {
+  if (isNonImplementation && !EMPTY_APPROVAL_SOURCES.includes(task.source) && !ADVISORY_PROSE_SOURCES.includes(task.source)) {
     const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).';
     task.reviewProvider = 'deterministic-non-implementation';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });

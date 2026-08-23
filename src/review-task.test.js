@@ -83,6 +83,42 @@ test('buildVerdictPrompt does not fabricate a carve-out for a source with none d
   assert.doesNotMatch(prompt, /CLASSIFICATION task/);
 });
 
+// Regression, 2026-08-22: caught live -- a real staleness_audit advisory report
+// (hedged, uncertain prose by design -- see stalenessAuditImplementPrompt, prompts.js)
+// got rejected by review as "meta-commentary and hedging... rather than providing the
+// requested implementation," because buildVerdictPrompt had no carve-out for it and the
+// generic instructions explicitly tell a reviewer to reject exactly that language shape.
+test('buildVerdictPrompt gives staleness_audit its own carve-out -- hedged prose is the expected deliverable, not a rejection signal', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'staleness_audit',
+    implementResponse: '**Advisory report**\n\n1. Inconclusive on the original concern.\n2. Fabrication confirmed.\n\nRECOMMENDATION: worth a fresh investigation.',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /staleness-audit task/);
+  assert.match(prompt, /Hedged, uncertain language.*is the EXPECTED and CORRECT way/);
+  assert.match(prompt, /RECOMMENDATION line/);
+  assert.doesNotMatch(prompt, /does it contain real, complete code/i);
+  assert.doesNotMatch(prompt, /CLASSIFICATION task/);
+});
+
+test('a short staleness_audit report is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'staleness-test-1', domain: 'default', source: 'staleness_audit',
+    title: 'Staleness audit: test',
+    planResponse: 'QUERY: something',
+    implementResponse: 'RECOMMENDATION: archive.', // deliberately short, no code fence -- would trip the <80-char heuristic for any other source
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, ornithMajorityVote: fakeApprove(captured),
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'a short-but-legitimate advisory report must reach the real reviewer vote, not get auto-rejected before it');
+});
+
 function makeFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-test-'));
   const repoRoot = path.join(dir, 'repo');
