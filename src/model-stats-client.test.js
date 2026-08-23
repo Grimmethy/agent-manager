@@ -72,6 +72,37 @@ test('getCostSummary aggregates totalCostUsd and byModel across multiple calls, 
   });
 });
 
+test('recordCall stamps instanceId from AGENT_MANAGER_INSTANCE_ID, getCostSummary breaks cost down by instance', async () => {
+  const dbPath = freshDbPath();
+  const prevInstanceId = process.env.AGENT_MANAGER_INSTANCE_ID;
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    process.env.AGENT_MANAGER_INSTANCE_ID = 'worker-reasoning';
+    recordCall({ taskId: 't1', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.30 } });
+    process.env.AGENT_MANAGER_INSTANCE_ID = 'worker-1';
+    recordCall({ taskId: 't2', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.10 } });
+
+    const summary = getCostSummary();
+    const byInstance = Object.fromEntries(summary.byInstance.map((i) => [i.instanceId, i]));
+    assert.ok(Math.abs(byInstance['worker-reasoning'].totalCost - 0.30) < 1e-9);
+    assert.ok(Math.abs(byInstance['worker-1'].totalCost - 0.10) < 1e-9);
+  });
+  if (prevInstanceId === undefined) delete process.env.AGENT_MANAGER_INSTANCE_ID;
+  else process.env.AGENT_MANAGER_INSTANCE_ID = prevInstanceId;
+});
+
+test('recordCall stores a null instanceId (not a crash) when AGENT_MANAGER_INSTANCE_ID is unset', async () => {
+  const dbPath = freshDbPath();
+  const prevInstanceId = process.env.AGENT_MANAGER_INSTANCE_ID;
+  delete process.env.AGENT_MANAGER_INSTANCE_ID;
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    recordCall({ taskId: 't1', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.05 } });
+    const summary = getCostSummary();
+    assert.equal(summary.byInstance[0].instanceId, '(unknown)');
+  });
+  if (prevInstanceId === undefined) delete process.env.AGENT_MANAGER_INSTANCE_ID;
+  else process.env.AGENT_MANAGER_INSTANCE_ID = prevInstanceId;
+});
+
 test('getCostSummary returns a real (not null) summary even with zero calls recorded yet', async () => {
   const dbPath = freshDbPath();
   await withFreshDb(dbPath, async ({ getCostSummary }) => {

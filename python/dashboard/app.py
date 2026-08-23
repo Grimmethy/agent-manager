@@ -716,6 +716,15 @@ def _has_cost_usd_column(conn: sqlite3.Connection) -> bool:
     return bool(row and row[0])
 
 
+def _has_instance_id_column(conn: sqlite3.Connection) -> bool:
+    """Same guard as _has_cost_usd_column above, for the instance_id column (2026-08-23,
+    "Where else would it make sense to track it?" -> Workers tab, per-instance cost) --
+    added in the same migration pass as cost_usd, but guarded independently since a
+    caller should never assume two separate ALTER TABLE statements landed atomically."""
+    row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'instance_id'").fetchone()
+    return bool(row and row[0])
+
+
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
     kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
@@ -981,14 +990,15 @@ def api_models_cost_summary():
     API pricing, independent of subscription billing); nothing ever stored or surfaced it
     until now."""
     db_path = model_stats_db_path()
+    empty = {"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": 0, "byModel": [], "byDay": [], "byInstance": []}
     if not db_path or not db_path.is_file():
-        return jsonify({"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": 0, "byModel": [], "byDay": []})
+        return jsonify(empty)
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         if not _has_cost_usd_column(conn):
             total_calls = conn.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0]
-            return jsonify({"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": total_calls, "byModel": [], "byDay": []})
+            return jsonify({**empty, "freeCalls": total_calls})
 
         total_row = conn.execute(
             "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM model_calls WHERE cost_usd IS NOT NULL"
@@ -1002,6 +1012,12 @@ def api_models_cost_summary():
             SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS total_cost, COUNT(*) AS calls
             FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
         """).fetchall()
+        by_instance = []
+        if _has_instance_id_column(conn):
+            by_instance = conn.execute("""
+                SELECT COALESCE(instance_id, '(unknown)') AS instance_id, COALESCE(SUM(cost_usd), 0) AS total_cost, COUNT(*) AS calls
+                FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY instance_id ORDER BY total_cost DESC
+            """).fetchall()
     finally:
         conn.close()
 
@@ -1011,6 +1027,7 @@ def api_models_cost_summary():
         "freeCalls": free_calls,
         "byModel": [{"model": m, "totalCost": c, "calls": n} for m, c, n in by_model],
         "byDay": [{"day": d, "totalCost": c, "calls": n} for d, c, n in by_day],
+        "byInstance": [{"instanceId": i, "totalCost": c, "calls": n} for i, c, n in by_instance],
     })
 
 
@@ -1515,6 +1532,37 @@ def api_queue_state(state):
     return jsonify({"items": entries, "total": total})
 
 
+def _task_cost_summary(task_id: str) -> dict | None:
+    """Estimated Anthropic API cost for ONE task, summed across every model_calls row
+    for it -- a task can carry several real calls (plan, implement, critique, revision,
+    or an agentic pass's own single call), and task.abCallId on the task JSON itself only
+    ever holds the MOST RECENT one, so this queries by task_id directly rather than
+    relying on that field. Returns None (not a zeroed dict) when the db/column isn't
+    available yet, so the frontend can distinguish "no cost data at all" from "$0, no
+    Claude calls for this task" -- the same distinction api_models_cost_summary's own
+    freeCalls count already makes at the aggregate level.
+    Grimmethy, 2026-08-23: "We should include estimated cost tracking in the job page
+    itself." """
+    db_path = model_stats_db_path()
+    if not db_path or not db_path.is_file():
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        if not _has_cost_usd_column(conn):
+            return None
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM model_calls WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    total_cost, total_calls, calls_with_cost = row
+    if total_calls == 0:
+        return None
+    return {"totalCostUsd": total_cost, "totalCalls": total_calls, "callsWithCost": calls_with_cost or 0}
+
+
 @app.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     qdir = queue_dir()
@@ -1527,7 +1575,7 @@ def api_task_detail(state, task_id):
             for candidate in drafting_root.rglob(f"{task_id}.json"):
                 data = read_json_safe(candidate)
                 if data:
-                    return jsonify(data)
+                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id)})
         abort(404)
 
     if state not in QUEUE_STATES:
@@ -1536,7 +1584,7 @@ def api_task_detail(state, task_id):
     data = read_json_safe(f)
     if not data:
         abort(404)
-    return jsonify(data)
+    return jsonify({**data, "_costSummary": _task_cost_summary(task_id)})
 
 
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
@@ -1790,12 +1838,12 @@ def api_task_anywhere(task_id):
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting"})
+                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id)})
 
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return jsonify({**data, "_foundState": state})
+            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id)})
 
     abort(404, description=f"task {task_id} not found in any queue state")
 

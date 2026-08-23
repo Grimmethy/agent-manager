@@ -115,6 +115,53 @@ test('computeTimeAccounting: sums latency_ms per classification bucket, unmatche
   assert.equal(result.bucketSec['in-progress'], 3);
 });
 
+// Cost accounting, 2026-08-23 (Grimmethy: "We should track it in the hourly/daily/weekly
+// logs") -- a db with NO cost_usd column at all (the exact schema the test right above
+// this one already uses) must still work, not throw "no such column".
+test('computeTimeAccounting: a db with no cost_usd column at all reports zero cost, not a crash', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dir = tempDir();
+  const dbPath = path.join(dir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT, task_id TEXT, started_at TEXT, latency_ms INTEGER)');
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms) VALUES (?, ?, ?, ?)').run('c1', 'task-a', '2026-08-19T10:10:00.000Z', 5000);
+  db.close();
+
+  const tasks = [{ id: 'task-a', source: 'trouble_log', classification: 'benefit' }];
+  const result = computeTimeAccounting(dbPath, tasks, '2026-08-19T10:00:00.000Z', '2026-08-19T11:00:00.000Z');
+  assert.equal(result.totalCostUsd, 0);
+  assert.equal(result.callsWithCost, 0);
+  assert.deepEqual(result.costBySource, []);
+});
+
+test('computeTimeAccounting: sums cost_usd per classification bucket AND per task source', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dir = tempDir();
+  const dbPath = path.join(dir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT, task_id TEXT, started_at TEXT, latency_ms INTEGER, cost_usd REAL)');
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms, cost_usd) VALUES (?, ?, ?, ?, ?)').run('c1', 'task-a', '2026-08-19T10:10:00.000Z', 5000, 0.30);
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms, cost_usd) VALUES (?, ?, ?, ?, ?)').run('c2', 'task-b', '2026-08-19T10:15:00.000Z', 2000, 0.10);
+  // A local (Ornith) call in the same window -- null cost_usd, must not count toward totalCostUsd.
+  db.prepare('INSERT INTO model_calls (call_id, task_id, started_at, latency_ms, cost_usd) VALUES (?, ?, ?, ?, ?)').run('c3', 'task-c', '2026-08-19T10:20:00.000Z', 1000, null);
+  db.close();
+
+  const tasks = [
+    { id: 'task-a', source: 'manual', classification: 'benefit' },
+    { id: 'task-b', source: 'manual', classification: 'benefit' },
+    { id: 'task-c', source: 'brain_dump_sort', classification: 'housekeeping' },
+  ];
+  const result = computeTimeAccounting(dbPath, tasks, '2026-08-19T10:00:00.000Z', '2026-08-19T11:00:00.000Z');
+  assert.ok(Math.abs(result.totalCostUsd - 0.40) < 1e-9);
+  assert.equal(result.callsWithCost, 2);
+  assert.ok(Math.abs(result.bucketCostUsd.benefit - 0.40) < 1e-9);
+  assert.equal(result.bucketCostUsd.housekeeping, 0);
+  assert.equal(result.costBySource.length, 1);
+  assert.equal(result.costBySource[0].source, 'manual');
+  assert.ok(Math.abs(result.costBySource[0].costUsd - 0.40) < 1e-9);
+  assert.equal(result.costBySource[0].calls, 2);
+});
+
 test('renderMarkdown: includes all major sections', () => {
   const md = renderMarkdown({
     period: 'hourly',
@@ -264,6 +311,67 @@ test('renderMarkdown includes Queue Health, Failure Patterns, and Self-Audit Act
   assert.match(md, /arch_import::harness-search-zero-results.*1\/1/);
   assert.match(md, /## Self-Audit Activity/);
   assert.match(md, /pipeline-self-audit-1/);
+});
+
+// Estimated Anthropic API Cost section (2026-08-23, Grimmethy: "We should track it in the
+// hourly/daily/weekly logs").
+test('renderMarkdown includes an Estimated Anthropic API Cost section with a source breakdown', () => {
+  const md = renderMarkdown({
+    period: 'hourly',
+    startIso: '2026-08-20T10:00:00.000Z',
+    endIso: '2026-08-20T11:00:00.000Z',
+    tasks: [{ id: 't1', source: 'manual', classification: 'benefit' }],
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+    timeAccounting: {
+      bucketSec: { benefit: 60 }, bucketCalls: { benefit: 1 },
+      bucketCostUsd: { benefit: 0.42, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
+      totalCostUsd: 0.42, callsWithCost: 1,
+      costBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
+    },
+    queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+  });
+  assert.match(md, /## Estimated Anthropic API Cost/);
+  assert.match(md, /\$0\.4200/);
+  assert.match(md, /manual: \$0\.4200 \(1 call\(s\)\)/);
+});
+
+test('renderMarkdown reports "no Claude calls" plainly when timeAccounting exists but nothing cost anything', () => {
+  const md = renderMarkdown({
+    period: 'hourly',
+    startIso: '2026-08-20T10:00:00.000Z',
+    endIso: '2026-08-20T11:00:00.000Z',
+    tasks: [],
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+    timeAccounting: { bucketSec: {}, bucketCalls: {}, bucketCostUsd: {}, totalCostUsd: 0, callsWithCost: 0, costBySource: [] },
+    queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+  });
+  assert.match(md, /## Estimated Anthropic API Cost/);
+  assert.match(md, /every real model call ran locally, free/);
+});
+
+test('buildPlainEnglishSummary mentions the real Anthropic API cost estimate when Claude calls happened', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'hourly',
+    tasks: [{ classification: 'benefit', title: 'Ship a real fix' }],
+    byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+    downtime: { pipelineDownSec: 0 },
+    timeAccounting: { totalCostUsd: 0.42, callsWithCost: 1 },
+  });
+  assert.match(summary, /\$0\.4200/);
+  assert.match(summary, /never billed per-token/);
+});
+
+test('buildPlainEnglishSummary says nothing about cost when no Claude calls happened this period', () => {
+  const summary = buildPlainEnglishSummary({
+    period: 'hourly',
+    tasks: [{ classification: 'benefit', title: 'Ship a real fix' }],
+    byClassification: { benefit: 1, filtering: 0, junk: 0, housekeeping: 0, unclear: 0 },
+    blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+    downtime: { pipelineDownSec: 0 },
+    timeAccounting: { totalCostUsd: 0, callsWithCost: 0 },
+  });
+  assert.doesNotMatch(summary, /Anthropic API/);
 });
 
 // Plain-English period summary (2026-08-20, Grimmethy: "Every time tracking entry should

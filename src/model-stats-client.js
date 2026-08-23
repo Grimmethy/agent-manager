@@ -59,6 +59,12 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
     evalDurationNs: result && result.eval_duration != null ? result.eval_duration : null,
     promptEvalCount: result && result.prompt_eval_count != null ? result.prompt_eval_count : null,
     evalCount: result && result.eval_count != null ? result.eval_count : null,
+    // instanceId (2026-08-23, "Where else would it make sense to track it?" -> Workers
+    // tab, per-instance cumulative cost): AGENT_MANAGER_INSTANCE_ID is already a real env
+    // var in every worker's process tree (local-worker.sh exports it -- see
+    // model-inflight-lock.js's own use of it for the exact same kind of attribution), read
+    // directly here rather than threading a new param through all 3 call sites.
+    instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null,
     // costUsd (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
     // tasks would cost using anthropic API?"): claude-client.js's call() has always
     // computed this (Claude Code CLI's own total_cost_usd, a client-side estimate

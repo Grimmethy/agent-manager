@@ -198,13 +198,20 @@ function computeDowntime(instancesDir, startIso, endIso) {
   };
 }
 
-// Real per-call wall-clock time (model-stats.db's model_calls.latency_ms), summed per
-// classification bucket by joining each call's task_id to the same tasks scanTaskActivity
-// already classified. Calls whose task_id doesn't match anything in `tasks` (e.g. a task
-// still in progress, not yet terminal) are summed separately as 'in-progress' rather than
-// dropped silently. Returns null (not thrown) if the db is missing/unreadable -- node:
-// sqlite is itself optional-at-runtime the same way the rest of this pipeline treats a
-// missing dependency, and a report with no time-accounting section is still useful.
+// Real per-call wall-clock time AND estimated Anthropic API cost (model-stats.db's
+// model_calls.latency_ms / cost_usd), summed per classification bucket AND per task
+// source, by joining each call's task_id to the same tasks scanTaskActivity already
+// classified. Calls whose task_id doesn't match anything in `tasks` (e.g. a task still in
+// progress, not yet terminal) are summed separately as 'in-progress' rather than dropped
+// silently. Returns null (not thrown) if the db is missing/unreadable -- node:sqlite is
+// itself optional-at-runtime the same way the rest of this pipeline treats a missing
+// dependency, and a report with no time-accounting section is still useful.
+//
+// Cost accounting (2026-08-23, Grimmethy: "We should track it in the hourly/daily/weekly
+// logs") -- cost_usd may not exist yet on an older db (model-stats-db.js's own ALTER
+// TABLE migration only runs from the Node side's next real recordCall()), so this checks
+// pragma_table_info the same way app.py's own _has_cost_usd_column already does, rather
+// than letting a missing-column query throw and take down the whole report.
 function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   let DatabaseSync;
   try {
@@ -222,22 +229,50 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   }
 
   const byTaskId = new Map(tasks.map((t) => [t.id, t.classification]));
+  const sourceByTaskId = new Map(tasks.map((t) => [t.id, t.source || 'unknown']));
   const bucketMs = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
   const bucketCalls = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const bucketCostUsd = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const costBySource = new Map(); // source -> { costUsd, calls }
+  let totalCostUsd = 0;
+  let callsWithCost = 0;
 
   try {
-    const rows = db.prepare('SELECT task_id, latency_ms FROM model_calls WHERE started_at >= ? AND started_at < ?').all(startIso, endIso);
+    const hasCostColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'`).get().c > 0;
+    const costSelect = hasCostColumn ? ', cost_usd' : '';
+    const rows = db.prepare(`SELECT task_id, latency_ms${costSelect} FROM model_calls WHERE started_at >= ? AND started_at < ?`).all(startIso, endIso);
     for (const row of rows) {
       const ms = row.latency_ms || 0;
       const bucket = byTaskId.has(row.task_id) ? byTaskId.get(row.task_id) : 'in-progress';
       bucketMs[bucket] = (bucketMs[bucket] || 0) + ms;
       bucketCalls[bucket] = (bucketCalls[bucket] || 0) + 1;
+      if (hasCostColumn && row.cost_usd != null) {
+        bucketCostUsd[bucket] = (bucketCostUsd[bucket] || 0) + row.cost_usd;
+        totalCostUsd += row.cost_usd;
+        callsWithCost += 1;
+        const source = sourceByTaskId.has(row.task_id) ? sourceByTaskId.get(row.task_id) : 'in-progress';
+        const entry = costBySource.get(source) || { costUsd: 0, calls: 0 };
+        entry.costUsd += row.cost_usd;
+        entry.calls += 1;
+        costBySource.set(source, entry);
+      }
     }
   } finally {
     db.close();
   }
 
-  return { bucketSec: Object.fromEntries(Object.entries(bucketMs).map(([k, v]) => [k, Math.round(v / 1000)])), bucketCalls };
+  const bySource = [...costBySource.entries()]
+    .map(([source, v]) => ({ source, costUsd: v.costUsd, calls: v.calls }))
+    .sort((a, b) => b.costUsd - a.costUsd);
+
+  return {
+    bucketSec: Object.fromEntries(Object.entries(bucketMs).map(([k, v]) => [k, Math.round(v / 1000)])),
+    bucketCalls,
+    bucketCostUsd,
+    totalCostUsd,
+    callsWithCost,
+    costBySource: bySource,
+  };
 }
 
 const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 'needs-clarification', 'blocked'];
@@ -388,6 +423,10 @@ function fmtDuration(sec) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+function fmtUsd(usd) {
+  return `$${usd.toFixed(4)}`;
+}
+
 // A short (2-5 sentence) plain-English narrative of what THIS PERIOD specifically
 // accomplished -- added 2026-08-20 (Grimmethy: "Every time tracking entry should contain
 // a plain english description of the specific benefit and results of that period. This
@@ -400,7 +439,7 @@ function fmtDuration(sec) {
 // reviewer-starvation incident, caused by exactly that kind of unnecessary GPU
 // contention. Names REAL accomplishments (actual task titles), not just restated counts,
 // so a reader gets something concrete rather than a rephrase of the bullet lists below.
-function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime }) {
+function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }) {
   const periodLabel = period === 'hourly' ? 'This hour' : period === 'daily' ? 'Today' : period === 'weekly' ? 'This week' : 'In this period';
   const sentences = [];
 
@@ -444,6 +483,13 @@ function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatt
     }
   }
 
+  // 2026-08-23, Grimmethy: "We should track it in the hourly/daily/weekly logs" -- folds
+  // the estimated Anthropic API cost into the narrative itself, not just the table below,
+  // same "name something concrete" intent this whole function already follows.
+  if (timeAccounting && timeAccounting.callsWithCost > 0) {
+    sentences.push(`An estimated ${fmtUsd(timeAccounting.totalCostUsd)} of Anthropic API-equivalent cost was spent across ${timeAccounting.callsWithCost} Claude call(s) this period (all real calls actually ran under a subscription, never billed per-token).`);
+  }
+
   return sentences.join(' ');
 }
 
@@ -462,7 +508,7 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   lines.push('');
 
   lines.push('## Summary');
-  lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime }));
+  lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }));
   lines.push('');
 
   lines.push('## By Source');
@@ -491,6 +537,28 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   } else {
     lines.push('## Junk vs. Benefit (by real wall-clock time)');
     lines.push('_model-stats.db was unavailable for this period -- see task-count breakdown above instead._');
+    lines.push('');
+  }
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "We should track it in the
+  // hourly/daily/weekly logs") -- what every real Claude call this period would have
+  // cost on real Anthropic API pricing; these calls actually ran under a subscription,
+  // never billed per-token, so this is an estimate/equivalent-cost figure, not a bill.
+  if (timeAccounting && timeAccounting.callsWithCost > 0) {
+    lines.push('## Estimated Anthropic API Cost');
+    lines.push(`- Total: ${fmtUsd(timeAccounting.totalCostUsd)} across ${timeAccounting.callsWithCost} Claude call(s) this period.`);
+    const cb = timeAccounting.bucketCostUsd;
+    lines.push(`- By outcome: benefit ${fmtUsd(cb.benefit || 0)} · filtering ${fmtUsd(cb.filtering || 0)} · housekeeping ${fmtUsd(cb.housekeeping || 0)} · junk ${fmtUsd(cb.junk || 0)}${cb['in-progress'] ? ` · in-progress ${fmtUsd(cb['in-progress'])}` : ''}`);
+    if (timeAccounting.costBySource.length > 0) {
+      lines.push('- By source:');
+      for (const { source, costUsd, calls } of timeAccounting.costBySource) {
+        lines.push(`  - ${source}: ${fmtUsd(costUsd)} (${calls} call(s))`);
+      }
+    }
+    lines.push('');
+  } else if (timeAccounting) {
+    lines.push('## Estimated Anthropic API Cost');
+    lines.push('_No Claude calls recorded this period -- every real model call ran locally, free._');
     lines.push('');
   }
 
@@ -628,7 +696,7 @@ function checkDue({ pipelineDir, instancesDir, dbPath, secondBrainDir, selfAudit
 
 module.exports = {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, renderMarkdown,
-  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary, fmtLocal,
+  computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary, fmtLocal, fmtUsd,
   generateReport, checkDue, loadSchedule, saveSchedule, PERIOD_MS,
 };
 
