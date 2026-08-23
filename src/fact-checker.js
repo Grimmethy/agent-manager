@@ -136,6 +136,56 @@ function checkFilePaths(text, repoRoot, extraRoots = []) {
   });
 }
 
+// Fabricated-commit-reference check (2026-08-23, Grimmethy: "use it to harden the
+// pipeline" -- caught live via an adhoc task rejected TWICE by a human reviewer for the
+// SAME fabrication: the draft claimed "commit 7261944" had already resolved the request,
+// with no diff or evidence, and that hash does not exist anywhere in this repo's history.
+// checkFilePaths already catches a fabricated FILE reference deterministically before a
+// review pass ever spends a token on it -- a fabricated COMMIT reference is the exact same
+// failure mode (a specific, checkable, concrete claim invented instead of verified) with
+// no equivalent check, so it took two full reject cycles to catch by hand what `git log`
+// could have answered in milliseconds on the first attempt.
+const COMMIT_CLAIM_RE = /\bcommits?\s+`?([0-9a-f]{7,40})`?\b/gi;
+
+function extractClaimedCommits(text) {
+  const matches = [...(text || '').matchAll(COMMIT_CLAIM_RE)].map((m) => m[1].toLowerCase());
+  return [...new Set(matches)];
+}
+
+const GIT_COMMIT_CHECK_TIMEOUT_MS = 15_000;
+
+// Best-effort, same non-fatal treatment every other git call in this pipeline already
+// follows (see staleness-audit.js's own findFilesTouchedSince): a repo with no .git dir,
+// git itself unavailable, or any other lookup failure resolves to "unknown" (neither
+// confirmed nor flagged as fabricated) rather than a false-positive fabrication flag on
+// an environment problem that has nothing to do with the draft's own honesty.
+function checkCommitClaims(text, repoRoot) {
+  const { execFileSync } = require('child_process');
+  return extractClaimedCommits(text).map((hash) => {
+    let exists;
+    try {
+      execFileSync('git', ['cat-file', '-e', `${hash}^{commit}`], {
+        cwd: repoRoot, timeout: GIT_COMMIT_CHECK_TIMEOUT_MS, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      exists = true;
+    } catch (e) {
+      // git exits non-zero both for "not a valid object name" (the real fabrication
+      // signal, exit 128) AND for "not a git repository at all" (also exit 128) -- the
+      // exit code alone can't tell those apart, only the message can. Confirmed live:
+      // `git cat-file -e X^{commit}` outside any repo prints "fatal: not a git
+      // repository (or any of the parent directories): .git", never mentioning the hash
+      // itself -- an environment problem, not evidence about the claim, so it must not
+      // read as false the same way an unresolved find-string bug would misreport a
+      // config problem as a content problem.
+      const stderr = (e.stderr || '').toString();
+      // e.code === 'ENOENT' (git binary itself not found) or a timeout (e.signal set)
+      // also carries no evidence about the hash -- same unknown treatment.
+      exists = (e.code === 'ENOENT' || e.signal || /not a git repository/i.test(stderr)) ? null : false;
+    }
+    return { claimedHash: hash, exists };
+  });
+}
+
 function extractClaimedRelationships(text) {
   const out = [];
   let match;
@@ -251,6 +301,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText);
   const createModeTargets = extractCreateModeTargets(draftText);
+  const commitChecks = checkCommitClaims(draftText, repoRoot);
 
   // isCreateTarget is stamped onto fileChecks itself (not just used to filter `flags`
   // below) because buildVerdictPrompt (review-task.js) hands the REVIEWER MODEL the raw
@@ -277,12 +328,21 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
       flags.push({ type: 'unconfirmed-relationship', detail: `"${r.from}" does not appear to reference "${r.to}"` });
     }
   }
+  for (const c of commitChecks) {
+    // exists === false only (not null) -- git itself confirmed this hash is not a real
+    // object in this repo's history, not just "couldn't check" (missing repo/git, see
+    // checkCommitClaims' own comment). A drafter claiming specific work was "already done
+    // in commit X" is exactly the same checkable-but-unchecked-claim shape a missing-file
+    // reference already catches; this closes the gap for the same fabrication pattern
+    // aimed at a commit hash instead of a path.
+    if (c.exists === false) flags.push({ type: 'fabricated-commit-reference', detail: c.claimedHash });
+  }
   if (blastRadiusFlag) {
     flags.push({ type: 'unscoped-heavy-change', detail: blastRadiusFlag.note });
   }
   flags.push(...groundedFlags);
 
-  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags };
+  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks };
 }
 
 module.exports = {
@@ -291,9 +351,11 @@ module.exports = {
   checkRelationships,
   checkBlastRadiusBias,
   checkGroundedValues,
+  checkCommitClaims,
   extractFilePaths,
   extractCreateModeTargets,
   extractClaimedRelationships,
+  extractClaimedCommits,
   resolveAgainstRepo,
   findByBasename,
 };
