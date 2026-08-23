@@ -17,7 +17,22 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets } = require('./fact-checker.js');
+const { execFileSync } = require('child_process');
+const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits } = require('./fact-checker.js');
+
+// Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
+// against a hash that genuinely exists, not just one that doesn't.
+function makeGitRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-git-test-'));
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'test');
+  execFileSync('git', ['add', 'README.md'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: dir });
+  const realHash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  return { dir, realHash };
+}
 
 function makeRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
@@ -224,4 +239,63 @@ test('checkDraft still flags a genuinely fabricated path referenced by an edit/d
   const result = checkDraft(draft, dir);
   const missing = result.flags.filter((f) => f.type === 'missing-file').map((f) => f.detail);
   assert.deepEqual(missing, ['src/does-not-exist.js']);
+});
+
+// Regression, 2026-08-23: caught live -- a draft was rejected TWICE by a human reviewer
+// for claiming "already resolved (commit 7261944)" with no diff or evidence, and that
+// hash does not exist anywhere in the repo. checkFilePaths already catches a fabricated
+// FILE reference deterministically before a review pass spends a token on it; this closes
+// the same gap for a fabricated COMMIT reference.
+
+test('extractClaimedCommits finds a commit hash following the word "commit"', () => {
+  assert.deepEqual(extractClaimedCommits('already resolved (commit 7261944), nothing to do'), ['7261944']);
+});
+
+test('extractClaimedCommits finds a backtick-wrapped hash and lowercases it', () => {
+  assert.deepEqual(extractClaimedCommits('see commit `ABC1234`'), ['abc1234']);
+});
+
+test('extractClaimedCommits dedupes repeated mentions of the same hash', () => {
+  assert.deepEqual(extractClaimedCommits('fixed in commit abc1234. See also commit abc1234 for details.'), ['abc1234']);
+});
+
+test('extractClaimedCommits ignores a bare hex-looking string with no "commit" nearby', () => {
+  assert.deepEqual(extractClaimedCommits('the value 7261944 appears in the config'), []);
+});
+
+test('checkCommitClaims flags a hash that does not exist in the repo as exists:false', () => {
+  const { dir } = makeGitRepo();
+  const result = checkCommitClaims('already resolved in commit 7261944', dir);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].claimedHash, '7261944');
+  assert.equal(result[0].exists, false);
+});
+
+test('checkCommitClaims confirms a hash that genuinely exists in the repo as exists:true', () => {
+  const { dir, realHash } = makeGitRepo();
+  const result = checkCommitClaims(`already resolved in commit ${realHash}`, dir);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].exists, true);
+});
+
+test('checkCommitClaims reports exists:null (not false) when the repo/git itself is unavailable', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-nogit-test-')); // not a git repo
+  const result = checkCommitClaims('already resolved in commit 7261944', dir);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].exists, null);
+});
+
+test('checkDraft flags a fabricated commit reference and includes commitChecks in its return value', () => {
+  const { dir } = makeGitRepo();
+  const result = checkDraft('This was already resolved in commit 7261944, no changes needed.', dir);
+  const fabricated = result.flags.filter((f) => f.type === 'fabricated-commit-reference');
+  assert.deepEqual(fabricated, [{ type: 'fabricated-commit-reference', detail: '7261944' }]);
+  assert.equal(result.commitChecks.length, 1);
+});
+
+test('checkDraft does NOT flag a real, existing commit hash', () => {
+  const { dir, realHash } = makeGitRepo();
+  const result = checkDraft(`This was already resolved in commit ${realHash}, no changes needed.`, dir);
+  const fabricated = result.flags.filter((f) => f.type === 'fabricated-commit-reference');
+  assert.deepEqual(fabricated, []);
 });
