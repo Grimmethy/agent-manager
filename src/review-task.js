@@ -94,6 +94,7 @@ async function waitForOrnithAvailability(instancesDir, maxWaitAttempts = 3, wait
 const EMPTY_APPROVAL_SOURCES = [
   'arch_discovery', 'project_search', 'deep_dive', 'arch_import', 'pipeline_self_audit',
   'arch_review', 'arch_import_review', 'observability_fix', 'performance_fix', 'backlog_fulfillment',
+  'function_length_fix',
 ];
 
 // staleness_audit (2026-08-22, caught live: a real advisory report got rejected by the
@@ -118,7 +119,7 @@ const EMPTY_APPROVAL_SOURCES = [
 // attempt" before ever reaching apply() -- which (applyArchDiscoveryCandidates, task-
 // sources.js) already treats a plain prose verdict as a documented no-op, proving the
 // intent was always for this prose to pass review, not be rejected by it.
-const ADVISORY_PROSE_SOURCES = ['staleness_audit', 'observability_review', 'performance_review'];
+const ADVISORY_PROSE_SOURCES = ['staleness_audit', 'observability_review', 'performance_review', 'function_length_review'];
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }

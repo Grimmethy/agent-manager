@@ -2185,6 +2185,17 @@ registerTaskSource('backlog_fulfillment', {
   next: () => nextCandidateFulfillmentTask(getConfig().backlogCandidatesPath, 'backlog_fulfillment'),
 });
 
+// function_length_review / function_length_fix (2026-08-23, Grimmethy: "Let's start with
+// the modular approach with the intent to further separate it into a fully separate npm
+// later") -- first member of the "maintenance" task-source family, kept in its own
+// src/maintenance/ directory with the narrowest possible dependency on this file (only
+// the already-public nextCandidateFulfillmentTask/taskIdExistsInQueue/taskPriority,
+// injected here rather than required by that module directly) -- see its own header for
+// the full design and the extraction this is meant to make cheap later.
+require('./maintenance/function-length-review.js').register({
+  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
+});
+
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible
 // work and stops there, even when that source's task doesn't match the calling lane's own
