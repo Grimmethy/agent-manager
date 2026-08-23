@@ -26,7 +26,13 @@
 
 const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
 
-const DEFAULT_STALENESS_THRESHOLD_DAYS = 14;
+// Lowered from 14 (2026-08-23, Grimmethy: "Yes, lower the default" -- after confirming
+// live that the first real candidate, adhoc-brain-dump-bd-1786742554232, had been
+// genuinely dead since 2026-08-14 with zero real developments, yet its CORRECTED age
+// (lastActivityTs's own exhausted-spam fix, same commit range) was only ~9 days --
+// still under the old 14-day threshold. 7 days catches that case with margin while
+// staying well clear of a task still in normal active back-and-forth.
+const DEFAULT_STALENESS_THRESHOLD_DAYS = 7;
 const DEFAULT_COOLDOWN_DAYS = 21; // re-eligible after this long even if already reported once -- a
 // human who leaves a flagged task blocked (rather than archiving it) hasn't resolved it,
 // so this should surface again eventually rather than being suppressed forever, unlike
