@@ -8,6 +8,7 @@ const {
   resolveNumCtx,
   resolveTimeoutMs,
   MIN_NUM_CTX,
+  PINNED_NUM_CTX,
   MIN_TIMEOUT_MS,
   HARD_TIMEOUT_CEILING_MS,
 } = require('./gpu-capacity.js');
@@ -41,20 +42,33 @@ test('computeMaxSafeNumCtx respects a larger safety margin fraction by leaving m
   assert.ok(loose.maxSafeNumCtx > tight.maxSafeNumCtx);
 });
 
-test('resolveNumCtx buckets a small prompt to the floor instead of always requesting the max', () => {
-  const ctx = resolveNumCtx({ estimatedTokens: 300, numPredict: 1200, maxSafeNumCtx: 65536 });
+// 2026-08-23 regression: resolveNumCtx() used to bucket UP per call based on that call's
+// own prompt size (a 300-token prompt got MIN_NUM_CTX, a 20000-token one got a much
+// bigger bucket) -- confirmed live that this was the direct cause of a severe hang: any
+// request whose num_ctx exceeds whatever Ollama currently has resident hangs
+// indefinitely rather than reloading cleanly. Fixed by pinning num_ctx to ONE stable
+// value regardless of prompt size, so it stops varying call to call. See
+// resolveNumCtx()'s own comment for the full incident.
+test('resolveNumCtx returns the SAME pinned value for a small prompt as for a large one -- it no longer varies by prompt size', () => {
+  const small = resolveNumCtx({ estimatedTokens: 300, numPredict: 1200, maxSafeNumCtx: 65536 });
+  const large = resolveNumCtx({ estimatedTokens: 20000, numPredict: 1200, maxSafeNumCtx: 65536 });
+  assert.equal(small, PINNED_NUM_CTX);
+  assert.equal(large, PINNED_NUM_CTX);
+});
+
+test('resolveNumCtx clamps DOWN to maxSafeNumCtx on a box where the pinned value genuinely is not affordable', () => {
+  const ctx = resolveNumCtx({ estimatedTokens: 20000, numPredict: 1200, maxSafeNumCtx: 10000 });
+  assert.equal(ctx, 10000);
+});
+
+test('resolveNumCtx never clamps below MIN_NUM_CTX even if maxSafeNumCtx is reported smaller still', () => {
+  const ctx = resolveNumCtx({ estimatedTokens: 300, numPredict: 100, maxSafeNumCtx: 512 });
   assert.equal(ctx, MIN_NUM_CTX);
 });
 
-test('resolveNumCtx buckets a large harness-grounded prompt up, clamped to what the GPU can afford', () => {
-  const ctx = resolveNumCtx({ estimatedTokens: 20000, numPredict: 1200, maxSafeNumCtx: 24000 });
-  assert.ok(ctx <= 24000);
-  assert.ok(ctx >= 21200);
-});
-
-test('resolveNumCtx falls back to a plain power-of-two bucket when no live capacity snapshot exists', () => {
+test('resolveNumCtx falls back to the pinned value when no live capacity snapshot exists', () => {
   const ctx = resolveNumCtx({ estimatedTokens: 5000, numPredict: 1200 });
-  assert.equal(ctx, 8192);
+  assert.equal(ctx, PINNED_NUM_CTX);
 });
 
 test('resolveTimeoutMs scales down for a cheap short call instead of always returning the same fixed value', () => {
