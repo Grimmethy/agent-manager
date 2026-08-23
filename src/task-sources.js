@@ -1937,7 +1937,7 @@ function markPipelineSelfAuditReported(task) {
 // premise-recheck goes through the same harness-grounded local-model path
 // pipeline_self_audit's own fix-drafting already proves works end-to-end without Claude.
 function nextStalenessAuditTask() {
-  const { pipelineDir, stalenessAuditCoveragePath, defaultDomain } = getConfig();
+  const { pipelineDir, stalenessAuditCoveragePath, defaultDomain, repoRoot } = getConfig();
 
   const candidateTasks = [];
   for (const dirName of ['blocked', 'needs-clarification']) {
@@ -1964,7 +1964,13 @@ function nextStalenessAuditTask() {
     coverage = {};
   }
 
-  const candidates = findStalenessCandidates(candidateTasks, coverage);
+  // repoRoot enables the fourth criterion (possibly-resolved -- real commits landed
+  // since the task was filed, touching files it names, see staleness-audit.js's own
+  // header on findFilesTouchedSince): a real git log per candidate file, best-effort and
+  // non-fatal on any failure, but genuinely slower than the other three pure-JSON checks
+  // when queue/blocked/ is large -- acceptable here since this runs as an occasional
+  // background task-generation tick, never on an interactive path.
+  const candidates = findStalenessCandidates(candidateTasks, coverage, Date.now(), { repoRoot });
   if (candidates.length === 0) return null;
 
   const task = buildStalenessAuditTask(candidates[0], defaultDomain);
