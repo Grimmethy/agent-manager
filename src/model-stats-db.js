@@ -71,6 +71,19 @@ try {
     db.exec(`ALTER TABLE model_calls ADD COLUMN instance_id TEXT`)
   }
 
+  // hypothetical_cost_usd (2026-08-23, Grimmethy: "I'd like estimates for if we had used
+  // the API. Even if we used the local models.") -- cost_usd above is real spend for an
+  // ACTUAL Claude call, null for a local one; this is "what would this call have cost on
+  // the API regardless of what actually ran it" (the same real cost_usd when it WAS a
+  // Claude call, a token-based estimate via anthropic-pricing.js when it wasn't) --
+  // always populated, never null, so SUM(hypothetical_cost_usd) alone answers "what if
+  // everything this period had gone through the API." Same ALTER-guarded-by-pragma
+  // migration shape as cost_usd/instance_id above.
+  const hasHypotheticalCostColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'hypothetical_cost_usd'`).get().c > 0
+  if (!hasHypotheticalCostColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN hypothetical_cost_usd REAL`)
+  }
+
   const [event, payloadPath] = process.argv.slice(2)
   if (!event || (event !== 'cost-summary' && !payloadPath)) {
     console.error('Usage: node model-stats-db.js <record-call|record-outcome> <payloadPath>')
@@ -98,6 +111,29 @@ try {
       FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY instanceId ORDER BY totalCost DESC
     `).all()
     const freeRow = db.prepare(`SELECT COUNT(*) AS calls FROM model_calls WHERE cost_usd IS NULL`).get()
+
+    // Hypothetical: "what if EVERY call this pipeline ever made -- including the local
+    // ones -- had gone through the Anthropic API" (2026-08-23, Grimmethy: "I'd like
+    // estimates for if we had used the API. Even if we used the local models."). Covers
+    // every row with a hypothetical_cost_usd value, not just the ones that were actually
+    // real Claude calls -- see model-stats-client.js's own recordCall() for how this
+    // column is always populated (real cost when it was a real Claude call, a
+    // token-based estimate via anthropic-pricing.js otherwise).
+    const hasHypotheticalColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'hypothetical_cost_usd'`).get().c > 0
+    let hypothetical = { totalCostUsd: 0, totalCalls: 0, byModel: [], byDay: [] }
+    if (hasHypotheticalColumn) {
+      const hTotalRow = db.prepare(`SELECT COALESCE(SUM(hypothetical_cost_usd), 0) AS total, COUNT(*) AS calls FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL`).get()
+      const hByModel = db.prepare(`
+        SELECT model, COALESCE(SUM(hypothetical_cost_usd), 0) AS totalCost, COUNT(*) AS calls
+        FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL GROUP BY model ORDER BY totalCost DESC
+      `).all()
+      const hByDay = db.prepare(`
+        SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(hypothetical_cost_usd), 0) AS totalCost, COUNT(*) AS calls
+        FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
+      `).all()
+      hypothetical = { totalCostUsd: hTotalRow.total, totalCalls: hTotalRow.calls, byModel: hByModel, byDay: hByDay }
+    }
+
     console.log(JSON.stringify({
       totalCostUsd: totalRow.total,
       callsWithCost: totalRow.callsWithCost,
@@ -105,6 +141,7 @@ try {
       byModel,
       byDay,
       byInstance,
+      hypothetical,
     }))
     db.close()
     process.exit(0)
@@ -116,10 +153,10 @@ try {
     db.prepare(`
       INSERT INTO model_calls (
         call_id, task_id, stage, model, candidates, started_at, latency_ms,
-        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id
+        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id, hypothetical_cost_usd
       ) VALUES (
         @callId, @taskId, @stage, @model, @candidates, @startedAt, @latencyMs,
-        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId
+        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId, @hypotheticalCostUsd
       )
     `).run({
       callId: payload.callId,
@@ -137,6 +174,7 @@ try {
       callError: payload.callError != null ? payload.callError : null,
       costUsd: payload.costUsd != null ? payload.costUsd : null,
       instanceId: payload.instanceId != null ? payload.instanceId : null,
+      hypotheticalCostUsd: payload.hypotheticalCostUsd != null ? payload.hypotheticalCostUsd : null,
     })
   } else if (event === 'record-outcome') {
     if (!payload.callId) {

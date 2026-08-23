@@ -725,6 +725,18 @@ def _has_instance_id_column(conn: sqlite3.Connection) -> bool:
     return bool(row and row[0])
 
 
+def _has_hypothetical_cost_column(conn: sqlite3.Connection) -> bool:
+    """Same guard as _has_cost_usd_column above, for hypothetical_cost_usd (2026-08-23,
+    Grimmethy: "Clarification on the anthropic costs. I'd like estimates for if we had
+    used the API. Even if we used the local models.") -- unlike cost_usd (real spend,
+    null for a local call), this column is always populated (the real cost for an actual
+    Claude call, a token-based estimate via anthropic-pricing.js otherwise), so
+    SUM(hypothetical_cost_usd) alone answers "what if everything had gone through the API."
+    """
+    row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'hypothetical_cost_usd'").fetchone()
+    return bool(row and row[0])
+
+
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
     kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
@@ -990,7 +1002,8 @@ def api_models_cost_summary():
     API pricing, independent of subscription billing); nothing ever stored or surfaced it
     until now."""
     db_path = model_stats_db_path()
-    empty = {"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": 0, "byModel": [], "byDay": [], "byInstance": []}
+    empty_hypothetical = {"totalCostUsd": 0, "totalCalls": 0, "byModel": [], "byDay": []}
+    empty = {"totalCostUsd": 0, "callsWithCost": 0, "freeCalls": 0, "byModel": [], "byDay": [], "byInstance": [], "hypothetical": empty_hypothetical}
     if not db_path or not db_path.is_file():
         return jsonify(empty)
 
@@ -1018,6 +1031,32 @@ def api_models_cost_summary():
                 SELECT COALESCE(instance_id, '(unknown)') AS instance_id, COALESCE(SUM(cost_usd), 0) AS total_cost, COUNT(*) AS calls
                 FROM model_calls WHERE cost_usd IS NOT NULL GROUP BY instance_id ORDER BY total_cost DESC
             """).fetchall()
+
+        # Hypothetical: "what if EVERY call -- including the local ones -- had gone
+        # through the Anthropic API" (2026-08-23, Grimmethy: "I'd like estimates for if
+        # we had used the API. Even if we used the local models."). Covers every row
+        # with a hypothetical_cost_usd value, always populated per model-stats-client.js's
+        # own recordCall() (real cost for an actual Claude call, a token-based estimate
+        # via anthropic-pricing.js otherwise).
+        hypothetical = empty_hypothetical
+        if _has_hypothetical_cost_column(conn):
+            h_total_row = conn.execute(
+                "SELECT COALESCE(SUM(hypothetical_cost_usd), 0), COUNT(*) FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL"
+            ).fetchone()
+            h_by_model = conn.execute("""
+                SELECT model, COALESCE(SUM(hypothetical_cost_usd), 0) AS total_cost, COUNT(*) AS calls
+                FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL GROUP BY model ORDER BY total_cost DESC
+            """).fetchall()
+            h_by_day = conn.execute("""
+                SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(hypothetical_cost_usd), 0) AS total_cost, COUNT(*) AS calls
+                FROM model_calls WHERE hypothetical_cost_usd IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 30
+            """).fetchall()
+            hypothetical = {
+                "totalCostUsd": h_total_row[0],
+                "totalCalls": h_total_row[1],
+                "byModel": [{"model": m, "totalCost": c, "calls": n} for m, c, n in h_by_model],
+                "byDay": [{"day": d, "totalCost": c, "calls": n} for d, c, n in h_by_day],
+            }
     finally:
         conn.close()
 
@@ -1028,6 +1067,7 @@ def api_models_cost_summary():
         "byModel": [{"model": m, "totalCost": c, "calls": n} for m, c, n in by_model],
         "byDay": [{"day": d, "totalCost": c, "calls": n} for d, c, n in by_day],
         "byInstance": [{"instanceId": i, "totalCost": c, "calls": n} for i, c, n in by_instance],
+        "hypothetical": hypothetical,
     })
 
 
@@ -1555,12 +1595,27 @@ def _task_cost_summary(task_id: str) -> dict | None:
             "FROM model_calls WHERE task_id = ?",
             (task_id,),
         ).fetchone()
+        # Hypothetical: what this SAME task would have cost if every one of its calls --
+        # including any that ran locally -- had gone through the API (2026-08-23,
+        # Grimmethy: "I'd like estimates for if we had used the API. Even if we used the
+        # local models."). None when the column isn't migrated in yet, same "no data" vs.
+        # "real $0" distinction the rest of this function already makes.
+        hypothetical_cost_usd = None
+        if _has_hypothetical_cost_column(conn):
+            h_row = conn.execute(
+                "SELECT COALESCE(SUM(hypothetical_cost_usd), 0) FROM model_calls WHERE task_id = ? AND hypothetical_cost_usd IS NOT NULL",
+                (task_id,),
+            ).fetchone()
+            hypothetical_cost_usd = h_row[0]
     finally:
         conn.close()
     total_cost, total_calls, calls_with_cost = row
     if total_calls == 0:
         return None
-    return {"totalCostUsd": total_cost, "totalCalls": total_calls, "callsWithCost": calls_with_cost or 0}
+    return {
+        "totalCostUsd": total_cost, "totalCalls": total_calls, "callsWithCost": calls_with_cost or 0,
+        "hypotheticalCostUsd": hypothetical_cost_usd,
+    }
 
 
 @app.route("/api/task/<state>/<task_id>")

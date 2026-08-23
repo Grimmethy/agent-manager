@@ -233,28 +233,49 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   const bucketMs = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
   const bucketCalls = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
   const bucketCostUsd = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  // Hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // bucketCostUsd above (real spend, only real Claude calls contribute), this sums
+  // hypothetical_cost_usd, which model-stats-client.js's recordCall() always populates
+  // for EVERY call (the real cost when it was a real Claude call, a token-based estimate
+  // via anthropic-pricing.js otherwise) -- so this bucket set answers "what would THIS
+  // period have cost if every call, including the local ones, had gone through the API."
+  const bucketHypotheticalCostUsd = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
   const costBySource = new Map(); // source -> { costUsd, calls }
+  const hypotheticalCostBySource = new Map(); // source -> { costUsd, calls }
   let totalCostUsd = 0;
   let callsWithCost = 0;
+  let totalHypotheticalCostUsd = 0;
+  let callsWithHypotheticalCost = 0;
 
   try {
     const hasCostColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'`).get().c > 0;
-    const costSelect = hasCostColumn ? ', cost_usd' : '';
+    const hasHypotheticalColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'hypothetical_cost_usd'`).get().c > 0;
+    const costSelect = (hasCostColumn ? ', cost_usd' : '') + (hasHypotheticalColumn ? ', hypothetical_cost_usd' : '');
     const rows = db.prepare(`SELECT task_id, latency_ms${costSelect} FROM model_calls WHERE started_at >= ? AND started_at < ?`).all(startIso, endIso);
     for (const row of rows) {
       const ms = row.latency_ms || 0;
       const bucket = byTaskId.has(row.task_id) ? byTaskId.get(row.task_id) : 'in-progress';
+      const source = sourceByTaskId.has(row.task_id) ? sourceByTaskId.get(row.task_id) : 'in-progress';
       bucketMs[bucket] = (bucketMs[bucket] || 0) + ms;
       bucketCalls[bucket] = (bucketCalls[bucket] || 0) + 1;
       if (hasCostColumn && row.cost_usd != null) {
         bucketCostUsd[bucket] = (bucketCostUsd[bucket] || 0) + row.cost_usd;
         totalCostUsd += row.cost_usd;
         callsWithCost += 1;
-        const source = sourceByTaskId.has(row.task_id) ? sourceByTaskId.get(row.task_id) : 'in-progress';
         const entry = costBySource.get(source) || { costUsd: 0, calls: 0 };
         entry.costUsd += row.cost_usd;
         entry.calls += 1;
         costBySource.set(source, entry);
+      }
+      if (hasHypotheticalColumn && row.hypothetical_cost_usd != null) {
+        bucketHypotheticalCostUsd[bucket] = (bucketHypotheticalCostUsd[bucket] || 0) + row.hypothetical_cost_usd;
+        totalHypotheticalCostUsd += row.hypothetical_cost_usd;
+        callsWithHypotheticalCost += 1;
+        const hEntry = hypotheticalCostBySource.get(source) || { costUsd: 0, calls: 0 };
+        hEntry.costUsd += row.hypothetical_cost_usd;
+        hEntry.calls += 1;
+        hypotheticalCostBySource.set(source, hEntry);
       }
     }
   } finally {
@@ -262,6 +283,9 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   }
 
   const bySource = [...costBySource.entries()]
+    .map(([source, v]) => ({ source, costUsd: v.costUsd, calls: v.calls }))
+    .sort((a, b) => b.costUsd - a.costUsd);
+  const hypotheticalBySource = [...hypotheticalCostBySource.entries()]
     .map(([source, v]) => ({ source, costUsd: v.costUsd, calls: v.calls }))
     .sort((a, b) => b.costUsd - a.costUsd);
 
@@ -272,6 +296,10 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
     totalCostUsd,
     callsWithCost,
     costBySource: bySource,
+    bucketHypotheticalCostUsd,
+    totalHypotheticalCostUsd,
+    callsWithHypotheticalCost,
+    hypotheticalCostBySource: hypotheticalBySource,
   };
 }
 
@@ -483,11 +511,16 @@ function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatt
     }
   }
 
-  // 2026-08-23, Grimmethy: "We should track it in the hourly/daily/weekly logs" -- folds
-  // the estimated Anthropic API cost into the narrative itself, not just the table below,
-  // same "name something concrete" intent this whole function already follows.
-  if (timeAccounting && timeAccounting.callsWithCost > 0) {
-    sentences.push(`An estimated ${fmtUsd(timeAccounting.totalCostUsd)} of Anthropic API-equivalent cost was spent across ${timeAccounting.callsWithCost} Claude call(s) this period (all real calls actually ran under a subscription, never billed per-token).`);
+  // 2026-08-23, Grimmethy: "We should track it in the hourly/daily/weekly logs" / "I'd
+  // like estimates for if we had used the API. Even if we used the local models." --
+  // folds the estimated cost into the narrative itself, not just the table below, using
+  // the hypothetical (real Claude + estimated local) figure so a period that ran
+  // entirely on local models still gets a real number here instead of silence.
+  if (timeAccounting && timeAccounting.callsWithHypotheticalCost > 0) {
+    const realPart = timeAccounting.callsWithCost > 0
+      ? ` (${fmtUsd(timeAccounting.totalCostUsd)} of that was REAL Claude spend; the rest ran locally, free, and is a token-based estimate)`
+      : ' (every one of those calls actually ran locally, free -- this is a token-based estimate of what they would have cost)';
+    sentences.push(`If every model call this period had gone through the Anthropic API, it would have cost an estimated ${fmtUsd(timeAccounting.totalHypotheticalCostUsd)} across ${timeAccounting.callsWithHypotheticalCost} call(s)${realPart}.`);
   }
 
   return sentences.join(' ');
@@ -528,25 +561,29 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   if (timeAccounting) {
     // Estimated cost folded directly into this table (2026-08-23, Grimmethy: "I'd like
     // the main time tracking data frame to also include an estimated token cost for
-    // that period") -- previously a separate "By outcome" line below duplicated the
-    // exact same bucket breakdown; this is the one place a reader looks for "how did
-    // this period's real compute break down," so cost belongs on the SAME line as the
-    // time/call-count it was spent on, not a second table repeating the same buckets.
-    const bucketLine = (label, sec, calls, costUsd) => {
-      const costPart = costUsd > 0 ? `, ${fmtUsd(costUsd)} est.` : '';
+    // that period" -- clarified same day: "I'd like estimates for if we had used the
+    // API. Even if we used the local models.") -- each bucket line shows the
+    // HYPOTHETICAL figure (what this bucket's real compute would have cost on the API,
+    // whether it actually ran on Claude or locally -- always populated, see
+    // computeTimeAccounting's own header), not just real spend, since real-spend-only
+    // was silently $0 for any bucket that ran entirely on local models -- exactly the
+    // gap this clarification called out. The closing line then splits out how much of
+    // that total was REAL spend vs. purely hypothetical.
+    const bucketLine = (label, sec, calls, hypotheticalCostUsd) => {
+      const costPart = hypotheticalCostUsd > 0 ? `, ${fmtUsd(hypotheticalCostUsd)} est. if API` : '';
       return `- ${label}: ${fmtDuration(sec)} (${calls} call(s)${costPart})`;
     };
     lines.push('## Junk vs. Benefit (by real wall-clock time, from model-stats.db)');
     const b = timeAccounting.bucketSec;
-    const cb = timeAccounting.bucketCostUsd || {};
+    const hcb = timeAccounting.bucketHypotheticalCostUsd || {};
     const calls = timeAccounting.bucketCalls;
-    lines.push(bucketLine('Benefit', b.benefit || 0, calls.benefit || 0, cb.benefit || 0));
-    lines.push(bucketLine('Signal-filtering', b.filtering || 0, calls.filtering || 0, cb.filtering || 0));
-    lines.push(bucketLine('Housekeeping', b.housekeeping || 0, calls.housekeeping || 0, cb.housekeeping || 0));
-    lines.push(bucketLine('Junk', b.junk || 0, calls.junk || 0, cb.junk || 0));
-    if (b['in-progress']) lines.push(bucketLine('In-progress / unmatched', b['in-progress'], calls['in-progress'], cb['in-progress'] || 0));
-    if (timeAccounting.callsWithCost > 0) {
-      lines.push(`- **Total estimated cost: ${fmtUsd(timeAccounting.totalCostUsd)}** across ${timeAccounting.callsWithCost} Claude call(s) this period (real calls ran under a subscription, never billed per-token -- this is an equivalent-cost estimate, not a bill).`);
+    lines.push(bucketLine('Benefit', b.benefit || 0, calls.benefit || 0, hcb.benefit || 0));
+    lines.push(bucketLine('Signal-filtering', b.filtering || 0, calls.filtering || 0, hcb.filtering || 0));
+    lines.push(bucketLine('Housekeeping', b.housekeeping || 0, calls.housekeeping || 0, hcb.housekeeping || 0));
+    lines.push(bucketLine('Junk', b.junk || 0, calls.junk || 0, hcb.junk || 0));
+    if (b['in-progress']) lines.push(bucketLine('In-progress / unmatched', b['in-progress'], calls['in-progress'], hcb['in-progress'] || 0));
+    if (timeAccounting.callsWithHypotheticalCost > 0) {
+      lines.push(`- **Total if every call this period had used the Anthropic API: ${fmtUsd(timeAccounting.totalHypotheticalCostUsd)}** across ${timeAccounting.callsWithHypotheticalCost} call(s) (local models included) -- of which ${fmtUsd(timeAccounting.totalCostUsd)} was REAL spend across ${timeAccounting.callsWithCost} actual Claude call(s); the rest is a token-based estimate for calls that ran locally, free.`);
     }
     lines.push('');
   } else {
@@ -556,18 +593,21 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   }
 
   // Estimated Anthropic API Cost by SOURCE (2026-08-23, Grimmethy: "We should track it
-  // in the hourly/daily/weekly logs" / "Where else would it make sense to track it?")
-  // -- the by-outcome-bucket breakdown now lives inline in the table above; this section
-  // is what's left that table can't show (which task SOURCE actually drove spend).
-  if (timeAccounting && timeAccounting.callsWithCost > 0) {
-    lines.push('## Estimated Anthropic API Cost by Source');
-    for (const { source, costUsd, calls } of timeAccounting.costBySource) {
+  // in the hourly/daily/weekly logs" / "Where else would it make sense to track it?" /
+  // "Even if we used the local models.") -- the by-outcome-bucket breakdown now lives
+  // inline in the table above; this section is what's left that table can't show (which
+  // task SOURCE actually drove spend, real or hypothetical). Uses the hypothetical
+  // figure so a source that's ENTIRELY local-model-driven still shows up here instead of
+  // silently vanishing (a real gap the real-cost-only version had).
+  if (timeAccounting && timeAccounting.callsWithHypotheticalCost > 0) {
+    lines.push('## Estimated API Cost by Source (if every call had used the API)');
+    for (const { source, costUsd, calls } of timeAccounting.hypotheticalCostBySource) {
       lines.push(`- ${source}: ${fmtUsd(costUsd)} (${calls} call(s))`);
     }
     lines.push('');
   } else if (timeAccounting) {
-    lines.push('## Estimated Anthropic API Cost by Source');
-    lines.push('_No Claude calls recorded this period -- every real model call ran locally, free._');
+    lines.push('## Estimated API Cost by Source (if every call had used the API)');
+    lines.push('_No model calls with a usable token/cost estimate this period._');
     lines.push('');
   }
 

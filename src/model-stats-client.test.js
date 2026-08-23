@@ -137,3 +137,71 @@ test('a pre-existing database with no cost_usd column is migrated cleanly, not c
     assert.equal(summary.freeCalls, 1, 'the pre-existing old row must still be counted, now with a null cost_usd');
   });
 });
+
+// Hypothetical cost (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd
+// like estimates for if we had used the API. Even if we used the local models.") --
+// distinct from cost_usd (real spend, null for a local call): hypothetical_cost_usd is
+// ALWAYS populated, so it answers "what if everything had gone through the API."
+test('recordCall estimates a local call\'s hypothetical API cost from its real token counts', async () => {
+  const dbPath = freshDbPath();
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    recordCall({
+      taskId: 't1', model: 'qwen3.8:27b-q4_K_M', startedAt: new Date().toISOString(), latencyMs: 500,
+      result: { prompt_eval_count: 4000, eval_count: 800 },
+    });
+    const summary = getCostSummary();
+    // Real spend is still $0 (no actual Claude call happened) -- the local call is still "free".
+    assert.equal(summary.totalCostUsd, 0);
+    assert.equal(summary.freeCalls, 1);
+    // But the hypothetical figure prices it against the default Claude tier (sonnet:
+    // $2/$10 per million) -- (4000/1e6)*2 + (800/1e6)*10 = 0.016.
+    assert.ok(Math.abs(summary.hypothetical.totalCostUsd - 0.016) < 1e-9);
+    assert.equal(summary.hypothetical.totalCalls, 1);
+  });
+});
+
+test('recordCall\'s hypothetical cost for a REAL Claude call equals its real costUsd, not a separate re-estimate', async () => {
+  const dbPath = freshDbPath();
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    recordCall({ taskId: 't1', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.42 } });
+    const summary = getCostSummary();
+    assert.equal(summary.totalCostUsd, 0.42);
+    assert.equal(summary.hypothetical.totalCostUsd, 0.42);
+  });
+});
+
+test('getCostSummary\'s hypothetical total combines real Claude spend AND local-call estimates', async () => {
+  const dbPath = freshDbPath();
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    recordCall({ taskId: 't1', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.42 } });
+    recordCall({ taskId: 't2', model: 'qwen3.8:27b-q4_K_M', startedAt: new Date().toISOString(), latencyMs: 1, result: { prompt_eval_count: 4000, eval_count: 800 } });
+    const summary = getCostSummary();
+    assert.ok(Math.abs(summary.hypothetical.totalCostUsd - (0.42 + 0.016)) < 1e-9);
+    assert.equal(summary.hypothetical.totalCalls, 2);
+    const local = summary.hypothetical.byModel.find((m) => m.model === 'qwen3.8:27b-q4_K_M');
+    assert.ok(Math.abs(local.totalCost - 0.016) < 1e-9);
+  });
+});
+
+test('a pre-existing database with no hypothetical_cost_usd column is migrated cleanly, not crashed on', async () => {
+  const dbPath = freshDbPath();
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE model_calls (
+      call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'implement',
+      model TEXT NOT NULL, candidates TEXT, started_at TEXT NOT NULL, latency_ms INTEGER,
+      eval_duration_ns INTEGER, prompt_eval_count INTEGER, eval_count INTEGER, attempts INTEGER,
+      degenerate TEXT, call_error TEXT, outcome TEXT, outcome_stage TEXT, outcome_reason TEXT, outcome_at TEXT,
+      cost_usd REAL, instance_id TEXT
+    );
+  `);
+  db.prepare(`INSERT INTO model_calls (call_id, task_id, model, started_at) VALUES ('old-1', 'old-task', 'qwen3.8:27b-q4_K_M', '2026-08-01T00:00:00.000Z')`).run();
+  db.close();
+
+  await withFreshDb(dbPath, async ({ recordCall, getCostSummary }) => {
+    recordCall({ taskId: 't-new', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 5.00 } });
+    const summary = getCostSummary();
+    assert.equal(summary.hypothetical.totalCostUsd, 5.00);
+    assert.equal(summary.hypothetical.totalCalls, 1, 'the pre-existing old row has no hypothetical_cost_usd value and must not be counted until migrated');
+  });
+});
