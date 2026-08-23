@@ -7,14 +7,14 @@
 // machinery -- this is a manual analysis tool (invoked directly, or as a background
 // process launched by the dashboard's Models tab, see python/dashboard/app.py's
 // api_benchmark_run) rather than a pipeline daemon, so it only needs OLLAMA_URL/model
-// names (ornith-client.js's own env vars) plus, optionally, CLAUDE_CODE_OAUTH_TOKEN for
+// names (local-client.js's own env vars) plus, optionally, CLAUDE_CODE_OAUTH_TOKEN for
 // judge-graded cases and SECOND_BRAIN_DIR for persisting responses.
 //
 // Runs the fixed case battery (reasoning-bench-cases.js) against each requested model, one
 // model's full case set at a time (not interleaved) -- minimizes Ollama model-swap churn
 // during the run itself to exactly (modelCount - 1) swaps, and each real call still goes
-// through ornith-client.js's own in-flight lock (model-inflight-lock.js), so if the live
-// pipeline (ornith-worker.sh/review-runner.sh) is running at the same time, THEIR
+// through local-client.js's own in-flight lock (model-inflight-lock.js), so if the live
+// pipeline (local-worker.sh/review-runner.sh) is running at the same time, THEIR
 // should_yield_for_model_swap guard will back off while this is actively calling a
 // different model -- but this script does not itself wait on anything, so for a clean,
 // uncontended run, stop the pipeline daemons first (stop.sh) rather than relying on that.
@@ -160,7 +160,7 @@ async function gradeJudge(kase, candidateResponse, judgeModel, claudeClient) {
 
 // Every field Ollama's /api/generate itself reports beyond `response`/`thinking` --
 // load_duration, prompt_eval_count/duration, eval_count/duration, total_duration,
-// done_reason -- passes straight through ornith-client.js's call()/callOnce() via its own
+// done_reason -- passes straight through local-client.js's call()/callOnce() via its own
 // `{ ...result }` spread, but the ORIGINAL version of this harness only ever read
 // `.response`/`.degenerate`/`.attempts` off it, silently discarding the rest. That gap is
 // exactly what made an earlier investigation session mischaracterize qwen3.8:27b-q4_K_M as
@@ -217,7 +217,7 @@ async function runCase(model, kase, runIndex, judgeModel, judgeClient) {
   try {
     // think:true -- these are reasoning probes, deliberately NOT disabling the model's
     // own chain-of-thought the way majorityVote's classification calls do. numPredict
-    // raised well above ornith-draft.js's typical passes -- several cases (the logic
+    // raised well above local-draft.js's typical passes -- several cases (the logic
     // grid, the code trace) need real multi-step working, and truncating mid-reasoning
     // would fail them for a harness reason, not a model-quality one.
     callResult = await local.call({ prompt: kase.prompt, model, think: true, temperature: 0.2, numPredict: 1800 }, 1);

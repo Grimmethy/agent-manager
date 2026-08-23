@@ -6,7 +6,7 @@
 // building the Discuss harness-search feature, 2026-08-17) -- only Claude Code CLI mode
 // can actually investigate a real repo, implement a real fix, and run real tests before
 // finishing, the way a human session (this one, all of today) has been doing by hand
-// outside the app entirely. This module is what ornith-draft.js's draftTask() calls
+// outside the app entirely. This module is what local-draft.js's draftTask() calls
 // instead of the generic blind-JSON-diff implement pass for every task.domain === 'adhoc'
 // task ("Process now" queues one of these, regardless of task.source -- see
 // task-source-registry.js's resolveSourceName()).
@@ -44,7 +44,7 @@ const ADHOC_MAX_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_MAX_TURNS) || 30;
 
 const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed)\b/i;
 
-// Same "claude:<model>" label format model-provider.js's labelFor()/ornith-worker.sh's
+// Same "claude:<model>" label format model-provider.js's labelFor()/local-worker.sh's
 // HEARTBEAT_MODEL use -- stamped onto task.draftModel below so apply-task.js's commit
 // message can attribute Co-Authored-By to whichever model actually drafted the change,
 // instead of always crediting Ornith (this path never calls Ornith at all).

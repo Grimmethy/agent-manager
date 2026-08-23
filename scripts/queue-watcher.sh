@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/orc-common.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
-# Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
+# Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 # Applies to the watchdog's OWN identity here -- distinct from (and unrelated to) the
 # dead-PROCESS restart logic this same daemon runs later in its loop for the OTHER daemons.
@@ -146,7 +146,7 @@ while :; do
       echo $! > "$GRAPH_BUILD_LOCK"
     fi
 
-    _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither ornith-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
+    _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither local-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
     stale_count=0
 
     if [[ ! -d "$_pending_dir" ]]; then

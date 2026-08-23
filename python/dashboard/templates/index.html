@@ -481,7 +481,7 @@ function statusBadgeClass(status, stale) {
 // Which worker lane the Workers tab shows -- 'all' | 'ornith' | 'reasoning'. Kept in
 // memory only (like modelsSortKey below), not localStorage: this is a quick glance-time
 // filter, not a durable preference worth surviving a page reload. Lane is derived from
-// instanceId's 'worker-reasoning*' vs everything-else convention (see ornith-worker.sh's
+// instanceId's 'worker-reasoning*' vs everything-else convention (see local-worker.sh's
 // IS_CLAUDE_LANE -- renamed from worker-claude* 2026-08-18, matching the underlying
 // concept generalizing from "the Claude-specific lane" to "the high-reasoning-tier lane"
 // per that script's own header), the same distinction the two worker-* lanes already use
@@ -497,7 +497,7 @@ function laneForInstance(inst) {
 // EITHER backend (2026-08-18, Grimmethy: "reasoning is set to only show subscription
 // models -- I need to be able to select from both subscription and local models") -- it
 // gets Claude models AND locally pulled Ollama models in one dropdown, disambiguated by a
-// "claude:"/"ollama:" value prefix (see ornith-worker.sh's refresh_active_model, which
+// "claude:"/"ollama:" value prefix (see local-worker.sh's refresh_active_model, which
 // parses that same prefix to decide whether to force this lane onto the local model this
 // tick). Every other model-calling lane (worker-* / reviewer) only ever calls Ornith, so
 // its dropdown stays a plain Ollama-only list with no prefix. watchdog gets no dropdown at
@@ -557,7 +557,7 @@ async function renderWorkers() {
             : '';
           let body;
           if (kind === 'mixed') {
-            // Prefixed so ornith-worker.sh's refresh_active_model can tell which backend
+            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
             // was picked -- see that function's own comment for why this is the fix for
             // "reasoning only shows subscription models."
             body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))

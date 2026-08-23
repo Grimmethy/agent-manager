@@ -1,8 +1,8 @@
 'use strict';
 
 // Thin wrapper over the `claude` CLI's non-interactive mode (`claude -p`), matching
-// ornith-client.js's exact interface (`{ call, callOnce, majorityVote, detectDegenerate }`)
-// so it's a drop-in swap for `ornithCall`/`ornithMajorityVote` at ornith-draft.js's and
+// local-client.js's exact interface (`{ call, callOnce, majorityVote, detectDegenerate }`)
+// so it's a drop-in swap for `ornithCall`/`ornithMajorityVote` at local-draft.js's and
 // review-task.js's existing injection points (`draftTask(task, { ornithCall = call, ... })`)
 // -- see model-provider.js for the per-task-source selection that actually wires this in.
 //
@@ -35,7 +35,7 @@ const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 // Claude Code turns can legitimately run minutes on hard tasks per its own docs, but
 // every call here is --max-turns 1 with no tools -- a single completion, not an agentic
-// loop -- so this is sized closer to ornith-client.js's own REQUEST_TIMEOUT_MS (240s)
+// loop -- so this is sized closer to local-client.js's own REQUEST_TIMEOUT_MS (240s)
 // than to an open-ended agent run. Configurable for slower/loaded accounts.
 const REQUEST_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 300_000;
 const MAX_BUDGET_USD = process.env.CLAUDE_MAX_BUDGET_USD || '';
@@ -175,7 +175,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   };
 }
 
-// Same retry-on-degenerate shape as ornith-client.js's call() -- reuses that module's
+// Same retry-on-degenerate shape as local-client.js's call() -- reuses that module's
 // detectDegenerate() rather than duplicating the heuristics, since garbage output
 // (empty, repeated-character, repetition-loop, non-ascii-gibberish) is a property of
 // what counts as a usable response, not of which backend produced it.
@@ -190,9 +190,9 @@ async function call(opts, maxRetries = 2) {
   return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
 }
 
-// Mirrors ornith-client.js's majorityVote() exactly (same signature, same tally logic)
+// Mirrors local-client.js's majorityVote() exactly (same signature, same tally logic)
 // so review-task.js's ornithMajorityVote injection point works unchanged with this
-// module swapped in -- duplicated rather than imported since ornith-client.js's version
+// module swapped in -- duplicated rather than imported since local-client.js's version
 // calls its own local `call` directly with no injection seam of its own.
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2 }) {
   const votes = [];
@@ -229,7 +229,7 @@ module.exports = { call, callOnce, majorityVote, detectDegenerate, assertSubscri
 // CLI: node claude-client.js <request.json>
 // request.json: { prompt, model, maxTurns, allowedTools, permissionMode, maxRetries,
 //                 mode: "single" | "majority-vote", classifyMarkers: [string, ...] }
-// Writes the JSON result to stdout. Mirrors ornith-client.js's own CLI shape.
+// Writes the JSON result to stdout. Mirrors local-client.js's own CLI shape.
 if (require.main === module) {
   const requestPath = process.argv[2];
   if (!requestPath) {

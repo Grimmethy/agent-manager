@@ -3,7 +3,7 @@
 # only some things) are running -- just reports what it found.
 #
 # Two-phase: SIGTERM everything first (each daemon's own trap lets it finish its current
-# tick and exit cleanly -- see ornith-worker.sh/review-runner.sh/queue-watcher.sh), then
+# tick and exit cleanly -- see local-worker.sh/review-runner.sh/queue-watcher.sh), then
 # poll up to AGENT_MANAGER_STOP_GRACE_SEC (default 90s) for each to actually exit, then
 # SIGKILL anything still alive. Plain `kill` with no wait (the old behavior) reported
 # "stopped" the instant the signal was sent, whether or not the process actually died --
@@ -119,7 +119,7 @@ done
 
 # Stray sweep: worker-1/reviewer are the only two instanceIds queue-watchdog's own
 # dead-process-check.js will restart on its own initiative (see restartTargetFor there --
-# 'worker-*' -> ornith-worker.sh, 'reviewer' -> review-runner.sh; queue-watchdog never
+# 'worker-*' -> local-worker.sh, 'reviewer' -> review-runner.sh; queue-watchdog never
 # restarts itself). This creates a real race against the pidfile-based stop above: this
 # script SIGTERMs queue-watchdog and immediately `rm -f`s every pidfile (line ~74 above,
 # before waiting for any exit), but a watchdog tick already in flight at that exact moment
@@ -130,7 +130,7 @@ done
 # tracked `pids` array (built from pidfiles that existed when THIS script started), so the
 # wait/force-kill loop above never sees it -- a fully "stopped" pipeline with a live worker
 # still silently claiming tasks. Confirmed live 2026-08-16, twice in one session: a stray
-# ornith-worker.sh worker-1, reparented to systemd --user, still running minutes after this
+# local-worker.sh worker-1, reparented to systemd --user, still running minutes after this
 # script reported everything exited cleanly. See the matching brain-dump entry ("Stop
 # pipeline currently does exactly that but I keep seeing workers starting up after the
 # fact") -- marked resolved earlier without the root cause ever being captured; this is it.

@@ -19,7 +19,7 @@
 // endpoint is the same action a human clicking "Stop" in TheAgent's own UI would take,
 // not a raw `kill` on a process this pipeline doesn't own.
 //
-// CLI: node gpu-guard.js   -- best-effort, always exits 0; callers (ornith-worker.sh,
+// CLI: node gpu-guard.js   -- best-effort, always exits 0; callers (local-worker.sh,
 // review-runner.sh) run this once per tick and never let its outcome block the tick
 // itself, same "network/external state is unreliable, log and move on" treatment
 // project-search-fetch.js's own try/catch gives its own external call.
@@ -44,7 +44,7 @@ function readFreeVramMb() {
     );
     // Multi-GPU boxes report one line per card; this pipeline only ever targets the one
     // Ollama is configured against, and nvidia-smi doesn't distinguish that for us here --
-    // take the first line, matching how OLLAMA_URL/ornith-client.js is itself single-GPU
+    // take the first line, matching how OLLAMA_URL/local-client.js is itself single-GPU
     // in every deployment this pipeline has actually run on.
     const first = out.trim().split('\n')[0];
     const mb = Number(first.trim());

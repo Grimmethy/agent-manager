@@ -3,7 +3,7 @@
 // Single source of truth for every env-var-driven setting this package reads. A consumer
 // project sets these in its own environment/launcher before invoking any
 // script in this package -- there is no per-project config FILE the package loads itself,
-// matching the env-var style already established by ornith-client.js's OLLAMA_URL/
+// matching the env-var style already established by local-client.js's OLLAMA_URL/
 // LOCAL_MODEL and review-runner.ps1's SECOND_BRAIN_DIR, rather than inventing a second
 // config mechanism alongside it.
 //

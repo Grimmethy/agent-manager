@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Review-daemon: scans queue/review/*.json (tasks ornith-worker.sh's draft pass has finished, status "needs-review"), invokes review-task.js's Ornith majority-vote gate to approve or block each one. Port of src/review-runner.ps1's 'ornith' review-provider path.
+# Review-daemon: scans queue/review/*.json (tasks local-worker.sh's draft pass has finished, status "needs-review"), invokes review-task.js's Ornith majority-vote gate to approve or block each one. Port of src/review-runner.ps1's 'ornith' review-provider path.
 
 set -u                                                                              # strict mode: catch unset var typos before they surface as confusing errors deep inside daemon logic (PowerShell doesn't have equivalent by default but this is bash best practice).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # locate scripts/ dir so we can reference sibling files regardless of where script was invoked from.
 
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
-export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so ornith-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
+export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# Refuse to start if a live process already holds this instanceId -- see ornith-worker.sh's
+# Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 check_instance_liveness "$INSTANCE_ID" || exit 1
 
-# Graceful stop: same reasoning as ornith-worker.sh's trap -- deferred until the current
+# Graceful stop: same reasoning as local-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
 trap 'printf "[review-%s] SIGTERM/SIGINT received -- exiting after current tick.\n" "$INSTANCE_ID" >&2; exit 0' TERM INT
 
@@ -28,7 +28,7 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
 # dropdown, 2026-08-18) -- exports LOCAL_MODEL for this tick so every write_heartbeat_file
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
-# Reviewer is always Ornith (never Claude), unlike ornith-worker.sh's two lanes, so this is
+# Reviewer is always Ornith (never Claude), unlike local-worker.sh's two lanes, so this is
 # the simpler single-model version of that script's refresh_active_model.
 refresh_active_model() {
   local override
@@ -42,12 +42,12 @@ while :; do                                                                     
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
   write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
 
-  review_dir="${QUEUE_DIR}/review"                          # queue/review/ -- the real stage name from task-sources.js's QUEUE_STATES, and where ornith-worker.sh's own draft pass now files a task once it's ready (status "needs-review"). Was previously scanning queue/drafting/<instance>/ for a needs-review flag ornith-worker.sh never actually set there -- see git history for that dead end.
+  review_dir="${QUEUE_DIR}/review"                          # queue/review/ -- the real stage name from task-sources.js's QUEUE_STATES, and where local-worker.sh's own draft pass now files a task once it's ready (status "needs-review"). Was previously scanning queue/drafting/<instance>/ for a needs-review flag local-worker.sh never actually set there -- see git history for that dead end.
 
   [[ -d "$review_dir" && -r "$review_dir" ]]                                    || { sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
 
   # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap) --
-  # same guard ornith-worker.sh's worker-1 lane uses, tier='low' for the same reason: this
+  # same guard local-worker.sh's worker-1 lane uses, tier='low' for the same reason: this
   # daemon's own Ornith calls only ever review low-tier items (a high-tier item's vote
   # routes straight to Claude inside review-task.js's own providerFor(task) call,
   # independent of LOCAL_MODEL). No-op when reviewer already shares worker-1's model, the
@@ -61,7 +61,7 @@ while :; do                                                                     
   record_active_model "$INSTANCE_ID" "${LOCAL_MODEL:-}" "low"
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
-  # (n=3 votes per item), same starvation risk ornith-worker.sh's tick guards against;
+  # (n=3 votes per item), same starvation risk local-worker.sh's tick guards against;
   # see gpu-guard.js's header for the live incident this responds to. Best-effort, never
   # blocks the tick.
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
@@ -69,7 +69,7 @@ while :; do                                                                     
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
   items=()
   while IFS= read -r name; do
-    [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as ornith-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
+    [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
   done < <(ls -1tr "$review_dir" 2>/dev/null)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
@@ -85,21 +85,21 @@ while :; do                                                                     
   # observability_review items (55 in the last 11h alone) perpetually pushed the 3 much
   # older research items to the back of every single tick's scan. mtime is a real,
   # source-agnostic ordering.) Same "drain the whole backlog before the next tick" choice
-  # ornith-worker.sh's claim loop makes, rather than review-runner.ps1's one-per-invocation
+  # local-worker.sh's claim loop makes, rather than review-runner.ps1's one-per-invocation
   # pacing (that script relies on its OWN outer loop calling Invoke-ReviewPass again
   # immediately after an 'approved' result; this script's single `while :; do ... sleep
   # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
   # per tick is what keeps a backlog from taking N*30s longer than it needs to).
   for name in "${items[@]}"; do
     file="${review_dir}/${name}"
-    [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check ornith-worker.sh's claim loop uses.
+    [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check local-worker.sh's claim loop uses.
 
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
 
     # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy). Unlike
-    # ornith-worker.sh's lane-wide gate, this has to be per-item: review/ mixes drafts from
+    # local-worker.sh's lane-wide gate, this has to be per-item: review/ mixes drafts from
     # both lanes, and review-task.js's own majorityVote call routes through the SAME
-    # per-task reasoningTierFor() tier ornith-draft.js used to draft it (model-provider.js's
+    # per-task reasoningTierFor() tier local-draft.js used to draft it (model-provider.js's
     # providerFor()) -- a high-tier item lands here having been drafted by Claude, and its
     # review vote also calls Claude. Skip (don't consume) just this item and leave it in
     # review/ for a later tick if Claude's rate-limited; low-tier items keep reviewing
@@ -122,7 +122,7 @@ while :; do                                                                     
 
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     # "queued" until the single-flight lock is actually held, then "working" -- see
-    # ornith-worker.sh's process_drafting_file for the full rationale (2026-08-19,
+    # local-worker.sh's process_drafting_file for the full rationale (2026-08-19,
     # Grimmethy: "add the distinct queued status. The current is too unclear").
     write_heartbeat_file "$INSTANCE_ID" "queued" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
@@ -160,7 +160,7 @@ while :; do                                                                     
     else
       # Review call itself failed (unknown domain, Ollama unreachable, etc.) -- leave the
       # file in review/ rather than lose it; it's picked up again next tick. Matches
-      # ornith-worker.sh's own "leave claimed work in place on an unhandled error" choice.
+      # local-worker.sh's own "leave claimed work in place on an unhandled error" choice.
       printf '[review-%s] review call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
 
       # 2026-08-23, Grimmethy: "build it" -- same gap local-worker.sh's own draft-call
@@ -235,7 +235,7 @@ while :; do                                                                     
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to review. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
   # end of EVERY tick regardless of whether more items were sitting right there waiting --
-  # same utilization problem ornith-worker.sh's claim loop had (confirmed live 2026-08-15:
+  # same utilization problem local-worker.sh's claim loop had (confirmed live 2026-08-15:
   # under 50% uptime on a real backlog whose individual reviews finish well under 30s).
   if "$did_work"; then
     sleep 1

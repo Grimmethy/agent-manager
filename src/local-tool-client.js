@@ -1,7 +1,7 @@
 'use strict';
 
 // Multi-turn tool-calling loop for a plan pass, giving it a real, narrow, read-only
-// codebase-search capability via grep-codebase-tool.js. Unlike ornith-client.js (which only
+// codebase-search capability via grep-codebase-tool.js. Unlike local-client.js (which only
 // ever calls Ollama's /api/generate -- a single prompt-in, text-out call with no structured
 // tool support), this hits /api/chat, the endpoint that actually supports Ollama's tools
 // array and tool_calls response field.
@@ -89,7 +89,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // LOCAL_MODEL now surfaces as a real Ollama "model not found" error, not a guessed name.
 const MODEL = process.env.LOCAL_MODEL;
 
-// Matches ornith-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
+// Matches local-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
 // reasoning that a tool-calling turn can legitimately run longer than a plain generation
 // call. That reasoning turned out to be actively harmful, not just generous: this exact
 // path is why Invoke-OrnithToolClient is disabled in ornith-worker.ps1 (see that file's
@@ -163,7 +163,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }
 
-  // Same TokenFold session/scope headers ornith-client.js sends on /api/generate.
+  // Same TokenFold session/scope headers local-client.js sends on /api/generate.
   // Without the session header every /api/chat call hashed into its own one-off
   // TokenFold session, so the dictionary bootstrap's one-time cost could never
   // amortize across the tool loop's turns -- the exact traffic shape (one prompt
@@ -225,14 +225,14 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
 
 module.exports = { runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS };
 
-// CLI: node ornith-tool-client.js <request.json>
+// CLI: node local-tool-client.js <request.json>
 // request.json: { prompt, maxTurns, source? }  (source: task type, keys the
-// per-task-type TokenFold dictionary -- same meaning as ornith-client.js's source)
+// per-task-type TokenFold dictionary -- same meaning as local-client.js's source)
 // Writes the JSON result to stdout.
 if (require.main === module) {
   const requestPath = process.argv[2];
   if (!requestPath) {
-    console.error('usage: node ornith-tool-client.js <request.json>');
+    console.error('usage: node local-tool-client.js <request.json>');
     process.exit(1);
   }
   const req = JSON.parse(fs.readFileSync(requestPath, 'utf8'));

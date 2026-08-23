@@ -44,7 +44,7 @@ function probeOnce() {
 // forceRefresh bypasses the cache -- used by tests and by anything that just changed
 // network state and needs a real answer immediately rather than a stale cached one.
 // probe is injectable (defaults to the real curl-based probeOnce) purely for this
-// module's own tests -- same shape as ornith-draft.js's injectable ornithCall/
+// module's own tests -- same shape as local-draft.js's injectable ornithCall/
 // projectSearchFetch deps -- so isOnline()'s caching/refresh logic can be verified
 // deterministically without spending a real network round-trip (or a real 3s timeout)
 // on every test run.

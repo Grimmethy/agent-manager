@@ -1,7 +1,7 @@
 'use strict';
 
 // Thin wrapper over the local Ollama HTTP API for the `ornith` model, encoding the
-// mechanics and guardrails documented in Docs/agents/ornith-delegation.md so no caller
+// mechanics and guardrails documented in Docs/agents/local-delegation.md so no caller
 // has to rediscover them: explicit num_ctx/num_predict (the `ollama run` CLI silently
 // truncates), a degenerate-output detector for the failure modes that fail *silently*
 // (done_reason: stop, syntactically fine, semantically garbage), retry-on-degenerate
@@ -18,7 +18,7 @@ const ornithThroughput = require('./local-throughput.js');
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
 // it without setting up a full pipeline env) into a hard crash just from requiring
-// ornith-client.js. Same pipelineDir-falls-back-to-repoRoot derivation config.js uses,
+// local-client.js. Same pipelineDir-falls-back-to-repoRoot derivation config.js uses,
 // just tolerant of "neither is set" (returns null -- the in-flight lock below then simply
 // isn't taken, same as any other best-effort failure in acquire()).
 function resolveInstancesDir() {
@@ -138,7 +138,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // Ollama restricts the sampler to tokens valid for that grammar, so a malformed or
   // markdown-fenced response is *unrepresentable* rather than merely discouraged in the prompt.
   // This is the structural replacement for "Output ONLY the draft JSON"-style instructions that
-  // the model is documented to ignore (Docs/agents/ornith-delegation.md — a real state_targets
+  // the model is documented to ignore (Docs/agents/local-delegation.md — a real state_targets
   // implement draft came back ```json-fenced despite that exact instruction). The constraint
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
@@ -279,7 +279,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
 
 module.exports = { call, callOnce, majorityVote, detectDegenerate };
 
-// CLI: node ornith-client.js <request.json>
+// CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
 //                 format, mode: "single" | "majority-vote", classifyMarkers: [string, ...] }
 //   format: "json" (or a JSON-schema object) grammar-constrains the response — use for passes
@@ -289,7 +289,7 @@ if (require.main === module) {
   const fs = require('fs');
   const requestPath = process.argv[2];
   if (!requestPath) {
-    console.error('usage: node ornith-client.js <request.json>');
+    console.error('usage: node local-client.js <request.json>');
     process.exit(1);
   }
   const req = JSON.parse(fs.readFileSync(requestPath, 'utf8'));

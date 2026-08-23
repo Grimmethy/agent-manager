@@ -12,13 +12,13 @@
 // KNOWN LIMITATION (same as the reference): this is a BLIND retry -- the redraft doesn't
 // see WHY it was rejected beyond priorRejectionFeedback's accumulated reasons (which
 // prompts.js's priorRejectionBlock() DOES already read and fold into the next plan/
-// implement prompt -- no changes needed there, ornith-draft.js already imports
+// implement prompt -- no changes needed there, local-draft.js already imports
 // buildPlanPrompt/buildImplementPrompt directly).
 //
 // Trimmed to what's actually reachable via task-domains.json on this deployment: the
 // exhaustion-stamping side effect is ported for deep_dive (wired, real coverage file)
 // but NOT arch_discovery/arch_import (neither domain is reachable here -- see
-// ornith-draft.js's own scope note). model-stats-db recording (Invoke-ModelStatsDb in the
+// local-draft.js's own scope note). model-stats-db recording (Invoke-ModelStatsDb in the
 // reference) is analytics, not core correctness, and is left out.
 //
 // CLI: node reject-retry-check.js
