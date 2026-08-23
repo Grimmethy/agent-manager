@@ -217,6 +217,63 @@ test('arch_import skips the implement call entirely (deterministic empty, not le
   });
 });
 
+// Regression, 2026-08-23: caught live -- a Grill-skills adhoc task exhausted both
+// retries because the model couldn't reliably reproduce a 4362-char fixedLiterals block
+// character-for-character, even though file/find/replace were all already fully given
+// in the task. This test proves the plan call (the only real model call this path
+// should ever need) is bypassed for the construction itself -- the exact JSON edit
+// directive is built directly from the task's own promptContext.
+test('a task with file+find+one fixedLiterals block fully specified skips the model entirely and constructs the exact edit directive', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'literal-edit-test-1', domain: 'default', source: 'manual', title: 'test',
+      promptContext: {
+        file: 'python/dashboard/templates/index.html',
+        find: 'async function loadSecondBrainFile(filePath) {\n  ...\n}',
+        fixedLiterals: [{ name: 'loadSecondBrainFile + grill session functions', content: 'async function loadSecondBrainFile(filePath) {\n  ...\n}\n\nasync function grillStartSession() { /* new */ }' }],
+      },
+    };
+
+    let callCount = 0;
+    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(callCount, 1, 'only the plan call should have happened -- implement must never be called when the edit is already fully determined');
+    const parsed = JSON.parse(task.implementResponse);
+    assert.equal(parsed.mode, 'edit');
+    assert.equal(parsed.file, 'python/dashboard/templates/index.html');
+    assert.equal(parsed.find, task.promptContext.find);
+    assert.equal(parsed.replace, task.promptContext.fixedLiterals[0].content);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('a task with fixedLiterals but NO file field falls through to the normal implement path, not the deterministic short-circuit', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'literal-edit-test-2', domain: 'default', source: 'manual', title: 'test',
+      promptContext: {
+        find: 'old text',
+        fixedLiterals: [{ name: 'x', content: 'new text' }],
+        // no `file` field -- must NOT trigger the deterministic path
+      },
+    };
+
+    const ornithCall = async () => ({ response: 'plan text', degenerate: null, attempts: 1 });
+
+    // Only asserting the short-circuit did NOT fire here -- not exercising the full real
+    // implement path (needs a real git repo/registered source this fixture doesn't set
+    // up), same scope every other test in this file keeps to per its own header comment.
+    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() }).catch(() => {});
+
+    const deterministicEvent = (task.history || []).find((h) => (h.detail || '').includes('deterministic find/replace'));
+    assert.equal(deterministicEvent, undefined, 'without a `file` field, the deterministic short-circuit must never fire -- the edit is not fully unambiguous without it');
+  });
+});
+
 test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local, not a crash', async () => {
   await withFixtureRepo(async (draftTask) => {
     delete process.env.LOCAL_MODEL; // the exact edge case local-client.js's own fallback-removal fix made newly possible
