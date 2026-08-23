@@ -18,11 +18,12 @@
 // signature, since staleness is a per-task property (age, its own rejection history) that
 // clustering would only obscure.
 //
-// This module ONLY detects and describes -- it never touches queue/ files, never archives
-// or requeues anything itself. The filed task's own implement pass is explicitly advisory
-// ("here's what I found, you decide" -- see prompts.js's stalenessAuditImplementPrompt),
-// and the human archives/requeues the ORIGINAL stale task themselves via the existing
-// archive/requeue mechanism already on the Blocked/Needs-Clarification tabs.
+// This module ONLY detects and describes -- it never touches queue/ files itself. The
+// filed task's own implement pass produces a real recommendation ('archive' or 'worth a
+// fresh investigation') which, once it clears an independent review vote, DOES have a
+// real automatic effect (2026-08-23, Grimmethy: "We need to remove the human part of that
+// step" -- see staleness-auto-archive.js for the actual archiving mechanism and its
+// safety scoping; this module still never performs that action itself).
 
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -291,6 +292,11 @@ function buildStalenessAuditTask(candidate, domain) {
     title: `Staleness audit: "${task.title || task.id}" (${reasons.join(', ')})`,
     promptContext: {
       originalTaskId: task.id,
+      // Which QUEUE domain the flagged task itself belongs to (adhoc, project_search,
+      // default, ...) -- NOT this staleness-audit task's own `domain` above (always
+      // defaultDomain). Threaded through to markStalenessAuditReported() so coverage can
+      // track per-domain throughput -- see pickFairCandidate()'s own header for why.
+      originalDomain: task.domain || null,
       // Structured, dashboard-renderable fields (2026-08-22, Grimmethy: "I don't have
       // information in the task page about when it was actually set up") -- alongside
       // evidenceText's prose version below (what the MODEL reads), so the dashboard can
@@ -302,6 +308,46 @@ function buildStalenessAuditTask(candidate, domain) {
       evidenceText: buildStalenessEvidenceText(candidate),
     },
   };
+}
+
+// Picks which candidate to file a report for next -- 2026-08-23, Grimmethy: "So why then
+// does adhoc tasks still show 35 blocked? It hasn't gone down." Found live: plain
+// oldest-first (candidates[0] after findStalenessCandidates' own age-sort) meant whichever
+// domain happened to contain the globally-oldest neglected task kept winning every single
+// tick -- coverage showed 8 straight project_search picks in a row while 28 real, evidenced
+// adhoc candidates (16 with concrete git-log proof) sat untouched simply because they
+// weren't quite as old. Age alone isn't fair across domains with very different task
+// volumes/lifecycles.
+//
+// Fix: group by task.domain, rank domains by how long it's been since THAT domain last
+// had a report filed (never-reported domains first, ties by real age) using coverage's own
+// `domain`+`reportedAt` fields (see markStalenessAuditReported, task-sources.js), then pick
+// the oldest candidate within the most-overdue domain. A domain with a huge, ancient
+// backlog no longer permanently starves every other domain's real candidates.
+function pickFairCandidate(candidates, coverage = {}) {
+  if (!candidates || candidates.length === 0) return null;
+
+  const domainLastReportedMs = {};
+  for (const entry of Object.values(coverage)) {
+    if (!entry || !entry.domain || !entry.reportedAt) continue;
+    const ts = Date.parse(entry.reportedAt);
+    if (!Number.isFinite(ts)) continue;
+    if (!(entry.domain in domainLastReportedMs) || ts > domainLastReportedMs[entry.domain]) {
+      domainLastReportedMs[entry.domain] = ts;
+    }
+  }
+
+  const ranked = candidates.slice().sort((a, b) => {
+    const domainA = a.task.domain || '(none)';
+    const domainB = b.task.domain || '(none)';
+    // A domain with no prior report at all is maximally overdue -- sorts before any
+    // domain with a real reportedAt, however old.
+    const lastA = domainA in domainLastReportedMs ? domainLastReportedMs[domainA] : -Infinity;
+    const lastB = domainB in domainLastReportedMs ? domainLastReportedMs[domainB] : -Infinity;
+    if (lastA !== lastB) return lastA - lastB;
+    return (a.lastActivityTs || 0) - (b.lastActivityTs || 0);
+  });
+  return ranked[0];
 }
 
 module.exports = {
@@ -318,4 +364,5 @@ module.exports = {
   findStalenessCandidates,
   buildStalenessEvidenceText,
   buildStalenessAuditTask,
+  pickFairCandidate,
 };

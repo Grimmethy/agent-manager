@@ -24,7 +24,7 @@ const { scanProject: scanProjectForPerformance } = require('./performance-scan.j
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
-const { findStalenessCandidates, buildStalenessAuditTask } = require('./staleness-audit.js');
+const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 
 function slugifyForId(str) {
@@ -1974,7 +1974,12 @@ function nextStalenessAuditTask() {
   const candidates = findStalenessCandidates(candidateTasks, coverage, Date.now(), { repoRoot });
   if (candidates.length === 0) return null;
 
-  const task = buildStalenessAuditTask(candidates[0], defaultDomain);
+  // Domain-fair pick, not plain oldest-first (2026-08-23, Grimmethy: "So why then does
+  // adhoc tasks still show 35 blocked? It hasn't gone down" -- plain candidates[0] let
+  // whichever domain held the globally-oldest task monopolize every tick; see
+  // pickFairCandidate's own header in staleness-audit.js).
+  const picked = pickFairCandidate(candidates, coverage);
+  const task = buildStalenessAuditTask(picked, defaultDomain);
   if (taskIdExistsInQueue(task.id)) return null;
 
   // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
@@ -1997,7 +2002,14 @@ function markStalenessAuditReported(task) {
   } catch {
     coverage = {};
   }
-  coverage[originalTaskId] = { reportedAt: new Date().toISOString(), taskId: task.id };
+  // domain: the FLAGGED task's own domain (promptContext.originalDomain), not this
+  // staleness-audit task's own domain (always defaultDomain) -- read by
+  // pickFairCandidate() to track per-domain report throughput.
+  coverage[originalTaskId] = {
+    reportedAt: new Date().toISOString(),
+    taskId: task.id,
+    domain: (task.promptContext && task.promptContext.originalDomain) || null,
+  };
   fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
