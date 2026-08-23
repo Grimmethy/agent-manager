@@ -108,6 +108,21 @@ function isFabricationRepeat(task) {
   return FABRICATION_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+// Third criterion, added 2026-08-23 (Grimmethy: "we very likely have other adhoc tasks
+// that are just stuck" -- confirmed live: 167 of 213 real blocked tasks, 78%, already
+// carry this marker) -- reject-retry-check.js stamps 'exhausted' on a task once it's
+// used up its MAX_ORNITH_REJECT_RETRIES (2) automatic review-rejection retries; from
+// that point on, NOTHING in this pipeline will ever touch it again on its own,
+// regardless of how young it is. Age and fabrication-repeat both needed real time (or a
+// specific rejection reason) to accumulate before catching a task -- this catches the
+// pipeline's own explicit "I have given up on this automatically" signal the instant it
+// fires, closing the exact backlog gap a fresh 7-day-old task with genuinely no future
+// would otherwise sit in, uncaught, for up to a week.
+function hasExhaustedRetries(task) {
+  const hist = Array.isArray(task.history) ? task.history : [];
+  return hist.some((h) => h.stage === 'exhausted');
+}
+
 // One entry per task that survives EITHER condition -- reasons records which one(s) fired
 // (a task can be both old AND a repeat fabricator) so the filed task's own text can be
 // specific about why it was flagged, rather than a generic "this looked stale."
@@ -120,6 +135,7 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now()) {
     const reasons = [];
     if (isStaleByAge(task, now, threshold)) reasons.push('stale-age');
     if (isFabricationRepeat(task)) reasons.push('fabrication-repeat');
+    if (hasExhaustedRetries(task)) reasons.push('retries-exhausted');
     if (reasons.length === 0) continue;
 
     const covered = coverage[task.id];
@@ -214,6 +230,7 @@ module.exports = {
   lastActivityTs,
   isStaleByAge,
   isFabricationRepeat,
+  hasExhaustedRetries,
   findStalenessCandidates,
   buildStalenessEvidenceText,
   buildStalenessAuditTask,

@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  lastActivityTs, isStaleByAge, isFabricationRepeat, findStalenessCandidates,
+  lastActivityTs, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, findStalenessCandidates,
   buildStalenessEvidenceText, buildStalenessAuditTask, DEFAULT_STALENESS_THRESHOLD_DAYS,
 } = require('./staleness-audit.js');
 
@@ -105,14 +105,33 @@ test('isFabricationRepeat also checks priorRejectionFeedback (string or array)',
   assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 2, blockedReason: 'no code', priorRejectionFeedback: ['fine', 'this one hallucinates a whole module'] })), true);
 });
 
-test('findStalenessCandidates flags age-stale and fabrication-repeat tasks, skips neither-condition tasks', () => {
+// Third criterion, added 2026-08-23 (Grimmethy: "we very likely have other adhoc tasks
+// that are just stuck" -- confirmed live: 167 of 213 real blocked tasks, 78%, already
+// carry an 'exhausted' history entry, meaning reject-retry-check.js has already used up
+// every automatic retry it will ever attempt on them). Age-independent by design: a
+// task exhausted an hour ago is exactly as "the pipeline gave up" as one exhausted a
+// month ago.
+test('hasExhaustedRetries is true once history contains an "exhausted" stage entry, regardless of age', () => {
+  assert.equal(hasExhaustedRetries(makeTask({ history: [{ stage: 'exhausted', at: '2026-01-01T00:00:00.000Z', detail: '2/2 retries used' }] })), true);
+  assert.equal(hasExhaustedRetries(makeTask({ history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] })), false);
+  assert.equal(hasExhaustedRetries(makeTask({ history: [] })), false);
+});
+
+test('findStalenessCandidates flags age-stale, fabrication-repeat, AND retries-exhausted tasks, skips a task matching none', () => {
   const now = Date.parse('2026-02-01T00:00:00.000Z');
   const stale = makeTask({ id: 'stale-1', history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] });
   const fabricator = makeTask({ id: 'fab-1', history: [{ stage: 'blocked', at: '2026-01-30T00:00:00.000Z' }], ornithRejectCount: 2, blockedReason: 'fabricated a fake module' });
+  // Blocked TODAY (not remotely old, not a fabricator) but has already exhausted every
+  // automatic retry the pipeline will ever attempt -- exactly the "young but genuinely
+  // stuck" case age/fabrication alone would miss for up to a full week.
+  const exhausted = makeTask({ id: 'exhausted-1', history: [{ stage: 'exhausted', at: '2026-01-31T23:00:00.000Z', detail: '2/2 retries used' }] });
   const fine = makeTask({ id: 'fine-1', history: [{ stage: 'blocked', at: '2026-01-30T00:00:00.000Z' }] });
 
-  const candidates = findStalenessCandidates([stale, fabricator, fine], {}, now);
+  const candidates = findStalenessCandidates([stale, fabricator, exhausted, fine], {}, now);
   const ids = candidates.map((c) => c.task.id);
+  assert.ok(ids.includes('exhausted-1'), 'a young-but-exhausted task must be caught even though it fails both other criteria');
+  const exhaustedCandidate = candidates.find((c) => c.task.id === 'exhausted-1');
+  assert.deepEqual(exhaustedCandidate.reasons, ['retries-exhausted']);
   assert.ok(ids.includes('stale-1'));
   assert.ok(ids.includes('fab-1'));
   assert.ok(!ids.includes('fine-1'));
