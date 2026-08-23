@@ -50,15 +50,35 @@ function cooldownMs() {
   return envDays('AGENT_MANAGER_STALENESS_COOLDOWN_DAYS', DEFAULT_COOLDOWN_DAYS) * MS_PER_DAY;
 }
 
-// The last real forward-progress timestamp for a task -- history[]'s own last entry
-// (whatever stage it's in: blocked, needs-clarification, a retry's plan-done, etc.), NOT
-// createdAt, so a task that's old but still actively retrying doesn't count as stale.
-// Falls back to createdAt only when history is missing/empty (malformed or pre-history
-// task file) -- logged nowhere specifically, but a missing history is itself unusual
-// enough that treating it as "last touched at creation" is the safe, conservative read.
+// Stages that mean "retries stopped happening," not "something happened" -- excluded
+// from lastActivityTs below. Found live 2026-08-23 (Grimmethy: "analyze the staleness
+// criteria to make sure it recognizes tasks like that as stale"): the very first real
+// staleness_audit candidate (adhoc-brain-dump-bd-1786742554232, "agent manager is doing
+// project searches...") has 2,756 near-identical 'exhausted' entries, fired roughly every
+// 30s for 25 hours straight (2026-08-16T20:32 to 2026-08-17T21:38) by a since-fixed
+// reject-retry-check.js bug (see that file's own `alreadyStamped` guard comment -- it no
+// longer re-stamps a task that's already exhausted, but existing tasks from before that
+// fix still carry the old spam in their history). Blindly taking max(history[].at) read
+// this task as "5 days old" (the last spam ping) when its real last substantive activity
+// was 2026-08-14 -- 9 days old, and its underlying concern hasn't moved since. A retry
+// storm should make a task look MORE stuck, never fresher; 'exhausted' is explicitly a
+// "no further attempts will happen" marker, the opposite of progress, so it can never be
+// the most recent signal used to judge how stale something is.
+const NON_PROGRESS_STAGES = new Set(['exhausted']);
+
+// The last real forward-progress timestamp for a task -- history[]'s own last entry NOT
+// in NON_PROGRESS_STAGES above (whatever real stage it's in: blocked, needs-clarification,
+// a retry's plan-done, etc.), NOT createdAt, so a task that's old but still actively
+// retrying doesn't count as stale. Falls back to createdAt only when history is missing/
+// empty, or every entry is a non-progress marker (a task that NEVER did anything but
+// exhaust retries) -- logged nowhere specifically, but both cases are unusual enough that
+// treating it as "last touched at creation" is the safe, conservative read.
 function lastActivityTs(task) {
   const hist = Array.isArray(task.history) ? task.history : [];
-  const timestamps = hist.map((h) => Date.parse(h.at)).filter((t) => Number.isFinite(t));
+  const timestamps = hist
+    .filter((h) => !NON_PROGRESS_STAGES.has(h.stage))
+    .map((h) => Date.parse(h.at))
+    .filter((t) => Number.isFinite(t));
   if (timestamps.length > 0) return Math.max(...timestamps);
   const created = Date.parse(task.createdAt);
   return Number.isFinite(created) ? created : null;
