@@ -3,7 +3,7 @@
 // Unused-export scanner. A small, dependency-free, purpose-built scanner (no vulture/knip
 // needed) that flags low-usage CommonJS exports for downstream Ornith triage. It attaches
 // each candidate's REAL call sites (not just a bare "unused" claim), because that bare claim
-// is exactly the false-positive trap documented in docs/ornith-delegation.md (barrel
+// is exactly the false-positive trap documented in docs/local-delegation.md (barrel
 // re-exports, factory patterns, etc. all look "unused" to naive grep but aren't) -- the
 // triage task needs the actual call sites to judge; this script only gathers them.
 //

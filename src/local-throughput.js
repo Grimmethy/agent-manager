@@ -13,7 +13,7 @@ const DEFAULT_TPS = 15; // conservative floor, used only until real samples exis
 const EMA_ALPHA = 0.25; // recent calls weighted more than old ones, but one slow/fast outlier can't swing the estimate on its own.
 
 function statePath(instancesDir) {
-  return path.join(instancesDir, '.ornith-throughput.json');
+  return path.join(instancesDir, '.local-throughput.json');
 }
 
 // evalCount/evalDurationNs come straight off Ollama's /api/generate response

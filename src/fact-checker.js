@@ -1,7 +1,7 @@
 'use strict';
 
 // Deterministic, non-LLM pre-filter that runs on an Ornith draft before a Claude review
-// pass spends any tokens on it. Per Docs/agents/ornith-delegation.md's own hard-won
+// pass spends any tokens on it. Per Docs/agents/local-delegation.md's own hard-won
 // finding from the prior overnight run: "the file exists" is necessary but NOT
 // sufficient -- a design once cited a real file and a real function name that were
 // never actually connected (a different, similarly-named file made the real call).
@@ -99,7 +99,7 @@ function findByBasename(root, basename, maxResults = 2) {
 
 // extraRoots: repoRoot-relative dirs to ALSO try prefixing the claimed path with, for
 // when a draft writes a bare filename dropped of its real leading directory (e.g. "Files:
-// ornith-client.js" instead of "src/ornith-client.js" -- confirmed live 2026-07-21: this
+// local-client.js" instead of "src/local-client.js" -- confirmed live 2026-07-21: this
 // repo's own arch_discovery drafts do exactly this routinely). Previously hardcoded to
 // 'backend'/'backend/python_services' -- a DIFFERENT consumer project's layout baked into
 // this package's own code, not generalized. This repo's real files live under 'src/',
@@ -161,7 +161,7 @@ function checkRelationships(text, repoRoot, extraRoots = []) {
 // Third tier, added 2026-07-08 from the agenticloops-ai eval-harness plan (case 6 of the
 // golden-dataset design): a documented Ornith failure mode is proposing the architecturally
 // heavier/riskier fix over a narrow one with no apparent sense of blast radius (see
-// Docs/agents/ornith-delegation.md, "What Ornith is bad at"). This is a cheap keyword-adjacency
+// Docs/agents/local-delegation.md, "What Ornith is bad at"). This is a cheap keyword-adjacency
 // heuristic, not a real risk analysis -- same "necessary but not sufficient" caveat as the two
 // checks above. It flags drafts that use broad/heavy-change language without ANY nearby
 // scoping or risk-acknowledgment language, so Claude's review pass looks at blast radius first
@@ -198,7 +198,7 @@ function checkBlastRadiusBias(text) {
 
 // Fourth tier, added 2026-07-08: the grounded-value check. This attacks the failure mode that
 // constrained decoding structurally CANNOT prevent -- confident fabrication of a plausible,
-// grammatically-valid value (a made-up GIS URL or field name). Docs/agents/ornith-delegation.md
+// grammatically-valid value (a made-up GIS URL or field name). Docs/agents/local-delegation.md
 // records this as the worst, most-repeated failure ("fabricated a specific vendor attribution",
 // "invented classification codes/filenames"). The prompts explicitly instruct Ornith to use a
 // placeholder + note rather than invent an unverified URL/field -- an instruction it is

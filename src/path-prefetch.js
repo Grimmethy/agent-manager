@@ -3,7 +3,7 @@
 // Anchor-resolution + file-path prefetch for adhoc brain-dump tasks
 // (context-aware-file-path-prefetch-job.md -- design settled across a Grill Me +
 // Discuss session on 2026-08-16). Runs once, right when applyBrainDumpSort queues a real
-// adhoc task for a matched project -- BEFORE ornith-worker.sh ever claims and drafts it
+// adhoc task for a matched project -- BEFORE local-worker.sh ever claims and drafts it
 // -- so the plan/implement passes already have real, validated file paths in context
 // instead of the model searching (or worse, inventing) them from scratch on every call.
 //

@@ -1,7 +1,7 @@
 'use strict';
 
-// Shared HTTP POST helper for talking to Ollama -- both ornith-client.js (/api/generate)
-// and ornith-tool-client.js (/api/chat) independently implemented the exact same raw
+// Shared HTTP POST helper for talking to Ollama -- both local-client.js (/api/generate)
+// and local-tool-client.js (/api/chat) independently implemented the exact same raw
 // http.request-with-timeout wrapper, each with its own comment explaining why (fetch/
 // undici's ~5-minute built-in timeout is too short for this hardware's real generation
 // times) instead of sharing one. The 4-minute overtime-fail tuning this exists for is a
@@ -15,7 +15,7 @@
 // FORMALIZED CEILING (2026-07-19): no timeoutMs passed to postJson, and no worker-liveness
 // threshold anywhere in this pipeline (queue-watchdog.ps1's $StaleHeartbeatSeconds /
 // $WorkerZombieThresholdSeconds), should exceed 5 minutes (300_000ms / 300s). This was
-// learned the hard way, twice, the same night: ornith-tool-client.js originally used a
+// learned the hard way, twice, the same night: local-tool-client.js originally used a
 // 30-minute timeout on the theory that a slower call class deserved more room, and that
 // theory was actively harmful -- it let a genuinely hung call block a worker for 13+
 // minutes with nothing catching it, and is a direct reason that whole call path is
@@ -38,7 +38,7 @@ const http = require('http');
  *   kept as separate named constants per caller rather than one shared value here, so each
  *   call site's reasoning stays visible next to it.
  * @param {object} [extraHeaders] - Additional headers merged into the request. Used to pass
- *   X-TokenFold-Session (see ornith-client.js) -- without it, TokenFold's registry.py-adjacent
+ *   X-TokenFold-Session (see local-client.js) -- without it, TokenFold's registry.py-adjacent
  *   proxy hashes each call's own prompt into a fresh, one-off session_id, so its dictionary
  *   bootstrap can never amortize across calls (see encoder.py: "One-shot requests stay at face
  *   value") and nearly every request loses more to the bootstrap tax than it gains from

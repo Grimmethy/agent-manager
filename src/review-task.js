@@ -1,7 +1,7 @@
 'use strict';
 
 // Review step: takes one task sitting in queue/review/ (status "needs-review", written by
-// ornith-draft.js) and decides approved vs. blocked. Port of review-runner.ps1's 'ornith'
+// local-draft.js) and decides approved vs. blocked. Port of review-runner.ps1's 'ornith'
 // review-provider path ONLY -- the 'claude' path (a single `claude -p` call that reviews
 // AND applies in one shot) is a different reviewProvider mode this deployment never uses
 // (REVIEW_PROVIDER env var is unset here, and review-runner.ps1's own default is 'ornith'),
@@ -16,7 +16,7 @@
 //
 // 'research' (Grimmethy, 2026-08-20: "Last hours report shows 0 tasks done. Please
 // investigate"): task-domains.json never had a research_task entry at all, even though
-// ornith-draft.js has had a real domain==='research' agentic-drafting branch since
+// local-draft.js has had a real domain==='research' agentic-drafting branch since
 // research_task shipped -- every research_task draft that ever reached review hard-failed
 // here with "Unknown task domain: research", permanently, not just during a rate-limit
 // window. Confirmed live: 3 research_task items sat in queue/review/ since 2026-08-17,
@@ -30,7 +30,7 @@
 //   { succeeded: true, verdict: 'approved' }
 //   { succeeded: true, verdict: 'blocked', blockedReason: '...', blockedStage?: 'review' }
 //   { succeeded: false, reason: '...' }
-// Same division of labor as ornith-draft.js/apply-task.js: this script mutates and
+// Same division of labor as local-draft.js/apply-task.js: this script mutates and
 // rewrites the task JSON IN PLACE at the given path; the caller (review-runner.sh) owns
 // moving the file to queue/approved/ or queue/blocked/.
 
@@ -88,7 +88,7 @@ async function waitForOrnithAvailability(instancesDir, maxWaitAttempts = 3, wait
 // a valid, documented outcome for these, not a failure. Same isEffectivelyEmpty check as
 // apply-group-a.js's own definition.
 // arch_review/arch_import_review/observability_fix/performance_fix/backlog_fulfillment
-// (2026-08-21): joined this list alongside ornith-draft.js's own allowEmptyImplement update
+// (2026-08-21): joined this list alongside local-draft.js's own allowEmptyImplement update
 // -- see task-sources.js's nextCandidateFulfillmentTask header for the grounding fix this
 // is part of.
 const EMPTY_APPROVAL_SOURCES = [
@@ -214,7 +214,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   return lines.join('\n');
 }
 
-// Same classify function as ornith-client.js's own CLI (mode: 'majority-vote') --
+// Same classify function as local-client.js's own CLI (mode: 'majority-vote') --
 // duplicated rather than imported since it lives inline in that file's CLI section, not
 // exported. minReasoningChars=20: discards a vote whose reasoning (after stripping the
 // verdict marker + colon) is too short to carry real signal.
@@ -237,7 +237,7 @@ function classifyVote(markers, minReasoningChars) {
  */
 async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, ornithMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
-  // ornith-draft.js's draftTask() -- the right backend depends on the task's reasoning
+  // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
   // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
   // caller override always wins.

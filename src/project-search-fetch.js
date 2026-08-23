@@ -2,7 +2,7 @@
 
 // Harness-side search execution for the project_search task source (see ADR-0018,
 // docs/project-search-pipeline.md). Ornith has no internet access -- confirmed neither
-// ornith-client.js's /api/generate nor ornith-tool-client.js's /api/chat call path can
+// local-client.js's /api/generate nor local-tool-client.js's /api/chat call path can
 // reach the network -- so the Node harness does the actual GitHub/Hugging Face API calls
 // and hands Ornith pre-fetched text, the same split every other source uses for local file
 // content (see get-grounding-source.js).
