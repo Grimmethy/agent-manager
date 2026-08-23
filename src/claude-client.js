@@ -163,6 +163,15 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     // per-token -- kept only as an observability breadcrumb, never treated as billing.
     costUsd: parsed.total_cost_usd,
     sessionId: parsed.session_id,
+    // stopReason/numTurns (2026-08-23, Grimmethy: "Fix: Claude agentic adhoc drafts that
+    // exhaust their turn budget get blindly retried at the same budget, wasting real
+    // spend") -- previously discarded entirely, even though the raw CLI JSON always
+    // carries them (confirmed live in a real failure: stop_reason":"tool_use",
+    // "num_turns":31). Without these, a caller has no way to tell "ran out of turns
+    // mid-investigation" apart from any other incomplete response -- see
+    // adhoc-agentic-draft.js's own turn-exhaustion retry, the first real consumer.
+    stopReason: parsed.stop_reason || null,
+    numTurns: parsed.num_turns != null ? parsed.num_turns : null,
   };
 }
 
