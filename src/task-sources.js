@@ -25,6 +25,7 @@ const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const { findStalenessCandidates, buildStalenessAuditTask } = require('./staleness-audit.js');
+const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -2025,11 +2026,15 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask });
-// apply: applyVerdictOnly -- same reasoning as unused_export/observability_review's own:
-// this source's implement pass writes an advisory report, never a diff (see
-// stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's JSON-diff
-// parser to apply and no branch to keep.
-registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyVerdictOnly });
+// apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
+// part of that step") -- this source's implement pass writes an advisory report, never a
+// diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
+// JSON-diff parser to apply and no branch to keep, same shape applyVerdictOnly already
+// covers for unused_export/observability_review -- but this ALSO acts on the report's own
+// explicit RECOMMENDATION: archive, moving the ORIGINAL flagged task to
+// done/_archived_no_action/ automatically once the report has cleared review. See
+// staleness-auto-archive.js's own header for the full reasoning and safety scoping.
+registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...

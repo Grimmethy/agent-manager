@@ -766,12 +766,12 @@ function stalenessAuditImplementPrompt(task, planText) {
     '',
     filesText,
     '',
-    'Write a short advisory report (a few sentences, not a diff) covering exactly these three things, grounded ONLY in the real evidence above -- never a guessed or invented file/line/claim:',
+    'Write a short report (a few sentences, not a diff) covering exactly these three things, grounded ONLY in the real evidence above -- never a guessed or invented file/line/claim:',
     '1. Does the original concern still hold against current repo state, or has it already been resolved by other work?',
     '2. If the original task was flagged for repeated fabrication, does the evidence above suggest its claims were genuinely ungrounded, or does it hold up after all?',
     '3. An explicit RECOMMENDATION: either "archive" (the concern is resolved or was never grounded) or "worth a fresh investigation" (the concern still looks real and unaddressed) -- with one sentence of reasoning.',
     '',
-    'This is advisory only -- a human decides and acts, using the existing archive button on the Blocked/Needs-Clarification tabs. Write this as "here is what I found, you decide," never as an instruction that something should definitely be archived. If the searches found nothing useful either way, say so plainly rather than guessing.',
+    'Your RECOMMENDATION here has a real, automatic effect once this report passes review: "archive" moves the ORIGINAL flagged task out of the active queue for good; "worth a fresh investigation" takes no action at all and leaves it exactly as it is. This is no longer a human double-checking your read before anything happens -- get it right the first time. Recommend "archive" ONLY when the evidence above genuinely, concretely supports it (the file/behavior it named plainly no longer applies, or the fabricated claims are clearly confirmed baseless) -- if the evidence is thin, ambiguous, or the searches found nothing useful either way, say so plainly and recommend "worth a fresh investigation" instead. When genuinely uncertain, the safe default is "worth a fresh investigation," never "archive."',
   ].join('\n');
 }
 
