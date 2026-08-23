@@ -81,6 +81,32 @@ test('postJson opens a FRESH connection every call, never reusing a pooled keep-
   );
 });
 
+// Regression, 2026-08-23: 159 blocked tasks all sharing the identical, content-free
+// reason "draft call failed 5 times in a row (most recent: )" -- draft_result was truly
+// empty on every attempt (not a caught error with a blank message), meaning local-draft.js's
+// node process was dying outright before ever reaching its own process.stdout.write. Root
+// cause: `res` (the response stream) had no 'error' listener -- only `req` did -- so a
+// connection reset arriving after headers but mid-body threw as an uncaught exception
+// instead of rejecting the postJson() promise. Doubly bad: an empty message never matches
+// local-worker.sh's INFRA_FAILURE_PATTERN regex, so every one of these permanently blocked
+// instead of qualifying for the bounded infra-requeue path a real "ECONNRESET"-bearing
+// Error would have gotten.
+test('postJson rejects (rather than crashing the process) when the response stream errors mid-body', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write('{"partial":'); // headers sent, body started, then abort before it's valid JSON
+        res.destroy(new Error('simulated ECONNRESET mid-body'));
+      });
+    },
+    async (base) => {
+      await assert.rejects(() => postJson(`${base}/api/generate`, { a: 1 }, 5000));
+    }
+  );
+});
+
 test('postJson works with no extraHeaders (backward compatible)', async () => {
   let receivedHeaders = null;
   await withServer(

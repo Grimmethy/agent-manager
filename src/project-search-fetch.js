@@ -43,6 +43,10 @@ function httpsGetJson(urlString, headers) {
         }
         try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Unparseable JSON: ${e.message}`)); }
       });
+      // See ollama-http.js's postJson for why this matters: a stream error arriving after
+      // headers but mid-body has no listener without this, and Node throws it as an
+      // uncaught exception instead of a caught, reportable rejection.
+      res.on('error', reject);
     });
     req.on('timeout', () => req.destroy(new Error('request timed out')));
     req.on('error', reject);

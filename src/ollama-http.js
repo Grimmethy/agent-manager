@@ -88,6 +88,18 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
         }
         try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Ollama returned unparseable JSON: ${e.message}`)); }
       });
+      // Without this, a connection reset (or any other stream error) arriving AFTER
+      // headers but mid-body has no listener on `res` itself (only `req` was covered
+      // below) -- Node throws it as an uncaught exception, killing the whole worker
+      // process with zero stdout written. Confirmed live 2026-08-23: 159 blocked tasks
+      // sharing the identical, content-free reason "draft call failed 5 times in a row
+      // (most recent: )" -- draft_result was truly empty every time (not a caught error
+      // with a blank message), meaning local-draft.js's node process was dying outright
+      // before ever reaching its own process.stdout.write. Doubly bad: an empty message
+      // never matches local-worker.sh's INFRA_FAILURE_PATTERN regex either, so every one
+      // of these permanently blocked instead of going through the bounded infra-requeue
+      // path a real "ECONNRESET"-bearing Error would have qualified for.
+      res.on('error', reject);
     });
     req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${timeoutMs}ms`)); });
     req.on('error', reject);

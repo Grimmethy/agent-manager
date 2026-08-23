@@ -45,6 +45,10 @@ function queryLoadedModel(ollamaUrl, modelName) {
           finish(null);
         }
       });
+      // See ollama-http.js's postJson for why this matters: without it, a stream error
+      // arriving mid-body (after `req`'s own 'error' listener below no longer applies)
+      // throws uncaught instead of hitting this file's own fail-open finish(null).
+      res.on('error', () => finish(null));
     });
     req.on('error', () => finish(null));
     req.on('timeout', () => { req.destroy(); finish(null); });
