@@ -526,13 +526,28 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   lines.push('');
 
   if (timeAccounting) {
+    // Estimated cost folded directly into this table (2026-08-23, Grimmethy: "I'd like
+    // the main time tracking data frame to also include an estimated token cost for
+    // that period") -- previously a separate "By outcome" line below duplicated the
+    // exact same bucket breakdown; this is the one place a reader looks for "how did
+    // this period's real compute break down," so cost belongs on the SAME line as the
+    // time/call-count it was spent on, not a second table repeating the same buckets.
+    const bucketLine = (label, sec, calls, costUsd) => {
+      const costPart = costUsd > 0 ? `, ${fmtUsd(costUsd)} est.` : '';
+      return `- ${label}: ${fmtDuration(sec)} (${calls} call(s)${costPart})`;
+    };
     lines.push('## Junk vs. Benefit (by real wall-clock time, from model-stats.db)');
     const b = timeAccounting.bucketSec;
-    lines.push(`- Benefit: ${fmtDuration(b.benefit || 0)} (${timeAccounting.bucketCalls.benefit || 0} calls)`);
-    lines.push(`- Signal-filtering: ${fmtDuration(b.filtering || 0)} (${timeAccounting.bucketCalls.filtering || 0} calls)`);
-    lines.push(`- Housekeeping: ${fmtDuration(b.housekeeping || 0)} (${timeAccounting.bucketCalls.housekeeping || 0} calls)`);
-    lines.push(`- Junk: ${fmtDuration(b.junk || 0)} (${timeAccounting.bucketCalls.junk || 0} calls)`);
-    if (b['in-progress']) lines.push(`- In-progress / unmatched: ${fmtDuration(b['in-progress'])} (${timeAccounting.bucketCalls['in-progress']} calls)`);
+    const cb = timeAccounting.bucketCostUsd || {};
+    const calls = timeAccounting.bucketCalls;
+    lines.push(bucketLine('Benefit', b.benefit || 0, calls.benefit || 0, cb.benefit || 0));
+    lines.push(bucketLine('Signal-filtering', b.filtering || 0, calls.filtering || 0, cb.filtering || 0));
+    lines.push(bucketLine('Housekeeping', b.housekeeping || 0, calls.housekeeping || 0, cb.housekeeping || 0));
+    lines.push(bucketLine('Junk', b.junk || 0, calls.junk || 0, cb.junk || 0));
+    if (b['in-progress']) lines.push(bucketLine('In-progress / unmatched', b['in-progress'], calls['in-progress'], cb['in-progress'] || 0));
+    if (timeAccounting.callsWithCost > 0) {
+      lines.push(`- **Total estimated cost: ${fmtUsd(timeAccounting.totalCostUsd)}** across ${timeAccounting.callsWithCost} Claude call(s) this period (real calls ran under a subscription, never billed per-token -- this is an equivalent-cost estimate, not a bill).`);
+    }
     lines.push('');
   } else {
     lines.push('## Junk vs. Benefit (by real wall-clock time)');
@@ -540,24 +555,18 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     lines.push('');
   }
 
-  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "We should track it in the
-  // hourly/daily/weekly logs") -- what every real Claude call this period would have
-  // cost on real Anthropic API pricing; these calls actually ran under a subscription,
-  // never billed per-token, so this is an estimate/equivalent-cost figure, not a bill.
+  // Estimated Anthropic API Cost by SOURCE (2026-08-23, Grimmethy: "We should track it
+  // in the hourly/daily/weekly logs" / "Where else would it make sense to track it?")
+  // -- the by-outcome-bucket breakdown now lives inline in the table above; this section
+  // is what's left that table can't show (which task SOURCE actually drove spend).
   if (timeAccounting && timeAccounting.callsWithCost > 0) {
-    lines.push('## Estimated Anthropic API Cost');
-    lines.push(`- Total: ${fmtUsd(timeAccounting.totalCostUsd)} across ${timeAccounting.callsWithCost} Claude call(s) this period.`);
-    const cb = timeAccounting.bucketCostUsd;
-    lines.push(`- By outcome: benefit ${fmtUsd(cb.benefit || 0)} · filtering ${fmtUsd(cb.filtering || 0)} · housekeeping ${fmtUsd(cb.housekeeping || 0)} · junk ${fmtUsd(cb.junk || 0)}${cb['in-progress'] ? ` · in-progress ${fmtUsd(cb['in-progress'])}` : ''}`);
-    if (timeAccounting.costBySource.length > 0) {
-      lines.push('- By source:');
-      for (const { source, costUsd, calls } of timeAccounting.costBySource) {
-        lines.push(`  - ${source}: ${fmtUsd(costUsd)} (${calls} call(s))`);
-      }
+    lines.push('## Estimated Anthropic API Cost by Source');
+    for (const { source, costUsd, calls } of timeAccounting.costBySource) {
+      lines.push(`- ${source}: ${fmtUsd(costUsd)} (${calls} call(s))`);
     }
     lines.push('');
   } else if (timeAccounting) {
-    lines.push('## Estimated Anthropic API Cost');
+    lines.push('## Estimated Anthropic API Cost by Source');
     lines.push('_No Claude calls recorded this period -- every real model call ran locally, free._');
     lines.push('');
   }

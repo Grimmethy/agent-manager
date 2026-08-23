@@ -330,9 +330,35 @@ test('renderMarkdown includes an Estimated Anthropic API Cost section with a sou
     },
     queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
   });
-  assert.match(md, /## Estimated Anthropic API Cost/);
+  assert.match(md, /## Estimated Anthropic API Cost by Source/);
   assert.match(md, /\$0\.4200/);
   assert.match(md, /manual: \$0\.4200 \(1 call\(s\)\)/);
+});
+
+// 2026-08-23, Grimmethy: "I'd like the main time tracking data frame to also include an
+// estimated token cost for that period" -- cost belongs INLINE in the wall-clock-time
+// bucket line itself, not only in a separate section repeating the same buckets.
+test('renderMarkdown folds estimated cost directly into the wall-clock-time bucket line, not just a separate section', () => {
+  const md = renderMarkdown({
+    period: 'hourly',
+    startIso: '2026-08-20T10:00:00.000Z',
+    endIso: '2026-08-20T11:00:00.000Z',
+    tasks: [{ id: 't1', source: 'manual', classification: 'benefit' }],
+    downtime: { pipelineDownSec: 0, pipelineDownIntervals: [], perInstanceDownSec: {} },
+    timeAccounting: {
+      bucketSec: { benefit: 60, junk: 30 }, bucketCalls: { benefit: 1, junk: 2 },
+      bucketCostUsd: { benefit: 0.42, junk: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 },
+      totalCostUsd: 0.42, callsWithCost: 1,
+      costBySource: [{ source: 'manual', costUsd: 0.42, calls: 1 }],
+    },
+    queueHealth: null, selfAuditActivity: [], blockedPatterns: { patterns: [], uncategorized: 0, totalJunk: 0 },
+  });
+  const timeSection = md.split('## Junk vs. Benefit (by real wall-clock time')[1].split('## ')[0];
+  assert.match(timeSection, /Benefit: 1m \(1 call\(s\), \$0\.4200 est\.\)/);
+  // A bucket with zero cost must NOT show a misleading "$0.0000 est." tacked on.
+  assert.match(timeSection, /Junk: 30s \(2 call\(s\)\)/);
+  assert.doesNotMatch(timeSection, /Junk:.*est\./);
+  assert.match(timeSection, /\*\*Total estimated cost: \$0\.4200\*\*/);
 });
 
 test('renderMarkdown reports "no Claude calls" plainly when timeAccounting exists but nothing cost anything', () => {
