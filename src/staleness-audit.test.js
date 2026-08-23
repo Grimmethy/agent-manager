@@ -41,6 +41,42 @@ test('lastActivityTs returns null when neither history nor createdAt is usable',
   assert.equal(lastActivityTs(task), null);
 });
 
+// Regression, 2026-08-23 (Grimmethy: "analyze the staleness criteria to make sure it
+// recognizes tasks like that as stale") -- a real production task
+// (adhoc-brain-dump-bd-1786742554232) has 2,756 near-identical 'exhausted' history
+// entries spammed by a since-fixed reject-retry-check.js bug, spanning
+// 2026-08-16T20:32 to 2026-08-17T21:38 -- 25 hours of a stuck retry loop, not real
+// progress. Blindly taking the last history entry read this task as "5 days old" (the
+// last spam ping) instead of ~9 days (its real last substantive activity), silently
+// weakening the age check for exactly the tasks a retry storm affects. 'exhausted'
+// means retries STOPPED -- it can never be evidence of recent forward progress.
+test('lastActivityTs ignores a trailing spam of "exhausted" retry-loop entries, using the real last substantive activity instead', () => {
+  const exhaustedSpam = [];
+  for (let i = 0; i < 50; i++) {
+    exhaustedSpam.push({ stage: 'exhausted', at: `2026-01-10T00:${String(i).padStart(2, '0')}:00.000Z`, detail: '2/2 retries used' });
+  }
+  const task = makeTask({
+    createdAt: '2026-01-01T00:00:00.000Z',
+    history: [
+      { status: 'pending', at: '2026-01-01T00:00:00.000Z' },
+      { status: 'needs-review', at: '2026-01-01T00:10:00.000Z' },
+      ...exhaustedSpam, // the real last-in-array entry is 2026-01-10 -- must NOT win
+    ],
+  });
+  assert.equal(lastActivityTs(task), Date.parse('2026-01-01T00:10:00.000Z'));
+});
+
+test('lastActivityTs falls back to createdAt when EVERY history entry is a non-progress (exhausted) marker', () => {
+  const task = makeTask({
+    createdAt: '2026-01-01T00:00:00.000Z',
+    history: [
+      { stage: 'exhausted', at: '2026-01-05T00:00:00.000Z' },
+      { stage: 'exhausted', at: '2026-01-06T00:00:00.000Z' },
+    ],
+  });
+  assert.equal(lastActivityTs(task), Date.parse('2026-01-01T00:00:00.000Z'));
+});
+
 test('isStaleByAge is true once now is past the threshold since last activity', () => {
   const now = Date.parse('2026-02-01T00:00:00.000Z');
   const task = makeTask({ history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] });
