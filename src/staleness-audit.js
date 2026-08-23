@@ -24,7 +24,10 @@
 // and the human archives/requeues the ORIGINAL stale task themselves via the existing
 // archive/requeue mechanism already on the Blocked/Needs-Clarification tabs.
 
+const path = require('path');
+const { execFileSync } = require('child_process');
 const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
+const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 
 // Lowered from 14 (2026-08-23, Grimmethy: "Yes, lower the default" -- after confirming
 // live that the first real candidate, adhoc-brain-dump-bd-1786742554232, had been
@@ -123,10 +126,74 @@ function hasExhaustedRetries(task) {
   return hist.some((h) => h.stage === 'exhausted');
 }
 
-// One entry per task that survives EITHER condition -- reasons records which one(s) fired
-// (a task can be both old AND a repeat fabricator) so the filed task's own text can be
-// specific about why it was flagged, rather than a generic "this looked stale."
-function findStalenessCandidates(tasks, coverage = {}, now = Date.now()) {
+const GIT_LOG_TIMEOUT_MS = 15_000;
+
+// Real file paths a task's own text mentions -- reuses fact-checker.js's own extraction
+// (same PATH_EXT_RE regex checkFilePaths already runs at review time) rather than a
+// second, possibly-inconsistent implementation. Pulls from every place a task's own
+// concern is described in free text: the original request, the title, the reason it got
+// blocked, and any accumulated rejection feedback.
+function candidateFilePaths(task) {
+  const ctx = task.promptContext || {};
+  const feedback = Array.isArray(task.priorRejectionFeedback)
+    ? task.priorRejectionFeedback.join(' ')
+    : (task.priorRejectionFeedback || '');
+  const text = [ctx.rawText, task.title, task.blockedReason, feedback].filter(Boolean).join('\n');
+  return extractFilePaths(text);
+}
+
+// Fourth criterion, added 2026-08-23 (Grimmethy: "What really makes a task stale is if
+// it's already been completed or redundant in some way. How do we check for that?") --
+// the other three criteria are all proxies for "the pipeline gave up trying," not the
+// actual thing that matters: has the concern this task describes already been addressed
+// by OTHER work since. This is the one deterministic, git-based signal for that: if a
+// real file this task's own text names was genuinely committed to AFTER the task was
+// filed, that's strong evidence something already touched the area it's about,
+// independent of age/retries/fabrication (the young-and-already-resolved case none of
+// the other three would ever catch). Deliberately still just a SIGNAL, not a verdict --
+// the actual "is this really resolved" judgment stays with the filed task's own
+// harness-grounded premise-recheck pass (real current file content, not just "was it
+// committed"), same division of labor as every other criterion here.
+//
+// Needs real repo access (git log), unlike the other three pure-JSON criteria -- takes
+// repoRoot explicitly rather than reading getConfig() itself, so this file stays fully
+// testable without a real repo unless a caller actually wants this check. Best-effort:
+// any git failure (not a real repo, a file genuinely untracked, git itself unavailable)
+// is non-fatal, same philosophy every other git call in this pipeline already follows --
+// returns {touched: false, files: []} rather than throwing.
+function findFilesTouchedSince(repoRoot, task) {
+  const createdAtIso = task.createdAt;
+  if (!repoRoot || !createdAtIso || Number.isNaN(Date.parse(createdAtIso))) {
+    return { touched: false, files: [] };
+  }
+
+  const claimedPaths = candidateFilePaths(task);
+  const touchedFiles = [];
+  for (const claimed of claimedPaths) {
+    const resolved = resolveAgainstRepo(repoRoot, claimed);
+    if (!resolved) continue; // not a real file in this repo -- nothing to check against
+    const relPath = path.relative(repoRoot, resolved);
+    try {
+      const out = execFileSync(
+        'git', ['log', `--since=${createdAtIso}`, '--oneline', '-1', '--', relPath],
+        { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      if (out.trim()) touchedFiles.push(relPath);
+    } catch (e) {
+      // best-effort -- one file's git error must not abort checking the rest
+    }
+  }
+  return { touched: touchedFiles.length > 0, files: touchedFiles };
+}
+
+// One entry per task that survives ANY condition -- reasons records which one(s) fired
+// (a task can be old AND a repeat fabricator AND possibly-resolved) so the filed task's
+// own text can be specific about why it was flagged, rather than a generic "this looked
+// stale." opts.repoRoot is optional and opt-in: when omitted (every existing test, and
+// any caller that doesn't have/want real git access), the possibly-resolved check is
+// skipped entirely -- this file stays fully testable with zero git dependency unless a
+// caller actually asks for it.
+function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot } = {}) {
   const threshold = stalenessThresholdMs();
   const cooldown = cooldownMs();
   const candidates = [];
@@ -136,6 +203,14 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now()) {
     if (isStaleByAge(task, now, threshold)) reasons.push('stale-age');
     if (isFabricationRepeat(task)) reasons.push('fabrication-repeat');
     if (hasExhaustedRetries(task)) reasons.push('retries-exhausted');
+    let touchedFiles = [];
+    if (repoRoot) {
+      const gitCheck = findFilesTouchedSince(repoRoot, task);
+      if (gitCheck.touched) {
+        reasons.push('possibly-resolved');
+        touchedFiles = gitCheck.files;
+      }
+    }
     if (reasons.length === 0) continue;
 
     const covered = coverage[task.id];
@@ -144,7 +219,7 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now()) {
       if (Number.isFinite(reportedMs) && now - reportedMs < cooldown) continue;
     }
 
-    candidates.push({ task, reasons, lastActivityTs: lastActivityTs(task) });
+    candidates.push({ task, reasons, lastActivityTs: lastActivityTs(task), touchedFiles });
   }
   // Oldest last-activity first -- the longest-neglected task is the most overdue for a
   // human's attention, same "most-evidenced first" intent pipeline-self-audit.js's own
@@ -193,6 +268,13 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
     const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [task.priorRejectionFeedback];
     lines.push('', 'Prior rejection feedback:', ...feedback.map((f, i) => `${i + 1}. ${f}`));
   }
+  // 2026-08-23, Grimmethy: "What really makes a task stale is if it's already been
+  // completed or redundant in some way. How do we check for that?" -- surfaced directly
+  // here (not left for the premise-recheck to rediscover on its own) so the model's own
+  // grep queries start from a concrete lead instead of guessing which files to check.
+  if (candidate.touchedFiles && candidate.touchedFiles.length > 0) {
+    lines.push('', `Real commits landed AFTER this task was created, touching file(s) it names: ${candidate.touchedFiles.join(', ')} -- strong evidence something already addressed this, though NOT a confirmed verdict on its own; verify against the real current content of these files.`);
+  }
   return lines.join('\n');
 }
 
@@ -231,6 +313,8 @@ module.exports = {
   isStaleByAge,
   isFabricationRepeat,
   hasExhaustedRetries,
+  candidateFilePaths,
+  findFilesTouchedSince,
   findStalenessCandidates,
   buildStalenessEvidenceText,
   buildStalenessAuditTask,

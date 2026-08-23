@@ -6,7 +6,32 @@ const assert = require('node:assert/strict');
 const {
   lastActivityTs, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, findStalenessCandidates,
   buildStalenessEvidenceText, buildStalenessAuditTask, DEFAULT_STALENESS_THRESHOLD_DAYS,
+  candidateFilePaths, findFilesTouchedSince,
 } = require('./staleness-audit.js');
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+const { execFileSync } = require('child_process');
+
+function git(args, cwd, extraEnv) {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe', env: { ...process.env, ...extraEnv } });
+}
+
+// Real throwaway git repo (same pattern as group-b-worktree-diff.test.js) -- the
+// possibly-resolved check needs real `git log --since` filtering, which needs real,
+// precisely-dated commits, not a fake/mocked git layer.
+function makeRepoWithFile(relPath, content, commitIso) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'staleness-git-test-'));
+  git(['init', '-b', 'main', dir], dir);
+  git(['config', 'user.email', 'test@example.com'], dir);
+  git(['config', 'user.name', 'Test'], dir);
+  const full = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, content);
+  git(['add', relPath], dir);
+  git(['commit', '-m', 'commit'], dir, { GIT_AUTHOR_DATE: commitIso, GIT_COMMITTER_DATE: commitIso });
+  return dir;
+}
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -205,4 +230,89 @@ test('buildStalenessAuditTask exposes the original task\'s dates as structured, 
 
 test('DEFAULT_STALENESS_THRESHOLD_DAYS is a sane positive default', () => {
   assert.ok(DEFAULT_STALENESS_THRESHOLD_DAYS >= 1);
+});
+
+// Fourth criterion, added 2026-08-23 (Grimmethy: "What really makes a task stale is if
+// it's already been completed or redundant in some way. How do we check for that?") --
+// a real, deterministic, git-based signal for "this may already be resolved": a file the
+// task's own text names was genuinely committed to AFTER the task was filed.
+
+test('candidateFilePaths extracts real-looking file paths from rawText, title, blockedReason, and priorRejectionFeedback', () => {
+  const task = makeTask({
+    title: 'Investigate src/foo.js',
+    promptContext: { rawText: 'The bug is in src/bar.js somewhere' },
+    blockedReason: 'src/baz.js does not exist',
+    priorRejectionFeedback: ['also check src/qux.md'],
+  });
+  const paths = candidateFilePaths(task);
+  assert.ok(paths.includes('src/foo.js'));
+  assert.ok(paths.includes('src/bar.js'));
+  assert.ok(paths.includes('src/baz.js'));
+  assert.ok(paths.includes('src/qux.md'));
+});
+
+test('findFilesTouchedSince detects a real commit landed AFTER the task was created', () => {
+  const dir = makeRepoWithFile('src/widget.js', 'v1\n', '2026-01-10T00:00:00');
+  // A second, later commit to the SAME file -- this is the "already touched since" signal.
+  fs.writeFileSync(path.join(dir, 'src/widget.js'), 'v2\n');
+  git(['add', 'src/widget.js'], dir);
+  git(['commit', '-m', 'fix widget'], dir, { GIT_AUTHOR_DATE: '2026-01-15T00:00:00', GIT_COMMITTER_DATE: '2026-01-15T00:00:00' });
+
+  const task = makeTask({ createdAt: '2026-01-12T00:00:00.000Z', promptContext: { rawText: 'Something is wrong in src/widget.js' } });
+  const result = findFilesTouchedSince(dir, task);
+  assert.equal(result.touched, true);
+  assert.deepEqual(result.files, ['src/widget.js']);
+});
+
+test('findFilesTouchedSince reports NOT touched when the file has had no commits since the task was created', () => {
+  const dir = makeRepoWithFile('src/widget.js', 'v1\n', '2026-01-01T00:00:00');
+  const task = makeTask({ createdAt: '2026-01-10T00:00:00.000Z', promptContext: { rawText: 'Something is wrong in src/widget.js' } });
+  const result = findFilesTouchedSince(dir, task);
+  assert.equal(result.touched, false);
+  assert.deepEqual(result.files, []);
+});
+
+test('findFilesTouchedSince ignores a claimed path that does not resolve to a real file in the repo', () => {
+  const dir = makeRepoWithFile('src/widget.js', 'v1\n', '2026-01-01T00:00:00');
+  const task = makeTask({ createdAt: '2026-01-01T00:00:00.000Z', promptContext: { rawText: 'Check src/does-not-exist.js' } });
+  assert.doesNotThrow(() => {
+    const result = findFilesTouchedSince(dir, task);
+    assert.equal(result.touched, false);
+  });
+});
+
+test('findFilesTouchedSince returns {touched:false} (not a throw) when repoRoot or createdAt is missing/invalid', () => {
+  const task = makeTask({ createdAt: 'not-a-date', promptContext: { rawText: 'src/widget.js' } });
+  assert.deepEqual(findFilesTouchedSince('/nonexistent/repo', task), { touched: false, files: [] });
+  assert.deepEqual(findFilesTouchedSince(null, makeTask({ createdAt: '2026-01-01T00:00:00.000Z' })), { touched: false, files: [] });
+});
+
+test('findStalenessCandidates flags a task via possibly-resolved when repoRoot is given, even though it fails the other three criteria', () => {
+  const dir = makeRepoWithFile('src/widget.js', 'v1\n', '2026-01-10T00:00:00');
+  fs.writeFileSync(path.join(dir, 'src/widget.js'), 'v2\n');
+  git(['add', 'src/widget.js'], dir);
+  git(['commit', '-m', 'fix widget'], dir, { GIT_AUTHOR_DATE: '2026-01-15T00:00:00', GIT_COMMITTER_DATE: '2026-01-15T00:00:00' });
+
+  const now = Date.parse('2026-01-16T00:00:00.000Z'); // only 1 day after creation -- not stale-age, no fabrication, no exhausted retries
+  const task = makeTask({
+    id: 'maybe-resolved-1', createdAt: '2026-01-12T00:00:00.000Z',
+    history: [{ stage: 'blocked', at: '2026-01-12T00:00:00.000Z' }],
+    promptContext: { rawText: 'Something is wrong in src/widget.js' },
+  });
+
+  const withoutGit = findStalenessCandidates([task], {}, now);
+  assert.equal(withoutGit.length, 0, 'without repoRoot, this young task matches nothing');
+
+  const withGit = findStalenessCandidates([task], {}, now, { repoRoot: dir });
+  assert.equal(withGit.length, 1);
+  assert.deepEqual(withGit[0].reasons, ['possibly-resolved']);
+  assert.deepEqual(withGit[0].touchedFiles, ['src/widget.js']);
+});
+
+test('buildStalenessEvidenceText includes the touched-files evidence when present', () => {
+  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug' });
+  const candidate = { task, reasons: ['possibly-resolved'], lastActivityTs: Date.now(), touchedFiles: ['src/widget.js'] };
+  const text = buildStalenessEvidenceText(candidate);
+  assert.match(text, /Real commits landed AFTER this task was created/);
+  assert.match(text, /src\/widget\.js/);
 });
