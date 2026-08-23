@@ -34,7 +34,18 @@ const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above local-client.
 // confirmed live 2026-08-16: worker-1 was SIGKILL'd and restarted by the watchdog roughly
 // every 5 minutes for hours straight, re-starting the same leftover drafting/ tasks from
 // scratch each time (no partial-pass checkpointing) and never completing one.
-const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200; // 20 min -- comfortably above the real ~960s worst-case chain, not a single call.
+// reviewer-only: review-task.js's own single majorityVote() call (n=3 votes) now retries
+// each vote's call() up to maxRetries=1 (2 attempts) after 2026-08-23's fix for a
+// different bug (a single vote's hard failure no longer aborts the whole review -- see
+// local-client.js's own header on that commit). Worst case is therefore up to 3*2=6
+// sequential real network calls, each individually bounded by the same 240s ceiling draft
+// uses, before review-task.js finally reports failure: 6*240s=1440s -- ALREADY above the
+// 1200s value this constant used to be sized to, which would have started zombie-killing
+// a reviewer instance genuinely still working through its own new (and correct) retry
+// budget, the exact same SIGKILL-loop failure mode the comment above documents for
+// draft's own worst case. Sized to the LARGER of the two chains (review's 1440s, not
+// draft's 960s) plus the same 240s slack margin the original value used.
+const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680; // 28 min -- comfortably above review's real ~1440s worst-case chain (the larger of the two), not a single call.
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
 // instanceId -> { script, args, pidfileName } -- mirrors launch.sh's own hardcoded

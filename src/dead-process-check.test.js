@@ -61,6 +61,24 @@ test('a genuinely dead worker (pid gone, stale heartbeat) still produces a resta
   assert.match(actions[0].reason, /process confirmed gone/);
 });
 
+// Regression, 2026-08-23: caught live -- local-client.js's majorityVote() fix (a single
+// vote's hard failure no longer aborts the whole review) raised the reviewer's real
+// worst-case single-review duration to ~1440s (3 votes * up to 2 attempts each * 240s
+// ceiling), which the OLD 1200s WORKER_ZOMBIE_THRESHOLD_SECONDS would have started
+// SIGKILL-ing mid-legitimate-retry -- the exact same failure mode this file's own header
+// comment documents happening to draft's worst case in 2026-08-16 before that value was
+// last raised. A reviewer instance whose pid is alive and stuck on the SAME task for
+// 1440s must NOT be flagged as a zombie.
+test('a reviewer stuck "working" the SAME task for review\'s real worst-case duration (~1440s, 6 sequential majorityVote attempts) is NOT flagged as a zombie', () => {
+  const dir = tempInstancesDir();
+  const stuckTime = new Date(Date.now() - 1440_000).toISOString(); // 24 min -- review's real worst case
+  writeHeartbeat(dir, 'reviewer', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime });
+  const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  assert.deepEqual(actions, [], 'still comfortably within the real worst-case chain -- must not be treated as a hung/zombie process');
+});
+
 test('a healthy, recently-updated worker heartbeat produces no action', () => {
   const dir = tempInstancesDir();
   writeHeartbeat(dir, 'reviewer');
