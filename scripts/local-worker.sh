@@ -200,23 +200,66 @@ process_drafting_file() {
       } catch (e) { console.log(1); }
     ' "$wpath")"
     if [[ "${failure_count:-1}" -ge "${DRAFT_FAILURE_RETRY_LIMIT:-5}" ]]; then
-      reason="draft call failed ${failure_count} times in a row (most recent: ${draft_result}) -- giving up rather than retrying every tick forever and starving this lane"
-      node -e '
+      # 2026-08-23, Grimmethy: "draft call failed 5 times in a row... giving up rather
+      # than retrying every tick forever and starving this lane" -- caught live via a
+      # staleness_audit attempt on an adhoc-domain candidate that hit exactly this path,
+      # itself becoming a NEW permanently-blocked task rather than ever producing a
+      # report (the very thing meant to shrink the adhoc backlog was adding to it). A
+      # timeout/5xx/connection failure under Ollama contention is a TRANSIENT infra
+      # condition, not evidence the task itself is unfixable -- unlike a real content
+      # failure (bad prompt, malformed response), 5 more identical attempts in the same
+      # burst won't help, but the SAME task tried again later, after other lanes have had
+      # a turn and load has settled, plausibly will. So: an infra-shaped failure gets
+      # requeued to pending/ instead of permanently blocked, bounded by
+      # DRAFT_INFRA_REQUEUE_LIMIT rounds (default 3, ~4x the original budget) -- mv resets
+      # its mtime, so it re-enters the SAME oldest-first pending/ competition every other
+      # task goes through (see task-sources.js's own mtime-sort next-task pickers) rather
+      # than being retried instantly, giving Ollama real recovery time and this lane real
+      # other work to do in between rounds. A non-infra failure, or an infra failure that
+      # still hasn't cleared after every requeue round, still gives up exactly as before.
+      action="$(node -e '
         const fs = require("fs");
         const p = process.argv[1];
-        const reason = process.argv[2];
-        try {
-          const o = JSON.parse(fs.readFileSync(p, "utf8"));
+        const draftResult = process.argv[2];
+        const failureCount = process.argv[3];
+        const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
+        const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
+        let o;
+        try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
+        const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "");
+        const infraRequeueCount = o.infraRequeueCount || 0;
+        o.history = o.history || [];
+        if (isInfra && infraRequeueCount < infraRequeueLimit) {
+          o.infraRequeueCount = infraRequeueCount + 1;
+          o.draftFailureCount = 0;
+          o.history.push({
+            stage: "requeued",
+            at: new Date().toISOString(),
+            detail: `draft call failed ${failureCount} times in a row on an apparent infra outage (most recent: ${draftResult}) -- requeued (survived outage round ${o.infraRequeueCount}/${infraRequeueLimit}) instead of permanently blocking`,
+          });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("requeue");
+        } else {
+          const reason = isInfra
+            ? `draft call failed on an apparent infra outage that did not clear even after ${infraRequeueCount} requeue round(s) -- giving up rather than retrying forever (most recent: ${draftResult})`
+            : `draft call failed ${failureCount} times in a row (most recent: ${draftResult}) -- giving up rather than retrying every tick forever and starving this lane`;
           o.blockedStage = "draft";
           o.blockedReason = reason;
-          o.history = o.history || [];
           o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
-        } catch (e) { /* best-effort -- the mv below still frees the lane either way */ }
-      ' "$wpath" "$reason"
-      mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
-      mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
-      printf '[worker-%s] giving up on %s after %s failed draft attempts -- moved to blocked/\n' "$INSTANCE_ID" "$task_id" "$failure_count" >&2
+          console.log("block");
+        }
+      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}")"
+
+      if [[ "$action" == "requeue" ]]; then
+        mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
+        mv -n "$wpath" "${QUEUE_DIR}/pending/${name}"
+        printf '[worker-%s] requeuing %s after %s failed draft attempts (apparent infra outage) -- back to pending/\n' "$INSTANCE_ID" "$task_id" "$failure_count" >&2
+      else
+        mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
+        mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
+        printf '[worker-%s] giving up on %s after %s failed draft attempts -- moved to blocked/\n' "$INSTANCE_ID" "$task_id" "$failure_count" >&2
+      fi
     fi
   fi
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
