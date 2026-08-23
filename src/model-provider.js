@@ -1,13 +1,13 @@
 'use strict';
 
-// Per-task-source model backend selection: routes ornith-draft.js's/review-task.js's
-// default `call`/`majorityVote` between the local Ollama model (ornith-client.js) and
+// Per-task-source model backend selection: routes local-draft.js's/review-task.js's
+// default `call`/`majorityVote` between the local Ollama model (local-client.js) and
 // Claude Code CLI under a subscription (claude-client.js), by task.source.
 //
 // Added 2026-08-16 alongside claude-client.js specifically so this doesn't repeat
 // model-strategies.js's own fate -- that module (per-model generation-parameter
 // overrides) shipped fully built and tested but was never actually wired into
-// ornith-draft.js/ornith-client.js on the Linux port, so it's had zero real callers
+// local-draft.js/local-client.js on the Linux port, so it's had zero real callers
 // since. The mechanism here is deliberately the smallest thing that actually gets
 // used: one env var, one lookup function, called from the one place selection happens.
 //
@@ -34,7 +34,7 @@ function normalizeTask(sourceOrTask) {
 
 // Single source of truth for "should this task run on the high-reasoning (Claude) or
 // low-reasoning (Ornith) tier" -- used by providerFor()/labelFor() below AND by
-// ornith-worker.sh's worker-lane claim filter (via a `node -e` call into this module), so
+// local-worker.sh's worker-lane claim filter (via a `node -e` call into this module), so
 // the two can never disagree about which lane a task belongs on. Checked in order:
 //   1. task.reasoningTier -- a per-instance override, e.g. the Brain Dump #77 automatic
 //      high-reasoning retry for a needs-clarification task whose FIRST (low-tier) attempt
@@ -44,7 +44,7 @@ function normalizeTask(sourceOrTask) {
 //      per-source default alone can't express.
 //   2. the task's registered source's own static `reasoningTier` (e.g. adhoc, registered
 //      'high' in task-sources.js -- though adhoc's actual draft call is hardcoded to
-//      Claude via ornith-draft.js's own resolveSourceName()==='adhoc' branch regardless;
+//      Claude via local-draft.js's own resolveSourceName()==='adhoc' branch regardless;
 //      this registration exists so the worker-lane filter agrees with that by
 //      construction rather than by two people remembering to update two places).
 //   3. AGENT_MANAGER_CLAUDE_SOURCES (pre-existing opt-in env var, kept for compatibility).
@@ -59,14 +59,14 @@ function reasoningTierFor(task) {
 }
 
 // AGENT_MANAGER_FORCE_PROVIDER ('local'|'claude'): per-process override set by
-// ornith-worker.sh's refresh_active_model() when the Workers tab's worker-reasoning
+// local-worker.sh's refresh_active_model() when the Workers tab's worker-reasoning
 // dropdown picks a local model instead of a Claude one (2026-08-18, Grimmethy: "reasoning
 // is set to only show subscription models -- I need to be able to select from both
-// subscription and local models"). Only ornith-worker.sh's worker-reasoning* lane ever
+// subscription and local models"). Only local-worker.sh's worker-reasoning* lane ever
 // sets this; every other caller of providerFor() (worker-1's low-tier tasks, reviewer's
 // votes, etc.) is unaffected since the env var is unset in their process tree. Checked
 // BEFORE reasoningTierFor()-based routing so it wins regardless of the task's own tier --
-// but adhoc/research_task's agentic implement calls (ornith-draft.js's own
+// but adhoc/research_task's agentic implement calls (local-draft.js's own
 // resolveSourceName()==='adhoc'/'research_task' branches) bypass providerFor() entirely
 // and are never affected either way; those need Claude Code CLI's real tool access
 // (Read/Edit/Bash/WebSearch), which Ornith cannot provide, so forcing them onto a local

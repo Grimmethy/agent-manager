@@ -4,12 +4,12 @@
 set -u                                                                              # strict mode: catch unset var typos as failure (prevents silent "working on nothing" loop that PowerShell's lack-of-modes lets slide).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # locate scripts/ dir so we can reference sibling files regardless of how this script was invoked by launch.sh / user.
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
-export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so ornith-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
+export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
 # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17; generalized from
 # adhoc-only to a reasoning-tier concept for Brain Dump #77, 2026-08-17): any instance
 # named worker-reasoning* claims ONLY pending tasks whose reasoning tier (model-provider.js's
-# reasoningTierFor() -- the same function ornith-draft.js/review-task.js already call to
+# reasoningTierFor() -- the same function local-draft.js/review-task.js already call to
 # pick a backend) resolves to 'high', and every OTHER worker-* instance skips them
 # instead, leaving them for this lane. Originally this was hardcoded to "adhoc-shaped"
 # tasks specifically (the ones whose implement pass is a real agentic Claude Code CLI
@@ -43,7 +43,7 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 # model dropdown) -- exports LOCAL_MODEL/CLAUDE_MODEL for this tick from
 # dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
 # instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
-# call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
+# call downstream this tick (local-draft.js, claude-client.js via the reasoning lane)
 # inherits the exported value, so no other call site needs to change.
 #
 # The reasoning lane's override can name EITHER backend (2026-08-18 follow-up, Grimmethy:
@@ -91,7 +91,7 @@ refresh_active_model
 check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Graceful stop: bash defers a trapped signal until the current foreground command
-# (e.g. the node ornith-draft.js call below) returns control to the shell, so this exits
+# (e.g. the node local-draft.js call below) returns control to the shell, so this exits
 # right after finishing whatever draft is in flight rather than mid-call -- no orphaned
 # node child, no half-written task file. stop.sh's SIGTERM-then-grace-period-then-SIGKILL
 # handles the case where a single call runs long enough that this isn't fast enough.
@@ -103,7 +103,7 @@ LOG_FILE="${HOME_LOGS}/ornith-worker-${INSTANCE_ID}.log"          # per-instance
 # Infinite polling loop mimicking PowerShell's `while ($true) { ... Start-Sleep -Seconds 60 }` block structure exactly — same design philosophy: simple poll-and-do is easier to debug than event-driven alternatives for file-based state (which agent-manager uses exclusively, not databases or message queues that would benefit from true push mechanisms).
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
-# Runs the plan -> implement -> critique -> (revision) passes (ornith-draft.js) against a
+# Runs the plan -> implement -> critique -> (revision) passes (local-draft.js) against a
 # task JSON already sitting in queue/drafting/${INSTANCE_ID}/, then files the result into
 # queue/review/ or queue/blocked/. Shared by both the freshly-claimed path below and the
 # leftover-drafting-file resume pass at the top of each tick -- factored out so a task
@@ -450,7 +450,7 @@ while :; do                                                                     
       fi
 
       # Parallel Claude worker lane filter (see IS_CLAUDE_LANE's own comment above) --
-      # reasoningTierFor() is the SAME function ornith-draft.js/review-task.js already call
+      # reasoningTierFor() is the SAME function local-draft.js/review-task.js already call
       # to pick a backend, so this lane split can never disagree with what actually happens
       # once a task is claimed. The Claude lane claims ONLY high-reasoning-tier tasks;
       # every other lane skips them, leaving them free for the Claude lane to pick up
@@ -489,7 +489,7 @@ while :; do                                                                     
         printf '[worker-%s] claimed %s -> %s\n' "$INSTANCE_ID" "$wpath" "$new_wpath"     # log claim action with old+new paths — same information PowerShell's `$null = Write-Host "Claimed $src for $dest"` writes but using file redirection operator to send our printf output directly into stderr (which gets captured by launch.sh later via `nohup ... > /dev/null 2>&1 &` and tee'd into HOME_LOGS directory so user can review claim history later in log files even if their terminal is closed or busy).
 
         # Run the actual plan -> implement -> critique -> (revision) passes against Ornith,
-        # via ornith-draft.js (a port of ornith-worker.ps1's equivalent sequence -- see that
+        # via local-draft.js (a port of ornith-worker.ps1's equivalent sequence -- see that
         # file's header comment for scope: the 6 domains task-domains.json actually wires up
         # on Linux, not arch_discovery/arch_import's extra structural-check pass). Mutates
         # new_wpath's task JSON in place with pass results and status:"needs-review" on

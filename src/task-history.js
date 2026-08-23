@@ -3,7 +3,7 @@
 // Shared per-task pipeline event log: one appended entry per meaningful checkpoint a task
 // passes through (created, claimed, plan/implement/critique done, review verdict, requeue,
 // exhausted, applied), each carrying its own timestamp. Every stage-transition writer in
-// the pipeline (task-sources.js, ornith-draft.js, review-task.js, reject-retry-check.js,
+// the pipeline (task-sources.js, local-draft.js, review-task.js, reject-retry-check.js,
 // apply-task.js) calls this instead of hand-rolling its own `task.history.push(...)`, so
 // the schema stays one shape everywhere rather than drifting per-file.
 //

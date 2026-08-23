@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bash port of src/agent-manager-common.ps1 -- shared helpers sourced by ornith-worker.sh,
+# Bash port of src/agent-manager-common.ps1 -- shared helpers sourced by local-worker.sh,
 # review-runner.sh, and queue-watcher.sh (apply-task.sh intentionally does not use this --
 # see its own header). A bug fix here applies everywhere at once instead of needing to be
 # found and reapplied in each daemon separately, same reasoning the .ps1 version documents.
@@ -47,7 +47,7 @@ invoke_model_stats_db() {
 # api_set_worker_model) writes there, same file claudeDefaultModel/
 # claudeDefaultEffort already live in for the same "takes effect without a
 # pipeline restart" reason. Called once per tick (not just at daemon startup)
-# by ornith-worker.sh/review-runner.sh so a dashboard change reaches a running
+# by local-worker.sh/review-runner.sh so a dashboard change reaches a running
 # worker within one tick. Prints nothing (not even a newline) when unset --
 # callers treat empty output as "use the agent-manager.env default".
 get_model_override() {
@@ -183,7 +183,7 @@ should_yield_for_model_swap() {
 # check. flock is different in kind, not just degree: it's a kernel-enforced exclusive
 # lock with no such window -- acquire_single_flight_lock BLOCKS until it can actually
 # hold the lock, so there is no gap between "I checked" and "I have it" for another
-# process to slip through. Callers wrap ONLY the real model call (ornith-worker.sh's
+# process to slip through. Callers wrap ONLY the real model call (local-worker.sh's
 # process_drafting_file / review-runner.sh's review-task.js invocation), not the whole
 # tick -- claiming a task, GPU-guard, task-generation etc. are all still allowed to run
 # concurrently across lanes; only the actual GPU-consuming call is serialized, which is
@@ -340,7 +340,7 @@ write_heartbeat_file() {
 # heartbeat and creating a duplicate claimant -- exactly CONTEXT.md's "Duplicate
 # instance" entry ("two or more processes sharing the same instanceId... root-caused
 # but not yet fixed in code as of 2026-07-19"), watched happen live this session: an
-# EPIPE crash auto-restarted ornith-worker.sh worker-1 while a second worker-1 was
+# EPIPE crash auto-restarted local-worker.sh worker-1 while a second worker-1 was
 # ALSO started manually, both racing to write instances/worker-1.json and claim from
 # the same drafting/worker-1/ folder. write_heartbeat_file (above) still writes
 # unconditionally on every tick -- this is a one-time gate at startup only, before the

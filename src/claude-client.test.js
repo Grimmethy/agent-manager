@@ -14,7 +14,7 @@
 //
 // call()'s retry-on-degenerate loop and majorityVote()'s tally logic are intentionally
 // NOT re-tested here beyond what's needed to prove the wiring works -- they're verbatim
-// copies of ornith-client.js's own (untested-in-isolation) implementations, and this
+// copies of local-client.js's own (untested-in-isolation) implementations, and this
 // file's job is proving claude-client.js's OWN new surface (subprocess invocation,
 // auth guard, JSON parsing, env stripping) is correct.
 
@@ -230,7 +230,7 @@ test('call() succeeds immediately on a real response, no retries spent', async (
   });
 });
 
-test('module exports the same shape as ornith-client.js so it is a drop-in swap at the injection points', () => {
+test('module exports the same shape as local-client.js so it is a drop-in swap at the injection points', () => {
   const claudeClient = requireFreshClaudeClient();
   for (const key of ['call', 'callOnce', 'majorityVote', 'detectDegenerate']) {
     assert.equal(typeof claudeClient[key], 'function', `missing or non-function export: ${key}`);

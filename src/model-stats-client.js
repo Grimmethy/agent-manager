@@ -1,7 +1,7 @@
 'use strict';
 
 // Thin wrapper around model-stats-db.js's CLI (record-call / record-outcome), letting
-// ornith-draft.js/review-task.js/reject-retry-check.js call it as a normal async function
+// local-draft.js/review-task.js/reject-retry-check.js call it as a normal async function
 // instead of each hand-rolling its own temp-file-plus-execFileSync boilerplate.
 // model-stats-db.js itself can't be require()'d directly -- it runs its logic
 // unconditionally at module-load time (no `require.main === module` guard) and calls
@@ -29,7 +29,7 @@ function runEvent(event, payload) {
     // better-sqlite3 2026-08-19) emits an ExperimentalWarning on every single invocation
     // otherwise -- harmless, but this call already runs with stdio:'pipe' specifically to
     // stay quiet, and the warning would otherwise land in whatever captures this process's
-    // stderr (e.g. ornith-worker.sh's own log redirect) on every implement/review pass.
+    // stderr (e.g. local-worker.sh's own log redirect) on every implement/review pass.
     execFileSync('node', ['--no-warnings', SCRIPT_PATH, event, tmpPath], { stdio: 'pipe' });
   } catch (e) {
     // Non-fatal -- see header.
@@ -45,7 +45,7 @@ function runEvent(event, payload) {
 // candidates (2026-08-19): the raw LOCAL_AB_MODELS list this call was chosen from, or
 // null when no A/B mechanism is active for this call -- model-stats-db.js's schema already
 // had this column (the PowerShell reference always populated it), it just had no way to
-// reach it through this JS wrapper until ab-model-select.js gave ornith-draft.js a real
+// reach it through this JS wrapper until ab-model-select.js gave local-draft.js a real
 // selection to record.
 function recordCall({ taskId, stage = 'implement', model, candidates = null, startedAt, latencyMs, result }) {
   const callId = require('crypto').randomUUID();

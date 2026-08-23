@@ -79,7 +79,7 @@ different, unrelated mount mechanisms for the same physical disk.
 the two conventions, rather than editing the shortcut (safer/more reversible, and it's a
 real symlink so it survives reboots on its own).
 
-### 3. `ornith-worker.sh`'s claim loop: three stacked bugs, each independently sufficient to fully block the pipeline
+### 3. `local-worker.sh`'s claim loop: three stacked bugs, each independently sufficient to fully block the pipeline
 
 Found together while debugging "worker shows running but never picks up any task." All
 three had to be fixed before *any* of them stopped mattering — fixing one alone showed no
@@ -100,13 +100,13 @@ diagnose (each fix looked like it did nothing).
 
 ### 4. The actual drafting orchestration (plan → implement → critique → revision) was never ported to Linux at all
 
-`ornith-worker.sh` only ever claimed a task (moved it from `queue/pending/` to
+`local-worker.sh` only ever claimed a task (moved it from `queue/pending/` to
 `queue/drafting/<instance>/`) and stopped — the real per-task work lived only in
 `src/ornith-worker.ps1` (867 lines), never translated to the Linux side. Symmetric gap in
 `review-runner.sh`: it correctly found `needs-review` items but had a hardcoded "no
 review logic ported yet" stub (previously called a nonexistent `src/reviewer.js`).
 
-**Fix:** new `src/ornith-draft.js` (worker side — plan/implement/critique/revision
+**Fix:** new `src/local-draft.js` (worker side — plan/implement/critique/revision
 against Ornith, moves the task to `queue/review/` or `queue/blocked/`) and
 `src/review-task.js` (review side — deterministic gates, fact-check, 3-vote unanimous
 Ornith majority vote, moves to `queue/approved/` or `queue/blocked/`). Both are ports of
@@ -176,7 +176,7 @@ background generators; that bypass is intentional, not a gap.)
 
 ### 8. No crash-resume: a claimed task that outlived its worker process was lost until manually noticed
 
-`ornith-worker.sh`'s claim loop only ever looked at `queue/pending/` for *new* work — it
+`local-worker.sh`'s claim loop only ever looked at `queue/pending/` for *new* work — it
 never revisited a task already sitting in its own `queue/drafting/<instance>/` from a
 previous run that got interrupted (the worker process killed/restarted mid-draft-call,
 which happened repeatedly during this same day's development). The Windows reference has
@@ -217,7 +217,7 @@ its retries doesn't starve that project's rotation forever) since that domain is
 reachable here; skipped the equivalent `arch_discovery`/`arch_import` stamping since
 neither domain is wired up in this deployment's `task-domains.json`.
 
-**A second, more serious bug found while fixing this one:** `ornith-draft.js`'s
+**A second, more serious bug found while fixing this one:** `local-draft.js`'s
 "already has content, skip regeneration" check was keyed on whether `implementResponse`
 merely *existed* on the task, not on an explicit `preDrafted` flag. Since
 `reject-retry-check.js` intentionally does *not* clear the old (rejected) content when
@@ -251,7 +251,7 @@ systemd-managed Ollama actually fail here.
 The plan pass proposes search queries only (Ornith has no network access); a harness step
 is supposed to run between plan and implement, executing those queries for real against
 GitHub/Hugging Face (`src/project-search-fetch.js`, which already existed and worked
-fine) and handing real results to the implement pass. `ornith-draft.js`'s first version
+fine) and handing real results to the implement pass. `local-draft.js`'s first version
 never called this step at all, so `task.promptContext.searchResults` stayed `undefined`
 for every `project_search` draft. Ornith — explicitly instructed "write findings from the
 REAL results — do not invent" — responded by inventing well-known project names from its
@@ -259,7 +259,7 @@ own training data instead (one draft's own text admitted: *"actual web search to
 not available in this interface"*), and in the wrong format besides, so the deterministic
 apply-time parser found zero real findings in every one of 17+ completed tasks.
 
-**Fix:** added the missing fetch step to `ornith-draft.js` (extract `QUERY:` lines from
+**Fix:** added the missing fetch step to `local-draft.js` (extract `QUERY:` lines from
 the plan response via regex, run them through `runSearches()`, attach the real results to
 `promptContext.searchResults` before building the implement prompt). Verified against the
 exact query text from a real stuck task — confirms some queries genuinely return zero
@@ -281,7 +281,7 @@ Two separate causes, both silent:
 
 **Fix:** `npm install`, plus a new `src/model-stats-client.js` (a thin subprocess wrapper
 — `model-stats-db.js` can't be `require()`'d directly, it executes unconditionally at
-load time) wired into `ornith-draft.js` (records the call right after the implement
+load time) wired into `local-draft.js` (records the call right after the implement
 pass, stamping `task.abCallId`) and into every verdict branch of `review-task.js` plus
 `reject-retry-check.js`'s requeue path (records the eventual outcome against that same
 `callId`). Verified live: `/api/models` went from `[]` to real per-model call counts,
@@ -308,7 +308,7 @@ completed tasks accumulated.
   uses for the dashboard, not a bare `python3` off `PATH`.
 
 Both failures were caught and logged via `console.error`, but were invisible for most of
-this migration because `ornith-worker.sh` was discarding `task-sources.js`'s entire
+this migration because `local-worker.sh` was discarding `task-sources.js`'s entire
 stderr to `/dev/null` until item 4's logging fix landed separately — a good example of
 why routing a subprocess's real output somewhere durable matters even when nothing looks
 obviously broken.

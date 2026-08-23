@@ -231,7 +231,7 @@ function adhocPlanPrompt(task) {
   ].join('\n');
 }
 
-// research_task never had a plan template registered here -- ornith-draft.js's main loop
+// research_task never had a plan template registered here -- local-draft.js's main loop
 // unconditionally calls buildPlanPrompt() before checking task.domain (the domain==='research'
 // branch that skips straight to research-agentic-draft.js's own WebSearch/WebFetch call only
 // kicks in at the IMPLEMENT stage, further down), so every research task fell through to
@@ -1129,7 +1129,7 @@ updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolve
 // 2026-08-17 testing this exact feature (Brain Dump #67): drafting/review worked (both
 // go through this file), but apply fell through to the generic Group B JSON-diff path
 // and failed parsing a real unified diff as JSON, every time, until apply moved to
-// task-sources.js instead. ornith-draft.js's draftTask() now bypasses
+// task-sources.js instead. local-draft.js's draftTask() now bypasses
 // buildPlanPrompt/buildImplementPrompt's generic implement pass for domain:'adhoc'
 // entirely in favor of a real agentic implement (adhoc-agentic-draft.js) -- these two
 // stay registered regardless, still a real, generic dispatch target (see this file's
@@ -1137,7 +1137,7 @@ updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolve
 // production path specifically.
 updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementPrompt: adhocImplementPrompt });
 // No buildImplementPrompt -- domain==='research' bypasses buildImplementPrompt entirely
-// (see ornith-draft.js's own domain==='research' branch), same as adhoc's agentic bypass
+// (see local-draft.js's own domain==='research' branch), same as adhoc's agentic bypass
 // just above. Only the mandatory plan stage needs a real template here.
 updateTaskSource('research_task', { buildPlanPrompt: researchPlanPrompt });
 updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });

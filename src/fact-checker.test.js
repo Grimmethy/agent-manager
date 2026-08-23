@@ -5,7 +5,7 @@
 // repoRoot/backend, and repoRoot/backend/python_services as candidate roots -- a
 // DIFFERENT consumer project's directory layout hardcoded into this package's own code.
 // This repo's real files live under src/, which was never tried, so a draft claiming a
-// bare filename (e.g. "Files: ornith-client.js" instead of "src/ornith-client.js") always
+// bare filename (e.g. "Files: local-client.js" instead of "src/local-client.js") always
 // false-negatived as "missing" and got misreported to review as fabrication -- even
 // though the file is real and the draft's specific technical claims about its content
 // were independently verified accurate.
