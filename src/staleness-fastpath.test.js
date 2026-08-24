@@ -36,9 +36,9 @@ test('deterministicRecheck returns null when originalSource is unsupported (e.g.
   assert.equal(deterministicRecheck(task, dir), null);
 });
 
-test('deterministicRecheck returns null when originalRule is not in RULE_DETECTORS', () => {
+test('deterministicRecheck returns null when originalRule is not in RULE_DETECTORS or REPO_WIDE_RULE_DETECTORS', () => {
   const dir = makeFixtureRepo();
-  const task = stalenessTask({ originalRule: 'missing-reserved-attribute' }); // repo-wide, not a single-file rule
+  const task = stalenessTask({ originalRule: 'some-rule-that-does-not-exist' });
   assert.equal(deterministicRecheck(task, dir), null);
 });
 
@@ -111,4 +111,47 @@ test('deterministicRecheck works for performance_review rules too (sequential-aw
   const verdict = deterministicRecheck(task, dir);
   assert.equal(verdict.recommendation, 'investigate');
   assert.equal(verdict.hits.length, 1);
+});
+
+// missing-reserved-attribute is REPO-WIDE (no single file/line -- a project either has
+// service.name/error.type somewhere in its source or it doesn't), so it needs its own
+// coverage separate from the per-file RULE_DETECTORS tests above -- originalFile is null
+// on a real task for this rule, matching observability-scan.js's own finding shape.
+function missingReservedAttributeTask(overrides) {
+  return {
+    id: 'staleness-audit-mra-1',
+    source: 'staleness_audit',
+    promptContext: {
+      originalTaskId: 'observability-x-missing-reserved-attribute-repo-0',
+      originalSource: 'observability_review',
+      originalRule: 'missing-reserved-attribute',
+      originalFile: null,
+      ...overrides,
+    },
+  };
+}
+
+test('deterministicRecheck (missing-reserved-attribute) recommends archive when the project has no OpenTelemetry dependency at all', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: {} }));
+  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
+  assert.equal(verdict.recommendation, 'archive');
+  assert.match(verdict.reportText, /RECOMMENDATION: archive/);
+});
+
+test('deterministicRecheck (missing-reserved-attribute) recommends archive once both reserved attributes are present in source', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: { '@opentelemetry/api': '^1.0.0' } }));
+  fs.writeFileSync(path.join(dir, 'tracing.js'), "resource.setAttribute('service.name', 'x');\nspan.setAttribute('error.type', e.name);\n");
+  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
+  assert.equal(verdict.recommendation, 'archive');
+});
+
+test('deterministicRecheck (missing-reserved-attribute) recommends investigate when a reserved attribute is still genuinely missing', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: { '@opentelemetry/api': '^1.0.0' } }));
+  fs.writeFileSync(path.join(dir, 'tracing.js'), "resource.setAttribute('service.name', 'x');\n"); // error.type still missing
+  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
+  assert.equal(verdict.recommendation, 'investigate');
+  assert.ok(verdict.hits.length > 0);
 });
