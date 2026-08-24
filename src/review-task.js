@@ -39,7 +39,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { checkDraft } = require('./fact-checker.js');
-const { providerFor } = require('./model-provider.js');
+const { providerFor, resolveModelProfile } = require('./model-provider.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -233,7 +233,26 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   // tier, only known once the task object is in hand. Passing the whole task (not just
   // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
   // caller override always wins.
-  const resolvedMajorityVote = ornithMajorityVote || providerFor(task).majorityVote;
+  // 2026-08-24 (model-profile-registry.js): same pattern as local-draft.js's own
+  // resolvedOrnithCall wrapping -- when the task's own source declares a modelProfile,
+  // its overrides become defaults spread BEFORE the real majorityVote() call below (opts
+  // spread after wins, though the one real call site doesn't set model/numCtx/numPredict/
+  // effort/timeoutMs itself today, so the profile's values reliably take effect). Passing
+  // both local-only (numCtx/numPredict) and claude-only (effort/timeoutMs) keys
+  // unconditionally is safe -- whichever backend's majorityVote() runs only destructures
+  // the params it recognizes, ignoring the rest. Skipped for an injected
+  // ornithMajorityVote (test/caller override), same as local-draft.js.
+  const modelProfile = resolveModelProfile(task);
+  const profileOverrides = modelProfile
+    ? {
+      model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict,
+      effort: modelProfile.effort, timeoutMs: modelProfile.timeoutMs,
+    }
+    : null;
+  const baseMajorityVote = ornithMajorityVote || providerFor(task).majorityVote;
+  const resolvedMajorityVote = profileOverrides && !ornithMajorityVote
+    ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
+    : baseMajorityVote;
   appendHistoryEvent(task, 'review-started');
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });

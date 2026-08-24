@@ -248,13 +248,20 @@ async function call(opts, maxRetries = 2) {
 // agreeing REAL (non-degenerate) votes (`minAgreeing`), not a relative comparison of
 // two buckets that can both be small — that relative-comparison bug once let 1 genuine
 // verdict + 2 degenerate "unclear" votes pass as a confident 1-0 consensus.
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source }) {
+// 2026-08-24: model/numCtx/numPredict added -- previously silently dropped, so a
+// model-profile-registry.js profile naming a specific model/context/output-length had no
+// way to actually reach a vote (majorityVote is the only caller of call() review-task.js
+// uses). All three are plain pass-throughs to the same-named callOnce() options this
+// function's own internal call() already accepts; omitted entirely (undefined) preserves
+// today's exact behavior (call()'s own defaults / this module's MODEL const) for every
+// existing caller that doesn't pass them.
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict }) {
   const votes = [];
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
     try {
-      result = await call({ prompt, think: false, temperature, source }, 1);
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict }, 1);
     } catch (e) {
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under

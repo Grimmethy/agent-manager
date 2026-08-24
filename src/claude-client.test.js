@@ -230,6 +230,28 @@ test('call() succeeds immediately on a real response, no retries spent', async (
   });
 });
 
+// Regression, 2026-08-24: model/effort/timeoutMs were silently dropped by majorityVote()
+// -- a model-profile-registry.js profile naming a specific model had no way to actually
+// reach a vote, since majorityVote is review-task.js's only entry point into this module.
+test('majorityVote() forwards a model override into the real CLI invocation for every vote', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    const capturedArgsPerCall = [];
+    await withMockedClient(
+      (bin, args) => { capturedArgsPerCall.push(args); return JSON.stringify({ result: 'APPROVE: looks correct' }); },
+      async ({ majorityVote }) => {
+        const classify = (text) => (text.includes('APPROVE') ? 'approve' : null);
+        await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2, model: 'claude:opus' });
+      },
+    );
+    assert.ok(capturedArgsPerCall.length >= 2, 'early-exit still needs at least 2 votes to reach minAgreeing');
+    for (const args of capturedArgsPerCall) {
+      const modelIdx = args.indexOf('--model');
+      assert.ok(modelIdx !== -1, 'every vote must pass --model');
+      assert.equal(args[modelIdx + 1], 'claude:opus');
+    }
+  });
+});
+
 test('module exports the same shape as local-client.js so it is a drop-in swap at the injection points', () => {
   const claudeClient = requireFreshClaudeClient();
   for (const key of ['call', 'callOnce', 'majorityVote', 'detectDegenerate']) {

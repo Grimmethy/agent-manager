@@ -112,3 +112,94 @@ test('reasoningTierFor: accepts a bare source-name string, same as providerFor/l
     assert.equal(reasoningTierFor('arch_import'), 'high');
   });
 });
+
+// --- resolveModelProfile / providerFor / labelFor precedence (2026-08-24,
+// model-profile-registry.js: forced > profile > tier-default) --------------------------
+
+function withRegisteredProfile(taskSourceConfig, profileConfig, fn) {
+  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
+  const { clearModelProfileRegistry, registerModelProfile } = require('./model-profile-registry.js');
+  clearRegistry();
+  clearModelProfileRegistry();
+  try {
+    registerTaskSource('observability_review', taskSourceConfig);
+    if (profileConfig) registerModelProfile(taskSourceConfig.modelProfile, profileConfig);
+    return fn();
+  } finally {
+    clearRegistry();
+    clearModelProfileRegistry();
+  }
+}
+
+test('resolveModelProfile returns the registered profile for a source that declares modelProfile', () => {
+  withRegisteredProfile(
+    { modelProfile: 'cheap-local' },
+    { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192 },
+    () => {
+      const { resolveModelProfile } = freshModelProvider();
+      const profile = resolveModelProfile({ source: 'observability_review' });
+      assert.equal(profile.backend, 'local');
+      assert.equal(profile.model, 'qwen2.5:3b');
+    },
+  );
+});
+
+test('resolveModelProfile returns null when the source declares no modelProfile', () => {
+  withRegisteredProfile({}, null, () => {
+    const { resolveModelProfile } = freshModelProvider();
+    assert.equal(resolveModelProfile({ source: 'observability_review' }), null);
+  });
+});
+
+test('resolveModelProfile returns null (fails open) when the declared profile name is not actually registered -- no throw', () => {
+  withRegisteredProfile({ modelProfile: 'does-not-exist' }, null, () => {
+    const { resolveModelProfile } = freshModelProvider();
+    assert.equal(resolveModelProfile({ source: 'observability_review' }), null);
+  });
+});
+
+test('resolveModelProfile returns null when AGENT_MANAGER_FORCE_PROVIDER is set -- a human override always wins outright, a profile never overrides it', () => {
+  withEnv({ AGENT_MANAGER_FORCE_PROVIDER: 'local' }, () => {
+    withRegisteredProfile(
+      { modelProfile: 'cheap-local' },
+      { backend: 'claude', model: 'claude:opus' },
+      () => {
+        const { resolveModelProfile } = freshModelProvider();
+        assert.equal(resolveModelProfile({ source: 'observability_review' }), null);
+      },
+    );
+  });
+});
+
+test('providerFor routes to the profile\'s own backend, overriding the source\'s normal reasoningTier-based default', () => {
+  withRegisteredProfile(
+    { modelProfile: 'claude-review', reasoningTier: 'low' }, // normally local, per its own static tier
+    { backend: 'claude', model: 'claude:opus' },
+    () => {
+      const { providerFor } = freshModelProvider();
+      const claude = require('./claude-client.js');
+      assert.equal(providerFor({ source: 'observability_review' }), claude);
+    },
+  );
+});
+
+test('providerFor falls back to today\'s tier-based default when no profile is registered for the source', () => {
+  withRegisteredProfile({}, null, () => {
+    const { providerFor } = freshModelProvider();
+    const ornith = require('./local-client.js');
+    assert.equal(providerFor({ source: 'observability_review' }), ornith);
+  });
+});
+
+test('labelFor reflects the profile\'s own model name, not LOCAL_MODEL, when a profile is registered', () => {
+  withEnv({ LOCAL_MODEL: 'qwen3.8:27b-q4_K_M' }, () => {
+    withRegisteredProfile(
+      { modelProfile: 'cheap-local' },
+      { backend: 'local', model: 'qwen2.5:3b' },
+      () => {
+        const { labelFor } = freshModelProvider();
+        assert.equal(labelFor({ source: 'observability_review' }), 'qwen2.5:3b');
+      },
+    );
+  });
+});

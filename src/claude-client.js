@@ -193,11 +193,15 @@ async function call(opts, maxRetries = 2) {
 // Mirrors local-client.js's majorityVote() exactly (same signature, same tally logic)
 // so review-task.js's ornithMajorityVote injection point works unchanged with this
 // module swapped in -- duplicated rather than imported since local-client.js's version
-// calls its own local `call` directly with no injection seam of its own.
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2 }) {
+// calls its own local `call` directly with no injection seam of its own. Still true as
+// of 2026-08-24 (model-profile-registry.js) -- not consolidated, deliberately deferred,
+// see that file's own header. model/effort/timeoutMs added here for profile support --
+// no numCtx/numPredict equivalent exists on this module's own callOnce() (a Claude Code
+// CLI call, not a raw Ollama /api/generate), so those two are local-client.js-only.
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs }) {
   const votes = [];
   for (let i = 0; i < n; i++) {
-    const result = await call({ prompt, think: false, temperature }, 1);
+    const result = await call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1);
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response });
