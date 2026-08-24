@@ -1125,6 +1125,37 @@ def api_models_cost_summary():
     })
 
 
+@app.route("/api/instances/<instance_id>/recent-tasks")
+def api_instance_recent_tasks(instance_id):
+    """Last 10 tasks a given worker instance actually completed (2026-08-23, Workers tab:
+    "When I click on a worker to expand it's information I'd like to see a list of the
+    last 10 tasks it completed."). model_calls is the only place that ties a task_id to
+    the instance that drafted it (see model-stats-db.js's own instance_id migration) --
+    'completed' here means outcome='approved' on that instance's own call for the task
+    (review-task.js's recordModelOutcome stamps that onto the drafting instance's own
+    call_id via task.abCallId), same shipped-vs-not distinction the rest of this file's
+    cost tracking already relies on. GROUP BY task_id since a task can carry several calls
+    (retries/revisions) from the same instance; ordered by whichever timestamp is freshest."""
+    db_path = model_stats_db_path()
+    if not db_path or not db_path.is_file():
+        return jsonify({"tasks": []})
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        if not _has_instance_id_column(conn):
+            return jsonify({"tasks": []})
+        rows = conn.execute("""
+            SELECT task_id, MAX(COALESCE(outcome_at, started_at)) AS at, MAX(model) AS model
+            FROM model_calls
+            WHERE instance_id = ? AND outcome = 'approved'
+            GROUP BY task_id
+            ORDER BY at DESC
+            LIMIT 10
+        """, (instance_id,)).fetchall()
+    finally:
+        conn.close()
+    return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m} for t, at, m in rows]})
+
+
 @app.route("/api/models/usage")
 def api_models_usage():
     """Per-model call volume across EVERY stage, not just 'implement' -- api_models()
