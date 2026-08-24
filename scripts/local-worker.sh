@@ -166,11 +166,20 @@ process_drafting_file() {
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
+  # needs-human-decision (2026-08-24, adhoc-agentic-draft.js's RESOLUTION: needs-human-
+  # decision) -- a real open product/design question, not a diff to review. Routed to
+  # queue/needs-clarification/ instead of review/, same "nothing here for an automatic
+  # reviewer to verify" reasoning local-draft.js's own comment documents.
+  draft_needs_clarification="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsClarification?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$draft_succeeded" == "true" && "$draft_blocked" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
     printf '[worker-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
+  elif [[ "$draft_succeeded" == "true" && "$draft_needs_clarification" == "true" ]]; then
+    mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
+    printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"

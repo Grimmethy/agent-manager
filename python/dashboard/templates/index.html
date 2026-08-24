@@ -1475,7 +1475,7 @@ async function renderQueueTab(state) {
     // "check the task's own domain" signal as isAdhocConfirm above.
     const isResearchConfirm = state === 'awaiting-confirm' && t.domain === 'research';
     const detailCell = t.needsClarification
-      ? `<span style="color:var(--warn)">⚠ ${t.needsClarification.reason === 'ambiguous' ? 'ambiguous match' : 'no anchor match'}</span>`
+      ? `<span style="color:var(--warn)">⚠ ${t.needsClarification.reason === 'ambiguous' ? 'ambiguous match' : t.needsClarification.reason === 'design-decision' ? 'needs a human decision' : 'no anchor match'}</span>`
       : isAdhocConfirm
         ? '<span style="color:var(--warn)">⚠ real code diff ready to apply</span>'
         : isResearchConfirm
@@ -1507,7 +1507,7 @@ async function renderQueueTab(state) {
   }).join('');
   const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
   const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
-    + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path (or proceed with no prefetch) and send it to drafting.</div>' : '');
+    + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path, answer an open design question, or Discuss -- then send it back to drafting.</div>' : '');
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   wireQueueSourceFilter(state);
   main.querySelectorAll('tr.clickable').forEach(row => {
@@ -1699,8 +1699,32 @@ function renderTaskDetailModal(task) {
 // input. Both cases also get "Proceed without prefetch" -- the explicit escape hatch for
 // when prefetch genuinely has nothing useful to offer, rather than blocking the task
 // forever over it.
+// 2026-08-24 (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision, Grimmethy: "We
+// already have a 'needs clarification' tab. That's a perfect place for this type of
+// job."): a genuinely different held-task shape from path_prefetch_resolve's own ambiguous/
+// no-match file-path picker below -- there's no candidate list to pick from, just the
+// model's own real open questions. Reuses the SAME element IDs (clarify-resolve-btn,
+// clarify-discuss-btn, clarify-discuss-provider) as the picker below so wireClarification-
+// Picker's existing wiring works completely unchanged: with no .clarify-pick-btn/manual-
+// path/accept-suggestion elements in this branch's HTML, `selected` in that function's
+// closure simply stays empty, so clicking "Send to Drafting" here calls the exact same
+// resolveNeedsClarification(taskId, []) the file-picker's own "Proceed Without Prefetch"
+// button already uses -- correct for this case too, since there are no paths to attach,
+// just the discussion (already folded into promptContext.rawText server-side by
+// api_discuss_end) riding along when the task moves back to queue/adhoc/.
+function renderDesignDecisionPicker(task) {
+  const nc = task.needsClarification;
+  let html = `<div class="field-label">⚠ Needs a Human Decision</div>`;
+  html += `<div class="meta">The agentic draft investigated this for real and has genuine open questions it shouldn't guess at:</div>`;
+  html += `<div class="grill-session" style="margin-top:8px; white-space:pre-wrap">${escapeHtml(nc.openQuestions || '')}</div>`;
+  html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button> ${renderProviderToggle('clarify-discuss-provider')}</div>`;
+  html += `<div id="clarify-discuss-panel" style="margin-top:10px"></div>`;
+  return html;
+}
+
 function renderClarificationPicker(task) {
   const nc = task.needsClarification;
+  if (nc.reason === 'design-decision') return renderDesignDecisionPicker(task);
   let html = `<div class="field-label">⚠ Needs Clarification</div>`;
   // LLM-assisted fallback suggestion (path_prefetch_resolve, hybrid design 2026-08-16) --
   // shown FIRST and most prominent, since accepting it is the one-click path that's the

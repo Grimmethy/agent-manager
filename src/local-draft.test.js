@@ -86,6 +86,38 @@ test('an adhoc task with NO local-model override never locks at all (plan and im
   });
 });
 
+// 2026-08-24 (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision, Grimmethy: "We
+// already have a 'needs clarification' tab... we need a 'discuss' button here"): a real
+// open product/design question skips review-task.js/apply-task.js entirely -- there's
+// nothing for an automatic reviewer to verify -- and goes straight to queue/needs-
+// clarification/ (local-worker.sh's own move-destination branch) via a distinct
+// needsClarification flag on both the task object and draftTask()'s own return value.
+test('an adhoc task whose agentic draft needs a human decision skips needs-review and sets task.needsClarification', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-test-needs-decision', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'build something with real open questions' } };
+
+    const draftAdhocImplementFn = async (t) => {
+      t.adhocResolution = 'needs-human-decision';
+      t.implementResponse = 'Which charting library should this use?';
+      return { succeeded: true, blocked: false, needsClarification: true };
+    };
+
+    const { withLockFn } = spyLock();
+    const result = await draftTask(task, {
+      ornithCall: fakeOrnithCall('no real match -- nothing plausible'),
+      withLockFn,
+      ...declineLocalTiers(),
+      draftAdhocImplementFn,
+    });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(result.needsClarification, true);
+    assert.equal(task.status, undefined, 'must NOT be routed into the normal needs-review flow');
+    assert.deepEqual(task.needsClarification, { reason: 'design-decision', openQuestions: 'Which charting library should this use?' });
+  });
+});
+
 test('an adhoc task with a local-model override (the real bug scenario) locks around the plan call but NOT the real Claude implement call', async () => {
   await withFixtureRepo(async (draftTask) => {
     process.env.AGENT_MANAGER_FORCE_PROVIDER = 'local'; // the dashboard workerModelOverrides scenario that caused the original bug

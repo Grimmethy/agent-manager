@@ -2975,17 +2975,31 @@ def api_discuss_end(session_id):
                 ctx = held_task.setdefault("promptContext", {})
                 ctx["rawText"] = f"{ctx.get('rawText', '')}\n\n[Discussed {stamp}]: {summary}"
                 nc = held_task.setdefault("needsClarification", {})
-                nc.pop("suggested", None)
-                nc["suggestionAttempted"] = False
-                # Brain Dump #77: reset alongside suggestionAttempted so a human-reopened
-                # task gets a fresh automatic low-then-high reasoning pair again, not just
-                # the low tier (see task-sources.js's nextPathPrefetchResolveTask()).
-                nc["highReasoningAttempted"] = False
-                # Bumped so nextPathPrefetchResolveTask()'s resolve-task id includes the
-                # attempt number -- without this, a second attempt's id collides with the
-                # first attempt's now-done/ file forever (taskIdExistsInQueue() checks
-                # done/ too), silently blocking every re-attempt after Discuss.
-                nc["attempt"] = nc.get("attempt", 1) + 1
+                if nc.get("reason") == "design-decision":
+                    # 2026-08-24 (adhoc-agentic-draft.js's RESOLUTION: needs-human-
+                    # decision): a real product/design question, not path_prefetch_
+                    # resolve's ambiguous-file-path picker -- this task never had
+                    # suggested/suggestionAttempted/highReasoningAttempted/attempt in the
+                    # first place, so touching those fields would just fabricate a shape
+                    # nothing else here ever wrote. The discussion is already folded into
+                    # promptContext.rawText above; the task stays in needs-clarification/
+                    # exactly as-is, ready for the existing generic /resolve endpoint
+                    # (already reused unchanged) to send it to queue/adhoc/ for a fresh
+                    # agentic draft once a human decides it's ready.
+                    pass
+                else:
+                    nc.pop("suggested", None)
+                    nc["suggestionAttempted"] = False
+                    # Brain Dump #77: reset alongside suggestionAttempted so a human-
+                    # reopened task gets a fresh automatic low-then-high reasoning pair
+                    # again, not just the low tier (see task-sources.js's
+                    # nextPathPrefetchResolveTask()).
+                    nc["highReasoningAttempted"] = False
+                    # Bumped so nextPathPrefetchResolveTask()'s resolve-task id includes
+                    # the attempt number -- without this, a second attempt's id collides
+                    # with the first attempt's now-done/ file forever (taskIdExistsInQueue()
+                    # checks done/ too), silently blocking every re-attempt after Discuss.
+                    nc["attempt"] = nc.get("attempt", 1) + 1
                 held_path.write_text(json.dumps(held_task, indent=2), encoding="utf-8")
 
     return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated, "heldTask": held_task})
