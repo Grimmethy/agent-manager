@@ -144,6 +144,35 @@ function parseSubTaskProposals(text) {
   return cleaned.length ? cleaned : null;
 }
 
+// Multiple-choice shortcut for a needs-human-decision resolution (Grimmethy, 2026-08-24:
+// "we could build in some multiple choice options into the task log including an
+// 'other:' option... reduce the friction caused by pausing the pipeline to set up a
+// chat"). Deliberately optional and best-effort: a model that skips the OPTIONS block
+// entirely, or gets the format slightly wrong, still has its plain-English open-question
+// text preserved in full (see buildAgenticPrompt's own instruction above) -- this only
+// ever ADDS a one-click shortcut in the dashboard, it never replaces the free-text
+// fallback ("Other") every needs-clarification task still has regardless. Requires 2+
+// well-formed lines to return anything -- a single stray "1. foo :: bar" isn't a real
+// multiple-choice set, and returning just one option would make the human's Other-text
+// fallback the ONLY other path, i.e. no real shortcut at all.
+const OPTIONS_LINE_RE = /^\s*\d+\.\s*(.+?)\s*::\s*(.+?)\s*$/;
+function parseClarificationOptions(text) {
+  const lines = (text || '').split('\n');
+  const headerIdx = lines.findIndex((l) => /^OPTIONS:\s*$/.test(l));
+  if (headerIdx === -1) return null;
+  const options = [];
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) { if (options.length) break; else continue; }
+    const m = line.match(OPTIONS_LINE_RE);
+    if (!m) break;
+    const label = m[1].trim();
+    const description = m[2].trim();
+    if (label && description) options.push({ label, description });
+  }
+  return options.length >= 2 ? options : null;
+}
+
 // Same "claude:<model>" label format model-provider.js's labelFor()/local-worker.sh's
 // HEARTBEAT_MODEL use -- stamped onto task.draftModel below so apply-task.js's commit
 // message can attribute Co-Authored-By to whichever model actually drafted the change,
@@ -210,6 +239,20 @@ function buildAgenticPrompt(task) {
     'actual tradeoffs are) for a human to answer them without having to re-investigate ' +
     'themselves. This goes straight to a human for a real answer, not through automatic ' +
     'review -- make it something they can actually act on.',
+    '',
+    'Then, if the real open question boils down to a small number of genuinely distinct ' +
+    'answers (e.g. "which storage backend" or "which of these 3 architectures"), ALSO ' +
+    'give 2-4 concrete options in exactly this format, so a human can resolve it with one ' +
+    'click instead of writing a reply from scratch:',
+    'OPTIONS:',
+    '1. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
+    '2. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
+    '(a free-text "Other" answer is always available separately in the UI -- do not add ' +
+    'an "other" option yourself)',
+    'If the honest answer space is genuinely open-ended (e.g. "describe what you want ' +
+    'this to do") rather than a handful of concrete choices, omit the OPTIONS block ' +
+    'entirely and rely on the open question text alone -- do not force a fake multiple-' +
+    'choice list onto a question that does not have one.',
   ].join('\n');
 }
 
@@ -389,4 +432,4 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   }
 }
 
-module.exports = { draftAdhocImplement, buildAgenticPrompt, parseSubTaskProposals, buildSandboxOpts };
+module.exports = { draftAdhocImplement, buildAgenticPrompt, parseSubTaskProposals, parseClarificationOptions, buildSandboxOpts };

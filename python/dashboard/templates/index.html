@@ -2130,7 +2130,26 @@ function renderDesignDecisionPicker(task) {
   let html = `<div class="field-label">⚠ Needs a Human Decision</div>`;
   html += `<div class="meta">The agentic draft investigated this for real and has genuine open questions it shouldn't guess at:</div>`;
   html += `<div class="grill-session" style="margin-top:8px; white-space:pre-wrap">${escapeHtml(nc.openQuestions || '')}</div>`;
-  html += `<div style="margin-top:10px"><button type="button" class="action" id="clarify-resolve-btn">Send to Drafting</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss</button> ${renderProviderToggle('clarify-discuss-provider')}</div>`;
+
+  // Multiple-choice shortcut (2026-08-24, Grimmethy: "build in some multiple choice
+  // options into the task log... reduce the friction caused by pausing the pipeline to
+  // set up a chat") -- nc.options is only ever present when the draft offered a clean
+  // 2+ option OPTIONS block (see adhoc-agentic-draft.js's parseClarificationOptions);
+  // absent for older held tasks drafted before this feature, or when the model judged
+  // the real answer space too open-ended for multiple choice. Either way, the free-text
+  // "Other" box below is always available as the universal fallback.
+  if (nc.options && nc.options.length) {
+    html += `<div style="margin-top:10px"><strong>Pick one:</strong></div>`;
+    html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
+    html += nc.options.map((o, i) => `
+      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
+        <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtml(o.description)}</span>
+      </button>`).join('');
+    html += `</div>`;
+  }
+  html += `<div style="margin-top:10px"><strong>${nc.options && nc.options.length ? 'Other:' : 'Your answer:'}</strong></div>`;
+  html += `<div style="margin-top:6px"><textarea id="clarify-answer-other" rows="3" style="width:100%;background:var(--panel);border:2px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-family:inherit;font-size:13px" placeholder="Type your decision here -- this gets folded directly into the task's instructions, same as ending a Discuss session would."></textarea></div>`;
+  html += `<div style="margin-top:8px"><button type="button" class="action" id="clarify-answer-submit-btn">Submit &amp; Send to Drafting</button> <button type="button" class="secondary" id="clarify-discuss-btn">Discuss instead</button> ${renderProviderToggle('clarify-discuss-provider')}</div>`;
   html += `<div id="clarify-discuss-panel" style="margin-top:10px"></div>`;
   return html;
 }
@@ -2329,6 +2348,17 @@ function wireClarificationPicker(taskId) {
   const discussBtn = document.getElementById('clarify-discuss-btn');
   if (discussBtn) discussBtn.onclick = () => clarifyDiscussStart(taskId);
   wireProviderToggle('clarify-discuss-provider');
+  document.querySelectorAll('.clarify-answer-option-btn').forEach((btn) => {
+    btn.onclick = () => answerNeedsClarification(taskId, btn.dataset.answer);
+  });
+  const answerSubmitBtn = document.getElementById('clarify-answer-submit-btn');
+  if (answerSubmitBtn) {
+    answerSubmitBtn.onclick = () => {
+      const text = (document.getElementById('clarify-answer-other').value || '').trim();
+      if (!text) { alert('Type an answer first, or click one of the options above.'); return; }
+      answerNeedsClarification(taskId, text);
+    };
+  }
   // Surface an existing (active or already-ended) discussion instead of leaving the
   // picker looking like nothing has been tried yet -- same "don't bury prior work"
   // reasoning as every other Discuss integration's own for-note/latest check.
@@ -2352,6 +2382,24 @@ async function resolveNeedsClarification(taskId, paths) {
     if (activeTab === 'needs-clarification') renderQueueTab('needs-clarification');
   } catch (e) {
     alert(`Could not resolve '${taskId}': ` + e.message);
+  }
+}
+
+async function answerNeedsClarification(taskId, answer) {
+  try {
+    const res = await fetch(`/api/task/needs-clarification/${encodeURIComponent(taskId)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.description || `${res.status}`);
+    }
+    closeDetail();
+    if (activeTab === 'needs-clarification') renderQueueTab('needs-clarification');
+  } catch (e) {
+    alert(`Could not answer '${taskId}': ` + e.message);
   }
 }
 
