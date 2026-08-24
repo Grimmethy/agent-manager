@@ -1906,6 +1906,79 @@ def api_task_confirm_delete(task_id):
     return jsonify({"id": task_id, "confirmed": True})
 
 
+# Repeated-blocker guard (2026-08-24, pipeline hardening, Grimmethy: "no 'repeated
+# identical blocker' escalation"). Root-caused live: two real tasks each survived a full
+# bulk-requeue pass ("get to 0 blocked", 2026-08-23) and immediately failed the exact
+# same way again -- a blind requeue changes nothing about the task or its environment,
+# so a genuinely structural failure just replays. blockedReason text is a much more
+# reliable similarity signal than a task's title (concrete symbols/requirements repeat
+# near-verbatim across attempts at the same root cause, e.g. "CLAUDE_MODEL_CHOICES"
+# literally recurred across 3 of 6 real rejections for one task this session), so this
+# compares the CURRENT blockedReason against every entry already accumulated in
+# priorRejectionFeedback (reject-retry-check.js's automatic retries already append every
+# rejection reason there) rather than trying to fingerprint task identity at all.
+_STOPWORDS = {
+    "a", "an", "the", "to", "of", "for", "and", "or", "in", "on", "with", "is", "are",
+    "this", "that", "it", "be", "as", "at", "by", "from", "into", "not", "but", "its",
+    "was", "were", "has", "have", "had", "do", "does", "did",
+}
+
+
+def _significant_words(text):
+    return {w for w in re.findall(r"[a-z0-9_]+", (text or "").lower()) if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return (intersection / union) if union else 0.0
+
+
+_QUOTED_SYMBOL_RE = re.compile(r"`([^`]{3,60})`")
+_REPEATED_BLOCKER_THRESHOLD = 0.3
+
+
+def _quoted_symbols(text):
+    """Backtick-quoted spans (a code identifier, file path, or function name) -- review-
+    task.js's own blockedReason prose consistently cites the specific symbol it's
+    objecting to this way (confirmed against real data: `CLAUDE_MODEL_CHOICES` literally
+    recurred, backtick-quoted, across 3 of 6 real rejections for one task this session).
+    Far more precise than generic word overlap for THIS specific failure mode -- two
+    fresh pieces of critique prose about the same missing symbol often share almost no
+    other vocabulary at all."""
+    return {m.strip() for m in _QUOTED_SYMBOL_RE.findall(text or "") if m.strip()}
+
+
+def _repeated_blocker_match(task):
+    """Returns the most similar prior rejection reason if the CURRENT blockedReason looks
+    like the same underlying problem recurring, else None. Deliberately best-effort and
+    approximate -- a missed match just means no warning shown (same as before this
+    existed); a false-positive match costs one extra confirm click (force=true), never
+    blocks a requeue outright."""
+    current_reason = task.get("blockedReason") or ""
+    if not current_reason:
+        return None
+    current_symbols = _quoted_symbols(current_reason)
+    current_words = _significant_words(current_reason)
+    best = None
+    for prior in (task.get("priorRejectionFeedback") or []):
+        prior = prior or ""
+        # Primary, high-precision signal: the exact same quoted symbol named as the
+        # problem in both this rejection and an earlier one -- a match here is decisive,
+        # no need to also clear the (weaker) word-overlap bar below.
+        if current_symbols & _quoted_symbols(prior):
+            return prior
+        # Fallback for rejections that don't happen to quote a symbol (e.g. "fails to
+        # search ClinicalTrials.gov for a registration number") -- generic word overlap,
+        # a weaker signal on its own so held to a slightly lower bar than the primary one.
+        score = _jaccard(current_words, _significant_words(prior))
+        if score >= _REPEATED_BLOCKER_THRESHOLD and (best is None or score > best[1]):
+            best = (prior, score)
+    return best[0] if best else None
+
+
 @app.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
 def api_task_requeue(state, task_id):
     """Manual requeue (Job Status > Blocked/Done tabs, per-row button; also the Brain Dump
@@ -1951,6 +2024,17 @@ def api_task_requeue(state, task_id):
     data = read_json_safe(src)
     if not data:
         abort(404)
+
+    if state == "blocked" and not (request.get_json(silent=True) or {}).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                "This task's rejection looks like the same underlying problem as an "
+                f"earlier attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed "
+                "this before and likely won't now without a real change. Diagnose the "
+                "actual root cause first (or confirm you already have), then requeue "
+                "again to proceed anyway."
+            ))
 
     pending_dir = qdir / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
