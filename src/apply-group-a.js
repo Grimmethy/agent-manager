@@ -399,6 +399,10 @@ function parseBrainDumpSortResult(implementResponse) {
     rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
     belongsToProject: parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null,
     requiresResearch: !!parsed.requiresResearch,
+    // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
+    // filing") -- the classifier is shown a list of already-queued task titles and
+    // asked to flag a near-duplicate here; null/absent means it saw nothing similar.
+    possibleDuplicateOf: parsed.possibleDuplicateOf ? String(parsed.possibleDuplicateOf).trim() : null,
   };
 }
 
@@ -644,6 +648,33 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       }
       // 'greenfield': adhocTask left exactly as constructed above, queues normally with
       // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
+
+      // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
+      // filing") -- brainDumpSortPlanPrompt/ImplementPrompt already showed the classifier
+      // every currently-queued task title and asked it to flag a real match. Overrides
+      // whatever the anchor-resolution logic above decided (even a confident path match
+      // isn't worth drafting if the whole task is a duplicate) -- held for a human via the
+      // SAME multiple-choice/free-text picker the "needs a human decision" adhoc path
+      // already uses (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision), not a
+      // new UI: no structured options here since this is really a binary "is this real"
+      // call the existing generic Archive button on every needs-clarification row (for
+      // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
+      // fully cover.
+      if (result.possibleDuplicateOf) {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        adhocTask.needsClarification = {
+          reason: 'design-decision',
+          openQuestions: (
+            `This brain-dump note was flagged as a possible duplicate of an already-` +
+            `queued task:\n\n  "${result.possibleDuplicateOf}"\n\n` +
+            `NOTE (this task's own text): ${rawText}\n\n` +
+            'If this genuinely is the same underlying feature/fix, use the Archive ' +
+            'button on this row instead of answering below. If it is NOT actually a ' +
+            'duplicate (different scope, different project, coincidental overlap), ' +
+            'explain why in the box below and submit to send it to drafting.'
+          ),
+        };
+      }
 
       // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific
       // tasks go into that repo instead of the second brain") -- stamped here (not just

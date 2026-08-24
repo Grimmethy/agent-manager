@@ -123,6 +123,47 @@ function taskIdExistsInQueue(id) {
   });
 }
 
+// Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
+// classifier so it can flag a note that plainly duplicates something already queued
+// (2026-08-24, pipeline hardening -- see prompts.js's brainDumpSortPlanPrompt). Scans the
+// pre-drafting staging dirs (adhoc/, research/) PLUS every real QUEUE_STATE except 'done'
+// (finished work re-surfacing is staleness_audit's separate concern, not a duplicate-
+// filing one) and 'drafting' (per-worker claim subfolders, not simple <id>.json files --
+// see taskIdExistsInQueue's own handling of that shape; the source-generator tick this
+// runs on is cheap and frequent enough that missing an item mid-draft for one tick is an
+// acceptable gap, not worth the extra directory-walk complexity here). Capped and
+// truncated purely for prompt size -- this is context for a judgment call, not a
+// database query that needs to be exhaustive.
+const EXISTING_TITLES_MAX_COUNT = 60;
+const EXISTING_TITLES_MAX_CHARS = 140;
+function existingQueuedTaskTitles(pipelineDir) {
+  const dirs = ['adhoc', 'research', ...QUEUE_STATES.filter((s) => s !== 'done' && s !== 'drafting')];
+  const titles = [];
+  for (const dir of dirs) {
+    const full = path.join(pipelineDir, 'queue', dir);
+    let entries;
+    try {
+      entries = fs.readdirSync(full, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (titles.length >= EXISTING_TITLES_MAX_COUNT) return titles;
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      let data;
+      try {
+        data = JSON.parse(fs.readFileSync(path.join(full, entry.name), 'utf8'));
+      } catch {
+        continue;
+      }
+      if (data && typeof data.title === 'string' && data.title.trim()) {
+        titles.push(data.title.trim().slice(0, EXISTING_TITLES_MAX_CHARS));
+      }
+    }
+  }
+  return titles;
+}
+
 // Lightweight DAG-readiness check (agent-engine's TaskGraph pattern, adapted 2026-07-26,
 // ahead of real need -- no built-in task source declares `deps` today, since every one
 // generates fully independent units of work; this exists so a future task source CAN
@@ -1071,7 +1112,7 @@ function readProjectLabels() {
 }
 
 function nextBrainDumpSortTask() {
-  const { brainDumpPath, secondBrainDir } = getConfig();
+  const { brainDumpPath, secondBrainDir, pipelineDir } = getConfig();
   if (!brainDumpPath) return null;
   const raw = readIfExists(brainDumpPath);
   if (!raw) return null;
@@ -1108,6 +1149,7 @@ function nextBrainDumpSortTask() {
       rawText: chosen.rawText,
       existingStructure: listSecondBrainTopLevel(secondBrainDir),
       projectLabels: readProjectLabels(),
+      existingQueuedTitles: existingQueuedTaskTitles(pipelineDir),
       // If this package's own source directory is ALSO one of the tracked projects (this
       // deployment: agent-manager operating on itself), self-referential notes -- about
       // the brain-dump/pipeline/dashboard system itself -- are near-certainly a feature/
@@ -2058,6 +2100,7 @@ module.exports = {
   nextStalenessAuditTask, markStalenessAuditReported,
   nextProductSpecTask,
   nextBacklogDecompositionTask,
+  existingQueuedTaskTitles,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found

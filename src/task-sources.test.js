@@ -1592,3 +1592,55 @@ test('nextCandidateFulfillmentTask skips a candidate when only Problem (not Solu
   const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
   assert.equal(task, null);
 });
+
+// existingQueuedTaskTitles (2026-08-24, pipeline hardening, Grimmethy: "duplicate-task
+// detection before filing") -- feeds brain_dump_sort's classifier a list of what's
+// already queued so it can flag a real duplicate before drafting either one.
+test('existingQueuedTaskTitles collects titles from adhoc/, research/, and the real queue states', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'existing-titles-test-'));
+  const { existingQueuedTaskTitles } = freshTaskSources(dir);
+
+  for (const [state, title] of [
+    ['adhoc', 'Add authentication to the dashboard'],
+    ['research', 'Investigate a GitHub repo'],
+    ['pending', 'Pending task title'],
+    ['needs-clarification', 'Held task title'],
+    ['blocked', 'Blocked task title'],
+  ]) {
+    const stateDir = path.join(dir, 'queue', state);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'x.json'), JSON.stringify({ title }));
+  }
+
+  const titles = existingQueuedTaskTitles(dir);
+  assert.equal(titles.length, 5);
+  assert.ok(titles.includes('Add authentication to the dashboard'));
+  assert.ok(titles.includes('Held task title'));
+});
+
+test('existingQueuedTaskTitles excludes done/ (finished work) and drafting/ (per-worker subfolders)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'existing-titles-test-'));
+  const { existingQueuedTaskTitles } = freshTaskSources(dir);
+
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'x.json'), JSON.stringify({ title: 'Already finished' }));
+  fs.mkdirSync(path.join(dir, 'queue', 'drafting', 'worker-1'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'drafting', 'worker-1', 'x.json'), JSON.stringify({ title: 'Mid-draft' }));
+
+  assert.deepEqual(existingQueuedTaskTitles(dir), []);
+});
+
+test('existingQueuedTaskTitles returns an empty array when the queue directory does not exist at all', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'existing-titles-test-'));
+  const { existingQueuedTaskTitles } = freshTaskSources(dir);
+  assert.deepEqual(existingQueuedTaskTitles(dir), []);
+});
+
+test('existingQueuedTaskTitles skips a malformed JSON file rather than throwing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'existing-titles-test-'));
+  const { existingQueuedTaskTitles } = freshTaskSources(dir);
+  fs.mkdirSync(path.join(dir, 'queue', 'adhoc'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'adhoc', 'bad.json'), '{not valid json');
+  fs.writeFileSync(path.join(dir, 'queue', 'adhoc', 'good.json'), JSON.stringify({ title: 'A real title' }));
+  assert.deepEqual(existingQueuedTaskTitles(dir), ['A real title']);
+});
