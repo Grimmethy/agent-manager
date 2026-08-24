@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-manager dashboard</title>
 <style>
   :root {
@@ -178,6 +179,36 @@
   .browser-entry.active { background: var(--bg); color: var(--accent); }
   .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
+
+  /* Mobile layout: below this width there isn't room for the fixed 200px nav rail plus a
+     380px chat panel alongside main content, so the three-column .layout collapses to a
+     single column -- nav becomes a horizontally-scrollable top strip (same buttons, just
+     laid out in a row instead of stacked), and the chat panel becomes a bottom sheet that
+     overlays main instead of sitting beside it (it already toggles via .chat-collapsed on
+     #chat-panel, so this only changes ITS geometry, not the JS that drives it). Tables are
+     left as real <table> markup (JS renders them as raw HTML strings with no wrapper div to
+     hang overflow on) and instead scroll horizontally inside #main itself. */
+  @media (max-width: 860px) {
+    header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
+    header .pipeline-dir { flex-basis: 100%; }
+    .layout { flex-direction: column; }
+    nav { width: 100%; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
+    nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
+    nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    main { padding: 12px; overflow-x: auto; }
+    table { min-width: 560px; }
+    #chat-panel { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
+    #chat-panel.chat-collapsed { height: 0; width: 100%; border-top: none; }
+    #chat-toggle-tab { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; }
+    .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
+    .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
+    .stat-row { flex-wrap: wrap; row-gap: 10px; }
+    .split-pane { flex-direction: column; }
+    .path-row, .capture-row { flex-wrap: wrap; }
+    .modal-backdrop { padding: 12px; }
+    .modal { padding: 16px; max-width: 100%; }
+    .benchmark-check-grid { gap: 4px 10px; }
+  }
 </style>
 </head>
 <body>
