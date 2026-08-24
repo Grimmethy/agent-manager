@@ -31,6 +31,7 @@ const os = require('os');
 const path = require('path');
 const { detectDegenerate } = require('./local-client.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { currentDateLine } = require('./current-date-line.js');
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
@@ -95,8 +96,9 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   const workDir = cwd || CLAUDE_CWD;
   fs.mkdirSync(workDir, { recursive: true });
 
+  const datedPrompt = `${currentDateLine()}\n\n${prompt}`;
   const args = [
-    '-p', prompt,
+    '-p', datedPrompt,
     '--output-format', 'json',
     '--model', model || MODEL,
     '--max-turns', String(maxTurns),
