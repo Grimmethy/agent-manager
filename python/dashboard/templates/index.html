@@ -930,11 +930,39 @@ async function ghostToggleReserve() {
   ghostRender();
 }
 
+// 2026-08-24 -- caught live: clicking the header's provider toggle while a session was
+// already active (the common case -- get_active_session() always has one) only changed
+// this button's own DOM state. ghostSend() never reads it at all (only ghostStartNew()
+// does), so the very next message silently went to whichever provider the ALREADY-ACTIVE
+// session was on, not the one the toggle now visually showed -- then ghostRender()'s own
+// "keep the toggle in sync with the active session" logic snapped it back afterward,
+// which is what looked like the click just "reverting" for no reason. A toggle that
+// visually responds to a click but doesn't actually do what it shows is worse than no
+// toggle at all -- wired here to immediately start a fresh conversation on the newly
+// picked provider, so the click has real, guaranteed effect instead of a cosmetic one
+// the next message could silently ignore. Deliberately NOT reusing the generic
+// wireProviderToggle() (shared with Discuss, where a toggle really is just a pre-start
+// choice with no persistent existing session to worry about) -- Ghost needs this
+// different, session-aware behavior.
+function ghostWireProviderToggle() {
+  const btn = document.getElementById('ghost-provider');
+  if (!btn) return;
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
+    btn.dataset.provider = next;
+    providerChoices['ghost-provider'] = next;
+    btn.textContent = next === 'claude' ? 'Claude' : 'Local';
+    btn.classList.toggle('provider-toggle-claude', next === 'claude');
+    await ghostStartNew();
+  };
+}
+
 function ghostRender() {
   const container = document.getElementById('ghost-provider-container');
   if (container && !document.getElementById('ghost-provider')) {
     container.innerHTML = renderProviderToggle('ghost-provider');
-    wireProviderToggle('ghost-provider');
+    ghostWireProviderToggle();
   }
   if (ghostSession && document.getElementById('ghost-provider')) {
     // Provider is fixed once a session exists (same "no mid-conversation switch"
