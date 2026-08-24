@@ -19,6 +19,7 @@
 const local = require('./local-client.js');
 const claude = require('./claude-client.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+const { getConfig } = require('./config.js');
 
 const CLAUDE_SOURCES = new Set(
   (process.env.AGENT_MANAGER_CLAUDE_SOURCES || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -42,17 +43,24 @@ function normalizeTask(sourceOrTask) {
 //      nextPathPrefetchResolveTask()) -- the same *source* (path_prefetch_resolve) needs
 //      to run on different tiers depending on which attempt this is, which a static
 //      per-source default alone can't express.
-//   2. the task's registered source's own static `reasoningTier` (e.g. adhoc, registered
+//   2. AGENT_MANAGER_TASK_TIERS -- the dashboard's Job List "Worker Type" column, a
+//      per-source human override that wins over a source's own baked-in default (but not
+//      over #1's one-off automatic escalation, which only applies to the specific task
+//      that already failed once).
+//   3. the task's registered source's own static `reasoningTier` (e.g. adhoc, registered
 //      'high' in task-sources.js -- though adhoc's actual draft call is hardcoded to
 //      Claude via local-draft.js's own resolveSourceName()==='adhoc' branch regardless;
 //      this registration exists so the worker-lane filter agrees with that by
 //      construction rather than by two people remembering to update two places).
-//   3. AGENT_MANAGER_CLAUDE_SOURCES (pre-existing opt-in env var, kept for compatibility).
-//   4. default: 'low'.
+//   4. AGENT_MANAGER_CLAUDE_SOURCES (pre-existing opt-in env var, kept for compatibility).
+//   5. default: 'low'.
 function reasoningTierFor(task) {
   const t = normalizeTask(task);
   if (t.reasoningTier) return t.reasoningTier;
-  const entry = getRegisteredSource(resolveSourceName(t));
+  const sourceName = resolveSourceName(t);
+  const { taskTierOverrides } = getConfig();
+  if (taskTierOverrides && taskTierOverrides[sourceName]) return taskTierOverrides[sourceName];
+  const entry = getRegisteredSource(sourceName);
   if (entry && entry.reasoningTier) return entry.reasoningTier;
   if (CLAUDE_SOURCES.has(t.source)) return 'high';
   return 'low';
