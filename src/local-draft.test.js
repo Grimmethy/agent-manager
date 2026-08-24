@@ -488,3 +488,42 @@ test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local
     assert.ok(calls.length > 0, 'an unresolved (undefined) label must default to "treat as local, lock" -- not silently skip locking');
   });
 });
+
+// 2026-08-24 (pipeline hardening): root-caused live -- EVERY brain_dump_sort draft
+// failed outright with "Ollama HTTP 400: \"qwen2.5:3b\" does not support thinking" for
+// as long as the brain-dump-cheap-local model profile existed, because every call site
+// in draftTask() unconditionally passed think:true (or think:!hasFixedLiterals) with no
+// way for a profile's model choice to override it.
+test('a task whose model profile sets think:false never requests thinking, even though the call sites default to true', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const seenThinkValues = [];
+    const localCall = async (opts) => {
+      seenThinkValues.push(opts.think);
+      if (seenThinkValues.length === 1) return { response: '1. about x\n2. reference\n3. Ideas\n4. Ideas/x.md\n5. none apply\n6. no', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+    };
+    const task = { id: 'brain-dump-think-test', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'x', tags: [] } };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.ok(seenThinkValues.length >= 2, 'expected at least a plan and an implement call');
+    assert.ok(seenThinkValues.every((v) => v === false), `every call for a think:false-profiled task must request think:false, got: ${JSON.stringify(seenThinkValues)}`);
+  });
+});
+
+test('a task with NO model profile still defaults to think:true, unaffected by the brain-dump-cheap-local fix', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const seenThinkValues = [];
+    const localCall = async (opts) => {
+      seenThinkValues.push(opts.think);
+      return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+    };
+    // trouble_log has no registered modelProfile -- ordinary default-tier local source.
+    const task = { id: 'no-profile-think-test', domain: 'default', source: 'trouble_log', title: 'test', promptContext: {} };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() }).catch(() => {});
+
+    assert.ok(seenThinkValues.length > 0, 'expected at least one real call');
+    assert.ok(seenThinkValues.every((v) => v === true), `a task with no model profile must keep the existing think:true default, got: ${JSON.stringify(seenThinkValues)}`);
+  });
+});
