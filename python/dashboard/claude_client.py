@@ -72,10 +72,24 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     tmp_path = Path(tempfile.gettempdir()) / f"claude-client-req-{uuid.uuid4().hex}.json"
     try:
         tmp_path.write_text(json.dumps(request), encoding="utf-8")
-        result = subprocess.run(
-            ["node", str(CLAUDE_CLIENT_JS), str(tmp_path)],
-            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
-        )
+        try:
+            result = subprocess.run(
+                ["node", str(CLAUDE_CLIENT_JS), str(tmp_path)],
+                capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as e:
+            # 2026-08-24 -- caught live via the Ghost panel's sibling module
+            # (local_tool_client.py had the identical gap): subprocess.TimeoutExpired
+            # does NOT inherit from TimeoutError, so it was never caught by any of this
+            # module's own error handling OR by app.py's _call_discuss/_call_ghost
+            # (which only know to catch ClaudeClientError/LocalToolClientError plus the
+            # builtin TimeoutError/ConnectionError/OSError trio) -- it fell all the way
+            # through as a raw, unhandled 500 with no indication of what happened. Every
+            # OTHER failure mode of this subprocess call already gets normalized into
+            # ClaudeClientError below; a hang past SUBPROCESS_TIMEOUT_S is just as much
+            # this module's own failure mode as a non-zero exit or bad JSON, and belongs
+            # in the same one exception type callers already know to catch.
+            raise ClaudeClientError(f"claude -p (via claude-client.js) did not respond within {SUBPROCESS_TIMEOUT_S}s") from e
     finally:
         try:
             tmp_path.unlink()
