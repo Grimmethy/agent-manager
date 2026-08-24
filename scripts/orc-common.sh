@@ -1,5 +1,20 @@
 # Shared env-load/validation for all four agent-manager daemons.
 set -u
+
+# 2026-08-24 (pipeline hardening): caught live, twice at two different call sites in
+# local-worker.sh -- a daemon launched from an interactive shell with FORCE_COLOR set
+# (this session's own launching shell had FORCE_COLOR=3) inherits it into every `node -e`
+# one-liner these scripts spawn. Node's console.log colorizes a bare number with ANSI
+# escape codes even though stdout is piped (not a TTY) when FORCE_COLOR forces it, which
+# then breaks any bash `[[ ... -ge ... ]]`/`-gt` numeric test consuming that output
+# ("syntax error: operand expected") -- silently, since the daemon doesn't exit, it just
+# logs a stray error line and the numeric check underneath it always evaluates false.
+# Exported here once for all daemons sourcing this file, rather than patching every
+# individual numeric-extraction call site as each is discovered -- kills the whole class
+# of bug instead of one instance at a time.
+export NO_COLOR=1
+export FORCE_COLOR=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 [[ "$SCRIPT_DIR" == *"$(dirname "$0")"* ]] || SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 

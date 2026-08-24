@@ -153,6 +153,15 @@ async function draftTask(task, {
   const resolvedLocalCall = profileOverrides && !localCall
     ? (opts) => baseLocalCall({ ...profileOverrides, ...opts })
     : baseLocalCall;
+  // 2026-08-24 (root-caused live: every brain_dump_sort draft failed outright with
+  // "does not support thinking" for as long as the brain-dump-cheap-local profile
+  // existed) -- unlike model/numCtx/numPredict above, `think` can't just join
+  // profileOverrides: every call site below passes its OWN explicit think value as part
+  // of `opts` (plan/critique/revise: true; implement: !hasFixedLiterals), and opts is
+  // spread AFTER profileOverrides in resolvedLocalCall above, so a profile-level think
+  // override would never actually take effect no matter what value it held. Each call
+  // site below now ANDs its own reasoning-needed value with this, instead.
+  const profileSupportsThink = !modelProfile || modelProfile.think !== false;
 
   // Real plan/implement lock split (2026-08-22, Grimmethy: "build it now" -- see
   // single-flight-lock.js's own header for the full incident this fixes). Every real
@@ -253,7 +262,7 @@ async function draftTask(task, {
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
@@ -656,7 +665,7 @@ async function draftTask(task, {
           model: abModel,
         }));
       } else {
-        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
       }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -711,7 +720,7 @@ async function draftTask(task, {
         const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
         if (unverified) {
           const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
-          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
           if (!retryResult.degenerate) {
             task.implementResponse = retryResult.response;
           }
@@ -727,7 +736,7 @@ async function draftTask(task, {
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
     const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source }));
+    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }));
 
     if (critiqueResult.degenerate) {
       task.critiqueOutcome = 'critique-degenerate';
@@ -742,7 +751,7 @@ async function draftTask(task, {
       // reviewer might want to verify it really addressed those specific points.
       task.critiqueText = critiqueResult.response;
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
+      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (!reviseResult.degenerate) {
         task.implementResponse = reviseResult.response;
         task.revisionApplied = true;

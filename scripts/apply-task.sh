@@ -6,6 +6,14 @@
 # bookkeeping) and just does the mechanical "apply what's approved, once" pass. Run it
 # again (e.g. from the desktop shortcut) whenever you want to pick up newly-approved tasks.
 set -u
+
+# Same guard as orc-common.sh (see its own header) -- this script isn't one of the three
+# daemons that source it, but has the identical "node -e ... console.log(<number>)"
+# pattern feeding a bash numeric test, so it's just as exposed to an inherited
+# FORCE_COLOR breaking that test with stray ANSI codes.
+export NO_COLOR=1
+export FORCE_COLOR=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 

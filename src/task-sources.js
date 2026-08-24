@@ -1451,7 +1451,12 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // source's output as "JSON metadata, not code" -- low blast radius if the experiment
 // doesn't pan out (same reject-retry bounded budget every other source already has, not a
 // new risk this profile introduces).
-registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192 });
+// think: false -- qwen2.5:3b does not support Ollama's `think` parameter at all
+// (confirmed live 2026-08-24: every single brain_dump_sort draft call failed outright
+// with "Ollama HTTP 400: \"qwen2.5:3b\" does not support thinking" for as long as this
+// profile existed, since local-draft.js's own call sites unconditionally requested
+// think:true and had no way to know this profile's model couldn't honor it).
+registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local' });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
