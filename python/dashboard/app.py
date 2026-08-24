@@ -4659,7 +4659,7 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
         if not Path(launch_py).is_file():
             return {"started": False, "reason": f"{launch_py} missing; cannot start daemons on Linux without a working launch script."}
         subprocess.Popen(
-            ["bash", launch_py, "--no-browser"],
+            ["bash", launch_py],
             env=child_env,
             cwd=str(PACKAGE_ROOT),
             stdout=(LOG_DIR / 'launch-python.log').open('a'),

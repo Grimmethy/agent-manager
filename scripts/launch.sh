@@ -188,7 +188,18 @@ for i in $(seq 1 20); do
   sleep 0.5
 done
 
-if [[ "${1:-}" != "--no-browser" ]]; then
+# 2026-08-24 (Grimmethy: dashboard kept opening unexplained new Brave tabs) -- this used
+# to default to OPEN, suppressed only by an explicit --no-browser that only app.py's own
+# internal call site (the Start Pipeline button) ever passed. Traced live: Claude's
+# agentic adhoc drafts run the real Claude Code CLI with genuine Bash access against this
+# repo (see claude-client.js/adhoc-agentic-draft.js) -- a completely reasonable
+# verification step like `./scripts/launch.sh` to check the dashboard still starts after a
+# change inherited the old default and popped a real browser tab as a side effect, with no
+# human anywhere near a button. Flipped: silent by default, opening now requires an
+# explicit --open-browser opt-in that only a real top-level manual launch passes. This is
+# the safer failure mode for an unknown/future caller (agentic or otherwise) -- forgetting
+# the new flag means no browser tab, not a surprise one.
+if [[ "${1:-}" == "--open-browser" ]]; then
   xdg-open "$URL" >/dev/null 2>&1 &
 fi
 
