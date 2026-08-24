@@ -134,16 +134,24 @@ async function draftAdhocViaHarnessSearch(task, { ornithCall } = {}) {
 
   const responseText = (implResult.response || '').trim();
 
-  // Real matches were found, but the model itself confidently says nothing needs to
-  // change -- a legitimate, grounded no-changes-needed outcome (unlike the zero-hits case
-  // above, this one DID see real evidence and made a real judgment call on it), same
-  // shape adhoc-agentic-draft.js's own RESOLUTION: no-changes-needed already represents.
+  // 2026-08-24, Grimmethy: caught live via a real adhoc task ("show a count of
+  // observability/architecture tasks in the UI") that exhausted both automatic reject-
+  // retries on this exact path, twice, review correctly rejecting it both times for
+  // "does not specify any changes... contradicts the task's request" -- because this
+  // branch was stamping an empty response as a CONFIDENT, TERMINAL no-changes-needed
+  // verdict, directly contradicting what adhocHarnessSearchImplementPrompt's own text
+  // promises the model (prompts.js: "output the empty string... a deeper investigation
+  // pass will take over next" -- NOT "this ends here"). An empty response here means "I
+  // could not confidently ground a change from these hits," the exact same signal as the
+  // zero-hits case just above -- not a reasoned decision that nothing needs to change.
+  // adhoc-agentic-draft.js's real no-changes-needed mechanism (a full explained response
+  // plus an explicit `RESOLUTION: no-changes-needed` marker) is what a genuine, grounded
+  // "nothing to do here" verdict actually looks like in this codebase; a bare empty
+  // string was never that, and treating it as if it were skipped the Claude tier this
+  // exact case exists for, wasting the task's limited automatic-retry budget on a tier
+  // that had already told the model it wasn't confident enough to answer.
   if (isEffectivelyEmptyResponse(responseText)) {
-    task.adhocResolution = 'no-changes-needed';
-    task.rawDiff = '';
-    task.implementResponse = 'Harness-search tier: real matches were found and reviewed, but no code change was needed.';
-    task.draftModel = localDraftModelLabel();
-    return { applied: true, succeeded: true };
+    return { applied: false, succeeded: true, reason: 'implement pass found insufficient grounding to confidently draft a change (empty response, per its own prompt\'s contract)' };
   }
 
   // A "let me read/check/..." hedge (NON_IMPL_PATTERNS) means the model itself is
