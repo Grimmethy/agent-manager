@@ -230,7 +230,7 @@ test('parseBrainDumpSortResult parses a well-formed classification object', () =
   }));
   assert.deepEqual(result, {
     category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
-    belongsToProject: null, requiresResearch: false,
+    belongsToProject: null, requiresResearch: false, possibleDuplicateOf: null,
   });
 });
 
@@ -266,6 +266,19 @@ test('parseBrainDumpSortResult defaults tags/actionable/rationale when absent', 
   assert.deepEqual(result.tags, []);
   assert.equal(result.actionable, false);
   assert.equal(result.rationale, '');
+});
+
+// 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before filing")
+test('parseBrainDumpSortResult parses a possibleDuplicateOf value when present', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', possibleDuplicateOf: 'Add authentication to the Agent Manager dashboard',
+  }));
+  assert.equal(result.possibleDuplicateOf, 'Add authentication to the Agent Manager dashboard');
+});
+
+test('parseBrainDumpSortResult defaults possibleDuplicateOf to null when absent', () => {
+  const result = parseBrainDumpSortResult(JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' }));
+  assert.equal(result.possibleDuplicateOf, null);
 });
 
 test('parseBrainDumpSortResult returns null for unparseable JSON', () => {
@@ -529,6 +542,39 @@ test('applyBrainDumpSort injects prefetchedPaths and queues to adhoc/ on an unam
   assert.equal(written.needsClarification, undefined);
   assert.equal(result.queuedTaskId, adhocFiles[0].replace(/\.json$/, ''));
   assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false);
+});
+
+// 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before filing" --
+// this session found 3 separate near-duplicate tasks that each independently reached
+// drafting/review before anyone noticed, because nothing checked what was already
+// queued at filing time). A flagged possibleDuplicateOf overrides even a confident
+// anchor match -- routed to needs-clarification for a human via the same multiple-
+// choice/free-text picker "needs a human decision" adhoc tasks already use.
+test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the classifier flags a possible duplicate', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-dup-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    possibleDuplicateOf: 'Fix the budget guard rounding bug',
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')) && fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc')).length > 0, false, 'must not queue into adhoc/ when a duplicate is flagged');
+  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
+  assert.equal(heldFiles.length, 1);
+  const held = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
+  assert.equal(held.needsClarification.reason, 'design-decision');
+  assert.match(held.needsClarification.openQuestions, /Fix the budget guard rounding bug/);
+  // Even though the anchor match above was confident, prefetchedPaths still isn't
+  // silently discarded -- it stays on the record for if/when a human proceeds anyway.
+  assert.deepEqual(held.promptContext.prefetchedPaths, ['src/budget_guard.ts']);
 });
 
 // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific tasks
