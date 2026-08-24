@@ -97,7 +97,61 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
     // needed for a diff captured this way (not hand-written, so a header/body mismatch is
     // a capture-format quirk, not a sign of real corruption -- --numstat above already
     // proved the patch parses and lists real files before this point).
-    execFileSync('git', ['apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    try {
+      execFileSync('git', ['apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    } catch (plainApplyErr) {
+      // 2026-08-24 (pipeline hardening -- caught live: a real task's diff conflicted with
+      // an unrelated sibling task's own change that landed on the SAME file in between
+      // this draft's worktree being cut and apply actually running -- the classic
+      // "patch went stale because something else nearby changed" failure, not a
+      // malformed or genuinely wrong diff). Plain `git apply` only ever does literal
+      // context-line matching -- it has no way to tell "the code I'm editing is still
+      // there, just a few lines further down" from "this code is genuinely gone." A
+      // real three-way merge (using the base/ours/theirs blob content the diff's own
+      // `index` lines already point at -- this worktree shares the repo's object
+      // database, so those blobs are all reachable) resolves exactly this class of
+      // conflict automatically, the same way `git apply --3way`/`git am --3way` are
+      // git's own documented answer to "the plain apply failed, try harder before
+      // giving up." Only attempted as a fallback, never instead of the plain apply --
+      // a clean context-based apply is unambiguous and should always be preferred when
+      // it works.
+      try {
+        execFileSync('git', ['apply', '--3way', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      } catch (threeWayErr) {
+        // Unlike plain `git apply` (atomic -- either applies cleanly or leaves the
+        // working tree untouched), a FAILED `--3way` attempt still writes real
+        // <<<<<<< ours / ======= / >>>>>>> theirs conflict markers directly into the
+        // working tree file before returning failure -- confirmed live writing this
+        // fix's own test. Left alone, a genuine conflict (not just a stale-context
+        // shift) would leave corrupted source sitting in the repo under an "apply
+        // failed" report that reads as "nothing changed." Restore every file this
+        // patch touches to its real HEAD content before rethrowing, so a failed
+        // attempt -- 3-way or plain -- has the exact same "untouched" guarantee.
+        for (const file of files) {
+          try {
+            // `HEAD --` (not bare `--`, which means "from the index") -- confirmed live
+            // writing this fix: a failed --3way conflict leaves the INDEX itself marked
+            // unmerged (stage U), and plain `git checkout -- <file>` refuses to touch an
+            // unmerged path ("error: path is unmerged") entirely. Checking out an actual
+            // commit-ish resets both the index and working tree regardless of merge state.
+            execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+          } catch (restoreErr) {
+            // Fails for a file this patch CREATES (mode:"create" has no HEAD entry to
+            // restore from) -- the failed --3way attempt may have still written a stray
+            // file there. Best-effort remove it rather than leave a leftover conflict-
+            // marker file sitting in the repo untracked; per-file (not a blanket git
+            // clean) so an unrelated pre-existing untracked file elsewhere is never
+            // touched.
+            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (_) { /* nothing to remove, or already gone -- fine either way */ }
+          }
+        }
+        // Surface the PLAIN apply's error (what a human/redraft decision should
+        // actually see), not the 3-way attempt's, since 3-way's own failure mode
+        // ("Failed to merge in the changes") is less informative about the real
+        // underlying conflict than the plain apply's own message.
+        throw plainApplyErr;
+      }
+    }
 
     return { files };
   } catch (e) {
