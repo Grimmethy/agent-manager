@@ -49,6 +49,18 @@
 // so collapsing changes nothing about what they see.
 const COLLAPSIBLE_REPEAT_STAGES = new Set(['exhausted']);
 
+// Stages that commit the task's own record into its repo (task-repo-sync.js, 2026-08-24,
+// Grimmethy: "start saving the tasks directly to repo... so collaborators can access not
+// only future work but the history as well"). Hooked centrally HERE rather than at every
+// individual call site (local-draft.js/review-task.js each reach 'blocked' from several
+// different branches) since every one of them already funnels through this one shared
+// function -- one hook covers all of them, present and future, instead of scattering sync
+// calls across the whole call graph. 'done' is deliberately NOT here: apply-task.js's own
+// commit already exists for that transition, and task-repo-sync.js's commit:false mode
+// folds the task record into THAT same commit (true piggyback) rather than creating a
+// second, redundant one -- see apply-task.js's own call site.
+const REPO_SYNC_STAGES = new Set(['blocked', 'needs-clarification']);
+
 function appendHistoryEvent(task, stage, detail) {
   const nowIso = new Date().toISOString();
   task.history = Array.isArray(task.history) ? task.history : [];
@@ -59,13 +71,34 @@ function appendHistoryEvent(task, stage, detail) {
     last.at = nowIso;
     last.count = (last.count || 1) + 1;
     if (detail !== undefined && detail !== null && detail !== '') last.detail = String(detail);
+    syncTaskRecordToRepo(task, stage);
     return last;
   }
 
   const entry = { stage, at: nowIso };
   if (detail !== undefined && detail !== null && detail !== '') entry.detail = String(detail);
   task.history.push(entry);
+  syncTaskRecordToRepo(task, stage);
   return entry;
+}
+
+// Fails open unconditionally -- a network blip on the commit/push must never block real
+// pipeline work, same "a capability check failing here must never block real work"
+// convention this codebase already applies everywhere else. task.generatedForRepoRoot is
+// stamped on every task at creation time (task-sources.js's writeTask()); a task with no
+// such field (an older record predating this, or a test fixture) just skips silently.
+function syncTaskRecordToRepo(task, stage) {
+  if (!REPO_SYNC_STAGES.has(stage)) return;
+  if (!task.generatedForRepoRoot) return;
+  try {
+    // Required lazily, not at module top-level -- task-repo-sync.js's own git-runner.js
+    // dependency chain is heavier than task-history.js needs for every other stage this
+    // module is called with, and this path only actually runs for the two stages above.
+    const { syncTaskToRepo } = require('./task-repo-sync.js');
+    syncTaskToRepo(task, { repoRoot: task.generatedForRepoRoot });
+  } catch (e) {
+    console.error(`[task-history] syncTaskToRepo failed for ${task.id}: ${e.message}`);
+  }
 }
 
 module.exports = { appendHistoryEvent, COLLAPSIBLE_REPEAT_STAGES };

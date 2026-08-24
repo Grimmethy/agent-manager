@@ -531,6 +531,48 @@ test('applyBrainDumpSort injects prefetchedPaths and queues to adhoc/ on an unam
   assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false);
 });
 
+// 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific tasks
+// go into that repo instead of the second brain") -- a matched project must skip Second
+// Brain entirely now, not write a cross-reference line there in addition to queuing the
+// real task.
+test('applyBrainDumpSort writes NOTHING to secondBrainDir when a project matches -- the task record itself is the audit trail now', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+
+  const secondBrainDir = path.join(dir, 'sb');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(fs.existsSync(secondBrainDir), false, 'secondBrainDir must never even be created -- nothing was written there');
+  assert.equal(result.queuedProject, label);
+  const adhocFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', adhocFiles[0]), 'utf8'));
+  assert.equal(written.generatedForRepoRoot, repoRoot, 'stamped so this task\'s later blocked/needs-clarification transitions know which repo to sync into');
+});
+
+test('applyBrainDumpSort still writes to secondBrainDir for a plain note with no matched project -- unmatched path is unchanged', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
+  const secondBrainDir = path.join(dir, 'sb');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Just a journal note' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Just a journal note' } };
+  const implementResponse = JSON.stringify({
+    category: 'journal', secondBrainPath: 'journal/personal-reflections.md', actionable: false, belongsToProject: null,
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(fs.existsSync(result.file), true);
+  assert.match(fs.readFileSync(result.file, 'utf8'), /Just a journal note/);
+});
+
 test('applyBrainDumpSort routes to queue/needs-clarification/ (not adhoc/) when no anchor keyword matches', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
   const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);

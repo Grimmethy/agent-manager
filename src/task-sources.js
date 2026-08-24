@@ -19,6 +19,7 @@ const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
+const { syncTaskToRepo } = require('./task-repo-sync.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -2007,6 +2008,17 @@ function writeTask(task) {
   };
   appendHistoryEvent(record, 'created', task.source);
   fs.writeFileSync(file, JSON.stringify(record, null, 2));
+  // 2026-08-24 (task-repo-sync.js, Grimmethy: "start saving the tasks directly to repo...
+  // so collaborators can access not only future work but the history as well") -- best-
+  // effort, fails open: a network blip on the commit/push must never block real task
+  // generation, the same "a capability check failing here must never block real work"
+  // convention this codebase already applies everywhere else (gpu-guard.js, reasoning-
+  // TierFor()'s own getConfig() try/catch, etc.).
+  try {
+    syncTaskToRepo(record, { repoRoot });
+  } catch (e) {
+    console.error(`[task-sources] syncTaskToRepo failed for ${record.id}: ${e.message}`);
+  }
   return file;
 }
 

@@ -21,6 +21,7 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { resolveAnchors } = require('./path-prefetch.js');
 const { resolveGraphPath } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const { syncTaskToRepo } = require('./task-repo-sync.js');
 
 function applySecondBrainNote({ implementResponse, notePath, secondBrainDir }) {
   const resolvedPath = path.isAbsolute(notePath) ? notePath : path.join(secondBrainDir, notePath);
@@ -631,35 +632,39 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
       });
       let adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
-      let heldReason = null;
       if (anchorResult.status === 'matched') {
         adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
       } else if (anchorResult.status === 'no-match') {
         adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-        heldReason = 'no-match';
         adhocTask.needsClarification = { reason: 'no-match' };
       } else if (anchorResult.status === 'ambiguous') {
         adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-        heldReason = 'ambiguous';
         adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
         if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
       }
       // 'greenfield': adhocTask left exactly as constructed above, queues normally with
       // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
 
+      // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific
+      // tasks go into that repo instead of the second brain") -- stamped here (not just
+      // relying on task-sources.js's writeTask(), which this apply-step write bypasses
+      // entirely) so this task's OWN later 'blocked'/'needs-clarification' transitions --
+      // handled by matchedProject's own separate daemon process -- know which repo to
+      // sync into (task-history.js's appendHistoryEvent hook reads this exact field).
+      adhocTask.generatedForRepoRoot = matchedProject.repoRoot;
+
       fs.mkdirSync(adhocDir, { recursive: true });
       writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
 
-      // Cross-reference note -- an audit trail, not the record of truth (brain-dump.json's
-      // queuedTaskId/queuedAt is that): confirms this entry was routed as real work, not
-      // silently dropped, findable the same way every other filed note is.
-      const fullPath = path.join(secondBrainDir, result.secondBrainPath);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      const stamp = new Date().toISOString().slice(0, 10);
-      const line = heldReason
-        ? `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}**, held for clarification (${heldReason}) before it can be drafted -- ${rawText}\n`
-        : `\n- **${stamp}** Queued as adhoc task \`${queuedId}\` in **${matchedProject.label}** -- ${rawText}\n`;
-      appendMarkdownLineAtomic(fullPath, line);
+      // Commits the task's own record directly into the matched project's repo instead of
+      // the old Second-Brain cross-reference line -- "repo specific tasks go into that
+      // repo instead of the second brain," not a duplicate of both. Best-effort, fails
+      // open: a sync failure must never block the entry from being marked actioned below.
+      try {
+        syncTaskToRepo(adhocTask, { repoRoot: matchedProject.repoRoot });
+      } catch (e) {
+        console.error(`[apply-group-a] syncTaskToRepo failed for ${queuedId}: ${e.message}`);
+      }
 
       entry.status = 'actioned';
       entry.queuedTaskId = queuedId;
@@ -667,7 +672,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
       writeJsonAtomicSync(brainDumpPath, data);
 
-      return { file: fullPath, category: result.category, queuedTaskId: queuedId, queuedProject: matchedProject.label };
+      return { file: path.join(adhocDir, `${queuedId}.json`), category: result.category, queuedTaskId: queuedId, queuedProject: matchedProject.label };
     }
     // Falls through to the plain-note path below if the matched project has no 'adhoc'
     // domain registered -- same non-fatal-skip convention as everything else here, rather
