@@ -84,6 +84,27 @@ try {
     db.exec(`ALTER TABLE model_calls ADD COLUMN hypothetical_cost_usd REAL`)
   }
 
+  // hostname/platform/gpu_name (2026-08-24, Grimmethy: "We need to start acquiring more
+  // models within the system and A/B testing them against certain jobs... Logs should
+  // include what hardware/software was used for each test") -- the A/B mechanism
+  // (ab-model-select.js, ORNITH_AB_MODELS) and outcome/latency tracking already existed;
+  // this was the one real gap -- a call's row said WHICH model ran but nothing about WHERE
+  // (which physical box/GPU) or on what OS, both of which matter for comparing candidates
+  // fairly across a mixed-hardware fleet. Same ALTER-guarded-by-pragma migration shape as
+  // cost_usd/instance_id/hypothetical_cost_usd above.
+  const hasHostnameColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'hostname'`).get().c > 0
+  if (!hasHostnameColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN hostname TEXT`)
+  }
+  const hasPlatformColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'platform'`).get().c > 0
+  if (!hasPlatformColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN platform TEXT`)
+  }
+  const hasGpuNameColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'gpu_name'`).get().c > 0
+  if (!hasGpuNameColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN gpu_name TEXT`)
+  }
+
   const [event, payloadPath] = process.argv.slice(2)
   if (!event || (event !== 'cost-summary' && !payloadPath)) {
     console.error('Usage: node model-stats-db.js <record-call|record-outcome> <payloadPath>')
@@ -153,10 +174,12 @@ try {
     db.prepare(`
       INSERT INTO model_calls (
         call_id, task_id, stage, model, candidates, started_at, latency_ms,
-        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id, hypothetical_cost_usd
+        eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id, hypothetical_cost_usd,
+        hostname, platform, gpu_name
       ) VALUES (
         @callId, @taskId, @stage, @model, @candidates, @startedAt, @latencyMs,
-        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId, @hypotheticalCostUsd
+        @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId, @hypotheticalCostUsd,
+        @hostname, @platform, @gpuName
       )
     `).run({
       callId: payload.callId,
@@ -175,6 +198,9 @@ try {
       costUsd: payload.costUsd != null ? payload.costUsd : null,
       instanceId: payload.instanceId != null ? payload.instanceId : null,
       hypotheticalCostUsd: payload.hypotheticalCostUsd != null ? payload.hypotheticalCostUsd : null,
+      hostname: payload.hostname != null ? payload.hostname : null,
+      platform: payload.platform != null ? payload.platform : null,
+      gpuName: payload.gpuName != null ? payload.gpuName : null,
     })
   } else if (event === 'record-outcome') {
     if (!payload.callId) {
