@@ -199,7 +199,43 @@ process_drafting_file() {
         console.log(o.draftFailureCount);
       } catch (e) { console.log(1); }
     ' "$wpath")"
-    if [[ "${failure_count:-1}" -ge "${DRAFT_FAILURE_RETRY_LIMIT:-5}" ]]; then
+
+    # 2026-08-24, Grimmethy: "We should ask this baseline set of questions every time one
+    # of these fails instead of waiting for it to be blocked 5 times" -- caught live twice
+    # this session (done-archive, self-assessed-decomposition): a task that already
+    # exhausted adhoc-agentic-draft.js's OWN internal turn-budget retry (1.5x budget, once,
+    # inside a single draftAdhocImplement() call -- see that file's own comment) produces a
+    # blockedReason containing the literal, deterministic string "ran out of turns twice in
+    # a row." Nothing about the task changes between outer attempts, so grinding through
+    # DRAFT_FAILURE_RETRY_LIMIT (default 5) identical replays before giving up burns real
+    # turns/spend 4 times over for zero new information -- this checks EVERY attempt (not
+    # gated behind the failure-count threshold below) and short-circuits straight to
+    # blocked/ on the FIRST one, distinctly labeled so it reads instantly as "structurally
+    # oversized" rather than an ordinary or infra-shaped block. Every OTHER failure shape
+    # (infra, generic, unknown) is untouched -- falls through to the existing unchanged
+    # failure_count>=limit logic below exactly as before.
+    turn_exhaustion_action="$(node -e '
+      const fs = require("fs");
+      const p = process.argv[1];
+      const draftResult = process.argv[2];
+      const TURN_EXHAUSTION_TWICE_PATTERN = /ran out of turns twice in a row/i;
+      if (!TURN_EXHAUSTION_TWICE_PATTERN.test(draftResult || "")) { console.log("no"); process.exit(0); }
+      let o;
+      try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("no"); process.exit(0); }
+      const reason = `STRUCTURALLY OVERSIZED: draft call ran out of turns twice in a row on the very first attempt (adhoc-agentic-draft.js already retried once internally at 1.5x budget) -- a bigger budget alone will not fix this, so blocking immediately instead of grinding through ${process.env.DRAFT_FAILURE_RETRY_LIMIT || 5} identical outer retries for no new information (most recent: ${draftResult})`;
+      o.blockedStage = "draft";
+      o.blockedReason = reason;
+      o.history = o.history || [];
+      o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
+      fs.writeFileSync(p, JSON.stringify(o, null, 2));
+      console.log("block");
+    ' "$wpath" "$draft_result")"
+
+    if [[ "$turn_exhaustion_action" == "block" ]]; then
+      mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
+      printf '[worker-%s] %s looks structurally oversized (ran out of turns twice on attempt 1) -- blocked immediately instead of retrying %s more times\n' "$INSTANCE_ID" "$task_id" "$(( ${DRAFT_FAILURE_RETRY_LIMIT:-5} - 1 ))" >&2
+    elif [[ "${failure_count:-1}" -ge "${DRAFT_FAILURE_RETRY_LIMIT:-5}" ]]; then
       # 2026-08-23, Grimmethy: "draft call failed 5 times in a row... giving up rather
       # than retrying every tick forever and starving this lane" -- caught live via a
       # staleness_audit attempt on an adhoc-domain candidate that hit exactly this path,
