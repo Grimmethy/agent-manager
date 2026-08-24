@@ -138,6 +138,14 @@ function decodeGroupBContent(implementResponse) {
 function buildVerdictPrompt(task, factCheck, groundingText) {
   const lines = [];
   lines.push('You are a review gate in an unattended pipeline. You are producing a VERDICT ONLY -- you have no ability to run commands, write files, or touch git. Do not attempt to.');
+  // 2026-08-24 (Grimmethy, caught live): a real, well-sourced research draft citing
+  // June/August 2026 press coverage got rejected as fabricated -- the reviewer's own
+  // blockedReason literally said "given the current real-world date context (2024/2025)",
+  // i.e. it had no actual anchor for "today" and fell back to an assumed date nowhere
+  // near this pipeline's real clock. This prompt never stated the real date anywhere
+  // before now. Stated once, unconditionally -- affects date-sensitive judgment for any
+  // source, not just research (a code claim citing "as of today" could hit the same trap).
+  lines.push(`The real current date is ${new Date().toISOString().slice(0, 10)}. Do not assume any earlier date is "now," and do not reject a cited source, URL, or claimed date merely for being after some earlier date you might otherwise assume is current -- judge recency/plausibility against the real date above, not your own training-data intuition of "the present."`);
   lines.push('The drafting model produced the plan and implementation below and cannot verify its own claims -- treat every concrete claim as UNVERIFIED.');
   lines.push('');
   lines.push(`TASK: ${task.title} (domain=${task.domain}, source=${task.source})`);

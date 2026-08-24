@@ -59,6 +59,17 @@ function baseTask(overrides = {}) {
   };
 }
 
+// 2026-08-24 (Grimmethy, caught live): a real, well-sourced research draft citing real
+// June/August 2026 press coverage got rejected -- the reviewer's own blockedReason said
+// "given the current real-world date context (2024/2025)", i.e. it had no real anchor for
+// "today" at all. Fixed by stating the actual date unconditionally.
+test('buildVerdictPrompt states the real current date so recency judgments have a real anchor', () => {
+  const prompt = buildVerdictPrompt(baseTask(), { flags: [] }, '');
+  const today = new Date().toISOString().slice(0, 10);
+  assert.match(prompt, new RegExp(`real current date is ${today}`));
+  assert.match(prompt, /do not reject a cited source, URL, or claimed date merely for being after some earlier date/);
+});
+
 test('buildVerdictPrompt gives brain_dump_sort its own carve-out, not the generic code-review framing', () => {
   const prompt = buildVerdictPrompt(baseTask(), { flags: [] }, '');
   assert.match(prompt, /CLASSIFICATION task, not a code-change task/);

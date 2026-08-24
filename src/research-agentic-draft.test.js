@@ -8,7 +8,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { draftResearchImplement } = require('./research-agentic-draft.js');
+const { draftResearchImplement, extractGithubRepoUrl } = require('./research-agentic-draft.js');
 
 function fakeRecordModelCall() {
   return 'fake-call-id';
@@ -95,4 +95,68 @@ test('draftResearchImplement passes WebSearch/WebFetch tool access to the underl
   await draftResearchImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall });
 
   assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
+});
+
+// extractGithubRepoUrl (2026-08-24, Grimmethy: root cause fix for 12 combined failed
+// attempts across two "investigate this GitHub repo" tasks -- WebSearch/WebFetch alone
+// can never reliably read an arbitrary repo's real source files).
+test('extractGithubRepoUrl finds a real github.com repo URL in free text', () => {
+  const text = 'Github repo investigation: https://github.com/usestrix/strix Penetration testing for your app.';
+  assert.equal(extractGithubRepoUrl(text), 'https://github.com/usestrix/strix');
+});
+
+test('extractGithubRepoUrl strips a trailing .git suffix', () => {
+  assert.equal(extractGithubRepoUrl('see https://github.com/foo/bar.git for details'), 'https://github.com/foo/bar');
+});
+
+test('extractGithubRepoUrl returns null when there is no github.com URL', () => {
+  assert.equal(extractGithubRepoUrl('Research project. World Monitor. It should be a github repo.'), null);
+});
+
+test('draftResearchImplement grants Read/Grep/Glob and sets cwd when a repo clone succeeds', async () => {
+  const task = { id: 'test-7', title: 'x', promptContext: { rawText: 'investigate https://github.com/foo/bar' } };
+  let capturedOpts = null;
+  let capturedPrompt = null;
+
+  const claudeCall = async (opts) => {
+    capturedOpts = opts;
+    capturedPrompt = opts.prompt;
+    return { response: 'x\n\nRESEARCH: completed', degenerate: null };
+  };
+  const cloneRepo = (url, taskId) => {
+    assert.equal(url, 'https://github.com/foo/bar');
+    assert.equal(taskId, 'test-7');
+    return '/tmp/fake-clone-dir';
+  };
+
+  await draftResearchImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, cloneRepo });
+
+  assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch,Read,Grep,Glob');
+  assert.equal(capturedOpts.cwd, '/tmp/fake-clone-dir');
+  assert.match(capturedPrompt, /cloned for real, read-only/);
+  assert.match(capturedPrompt, /\/tmp\/fake-clone-dir/);
+});
+
+test('draftResearchImplement falls back to web-only tools when no repo URL is present', async () => {
+  const task = { id: 'test-8', title: 'x', promptContext: { rawText: 'no repo here' } };
+  let cloneCalled = false;
+  const cloneRepo = () => { cloneCalled = true; return '/tmp/should-not-be-used'; };
+  const claudeCall = async (opts) => ({ response: 'x\n\nRESEARCH: completed', degenerate: null, _opts: opts });
+
+  const result = await draftResearchImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, cloneRepo });
+
+  assert.equal(cloneCalled, false, 'must never attempt a clone when the task text has no github.com URL');
+  assert.equal(result.succeeded, true);
+});
+
+test('draftResearchImplement falls back to web-only tools when the clone fails (returns null)', async () => {
+  const task = { id: 'test-9', title: 'x', promptContext: { rawText: 'investigate https://github.com/foo/bar' } };
+  let capturedOpts = null;
+  const cloneRepo = () => null; // simulates a failed clone (private repo, network error, etc.)
+  const claudeCall = async (opts) => { capturedOpts = opts; return { response: 'x\n\nRESEARCH: completed', degenerate: null }; };
+
+  await draftResearchImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, cloneRepo });
+
+  assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
+  assert.equal(capturedOpts.cwd, undefined);
 });
