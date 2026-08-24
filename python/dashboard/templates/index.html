@@ -534,10 +534,10 @@ async function toggleWorkerExpand(instanceId) {
 }
 
 function renderRecentTasksList(tasks) {
-  if (!tasks.length) return '<div class="meta">No completed tasks recorded for this worker yet.</div>';
+  if (!tasks.length) return '<div class="meta">No tasks recorded for this instance yet.</div>';
   return `<ul class="recent-tasks-list">${tasks.map(t => `
     <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtml(t.taskId)}</a>
-      <span class="meta">${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
+      <span class="meta">${t.outcome ? `<strong style="color:var(${t.outcome === 'approved' ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('')}</ul>`;
 }
 
@@ -608,7 +608,7 @@ async function renderWorkers() {
       </div>
       ${expandedWorkerId === inst.instanceId ? `
       <div class="worker-recent-tasks">
-        <div class="meta" style="margin-top:8px; font-weight:600">Last 10 completed tasks</div>
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Last 10 completed tasks'}</div>
         ${recentTasks ? renderRecentTasksList(recentTasks.tasks || []) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
