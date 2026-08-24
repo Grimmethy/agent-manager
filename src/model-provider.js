@@ -20,6 +20,7 @@ const local = require('./local-client.js');
 const claude = require('./claude-client.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { getConfig } = require('./config.js');
+const { getModelProfile } = require('./model-profile-registry.js');
 
 const CLAUDE_SOURCES = new Set(
   (process.env.AGENT_MANAGER_CLAUDE_SOURCES || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -87,8 +88,31 @@ function forcedProvider() {
   return null;
 }
 
+// 2026-08-24 (model-profile-registry.js): resolves the task's registered source's own
+// `modelProfile` flag (same convention emptyApproval/advisoryProse/candidateFulfillment
+// already use -- an arbitrary property on the registerTaskSource() config, no schema
+// enforced there) to a real profile, or null if none is declared. Checked AFTER
+// forcedProvider() -- a human's dashboard/env override always wins outright, same
+// precedence AGENT_MANAGER_FORCE_PROVIDER already had over reasoningTierFor() -- so a
+// profile only ever applies when nothing more specific overrides it. Returns null (not a
+// throw) for an unknown profile name, same fail-open convention getRegisteredSource()
+// itself uses for an unregistered source: a typo'd profile name falls back to today's
+// tier-based default instead of crashing task generation.
+function resolveModelProfile(sourceOrTask) {
+  if (forcedProvider()) return null;
+  const t = normalizeTask(sourceOrTask);
+  const entry = getRegisteredSource(resolveSourceName(t));
+  const profileName = entry && entry.modelProfile;
+  if (!profileName) return null;
+  return getModelProfile(profileName) || null;
+}
+
 function providerFor(sourceOrTask) {
-  return forcedProvider() || (reasoningTierFor(sourceOrTask) === 'high' ? claude : local);
+  const forced = forcedProvider();
+  if (forced) return forced;
+  const profile = resolveModelProfile(sourceOrTask);
+  if (profile) return profile.backend === 'claude' ? claude : local;
+  return reasoningTierFor(sourceOrTask) === 'high' ? claude : local;
 }
 
 // Display/stats label for whichever backend providerFor(source) actually picked --
@@ -105,8 +129,14 @@ function labelFor(sourceOrTask) {
   const forced = process.env.AGENT_MANAGER_FORCE_PROVIDER;
   if (forced === 'local') return process.env.LOCAL_MODEL;
   if (forced === 'claude') return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
+  const profile = resolveModelProfile(sourceOrTask);
+  if (profile) {
+    return profile.backend === 'claude'
+      ? `claude:${profile.model || process.env.CLAUDE_MODEL || 'sonnet'}`
+      : (profile.model || process.env.LOCAL_MODEL);
+  }
   if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.LOCAL_MODEL;
   return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 }
 
-module.exports = { providerFor, labelFor, reasoningTierFor };
+module.exports = { providerFor, labelFor, reasoningTierFor, resolveModelProfile };

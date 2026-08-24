@@ -235,6 +235,59 @@ test('majorityVote() stops calling once 2 of 3 votes already agree -- the 3rd ca
   );
 });
 
+// Regression, 2026-08-24: model/numCtx/numPredict were silently dropped by majorityVote()
+// -- a model-profile-registry.js profile naming a specific model/context/output-length had
+// no way to actually reach a vote, since majorityVote is the only caller of call() review
+// uses. Proves the override actually reaches the real HTTP request body, not just that the
+// param is accepted without erroring.
+test('majorityVote() forwards model/numCtx/numPredict overrides into the real request body', async () => {
+  let capturedBody = null;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        capturedBody = JSON.parse(raw);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('APPROVE'));
+      });
+    },
+    async (base) => {
+      const { majorityVote } = freshLocalClient(base);
+      const classify = (text) => (text.includes('APPROVE') ? 'approve' : null);
+      await majorityVote({
+        prompt: 'x', classify, n: 3, minAgreeing: 2,
+        model: 'qwen2.5:3b', numCtx: 8192, numPredict: 400,
+      });
+      assert.equal(capturedBody.model, 'qwen2.5:3b', 'must override the module-level LOCAL_MODEL default');
+      assert.equal(capturedBody.options.num_ctx, 8192, 'must override PINNED_NUM_CTX');
+      assert.equal(capturedBody.options.num_predict, 400);
+    }
+  );
+});
+
+test('majorityVote() falls back to the module default model when no override is given', async () => {
+  let capturedBody = null;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        capturedBody = JSON.parse(raw);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('APPROVE'));
+      });
+    },
+    async (base) => {
+      const { majorityVote } = freshLocalClient(base);
+      const classify = (text) => (text.includes('APPROVE') ? 'approve' : null);
+      await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 }); // no model/numCtx/numPredict passed
+      assert.equal(capturedBody.model, 'test-model', 'must fall back to LOCAL_MODEL when no profile override is given');
+      assert.equal(capturedBody.options.num_ctx, 16384, 'must fall back to PINNED_NUM_CTX when no profile override is given');
+    }
+  );
+});
+
 test('majorityVote() does NOT early-exit when only 1 vote has landed so far', async () => {
   let requestCount = 0;
   await withServer(

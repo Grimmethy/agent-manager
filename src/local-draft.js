@@ -41,7 +41,7 @@ const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { providerFor, labelFor } = require('./model-provider.js');
+const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
@@ -136,7 +136,22 @@ async function draftTask(task, {
   // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
   // production code leaves (local-draft.js's own main() calls draftTask(task) with no
   // second argument at all).
-  const resolvedOrnithCall = ornithCall || providerFor(task).call;
+  // 2026-08-24 (model-profile-registry.js): when the task's own source declares a
+  // modelProfile, its model/numCtx/numPredict become defaults for every real call below --
+  // spread BEFORE each call site's own opts so a pass's own tuned numPredict (plan=1400,
+  // critique=900, ...) still wins over the profile's generic default, while model/numCtx
+  // (never set by any call site's own opts today) reliably take effect. Skipped entirely
+  // for an injected ornithCall (test/caller override) -- that already wins outright, same
+  // as it always has; wrapping it here would silently change what a test believes it's
+  // calling.
+  const modelProfile = resolveModelProfile(task);
+  const profileOverrides = modelProfile
+    ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
+    : null;
+  const baseOrnithCall = ornithCall || providerFor(task).call;
+  const resolvedOrnithCall = profileOverrides && !ornithCall
+    ? (opts) => baseOrnithCall({ ...profileOverrides, ...opts })
+    : baseOrnithCall;
 
   // Real plan/implement lock split (2026-08-22, Grimmethy: "build it now" -- see
   // single-flight-lock.js's own header for the full incident this fixes). Every real
