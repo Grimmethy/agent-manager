@@ -196,7 +196,29 @@ should_yield_for_model_swap() {
 SINGLE_FLIGHT_LOCK_FD=200
 
 acquire_single_flight_lock() {
+  # 2026-08-24 (Grimmethy: "move the user interaction to the highest priority possible...
+  # no matter what other tasks may be in queue, if a user interaction shows up, it's
+  # next"): caught live -- a Discuss session waiting on this exact lock lost race after
+  # race against worker-1 continuously reclaiming it for its next queued task, and sat
+  # for minutes before failing. A held flock genuinely can't be interrupted mid-call (and
+  # shouldn't be -- killing a half-finished generation wastes real work), so this can't
+  # give Discuss the CURRENT call; what it CAN do is stop this lane from immediately
+  # racing to reclaim the lock for its NEXT task the instant the current holder releases.
+  # .discuss-waiting/ (Python's single_flight_lock.py drops a per-waiter marker file in
+  # here before blocking on its own flock, removes it the moment it actually acquires) is
+  # a plain advisory directory, not itself a lock -- a worker/reviewer that sees it
+  # non-empty just backs off a few seconds before attempting its own acquire, real
+  # headroom for Discuss's already-parked blocking flock() call to win the wakeup race
+  # once the current holder lets go. A directory of per-waiter files, not one shared
+  # flag, so a second concurrent Discuss session's priority isn't silently cleared the
+  # instant the first one gets the lock.
   local lockfile="${INSTANCES_DIR}/.pipeline-single-flight.lock"
+  local priority_dir="${INSTANCES_DIR}/.discuss-waiting"
+  local waited=0
+  while [[ -n "$(ls -A "$priority_dir" 2>/dev/null)" && "$waited" -lt "${DISCUSS_PRIORITY_MAX_WAIT_SEC:-8}" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   eval "exec ${SINGLE_FLIGHT_LOCK_FD}>\"\$lockfile\""
   flock "$SINGLE_FLIGHT_LOCK_FD"   # blocking, exclusive -- waits for the current holder; no -n, no race window.
 }
