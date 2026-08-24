@@ -156,6 +156,18 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('--- IMPLEMENT draft ---');
   lines.push(task.implementResponse);
   lines.push('');
+  // 2026-08-24 (pipeline hardening): only reaches here when critiqueOutcome ===
+  // 'issues-flagged' AND revisionApplied is true -- the unaddressed-critique case
+  // (revision failed/never happened) is a deterministic reject BEFORE this prompt is
+  // ever built, see reviewTask()'s own gate. This is the "revision was attempted, but
+  // did it actually work" case -- reusing the SAME review call to check, rather than a
+  // separate cross-check call, since this prompt already reviews the draft in full.
+  if (task.critiqueOutcome === 'issues-flagged' && task.revisionApplied && task.critiqueText) {
+    lines.push('--- This draft was revised in response to an earlier critique pass ---');
+    lines.push(`Before producing the draft above, an independent critique call flagged real problems, and a revision was attempted. The draft above is the REVISED version. Verify the issues below were actually addressed -- if the draft above still has any of these same problems, reject it; do not assume a revision attempt means the issues are fixed.`);
+    lines.push(task.critiqueText.length > 4000 ? `${task.critiqueText.slice(0, 4000)}\n...[truncated]` : task.critiqueText);
+    lines.push('');
+  }
   lines.push('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
   lines.push(JSON.stringify(factCheck));
   lines.push('');
@@ -333,6 +345,26 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined);
   const factCheckVerdict = factCheck.flags && factCheck.flags.length > 0 ? 'flagged' : 'pass';
 
+  // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
+  // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
+  // across this project's Linux port): fact-checker.js's own comments call ungrounded-url
+  // and ungrounded-field "almost never a false positive" -- checkGroundedValues() only
+  // ever flags a value when there IS real grounding source text to compare against and
+  // the value appears NOWHERE in it, placeholders already exempted. That precision was
+  // being wasted as advisory context a review vote could (and did) simply ignore, the
+  // same "known-bad signal, only advisory" shape every OTHER deterministic gate in this
+  // function already treats as disqualifying. Hard-blocks before spending a review call,
+  // same as the empty-response/non-implementation/fixed-literals gates below.
+  const highPrecisionFlags = (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
+  if (highPrecisionFlags.length > 0) {
+    const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
+    const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
+    task.reviewProvider = 'deterministic-ungrounded-value';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   const trimmedImplResponse = (task.implementResponse || '').trim();
   const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
 
@@ -381,6 +413,24 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       appendHistoryEvent(task, 'blocked', reason);
       return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
     }
+  }
+
+  // 2026-08-24 (pipeline hardening -- same resurrected gap as the ungrounded-value block
+  // above, closed once already on 2026-08-12 for review-runner.ps1, never carried
+  // forward across this project's Linux port): local-draft.js's own critique+revision
+  // pass had already found real issues in this exact draft (task.critiqueOutcome ===
+  // 'issues-flagged'), but review-task.js never once read that field -- a draft its own
+  // critique had flagged as broken could still win a clean vote, because the review pass
+  // simply never knew the critique ran at all. task.revisionApplied is only ever false
+  // here when local-draft.js's own follow-up revision call came back degenerate (see its
+  // own comment) -- meaning the ORIGINAL, critique-flagged draft is what's about to reach
+  // review, with a known, real, already-identified problem review has no visibility into.
+  if (task.critiqueOutcome === 'issues-flagged' && !task.revisionApplied) {
+    const reason = `Deterministic gate: this draft's own critique pass flagged real issues, and the follow-up revision attempt failed (degenerate) or was never applied -- the draft reaching review is the SAME one the critique already found problems with. No local-model review call spent voting on a draft already known to have unaddressed issues.${task.critiqueText ? ` Critique: ${task.critiqueText.slice(0, 500)}` : ''}`;
+    task.reviewProvider = 'deterministic-unaddressed-critique';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
   await waitForLocalAvailability(instancesDir);

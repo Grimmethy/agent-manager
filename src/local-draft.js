@@ -735,6 +735,12 @@ async function draftTask(task, {
       task.critiqueOutcome = 'no-issues';
     } else {
       task.critiqueOutcome = 'issues-flagged';
+      // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
+      // function -- the actual critique text was discarded the moment the revision call
+      // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
+      // what the critique actually found, even when a revision WAS applied and the
+      // reviewer might want to verify it really addressed those specific points.
+      task.critiqueText = critiqueResult.response;
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
       const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (!reviseResult.degenerate) {
