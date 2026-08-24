@@ -194,12 +194,28 @@ function findFilesTouchedSince(repoRoot, task) {
 // any caller that doesn't have/want real git access), the possibly-resolved check is
 // skipped entirely -- this file stays fully testable with zero git dependency unless a
 // caller actually asks for it.
+// Sources that produce a REPORT about another task rather than a standalone code claim
+// -- 2026-08-24, Grimmethy: "Why is worker-1 doing drafting tasks when there are tasks in
+// pending?" led to finding a real staleness_audit task auditing ANOTHER staleness_audit
+// task live in drafting/. Mechanism: a staleness_audit task's own evidenceText
+// necessarily quotes real repo file paths (describing the ORIGINAL flagged task it's
+// about), so findFilesTouchedSince's git-log check false-positives on those quoted
+// paths, flagging the audit itself as 'possibly-resolved' -- but "is this report still
+// relevant" is a meaningless question for a source whose entire output IS a verdict
+// about a DIFFERENT task, not a code claim later commits could resolve (unlike
+// observability_review/performance_review, whose findings genuinely can become moot --
+// see staleness-fastpath.js's own deterministic recheck for exactly that case). Excluded
+// entirely from candidacy rather than merely handled, since there is no real question
+// here to answer, deterministically or otherwise.
+const SELF_AUDIT_SOURCES = new Set(['staleness_audit', 'pipeline_self_audit']);
+
 function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot } = {}) {
   const threshold = stalenessThresholdMs();
   const cooldown = cooldownMs();
   const candidates = [];
   for (const task of tasks) {
     if (!task || !task.id) continue;
+    if (SELF_AUDIT_SOURCES.has(task.source)) continue;
     const reasons = [];
     if (isStaleByAge(task, now, threshold)) reasons.push('stale-age');
     if (isFabricationRepeat(task)) reasons.push('fabrication-repeat');
@@ -371,6 +387,7 @@ module.exports = {
   candidateFilePaths,
   findFilesTouchedSince,
   findStalenessCandidates,
+  SELF_AUDIT_SOURCES,
   buildStalenessEvidenceText,
   buildStalenessAuditTask,
   pickFairCandidate,
