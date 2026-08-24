@@ -204,3 +204,55 @@ test('majorityVote() reaches a real "no consensus" verdict (not a throw) when al
     }
   );
 });
+
+// Regression, 2026-08-23: Grimmethy: "Are there opportunities to make the actual review
+// more efficient?" -- majorityVote() always ran all n votes even once 2 of 3 already
+// agreed, paying for a 3rd real generation call whose result could never change the
+// outcome (2 already meets minAgreeing -- a 3rd vote can at best add to the winner, at
+// worst start a losing count that still can't overtake it). This proves the 3rd call is
+// now skipped entirely, not just that its result is ignored.
+test('majorityVote() stops calling once 2 of 3 votes already agree -- the 3rd call never happens', async () => {
+  let requestCount = 0;
+  await withServer(
+    (req, res) => {
+      requestCount += 1;
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('APPROVE'));
+      });
+    },
+    async (base) => {
+      const { majorityVote } = freshLocalClient(base);
+      const classify = (text) => (text.includes('APPROVE') ? 'approve' : null);
+      const result = await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 });
+      assert.equal(requestCount, 2, 'only 2 calls should have happened -- the 3rd is provably unnecessary once 2 agree');
+      assert.equal(result.realVoteCount, 2);
+      assert.equal(result.requestedVotes, 3);
+      assert.equal(result.verdict, 'approve');
+      assert.equal(result.confident, true);
+    }
+  );
+});
+
+test('majorityVote() does NOT early-exit when only 1 vote has landed so far', async () => {
+  let requestCount = 0;
+  await withServer(
+    (req, res) => {
+      requestCount += 1;
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse(requestCount === 1 ? 'APPROVE' : 'REJECT'));
+      });
+    },
+    async (base) => {
+      const { majorityVote } = freshLocalClient(base);
+      const classify = (text) => (text.includes('APPROVE') ? 'approve' : text.includes('REJECT') ? 'reject' : null);
+      const result = await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 });
+      assert.equal(requestCount, 3, 'a single vote (count=1) must not trigger the early-exit -- all 3 calls still happen since nothing reached minAgreeing until the 3rd');
+      assert.equal(result.verdict, 'reject'); // 2 REJECT vs 1 APPROVE
+      assert.equal(result.confident, true);
+    }
+  );
+});

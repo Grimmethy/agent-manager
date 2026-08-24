@@ -268,6 +268,20 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response });
+
+    // Early-exit once any verdict has mathematically already secured minAgreeing votes
+    // -- no remaining vote can change the outcome (adding to a losing verdict's tally, or
+    // starting a fresh one, can never overtake a count that's already >= minAgreeing out
+    // of n total). 2026-08-23, Grimmethy: "Are there opportunities to make the actual
+    // review more efficient?" -- the common 2-of-3-agree case was still always paying for
+    // a full 3rd real generation call whose result could never change the verdict, pure
+    // wasted GPU time on every single review. Safe for any n/minAgreeing combination, not
+    // just the default 3/2 -- a verdict's own count can only ever go UP as more votes
+    // come in, never down, so "already >= minAgreeing" is a permanent, not provisional,
+    // fact once observed.
+    const earlyCounts = {};
+    for (const v of votes) earlyCounts[v.verdict] = (earlyCounts[v.verdict] || 0) + 1;
+    if (Object.values(earlyCounts).some((c) => c >= minAgreeing)) break;
   }
 
   // Only when EVERY vote hard-failed (zero real responses of any kind, not even a
