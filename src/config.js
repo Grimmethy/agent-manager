@@ -61,6 +61,13 @@ function getConfig() {
   }
 
   const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
+  // task-repo-sync.js (2026-08-24, Grimmethy: "Can we build a sub-repo that stores task
+  // data?") -- a genuinely separate git remote (never repoRoot itself, see that module's
+  // own header for why) that this project's task records get committed into. null/unset
+  // means task-repo-sync.js's own callers no-op (fail open, same convention as every other
+  // optional integration in this file) -- a deployment that hasn't set this up yet keeps
+  // working exactly as before this feature existed.
+  const taskRepoUrl = process.env.AGENT_MANAGER_TASK_REPO_URL || null;
   const secondBrainDir = process.env.SECOND_BRAIN_DIR || null;
   const grepAllowedDirs = (process.env.AGENT_MANAGER_GREP_DIRS || 'frontend/src,backend/src')
     .split(',')
@@ -253,7 +260,7 @@ function getConfig() {
   });
 
   return {
-    repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
+    repoRoot, pipelineDir, taskRepoUrl, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,

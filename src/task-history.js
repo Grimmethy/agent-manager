@@ -49,17 +49,20 @@
 // so collapsing changes nothing about what they see.
 const COLLAPSIBLE_REPEAT_STAGES = new Set(['exhausted']);
 
-// Stages that commit the task's own record into its repo (task-repo-sync.js, 2026-08-24,
-// Grimmethy: "start saving the tasks directly to repo... so collaborators can access not
-// only future work but the history as well"). Hooked centrally HERE rather than at every
-// individual call site (local-draft.js/review-task.js each reach 'blocked' from several
-// different branches) since every one of them already funnels through this one shared
-// function -- one hook covers all of them, present and future, instead of scattering sync
-// calls across the whole call graph. 'done' is deliberately NOT here: apply-task.js's own
-// commit already exists for that transition, and task-repo-sync.js's commit:false mode
-// folds the task record into THAT same commit (true piggyback) rather than creating a
-// second, redundant one -- see apply-task.js's own call site.
-const REPO_SYNC_STAGES = new Set(['blocked', 'needs-clarification']);
+// Stages that commit the task's own record into the dedicated task-data repo (task-repo-
+// sync.js, 2026-08-24, Grimmethy: "start saving the tasks directly to repo... so
+// collaborators can access not only future work but the history as well" -> "Can we build
+// a sub-repo that stores task data?" -- moved off the code repo entirely, see that
+// module's own header). Hooked centrally HERE rather than at every individual call site
+// (local-draft.js/review-task.js each reach 'blocked' from several different branches,
+// apply-task.js reaches 'applied'/'apply-failed' from its own recordApplyOutcome()) since
+// every one of them already funnels through this one shared function -- one hook covers
+// all of them, present and future, instead of scattering sync calls across the whole call
+// graph. 'applied'/'apply-failed' fire strictly AFTER apply-task.js's own real code commit
+// already landed (recordApplyOutcome() runs on applyTask()'s return value, not before it),
+// so there's no ordering concern -- this is a genuinely separate repo now, never a
+// piggyback on the code commit the way an earlier version of this module worked.
+const REPO_SYNC_STAGES = new Set(['blocked', 'needs-clarification', 'applied', 'apply-failed']);
 
 function appendHistoryEvent(task, stage, detail) {
   const nowIso = new Date().toISOString();
@@ -84,18 +87,19 @@ function appendHistoryEvent(task, stage, detail) {
 
 // Fails open unconditionally -- a network blip on the commit/push must never block real
 // pipeline work, same "a capability check failing here must never block real work"
-// convention this codebase already applies everywhere else. task.generatedForRepoRoot is
-// stamped on every task at creation time (task-sources.js's writeTask()); a task with no
-// such field (an older record predating this, or a test fixture) just skips silently.
+// convention this codebase already applies everywhere else. task.taskRepoUrl is stamped
+// on every task at creation time (task-sources.js's writeTask()); a task with no such
+// field (an older record predating this, a project with no task-data repo configured yet,
+// or a test fixture) just skips silently.
 function syncTaskRecordToRepo(task, stage) {
   if (!REPO_SYNC_STAGES.has(stage)) return;
-  if (!task.generatedForRepoRoot) return;
+  if (!task.taskRepoUrl) return;
   try {
-    // Required lazily, not at module top-level -- task-repo-sync.js's own git-runner.js
+    // Required lazily, not at module top-level -- task-repo-sync.js's own child_process
     // dependency chain is heavier than task-history.js needs for every other stage this
     // module is called with, and this path only actually runs for the two stages above.
     const { syncTaskToRepo } = require('./task-repo-sync.js');
-    syncTaskToRepo(task, { repoRoot: task.generatedForRepoRoot });
+    syncTaskToRepo(task, { taskRepoUrl: task.taskRepoUrl });
   } catch (e) {
     console.error(`[task-history] syncTaskToRepo failed for ${task.id}: ${e.message}`);
   }

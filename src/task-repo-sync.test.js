@@ -1,8 +1,8 @@
 'use strict';
 
-// Unit tests for task-repo-sync.js -- real throwaway git repo + bare "origin" (same
-// fixture pattern as adhoc-agentic-draft.test.js/git-runner.test.js), never against this
-// package's own repo.
+// Unit tests for task-repo-sync.js -- real throwaway git repo used as a stand-in for the
+// dedicated task-data repo (a real local bare repo works fine as a git remote for `git
+// clone`/`git push`, same fixture pattern this codebase's other real-git tests already use).
 //
 // Run: node --test src/task-repo-sync.test.js  (or `npm test`)
 
@@ -18,84 +18,92 @@ function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
 }
 
-function makeRepoWithOrigin() {
-  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-origin-'));
-  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-repo-'));
+// A bare repo with an initial commit on main, standing in for the dedicated task-data
+// repo -- `git clone`/`git push` work against it identically to a real GitHub remote.
+function makeTaskDataRepo() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-remote-'));
   git(['init', '--bare', '-b', 'main', bareDir]);
-  git(['clone', bareDir, repoDir]);
-  git(['config', 'user.email', 'test@example.com'], repoDir);
-  git(['config', 'user.name', 'Test'], repoDir);
-  fs.writeFileSync(path.join(repoDir, 'f.txt'), 'v1\n');
-  git(['add', 'f.txt'], repoDir);
-  git(['commit', '-m', 'init'], repoDir);
-  git(['push', 'origin', 'main'], repoDir);
-  return { bareDir, repoDir };
+  const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-seed-'));
+  git(['clone', bareDir, seedDir]);
+  git(['config', 'user.email', 'test@example.com'], seedDir);
+  git(['config', 'user.name', 'Test'], seedDir);
+  fs.writeFileSync(path.join(seedDir, 'README.md'), 'task data repo\n');
+  git(['add', 'README.md'], seedDir);
+  git(['commit', '-m', 'init'], seedDir);
+  git(['push', 'origin', 'main'], seedDir);
+  return bareDir;
 }
 
-test('syncTaskToRepo(commit: true) writes .agent-manager/tasks/<id>.json and produces a real commit on main', () => {
-  const { repoDir } = makeRepoWithOrigin();
+// Read back the current content of a file at the remote's tip, via a fresh clone -- avoids
+// asserting against local clone state task-repo-sync.js itself already deleted.
+function readAtRemoteTip(taskRepoUrl, relPath) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-read-'));
+  git(['clone', taskRepoUrl, dir]);
+  return fs.readFileSync(path.join(dir, relPath), 'utf8');
+}
+
+function logAtRemoteTip(taskRepoUrl, args) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sync-test-read-'));
+  git(['clone', taskRepoUrl, dir]);
+  return git(['log', ...args], dir);
+}
+
+test('syncTaskToRepo writes tasks/<id>.json and produces a real commit on the task-data repo', () => {
+  const taskRepoUrl = makeTaskDataRepo();
   const task = { id: 'sync-1', title: 'Test task', status: 'pending' };
 
-  const result = syncTaskToRepo(task, { repoRoot: repoDir, commit: true });
+  const result = syncTaskToRepo(task, { taskRepoUrl });
 
-  assert.equal(result.relPath, '.agent-manager/tasks/sync-1.json');
+  assert.equal(result.relPath, path.join('tasks', 'sync-1.json'));
   assert.equal(result.committed, true);
 
-  git(['pull'], repoDir);
-  const content = JSON.parse(fs.readFileSync(path.join(repoDir, result.relPath), 'utf8'));
+  const content = JSON.parse(readAtRemoteTip(taskRepoUrl, result.relPath));
   assert.equal(content.status, 'pending');
-  const log = git(['log', '--oneline', '-1'], repoDir);
+  const log = logAtRemoteTip(taskRepoUrl, ['--oneline', '-1']);
   assert.match(log, /task: Test task \(pending\)/);
 });
 
-test('syncTaskToRepo(commit: true) updates the SAME file in place on a second call, not a new one', () => {
-  const { repoDir } = makeRepoWithOrigin();
+test('syncTaskToRepo updates the SAME file in place on a second call, not a new one', () => {
+  const taskRepoUrl = makeTaskDataRepo();
   const task = { id: 'sync-2', title: 'Test task', status: 'pending' };
-  syncTaskToRepo(task, { repoRoot: repoDir, commit: true });
+  syncTaskToRepo(task, { taskRepoUrl });
 
   task.status = 'blocked';
-  const result2 = syncTaskToRepo(task, { repoRoot: repoDir, commit: true });
+  const result2 = syncTaskToRepo(task, { taskRepoUrl });
 
   assert.equal(result2.committed, true);
-  git(['pull'], repoDir);
-  const history = git(['log', '--follow', '--oneline', '--', result2.relPath], repoDir).trim().split('\n');
+  const history = logAtRemoteTip(taskRepoUrl, ['--follow', '--oneline', '--', result2.relPath]).trim().split('\n');
   assert.equal(history.length, 2, 'both the create and the update must show up in the same file\'s history');
-  const content = JSON.parse(fs.readFileSync(path.join(repoDir, result2.relPath), 'utf8'));
+  const content = JSON.parse(readAtRemoteTip(taskRepoUrl, result2.relPath));
   assert.equal(content.status, 'blocked');
 });
 
-test('syncTaskToRepo(commit: false) writes the file without creating a commit, for the caller to piggyback', () => {
-  const { repoDir } = makeRepoWithOrigin();
-  const task = { id: 'sync-3', title: 'Test task', status: 'pending' };
-
-  const result = syncTaskToRepo(task, { repoRoot: repoDir, commit: false });
-
-  assert.equal(result.relPath, '.agent-manager/tasks/sync-3.json');
-  assert.equal(result.committed, false);
-  assert.equal(fs.existsSync(path.join(repoDir, result.relPath)), true, 'file must exist in the CALLER\'s own working tree (repoRoot), ready to be added to its own commit');
-  const status = git(['status', '--porcelain'], repoDir);
-  assert.match(status, /\.agent-manager\//, 'must show as an untracked/uncommitted change in repoRoot -- nothing here commits it');
-});
-
-test('syncTaskToRepo(commit: true) reports committed:false (not an error) when the record is unchanged', () => {
-  const { repoDir } = makeRepoWithOrigin();
+test('syncTaskToRepo reports committed:false (not an error) when the record is unchanged', () => {
+  const taskRepoUrl = makeTaskDataRepo();
   const task = { id: 'sync-4', title: 'Test task', status: 'pending' };
-  syncTaskToRepo(task, { repoRoot: repoDir, commit: true });
+  syncTaskToRepo(task, { taskRepoUrl });
 
   // Same task object, unchanged -- nothing new to commit.
-  const result2 = syncTaskToRepo(task, { repoRoot: repoDir, commit: true });
+  const result2 = syncTaskToRepo(task, { taskRepoUrl });
   assert.equal(result2.committed, false);
   assert.equal(result2.error, undefined);
 });
 
-test('syncTaskToRepo cleans up its own worktree even after a successful commit', () => {
-  const { repoDir } = makeRepoWithOrigin();
-  syncTaskToRepo({ id: 'sync-5', title: 'x', status: 'pending' }, { repoRoot: repoDir, commit: true });
-  const worktreeList = git(['worktree', 'list'], repoDir);
-  assert.equal(worktreeList.split('\n').filter(Boolean).length, 1, 'only the main worktree should remain');
+test('syncTaskToRepo cleans up its own clone directory even after a successful commit', () => {
+  const taskRepoUrl = makeTaskDataRepo();
+  const before = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith('agent-manager-task-sync-')).length;
+  syncTaskToRepo({ id: 'sync-5', title: 'x', status: 'pending' }, { taskRepoUrl });
+  const after = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith('agent-manager-task-sync-')).length;
+  assert.equal(after, before, 'the throwaway clone directory must be removed');
 });
 
-test('syncTaskToRepo returns a no-op result (not a throw) when repoRoot or task.id is missing', () => {
-  assert.deepEqual(syncTaskToRepo({ title: 'no id' }, { repoRoot: '/tmp/whatever' }), { relPath: null, committed: false });
+test('syncTaskToRepo returns a no-op result (not a throw) when taskRepoUrl or task.id is missing', () => {
+  assert.deepEqual(syncTaskToRepo({ title: 'no id' }, { taskRepoUrl: '/tmp/whatever' }), { relPath: null, committed: false });
   assert.deepEqual(syncTaskToRepo({ id: 'x' }, {}), { relPath: null, committed: false });
+});
+
+test('syncTaskToRepo returns an error (not a throw) when the remote does not exist', () => {
+  const result = syncTaskToRepo({ id: 'sync-6', title: 'x' }, { taskRepoUrl: '/nonexistent/remote/path' });
+  assert.equal(result.committed, false);
+  assert.match(result.error, /could not clone task-data repo/);
 });
