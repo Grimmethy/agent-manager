@@ -18,6 +18,7 @@ const { registerTaskSource, getRegisteredSources, resolveSourceName } = require(
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { listArchivedMonthDirs } = require('./done-archive.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -97,6 +98,13 @@ function taskIdExistsInQueue(id) {
   const { pipelineDir } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
   if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
+  // done-archive.js's own dated month buckets (queue/done/_archived/<YYYY-MM>/, 2026-08-24)
+  // -- without this, a task's underlying item (a brain-dump entry, a deep_dive community,
+  // an arch_import itemId) would look "never queued" the moment its completed task aged
+  // past the retention window and got moved out of done/'s top level, and could be
+  // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
+  // reasoning as the _archived_no_action check just above.
+  if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
   return QUEUE_STATES.some((state) => {
     if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
 

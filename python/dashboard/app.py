@@ -1839,14 +1839,30 @@ def api_task_requeue(state, task_id):
     'archived', not 'done', so this must be handled as a separate lookup path rather than
     falling through to state_dir/task_id.json, which would 404 (real gap found 2026-08-17
     auditing the "always reversible" promise: an archived item couldn't actually be
-    un-archived through the UI before this)."""
+    un-archived through the UI before this). 2026-08-24: also checks done-archive.js's own
+    dated month buckets (queue/done/_archived/<YYYY-MM>/) -- a task the AUTOMATIC daily
+    archive pass moved there is just as "archived" and must be just as requeueable as one a
+    human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
+    same "always reversible" promise this endpoint already exists to uphold."""
     if state not in ("blocked", "done", "archived"):
         abort(400, description="only a blocked, done, or archived task can be requeued")
     qdir = queue_dir()
     if not qdir:
         abort(404)
-    src = (qdir / "done" / "_archived_no_action" / f"{task_id}.json") if state == "archived" \
-        else (qdir / state / f"{task_id}.json")
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if not src.is_file():
+            archived_root = qdir / "done" / "_archived"
+            if archived_root.is_dir():
+                for month_dir in archived_root.iterdir():
+                    if not month_dir.is_dir():
+                        continue
+                    candidate = month_dir / f"{task_id}.json"
+                    if candidate.is_file():
+                        src = candidate
+                        break
+    else:
+        src = qdir / state / f"{task_id}.json"
     data = read_json_safe(src)
     if not data:
         abort(404)
@@ -2438,6 +2454,18 @@ def _task_state_index(qdir) -> dict:
     if archived_dir.is_dir():
         for f in archived_dir.glob("*.json"):
             index[f.stem] = "archived"
+    # done-archive.js's own dated month buckets (2026-08-24) -- a task the automatic daily
+    # archive pass relocated is exactly as "archived" as one a human moved by hand above;
+    # without this, a task's Brain Dump badge would silently go blank (not found anywhere
+    # in this index) the moment it aged out of done/'s top level, the same invisible-status
+    # bug this whole index was built to fix in the first place.
+    dated_archive_root = qdir / "done" / "_archived"
+    if dated_archive_root.is_dir():
+        for month_dir in dated_archive_root.iterdir():
+            if not month_dir.is_dir():
+                continue
+            for f in month_dir.glob("*.json"):
+                index[f.stem] = "archived"
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         for sub in drafting_root.iterdir():
