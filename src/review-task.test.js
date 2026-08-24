@@ -374,3 +374,112 @@ test('reviewTask still runs the deep_dive clonePath override correctly (no regre
   assert.equal(result.succeeded, true);
   assert.match(captured[0], /"claimedPath":"real\.ts","exists":true/);
 });
+
+// --- Pipeline hardening (2026-08-24): resurrects two real gaps closed once already on
+// 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
+// across this project's Linux port -- confirmed live via git archaeology that a stale,
+// unmergeable branch (383 commits behind, deletes a file long since removed) still named
+// two genuinely still-open weaknesses in review-task.js today. ------------------------
+
+test('reviewTask deterministically rejects a draft whose own critique flagged issues with no successful revision -- no review call spent', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual',
+    critiqueOutcome: 'issues-flagged',
+    revisionApplied: false,
+    critiqueText: 'The secondBrainPath does not match the plan\'s stated destination.',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-unaddressed-critique');
+  assert.match(result.blockedReason, /own critique pass flagged real issues/);
+  assert.match(result.blockedReason, /secondBrainPath does not match/);
+  assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known, unaddressed critique');
+});
+
+test('reviewTask reaches the real vote (does not auto-reject) when critique flagged issues but a revision was successfully applied', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual',
+    critiqueOutcome: 'issues-flagged',
+    revisionApplied: true,
+    critiqueText: 'The path was wrong in the first draft.',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-unaddressed-critique');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1);
+});
+
+test('reviewTask folds the critique text into the review prompt when a revision was applied, so the SAME vote can verify compliance', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual',
+    critiqueOutcome: 'issues-flagged',
+    revisionApplied: true,
+    critiqueText: 'The original draft referenced a nonexistent function name.',
+  });
+  const captured = [];
+  await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.match(captured[0], /revised in response to an earlier critique/);
+  assert.match(captured[0], /nonexistent function name/);
+});
+
+test('reviewTask does not touch the critique gate at all when no critique ever ran (critiqueOutcome unset)', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({ domain: 'default', source: 'manual' });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-unaddressed-critique');
+  assert.equal(result.verdict, 'approved');
+});
+
+// promptContext.body is a plain grounding field get-grounding-source.js includes
+// unconditionally for any domain (see that file's own main()) -- the simplest real path
+// to a non-empty groundingText for this test, since reviewTask() builds it via a real
+// child-process spawn keyed off the task's actual shape, not an injectable param.
+test('reviewTask deterministically rejects a draft citing a URL not present anywhere in its real grounding source -- no review call spent', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'ungrounded-url-test', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Real findings, citing https://totally-made-up-source.example-nonexistent.test/page for support.',
+    promptContext: { body: 'Some real grounding text with no URLs in it at all.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-ungrounded-value');
+  assert.match(result.blockedReason, /ungrounded-url/);
+  assert.match(result.blockedReason, /totally-made-up-source/);
+  assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known hallucinated URL');
+});
+
+test('reviewTask reaches the real vote when every URL in the draft actually appears in its grounding source', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'grounded-url-test', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Real findings, citing https://real-source.example.test/page for support, with enough detail here to clear the length floor.',
+    promptContext: { body: 'Background material mentioning https://real-source.example.test/page directly.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1);
+});
