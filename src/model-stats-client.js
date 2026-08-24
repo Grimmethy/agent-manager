@@ -6,7 +6,7 @@
 // model-stats-db.js itself can't be require()'d directly -- it runs its logic
 // unconditionally at module-load time (no `require.main === module` guard) and calls
 // process.exit() on error, so it has to be invoked as a real subprocess, matching how the
-// reference (Invoke-ModelStatsDb in ornith-worker.ps1/review-runner.ps1/queue-watchdog.ps1)
+// reference (Invoke-ModelStatsDb in local-worker.ps1/review-runner.ps1/queue-watchdog.ps1)
 // always shelled out to it too.
 //
 // Best-effort by design: stats tracking must never break real pipeline work over a

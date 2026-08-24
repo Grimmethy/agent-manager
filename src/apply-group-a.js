@@ -343,7 +343,7 @@ function applyArchImportCandidate({ implementResponse, candidatesPath, importCov
     // 2026-07-26: 134/134 "promoted" items had candidateId:null, ARCH_IMPORT_CANDIDATES.md
     // never even existed, and nextArchImportTask()'s `if (promotedAt) continue` treated
     // every one as permanently done. A zero-harness-grounding skip (the documented COMMON
-    // case, see ornith-worker.ps1's $skipImplement comment -- 10/14 in the original sample)
+    // case, see local-worker.ps1's $skipImplement comment -- 10/14 in the original sample)
     // is NOT the same as "genuinely evaluated, doesn't fit" -- agent-manager's own codebase
     // keeps growing, so a query with zero hits today can have a real hit next week. Only a
     // REAL candidate (result.skipped === false) is a terminal outcome now; a skip just

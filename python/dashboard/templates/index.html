@@ -484,7 +484,7 @@ function statusBadgeClass(status, stale) {
   return 'warn';
 }
 
-// Which worker lane the Workers tab shows -- 'all' | 'ornith' | 'reasoning'. Kept in
+// Which worker lane the Workers tab shows -- 'all' | 'local' | 'reasoning'. Kept in
 // memory only (like modelsSortKey below), not localStorage: this is a quick glance-time
 // filter, not a durable preference worth surviving a page reload. Lane is derived from
 // instanceId's 'worker-reasoning*' vs everything-else convention (see local-worker.sh's
@@ -496,7 +496,7 @@ function statusBadgeClass(status, stale) {
 let workersTypeFilter = 'all';
 
 function laneForInstance(inst) {
-  return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'ornith';
+  return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'local';
 }
 
 // Which model-list an instance's Workers-tab dropdown offers: the reasoning lane can run
@@ -563,7 +563,7 @@ async function renderWorkers() {
   instancesForTimers = instances;
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:10px">
-      ${[['all', 'All'], ['ornith', 'Ornith (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
+      ${[['all', 'All'], ['local', 'Local (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
         <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
       `).join('')}
     </div>

@@ -196,7 +196,7 @@ test('a short staleness_audit report is NOT auto-rejected by the deterministic n
   };
   const captured = [];
   const result = await reviewTask(task, {
-    repoRoot, domainsPath, ornithMajorityVote: fakeApprove(captured),
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured),
   });
   assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
   assert.equal(result.verdict, 'approved');
@@ -221,7 +221,7 @@ for (const source of ['observability_review', 'performance_review']) {
     };
     const captured = [];
     const result = await reviewTask(task, {
-      repoRoot, domainsPath, ornithMajorityVote: fakeApprove(captured),
+      repoRoot, domainsPath, localMajorityVote: fakeApprove(captured),
     });
     assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
     assert.equal(result.verdict, 'approved');
@@ -261,7 +261,7 @@ test('reviewTask surfaces majorityVote\'s voteErrors onto the task and into the 
   const task = baseTask();
   const result = await reviewTask(task, {
     repoRoot, secondBrainDir, domainsPath,
-    ornithMajorityVote: async () => ({
+    localMajorityVote: async () => ({
       confident: true, verdict: 'APPROVE',
       votes: [{ verdict: 'APPROVE', response: 'APPROVE: looks fine' }],
       realVoteCount: 1, requestedVotes: 3,
@@ -282,7 +282,7 @@ test('reviewTask leaves the vote-error suffix out entirely when every vote succe
   const captured = [];
   const result = await reviewTask(task, {
     repoRoot, secondBrainDir, domainsPath,
-    ornithMajorityVote: fakeApprove(captured),
+    localMajorityVote: fakeApprove(captured),
     recordModelOutcome: () => {},
   });
 
@@ -304,7 +304,7 @@ test('reviewTask fact-checks brain_dump_sort secondBrainPath against secondBrain
   const captured = [];
   const result = await reviewTask(baseTask(), {
     repoRoot, secondBrainDir, domainsPath,
-    ornithMajorityVote: fakeApprove(captured),
+    localMajorityVote: fakeApprove(captured),
     recordModelOutcome: () => {},
   });
 
@@ -321,7 +321,7 @@ test('reviewTask reports exists:false (not an error) for a brand-new secondBrain
   const captured = [];
   const result = await reviewTask(baseTask(), {
     repoRoot: path.join(secondBrainDir, '..', 'repo'), secondBrainDir, domainsPath,
-    ornithMajorityVote: fakeApprove(captured),
+    localMajorityVote: fakeApprove(captured),
     recordModelOutcome: () => {},
   });
 
@@ -354,7 +354,7 @@ test('reviewTask still runs the deep_dive clonePath override correctly (no regre
   const captured = [];
   const result = await reviewTask(task, {
     repoRoot: path.join(dir, 'unrelated-repo'), secondBrainDir, domainsPath, deepDiveCoveragePath,
-    ornithMajorityVote: fakeApprove(captured),
+    localMajorityVote: fakeApprove(captured),
     recordModelOutcome: () => {},
   });
   assert.equal(result.succeeded, true);

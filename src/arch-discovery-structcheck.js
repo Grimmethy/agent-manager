@@ -1,14 +1,14 @@
 'use strict';
 
 // CLI: node arch-discovery-structcheck.js <path to a text file containing implementResponse>
-// (a raw-text temp file, same convention as ornith-worker.ps1's $planTextPath/$implTextPath/
+// (a raw-text temp file, same convention as local-worker.ps1's $planTextPath/$implTextPath/
 // $critiqueTextPath -- NOT a task JSON path. At the point this runs, the task's revised
-// implementResponse only exists in ornith-worker.ps1's in-memory $task object, not yet
+// implementResponse only exists in local-worker.ps1's in-memory $task object, not yet
 // written back to the task JSON on disk.)
 // Deterministic structural sanity check for arch_discovery's implement/revision output,
-// run by ornith-worker.ps1 right after critique/revision, before the task reaches review.
+// run by local-worker.ps1 right after critique/revision, before the task reaches review.
 //
-// Reproduced live 2026-07-21: ornith-worker.ps1's Critique pass correctly flagged a draft
+// Reproduced live 2026-07-21: local-worker.ps1's Critique pass correctly flagged a draft
 // as unverifiable, triggered a Revision pass -- and the REVISION pass itself then produced
 // fluent, on-topic English refusing to verify the draft ("I cannot verify this draft
 // against the provided inputs...") instead of either fixing it or outputting nothing.
@@ -58,7 +58,7 @@ const MAX_STRUCT_FAILURES = 3;
 
 // A structural-check failure never accumulates toward queue-watchdog.ps1's own
 // exhausted-retry stamp: Test-ReviewRejection only recognizes blockedStage:'review', and a
-// structural block leaves blockedStage unset entirely (it fires INSIDE ornith-worker.ps1,
+// structural block leaves blockedStage unset entirely (it fires INSIDE local-worker.ps1,
 // before the task ever reaches review). Without this, a community/item that always fails
 // structurally -- never once reaching review -- gets re-selected by nextArchDiscoveryTask()/
 // nextArchImportTask() FOREVER, since their own "oldest lastReviewedAt"/"not yet promoted"
@@ -123,7 +123,7 @@ function recordArchImportStructFailure(importCoveragePath, itemId) {
 // matching exhaustion tracker also runs, and 'exhausted'/'failCount' are included in the
 // JSON response. Resolves communityCoveragePath/importCoveragePath itself via
 // getConfig() (same pattern arch-import-fetch.js already uses) rather than requiring the
-// caller (ornith-worker.ps1) to know about this package's own config paths -- it doesn't
+// caller (local-worker.ps1) to know about this package's own config paths -- it doesn't
 // have them in scope today, and shouldn't need to just to pass one through.
 if (require.main === module) {
   const [, , textPath, source, idArg] = process.argv;

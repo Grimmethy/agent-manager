@@ -19,7 +19,7 @@ const { postJson } = require('./ollama-http.js');
 // edit_file, or shell-execution tool exists here, and none should be added to this loop --
 // a local model is materially less reliable at agentic tool use than Claude (real
 // documented incident: a tool-calling call once stalled 13+ minutes with no progress, see
-// docs/pipeline-incident-2026-07-19.md and ornith-worker.ps1's own comment on why this
+// docs/pipeline-incident-2026-07-19.md and local-worker.ps1's own comment on why this
 // whole mechanism was disabled), so direct file-mutation/shell power here is a materially
 // bigger risk than read-only exploration. Any real file change a caller of this loop
 // produces still goes through the EXISTING, already-audited apply pipeline (see
@@ -92,7 +92,7 @@ const MODEL = process.env.LOCAL_MODEL;
 // Matches local-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
 // reasoning that a tool-calling turn can legitimately run longer than a plain generation
 // call. That reasoning turned out to be actively harmful, not just generous: this exact
-// path is why Invoke-OrnithToolClient is disabled in ornith-worker.ps1 (see that file's
+// path is why Invoke-OrnithToolClient is disabled in local-worker.ps1 (see that file's
 // comment) -- a real call through here stalled a worker for 13+ minutes with no progress,
 // and a 30-min ceiling meant nothing would have caught it for a very long time if the
 // disable hadn't happened first. 5 minutes is the formalized ceiling for every Ornith-call-
@@ -100,7 +100,7 @@ const MODEL = process.env.LOCAL_MODEL;
 // docs/pipeline-incident-2026-07-19.md and queue-watchdog.ps1's $WorkerZombieThresholdSeconds)
 // -- repeated-failure downtime compounds fast, and no legitimate call needs longer than
 // this. Do not raise this again "to be safe" without revisiting that reasoning first.
-const REQUEST_TIMEOUT_MS = Number(process.env.ORNITH_TIMEOUT_MS) || 240_000;
+const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || 240_000;
 
 const TOOLS = [
   {

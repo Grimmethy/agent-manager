@@ -85,10 +85,15 @@ function coAuthorTrailer(task) {
   if (draftModel.startsWith('claude:')) {
     return `Co-Authored-By: Claude (${draftModel.slice('claude:'.length)}) <noreply@anthropic.com>`;
   }
-  if (draftModel && draftModel !== 'ornith') {
-    return `Co-Authored-By: Ornith (${draftModel}) <noreply@ornith.local>`;
+  // 2026-08-24 (Grimmethy: "Ornith is no longer the default model... reference local
+  // instead") -- this used to hardcode "Ornith" as the local drafting model's identity,
+  // which was already stale per this function's own comment above (dashboard-settings.json
+  // pins qwen3.8:27b-q4_K_M, not literally "ornith"). Names whichever local model actually
+  // drafted it instead of assuming a fixed brand.
+  if (draftModel && draftModel !== 'ornith' && draftModel !== 'local') {
+    return `Co-Authored-By: Local Model (${draftModel}) <noreply@agent-manager.local>`;
   }
-  return 'Co-Authored-By: Ornith <noreply@ornith.local>';
+  return 'Co-Authored-By: Local Model <noreply@agent-manager.local>';
 }
 
 function usesGroupB(task) {

@@ -3,7 +3,7 @@
 // Unit tests for adhoc-harness-draft.js's harness-search-first tier. Uses a real throwaway
 // git repo + bare origin (same fixture pattern as adhoc-agentic-draft.test.js/
 // group-b-worktree-diff.test.js) since a successful outcome needs a real Group-B-to-diff
-// capture; ornithCall is faked throughout (no real Ollama call).
+// capture; localCall is faked throughout (no real Ollama call).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -57,8 +57,8 @@ function makeTask(overrides = {}) {
 test('applied:false with no queries proposed (degenerate plan) -- leaves task untouched', async () => {
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
-    const ornithCall = async () => ({ response: 'not sure what to search for', degenerate: 'empty', attempts: 1 });
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const localCall = async () => ({ response: 'not sure what to search for', degenerate: 'empty', attempts: 1 });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, false);
     assert.equal(result.succeeded, true);
     assert.equal(task.rawDiff, undefined);
@@ -69,11 +69,11 @@ test('applied:false when harness-search finds zero real matches -- never even ca
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
     let calls = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       calls++;
       return { response: 'QUERY: totally_nonexistent_symbol_xyz', degenerate: null, attempts: 1 };
     };
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, false);
     assert.match(result.reason, /no real matches/);
     assert.equal(calls, 1, 'implement pass must not be called when there are zero hits');
@@ -84,7 +84,7 @@ test('applied:true, resolution=implemented -- a real Group-B diff gets captured 
   await withFixtureRepo(async (draftAdhocViaHarnessSearch, repoDir) => {
     const task = makeTask();
     let call = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       call++;
       if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
       return {
@@ -92,7 +92,7 @@ test('applied:true, resolution=implemented -- a real Group-B diff gets captured 
         degenerate: null, attempts: 1,
       };
     };
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, true);
     assert.equal(task.adhocResolution, 'implemented');
     assert.match(task.rawDiff, /-const RATE = 1\.0;/);
@@ -113,12 +113,12 @@ test('applied:false when the implement pass returns an empty response -- falls t
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
     let call = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       call++;
       if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
       return { response: '', degenerate: null, attempts: 1 };
     };
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, false);
     assert.equal(result.succeeded, true);
     assert.match(result.reason, /insufficient grounding/);
@@ -131,12 +131,12 @@ test('applied:false when the implement pass signals it needs deeper investigatio
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
     let call = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       call++;
       if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
       return { response: 'Let me read the rest of the file to understand this fully.', degenerate: null, attempts: 1 };
     };
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, false);
     assert.match(result.reason, /deeper investigation/);
   });
@@ -146,12 +146,12 @@ test('applied:false when the implement pass produces a Group-B diff that fails t
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
     let call = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       call++;
       if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
       return { response: JSON.stringify({ mode: 'edit', file: 'src/widget.js', find: 'this text does not exist', replace: 'x' }), degenerate: null, attempts: 1 };
     };
-    const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
     assert.equal(result.applied, false);
     assert.match(result.reason, /did not apply cleanly/);
     assert.equal(task.rawDiff, undefined, 'a failed attempt must not leave partial state on the task');

@@ -46,7 +46,7 @@ function requeueBlockedTasksForSignature(pipelineDir, signature) {
 
     // Same "strip to a fresh pending shape" reset the dashboard's own manual requeue
     // endpoint uses (python/dashboard/app.py's api_task_requeue) -- every drafting/review
-    // artifact dropped, ornithRejectCount implicitly reset to 0 (field simply absent), a
+    // artifact dropped, localRejectCount implicitly reset to 0 (field simply absent), a
     // deliberate do-over rather than a continuation of whatever retry cycle blocked it
     // before this fix existed.
     const fresh = {

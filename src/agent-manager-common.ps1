@@ -1,4 +1,4 @@
-# Shared helpers dot-sourced by ornith-worker.ps1, review-runner.ps1, apply-runner.ps1,
+# Shared helpers dot-sourced by local-worker.ps1, review-runner.ps1, apply-runner.ps1,
 # and queue-watchdog.ps1 -- each previously carried its own byte-identical copy of
 # Invoke-TaskDb/Invoke-ModelStatsDb/Read-TaskJson/Write-TaskJson (a bug fix to any of them
 # had to be found and reapplied in up to four places, with no guarantee all four were kept
@@ -75,7 +75,7 @@ function Invoke-ModelStatsDb {
 # content in prompts; project_search/arch_import embed real GitHub/HuggingFace search
 # results. Every one of these external sources can legitimately contain a real leaked
 # credential (an accidentally-committed .env, a hardcoded test key in a README, etc.) --
-# and until this fix, ornith-worker.ps1/review-runner.ps1/queue-watchdog.ps1 all wrote
+# and until this fix, local-worker.ps1/review-runner.ps1/queue-watchdog.ps1 all wrote
 # planResponse/implementResponse/critique/review reasoning straight to a shared markdown
 # log (Ornith Live Log.md, which can live in a synced SecondBrain vault) with zero
 # scrubbing. This is a defense-in-depth net for THAT path specifically -- it does not touch
@@ -115,7 +115,7 @@ function Protect-LogSecrets {
 # itself didn't write. The Ornith-calling functions here share the same shape of risk, just
 # smaller: deep_dive/project_search/arch_import build prompts that embed real, UNTRUSTED
 # third-party content (cloned external repo source, fetched GitHub/HuggingFace search
-# results) verbatim, and hand that prompt to a spawned `node ornith-client.js` process.
+# results) verbatim, and hand that prompt to a spawned `node local-client.js` process.
 # Ornith itself has no tool access (a local Ollama text completion, nothing more) so this
 # is narrower than mission-control's threat model -- but the spawned node process, by
 # default, inherits this PowerShell session's ENTIRE environment, including anything
@@ -124,8 +124,8 @@ function Protect-LogSecrets {
 # reason to be visible to a subprocess whose only job is "send this prompt to Ollama and
 # return the response" -- so it's excluded by default rather than blindly inherited.
 #
-# Scope: applied to the Ornith-calling functions (Invoke-OrnithClient, Invoke-
-# OrnithMajorityVote, Invoke-OrnithToolClient) specifically, since those are the ones whose
+# Scope: applied to the Ornith-calling functions (Invoke-LocalClient, Invoke-
+# OrnithMajorityVote, Invoke-LocalToolClient) specifically, since those are the ones whose
 # prompt content is built partly from untrusted external material. The many other node
 # subprocess calls in this pipeline (fact-checker.js, arch-import-fetch.js, apply-group-*,
 # task-db, model-stats-db, etc.) are deterministic, non-agentic, and mostly operate on
@@ -156,7 +156,9 @@ $script:SafeEnvAllowlist = @(
     'AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR', 'AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH',
     'AGENT_MANAGER_GRAPH_PATH', 'AGENT_MANAGER_DOMAINS_PATH', 'AGENT_MANAGER_DEFAULT_DOMAIN',
     'AGENT_MANAGER_MAIN_BRANCH', 'AGENT_MANAGER_MODEL_STATS_DB_PATH', 'AGENT_MANAGER_TROUBLE_LOG_PATH',
-    'SECOND_BRAIN_DIR', 'OLLAMA_URL', 'ORNITH_MODEL', 'ORNITH_KEEP_ALIVE', 'ORNITH_TIMEOUT_MS'
+    'SECOND_BRAIN_DIR', 'OLLAMA_URL',
+    'LOCAL_MODEL', 'LOCAL_KEEP_ALIVE', 'LOCAL_TIMEOUT_MS', 'LOCAL_AB_MODELS',
+    'ORNITH_MODEL', 'ORNITH_KEEP_ALIVE', 'ORNITH_TIMEOUT_MS', 'ORNITH_AB_MODELS'  # back-compat names
 )
 
 # Runs $ScriptBlock (expected to spawn a node child process) with this PowerShell session's
@@ -212,7 +214,7 @@ function Write-TaskJson {
 # no existing call site anywhere had to change; only the file-write plumbing moved here.
 # The one invariant this owns: a task written to blocked/ with blockedStage='review' is a
 # genuine review-stage rejection eligible for queue-watchdog's reject-retry-requeue --
-# never merely "has ornithVotes" (an apply-stage failure can still carry votes from an
+# never merely "has localVotes" (an apply-stage failure can still carry votes from an
 # earlier, unrelated successful review). Previously this rule was independently re-derived
 # and re-explained in a comment in review-runner.ps1, apply-runner.ps1, and
 # queue-watchdog.ps1 instead of being enforced in one place.

@@ -104,7 +104,7 @@ function isStaleByAge(task, now, thresholdMs = stalenessThresholdMs()) {
 // priorRejectionBlock() handling of the same field) -- normalized to one lowercase blob
 // alongside blockedReason so a single keyword scan covers both.
 function isFabricationRepeat(task) {
-  if (!((task.ornithRejectCount || 0) >= 2)) return false;
+  if (!((task.localRejectCount || 0) >= 2)) return false;
   const feedback = Array.isArray(task.priorRejectionFeedback)
     ? task.priorRejectionFeedback.join(' ')
     : (task.priorRejectionFeedback || '');
@@ -115,7 +115,7 @@ function isFabricationRepeat(task) {
 // Third criterion, added 2026-08-23 (Grimmethy: "we very likely have other adhoc tasks
 // that are just stuck" -- confirmed live: 167 of 213 real blocked tasks, 78%, already
 // carry this marker) -- reject-retry-check.js stamps 'exhausted' on a task once it's
-// used up its MAX_ORNITH_REJECT_RETRIES (2) automatic review-rejection retries; from
+// used up its MAX_LOCAL_REJECT_RETRIES (2) automatic review-rejection retries; from
 // that point on, NOTHING in this pipeline will ever touch it again on its own,
 // regardless of how young it is. Age and fabrication-repeat both needed real time (or a
 // specific rejection reason) to accumulate before catching a task -- this catches the
@@ -274,7 +274,7 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
       ? `Last forward progress: ${lastActivityIso} (${ageDays} day(s) ago)`
       : 'Last forward progress: unknown (no usable timestamp)',
     `Flagged because: ${reasons.join(', ')}`,
-    `ornithRejectCount: ${task.ornithRejectCount != null ? task.ornithRejectCount : 0}`,
+    `localRejectCount: ${task.localRejectCount != null ? task.localRejectCount : 0}`,
     '',
     'Original task text/request:',
     rawText,

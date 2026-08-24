@@ -119,15 +119,15 @@ test('isStaleByAge is false (not a guess) when there is no usable timestamp at a
   assert.equal(isStaleByAge(task, Date.now(), 14 * DAY), false);
 });
 
-test('isFabricationRepeat requires ornithRejectCount>=2 AND a fabrication keyword match', () => {
-  assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 2, blockedReason: 'this draft fabricates a nonexistent file' })), true);
-  assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 1, blockedReason: 'fabricated nonsense' })), false, 'only rejected once -- not yet "repeatedly"');
-  assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 3, blockedReason: 'the draft was simply empty' })), false, 'rejected repeatedly but not for fabrication');
+test('isFabricationRepeat requires localRejectCount>=2 AND a fabrication keyword match', () => {
+  assert.equal(isFabricationRepeat(makeTask({ localRejectCount: 2, blockedReason: 'this draft fabricates a nonexistent file' })), true);
+  assert.equal(isFabricationRepeat(makeTask({ localRejectCount: 1, blockedReason: 'fabricated nonsense' })), false, 'only rejected once -- not yet "repeatedly"');
+  assert.equal(isFabricationRepeat(makeTask({ localRejectCount: 3, blockedReason: 'the draft was simply empty' })), false, 'rejected repeatedly but not for fabrication');
 });
 
 test('isFabricationRepeat also checks priorRejectionFeedback (string or array)', () => {
-  assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 2, blockedReason: 'no code', priorRejectionFeedback: 'cited an unverified claim about a config file' })), true);
-  assert.equal(isFabricationRepeat(makeTask({ ornithRejectCount: 2, blockedReason: 'no code', priorRejectionFeedback: ['fine', 'this one hallucinates a whole module'] })), true);
+  assert.equal(isFabricationRepeat(makeTask({ localRejectCount: 2, blockedReason: 'no code', priorRejectionFeedback: 'cited an unverified claim about a config file' })), true);
+  assert.equal(isFabricationRepeat(makeTask({ localRejectCount: 2, blockedReason: 'no code', priorRejectionFeedback: ['fine', 'this one hallucinates a whole module'] })), true);
 });
 
 // Third criterion, added 2026-08-23 (Grimmethy: "we very likely have other adhoc tasks
@@ -145,7 +145,7 @@ test('hasExhaustedRetries is true once history contains an "exhausted" stage ent
 test('findStalenessCandidates flags age-stale, fabrication-repeat, AND retries-exhausted tasks, skips a task matching none', () => {
   const now = Date.parse('2026-02-01T00:00:00.000Z');
   const stale = makeTask({ id: 'stale-1', history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] });
-  const fabricator = makeTask({ id: 'fab-1', history: [{ stage: 'blocked', at: '2026-01-30T00:00:00.000Z' }], ornithRejectCount: 2, blockedReason: 'fabricated a fake module' });
+  const fabricator = makeTask({ id: 'fab-1', history: [{ stage: 'blocked', at: '2026-01-30T00:00:00.000Z' }], localRejectCount: 2, blockedReason: 'fabricated a fake module' });
   // Blocked TODAY (not remotely old, not a fabricator) but has already exhausted every
   // automatic retry the pipeline will ever attempt -- exactly the "young but genuinely
   // stuck" case age/fabrication alone would miss for up to a full week.
@@ -173,7 +173,7 @@ test('findStalenessCandidates never proposes a staleness_audit or pipeline_self_
   const selfAudit = makeTask({
     id: 'staleness-audit-x', source: 'staleness_audit',
     history: [{ stage: 'exhausted', at: '2026-01-01T00:00:00.000Z', detail: '2/2 retries used' }],
-    ornithRejectCount: 2, blockedReason: 'fabricated a fake module',
+    localRejectCount: 2, blockedReason: 'fabricated a fake module',
   });
   const selfAudit2 = makeTask({
     id: 'pipeline-self-audit-x', source: 'pipeline_self_audit',

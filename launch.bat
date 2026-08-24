@@ -28,7 +28,7 @@ if defined AGENT_MANAGER_REPO_ROOT (
         rem -NoExit: if any of these scripts throws early (bad path in agent-manager.env,
         rem a real script bug), the window stays open showing the actual PowerShell error
         rem instead of flash-closing the instant it happens.
-        start "Ornith Worker 1" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\ornith-worker.ps1" -InstanceId worker-1
+        start "Ornith Worker 1" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\local-worker.ps1" -InstanceId worker-1
         start "Ornith Review Runner" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\review-runner.ps1"
         start "Apply Runner" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\apply-runner.ps1"
         start "Queue Watchdog" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\queue-watchdog.ps1"

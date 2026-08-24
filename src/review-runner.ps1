@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
-# Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
+# Two distinct locations, not one -- see local-worker.ps1's header comment for why.
 $PackageSrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AGENT_MANAGER_REPO_ROOT) { throw 'AGENT_MANAGER_REPO_ROOT env var is required.' }
 $RepoRoot = $env:AGENT_MANAGER_REPO_ROOT
@@ -22,19 +22,19 @@ New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir 'approved') | Out
 # this loop's own budget-gate sleep tier (the longest gap between heartbeat writes).
 if (-not (Test-InstanceLiveness -InstanceId 'review-runner' -TickSecs 600)) { exit 1 }
 
-# Review provider is swappable, not hardcoded -- defaults to Ornith (free, local) so this
+# Review provider is swappable, not hardcoded -- defaults to the local model (free) so this
 # loop no longer scales token spend with task volume. `claude` remains available for cases
 # that need real judgment quality; set REVIEW_PROVIDER=claude to use it.
 #
 # IMPORTANT asymmetry: `claude -p` is agentic (it can itself git-commit/push, or write a
 # vault note) -- when ReviewProvider is 'claude', review+apply still happen in ONE call.
-# Ornith via ornith-client.js is a plain text completion with NO tool access in this
+# The local model is a plain text completion with NO tool access in this
 # pipeline -- it can produce a verdict but cannot itself touch git or the filesystem. So
-# when ReviewProvider is 'ornith', an APPROVE verdict does NOT push/write anything -- the
+# when ReviewProvider is 'local' (or the older 'ornith' value), an APPROVE verdict does NOT push/write anything -- the
 # task moves to queue/approved/ instead of queue/done/, and a separate script
 # (apply-runner.ps1) does the actual git/file work for approved tasks.
-$ReviewProvider = if ($env:REVIEW_PROVIDER) { $env:REVIEW_PROVIDER } else { 'ornith' }
-$OrnithModel = if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
+$ReviewProvider = if ($env:REVIEW_PROVIDER) { $env:REVIEW_PROVIDER } else { 'local' }
+$LocalModel = if ($env:LOCAL_MODEL) { $env:LOCAL_MODEL } elseif ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
 
 # Best-effort stagger against worker-*.json's own Ornith/GPU usage -- confirmed live
 # 2026-07-20: a review majority-vote call overlapping a worker's active Ornith call
@@ -44,7 +44,7 @@ $OrnithModel = if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
 # server config (no restart risk, unlike the OLLAMA_NUM_PARALLEL experiment earlier
 # tonight that caused a real outage) and it gives up after a few short waits rather than
 # blocking review indefinitely if a worker's "working" status is itself stale/stuck.
-function Wait-ForOrnithAvailability {
+function Wait-ForLocalAvailability {
     param([int]$MaxWaitAttempts = 3, [int]$WaitSeconds = 5)
     for ($i = 0; $i -lt $MaxWaitAttempts; $i++) {
         $busy = $false
@@ -61,22 +61,22 @@ function Wait-ForOrnithAvailability {
     }
 }
 
-function Invoke-OrnithClient {
+function Invoke-LocalClient {
     param([string]$Prompt, [bool]$Think = $true, [double]$Temperature = 0.3, [int]$NumPredict = 1200)
     $reqPath = Join-Path $TempDir ('review-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; think = $Think; temperature = $Temperature; numPredict = $NumPredict }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     try {
         # 2>&1 actually merges stderr into the captured array -- confirmed empirically
         # that without it, `& node ...` in PowerShell captures stdout only, so
-        # ornith-client.js's console.error(...)-then-exit(1) failure text never reached
+        # local-client.js's console.error(...)-then-exit(1) failure text never reached
         # $rawLines (nor therefore the throw below) despite this comment previously
-        # claiming otherwise. See ornith-worker.ps1's Invoke-OrnithClient for the same fix
+        # claiming otherwise. See local-worker.ps1's Invoke-LocalClient for the same fix
         # and the concrete blocked-task example (arch-discovery-community-3) that exposed it.
         $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
-            throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+            throw ('local-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
@@ -85,27 +85,27 @@ function Invoke-OrnithClient {
 }
 
 # A single Ornith judgment call is a documented, observed coin flip -- the identical
-# prompt at low temperature has flipped verdict before. ornith-client.js already has a
+# prompt at low temperature has flipped verdict before. local-client.js already has a
 # majority-vote mode built for exactly this: run the SAME prompt n times, classify each
 # response against known marker strings, require an ABSOLUTE count of agreeing REAL
 # (non-degenerate) votes -- not a relative comparison that lets 1 real vote + 2 degenerate
 # "unclear" votes pass as a false 1-0 consensus. Used here instead of a single call for the
 # review verdict specifically because it gates a real state change (approved -> apply-runner).
-function Invoke-OrnithMajorityVote {
+function Invoke-LocalMajorityVote {
     param([string]$Prompt, [string[]]$ClassifyMarkers, [int]$N = 3, [int]$MinAgreeing = 2, [double]$Temperature = 0.2, [int]$MinReasoningChars = 0)
     $reqPath = Join-Path $TempDir ('review-vote-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; mode = 'majority-vote'; classifyMarkers = $ClassifyMarkers; n = $N; minAgreeing = $MinAgreeing; temperature = $Temperature; minReasoningChars = $MinReasoningChars }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     try {
         # 2>&1 is the actual fix, not the exit-code check alone -- without it, `& node ...`
-        # captures stdout only, so ornith-client.js's console.error(...)-then-exit(1)
+        # captures stdout only, so local-client.js's console.error(...)-then-exit(1)
         # failure text never reaches $rawLines, and the throw below reports it as empty
-        # (confirmed empirically; see ornith-worker.ps1's Invoke-OrnithClient for the
+        # (confirmed empirically; see local-worker.ps1's Invoke-LocalClient for the
         # concrete blocked-task example that exposed this same gap here too).
         $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
-            throw ('ornith-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+            throw ('local-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
@@ -449,7 +449,7 @@ function Invoke-ReviewPass {
         # regardless of how the wording was arranged. Whether a response is empty is not a
         # judgment call at all -- it's already deterministically knowable, so asking the
         # model to weigh in (and spending 3 real votes doing it) was never buying anything
-        # but reliability risk. Same philosophy as ornith-worker.ps1's own arch_import
+        # but reliability risk. Same philosophy as local-worker.ps1's own arch_import
         # implement short-circuit: don't ask a model to judge something code already knows.
         # Trimmed comparison against '""'/"''" too, not just IsNullOrWhiteSpace -- mirrors
         # apply-group-a.js's isEffectivelyEmptyResponse() exactly (same real-world quirk:
@@ -460,10 +460,10 @@ function Invoke-ReviewPass {
         $trimmedImplResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
         $isEffectivelyEmpty = ($trimmedImplResponse -eq '') -or ($trimmedImplResponse -eq '""') -or ($trimmedImplResponse -eq "''")
         if (($task.source -in $emptyApprovalSources) -and $isEffectivelyEmpty) {
-            $detail = 'Auto-approved: implementResponse is genuinely empty, a documented valid outcome for {0} (no Ornith vote spent -- this is deterministic, not a judgment call)' -f $task.source
+            $detail = 'Auto-approved: implementResponse is genuinely empty, a documented valid outcome for {0} (no local-model vote spent -- this is deterministic, not a judgment call)' -f $task.source
             $task | Add-Member -NotePropertyName 'reviewedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-approve' -Force
-            $task | Add-Member -NotePropertyName 'ornithVerdict' -NotePropertyValue $detail -Force
+            $task | Add-Member -NotePropertyName 'localVerdict' -NotePropertyValue $detail -Force
             $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $next.Name
             Write-TaskJson $approvedPath $task
             Remove-Item $next.FullName -Force
@@ -503,7 +503,7 @@ function Invoke-ReviewPass {
             }
         }
         if ($isNonImplementation -and ($task.source -notin $emptyApprovalSources)) {
-            $reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).'
+            $reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no local-model review call spent (mechanically detectable, not a judgment call).'
             Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-non-implementation' -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
@@ -567,7 +567,7 @@ function Invoke-ReviewPass {
             $missingLiterals = @($fixedLiterals | Where-Object { -not $compareText.Contains($_.content) })
             if ($missingLiterals.Count -gt 0) {
                 $missingNames = ($missingLiterals | ForEach-Object { $_.name }) -join ', '
-                $reason = 'Deterministic gate: draft does not contain the required fixed block(s) character-for-character: {0}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no Ornith review call spent on a draft that already fails a mechanical check.' -f $missingNames
+                $reason = 'Deterministic gate: draft does not contain the required fixed block(s) character-for-character: {0}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no local-model review call spent on a draft that already fails a mechanical check.' -f $missingNames
                 Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
                 $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-fixed-literals' -Force
                 $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
@@ -582,7 +582,7 @@ function Invoke-ReviewPass {
             }
         }
 
-        # --- Ornith path: verdict ONLY. Ornith has no tool access via ornith-client.js --
+        # --- Ornith path: verdict ONLY. Ornith has no tool access via local-client.js --
         # it cannot git-push or write files, so an APPROVE verdict moves the task to
         # queue/approved/ for apply-runner.ps1 to actually execute, rather than to done/. ---
         $verdictLines = [System.Collections.Generic.List[string]]::new()
@@ -704,7 +704,7 @@ function Invoke-ReviewPass {
         $reviewFailReason = $null
         $voteResult = $null
         try {
-            Wait-ForOrnithAvailability
+            Wait-ForLocalAvailability
             # 3 votes, requires ALL 3 agreeing real votes (raised from 2 on 2026-08-03 --
             # 2/3 let a single correctly-reasoned REJECT get outvoted by two bare, unreasoned
             # APPROVEs on two separate real drafts in one session; unanimous is the direct
@@ -712,7 +712,7 @@ function Invoke-ReviewPass {
             # verdict marker itself is stripped out, is under 20 characters -- catches a
             # model that ignores the reasoning instruction above and reverts to a bare
             # marker; such a vote is excluded from the tally rather than counted.
-            $voteResult = Invoke-OrnithMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 3 -Temperature 0.2 -MinReasoningChars 20
+            $voteResult = Invoke-LocalMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 3 -Temperature 0.2 -MinReasoningChars 20
         } catch {
             $reviewFailed = $true
             $reviewFailReason = $_.Exception.Message
@@ -721,14 +721,14 @@ function Invoke-ReviewPass {
         $reviewSw.Stop()
 
         if ($reviewFailed -or -not $voteResult) {
-            $reason = if ($reviewFailReason) { $reviewFailReason } else { 'Ornith majority-vote call returned nothing' }
+            $reason = if ($reviewFailReason) { $reviewFailReason } else { 'Local majority-vote call returned nothing' }
             Set-TaskBlockedStage -Task $task -Reason $reason
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
-            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'REVIEW-FAILED' -Detail $reason
-            Write-Host ('Ornith review failed (not crashing the loop): {0} ({1})' -f $task.id, $reason) -ForegroundColor Red
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'local' -Result 'REVIEW-FAILED' -Detail $reason
+            Write-Host ('Local review failed (not crashing the loop): {0} ({1})' -f $task.id, $reason) -ForegroundColor Red
             return 'blocked'
         }
 
@@ -738,17 +738,17 @@ function Invoke-ReviewPass {
             # No confident majority -- e.g. a 1-1-1 split, or too many degenerate votes to
             # reach minAgreeing. Treated as REJECT, not APPROVE: an unclear signal must
             # never default to letting a task through.
-            $reason = 'Ornith review inconclusive, no confident majority ({0})' -f $voteSummary
+            $reason = 'Local review inconclusive, no confident majority ({0})' -f $voteSummary
             Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
-            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith' -Force
-            $task | Add-Member -NotePropertyName 'ornithVotes' -NotePropertyValue $voteResult.votes -Force
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'local' -Force
+            $task | Add-Member -NotePropertyName 'localVotes' -NotePropertyValue $voteResult.votes -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
             Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
-            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'INCONCLUSIVE' -Detail $reason
-            Write-Host ('Ornith review inconclusive: {0} ({1})' -f $task.id, $voteSummary) -ForegroundColor Yellow
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'local' -Result 'INCONCLUSIVE' -Detail $reason
+            Write-Host ('Local review inconclusive: {0} ({1})' -f $task.id, $voteSummary) -ForegroundColor Yellow
             return 'blocked'
         }
 
@@ -756,30 +756,30 @@ function Invoke-ReviewPass {
             $sampleVote = ($voteResult.votes | Where-Object { $_.verdict -eq 'APPROVE' } | Select-Object -First 1)
             $detail = 'Confident majority APPROVE ({0})`n`n{1}' -f $voteSummary, ($sampleVote.response)
             $task | Add-Member -NotePropertyName 'reviewedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
-            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith' -Force
-            $task | Add-Member -NotePropertyName 'ornithVerdict' -NotePropertyValue $detail -Force
-            $task | Add-Member -NotePropertyName 'ornithVotes' -NotePropertyValue $voteResult.votes -Force
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'local' -Force
+            $task | Add-Member -NotePropertyName 'localVerdict' -NotePropertyValue $detail -Force
+            $task | Add-Member -NotePropertyName 'localVotes' -NotePropertyValue $voteResult.votes -Force
             $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $next.Name
             Write-TaskJson $approvedPath $task
             Remove-Item $next.FullName -Force
-            Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'ornith' } | ConvertTo-Json -Compress)
+            Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'local' } | ConvertTo-Json -Compress)
             Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'approved'; outcomeStage = 'review'; outcomeReason = $null }
-            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'APPROVED' -Detail $detail
-            Write-Host ('Approved by Ornith ({0}): {1} -- queued for apply-runner' -f $voteSummary, $task.id) -ForegroundColor Cyan
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'local' -Result 'APPROVED' -Detail $detail
+            Write-Host ('Approved by local model ({0}): {1} -- queued for apply-runner' -f $voteSummary, $task.id) -ForegroundColor Cyan
             return 'approved'
         } else {
             $sampleVote = ($voteResult.votes | Where-Object { $_.verdict -eq 'REJECT' } | Select-Object -First 1)
             $reason = if ($sampleVote -and $sampleVote.response -match 'REJECT:\s*(.+)') { $matches[1] } else { 'REJECT ({0})' -f $voteSummary }
             Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
-            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'ornith' -Force
-            $task | Add-Member -NotePropertyName 'ornithVotes' -NotePropertyValue $voteResult.votes -Force
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'local' -Force
+            $task | Add-Member -NotePropertyName 'localVotes' -NotePropertyValue $voteResult.votes -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
             Write-TaskJson $blockedPath $task
             Remove-Item $next.FullName -Force
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
             Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
-            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'ornith' -Result 'REJECTED' -Detail ('{0} ({1})' -f $reason, $voteSummary)
-            Write-Host ('Rejected by Ornith ({0}): {1} ({2})' -f $voteSummary, $task.id, $reason) -ForegroundColor Yellow
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'local' -Result 'REJECTED' -Detail ('{0} ({1})' -f $reason, $voteSummary)
+            Write-Host ('Rejected by local model ({0}): {1} ({2})' -f $voteSummary, $task.id, $reason) -ForegroundColor Yellow
             return 'blocked'
         }
     }

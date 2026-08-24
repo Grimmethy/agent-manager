@@ -1,11 +1,11 @@
 'use strict';
 
 // Review step: takes one task sitting in queue/review/ (status "needs-review", written by
-// local-draft.js) and decides approved vs. blocked. Port of review-runner.ps1's 'ornith'
+// local-draft.js) and decides approved vs. blocked. Port of review-runner.ps1's 'local'
 // review-provider path ONLY -- the 'claude' path (a single `claude -p` call that reviews
 // AND applies in one shot) is a different reviewProvider mode this deployment never uses
-// (REVIEW_PROVIDER env var is unset here, and review-runner.ps1's own default is 'ornith'),
-// so it's out of scope. Under the 'ornith' path Ornith has no tool access -- it produces a
+// (REVIEW_PROVIDER env var is unset here, and review-runner.ps1's own default is 'local'),
+// so it's out of scope. Under the 'local' path the local model has no tool access -- it produces a
 // verdict only -- so APPROVE moves the task to queue/approved/ for apply-task.sh to
 // actually execute; it never pushes/writes anything itself.
 //
@@ -62,12 +62,12 @@ function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
   throw new Error(`Unknown workDirKind: ${cfg.workDirKind}`);
 }
 
-// Ornith review and worker draft calls share one local GPU/model slot -- stagger review's
-// start if a worker looks actively mid-call, same contention-avoidance ornith-worker.ps1's
-// Wait-ForOrnithAvailability does. Best-effort: never blocks more than ~15s total.
+// Local-model review and worker draft calls share one local GPU/model slot -- stagger review's
+// start if a worker looks actively mid-call, same contention-avoidance local-worker.ps1's
+// Wait-ForLocalAvailability does. Best-effort: never blocks more than ~15s total.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitForOrnithAvailability(instancesDir, maxWaitAttempts = 3, waitSeconds = 5) {
+async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitSeconds = 5) {
   for (let i = 0; i < maxWaitAttempts; i++) {
     let busy = false;
     let files = [];
@@ -256,23 +256,23 @@ function classifyVote(markers, minReasoningChars) {
 
 /**
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported so
- * tests can call it directly with a fake ornithMajorityVote.
+ * tests can call it directly with a fake localMajorityVote.
  */
-async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, ornithMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
   // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
   // caller override always wins.
   // 2026-08-24 (model-profile-registry.js): same pattern as local-draft.js's own
-  // resolvedOrnithCall wrapping -- when the task's own source declares a modelProfile,
+  // resolvedLocalCall wrapping -- when the task's own source declares a modelProfile,
   // its overrides become defaults spread BEFORE the real majorityVote() call below (opts
   // spread after wins, though the one real call site doesn't set model/numCtx/numPredict/
   // effort/timeoutMs itself today, so the profile's values reliably take effect). Passing
   // both local-only (numCtx/numPredict) and claude-only (effort/timeoutMs) keys
   // unconditionally is safe -- whichever backend's majorityVote() runs only destructures
   // the params it recognizes, ignoring the rest. Skipped for an injected
-  // ornithMajorityVote (test/caller override), same as local-draft.js.
+  // localMajorityVote (test/caller override), same as local-draft.js.
   const modelProfile = resolveModelProfile(task);
   const profileOverrides = modelProfile
     ? {
@@ -280,8 +280,8 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       effort: modelProfile.effort, timeoutMs: modelProfile.timeoutMs,
     }
     : null;
-  const baseMajorityVote = ornithMajorityVote || providerFor(task).majorityVote;
-  const resolvedMajorityVote = profileOverrides && !ornithMajorityVote
+  const baseMajorityVote = localMajorityVote || providerFor(task).majorityVote;
+  const resolvedMajorityVote = profileOverrides && !localMajorityVote
     ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
     : baseMajorityVote;
   appendHistoryEvent(task, 'review-started');
@@ -331,7 +331,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   if (isEmptyApprovalSource(task.source) && effectivelyEmpty) {
     task.reviewedAt = new Date().toISOString();
     task.reviewProvider = 'deterministic-empty-approve';
-    task.ornithVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no Ornith vote spent -- this is deterministic, not a judgment call)`;
+    task.localVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no local-model review call spent -- this is deterministic, not a judgment call)`;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
     appendHistoryEvent(task, 'approved', 'deterministic-empty-approve');
     return { succeeded: true, verdict: 'approved', factCheckVerdict };
@@ -345,7 +345,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     }
   }
   if (isNonImplementation && !isEmptyApprovalSource(task.source) && !isAdvisoryProseSource(task.source)) {
-    const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).';
+    const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no local-model review call spent (mechanically detectable, not a judgment call).';
     task.reviewProvider = 'deterministic-non-implementation';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
@@ -367,7 +367,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     const missing = fixedLiterals.filter((lit) => !compareText.includes(lit.content.trimEnd()));
     if (missing.length > 0) {
       const missingNames = missing.map((m) => m.name).join(', ');
-      const reason = `Deterministic gate: draft does not contain the required fixed block(s) character-for-character: ${missingNames}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no Ornith review call spent on a draft that already fails a mechanical check.`;
+      const reason = `Deterministic gate: draft does not contain the required fixed block(s) character-for-character: ${missingNames}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no local-model review call spent on a draft that already fails a mechanical check.`;
       task.reviewProvider = 'deterministic-fixed-literals';
       recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
       appendHistoryEvent(task, 'blocked', reason);
@@ -375,7 +375,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     }
   }
 
-  await waitForOrnithAvailability(instancesDir);
+  await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
   // minAgreeing: 2 of 3 -- a genuine majority, matching majorityVote()'s own documented
@@ -403,7 +403,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   // "why did this take 3x longer than expected" trail that took hours of manual log
   // archaeology to reconstruct by hand earlier tonight. Surfaced into both voteSummary
   // (so it's visible in the task's own history without opening the raw field) and a new
-  // task.voteErrors (so it's queryable structured data, same convention task.ornithVotes
+  // task.voteErrors (so it's queryable structured data, same convention task.localVotes
   // already uses for the real vote responses).
   const voteErrorSuffix = voteResult.voteErrors && voteResult.voteErrors.length > 0
     ? `, ${voteResult.voteErrors.length} vote(s) hard-failed`
@@ -411,9 +411,9 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real${voteErrorSuffix}`;
 
   if (!voteResult.confident || !voteResult.verdict) {
-    const reason = `Ornith review inconclusive, no confident majority (${voteSummary})`;
-    task.reviewProvider = 'ornith';
-    task.ornithVotes = voteResult.votes;
+    const reason = `Local-model review inconclusive, no confident majority (${voteSummary})`;
+    task.reviewProvider = 'local';
+    task.localVotes = voteResult.votes;
     task.voteErrors = voteResult.voteErrors;
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
@@ -423,9 +423,9 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   if (voteResult.verdict === 'APPROVE') {
     const sampleVote = voteResult.votes.find((v) => v.verdict === 'APPROVE');
     task.reviewedAt = new Date().toISOString();
-    task.reviewProvider = 'ornith';
-    task.ornithVerdict = `Confident majority APPROVE (${voteSummary})\n\n${sampleVote ? sampleVote.response : ''}`;
-    task.ornithVotes = voteResult.votes;
+    task.reviewProvider = 'local';
+    task.localVerdict = `Confident majority APPROVE (${voteSummary})\n\n${sampleVote ? sampleVote.response : ''}`;
+    task.localVotes = voteResult.votes;
     task.voteErrors = voteResult.voteErrors;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
     appendHistoryEvent(task, 'approved', voteSummary);
@@ -435,8 +435,8 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   const sampleVote = voteResult.votes.find((v) => v.verdict === 'REJECT');
   const match = sampleVote && sampleVote.response.match(/REJECT:\s*(.+)/);
   const reason = match ? match[1] : `REJECT (${voteSummary})`;
-  task.reviewProvider = 'ornith';
-  task.ornithVotes = voteResult.votes;
+  task.reviewProvider = 'local';
+  task.localVotes = voteResult.votes;
   task.voteErrors = voteResult.voteErrors;
   recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
   appendHistoryEvent(task, 'blocked', reason);

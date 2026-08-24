@@ -31,7 +31,7 @@ function writeBlockedTask(blockedDir, id, extra = {}) {
 
 test('rejectRetryCheck requeues a review-rejected task under the retry cap', () => {
   const { blockedDir, pendingDir } = setupDirs();
-  writeBlockedTask(blockedDir, 'task-1', { ornithRejectCount: 0 });
+  writeBlockedTask(blockedDir, 'task-1', { localRejectCount: 0 });
 
   const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
 
@@ -40,12 +40,12 @@ test('rejectRetryCheck requeues a review-rejected task under the retry cap', () 
   assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
   assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
   const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
-  assert.equal(requeued.ornithRejectCount, 1);
+  assert.equal(requeued.localRejectCount, 1);
 });
 
 test('rejectRetryCheck stamps exhausted exactly once when the retry cap is hit, not on every call', () => {
   const { blockedDir, pendingDir } = setupDirs();
-  writeBlockedTask(blockedDir, 'task-1', { ornithRejectCount: 2 });
+  writeBlockedTask(blockedDir, 'task-1', { localRejectCount: 2 });
 
   const first = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
   assert.equal(first.exhausted, 1);

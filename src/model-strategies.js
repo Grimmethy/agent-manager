@@ -1,7 +1,7 @@
 'use strict';
 
 // Named model-strategy registry (chatdev's ThinkingRegistration pattern, adapted
-// 2026-07-26) -- extends the existing LOCAL_AB_MODELS A/B mechanism (ornith-worker.ps1's
+// 2026-07-26) -- extends the existing LOCAL_AB_MODELS A/B mechanism (local-worker.ps1's
 // Select-AbModel, in place well before this file existed) with per-model GENERATION
 // PARAMETERS, not just a different model tag. Every pass today uses one fixed
 // temperature/numPredict/think regardless of which model is actually running -- if a
@@ -43,7 +43,7 @@ function resolveStrategy(nameOrModelTag) {
 }
 
 // CLI mode (`node model-strategies.js --resolve <name>`): prints the resolved strategy as
-// JSON, so ornith-worker.ps1 can look one up without duplicating this registry in
+// JSON, so local-worker.ps1 can look one up without duplicating this registry in
 // PowerShell -- same "compute it once in JS, consume it from PowerShell" split as
 // task-sources.js's --priority-map/--pending-readiness.
 if (require.main === module) {

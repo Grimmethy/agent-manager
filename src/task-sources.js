@@ -143,7 +143,7 @@ function isTaskReady(task, pipelineDir) {
 }
 
 // CLI mode (`node task-sources.js --pending-readiness`, mirrors --priority-map): computes
-// isTaskReady() for every task currently sitting in pending/, so ornith-worker.ps1's claim
+// isTaskReady() for every task currently sitting in pending/, so local-worker.ps1's claim
 // order can skip a not-yet-ready task without re-implementing this check in PowerShell.
 function pendingReadinessMap() {
   const { pipelineDir } = getConfig();
@@ -708,7 +708,7 @@ function nextProjectSearchTask() {
 // local-client.js's num_ctx=8192 default, which deep_dive's plan/implement calls never
 // override. A community anywhere near the old ceiling had literally no room left in the
 // context window for a response, regardless of thinking mode -- the no-think retry
-// fallback (ornith-worker.ps1) helps the THINKING-budget-exhaustion failure mode, but
+// fallback (local-worker.ps1) helps the THINKING-budget-exhaustion failure mode, but
 // can't rescue a prompt that overflows num_ctx outright before any output is generated.
 // 24000 chars (~6K tokens) leaves headroom for the prompt template/instructions plus
 // num_predict=1400's response reservation within the 8192 budget.
@@ -759,7 +759,7 @@ function parseStrongLeadsFromIndex(indexText) {
 // clone with --no-model-naming (see ADR-0019: naming a community here is a free heuristic,
 // never a spent Ornith round-trip) and --target-dir so this repo's own graphify-out/
 // graph.json is never touched. Both the clone and the graph-build are slow/blocking --
-// deliberately done here, inline in the normal ornith-worker.ps1 tick, and NOT in
+// deliberately done here, inline in the normal local-worker.ps1 tick, and NOT in
 // queue-watchdog.ps1's tight poll loop (see docs/deep-dive-pipeline.md's "Clone management"
 // section for why).
 function onboardDeepDiveProject(lead, clonesDir) {
@@ -1985,7 +1985,7 @@ function getNextTask({ tierFilter } = {}) {
 // repoRoot can otherwise be claimed and applied against a totally different one if the
 // pipeline gets repointed in between (reproduced live 2026-07-27: repointing at a fresh
 // throwaway repo caused ~48 unrelated cross-project import candidates to be drafted and
-// auto-approved against it). ornith-worker.ps1 checks this at claim time, before any
+// auto-approved against it). local-worker.ps1 checks this at claim time, before any
 // Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
   const { pipelineDir, repoRoot, taskRepoUrl, jobTypeCountersPath } = getConfig();
@@ -2056,7 +2056,7 @@ if (require.main === module) {
   ensureRegistered();
 
   // `node task-sources.js --priority-map` prints {name: priority} for every registered
-  // source and exits without touching pending/adhoc. Consumed by ornith-worker.ps1 so the
+  // source and exits without touching pending/adhoc. Consumed by local-worker.ps1 so the
   // worker's claim order (which task in pending/ to pick up next) uses the SAME priority
   // ladder as generation order, instead of the old binary manual-vs-everything-else rank
   // that let a large pre-existing backlog starve a newer, higher-priority task indefinitely

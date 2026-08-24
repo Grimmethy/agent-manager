@@ -2,7 +2,7 @@
 # projects.json) into $env: for any var not already set in the process. Explicit
 # process-level env vars always win; this only fills gaps, never overrides.
 #
-# Dot-source this as the FIRST line of any entry-point script (ornith-worker.ps1,
+# Dot-source this as the FIRST line of any entry-point script (local-worker.ps1,
 # review-runner.ps1, apply-runner.ps1, queue-watchdog.ps1), before any $env:AGENT_MANAGER_*
 # check -- added 2026-07-25 after the exact same missing-env-var bug recurred independently
 # through three different launch paths in one night (a manual dashboard launch, manual

@@ -1,12 +1,12 @@
 param(
     [string]$InstanceId = ('worker-{0}' -f $PID),
-    [string]$Model = $(if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' })
+    [string]$Model = $(if ($env:LOCAL_MODEL) { $env:LOCAL_MODEL } elseif ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' })
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
 
 # Two distinct locations, not one: PackageSrcDir is where THIS script and its sibling
-# .js files (ornith-client.js, prompts.js, task-sources.js, ...) live -- fixed, wherever
+# .js files (local-client.js, prompts.js, task-sources.js, ...) live -- fixed, wherever
 # the package is installed. PipelineDir is where the CONSUMER's queue/instances/temp data
 # (and its own local task sources like agent-task-db.js) lives -- set via env var, since
 # the package no longer lives inside the consumer's own repo.
@@ -26,7 +26,7 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 $LiveLogPath = if ($SecondBrainDir) { Join-Path $SecondBrainDir 'Ornith Live Log.md' } else { Join-Path $TempDir 'live-log.md' }
 
 # All dynamic content (repo files, notes, the model's own output) is built as plain
-# strings in Node (prompts.js, ornith-client.js) and only ever passed here as opaque
+# strings in Node (prompts.js, local-client.js) and only ever passed here as opaque
 # variable values -- never spliced into a PowerShell string literal -- so there is no
 # here-string delimiter or interpolation hazard from arbitrary file content.
 
@@ -44,14 +44,17 @@ if (-not (Test-InstanceLiveness -InstanceId $InstanceId -TickSecs 60)) { exit 1 
 # All concurrent instances should normally use the SAME model tier -- Ollama keeps only
 # one tier resident on typical hardware (OLLAMA_MAX_LOADED_MODELS effectively 1), so
 # mixing model tiers across instances causes swap-load thrashing, not parallelism.
-$env:ORNITH_MODEL = $Model
+$env:LOCAL_MODEL = $Model
+$env:ORNITH_MODEL = $Model  # back-compat for anything still reading the old name
 
 # Same-stage A/B candidates for the implement pass only (see Select-AbModel below). Unset
 # or single-entry -- the default -- means every implement call uses $Model, byte-identical
 # to before this existed. Only safe on a single worker instance, same reason as above:
 # running distinct candidate lists across concurrent instances would thrash the model
 # cache the same way mixed model tiers would.
-$AbCandidates = if ($env:ORNITH_AB_MODELS) { $env:ORNITH_AB_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { @() }
+$AbCandidates = if ($env:LOCAL_AB_MODELS) { $env:LOCAL_AB_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
+    elseif ($env:ORNITH_AB_MODELS) { $env:ORNITH_AB_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
+    else { @() }
 
 # Per-instance drafting subfolder: the claim mechanism. Move-Item into it is atomic on
 # the same volume, so two workers can never hold the same task file.
@@ -66,29 +69,29 @@ function Write-Heartbeat {
     Write-HeartbeatFile -InstanceId $InstanceId -Status $Status -Model $Model -TaskId $TaskId -Pass $Pass -StartedAt $startedAt
 }
 
-function Invoke-OrnithClient {
+function Invoke-LocalClient {
     param([string]$Prompt, [bool]$Think = $true, [double]$Temperature = 0.4, [int]$NumPredict = 1400, [string]$Format = $null, [string]$ModelOverride = $null)
     $reqPath = Join-Path $TempDir ('req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; think = $Think; temperature = $Temperature; numPredict = $NumPredict }
     if ($Format) { $reqObj | Add-Member -NotePropertyName 'format' -NotePropertyValue $Format }
     if ($ModelOverride) { $reqObj | Add-Member -NotePropertyName 'model' -NotePropertyValue $ModelOverride }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     # 2>&1 is load-bearing, not cosmetic: without it, `& node ...` in PowerShell only ever
     # captures stdout into $rawLines -- stderr goes straight to the console/host and is
     # NEVER present in the captured variable, confirmed empirically (a `console.error(...);
     # process.exit(1)` child produced a completely empty captured array without 2>&1, and
     # the real message with it). This is exactly why arch-discovery-community-3 blocked
     # with the undiagnosable reason "call exited 1: " (nothing after the colon) --
-    # ornith-client.js's CLI entry writes its actual error via console.error (stderr) then
+    # local-client.js's CLI entry writes its actual error via console.error (stderr) then
     # process.exit(1), and that text was silently discarded before reaching this throw.
     # NOTE: an earlier version of this comment claimed review-runner.ps1's matching
     # functions already had this fixed -- checked directly, they do not; they have the
-    # identical gap. Fixed there too, see review-runner.ps1's Invoke-OrnithClient /
-    # Invoke-OrnithMajorityVote.
+    # identical gap. Fixed there too, see review-runner.ps1's Invoke-LocalClient /
+    # Invoke-LocalMajorityVote.
     $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
     if ($LASTEXITCODE -ne 0) {
-        throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+        throw ('local-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
     }
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
@@ -104,12 +107,12 @@ function Select-AbModel {
     return $Candidates[[BitConverter]::ToUInt32($hash, 0) % $Candidates.Count]
 }
 
-function Invoke-OrnithToolClient {
+function Invoke-LocalToolClient {
     param([string]$Prompt, [int]$MaxTurns = 5)
     $reqPath = Join-Path $TempDir ('tool-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; maxTurns = $MaxTurns }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-tool-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-tool-client.js'
     $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
@@ -159,7 +162,7 @@ function Add-LiveLogEntry {
 # is confirmed gone.
 #
 # That grace window is NOT about how long a legitimate Ornith call can run (a call
-# timing out doesn't put us here at all -- ornith-client.js's own 4-min REQUEST_TIMEOUT_MS
+# timing out doesn't put us here at all -- local-client.js's own 4-min REQUEST_TIMEOUT_MS
 # crashes the worker script, and Get-Process above already found the PID missing by the
 # time this runs). It exists purely for the startup race: THIS scan runs when a worker
 # is starting, and a just-restarted sibling could be mid-launch and not yet have written
@@ -235,7 +238,7 @@ Write-Host ('Worker {0} (model {1}) starting. Close this window or Ctrl+C to sto
 
 if (-not (Test-Path $LiveLogPath)) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LiveLogPath) | Out-Null
-    [System.IO.File]::WriteAllText($LiveLogPath, "# Live Log`n`nAppended to continuously by ornith-worker.ps1.`n")
+    [System.IO.File]::WriteAllText($LiveLogPath, "# Live Log`n`nAppended to continuously by local-worker.ps1.`n")
 }
 
 Write-Heartbeat -Status 'idle'
@@ -337,7 +340,7 @@ while ($true) {
 
     # Per-task error isolation (2026-07-19, the real fix behind candidate AC-015's correct
     # diagnosis): before this try existed, ANY uncaught error in the pass sequence below --
-    # most commonly ornith-client.js's 4-min REQUEST_TIMEOUT_MS surfacing as a thrown
+    # most commonly local-client.js's 4-min REQUEST_TIMEOUT_MS surfacing as a thrown
     # exception under $ErrorActionPreference='Stop' -- killed the ENTIRE worker process.
     # That one mechanism drove every crash loop of the 2026-07-19 incident: process death
     # -> -NoExit zombie shell -> watchdog restart -> full task redo -> same wall. A failed
@@ -423,7 +426,7 @@ while ($true) {
     # (a wrong Prisma property name) originated in the PLAN text itself, not implement, so a
     # plan-quality judgment call from Ornith review must still get a fresh plan attempt, not
     # risk silently repeating a flawed one forever.
-    $skipPlan = $task.ornithRejectCount -gt 0 -and
+    $skipPlan = $task.localRejectCount -gt 0 -and
         $task.PSObject.Properties['reviewProvider'] -and
         $task.reviewProvider -like 'deterministic-*' -and
         $task.PSObject.Properties['planResponse'] -and
@@ -435,22 +438,22 @@ while ($true) {
     } else {
         $planPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'plan'
         # arch_discovery's plan pass was wired to try a real, narrow, read-only codebase-search
-        # tool (grep_codebase via ornith-tool-client.js's /api/chat tool-calling loop) instead
+        # tool (grep_codebase via local-tool-client.js's /api/chat tool-calling loop) instead
         # of the plain single-shot /api/generate call every other source uses. DISABLED
         # 2026-07-15: confirmed live that Ollama's /api/chat + tools hangs indefinitely on this
         # model/hardware (a standalone test with a trivial prompt never returned in 30 minutes),
-        # and a real arch_discovery task through Invoke-OrnithToolClient stalled the whole
+        # and a real arch_discovery task through Invoke-LocalToolClient stalled the whole
         # worker for 13+ minutes with no progress even AFTER the Node-side kill-switch file was
         # already in place -- the degrade-to-plain-call path did not actually unstick it. Rather
         # than keep debugging a known-broken feature live against the production queue, this
         # reverts arch_discovery to the same plain call every other source already uses, byte-
-        # for-byte. Do not re-enable Invoke-OrnithToolClient here until the underlying hang is
+        # for-byte. Do not re-enable Invoke-LocalToolClient here until the underlying hang is
         # root-caused and fixed in isolation, off the live queue.
-        $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
+        $planResult = Invoke-LocalClient -Prompt $planPrompt -Think $true -Temperature 0.4 -NumPredict 1400
     }
     $planSw.Stop()
-    # Invoke-OrnithToolClient's result shape is { response, toolCallLog, turnsUsed,
-    # toolsDisabled } -- no .thinking or .degenerate fields, unlike Invoke-OrnithClient's
+    # Invoke-LocalToolClient's result shape is { response, toolCallLog, turnsUsed,
+    # toolsDisabled } -- no .thinking or .degenerate fields, unlike Invoke-LocalClient's
     # { response, thinking, degenerate, attempts }. Handle the shape mismatch defensively
     # rather than let a missing property crash the loop or silently miscompute degeneracy.
     $planThinking = if ($null -ne $planResult.thinking) { $planResult.thinking } else { '' }
@@ -467,13 +470,13 @@ while ($true) {
     # this model's documented thinking-budget-exhaustion failure mode: the hidden `thinking`
     # trace burns the entire num_predict allotment and leaves zero tokens for the actual
     # answer -- a real, silent empty response, not a transient glitch that a same-config
-    # retry would fix (ornith-client.js's call() already retried 3x with thinking on before
+    # retry would fix (local-client.js's call() already retried 3x with thinking on before
     # returning here). See docs/ornith-delegation.md's own hard-won conclusion: "thinking
     # off -- don't just raise num_predict and hope it finishes." Retrying once WITHOUT
     # thinking frees the whole budget for the answer instead, before giving up and blocking.
     if ($planDegenerate -eq 'empty' -and -not $skipPlan) {
         Write-Host ('Plan empty with thinking on, retrying without thinking: {0}' -f $task.id) -ForegroundColor DarkYellow
-        $planResult = Invoke-OrnithClient -Prompt $planPrompt -Think $false -Temperature 0.4 -NumPredict 1400
+        $planResult = Invoke-LocalClient -Prompt $planPrompt -Think $false -Temperature 0.4 -NumPredict 1400
         $planThinking = if ($null -ne $planResult.thinking) { $planResult.thinking } else { '' }
         $planDegenerate = if ($null -ne $planResult.degenerate) {
             $planResult.degenerate
@@ -652,10 +655,10 @@ while ($true) {
         $implNumPredict = if ($null -ne $abStrategyNumPredict) { $abStrategyNumPredict } else { 1400 }
         if ($task.source -in @('trouble_log', 'arch_review', 'brain_dump_sort') -or $task.domain -eq 'adhoc') {
             $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $false }
-            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -Format 'json' -ModelOverride $abModel
+            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -Format 'json' -ModelOverride $abModel
         } else {
             $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $true }
-            $implResult = Invoke-OrnithClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -ModelOverride $abModel
+            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -ModelOverride $abModel
         }
     }
     $implSw.Stop()
@@ -723,7 +726,7 @@ while ($true) {
 
     $critiquePromptLines = & node (Join-Path $PackageSrcDir 'prompts.js') $draftingPath 'critique' $planTextPath $implTextPath
     $critiquePrompt = ($critiquePromptLines -join "`n")
-    $critiqueResult = Invoke-OrnithClient -Prompt $critiquePrompt -Think $true -Temperature 0.4 -NumPredict 900
+    $critiqueResult = Invoke-LocalClient -Prompt $critiquePrompt -Think $true -Temperature 0.4 -NumPredict 900
     Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Critique' -Thinking $critiqueResult.thinking -Response $critiqueResult.response -Degenerate $critiqueResult.degenerate
 
     if ($critiqueResult.degenerate) {
@@ -742,7 +745,7 @@ while ($true) {
 
         $revisePromptLines = & node (Join-Path $PackageSrcDir 'prompts.js') $draftingPath 'revise' $planTextPath $implTextPath $critiqueTextPath
         $revisePrompt = ($revisePromptLines -join "`n")
-        $reviseResult = Invoke-OrnithClient -Prompt $revisePrompt -Think $true -Temperature 0.4 -NumPredict 1400
+        $reviseResult = Invoke-LocalClient -Prompt $revisePrompt -Think $true -Temperature 0.4 -NumPredict 1400
         Add-LiveLogEntry -TaskId $task.id -Title $task.title -Pass 'Revision' -Thinking $reviseResult.thinking -Response $reviseResult.response -Degenerate $reviseResult.degenerate
 
         if (-not $reviseResult.degenerate) {
@@ -779,7 +782,7 @@ while ($true) {
     # Revision pass, asked to fix a critiqued draft, produced fluent English refusing to
     # verify the draft ("I cannot verify this draft...") instead of either fixing it or
     # outputting nothing -- coherent prose, not gibberish/empty/repeated-character, so
-    # detectDegenerate() (ornith-client.js) never catches it. That exact response then won
+    # detectDegenerate() (local-client.js) never catches it. That exact response then won
     # a 2/3 APPROVE review vote and would have landed in the real candidates doc. Reuses
     # parseArchDiscoveryCandidates (the SAME parser apply-group-a.js's real apply step
     # uses for BOTH sources) via arch-discovery-structcheck.js, so "does this look like a
