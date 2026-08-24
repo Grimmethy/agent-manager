@@ -468,6 +468,7 @@ function fmtAge(sec) {
 
 function statusBadgeClass(status, stale) {
   if (stale) return 'bad';
+  if (status === 'offline') return 'idle';
   if (status === 'working' || status === 'checking') return 'ok';
   if (status === 'idle') return 'idle';
   // 'queued' (2026-08-19): a claimed task waiting its turn behind another lane at the
@@ -575,7 +576,7 @@ async function renderWorkers() {
         </div>
       </div>
       <div class="meta">
-        pid ${inst.pid} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
         ${inst.currentTaskId ? ' · working on <strong>' + inst.currentTaskId + '</strong>' + (inst.currentPass ? ' (' + inst.currentPass + ')' : '') : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
