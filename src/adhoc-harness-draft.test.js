@@ -102,7 +102,14 @@ test('applied:true, resolution=implemented -- a real Group-B diff gets captured 
   });
 });
 
-test('applied:true, resolution=no-changes-needed -- real matches found, model confidently says nothing to do', async () => {
+// Regression, 2026-08-24: caught live via a real adhoc task that exhausted both automatic
+// reject-retries on this exact path, review correctly rejecting an empty-derived "no code
+// change was needed" verdict both times -- adhocHarnessSearchImplementPrompt's own text
+// (prompts.js) tells the model an empty response means "not confident enough to ground a
+// change... a deeper investigation pass will take over next," not "this is my final
+// answer." An empty response here must fall through to the next tier, the same as the
+// zero-hits case, never a terminal no-changes-needed verdict on its own.
+test('applied:false when the implement pass returns an empty response -- falls through to the next tier, not a terminal no-changes-needed', async () => {
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask();
     let call = 0;
@@ -112,9 +119,11 @@ test('applied:true, resolution=no-changes-needed -- real matches found, model co
       return { response: '', degenerate: null, attempts: 1 };
     };
     const result = await draftAdhocViaHarnessSearch(task, { ornithCall });
-    assert.equal(result.applied, true);
-    assert.equal(task.adhocResolution, 'no-changes-needed');
-    assert.equal(task.rawDiff, '');
+    assert.equal(result.applied, false);
+    assert.equal(result.succeeded, true);
+    assert.match(result.reason, /insufficient grounding/);
+    assert.equal(task.adhocResolution, undefined, 'task must be left untouched so the next tier starts clean');
+    assert.equal(task.implementResponse, undefined);
   });
 });
 
