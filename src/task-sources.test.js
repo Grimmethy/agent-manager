@@ -1536,3 +1536,59 @@ test('nextCandidateFulfillmentTask fetches multiple named files, skipping only t
   assert.equal(task.promptContext.fetchedFiles[0].path, 'a.js');
   assert.deepEqual(task.promptContext.files, ['a.js', 'b.js']);
 });
+
+// Regression, 2026-08-24: caught live -- a real task (arch-review-ac-10, "AC-10 ·
+// Example candidate", Files: foo.js, Problem: "...", Solution: "...") sat permanently
+// un-completable for weeks and kept getting blindly bulk-requeued, since this function
+// had always trusted ANY "Strength: Strong" section as actionable content with no check
+// that the section's own Problem/Solution prose was real, not an unfilled template
+// placeholder.
+test('nextCandidateFulfillmentTask skips a candidate whose Problem/Solution is an unfilled "..." placeholder', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-10 · Example candidate',
+    'Strength: Strong',
+    'Files: foo.js',
+    '',
+    'Problem: ...',
+    'Solution: ...',
+  ].join('\n'));
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.equal(task, null, 'a placeholder-only candidate must never become a real task');
+});
+
+test('nextCandidateFulfillmentTask still queues a real candidate that legitimately proposes a brand-new file (no referenced files exist yet, but Problem/Solution are real prose)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'src/does-not-exist-yet.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task, 'a real finding proposing a new file must not be rejected just because the file does not exist yet');
+  assert.deepEqual(task.promptContext.fetchedFiles, []);
+});
+
+test('nextCandidateFulfillmentTask skips a candidate when only Problem (not Solution) is an unfilled placeholder', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-11 · Half-filled',
+    'Strength: Strong',
+    'Files: real.js',
+    '',
+    'Problem:',
+    '...',
+    '',
+    'Solution:',
+    'A genuine fix description.',
+    '',
+    'Benefits:',
+    'Real improvement.',
+  ].join('\n'));
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.equal(task, null);
+});
