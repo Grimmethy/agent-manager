@@ -24,6 +24,8 @@ function withFixtureRepo(fn) {
   delete process.env.AGENT_MANAGER_FORCE_PROVIDER;
   const { clearRegistry } = require('./task-source-registry.js');
   clearRegistry();
+  const { clearModelProfileRegistry } = require('./model-profile-registry.js');
+  clearModelProfileRegistry();
   delete require.cache[require.resolve('./task-sources.js')];
   delete require.cache[require.resolve('./prompts.js')];
   delete require.cache[require.resolve('./local-draft.js')];

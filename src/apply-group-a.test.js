@@ -194,6 +194,8 @@ test('a Strong candidate written by applyArchDiscoveryCandidates is correctly pi
     // calls (module cache alone would silently reuse whatever was registered first).
     const { getRegisteredSource, clearRegistry } = require('./task-source-registry.js');
     clearRegistry();
+  const { clearModelProfileRegistry } = require('./model-profile-registry.js');
+  clearModelProfileRegistry();
     delete require.cache[require.resolve('./task-sources.js')];
     require('./task-sources.js');
     const archReview = getRegisteredSource('arch_review');

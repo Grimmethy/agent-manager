@@ -18,6 +18,8 @@ function freshDeps(repoRoot) {
   process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
   const { clearRegistry } = require('../task-source-registry.js');
   clearRegistry();
+  const { clearModelProfileRegistry } = require('../model-profile-registry.js');
+  clearModelProfileRegistry();
   delete require.cache[require.resolve('../task-sources.js')];
   delete require.cache[require.resolve('../apply-group-a.js')];
   delete require.cache[require.resolve('./observability-review.js')];
@@ -178,6 +180,8 @@ test('observability_review genuine verdict -> apply writes a candidate -> observ
   process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
   const { clearRegistry, getRegisteredSource } = require('../task-source-registry.js');
   clearRegistry();
+  const { clearModelProfileRegistry } = require('../model-profile-registry.js');
+  clearModelProfileRegistry();
   delete require.cache[require.resolve('../task-sources.js')];
   const { nextCandidateFulfillmentTask } = require('../task-sources.js'); // registers observability_review + observability_fix as a module-load side effect
 
@@ -219,6 +223,8 @@ test('observability_review false-positive verdict -> apply is a clean no-op, no 
   process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = candidatesPath;
   const { clearRegistry, getRegisteredSource } = require('../task-source-registry.js');
   clearRegistry();
+  const { clearModelProfileRegistry } = require('../model-profile-registry.js');
+  clearModelProfileRegistry();
   delete require.cache[require.resolve('../task-sources.js')];
   require('../task-sources.js');
 
