@@ -7,6 +7,10 @@ Usage: python dashboard/app.py
 Reads AGENT_MANAGER_PIPELINE_DIR (or AGENT_MANAGER_REPO_ROOT as a fallback) for where
 queue/ and instances/ live, same as every other script in this package.
 AGENT_MANAGER_DASHBOARD_PORT (default 7420) picks the port.
+
+Binds 127.0.0.1 by default. AGENT_MANAGER_DASHBOARD_HOST opts into binding 0.0.0.0 or a
+specific LAN IP (see README's Dashboard section for the auth token this requires and the
+TLS options -- AGENT_MANAGER_DASHBOARD_CERT/_KEY for direct HTTPS, or a reverse proxy).
 """
 
 import fcntl
@@ -5037,14 +5041,49 @@ def api_pipeline_stop():
     return jsonify({"stopped": _stop_pipeline(force=force)})
 
 
+def _is_loopback_host(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("AGENT_MANAGER_DASHBOARD_PORT", "7420"))
-    # Default stays loopback-only; AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0 opts into LAN
-    # access for the companion app (see lan_mutation_gate above for what that changes).
+    # Default stays loopback-only; AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0 (or a specific LAN
+    # IP) opts into LAN access for the companion app (see lan_mutation_gate above for what
+    # that changes on the auth side).
     host = os.environ.get("AGENT_MANAGER_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+    # TLS: AGENT_MANAGER_DASHBOARD_CERT/_KEY point at a cert/key pair (self-signed via
+    # openssl/mkcert is fine -- see README's Dashboard section) so app.run() below can
+    # terminate HTTPS itself. Binding to a non-loopback host without them means every
+    # request -- including the claude-token setter and the Bearer token itself -- would
+    # cross the LAN in plaintext, so that combination is refused outright rather than
+    # silently serving plaintext HTTP to other machines. Running behind a reverse proxy
+    # (Caddy/Nginx/Tailscale serve, README documents Caddy) is the other supported path:
+    # in that setup AGENT_MANAGER_DASHBOARD_HOST stays at its loopback default and the
+    # proxy is what binds the LAN-facing address and terminates TLS.
+    cert_path = (os.environ.get("AGENT_MANAGER_DASHBOARD_CERT") or "").strip()
+    key_path = (os.environ.get("AGENT_MANAGER_DASHBOARD_KEY") or "").strip()
+    ssl_context = None
+    if cert_path or key_path:
+        if not (cert_path and key_path):
+            sys.exit(
+                "AGENT_MANAGER_DASHBOARD_CERT and AGENT_MANAGER_DASHBOARD_KEY must both be "
+                "set to enable HTTPS -- only one was provided."
+            )
+        ssl_context = (cert_path, key_path)
+    elif not _is_loopback_host(host):
+        sys.exit(
+            f"AGENT_MANAGER_DASHBOARD_HOST={host!r} binds off loopback, which sends "
+            "credentials and task data over the network in plaintext unless TLS is "
+            "terminated somewhere. Either set AGENT_MANAGER_DASHBOARD_CERT/_KEY to a "
+            "cert/key pair so this process serves HTTPS directly, or put a TLS-terminating "
+            "reverse proxy (Caddy/Nginx/Tailscale serve) in front and leave "
+            "AGENT_MANAGER_DASHBOARD_HOST unset -- see the README's Dashboard section."
+        )
+
     active = get_active_repo_root()
     print(f"Dashboard reading pipeline dir: {get_pipeline_dir() if active else '(none configured yet -- use the Project tab)'}")
-    print(f"Open http://localhost:{port}")
+    print(f"Open {'https' if ssl_context else 'http'}://localhost:{port}")
     # use_reloader=True alone (Werkzeug watches app.py's directory, restarts the whole
     # process on change) WITHOUT debug=True -- confirmed live 2026-07-25: a dashboard
     # process left running all night served stale API endpoints for hours after multiple
@@ -5069,4 +5108,4 @@ if __name__ == "__main__":
     # docstring for why this has to be built here rather than reused from elsewhere.
     threading.Thread(target=_chat_reservation_watchdog, daemon=True).start()
 
-    app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True)
+    app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True, ssl_context=ssl_context)
