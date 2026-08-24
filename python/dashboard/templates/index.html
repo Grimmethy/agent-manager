@@ -2165,6 +2165,7 @@ async function renderJobListTab() {
   const approvalModeByName = {};
   const workerTypeByName = {};
   const timesPerformedByName = {};
+  const availableByName = {};
   (jobTypes || []).forEach((j) => {
     activeByName[j.name] = j.active;
     alwaysActiveByName[j.name] = j.alwaysActive;
@@ -2172,6 +2173,7 @@ async function renderJobListTab() {
     approvalModeByName[j.name] = j.approvalMode;
     workerTypeByName[j.name] = j.workerType;
     timesPerformedByName[j.name] = j.timesPerformed;
+    availableByName[j.name] = j.available;
   });
 
   // Sort by the EFFECTIVE priority (server override if any, else JOB_TYPES' static
@@ -2224,6 +2226,15 @@ async function renderJobListTab() {
     // one way to change it is the "Reset counts" button below, which zeroes every row at
     // once (see /api/job-types/reset-counts's own comment for why never a single row).
     const timesPerformed = timesPerformedByName[j.source] ?? 0;
+    // Available: how many Strong-rated candidates this source's own backlog doc (e.g.
+    // ARCH_REVIEW_CANDIDATES.md) still has waiting, not yet claimed by any in-queue
+    // fulfillment task (app.py's available_candidate_counts()). Only a handful of sources
+    // have an enumerable backlog doc at all (arch_review, arch_import_review,
+    // observability_fix, performance_fix) -- null for everything else, shown as a blank
+    // cell rather than a misleading 0 for a source whose real backlog size just isn't
+    // tracked anywhere (an inbox folder, a flags file, external scanner output, ...).
+    const available = jobTypes ? availableByName[j.source] : null;
+    const availableCell = available == null ? '' : String(available);
     return `
     <tr>
       <td>${checkbox}</td>
@@ -2233,12 +2244,13 @@ async function renderJobListTab() {
       <td>${j.source}</td>
       <td>${j.domain}</td>
       <td>${timesPerformed}</td>
+      <td>${availableCell}</td>
       <td>${escapeHtml(j.description)}</td>
     </tr>
   `;
   }).join('');
   main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
 
   const resetButton = document.getElementById('reset-job-type-counts');
   if (resetButton) {
