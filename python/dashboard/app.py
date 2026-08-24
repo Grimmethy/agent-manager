@@ -4087,6 +4087,40 @@ def read_task_priorities() -> dict:
     return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_PRIORITIES.items()}
 
 
+VALID_WORKER_TYPES = ("ornith", "reasoning")
+
+# Mirrors src/task-sources.js's registerTaskSource({reasoningTier}) calls: only adhoc and
+# research_task are registered 'high' (Claude/reasoning worker); every other source defaults
+# to 'low' (Ornith). The default a source falls back to when AGENT_MANAGER_TASK_TIERS has no
+# override for it -- same "Python duplicates Node's knowledge" convention as
+# TASK_SOURCE_DEFAULT_PRIORITIES above.
+TASK_SOURCE_DEFAULT_WORKER_TYPES = {
+    name: ("reasoning" if name in ("adhoc", "research_task") else "ornith") for name in TASK_SOURCE_CATALOG
+}
+
+
+def read_worker_types() -> dict:
+    """Job List tab's editable Worker Type column (Ornith/low-reasoning vs the
+    Claude-backed reasoning worker). AGENT_MANAGER_TASK_TIERS holds only the overrides
+    ("name:tier,name:tier"), same sparse-override shape src/config.js's taskTierOverrides
+    parses on the Node side -- a source not listed here just keeps its
+    TASK_SOURCE_DEFAULT_WORKER_TYPES value. Stored as the Node-side low/high tier names
+    ('low'/'high') so both sides agree on-disk, translated to ornith/reasoning at the API
+    boundary for the UI."""
+    raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_TASK_TIERS", "")
+    tier_to_worker_type = {"low": "ornith", "high": "reasoning"}
+    overrides = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        name, _, tier = pair.partition(":")
+        name = name.strip()
+        tier = tier.strip()
+        if tier in tier_to_worker_type:
+            overrides[name] = tier_to_worker_type[tier]
+    return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_WORKER_TYPES.items()}
+
+
 VALID_APPROVAL_MODES = ("auto", "prompt", "approve")
 
 
@@ -4224,6 +4258,7 @@ def api_job_types():
     active = read_active_job_types()
     priorities = read_task_priorities()
     approval_modes = read_approval_modes()
+    worker_types = read_worker_types()
     counters = read_job_type_counters()
     return jsonify([
         {
@@ -4232,6 +4267,7 @@ def api_job_types():
             "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
             "priority": priorities.get(name, TASK_SOURCE_DEFAULT_PRIORITIES.get(name)),
             "approvalMode": approval_modes.get(name),
+            "workerType": worker_types.get(name, TASK_SOURCE_DEFAULT_WORKER_TYPES.get(name)),
             "timesPerformed": counters.get(name, 0),
         }
         for name in TASK_SOURCE_CATALOG
@@ -4351,6 +4387,38 @@ def api_job_types_approval_mode():
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPROVAL_MODES", new_value)
 
     return jsonify({"name": name, "approvalMode": mode})
+
+
+@app.route("/api/job-types/worker-type", methods=["POST"])
+def api_job_types_worker_type():
+    """Job List tab's editable Worker Type column (ornith/reasoning) -- lets a human
+    reassign which worker claims a given task type's tasks. Mirrors
+    api_job_types_priority()'s exact shape -- persists to AGENT_MANAGER_TASK_TIERS in
+    agent-manager.env (as the Node-side low/high tier names), which src/config.js's
+    taskTierOverrides reads fresh on every `node task-sources.js` invocation and
+    model-provider.js's reasoningTierFor() consults, so an edit here takes effect on the
+    very next worker tick with no pipeline restart needed."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    worker_type = (body.get("workerType") or "").strip()
+    if name not in TASK_SOURCE_CATALOG:
+        abort(400, description=f"unknown job type '{name}'")
+    if worker_type not in VALID_WORKER_TYPES:
+        abort(400, description=f"workerType must be one of {VALID_WORKER_TYPES}")
+
+    worker_types = read_worker_types()
+    worker_types[name] = worker_type
+
+    # Collapse back to "no overrides" (empty string) when every source ends up at its own
+    # default -- same tidy-round-trip reasoning as the priority/approval-mode collapses above.
+    worker_type_to_tier = {"ornith": "low", "reasoning": "high"}
+    non_default = {
+        n: worker_type_to_tier[wt] for n, wt in worker_types.items() if wt != TASK_SOURCE_DEFAULT_WORKER_TYPES.get(n)
+    }
+    new_value = ",".join(f"{n}:{t}" for n, t in sorted(non_default.items()))
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_TIERS", new_value)
+
+    return jsonify({"name": name, "workerType": worker_type})
 
 
 def _stop_pipeline(force: bool = False) -> list:

@@ -2079,12 +2079,14 @@ async function renderJobListTab() {
   const alwaysActiveByName = {};
   const priorityByName = {};
   const approvalModeByName = {};
+  const workerTypeByName = {};
   const timesPerformedByName = {};
   (jobTypes || []).forEach((j) => {
     activeByName[j.name] = j.active;
     alwaysActiveByName[j.name] = j.alwaysActive;
     priorityByName[j.name] = j.priority;
     approvalModeByName[j.name] = j.approvalMode;
+    workerTypeByName[j.name] = j.workerType;
     timesPerformedByName[j.name] = j.timesPerformed;
   });
 
@@ -2120,6 +2122,18 @@ async function renderJobListTab() {
           ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
         </select>`
       : `<span class="meta">${approvalMode}</span>`;
+    // Worker Type: which worker actually claims this source's tasks -- 'ornith' (the
+    // local, low-reasoning worker) or 'reasoning' (the Claude-backed high-reasoning
+    // worker). Note for adhoc/research_task specifically: their actual draft call is
+    // hardcoded to Claude regardless of this setting (see model-provider.js's
+    // reasoningTierFor() comment), so overriding those two rows to 'ornith' only changes
+    // which worker's claim filter picks the task up, not what drafts it.
+    const workerType = workerTypeByName[j.source] ?? 'ornith';
+    const workerTypeCell = jobTypes
+      ? `<select class="worker-type-select" data-source="${escapeAttr(j.source)}">
+          ${['ornith', 'reasoning'].map((w) => `<option value="${w}" ${w === workerType ? 'selected' : ''}>${w}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${workerType}</span>`;
     // Times Performed: cumulative, all-time count of how many tasks this job type has
     // ever generated (Brain Dump, 2026-08-23) -- independent of the Active/Priority/
     // Approval Mode columns above, which only affect FUTURE tasks. Read-only here; the
@@ -2131,6 +2145,7 @@ async function renderJobListTab() {
       <td>${checkbox}</td>
       <td>${priorityCell}</td>
       <td>${approvalModeCell}</td>
+      <td>${workerTypeCell}</td>
       <td>${j.source}</td>
       <td>${j.domain}</td>
       <td>${timesPerformed}</td>
@@ -2139,7 +2154,7 @@ async function renderJobListTab() {
   `;
   }).join('');
   main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
 
   const resetButton = document.getElementById('reset-job-type-counts');
   if (resetButton) {
@@ -2219,6 +2234,26 @@ async function renderJobListTab() {
         });
       } catch (e) {
         alert('Could not update approval mode: ' + e.message);
+        select.value = original;
+      }
+      select.disabled = false;
+    };
+  });
+
+  main.querySelectorAll('.worker-type-select').forEach((select) => {
+    select.onchange = async () => {
+      const source = select.dataset.source;
+      const original = workerTypeByName[source];
+      const workerType = select.value;
+      select.disabled = true;
+      try {
+        await fetch('/api/job-types/worker-type', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: source, workerType }),
+        });
+      } catch (e) {
+        alert('Could not update worker type: ' + e.message);
         select.value = original;
       }
       select.disabled = false;
