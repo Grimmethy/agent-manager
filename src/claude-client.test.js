@@ -30,6 +30,11 @@ const REAL_EXEC_FILE_SYNC = child_process.execFileSync;
 function requireFreshClaudeClient() {
   delete require.cache[require.resolve('./claude-client.js')];
   delete require.cache[require.resolve('./local-client.js')];
+  // sandbox.js caches bwrap's resolved path at first call (see its own clearBwrapPathCache
+  // comment) -- cleared here too so a test that installs a `which`-mocking execFileSync
+  // always gets a fresh lookup, never a path cached from an earlier test's real (or
+  // differently-mocked) environment.
+  delete require.cache[require.resolve('./sandbox.js')];
   return require('./claude-client.js');
 }
 
@@ -151,6 +156,80 @@ test('callOnce passes --allowedTools instead of --tools when a caller explicitly
     );
     assert.ok(capturedArgs.includes('--allowedTools'));
     assert.ok(!capturedArgs.includes('--tools'));
+  });
+});
+
+// 2026-08-24 (sandbox.js): the mock here has to handle TWO distinct execFileSync shapes --
+// sandbox.js's own `which bwrap` lookup, and the real `bwrap ... -- claude ...` invocation
+// this call site produces once available -- so a fake `which` command is passed via PATH
+// (a real script, not a further mock layer) rather than trying to special-case execFileSync
+// itself for the `which` shape. This host may or may not have real bwrap installed, so the
+// PATH override always wins regardless.
+function withFakeBwrapOnPath(bwrapCapture, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-fake-bwrap-'));
+  const fakeBwrap = path.join(dir, 'bwrap');
+  // Records its own invocation to bwrapCapture.args and exits 0 with nothing on stdout --
+  // callOnce()'s own JSON.parse would fail on empty output, so this script hands back a
+  // minimal valid result JSON, same shape execFileSync's mock returns elsewhere in this file.
+  fs.writeFileSync(fakeBwrap, `#!/bin/sh\necho "$@" > "${path.join(dir, 'captured-args.txt')}"\necho '{"result":"ok"}'\n`);
+  fs.chmodSync(fakeBwrap, 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${dir}:${priorPath}`;
+  try {
+    return fn(() => fs.readFileSync(path.join(dir, 'captured-args.txt'), 'utf8').trim());
+  } finally {
+    process.env.PATH = priorPath;
+  }
+}
+
+test('callOnce({ sandbox }) invokes bwrap instead of CLAUDE_BIN directly', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    await withFakeBwrapOnPath(null, async (readCaptured) => {
+      const claudeClient = requireFreshClaudeClient();
+      const result = await claudeClient.callOnce({
+        prompt: 'investigate this',
+        cwd: os.tmpdir(),
+        allowedTools: 'Read,Bash',
+        sandbox: { readOnlyBinds: ['/usr'], writableBinds: [os.tmpdir()] },
+      });
+      assert.equal(result.sandboxUnavailable, false);
+      const captured = readCaptured();
+      assert.match(captured, /--ro-bind \/usr \/usr/);
+      assert.match(captured, /-- claude -p/, 'the wrapped command must still be the real claude CLI invocation, after the bwrap sandbox args');
+    });
+  });
+});
+
+test('callOnce without a sandbox param never touches bwrap -- every existing caller keeps invoking CLAUDE_BIN directly', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedBin = null;
+    await withMockedClient(
+      (bin) => { capturedBin = bin; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'hello' }); },
+    );
+    assert.equal(capturedBin, 'claude');
+  });
+});
+
+test('callOnce({ sandbox }) falls open (still runs, unsandboxed) and flags sandboxUnavailable when bwrap is not on PATH', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedBin = null;
+    // execFileSync is fully replaced here (same as every other withMockedClient test), so
+    // a real PATH change alone can't simulate "bwrap missing" -- the mock never actually
+    // does a filesystem/PATH lookup. Instead, the mock itself throws for the `which`
+    // shape specifically (sandbox.js's own bwrapPath() lookup), reproducing exactly what
+    // a real `which bwrap` failure looks like to that try/catch, and answers normally for
+    // every other call (the real claude invocation this should still fall through to).
+    const result = await withMockedClient(
+      (bin, args) => {
+        if (bin === 'which') throw new Error('which: bwrap: command not found');
+        capturedBin = bin;
+        return JSON.stringify({ result: 'ok' });
+      },
+      async ({ callOnce }) => callOnce({ prompt: 'hello', sandbox: { readOnlyBinds: [], writableBinds: [] } }),
+    );
+    assert.equal(capturedBin, 'claude', 'must fall back to invoking claude directly, not fail the whole call');
+    assert.equal(result.sandboxUnavailable, true);
   });
 });
 

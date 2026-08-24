@@ -30,6 +30,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { detectDegenerate } = require('./local-client.js');
+const { wrapWithSandbox } = require('./sandbox.js');
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
@@ -82,7 +83,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -130,9 +131,31 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   }
   if (MAX_BUDGET_USD) args.push('--max-budget-usd', MAX_BUDGET_USD);
 
+  // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
+  // this -- the one real Bash-capable, unattended tool-use path in this codebase (see
+  // sandbox.js's own header). Every other caller omits it and this branch never runs,
+  // completely unchanged behavior. Fails OPEN with a flagged return field, not closed --
+  // a hardening layer on top of existing behavior must never become a new single point of
+  // failure that halts real work; the caller (adhoc-agentic-draft.js) is responsible for
+  // surfacing sandboxUnavailable somewhere visible (task.sandboxUnavailable) rather than
+  // silently degrading.
+  let execBin = CLAUDE_BIN;
+  let execArgs = args;
+  let sandboxUnavailable = false;
+  if (sandbox) {
+    const wrapped = wrapWithSandbox(CLAUDE_BIN, args, { workDir, ...sandbox });
+    if (wrapped.available) {
+      execBin = wrapped.command;
+      execArgs = wrapped.args;
+    } else {
+      sandboxUnavailable = true;
+      console.error('[claude-client] sandbox requested but bwrap is not available on this host -- running unsandboxed (see sandbox.js AGENT_MANAGER_ADHOC_SANDBOX)');
+    }
+  }
+
   let stdout;
   try {
-    stdout = execFileSync(CLAUDE_BIN, args, {
+    stdout = execFileSync(execBin, execArgs, {
       encoding: 'utf8',
       // timeoutMs lets a caller running a genuinely long agentic session (real
       // Read/Grep/Glob/Edit/Write/Bash investigation + implementation + test runs, not
@@ -172,6 +195,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     // adhoc-agentic-draft.js's own turn-exhaustion retry, the first real consumer.
     stopReason: parsed.stop_reason || null,
     numTurns: parsed.num_turns != null ? parsed.num_turns : null,
+    sandboxUnavailable,
   };
 }
 
