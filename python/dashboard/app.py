@@ -1127,7 +1127,7 @@ def api_models_cost_summary():
 
 @app.route("/api/instances/<instance_id>/recent-tasks")
 def api_instance_recent_tasks(instance_id):
-    """Last 10 tasks a given worker instance actually completed (2026-08-23, Workers tab:
+    """Last 10 tasks a given instance actually completed (2026-08-23, Workers tab:
     "When I click on a worker to expand it's information I'd like to see a list of the
     last 10 tasks it completed."). model_calls is the only place that ties a task_id to
     the instance that drafted it (see model-stats-db.js's own instance_id migration) --
@@ -1135,7 +1135,19 @@ def api_instance_recent_tasks(instance_id):
     (review-task.js's recordModelOutcome stamps that onto the drafting instance's own
     call_id via task.abCallId), same shipped-vs-not distinction the rest of this file's
     cost tracking already relies on. GROUP BY task_id since a task can carry several calls
-    (retries/revisions) from the same instance; ordered by whichever timestamp is freshest."""
+    (retries/revisions) from the same instance; ordered by whichever timestamp is freshest.
+
+    reviewer (2026-08-24, Grimmethy: "add reviewer's reviewed tasks too") is a special
+    case, not just the branch below with a different verdict word: review-task.js never
+    calls recordCall for its own majorityVote() calls at all, only recordModelOutcome
+    against the DRAFTER's own call_id -- so instance_id='reviewer' never matches a single
+    row in this table, the drafting worker's instance_id does. This deployment only ever
+    runs ONE reviewer instance (dead-process-check.js's restartTargetFor() has no
+    "reviewer-N" concept, unlike worker-N), so outcome_stage='review' alone unambiguously
+    means "the reviewer decided this" regardless of which worker drafted it -- no need to
+    join against instance_id at all for this branch. Includes both verdicts (approved AND
+    rejected both count as "reviewed"), unlike the draft branch below which only counts
+    approved as "completed"."""
     db_path = model_stats_db_path()
     if not db_path or not db_path.is_file():
         return jsonify({"tasks": []})
@@ -1143,6 +1155,16 @@ def api_instance_recent_tasks(instance_id):
     try:
         if not _has_instance_id_column(conn):
             return jsonify({"tasks": []})
+        if instance_id == "reviewer":
+            rows = conn.execute("""
+                SELECT task_id, MAX(outcome_at) AS at, MAX(model) AS model, MAX(outcome) AS outcome
+                FROM model_calls
+                WHERE outcome_stage = 'review' AND outcome IS NOT NULL
+                GROUP BY task_id
+                ORDER BY at DESC
+                LIMIT 10
+            """).fetchall()
+            return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m, "outcome": o} for t, at, m, o in rows]})
         rows = conn.execute("""
             SELECT task_id, MAX(COALESCE(outcome_at, started_at)) AS at, MAX(model) AS model
             FROM model_calls
