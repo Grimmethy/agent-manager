@@ -1743,13 +1743,26 @@ document.getElementById('global-brain-dump-btn').onclick = openGlobalBrainDumpMo
 // brain's set-active-project/create-github-project buttons already use. event.stopPropagation()
 // is load-bearing: the row's own onclick (openDetail) must not also fire when a button
 // inside that row is clicked.
-async function postTaskAction(state, id, action, confirmMessage) {
+async function postTaskAction(state, id, action, confirmMessage, body) {
   if (confirmMessage && !confirm(confirmMessage)) return;
   try {
-    const res = await fetch(`/api/task/${state}/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+    const opts = { method: 'POST' };
+    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+    const res = await fetch(`/api/task/${state}/${encodeURIComponent(id)}/${action}`, opts);
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.description || `${res.status}`);
+      const respBody = await res.json().catch(() => ({}));
+      // 2026-08-24 (pipeline hardening): a requeue can come back 409 specifically because
+      // this task's blockedReason looks like the same problem as an earlier attempt (see
+      // app.py's _repeated_blocker_match) -- not a generic error, a real "are you sure"
+      // checkpoint. Only requeue ever sends this shape; every other 409 (e.g. "already
+      // has a task in pending/") falls through to the plain alert below same as before.
+      if (res.status === 409 && action === 'requeue' && !(body && body.force)) {
+        if (confirm(`${respBody.description}\n\nRequeue anyway?`)) {
+          return postTaskAction(state, id, action, null, { force: true });
+        }
+        return;
+      }
+      throw new Error(respBody.description || `${res.status}`);
     }
     await renderQueueTab(state);
   } catch (e) {
