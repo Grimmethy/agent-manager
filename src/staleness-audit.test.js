@@ -162,6 +162,32 @@ test('findStalenessCandidates flags age-stale, fabrication-repeat, AND retries-e
   assert.ok(!ids.includes('fine-1'));
 });
 
+// Regression, 2026-08-24: caught live -- a real staleness_audit task ended up auditing
+// ANOTHER staleness_audit task, because a staleness_audit task's own evidenceText
+// necessarily quotes real repo file paths (describing the ORIGINAL flagged task it's
+// about), false-positiving findFilesTouchedSince's git-log check. "Is this report still
+// relevant" is a meaningless question for a source whose output IS a verdict about a
+// different task, not a code claim later commits could resolve.
+test('findStalenessCandidates never proposes a staleness_audit or pipeline_self_audit task as its own candidate, even when it matches every other criterion', () => {
+  const now = Date.parse('2026-02-01T00:00:00.000Z');
+  const selfAudit = makeTask({
+    id: 'staleness-audit-x', source: 'staleness_audit',
+    history: [{ stage: 'exhausted', at: '2026-01-01T00:00:00.000Z', detail: '2/2 retries used' }],
+    ornithRejectCount: 2, blockedReason: 'fabricated a fake module',
+  });
+  const selfAudit2 = makeTask({
+    id: 'pipeline-self-audit-x', source: 'pipeline_self_audit',
+    history: [{ stage: 'exhausted', at: '2026-01-01T00:00:00.000Z', detail: '2/2 retries used' }],
+  });
+  const normal = makeTask({ id: 'normal-1', source: 'observability_review', history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] });
+
+  const candidates = findStalenessCandidates([selfAudit, selfAudit2, normal], {}, now);
+  const ids = candidates.map((c) => c.task.id);
+  assert.ok(!ids.includes('staleness-audit-x'));
+  assert.ok(!ids.includes('pipeline-self-audit-x'));
+  assert.ok(ids.includes('normal-1'));
+});
+
 test('findStalenessCandidates orders the longest-neglected task first', () => {
   const now = Date.parse('2026-02-01T00:00:00.000Z');
   const older = makeTask({ id: 'older', history: [{ stage: 'blocked', at: '2026-01-01T00:00:00.000Z' }] });
