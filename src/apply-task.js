@@ -20,6 +20,7 @@ const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
+const { syncTaskToRepo } = require('./task-repo-sync.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -328,6 +329,21 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // { files: [...] } (one or more). Normalize to an array so both shapes stage
     // correctly regardless of which path produced the artifact.
     const filesToAdd = artifact.files || [artifact.file];
+
+    // task-repo-sync.js (2026-08-24) -- true piggyback: writes the task's own record
+    // (commit: false, no separate commit of its own) into THIS SAME working tree, then
+    // folds its path into filesToAdd so it lands in the exact same commit as the real
+    // code change, rather than creating a second, redundant commit the way task-
+    // history.js's own 'blocked'/'needs-clarification' hook does for transitions that
+    // have no code commit to ride along with. Best-effort, fails open -- a sync failure
+    // must never block a real, already-approved code change from landing.
+    try {
+      const synced = syncTaskToRepo(task, { repoRoot, commit: false });
+      if (synced.relPath) filesToAdd.push(synced.relPath);
+    } catch (e) {
+      console.error(`[apply-task] syncTaskToRepo failed for ${task.id}: ${e.message}`);
+    }
+
     gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
