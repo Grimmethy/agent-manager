@@ -124,13 +124,30 @@ test('callOnce builds the expected non-interactive invocation shape', async () =
         assert.equal(result.sessionId, 's1');
       },
     );
-    assert.deepEqual(capturedArgs.slice(0, 2), ['-p', 'summarize this']);
+    assert.equal(capturedArgs[0], '-p');
+    // 2026-08-24 (pipeline hardening): the raw prompt string is no longer sent verbatim
+    // -- callOnce prepends a real-date anchor line to every call (see
+    // current-date-line.js) -- so this asserts the ORIGINAL prompt is still present
+    // rather than the whole arg being exactly the caller's string.
+    assert.match(capturedArgs[1], /summarize this$/);
     assert.ok(capturedArgs.includes('--output-format'));
     assert.ok(capturedArgs.includes('json'));
     assert.ok(capturedArgs.includes('--max-turns'));
     assert.ok(capturedArgs.includes('--permission-mode'));
     // No tools granted by default -- this is a text-completion backend, not an agentic session.
     assert.ok(!capturedArgs.includes('--allowedTools'));
+  });
+});
+
+test('callOnce prepends a real-date anchor line to the prompt', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok', session_id: 's1' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'summarize this' }); },
+    );
+    const today = new Date().toISOString().slice(0, 10);
+    assert.match(capturedArgs[1], new RegExp(`Real current date: ${today}`));
   });
 });
 

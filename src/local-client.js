@@ -13,6 +13,7 @@ const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const localThroughput = require('./local-throughput.js');
+const { currentDateLine } = require('./current-date-line.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -103,14 +104,15 @@ function estimateTokens(text) {
 }
 
 async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source }) {
-  const promptTokens = estimateTokens(prompt);
+  const datedPrompt = `${currentDateLine()}\n\n${prompt}`;
+  const promptTokens = estimateTokens(datedPrompt);
 
   const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
 
-  const body = { model: model || MODEL, prompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
+  const body = { model: model || MODEL, prompt: datedPrompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
   // Grammar-constrained decoding. When `format` is set ("json", or a full JSON-schema object),
   // Ollama restricts the sampler to tokens valid for that grammar, so a malformed or
   // markdown-fenced response is *unrepresentable* rather than merely discouraged in the prompt.
