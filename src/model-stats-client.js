@@ -21,6 +21,26 @@ const { estimateApiCostUsd } = require('./anthropic-pricing.js');
 
 const SCRIPT_PATH = path.join(__dirname, 'model-stats-db.js');
 
+// hostname/platform/gpu_name (2026-08-24, see model-stats-db.js's own migration comment
+// for the full request): hostname and platform are pure os.*() reads (instant, no
+// subprocess), but the GPU name comes from nvidia-smi -- real but slow enough (tens of
+// ms) that paying it on EVERY call would add up across a busy pipeline. Queried once per
+// process and cached (module-level, not per-call) since a box's GPU doesn't change
+// mid-run; a box with no/unsupported GPU resolves to null once and stays null, same
+// fail-open shape as gpu-vram.js's own queryVram().
+let cachedGpuName;
+function getGpuName() {
+  if (cachedGpuName !== undefined) return cachedGpuName;
+  try {
+    const out = execFileSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], { encoding: 'utf8', timeout: 5000 });
+    const name = out.trim().split('\n')[0].trim();
+    cachedGpuName = name || null;
+  } catch (e) {
+    cachedGpuName = null;
+  }
+  return cachedGpuName;
+}
+
 function runEvent(event, payload) {
   const tmpPath = path.join(os.tmpdir(), `model-stats-${event}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   try {
@@ -93,6 +113,13 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
       }),
     attempts: result && result.attempts != null ? result.attempts : null,
     degenerate: result && result.degenerate != null ? result.degenerate : null,
+    // hostname/platform/gpuName (2026-08-24, "Logs should include what hardware/software
+    // was used for each test"): which physical box and OS ran this call, plus its GPU
+    // (best-effort, see getGpuName() above) -- needed to compare A/B candidates fairly
+    // across a mixed-hardware fleet instead of assuming every call ran on the same box.
+    hostname: os.hostname(),
+    platform: `${os.platform()} ${os.release()}`,
+    gpuName: getGpuName(),
   });
   return callId;
 }
