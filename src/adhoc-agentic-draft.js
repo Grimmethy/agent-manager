@@ -42,7 +42,36 @@ const GIT_TIMEOUT_MS = 60_000;
 const ADHOC_TIMEOUT_MS = Number(process.env.AGENT_MANAGER_ADHOC_TIMEOUT_MS) || 900_000;
 const ADHOC_MAX_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_MAX_TURNS) || 30;
 
-const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed)\b/i;
+const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose)\b/i;
+
+// Grimmethy, 2026-08-24: "we had discussed setting up a task that breaks down jobs that
+// are too large" -- the actual task built for this (adhoc "Give agentic adhoc drafting a
+// self-assessed decomposition path...") burned all 5 of its own draft retries hitting
+// max_turns itself, too large a task for the very mechanism it was building. Implemented
+// directly instead of leaving it stuck in that bootstrapping loop.
+//
+// A RESOLUTION: decompose response is expected to be followed by a JSON array of 2+
+// {title, rawText} sub-tasks (see buildAgenticPrompt below for the exact instruction).
+// Deliberately permissive parsing -- pulls out the first bracketed JSON array found
+// anywhere after the RESOLUTION line (models don't reliably put pure JSON with nothing
+// else around it, same reasoning apply-group-b.js's own JSON extraction already applies)
+// and drops any entry missing a non-empty title/rawText rather than failing the whole
+// batch over one malformed entry.
+function parseSubTaskProposals(text) {
+  const match = (text || '').match(/\[[\s\S]*\]/);
+  if (!match) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const cleaned = parsed
+    .filter((t) => t && typeof t.title === 'string' && t.title.trim() && typeof t.rawText === 'string' && t.rawText.trim())
+    .map((t) => ({ title: t.title.trim(), rawText: t.rawText.trim() }));
+  return cleaned.length ? cleaned : null;
+}
 
 // Same "claude:<model>" label format model-provider.js's labelFor()/local-worker.sh's
 // HEARTBEAT_MODEL use -- stamped onto task.draftModel below so apply-task.js's commit
@@ -70,19 +99,33 @@ function buildAgenticPrompt(task) {
     'confidently: implement it. Read whatever real files you need first -- do not guess ' +
     'at code you have not actually looked at. Run the real test suite relevant to what ' +
     'you changed (e.g. `npm test`, `python3 -m py_compile <changed .py files>`) before ' +
-    'finishing, and fix any failures your own change introduced. If the task is too ' +
-    'vague, too large, or requires a product/design decision only a human should make, ' +
-    'do not guess -- explain why in your final summary instead of making a large, ' +
-    'unrequested judgment call.',
+    'finishing, and fix any failures your own change introduced. If the task is vague or ' +
+    'requires a product/design decision only a human should make, do not guess -- explain ' +
+    'why in your final summary instead of making a large, unrequested judgment call.',
     '',
-    'When you are completely done, end your FINAL message with exactly one of these two ' +
+    'If the task is simply TOO LARGE to implement confidently in one pass (touches many ' +
+    'files/subsystems, or you can tell you would run out of turns partway through), do ' +
+    'NOT attempt a partial implementation and do NOT make any code changes. Instead split ' +
+    'it into 2-6 smaller, independently-implementable pieces that together cover the ' +
+    'original task -- each piece should be small enough for a single fresh session to ' +
+    'finish on its own.',
+    '',
+    'When you are completely done, end your FINAL message with exactly one of these three ' +
     'lines (nothing after it on that line):',
     'RESOLUTION: implemented',
     'RESOLUTION: no-changes-needed',
+    'RESOLUTION: decompose',
     '',
-    'followed by a short (2-4 sentence) plain-English summary of what you did, or why ' +
-    'nothing was needed -- this is what a human reads to decide whether to apply your ' +
-    'change.',
+    'If RESOLUTION: implemented or no-changes-needed -- follow with a short (2-4 sentence) ' +
+    'plain-English summary of what you did, or why nothing was needed -- this is what a ' +
+    'human reads to decide whether to apply your change.',
+    '',
+    'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, ' +
+    'in exactly this shape (a title and a full, self-contained description for each ' +
+    'piece -- someone implementing just that one piece must not need to re-read the ' +
+    'original task to understand it):',
+    '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
+    'Then a short (1-3 sentence) explanation of why you split it this way.',
   ].join('\n');
 }
 
@@ -182,6 +225,23 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
       return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}` };
     }
 
+    if (resolution === 'decompose') {
+      // No diff capture here -- Claude was told not to make code changes for this
+      // resolution, and even if it looked at files first that's read-only investigation,
+      // nothing to stage. applyAdhocDiff.js queues subTaskProposals as fresh adhoc tasks
+      // at apply time; this function's only job is producing a valid proposal list.
+      const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
+      const subTasks = parseSubTaskProposals(afterResolution);
+      if (!subTasks || subTasks.length < 2) {
+        return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks (total_cost_usd=${totalCostUsd.toFixed(4)})` };
+      }
+      task.adhocResolution = resolution;
+      task.subTaskProposals = subTasks;
+      task.rawDiff = '';
+      task.implementResponse = summary;
+      return { succeeded: true, blocked: false };
+    }
+
     let rawDiff = '';
     try {
       // `git diff` alone only ever shows already-TRACKED files' changes -- a brand new
@@ -219,4 +279,4 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   }
 }
 
-module.exports = { draftAdhocImplement, buildAgenticPrompt };
+module.exports = { draftAdhocImplement, buildAgenticPrompt, parseSubTaskProposals };
