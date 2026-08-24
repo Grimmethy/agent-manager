@@ -1983,6 +1983,55 @@ def api_task_resolve_clarification(task_id):
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
+@app.route("/api/task/needs-clarification/<task_id>/answer", methods=["POST"])
+def api_task_answer_clarification(task_id):
+    """Multiple-choice / free-text answer for a 'design-decision' held task -- Grimmethy,
+    2026-08-24: "we could build in some multiple choice options into the task log
+    including an 'other:' option that the user could fill in without ever starting a chat
+    session... reduce the friction caused by pausing the pipeline to set up a chat."
+    Distinct from /resolve above (that one's for the file-path picker's 'ambiguous'/
+    'no-match' shape); this is for nc.reason == 'design-decision', where the answer is a
+    human decision folded into the task's own instructions -- same text shape a Discuss
+    session's transcript already gets folded in as (see api_discuss_end's needs-
+    clarification branch), just without ever opening a session.
+    Body: {"answer": "<free text, or the clicked option's label+description>"}."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / "needs-clarification" / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    body = request.get_json(silent=True) or {}
+    answer = (body.get("answer") or "").strip()
+    if not answer:
+        abort(400, description="answer is required")
+
+    data.setdefault("promptContext", {})
+    prior = data["promptContext"].get("rawText", "")
+    data["promptContext"]["rawText"] = prior + (
+        f"\n\nHUMAN DESIGN DECISION (answered directly from the Needs Clarification "
+        f"picker, {datetime.now(timezone.utc).isoformat()}):\n{answer}\n"
+        f"This answer resolves the open question(s) above -- implement against it "
+        f"directly rather than re-asking for clarification."
+    )
+    data.pop("needsClarification", None)
+    data.setdefault("history", []).append({
+        "stage": "needs-clarification-resolved", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": "Answered directly from the dashboard's multiple-choice/Other picker -- requeued to adhoc/ for a fresh draft pass.",
+    })
+
+    adhoc_dir = qdir / "adhoc"
+    adhoc_dir.mkdir(parents=True, exist_ok=True)
+    dest = adhoc_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "answered": True})
+
+
 @app.route("/api/task/needs-clarification/<task_id>/done", methods=["POST"])
 def api_task_mark_done_clarification(task_id):
     """Manual "mark as done" for a held needs-clarification task (Job Status > Needs

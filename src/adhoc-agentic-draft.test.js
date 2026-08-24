@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { draftAdhocImplement, parseSubTaskProposals, buildSandboxOpts } = require('./adhoc-agentic-draft.js');
+const { draftAdhocImplement, parseSubTaskProposals, parseClarificationOptions, buildSandboxOpts } = require('./adhoc-agentic-draft.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -281,6 +281,44 @@ test('parseSubTaskProposals drops malformed entries but keeps valid ones', () =>
 
 test('parseSubTaskProposals returns null when there is no JSON array in the text', () => {
   assert.equal(parseSubTaskProposals('no json here'), null);
+});
+
+test('parseClarificationOptions parses a well-formed OPTIONS block', () => {
+  const text = [
+    'RESOLUTION: needs-human-decision',
+    'Some open question prose here.',
+    '',
+    'OPTIONS:',
+    '1. SQLite storage :: Persists across restarts, queryable by window.',
+    '2. In-memory ring buffer :: Simplest, resets on restart.',
+  ].join('\n');
+  const options = parseClarificationOptions(text);
+  assert.deepEqual(options, [
+    { label: 'SQLite storage', description: 'Persists across restarts, queryable by window.' },
+    { label: 'In-memory ring buffer', description: 'Simplest, resets on restart.' },
+  ]);
+});
+
+test('parseClarificationOptions returns null when there is no OPTIONS block', () => {
+  assert.equal(parseClarificationOptions('just an open question, no options'), null);
+});
+
+test('parseClarificationOptions returns null for a single option (not a real choice)', () => {
+  const text = 'OPTIONS:\n1. Only one :: not really multiple choice';
+  assert.equal(parseClarificationOptions(text), null);
+});
+
+test('parseClarificationOptions stops at the first malformed line rather than throwing', () => {
+  const text = 'OPTIONS:\n1. Good :: fine\nnot a numbered line\n2. Never reached :: nope';
+  const options = parseClarificationOptions(text);
+  assert.equal(options, null); // only 1 well-formed line collected before the malformed one -> not >= 2
+});
+
+test('parseClarificationOptions handles "::" appearing inside a description', () => {
+  const text = 'OPTIONS:\n1. Label A :: uses a ratio like 3::1 for weighting\n2. Label B :: plain description';
+  const options = parseClarificationOptions(text);
+  assert.equal(options.length, 2);
+  assert.equal(options[0].description, 'uses a ratio like 3::1 for weighting');
 });
 
 // 2026-08-24: "Why is it declining to do the work?" -- root-caused live on the hardware-

@@ -45,7 +45,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
-const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
+const { draftAdhocImplement, parseClarificationOptions } = require('./adhoc-agentic-draft.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
 const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
@@ -468,7 +468,15 @@ async function draftTask(task, {
         // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
         // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
         if (agenticResult.needsClarification) {
-          task.needsClarification = { reason: 'design-decision', openQuestions: task.implementResponse };
+          // 2026-08-24 (Grimmethy: multiple-choice shortcut) -- options is undefined
+          // (never a key at all, not even null) when the model didn't offer a clean
+          // 2+ option OPTIONS block, so the dashboard's existing `nc.options` check
+          // stays a plain truthy test either way.
+          const options = parseClarificationOptions(task.implementResponse);
+          task.needsClarification = {
+            reason: 'design-decision', openQuestions: task.implementResponse,
+            ...(options ? { options } : {}),
+          };
           appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
           appendHistoryEvent(task, 'needs-clarification');
           return { succeeded: true, blocked: false, needsClarification: true };
