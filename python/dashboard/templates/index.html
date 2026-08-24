@@ -1573,20 +1573,31 @@ function buildRadarChartSvg(axisLabels, seriesByModel) {
   return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">${rings}${spokes}${polygons}${labels}</svg>`;
 }
 
-// Combined view across every saved run -- no re-aggregated chart/performance table (that
-// would mean re-implementing reasoning-bench.js's summarize() a second time in browser JS
-// just to merge per-run summaries; the case picker's best/worst stats above already give
-// the pooled-across-all-runs verdict). This is specifically the "show me every response
-// we've ever collected" view the single-run Responses table can't provide by itself.
+// Combined view across every saved run -- no re-aggregated perf table (that would mean
+// re-implementing reasoning-bench.js's summarize() a second time in browser JS just to
+// merge per-run summaries; the case picker's best/worst stats above already give the
+// pooled-across-all-runs verdict). The radar IS included here (Grimmethy, 2026-08-24:
+// "I'd prefer it to be aggregate data" -- the single-run radar mostly came up empty since
+// no saved run happened to compare 2+ models across 3+ cases at once, even though the
+// SAME model pair had, in aggregate, plenty of overlapping case coverage across separate
+// runs): buildBenchmarkRadarHtml already scores off a flat results array grouped by
+// caseId+model, so pooling every run's results into one array before calling it is a
+// straight rename of the same call the single-run view already makes, not a second
+// re-aggregation path.
 function buildAllRunsResultsHtml(runsData) {
   if (runsData.length === 0) return '<div class="empty">No saved benchmark runs yet.</div>';
   const allResults = runsData.flatMap(run => run.results.map(r => ({ ...r, runId: run.runId })))
     .sort((a, b) => (a.model === b.model ? a.caseId.localeCompare(b.caseId) : a.model.localeCompare(b.model)));
   const totalRuns = runsData.length;
+  const allModels = [...new Set(runsData.flatMap(run => run.models))].sort();
+  const radarHtml = allModels.length > 1 ? buildBenchmarkRadarHtml(allModels, allResults) : '';
   return `
     <div class="meta">${allResults.length} response${allResults.length === 1 ? '' : 's'} across ${totalRuns} saved run${totalRuns === 1 ? '' : 's'}.</div>
     <div class="field-label" style="margin-top:16px">Responses (click to view full prompt/response)</div>
-    ${buildResponseTable(allResults)}
+    <div class="bench-responses-row">
+      <div class="bench-responses-table">${buildResponseTable(allResults)}</div>
+      ${radarHtml}
+    </div>
   `;
 }
 
