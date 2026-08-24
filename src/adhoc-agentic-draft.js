@@ -25,6 +25,7 @@
 
 const os = require('os');
 const path = require('path');
+const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
@@ -33,6 +34,53 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
+
+// AGENT_MANAGER_ADHOC_SANDBOX (2026-08-24, sandbox.js): '0' opts out, defaults ON -- same
+// env-var-with-sane-default convention as ADHOC_MAX_TURNS above. An explicit escape hatch
+// for a host where bwrap causes real trouble, without needing a code change.
+const SANDBOX_ENABLED = process.env.AGENT_MANAGER_ADHOC_SANDBOX !== '0';
+
+// Resolves the Claude CLI's real binary location so the sandbox can bind exactly what's
+// actually needed, not a hardcoded path -- this host happens to install it as a symlink
+// (~/.local/bin/claude) to a self-contained single-file binary under
+// ~/.local/share/claude/versions/<N>, but that's this host's own layout, not guaranteed.
+// Binds BOTH the symlink's own directory (so PATH-based resolution still works inside the
+// sandbox) and the resolved target's directory (the actual binary, wherever it lives).
+// Returns null (sandbox opts stay minimal, not broken) if `which`/realpath fails for any
+// reason -- same fail-open reasoning as the rest of this sandboxing pass.
+function resolveClaudeBinDirs() {
+  try {
+    const bin = process.env.CLAUDE_CLI_BIN || 'claude';
+    const which = execFileSync('which', [bin], { encoding: 'utf8' }).trim();
+    const real = fs.realpathSync(which);
+    return [...new Set([path.dirname(which), path.dirname(real)])];
+  } catch (e) {
+    return [];
+  }
+}
+
+function buildSandboxOpts(resolvedRepoRoot, worktreeDir) {
+  const readOnlyBinds = [
+    '/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl',
+    ...resolveClaudeBinDirs(),
+    path.join(resolvedRepoRoot, '.git'),
+  ];
+  const writableBinds = [
+    worktreeDir,
+    // The worktree's own thin git-dir (index/HEAD/logs -- see this module's header on
+    // `git worktree`'s real on-disk layout) -- needs to be writable even though the rest
+    // of <repoRoot>/.git above is read-only, so `git status`/local `git log` writes from
+    // INSIDE the worktree (not the main repo) still work. Bound AFTER the read-only
+    // <repoRoot>/.git bind above so it correctly overrides just this one subpath (see
+    // sandbox.js's own comment on bind ordering).
+    path.join(resolvedRepoRoot, '.git', 'worktrees', path.basename(worktreeDir)),
+  ];
+  return {
+    readOnlyBinds,
+    writableBinds,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN, PATH: process.env.PATH },
+  };
+}
 
 // Real implement+test cycles run far longer than claude-client.js's normal 300s default
 // (sized for a single text completion, not an agentic tool-use loop) -- generous enough
@@ -158,6 +206,8 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
     return { succeeded: false, reason: `could not create adhoc scratch worktree: ${e.message}` };
   }
 
+  const sandbox = SANDBOX_ENABLED ? buildSandboxOpts(resolvedRepoRoot, worktreeDir) : null;
+
   try {
     const prompt = buildAgenticPrompt(task);
     let totalCostUsd = 0;
@@ -175,8 +225,14 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
         maxTurns: attemptTurns,
         permissionMode: 'dontAsk',
         timeoutMs: ADHOC_TIMEOUT_MS,
+        ...(sandbox ? { sandbox } : {}),
       });
       totalCostUsd += result.costUsd || 0;
+      // sandboxUnavailable (2026-08-24): fails OPEN (the call above still ran, unsandboxed)
+      // but flagged loudly on the task itself, not just a console.error a human might never
+      // see -- see sandbox.js's own header on why this hardening layer must never become a
+      // new single point of failure that blocks real work.
+      if (result.sandboxUnavailable) task.sandboxUnavailable = true;
 
       task.abCallId = recordModelCall({
         taskId: task.id,
