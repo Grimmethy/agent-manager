@@ -61,6 +61,30 @@ convention the underlying model client already used. Set these before launching 
 | `ORNITH_AB_MODELS` | no (default unset -- A/B off) | Comma-separated candidate model tags for a same-stage A/B test of the worker's implement pass. A task deterministically hashes to one candidate (stable across redraft), so the same task always compares the same model. Only safe on a single worker instance -- Ollama keeps one model tier resident, so distinct candidate lists across concurrent instances would thrash the model cache the same way mixing `ORNITH_MODEL` tiers across instances would. |
 | `AGENT_MANAGER_MODEL_STATS_DB_PATH` | no (default `<pipelineDir>/model-stats.db`) | SQLite DB tracking per-model-call outcome/performance/stability stats (see the dashboard's Models tab). The one deliberate exception to this package's no-database-required design -- per-model comparisons need to survive past individual tasks leaving the queue. |
 | `REVIEW_PROVIDER` | no (default `ornith`) | Set to `claude` to use `claude -p` for a combined review+apply call instead. |
+| `AGENT_MANAGER_TASK_REPO_URL` | no | A dedicated git repo every task's record gets committed into (see [Task history](#task-history) below). Unset means this integration simply doesn't run. |
+
+## Task history
+
+Every task this pipeline runs — not just the ones that ship a code change — gets its own
+record committed into a **separate, dedicated repo** (`task-repo-sync.js`), never this
+project's own repo. That's a deliberate choice, not an oversight: mixing task-record
+commits into the code repo's own history bloats it for every collaborator, forever, with
+no way to undo it short of rewriting shared history. A dedicated repo keeps the two
+completely separate — code history stays exactly as clean as it's always been, and task
+history is still one click away.
+
+This pipeline's own live task history is public: **[Grimmethy/agent-manager-tasks](https://github.com/Grimmethy/agent-manager-tasks)**.
+Every task ever queued, drafted, reviewed, blocked, or applied by this actual running
+instance lives there at `tasks/<id>.json`, updated in place across the task's whole
+lifecycle — `git log --follow` on one file shows its complete history, from creation
+through whatever it eventually became.
+
+To wire this up for your own deployment: create an empty repo with a real initial commit
+on its default branch, then set `AGENT_MANAGER_TASK_REPO_URL` to its URL. Nothing else to
+configure — task creation, `blocked`/`needs-clarification` holds, and `applied`/
+`apply-failed` outcomes all sync automatically (`task-history.js`'s `appendHistoryEvent`
+hook). Leaving it unset is a fully supported, fail-open no-op — this integration never
+blocks real pipeline work if the sync itself fails or isn't configured.
 
 ## Domains
 
