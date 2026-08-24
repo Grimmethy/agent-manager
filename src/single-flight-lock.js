@@ -74,4 +74,16 @@ async function withLock(instancesDir, fn) {
   }
 }
 
+// 2026-08-24 (Grimmethy: "add the lock work" for a live Discuss/worker-1 contention bug)
+// -- python/dashboard/single_flight_lock.py is the dashboard-side twin of this file,
+// letting Discuss's LOCAL provider join the exact same GPU/model-slot mutex worker-1 and
+// reviewer already use. Deliberately did NOT add an equivalent lock for Claude calls
+// (worker-reasoning / Discuss's Claude provider): unlike Ollama's single resident model,
+// the Claude Code subscription has no real single-execution-slot constraint -- separate
+// `claude -p` calls already run genuinely concurrently (the same way two independent
+// Claude Code sessions do), bounded only by Anthropic's own account-level rate limits, not
+// a local hardware bottleneck. Forcing them through a mutex here would have been a real
+// regression, not a fix: a multi-minute adhoc draft (real Bash/Edit/Write investigation)
+// would block a live chat, or vice versa, for a resource conflict that doesn't actually
+// exist.
 module.exports = { acquire, release, withLock, lockFilePath };
