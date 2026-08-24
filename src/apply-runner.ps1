@@ -7,7 +7,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
-# Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
+# Two distinct locations, not one -- see local-worker.ps1's header comment for why.
 $PackageSrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AGENT_MANAGER_REPO_ROOT) { throw 'AGENT_MANAGER_REPO_ROOT env var is required.' }
 $RepoRoot = $env:AGENT_MANAGER_REPO_ROOT
@@ -189,7 +189,7 @@ function Invoke-ApplyPass {
             Where-Object {
                 $candidateTask = Read-TaskJson $_.FullName
                 # Mirrors task-source-registry.js's resolveSourceName() -- same mapping
-                # ornith-worker.ps1's own claim-order block already hand-duplicates for the
+                # local-worker.ps1's own claim-order block already hand-duplicates for the
                 # identical reason (no cheap way to round-trip through JS per candidate).
                 $name = $candidateTask.source
                 if ($candidateTask.domain -eq 'adhoc') { $name = 'adhoc' }

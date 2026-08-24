@@ -59,7 +59,7 @@ CLAUDE_DISCUSS_MAX_TURNS = 8
 # can we give it to it?"). Ornith has no tool-calling path through ollama_client.py at
 # all -- generate() is a bare completion call -- so unlike Claude's Read/Grep/Glob above,
 # giving it real grounding means the HARNESS decides what to search for (via a cheap,
-# separate proposal call, see _ornith_harness_context below) and greps on the model's
+# separate proposal call, see _local_harness_context below) and greps on the model's
 # behalf, then hands back real content as part of the actual prompt. Same two-call shape
 # local-draft.js's own arch_import plan->implement step already uses in production
 # (propose search terms, harness runs grep-codebase-tool.js, implement pass gets real
@@ -139,7 +139,7 @@ def _expand_grep_terms(raw_queries: list) -> list:
     return terms
 
 
-def _ornith_harness_context(subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None) -> str | None:
+def _local_harness_context(subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None) -> str | None:
     """Returns a block of real file content to inject into this turn's prompt, or None
     (Ornith decided it didn't need one, the search came back empty, or the search itself
     failed). Two calls: a short/cheap/low-temperature proposal call decides WHETHER and
@@ -191,11 +191,11 @@ def _ornith_harness_context(subject_text: str, transcript: list, repo_root: str,
 def _chat_prompt_for_turn(provider: str, subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None) -> str:
     """Builds the prompt for one Discuss turn, branching on how each provider gets project
     awareness: Claude reaches for real files itself (tools_available, above), Ornith has
-    none, so the harness greps on its behalf first (_ornith_harness_context) when a
+    none, so the harness greps on its behalf first (_local_harness_context) when a
     project is active."""
     if provider == PROVIDER_CLAUDE:
         return _build_chat_prompt(subject_text, transcript, tools_available=bool(repo_root))
-    harness_context = _ornith_harness_context(subject_text, transcript, repo_root, grep_dirs) if repo_root else None
+    harness_context = _local_harness_context(subject_text, transcript, repo_root, grep_dirs) if repo_root else None
     return _build_chat_prompt(subject_text, transcript, harness_context=harness_context)
 
 
@@ -286,7 +286,7 @@ def _build_chat_prompt(subject_text: str, transcript: list, tools_available: boo
         )
     elif harness_context:
         # Ornith has no tool-calling path of its own (see this module's own
-        # _ornith_harness_context) -- this IS its real-file access, already fetched by
+        # _local_harness_context) -- this IS its real-file access, already fetched by
         # the harness based on a search Ornith itself asked for one call ago. Framed as a
         # fait accompli ("here's what was found"), not an offer to search again, since
         # there's no mechanism for it to actually trigger a second search mid-reply.

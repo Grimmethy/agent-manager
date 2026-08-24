@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-// Real bug, reproduced live 2026-07-21: ornith-worker.ps1's arch_import branch builds
+// Real bug, reproduced live 2026-07-21: local-worker.ps1's arch_import branch builds
 // $importQueries via a regex-match -> ForEach-Object -> Where-Object pipeline. When the
 // plan proposes exactly ONE query (an explicitly valid shape -- archImportPlanPrompt asks
 // for "1 to 3"), PowerShell silently collapses that single-element pipeline result to a
@@ -19,7 +19,7 @@ const { execFileSync } = require('child_process');
 // (confirmed: arch-import-autogen-microsoft-1's one-query plan, "pipeline configuration
 // module", produced 232 hits tagged query:"p"/"i"/etc against one arbitrary file).
 //
-// ornith-worker.ps1 now force-wraps the PowerShell side with @(...); this test exercises
+// local-worker.ps1 now force-wraps the PowerShell side with @(...); this test exercises
 // the OTHER half of the fix -- this script's own defensive coercion at the CLI boundary --
 // by feeding it the exact bad shape (a bare string, not an array) a not-yet-fixed or
 // future caller could still produce, and proving it no longer degrades into per-character

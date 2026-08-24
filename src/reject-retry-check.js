@@ -2,12 +2,12 @@
 
 // Reject-retry-requeue: a task genuinely REJECTED by review (blockedStage==='review', not
 // a crash/domain-error block) gets moved back to queue/pending/ for a fresh redraft,
-// capped at MAX_ORNITH_REJECT_RETRIES attempts, tracked via `ornithRejectCount` on the
+// capped at MAX_LOCAL_REJECT_RETRIES attempts, tracked via `localRejectCount` on the
 // task JSON. Port of queue-watchdog.ps1's Invoke-RejectRetryCheck -- the only piece of
 // that script ported here (its other job, dead-process detection/restart, is a separate,
 // not-yet-ported gap; see queue-watcher.sh's own header). Without this, blockedStage:
 // 'review' is a permanent dead end on Linux -- confirmed live 2026-08-14: 17 real blocked
-// tasks, zero retries, because nothing was ever wired to look at ornithRejectCount at all.
+// tasks, zero retries, because nothing was ever wired to look at localRejectCount at all.
 //
 // KNOWN LIMITATION (same as the reference): this is a BLIND retry -- the redraft doesn't
 // see WHY it was rejected beyond priorRejectionFeedback's accumulated reasons (which
@@ -30,7 +30,7 @@ const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 
-const MAX_ORNITH_REJECT_RETRIES = 2;
+const MAX_LOCAL_REJECT_RETRIES = 2;
 
 function isReviewRejection(task) {
   return task.blockedStage === 'review';
@@ -80,13 +80,13 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       summary.checked++;
 
       // Only a genuine review-stage rejection is eligible -- never an apply-stage failure
-      // that happens to still carry ornithVotes from an earlier, unrelated successful
+      // that happens to still carry localVotes from an earlier, unrelated successful
       // review (redrafting can't fix that; see agent-manager-common.sh's
       // test_review_rejection, the bash equivalent of this exact check).
       if (!isReviewRejection(task)) continue;
 
-      const retryCount = Number(task.ornithRejectCount) || 0;
-      if (retryCount >= MAX_ORNITH_REJECT_RETRIES) {
+      const retryCount = Number(task.localRejectCount) || 0;
+      if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
         // Already stamped on a prior tick -- an exhausted task stays in blocked/
         // permanently (nothing here ever moves or deletes it), so without this guard this
         // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
@@ -99,8 +99,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
         // Persist the exhaustion itself onto the task -- previously this branch never
         // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
         // hitting the retry cap carried no record that retries were ever attempted or
-        // exhausted; only ornithRejectCount (no timestamp) hinted at it.
-        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_ORNITH_REJECT_RETRIES} retries used`);
+        // exhausted; only localRejectCount (no timestamp) hinted at it.
+        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
         fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
         summary.exhausted++;
         continue;
@@ -109,7 +109,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
       priorFeedback.push(String(task.blockedReason || ''));
       task.priorRejectionFeedback = priorFeedback;
-      task.ornithRejectCount = retryCount + 1;
+      task.localRejectCount = retryCount + 1;
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);

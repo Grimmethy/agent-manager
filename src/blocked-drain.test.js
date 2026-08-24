@@ -25,7 +25,7 @@ test('requeueBlockedTasksForSignature moves every task matching the signature to
     promptContext: { itemId: '1' },
     history: [{ stage: 'harness-search', detail: '3 quer(y/ies), 0 hit(s), 0 file(s)' }],
     blockedReason: 'no grounding',
-    ornithRejectCount: 2,
+    localRejectCount: 2,
   });
   writeBlocked(dir, 'arch-import-x-2', {
     source: 'arch_import', domain: 'default', title: 'X-2',
@@ -46,7 +46,7 @@ test('requeueBlockedTasksForSignature moves every task matching the signature to
   const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'arch-import-x-1.json'), 'utf8'));
   assert.equal(pending.status, 'pending');
   assert.equal(pending.title, 'X-1');
-  assert.equal(pending.ornithRejectCount, undefined); // stripped -- a fresh do-over, not a continuation
+  assert.equal(pending.localRejectCount, undefined); // stripped -- a fresh do-over, not a continuation
   assert.equal(pending.blockedReason, undefined);
   assert.match(pending.history[0].note, /auto-requeued/);
   assert.match(pending.history[0].note, /arch_import::harness-search-zero-results/);

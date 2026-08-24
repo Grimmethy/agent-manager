@@ -55,7 +55,7 @@ function extractQueries(planText) {
  *
  * @param {object} task
  * @param {object} [deps]
- * @param {function} [deps.ornithCall] - Defaults to model-provider.js's providerFor(task).call.
+ * @param {function} [deps.localCall] - Defaults to model-provider.js's providerFor(task).call.
  * @returns {Promise<{applied: boolean, succeeded: boolean, reason?: string}>}
  *   applied:false, succeeded:true -- couldn't confidently ground a change; try the next tier.
  *   applied:true, succeeded:true -- task mutated with a real result (implemented or
@@ -64,7 +64,7 @@ function extractQueries(planText) {
  *     quality judgment; caller should still fall through to the next tier rather than
  *     block the task outright.
  */
-async function draftAdhocViaHarnessSearch(task, { ornithCall } = {}) {
+async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
   const { repoRoot, pipelineDir } = getConfig();
   // Deliberately NOT model-provider.js's providerFor(task).call -- adhoc is registered
   // high-tier, so providerFor(task) resolves to Claude by default (unless
@@ -73,11 +73,11 @@ async function draftAdhocViaHarnessSearch(task, { ornithCall } = {}) {
   // -- local-client.js's own call(), same backend runPlanWithTools() (local-tool-client.js)
   // always uses for local-agentic-draft.js's own tier, regardless of any tier/override
   // routing that exists for other purposes entirely.
-  const resolvedOrnithCall = ornithCall || require('./local-client.js').call;
+  const resolvedLocalCall = localCall || require('./local-client.js').call;
 
   let planResult;
   try {
-    planResult = await resolvedOrnithCall({ prompt: adhocHarnessSearchPlanPrompt(task), think: true, temperature: 0.4, numPredict: 800, source: task.source });
+    planResult = await resolvedLocalCall({ prompt: adhocHarnessSearchPlanPrompt(task), think: true, temperature: 0.4, numPredict: 800, source: task.source });
   } catch (e) {
     return { applied: false, succeeded: true, reason: `plan call failed: ${e.message}` };
   }
@@ -117,7 +117,7 @@ async function draftAdhocViaHarnessSearch(task, { ornithCall } = {}) {
 
   let implResult;
   try {
-    implResult = await resolvedOrnithCall({
+    implResult = await resolvedLocalCall({
       prompt: adhocHarnessSearchImplementPrompt(task, planResult.response),
       think: false,
       temperature: 0.3,

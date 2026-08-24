@@ -7,13 +7,13 @@
 // apply-task.sh.
 //
 // This is a straight port of the plan/implement/critique/revision sequence in
-// src/ornith-worker.ps1 (the only place that logic previously existed), trimmed to the
+// src/local-worker.ps1 (the only place that logic previously existed), trimmed to the
 // domains actually reachable from task-domains.json (deep_dive, project_search,
 // brain_dump_sort, secondbrain, default, adhoc) -- arch_discovery/arch_import's extra
 // structural-check pass (arch-discovery-structcheck.js) is deliberately NOT ported here
 // since neither domain is wired up outside the Windows path yet.
 //
-// project_search also needs the harness-fetch step ornith-worker.ps1 runs BETWEEN plan and
+// project_search also needs the harness-fetch step local-worker.ps1 runs BETWEEN plan and
 // implement (real GitHub/Hugging Face search results for the queries the plan pass
 // proposed, via project-search-fetch.js) -- missed on the first pass of this port.
 // Confirmed live 2026-08-14: without it, task.promptContext.searchResults stayed
@@ -112,10 +112,10 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
 
 /**
  * The actual draft logic, independent of the CLI/stdout wrapper below -- exported so tests
- * can call it directly with a fake ornithCall.
+ * can call it directly with a fake localCall.
  * @param {object} task - The parsed task record (mutated in place with pass results).
  * @param {object} [deps]
- * @param {function} [deps.ornithCall] - Defaults to model-provider.js's per-task-source
+ * @param {function} [deps.localCall] - Defaults to model-provider.js's per-task-source
  *   pick (local-client.js's call() unless task.source is listed in
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @param {function} [deps.withLockFn] - Defaults to single-flight-lock.js's real withLock.
@@ -123,7 +123,7 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, needsClarification?: boolean, reason?: string}>}
  */
 async function draftTask(task, {
-  ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
+  localCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
   draftAdhocImplementFn = draftAdhocImplement,
   draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
@@ -134,7 +134,7 @@ async function draftTask(task, {
   // until the task object itself is in hand -- passing the whole task (not just
   // task.source) lets a per-instance task.reasoningTier override take effect, e.g. Brain
   // Dump #77's automatic high-reasoning retry for a needs-clarification task. Explicit
-  // test/caller overrides (ornithCall passed in) always win -- this only fills the gap
+  // test/caller overrides (localCall passed in) always win -- this only fills the gap
   // production code leaves (local-draft.js's own main() calls draftTask(task) with no
   // second argument at all).
   // 2026-08-24 (model-profile-registry.js): when the task's own source declares a
@@ -142,33 +142,33 @@ async function draftTask(task, {
   // spread BEFORE each call site's own opts so a pass's own tuned numPredict (plan=1400,
   // critique=900, ...) still wins over the profile's generic default, while model/numCtx
   // (never set by any call site's own opts today) reliably take effect. Skipped entirely
-  // for an injected ornithCall (test/caller override) -- that already wins outright, same
+  // for an injected localCall (test/caller override) -- that already wins outright, same
   // as it always has; wrapping it here would silently change what a test believes it's
   // calling.
   const modelProfile = resolveModelProfile(task);
   const profileOverrides = modelProfile
     ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
     : null;
-  const baseOrnithCall = ornithCall || providerFor(task).call;
-  const resolvedOrnithCall = profileOverrides && !ornithCall
-    ? (opts) => baseOrnithCall({ ...profileOverrides, ...opts })
-    : baseOrnithCall;
+  const baseLocalCall = localCall || providerFor(task).call;
+  const resolvedLocalCall = profileOverrides && !localCall
+    ? (opts) => baseLocalCall({ ...profileOverrides, ...opts })
+    : baseLocalCall;
 
   // Real plan/implement lock split (2026-08-22, Grimmethy: "build it now" -- see
   // single-flight-lock.js's own header for the full incident this fixes). Every real
-  // resolvedOrnithCall() invocation below -- plan, the non-A/B implement branch, critique,
+  // resolvedLocalCall() invocation below -- plan, the non-A/B implement branch, critique,
   // revision -- shares the SAME resolved backend for one draftTask() call (it's computed
   // once, above), so this is computed once too rather than re-checked at each call site.
-  // Deliberately based on labelFor(task) ALONE, not on whether ornithCall was injected --
-  // an earlier version of this gated on `!ornithCall` too (skip locking whenever a test
+  // Deliberately based on labelFor(task) ALONE, not on whether localCall was injected --
+  // an earlier version of this gated on `!localCall` too (skip locking whenever a test
   // supplies a mock call), but that conflated "is this call actually local" with "are we
   // in a test," which meant a test asserting real locking behavior for a normal task
-  // would have to leave ornithCall unset and make a real Ollama/Claude call to exercise
+  // would have to leave localCall unset and make a real Ollama/Claude call to exercise
   // it. A real flock acquire/release is single-digit milliseconds (confirmed live) --
   // cheap enough that tests just inject withLockFn as a lightweight in-memory spy instead
   // (see local-draft.test.js), and production behavior stays exactly what labelFor(task)
   // says regardless of how a test wires the rest of this function. Only ACTUALLY matters
-  // for adhoc/research tasks, whose real IMPLEMENT call bypasses resolvedOrnithCall
+  // for adhoc/research tasks, whose real IMPLEMENT call bypasses resolvedLocalCall
   // entirely for a Claude call that never touches the local GPU
   // (draftAdhocImplementFn/draftResearchImplementFn below) -- for every other task, plan
   // and implement always resolve to the SAME backend, so locking around each call
@@ -186,7 +186,7 @@ async function draftTask(task, {
   const maybeLocked = (isLocal, fn) => (isLocal ? withLockFn(instancesDir, fn) : fn());
 
   try {
-    appendHistoryEvent(task, 'draft-started', task.ornithRejectCount ? `retry ${task.ornithRejectCount}` : undefined);
+    appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
 
     // Deterministic staleness-recheck short-circuit (2026-08-23, Grimmethy: "How do we
     // systematically solve this issue in the future. We need to harden the system so
@@ -233,7 +233,7 @@ async function draftTask(task, {
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact
     // implementResponse -- skips plan+implement entirely, straight to critique. Matches
-    // ornith-worker.ps1's isPreDrafted check EXACTLY (an explicit flag, requiring non-empty
+    // local-worker.ps1's isPreDrafted check EXACTLY (an explicit flag, requiring non-empty
     // implementResponse) -- NOT "does implementResponse happen to already have a value",
     // which was this file's original (wrong) heuristic. That wrong heuristic meant ANY
     // requeued/retried task (reject-retry-check.js moves blocked->pending without clearing
@@ -241,7 +241,7 @@ async function draftTask(task, {
     // to inform the next attempt) hit this branch and skipped straight to critique on its
     // stale, ALREADY-REJECTED implementResponse from the prior attempt -- reject-retry-
     // requeue's entire purpose (a FRESH redraft) silently never happened. Confirmed live
-    // 2026-08-14: every task in queue/drafting/ or queue/pending/ with ornithRejectCount>0
+    // 2026-08-14: every task in queue/drafting/ or queue/pending/ with localRejectCount>0
     // already had planResponse+implementResponse populated from its original (rejected)
     // attempt.
     const isPreDrafted = task.preDrafted === true && !!task.implementResponse;
@@ -253,7 +253,7 @@ async function draftTask(task, {
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
@@ -281,7 +281,7 @@ async function draftTask(task, {
           } catch (e) {
             // Non-fatal -- implement proceeds with no results (its own prompt already
             // handles an empty results list: "(no results -- the searches returned nothing
-            // usable)"), same as ornith-worker.ps1's own try/catch around this call.
+            // usable)"), same as local-worker.ps1's own try/catch around this call.
           }
         }
         task.promptContext.searchResults = searchResults;
@@ -426,7 +426,7 @@ async function draftTask(task, {
         // the existing real Claude agentic path below, exactly as it always has. Both
         // local tiers always run the local model (never gated on resolvedCallIsLocal --
         // adhoc is registered high-tier so that would always read false here), so both
-        // are unconditionally lock-wrapped, same reasoning the abOrnithCall branch above
+        // are unconditionally lock-wrapped, same reasoning the abLocalCall branch above
         // already documents for the same "always local regardless of resolvedCallIsLocal" case.
         const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task));
         if (!harnessResult.applied && harnessResult.succeeded === false) {
@@ -610,13 +610,13 @@ async function draftTask(task, {
       const allowEmptyImplement = isEmptyApprovalSource(task.source);
 
       // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
-      // ornith-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
+      // local-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
       // this had zero real callers on Linux until now). LOCAL_AB_MODELS is a
       // comma-separated list, each entry either a bare Ollama model tag, a
       // model-strategies.js registry name, or a "claude:<model>" entry (new: this is the
       // extension that lets an A/B run directly compare a local model against Claude,
       // not just two local models). Empty/single-entry list -> selectAbModel returns null
-      // -> abModel stays null -> falls through to resolvedOrnithCall exactly as before,
+      // -> abModel stays null -> falls through to resolvedLocalCall exactly as before,
       // the same backward-compatibility guarantee model-strategies.js's own resolveStrategy()
       // already promises. When abModel IS set, it deliberately overrides providerFor(task)'s
       // normal tier-based routing rather than deferring to it -- the whole point of a
@@ -633,12 +633,12 @@ async function draftTask(task, {
         // Never local -- a claude: A/B candidate never touches the local GPU, so no lock.
         implResult = await abClaudeCall({ prompt: implPrompt, model: abModel.slice('claude:'.length), maxTurns: 1, permissionMode: 'dontAsk' });
       } else if (abModel) {
-        const { call: abOrnithCall } = require('./local-client.js');
+        const { call: abLocalCall } = require('./local-client.js');
         // Always local -- this branch only exists because abModel resolved to a bare
         // Ollama tag, not a "claude:" one, so it always needs the real lock (unlike
-        // resolvedCallIsLocal above, this doesn't depend on whether ornithCall was
-        // test-injected, since this branch never calls resolvedOrnithCall at all).
-        implResult = await maybeLocked(true, () => abOrnithCall({
+        // resolvedCallIsLocal above, this doesn't depend on whether localCall was
+        // test-injected, since this branch never calls resolvedLocalCall at all).
+        implResult = await maybeLocked(true, () => abLocalCall({
           prompt: implPrompt,
           think: abStrategy.think != null ? abStrategy.think : !hasFixedLiterals,
           temperature: abStrategy.temperature != null ? abStrategy.temperature : 0.4,
@@ -648,12 +648,12 @@ async function draftTask(task, {
           model: abModel,
         }));
       } else {
-        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
       }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
       // Models tab) and stamps task.abCallId so a later outcome (review verdict, watchdog
-      // requeue) can be joined back to this same row -- port of ornith-worker.ps1's own
+      // requeue) can be joined back to this same row -- port of local-worker.ps1's own
       // record-call-after-implement placement. Confirmed live 2026-08-14: model-stats.db
       // was never created at all (better-sqlite3, the dependency model-stats-db.js needs,
       // wasn't installed -- `npm install` had simply never been run on this Linux install),
@@ -666,7 +666,7 @@ async function draftTask(task, {
         // model-stats.db (the Models tab's own data source) the moment that routing
         // was used for anything. abModel (when an A/B candidate was actually selected)
         // takes precedence over labelFor(task) the same way it took precedence over
-        // resolvedOrnithCall above -- labelFor(task) only knows about providerFor(task)'s
+        // resolvedLocalCall above -- labelFor(task) only knows about providerFor(task)'s
         // normal tier routing, not this call's deliberate override of it.
         model: abModel || labelFor(task),
         candidates: abCandidates.length > 1 ? abCandidates.join(',') : null,
@@ -703,7 +703,7 @@ async function draftTask(task, {
         const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
         if (unverified) {
           const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
-          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: retryPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
           if (!retryResult.degenerate) {
             task.implementResponse = retryResult.response;
           }
@@ -719,7 +719,7 @@ async function draftTask(task, {
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
     const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source }));
+    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: true, temperature: 0.4, numPredict: 900, source: task.source }));
 
     if (critiqueResult.degenerate) {
       task.critiqueOutcome = 'critique-degenerate';
@@ -728,7 +728,7 @@ async function draftTask(task, {
     } else {
       task.critiqueOutcome = 'issues-flagged';
       const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedOrnithCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
+      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: true, temperature: 0.4, numPredict: 1400, source: task.source }));
       if (!reviseResult.degenerate) {
         task.implementResponse = reviseResult.response;
         task.revisionApplied = true;

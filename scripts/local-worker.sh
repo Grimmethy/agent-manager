@@ -98,7 +98,7 @@ check_instance_liveness "$INSTANCE_ID" || exit 1
 trap 'printf "[worker-%s] SIGTERM/SIGINT received -- exiting after current tick.\n" "$INSTANCE_ID" >&2; exit 0' TERM INT
 
 HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"                                                  # HOME_LOGS where we drop per-instance log files; same idea as PowerShell's $env:LocalStatePath/log/$env:InstanceID pattern so multiple runs don't clobber each other.
-LOG_FILE="${HOME_LOGS}/ornith-worker-${INSTANCE_ID}.log"          # per-instance log file for daemon status; keeps logs grouped by worker so user can grep / watch progress of specific loop instance without wading through others' output (same pattern as PowerShell's `Start-Transcript -Path $logFile` per-job pattern).
+LOG_FILE="${HOME_LOGS}/local-worker-${INSTANCE_ID}.log"          # per-instance log file for daemon status; keeps logs grouped by worker so user can grep / watch progress of specific loop instance without wading through others' output (same pattern as PowerShell's `Start-Transcript -Path $logFile` per-job pattern).
 
 # Infinite polling loop mimicking PowerShell's `while ($true) { ... Start-Sleep -Seconds 60 }` block structure exactly — same design philosophy: simple poll-and-do is easier to debug than event-driven alternatives for file-based state (which agent-manager uses exclusively, not databases or message queues that would benefit from true push mechanisms).
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
@@ -376,7 +376,7 @@ while :; do                                                                     
   # every ornithCall this tick would have timed out at 240s with no indication why.
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
 
-  # Seed pending/ with a new task if the queue has room to generate one -- ornith-worker.ps1
+  # Seed pending/ with a new task if the queue has room to generate one -- local-worker.ps1
   # calls this every tick (task-sources.js's own CLI header: "Safe to call on every worker
   # tick"). Previously never called anywhere in this bash port, so pending/ could never
   # receive work regardless of how correct the claim logic below was.
@@ -409,7 +409,7 @@ while :; do                                                                     
   # to be running at that moment; if that process was killed or crashed mid-draft-call
   # (confirmed live 2026-08-14: repeated worker restarts during that day's development left
   # 16+ tasks claimed but never drafted), nothing previously re-attempted them, since the
-  # claim loop below only ever looks at pending/ for NEW work. Matches ornith-worker.ps1's
+  # claim loop below only ever looks at pending/ for NEW work. Matches local-worker.ps1's
   # own "orphaned claim: recovered automatically at the next worker startup" behavior,
   # except run every tick (not just at startup) so it also self-heals from an interrupted
   # draft call without a full process restart being needed.
@@ -534,7 +534,7 @@ while :; do                                                                     
         printf '[worker-%s] claimed %s -> %s\n' "$INSTANCE_ID" "$wpath" "$new_wpath"     # log claim action with old+new paths — same information PowerShell's `$null = Write-Host "Claimed $src for $dest"` writes but using file redirection operator to send our printf output directly into stderr (which gets captured by launch.sh later via `nohup ... > /dev/null 2>&1 &` and tee'd into HOME_LOGS directory so user can review claim history later in log files even if their terminal is closed or busy).
 
         # Run the actual plan -> implement -> critique -> (revision) passes against Ornith,
-        # via local-draft.js (a port of ornith-worker.ps1's equivalent sequence -- see that
+        # via local-draft.js (a port of local-worker.ps1's equivalent sequence -- see that
         # file's header comment for scope: the 6 domains task-domains.json actually wires up
         # on Linux, not arch_discovery/arch_import's extra structural-check pass). Mutates
         # new_wpath's task JSON in place with pass results and status:"needs-review" on

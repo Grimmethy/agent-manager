@@ -619,7 +619,7 @@ def get_active_repo_root() -> str | None:
 def get_active_grep_dirs() -> str | None:
     """Same env-then-file resolution as get_active_repo_root(), for the one other setting
     Ornith's harness-mediated retrieval needs (discuss_sessions.py's
-    _ornith_harness_context) -- grep-codebase-tool.js/arch-import-fetch.js's own repoRoot-
+    _local_harness_context) -- grep-codebase-tool.js/arch-import-fetch.js's own repoRoot-
     relative search scope. Unset means grep_fetch_client falls back to the same
     'frontend/src,backend/src' default src/config.js's getConfig() already uses for every
     other AGENT_MANAGER_GREP_DIRS consumer."""
@@ -738,7 +738,7 @@ def _has_hypothetical_cost_column(conn: sqlite3.Connection) -> bool:
 
 
 def second_brain_dir() -> Path | None:
-    """Same SECOND_BRAIN_DIR env var ornith-worker.ps1 / src/config.js already read --
+    """Same SECOND_BRAIN_DIR env var local-worker.ps1 / src/config.js already read --
     kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
     agent-manager.env directly, same as get_active_repo_root(), since the dashboard is
     often started with no env vars pre-set at all."""
@@ -886,7 +886,7 @@ def task_summary(data: dict, filename: str) -> dict:
         "createdAt": data.get("createdAt"),
         "reviewedAt": data.get("reviewedAt"),
         "appliedAt": data.get("appliedAt"),
-        "ornithRejectCount": data.get("ornithRejectCount"),
+        "localRejectCount": data.get("localRejectCount", data.get("ornithRejectCount")),
         # Small (a reason string + a handful of short candidate paths at most) -- nothing
         # like the promptContext/planResponse bulk excluded above, and the needs-
         # clarification row rendering needs it to show WHICH kind of hold this is without
@@ -2032,8 +2032,8 @@ def _adhoc_task_excerpt(data):
     same fields api_alerts() already reads for the same reason."""
     if data.get("blockedReason"):
         return data["blockedReason"][:200]
-    if data.get("ornithVerdict"):
-        return data["ornithVerdict"][:200]
+    if data.get("localVerdict") or data.get("ornithVerdict"):
+        return (data.get("localVerdict") or data["ornithVerdict"])[:200]
     return None
 
 
@@ -2340,7 +2340,7 @@ def api_discovery():
                 "appliedAt": data.get("appliedAt"),
                 "doneMarker": data.get("doneMarker"),
                 "blockedReason": data.get("blockedReason"),
-                "ornithRejectCount": data.get("ornithRejectCount"),
+                "localRejectCount": data.get("localRejectCount", data.get("ornithRejectCount")),
                 # Cheap "is there anything to read yet" signals for the list view --
                 # the click-through detail modal (api_task_anywhere) carries the full
                 # readouts, same split task_summary() uses.
@@ -4749,8 +4749,8 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
 
     creationflags = subprocess.CREATE_NEW_CONSOLE
     scripts = [
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "ornith-worker.ps1"), "-InstanceId", "worker-1"], "Ornith Worker 1"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Ornith Review Runner"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "local-worker.ps1"), "-InstanceId", "worker-1"], "Local Worker 1"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Local Review Runner"),
         (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
     ]
     if include_apply:

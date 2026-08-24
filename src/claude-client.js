@@ -2,8 +2,8 @@
 
 // Thin wrapper over the `claude` CLI's non-interactive mode (`claude -p`), matching
 // local-client.js's exact interface (`{ call, callOnce, majorityVote, detectDegenerate }`)
-// so it's a drop-in swap for `ornithCall`/`ornithMajorityVote` at local-draft.js's and
-// review-task.js's existing injection points (`draftTask(task, { ornithCall = call, ... })`)
+// so it's a drop-in swap for `localCall`/`localMajorityVote` at local-draft.js's and
+// review-task.js's existing injection points (`draftTask(task, { localCall = call, ... })`)
 // -- see model-provider.js for the per-task-source selection that actually wires this in.
 //
 // The whole point of this module is running against a Claude Pro/Max/Team/Enterprise
@@ -215,7 +215,7 @@ async function call(opts, maxRetries = 2) {
 }
 
 // Mirrors local-client.js's majorityVote() exactly (same signature, same tally logic)
-// so review-task.js's ornithMajorityVote injection point works unchanged with this
+// so review-task.js's localMajorityVote injection point works unchanged with this
 // module swapped in -- duplicated rather than imported since local-client.js's version
 // calls its own local `call` directly with no injection seam of its own. Still true as
 // of 2026-08-24 (model-profile-registry.js) -- not consolidated, deliberately deferred,

@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
-# Two distinct locations, not one -- see ornith-worker.ps1's header comment for why.
+# Two distinct locations, not one -- see local-worker.ps1's header comment for why.
 $PackageSrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $env:AGENT_MANAGER_REPO_ROOT) { throw 'AGENT_MANAGER_REPO_ROOT env var is required.' }
 $RepoRoot = $env:AGENT_MANAGER_REPO_ROOT
@@ -30,9 +30,9 @@ if (-not (Test-InstanceLiveness -InstanceId 'queue-watchdog' -TickSecs 30)) { ex
 #
 #   1. Dead-process detection: a heartbeat file whose PID isn't actually running anymore
 #      means that process crashed. Restart the OS process. NEVER a git operation.
-#   2. Reject-retry-requeue: a task genuinely REJECTED by review (has real ornithVotes,
+#   2. Reject-retry-requeue: a task genuinely REJECTED by review (has real localVotes,
 #      not a crash/domain-error block) gets moved back to pending/ for a fresh redraft,
-#      capped at $MaxOrnithRejectRetries attempts, tracked via `ornithRejectCount` on the
+#      capped at $MaxLocalRejectRetries attempts, tracked via `localRejectCount` on the
 #      task JSON. KNOWN LIMITATION: this is a BLIND retry -- the redraft does not see WHY
 #      it was rejected. A blind redraft can still fix transient issues (a genuinely empty/
 #      degenerate first draft, which is documented to self-heal on a later call) but won't
@@ -42,7 +42,7 @@ if (-not (Test-InstanceLiveness -InstanceId 'queue-watchdog' -TickSecs 30)) { ex
 # try/catch'd per-item, so one bad heartbeat file or one bad blocked-task file never stops
 # the rest of a pass, and the outer loop itself never dies from an unhandled exception.
 
-# Tightened 2026-07-18 alongside ornith-client.js's 4-min REQUEST_TIMEOUT_MS: no single
+# Tightened 2026-07-18 alongside local-client.js's 4-min REQUEST_TIMEOUT_MS: no single
 # Ornith call should run longer than that anymore (it either finishes or crashes the
 # worker), so 8 min of "recently updated, fine" tolerance was pure added latency on top of
 # an already-crashed process, not real caution. StaleHeartbeatSeconds keeps a modest margin
@@ -52,10 +52,10 @@ if (-not (Test-InstanceLiveness -InstanceId 'queue-watchdog' -TickSecs 30)) { ex
 # of small JSON file reads plus Get-Process calls, no GPU/disk contention with Ornith.
 $CheckIntervalSeconds = 10
 $StaleHeartbeatSeconds = 300  # 5 min -- comfortably above the 4-min per-call ceiling
-$MaxOrnithRejectRetries = 2
+$MaxLocalRejectRetries = 2
 
 # Worker-only escape hatch for the "-NoExit zombie" failure mode: a worker crashes mid-call
-# (ornith-client.js's 4-min REQUEST_TIMEOUT_MS fires, the uncaught error terminates the
+# (local-client.js's 4-min REQUEST_TIMEOUT_MS fires, the uncaught error terminates the
 # script), but -NoExit keeps the PowerShell HOST process alive at an idle prompt after the
 # script inside it dies. Test-ProcessAlive sees that lingering shell and returns true
 # forever, so a worker that is provably dead by heartbeat never gets restarted -- reproduced
@@ -96,7 +96,7 @@ $script:LastRestartAt = @{}
 $RESTART_MAP = @(
     @{ Match = 'review-runner'; Script = 'review-runner.ps1'; Args = @() },
     @{ Match = 'apply-runner';  Script = 'apply-runner.ps1';  Args = @() },
-    @{ Match = 'worker-';       Script = 'ornith-worker.ps1'; Args = @('-InstanceId') }  # instanceId appended at restart time
+    @{ Match = 'worker-';       Script = 'local-worker.ps1'; Args = @('-InstanceId') }  # instanceId appended at restart time
 )
 
 function Write-Heartbeat {
@@ -204,7 +204,7 @@ function Invoke-DeadProcessCheck {
 #      and safe to kill unconditionally: it cannot be doing legitimate work for a server
 #      that no longer exists.
 function Invoke-StrayProcessReap {
-    $scriptNames = @('ornith-worker.ps1', 'review-runner.ps1', 'apply-runner.ps1', 'queue-watchdog.ps1')
+    $scriptNames = @('local-worker.ps1', 'review-runner.ps1', 'apply-runner.ps1', 'queue-watchdog.ps1')
     $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
     $psProcs = $allProcs | Where-Object { $_.Name -eq 'powershell.exe' -and $_.CommandLine }
 
@@ -271,12 +271,12 @@ function Invoke-RejectRetryCheck {
             $task = Get-Content $file.FullName -Raw | ConvertFrom-Json
             # Test-ReviewRejection (agent-manager-common.ps1) owns the invariant: only a
             # genuine review-stage rejection is eligible for reject-retry-requeue, never an
-            # apply-stage failure that happens to still carry ornithVotes from an earlier,
+            # apply-stage failure that happens to still carry localVotes from an earlier,
             # unrelated successful review (redrafting can't fix that).
             if (-not (Test-ReviewRejection -Task $task)) { continue }
 
-            $retryCount = if ($task.ornithRejectCount) { [int]$task.ornithRejectCount } else { 0 }
-            if ($retryCount -ge $MaxOrnithRejectRetries) {
+            $retryCount = if ($task.localRejectCount) { [int]$task.localRejectCount } else { 0 }
+            if ($retryCount -ge $MaxLocalRejectRetries) {
                 # Exhausted, stays blocked permanently -- but for arch_discovery
                 # specifically, lastReviewedAt only ever gets stamped on a SUCCESSFUL apply
                 # (apply-runner.ps1), never on rejection. Without this, a community that's
@@ -309,7 +309,7 @@ function Invoke-RejectRetryCheck {
                 # re-select FOREVER, since import-coverage.json's promotedAt never got
                 # touched by anything on the rejection path. Found overnight monitoring
                 # 2026-07-21: three real arch_import items (autogen-microsoft-2/6/7) had
-                # already hit ornithRejectCount=2 (exhausted) with promotedAt still null.
+                # already hit localRejectCount=2 (exhausted) with promotedAt still null.
                 if ($task.source -eq 'arch_import' -and $task.promptContext -and $task.promptContext.itemId) {
                     if (Test-Path $ImportCoveragePath) {
                         try {
@@ -335,7 +335,7 @@ function Invoke-RejectRetryCheck {
                 # never got touched by anything on the rejection path -- nextDeepDiveTask()
                 # sorts null-lastReviewedAt first, so it would just redraft the same doomed
                 # community every tick). Found overnight monitoring 2026-07-21:
-                # deep-dive-autogen-microsoft-7 hit ornithRejectCount=2 (exhausted) with its
+                # deep-dive-autogen-microsoft-7 hit localRejectCount=2 (exhausted) with its
                 # community-7 entry in deep-dive-coverage.json still lastReviewedAt:null.
                 # Schema differs from community-coverage.json's flat array -- deep_dive
                 # nests communities under coverage.projects.<projectSlug>.communities[].
@@ -364,7 +364,7 @@ function Invoke-RejectRetryCheck {
             $priorFeedback = if ($task.priorRejectionFeedback) { @($task.priorRejectionFeedback) } else { @() }
             $priorFeedback += [string]$task.blockedReason
 
-            $task | Add-Member -NotePropertyName 'ornithRejectCount' -NotePropertyValue ($retryCount + 1) -Force
+            $task | Add-Member -NotePropertyName 'localRejectCount' -NotePropertyValue ($retryCount + 1) -Force
             $task | Add-Member -NotePropertyName 'priorRejectionFeedback' -NotePropertyValue $priorFeedback -Force
 
             Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'requeued'; outcomeStage = 'watchdog'; outcomeReason = [string]$task.blockedReason }
@@ -373,8 +373,8 @@ function Invoke-RejectRetryCheck {
             [System.IO.File]::WriteAllText($newPath, ($task | ConvertTo-Json -Depth 20))
             Remove-Item $file.FullName -Force
 
-            Write-Host ('Watchdog: requeued {0} for redraft (attempt {1}/{2})' -f $task.id, ($retryCount + 1), $MaxOrnithRejectRetries) -ForegroundColor Cyan
-            Add-WatchdogLogEntry -Result 'REQUEUED' -Detail ('{0} -- Ornith rejected (attempt {1}/{2}), moved back to pending/ for a fresh redraft. Reason: {3}' -f $task.id, ($retryCount + 1), $MaxOrnithRejectRetries, [string]$task.blockedReason)
+            Write-Host ('Watchdog: requeued {0} for redraft (attempt {1}/{2})' -f $task.id, ($retryCount + 1), $MaxLocalRejectRetries) -ForegroundColor Cyan
+            Add-WatchdogLogEntry -Result 'REQUEUED' -Detail ('{0} -- Ornith rejected (attempt {1}/{2}), moved back to pending/ for a fresh redraft. Reason: {3}' -f $task.id, ($retryCount + 1), $MaxLocalRejectRetries, [string]$task.blockedReason)
         } catch {
             Write-Host ('Watchdog: error checking blocked/{0}: {1}' -f $file.Name, $_.Exception.Message) -ForegroundColor Red
         }

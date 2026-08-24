@@ -75,7 +75,7 @@ if ($orphanLlamaServers) {
 # --- 3. Core pipeline processes: find every powershell.exe running each known script,
 #    not just "is at least one alive" -- duplicates are the recurring failure mode. ------
 Section 'Core processes'
-$scripts = 'ornith-worker.ps1', 'review-runner.ps1', 'apply-runner.ps1', 'queue-watchdog.ps1'
+$scripts = 'local-worker.ps1', 'review-runner.ps1', 'apply-runner.ps1', 'queue-watchdog.ps1'
 $allProcs = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue
 foreach ($script in $scripts) {
     $matches = $allProcs | Where-Object { $_.CommandLine -match [regex]::Escape($script) }
@@ -92,7 +92,7 @@ foreach ($script in $scripts) {
         $child = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ParentProcessId -eq $m.ProcessId -and $_.Name -eq 'node.exe' }
         if ($child) {
             Write-Host ('  pid {0}: has a live node.exe child -- genuinely active, LEAVING ALONE' -f $m.ProcessId) -ForegroundColor Gray
-        } elseif ($script -eq 'ornith-worker.ps1') {
+        } elseif ($script -eq 'local-worker.ps1') {
             # Only auto-retire idle ornith-worker duplicates -- the other three roles
             # don't fork node children per-call the same way, so absence of one there
             # isn't a reliable "idle" signal. Confirm it holds no claimed file before

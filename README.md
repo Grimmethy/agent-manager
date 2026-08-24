@@ -18,7 +18,7 @@ second, more capable model) only has to review pushed branches, not babysit the 
 
 Four always-on processes, each in its own terminal:
 
-- **`ornith-worker.ps1`** — claims a pending task, runs a Plan pass, an Implement pass, and
+- **`local-worker.ps1`** — claims a pending task, runs a Plan pass, an Implement pass, and
   an independent Critique/Revision pass, then hands the draft to review.
 - **`review-runner.ps1`** — a majority-vote model call judges each draft APPROVE/REJECT.
   APPROVE moves the task to `queue/approved/`; nothing is written or pushed yet.
@@ -276,7 +276,7 @@ before running `launch.bat` — the Project tab's Start Pipeline only ever sets
 ```powershell
 $env:AGENT_MANAGER_REPO_ROOT = 'C:\path\to\your\repo'
 node .\src\task-sources.js  # optional one-shot smoke test
-powershell -File .\src\ornith-worker.ps1 -InstanceId worker-1
+powershell -File .\src\local-worker.ps1 -InstanceId worker-1
 powershell -File .\src\review-runner.ps1
 powershell -File .\src\apply-runner.ps1
 powershell -File .\src\queue-watchdog.ps1

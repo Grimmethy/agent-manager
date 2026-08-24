@@ -628,7 +628,8 @@ test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needs
 // coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script
 // which implies that the program is inaccurately representing model used"): the
 // commit-message Co-Authored-By trailer must name the REAL model that drafted the
-// change, not a generic "Ornith" brand name that discards task.draftModel's actual tag.
+// change, not a generic "Ornith" brand name that discards task.draftModel's actual tag
+// (2026-08-24: the generic fallback itself was also renamed from "Ornith" to "Local Model").
 function gitRunnerCapturingCommitMessage() {
   const base = createFakeGitRunner();
   let commitMessage = null;
@@ -646,7 +647,7 @@ test('coAuthorTrailer: a local (non-Claude) draftModel credits the SPECIFIC mode
   const gitRunner = gitRunnerCapturingCommitMessage();
   applyTask(baseTask({ draftModel: 'qwen3.8:27b-q4_K_M' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Ornith \(qwen3\.8:27b-q4_K_M\) <noreply@ornith\.local>/);
+  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Local Model \(qwen3\.8:27b-q4_K_M\) <noreply@agent-manager\.local>/);
 });
 
 test('coAuthorTrailer: a Claude draftModel still credits Claude with its specific model name (no regression)', () => {
@@ -660,8 +661,8 @@ test('coAuthorTrailer: a task with no draftModel at all (queued before the field
   const gitRunner = gitRunnerCapturingCommitMessage();
   applyTask(baseTask({ draftModel: undefined }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
-  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Ornith <noreply@ornith\.local>/);
-  assert.doesNotMatch(gitRunner.capturedCommitMessage, /Ornith \(/);
+  assert.match(gitRunner.capturedCommitMessage, /Co-Authored-By: Local Model <noreply@agent-manager\.local>/);
+  assert.doesNotMatch(gitRunner.capturedCommitMessage, /Local Model \(/);
 });
 
 // Auto-drain (2026-08-20, blocked-drain.js -- Grimmethy: "What kind of mechanism can we

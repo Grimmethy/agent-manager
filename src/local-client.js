@@ -12,7 +12,7 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
-const ornithThroughput = require('./local-throughput.js');
+const localThroughput = require('./local-throughput.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -40,9 +40,12 @@ const MODEL = process.env.LOCAL_MODEL;
 // observed live 2026-07-18 paying a ~38-40s cold-load penalty on the very next call
 // whenever a gap (between passes, or between tasks) outlasted it. Free to set generously
 // since nothing else is competing for the model slot on this box (OLLAMA_MAX_LOADED_MODELS
-// effectively 1 already, per ornith-worker.ps1's own comment on why concurrent instances
+// effectively 1 already, per local-worker.ps1's own comment on why concurrent instances
 // must share one model tier).
-const KEEP_ALIVE = process.env.ORNITH_KEEP_ALIVE || '30m';
+// 2026-08-24 (Grimmethy: "Ornith is no longer the default model... reference local
+// instead") -- LOCAL_KEEP_ALIVE is the current name; ORNITH_KEEP_ALIVE still read as a
+// fallback so an existing deployment's env doesn't silently stop working after this rename.
+const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
 
 function detectDegenerate(text, { allowEmpty = false } = {}) {
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
@@ -145,7 +148,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
     const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
-    ornithThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
+    localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
     // own response already carries this exact breakdown (load_duration -- time spent
@@ -171,18 +174,19 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
 // PER_CALL_TIMEOUT_CEILING_MS stays at the pipeline's pre-existing 4-minute ceiling, not
 // ollama-http.js's full 5-minute hard ceiling -- dead-process-check.js's
 // WORKER_ZOMBIE_THRESHOLD_SECONDS (20 min) was sized against "up to 4 sequential
-// ornithCall()s per task, each individually bounded by 240s -- worst case ~960s" with
+// localCall()s per task, each individually bounded by 240s -- worst case ~960s" with
 // deliberate slack to 1200s. Letting a single call float all the way to 300s would erase
 // that slack (4*300s = 1200s, exactly the zombie threshold, zero margin) without anyone
 // having revisited that math -- so a computed timeout here can come in BELOW 240s for cheap
 // calls (failing faster, freeing a stuck lane sooner) but never above it. An explicit
-// ORNITH_TIMEOUT_MS still overrides everything below, same as before this module existed.
+// LOCAL_TIMEOUT_MS (or the older ORNITH_TIMEOUT_MS name) still overrides everything below,
+// same as before this module existed.
 const PER_CALL_TIMEOUT_CEILING_MS = 240_000;
-const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.ORNITH_TIMEOUT_MS) || null;
+const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || null;
 
 function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
   if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
-  const tokensPerSecond = ornithThroughput.getTokensPerSecond(instancesDir);
+  const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir);
   return gpuCapacity.resolveTimeoutMs({
     promptTokens,
     numPredict,

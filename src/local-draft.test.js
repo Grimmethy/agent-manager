@@ -4,7 +4,7 @@
 // now" -- see single-flight-lock.js's own header for the full incident this fixes). NOT
 // a full draftTask() test suite (no dedicated one exists yet for this file, a real gap
 // unrelated to this change) -- this only verifies the NEW lock-usage behavior, using
-// dependency injection (ornithCall + withLockFn are both injectable specifically so this
+// dependency injection (localCall + withLockFn are both injectable specifically so this
 // never has to touch a real lockfile or make a real Ollama/Claude call). The stakes for
 // getting this specific logic right are high: a wrong lock decision here risks a real
 // deadlock (see local-worker.sh's own comment on why bash no longer locks around this
@@ -44,7 +44,7 @@ function withFixtureRepo(fn) {
   }
 }
 
-function fakeOrnithCall(response) {
+function fakeLocalCall(response) {
   return async () => ({ response, degenerate: null, attempts: 1 });
 }
 
@@ -73,7 +73,7 @@ test('an adhoc task with NO local-model override never locks at all (plan and im
     const task = { id: 'adhoc-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
     await draftTask(task, {
-      ornithCall: fakeOrnithCall('no real match -- nothing plausible'),
+      localCall: fakeLocalCall('no real match -- nothing plausible'),
       withLockFn,
       ...declineLocalTiers(),
       draftAdhocImplementFn: async (t) => {
@@ -104,7 +104,7 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
 
     const { withLockFn } = spyLock();
     const result = await draftTask(task, {
-      ornithCall: fakeOrnithCall('no real match -- nothing plausible'),
+      localCall: fakeLocalCall('no real match -- nothing plausible'),
       withLockFn,
       ...declineLocalTiers(),
       draftAdhocImplementFn,
@@ -135,7 +135,7 @@ test('an adhoc task with a local-model override (the real bug scenario) locks ar
     };
 
     const result = await draftTask(task, {
-      ornithCall: fakeOrnithCall('confident match: none -- no real match'),
+      localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn,
       ...declineLocalTiers(),
       draftAdhocImplementFn,
@@ -162,7 +162,7 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
     const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when harness-search already applied'); };
 
     const result = await draftTask(task, {
-      ornithCall: fakeOrnithCall('confident match: none -- no real match'),
+      localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
     });
 
@@ -189,7 +189,7 @@ test('an adhoc task where harness-search declines but local-agentic applies -- n
     const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when local-agentic already applied'); };
 
     const result = await draftTask(task, {
-      ornithCall: fakeOrnithCall('confident match: none -- no real match'),
+      localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
     });
 
@@ -204,14 +204,14 @@ test('a non-adhoc/research task locks around EVERY real call (plan, implement, c
     const task = { id: 'default-test-1', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'a note to classify', tags: [] } };
 
     let callCount = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       callCount++;
       if (callCount === 1) return { response: 'confident match: none', degenerate: null, attempts: 1 }; // plan
       if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 }; // implement
       return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
     };
 
-    await draftTask(task, { ornithCall, withLockFn });
+    await draftTask(task, { localCall, withLockFn });
 
     // brain_dump_sort is low-tier by default (no override needed) -- one lock-start/
     // lock-end pair per real call this task actually reaches (plan, implement, critique
@@ -235,13 +235,13 @@ test('arch_import skips the implement call entirely (deterministic empty, not le
     };
 
     let callCount = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       callCount += 1;
       if (callCount > 1) throw new Error('implement must never be called when harnessHits is empty -- the whole point of the deterministic skip');
       return { response: 'no useful search terms come to mind for this one', degenerate: null, attempts: 1 }; // plan -- deliberately zero QUERY: lines
     };
 
-    const result = await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, false);
@@ -269,9 +269,9 @@ test('a task with file+find+one fixedLiterals block fully specified skips the mo
     };
 
     let callCount = 0;
-    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+    const localCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
 
-    const result = await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, false);
@@ -296,12 +296,12 @@ test('a task with fixedLiterals but NO file field falls through to the normal im
       },
     };
 
-    const ornithCall = async () => ({ response: 'plan text', degenerate: null, attempts: 1 });
+    const localCall = async () => ({ response: 'plan text', degenerate: null, attempts: 1 });
 
     // Only asserting the short-circuit did NOT fire here -- not exercising the full real
     // implement path (needs a real git repo/registered source this fixture doesn't set
     // up), same scope every other test in this file keeps to per its own header comment.
-    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() }).catch(() => {});
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() }).catch(() => {});
 
     const deterministicEvent = (task.history || []).find((h) => (h.detail || '').includes('deterministic find/replace'));
     assert.equal(deterministicEvent, undefined, 'without a `file` field, the deterministic short-circuit must never fire -- the edit is not fully unambiguous without it');
@@ -330,9 +330,9 @@ test('a staleness_audit task for a still-live scanner finding skips the model en
     };
 
     let callCount = 0;
-    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+    const localCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
 
-    const result = await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() });
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
 
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, false);
@@ -359,9 +359,9 @@ test('a staleness_audit task for a resolved scanner finding skips the model enti
     };
 
     let callCount = 0;
-    const ornithCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+    const localCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
 
-    const result = await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() });
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
 
     assert.equal(result.succeeded, true);
     assert.match(task.implementResponse, /RECOMMENDATION: archive/);
@@ -383,12 +383,12 @@ test('a staleness_audit task for an unsupported original source (e.g. adhoc) fal
       },
     };
 
-    const ornithCall = async () => ({ response: 'QUERY: something', degenerate: null, attempts: 1 });
+    const localCall = async () => ({ response: 'QUERY: something', degenerate: null, attempts: 1 });
 
     // Only asserting the short-circuit did NOT fire -- not exercising the full harness
     // path (needs real registered prompt builders/harness fetch this fixture doesn't set
     // up), same scope every other test in this file keeps to.
-    await draftTask(task, { ornithCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
 
     const deterministicEvent = (task.history || []).find((h) => (h.detail || '').includes('deterministic recheck'));
     assert.equal(deterministicEvent, undefined, 'an unsupported originalSource must never trigger the deterministic short-circuit');
@@ -432,7 +432,7 @@ test('draftTask retries the implement call once when a candidate-fulfillment sou
     };
 
     let callCount = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       callCount += 1;
       if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 }; // plan
       if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'fabricated text not in file', replace: 'x' }), degenerate: null, attempts: 1 }; // implement, bad find
@@ -440,7 +440,7 @@ test('draftTask retries the implement call once when a candidate-fulfillment sou
       return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
     };
 
-    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(callCount, 4, 'plan, bad implement, retried implement, critique -- no infinite loop');
     const parsed = JSON.parse(task.implementResponse);
@@ -461,14 +461,14 @@ test('draftTask does not retry a candidate-fulfillment source whose find string 
     };
 
     let callCount = 0;
-    const ornithCall = async () => {
+    const localCall = async () => {
       callCount += 1;
       if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
       if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
       return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
     };
 
-    await draftTask(task, { ornithCall, withLockFn: async (dir, fn) => fn() });
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(callCount, 3, 'plan, implement, critique -- correct on the first try, no retry burned');
   });
@@ -481,7 +481,7 @@ test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local
     const task = { id: 'default-test-2', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'x', tags: [] } };
 
     await assert.doesNotReject(draftTask(task, {
-      ornithCall: fakeOrnithCall(JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' })),
+      localCall: fakeLocalCall(JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' })),
       withLockFn,
     }));
 

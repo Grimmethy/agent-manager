@@ -315,7 +315,7 @@ function unusedExportImplementPrompt(task, planText) {
 
 // project_search's plan pass has a different JOB than every other source's plan pass: it
 // doesn't plan a change, it proposes SEARCH QUERIES for the harness to execute against
-// GitHub/Hugging Face between plan and implement (see ornith-worker.ps1's project_search
+// GitHub/Hugging Face between plan and implement (see local-worker.ps1's project_search
 // branch and project-search-fetch.js). Ornith has no internet access, so this is the one
 // place its judgment actually adds value in this source's pipeline -- picking good queries
 // from project context is a reasoning task, not something worth hardcoding as keyword
@@ -469,7 +469,7 @@ function deepDiveImplementPrompt(task, planText) {
 // agent-manager-grounded candidate. Same two-call shape as project_search (plan proposes
 // search terms Ornith itself can't run, the harness runs them, implement gets real
 // results) but searching agent-manager's own repo instead of GitHub/Hugging Face -- see
-// ornith-worker.ps1's arch_import branch and arch-import-fetch.js.
+// local-worker.ps1's arch_import branch and arch-import-fetch.js.
 function archImportPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -891,7 +891,7 @@ function troubleLogImplementPrompt(task, planText) {
 // 4 different wrong lists, none matching the one given verbatim in the prompt) -- not
 // random hallucination, but confidently reaching for a generic prior over the specific
 // given data, even under an explicit "copy these exact strings" instruction. Distinct
-// from the preDrafted escape hatch above (ornith-worker.ps1) which skips generation for an
+// from the preDrafted escape hatch above (local-worker.ps1) which skips generation for an
 // ENTIRE already-known implementResponse -- this is for the more common case where only
 // PART of a file is fixed/known and the surrounding logic still needs real generation.
 // task.promptContext.fixedLiterals: optional array of { name, content } -- content is

@@ -24,7 +24,7 @@
 // model itself. This boundary exists specifically because a local model is materially less
 // reliable at agentic tool use than Claude (real documented incident: a tool-calling call
 // once stalled 13+ minutes with no progress, see docs/pipeline-incident-2026-07-19.md and
-// ornith-worker.ps1's own comment on why this mechanism was disabled) -- read-only
+// local-worker.ps1's own comment on why this mechanism was disabled) -- read-only
 // exploration degrades safely if the model gets confused; direct write/bash access would
 // not.
 //

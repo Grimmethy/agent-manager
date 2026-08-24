@@ -69,7 +69,7 @@ get_model_override() {
 # switching to the next model"; widened 2026-08-19, Grimmethy: "it's still running two
 # jobs at once. We really need it to do one at a time"). Ollama keeps effectively one
 # model resident on typical single-GPU hardware (OLLAMA_MAX_LOADED_MODELS effectively 1
-# -- see ornith-worker.ps1's own comment) and serves it through one execution slot, so
+# -- see local-worker.ps1's own comment) and serves it through one execution slot, so
 # worker-1, worker-reasoning-when-forced-local, and reviewer are only ever really running
 # ONE real call at a time regardless of how many of them THINK they're working. This
 # guard makes that true operationally, not just at the Ollama layer: the in-flight-lock
