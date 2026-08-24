@@ -1988,7 +1988,7 @@ function getNextTask({ tierFilter } = {}) {
 // auto-approved against it). ornith-worker.ps1 checks this at claim time, before any
 // Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
-  const { pipelineDir, repoRoot, jobTypeCountersPath } = getConfig();
+  const { pipelineDir, repoRoot, taskRepoUrl, jobTypeCountersPath } = getConfig();
   const dir = path.join(pipelineDir, 'queue', 'pending');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${task.id}.json`);
@@ -2001,6 +2001,11 @@ function writeTask(task) {
   const record = {
     ...task,
     generatedForRepoRoot: repoRoot,
+    // task-repo-sync.js (2026-08-24) -- stamped here (not just read from config at the
+    // moment of each later sync) so a LATER 'blocked'/'needs-clarification' transition,
+    // handled by a possibly-different process, still knows which task-data repo this task
+    // belongs to (task-history.js's appendHistoryEvent hook reads this exact field).
+    taskRepoUrl,
     status: 'pending',
     createdAt: new Date().toISOString(),
     jobTypeOccurrence,
@@ -2015,7 +2020,7 @@ function writeTask(task) {
   // convention this codebase already applies everywhere else (gpu-guard.js, reasoning-
   // TierFor()'s own getConfig() try/catch, etc.).
   try {
-    syncTaskToRepo(record, { repoRoot });
+    syncTaskToRepo(record, { taskRepoUrl });
   } catch (e) {
     console.error(`[task-sources] syncTaskToRepo failed for ${record.id}: ${e.message}`);
   }
