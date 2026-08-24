@@ -812,6 +812,24 @@ def brain_dump_path() -> Path | None:
     return (d / "brain-dump.json") if d else None
 
 
+def job_type_counters_path() -> Path | None:
+    """Mirrors src/config.js's jobTypeCountersPath default -- job-type-counters.json in
+    pipelineDir, same env-override convention (AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH) as
+    every other pipelineDir-relative state file above."""
+    override = os.environ.get("AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "job-type-counters.json") if d else None
+
+
+def read_job_type_counters() -> dict:
+    p = job_type_counters_path()
+    if not p:
+        return {}
+    return read_json_safe(p) or {}
+
+
 def read_json_safe(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -4170,6 +4188,7 @@ def api_job_types():
     active = read_active_job_types()
     priorities = read_task_priorities()
     approval_modes = read_approval_modes()
+    counters = read_job_type_counters()
     return jsonify([
         {
             "name": name,
@@ -4177,9 +4196,30 @@ def api_job_types():
             "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
             "priority": priorities.get(name, TASK_SOURCE_DEFAULT_PRIORITIES.get(name)),
             "approvalMode": approval_modes.get(name),
+            "timesPerformed": counters.get(name, 0),
         }
         for name in TASK_SOURCE_CATALOG
     ])
+
+
+@app.route("/api/job-types/reset-counts", methods=["POST"])
+def api_job_types_reset_counts():
+    """Job List tab's "Reset counts" button. Deliberately resets EVERY job type's counter
+    at once, never a single row -- see src/job-type-counters.js's header for why a per-type
+    reset would leave the counters meaning different things depending on when each was last
+    zeroed, defeating the point of a shared baseline."""
+    p = job_type_counters_path()
+    if not p:
+        abort(400, description="no active pipeline directory to reset counters in")
+    counters = read_job_type_counters()
+    for name in counters:
+        counters[name] = 0
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(counters, indent=2), encoding="utf-8")
+    except OSError as e:
+        abort(500, description=f"failed to write job-type-counters.json: {e}")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/job-types/toggle", methods=["POST"])

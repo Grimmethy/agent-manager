@@ -2078,11 +2078,13 @@ async function renderJobListTab() {
   const alwaysActiveByName = {};
   const priorityByName = {};
   const approvalModeByName = {};
+  const timesPerformedByName = {};
   (jobTypes || []).forEach((j) => {
     activeByName[j.name] = j.active;
     alwaysActiveByName[j.name] = j.alwaysActive;
     priorityByName[j.name] = j.priority;
     approvalModeByName[j.name] = j.approvalMode;
+    timesPerformedByName[j.name] = j.timesPerformed;
   });
 
   // Sort by the EFFECTIVE priority (server override if any, else JOB_TYPES' static
@@ -2117,6 +2119,12 @@ async function renderJobListTab() {
           ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
         </select>`
       : `<span class="meta">${approvalMode}</span>`;
+    // Times Performed: cumulative, all-time count of how many tasks this job type has
+    // ever generated (Brain Dump, 2026-08-23) -- independent of the Active/Priority/
+    // Approval Mode columns above, which only affect FUTURE tasks. Read-only here; the
+    // one way to change it is the "Reset counts" button below, which zeroes every row at
+    // once (see /api/job-types/reset-counts's own comment for why never a single row).
+    const timesPerformed = timesPerformedByName[j.source] ?? 0;
     return `
     <tr>
       <td>${checkbox}</td>
@@ -2124,11 +2132,28 @@ async function renderJobListTab() {
       <td>${approvalModeCell}</td>
       <td>${j.source}</td>
       <td>${j.domain}</td>
+      <td>${timesPerformed}</td>
       <td>${escapeHtml(j.description)}</td>
     </tr>
   `;
   }).join('');
-  main.innerHTML = `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Source</th><th>Domain</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
+    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  const resetButton = document.getElementById('reset-job-type-counts');
+  if (resetButton) {
+    resetButton.onclick = async () => {
+      if (!confirm('Reset the "Times Performed" counter for every job type back to 0?')) return;
+      resetButton.disabled = true;
+      try {
+        await fetch('/api/job-types/reset-counts', { method: 'POST' });
+        await renderJobListTab();
+      } catch (e) {
+        alert('Could not reset counts: ' + e.message);
+        resetButton.disabled = false;
+      }
+    };
+  }
 
   main.querySelectorAll('.job-type-toggle').forEach((cb) => {
     cb.onchange = async () => {
