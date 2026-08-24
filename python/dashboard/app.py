@@ -39,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import build_graph  # noqa: E402
 import visualize_graph  # noqa: E402
 
+import hardware_stats
+
 app = Flask(__name__)
 # Re-reads templates/index.html per-request instead of caching it at first load -- the
 # dashboard's own templates/index.html edits went unseen for hours tonight because nothing
@@ -972,6 +974,43 @@ def api_tokenfold_stats():
         return jsonify({"available": True, "port": port, "stats": data})
     except Exception:
         return jsonify({"available": False, "port": port})
+
+
+def _hardware_history_averages(history: list) -> dict:
+    """Current-vs-average is computed here rather than in hardware_stats.py -- that
+    module only knows about individual samples, "average over the retention window" is
+    a view concern for this endpoint's caller (the hardware graph), not something the
+    collector itself needs. None (not 0) when a field has no samples yet, same
+    fail-open convention as every field in hardware_stats.get_snapshot()."""
+
+    def avg(get):
+        values = [v for v in (get(entry) for entry in history) if v is not None]
+        return sum(values) / len(values) if values else None
+
+    return {
+        "cpuPercent": avg(lambda e: e["cpuPercent"]),
+        "cpuTemperatureCelsius": avg(lambda e: e["cpuTemperatureCelsius"]),
+        "ramUsedBytes": avg(lambda e: e["ram"]["usedBytes"] if e["ram"] else None),
+        "diskUsedBytes": avg(lambda e: e["disk"]["usedBytes"] if e["disk"] else None),
+        "gpuUtilizationPercent": avg(lambda e: e["gpu"]["utilizationPercent"] if e["gpu"] else None),
+        "gpuVramUsedMiB": avg(lambda e: e["gpu"]["vramUsedMiB"] if e["gpu"] else None),
+        "gpuTemperatureCelsius": avg(lambda e: e["gpu"]["temperatureCelsius"] if e["gpu"] else None),
+    }
+
+
+@app.route("/api/hardware/stats")
+def api_hardware_stats():
+    # hardware_stats' own functions never raise (see that module's fail-open docstring --
+    # every field independently degrades to None instead), so there's no try/except here:
+    # a fresh dashboard with an empty/nonexistent hardware-stats.db and no GPU still
+    # returns 200 with "history": [] and "gpu"/averages fields as None, never an error.
+    snapshot = hardware_stats.get_snapshot()
+    history = hardware_stats.get_history()
+    return jsonify({
+        "current": snapshot,
+        "history": history,
+        "averages": _hardware_history_averages(history),
+    })
 
 
 @app.route("/")
@@ -5342,5 +5381,10 @@ if __name__ == "__main__":
     # shape as _run_build's own background thread; see _chat_reservation_watchdog's own
     # docstring for why this has to be built here rather than reused from elsewhere.
     threading.Thread(target=_chat_reservation_watchdog, daemon=True).start()
+    # Hardware stats sampler -- 10s interval, 24h retention (Grimmethy, 2026-08-24): the
+    # module's own start_sampler() already implements the sleep-and-sweep loop (same
+    # daemon=True shape as _chat_reservation_watchdog above), it just wasn't called from
+    # anywhere yet. /api/hardware/stats reads whatever this thread has persisted.
+    hardware_stats.start_sampler(interval_seconds=10, retention_hours=24)
 
     app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True, ssl_context=ssl_context)
