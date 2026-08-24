@@ -35,7 +35,8 @@ class ClaudeClientError(RuntimeError):
 
 def generate(prompt: str, model: str = None, effort: str = None, think: bool = False,
              temperature: float = None, num_predict: int = None,
-             cwd: str = None, allowed_tools: str = None, max_turns: int = None) -> dict:
+             cwd: str = None, allowed_tools: str = None, max_turns: int = None,
+             resume: str = None) -> dict:
     """Same return shape as ollama_client.generate(): {"response": str, "thinking": str}.
     `think`/`temperature`/`num_predict` are accepted but ignored -- they're Ollama sampling
     knobs with no Claude Code CLI equivalent; kept in the signature only so callers built
@@ -47,7 +48,13 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     dump entry: "Claude in the agent-manager has no access to... the system it's housed
     inside") -- pass all three together to let this call actually Read/Grep/Glob a real
     project directory instead of claude-client.js's isolated scratch dir. Omitting them
-    keeps the existing plain-text-completion behavior (no tools, no real cwd)."""
+    keeps the existing plain-text-completion behavior (no tools, no real cwd).
+
+    `resume` (2026-08-24, Ghost panel -- Brain Dump #153) is a prior call's own
+    `sessionId` (returned below), threaded through to claude-client.js's `--resume` flag
+    so the CLI's own session storage carries real conversation state forward -- the
+    caller doesn't need to rebuild a transcript from scratch each turn the way
+    Discuss/Grill already do for lack of this."""
     request = {"prompt": prompt}
     if model:
         request["model"] = model
@@ -59,6 +66,8 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
         request["allowedTools"] = allowed_tools
     if max_turns:
         request["maxTurns"] = max_turns
+    if resume:
+        request["resume"] = resume
 
     tmp_path = Path(tempfile.gettempdir()) / f"claude-client-req-{uuid.uuid4().hex}.json"
     try:
@@ -93,4 +102,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
         "thinking": parsed.get("thinking", ""),
         "degenerate": parsed.get("degenerate"),
         "model": f"claude:{resolved_model}",
+        # 2026-08-24 (Ghost panel) -- the CLI's own session id, for a caller that wants
+        # real multi-turn continuity to pass back in as `resume` on its next call.
+        "sessionId": parsed.get("sessionId"),
     }

@@ -83,7 +83,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -130,6 +130,14 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     args.push('--tools', '');
   }
   if (MAX_BUDGET_USD) args.push('--max-budget-usd', MAX_BUDGET_USD);
+  // 2026-08-24 (Ghost panel, Brain Dump #153: "very similar to the claude terminal I have
+  // been using externally") -- resume threads --resume <sessionId> so the CLI's OWN
+  // session storage carries real conversation context forward between calls, instead of
+  // every caller having to rebuild a full prompt+transcript from scratch each turn the
+  // way discuss_sessions.py's Discuss/Grill callers already do. `result.sessionId` from a
+  // prior callOnce() (parsed.session_id, already returned below) is what a caller passes
+  // back in here for its next message.
+  if (resume) args.push('--resume', resume);
 
   // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
   // this -- the one real Bash-capable, unattended tool-use path in this codebase (see

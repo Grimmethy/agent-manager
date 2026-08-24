@@ -108,3 +108,81 @@ test('TOOLS declares exactly grep_codebase, read_file, and list_directory -- no 
     assert.deepEqual(names, ['grep_codebase', 'list_directory', 'read_file']);
   });
 });
+
+// Ghost panel (2026-08-24): write_file/edit_file/run_bash, deliberately kept OUT of TOOLS
+// above -- opt-in only via runPlanWithTools({allowWrite: true}), never the arch_discovery
+// default. Exported as standalone functions the same way readFileTool/listDirectoryTool
+// already are, so they're testable as pure functions with no real Ollama call.
+
+test('writeFileTool creates a new file with the given content', () => {
+  withFixtureRepo((mod, dir) => {
+    const result = mod.writeFileTool({ path: 'new/file.txt', content: 'hello\n' });
+    assert.equal(result.written, true);
+    assert.equal(fs.readFileSync(path.join(dir, 'new', 'file.txt'), 'utf8'), 'hello\n');
+  });
+});
+
+test('writeFileTool overwrites an existing file', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'existing.txt'), 'old\n');
+    mod.writeFileTool({ path: 'existing.txt', content: 'new\n' });
+    assert.equal(fs.readFileSync(path.join(dir, 'existing.txt'), 'utf8'), 'new\n');
+  });
+});
+
+test('writeFileTool refuses a path that escapes the repo root', () => {
+  withFixtureRepo((mod) => {
+    const result = mod.writeFileTool({ path: '../../etc/passwd', content: 'x' });
+    assert.match(result.error, /escapes the repo root/);
+  });
+});
+
+test('editFileTool replaces a unique, verbatim match', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'f.js'), 'const x = 1;\nconst y = 2;\n');
+    const result = mod.editFileTool({ path: 'f.js', find: 'const x = 1;', replace: 'const x = 100;' });
+    assert.equal(result.edited, true);
+    assert.equal(fs.readFileSync(path.join(dir, 'f.js'), 'utf8'), 'const x = 100;\nconst y = 2;\n');
+  });
+});
+
+test('editFileTool errors, without editing, when "find" is not found verbatim', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'f.js'), 'const x = 1;\n');
+    const result = mod.editFileTool({ path: 'f.js', find: 'const x = 999;', replace: 'whatever' });
+    assert.match(result.error, /not found verbatim/);
+    assert.equal(fs.readFileSync(path.join(dir, 'f.js'), 'utf8'), 'const x = 1;\n');
+  });
+});
+
+test('editFileTool errors, without editing, when "find" matches more than once', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'f.js'), 'x\nx\n');
+    const result = mod.editFileTool({ path: 'f.js', find: 'x', replace: 'y' });
+    assert.match(result.error, /matches 2 places/);
+    assert.equal(fs.readFileSync(path.join(dir, 'f.js'), 'utf8'), 'x\nx\n');
+  });
+});
+
+test('runBashTool runs a real command in the repo root and captures stdout', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'marker.txt'), 'present\n');
+    const result = mod.runBashTool({ command: 'cat marker.txt' });
+    // bwrap may or may not be installed on the test host -- either a real sandboxed
+    // result or the documented fail-closed error is acceptable, but never a throw and
+    // never a silent unsandboxed fallback (see this tool's own "fails CLOSED" comment).
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+    } else {
+      assert.match(result.stdout, /present/);
+      assert.equal(result.exitCode, 0);
+    }
+  });
+});
+
+test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
+  withFixtureRepo((mod) => {
+    const names = mod.WRITE_TOOLS.map((t) => t.function.name).sort();
+    assert.deepEqual(names, ['edit_file', 'run_bash', 'write_file']);
+  });
+});

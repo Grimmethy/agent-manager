@@ -30,5 +30,6 @@ project-history.json
 projects.json
 runs/
 .agent-manager-discuss-sessions.json
+.agent-manager-ghost-sessions.json
 dashboard-settings.json
 vendor/tokenfold/core/build/
