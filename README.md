@@ -166,6 +166,35 @@ Pending, Review, Approved, Blocked, Done) — click any task row for its full de
 (plan/implement text, blocked reason, branch). Polls every 5s. `AGENT_MANAGER_DASHBOARD_PORT`
 picks the port (default `7420`).
 
+### Remote access (LAN / phone)
+
+By default the dashboard binds `127.0.0.1` only — nothing on the network can reach it.
+Some endpoints mutate state (approve/apply/delete a task, set the Claude token), so
+opening this up to other machines needs both a shared secret and encryption in transit:
+
+1. **Auth token** — set `AGENT_MANAGER_DASHBOARD_TOKEN` to a random secret. Callers from
+   loopback are unaffected; callers from any other address must send it as
+   `Authorization: Bearer <token>` on every mutating (non-GET/HEAD/OPTIONS) request, or
+   they're rejected.
+2. **TLS** — pick one:
+   - **Direct HTTPS**: generate a cert/key pair (e.g.
+     `openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365
+     -subj "/CN=agent-manager-dashboard"`, or use [mkcert](https://github.com/FiloSottile/mkcert)
+     for one your devices will trust without a warning) and set
+     `AGENT_MANAGER_DASHBOARD_CERT` / `AGENT_MANAGER_DASHBOARD_KEY` to their paths. The
+     dashboard then serves HTTPS itself.
+   - **Reverse proxy**: leave `AGENT_MANAGER_DASHBOARD_HOST` unset (dashboard stays on
+     loopback) and put a TLS-terminating proxy in front that forwards to
+     `127.0.0.1:7420` — e.g. Caddy (`example.com { reverse_proxy 127.0.0.1:7420 }`,
+     automatic cert), Nginx with a cert of your own, or `tailscale serve https / http://127.0.0.1:7420`
+     if the machine is already on a Tailscale network.
+3. **Bind the address** — only after the above, set `AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0`
+   (or a specific LAN IP) so other devices can reach the port.
+
+Binding off loopback with neither `AGENT_MANAGER_DASHBOARD_CERT`/`_KEY` set nor a proxy in
+front refuses to start — the dashboard won't silently serve plaintext HTTP (including the
+Bearer token and the Claude OAuth token setter) to the LAN.
+
 ### Tabs
 
 **Project**
