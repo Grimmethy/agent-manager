@@ -13,6 +13,7 @@ const { grepCodebase } = require('./grep-codebase-tool.js');
 const { getConfig } = require('./config.js');
 const { postJson } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { withLock } = require('./single-flight-lock.js');
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
 // capabilities so that the local reasoning model can handle the work... I'd like to see
@@ -325,12 +326,23 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
     allowWrite ? '.ghost-write-tools-disabled' : '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
     const { call } = require('./local-client.js');
-    const result = await call({ prompt, think: true });
+    // local-client.js's own call() doesn't self-lock -- local-draft.js's maybeLocked()
+    // wraps it externally for its own plan pass, same discipline applied here.
+    const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }));
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }
 
   const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
   const toolHandlers = allowWrite ? { ...TOOL_HANDLERS, ...WRITE_TOOL_HANDLERS } : TOOL_HANDLERS;
+  // 2026-08-24 -- caught live via the Ghost panel's first real message: this loop's own
+  // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
+  // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
+  // work earlier tonight was built to fix, just reintroduced through a different call
+  // path. Same instancesDir derivation and withLock() usage local-draft.js's own
+  // maybeLocked() already establishes -- held ONLY around each individual /api/chat call
+  // below, not the whole multi-turn loop (tool execution between turns doesn't touch the
+  // GPU and shouldn't block other lanes while it runs).
+  const instancesDir = path.join(pipelineDir, 'instances');
 
   // Same TokenFold session/scope headers local-client.js sends on /api/generate.
   // Without the session header every /api/chat call hashed into its own one-off
@@ -347,12 +359,12 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
 
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
-    const res = await postJson(`${OLLAMA_URL}/api/chat`, {
+    const res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
       model: MODEL,
       messages,
       tools,
       stream: false,
-    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
+    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders));
 
     const message = res.message || {};
     lastMessage = message;
