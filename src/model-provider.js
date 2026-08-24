@@ -59,7 +59,20 @@ function reasoningTierFor(task) {
   const t = normalizeTask(task);
   if (t.reasoningTier) return t.reasoningTier;
   const sourceName = resolveSourceName(t);
-  const { taskTierOverrides } = getConfig();
+  // getConfig() throws when AGENT_MANAGER_REPO_ROOT is unset (config.js's own hard
+  // requirement, for fields this function has nothing to do with) -- reasoningTierFor()
+  // used to be a lightweight, env-independent function callable from any context
+  // (including tests, and local-worker.sh's own `node -e` worker-lane filter call),
+  // and taskTierOverrides itself is derived purely from AGENT_MANAGER_TASK_TIERS with no
+  // real repoRoot dependency at all (see config.js), so a missing/misconfigured repoRoot
+  // must not block this function the same "a capability check failing here must never
+  // block real work" way gpu-guard.js/model-inflight-lock.js's own best-effort reads do.
+  let taskTierOverrides;
+  try {
+    ({ taskTierOverrides } = getConfig());
+  } catch {
+    taskTierOverrides = null;
+  }
   if (taskTierOverrides && taskTierOverrides[sourceName]) return taskTierOverrides[sourceName];
   const entry = getRegisteredSource(sourceName);
   if (entry && entry.reasoningTier) return entry.reasoningTier;
