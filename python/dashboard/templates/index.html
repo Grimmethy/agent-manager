@@ -27,7 +27,13 @@
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
      uses) rather than removing the element, so its own scroll position and in-progress
      draft text survive a collapse/expand cycle. */
-  #ghost-panel { width: 380px; border-left: 2px solid var(--border); min-height: calc(100vh - 53px); display: flex; flex-direction: column; flex-shrink: 0; }
+  /* position: sticky + a real height (not min-height) pins the panel to the viewport
+     regardless of how tall #main's own content gets -- min-height alone let the whole
+     flex row stretch to match #main's scroll height, dragging the chat input down below
+     the fold and forcing a full-page scroll just to reach it (Grimmethy, confirmed live:
+     "I have to scroll to the bottom of the page to use the chat box"). overflow:hidden on
+     the panel itself pushes all scrolling down into .grill-transcript, where it belongs. */
+  #ghost-panel { width: 380px; border-left: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
   #ghost-panel.ghost-collapsed { width: 0; overflow: hidden; border-left: none; }
   .ghost-header { padding: 12px 16px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .ghost-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; }

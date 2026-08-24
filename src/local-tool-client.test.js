@@ -186,3 +186,37 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
     assert.deepEqual(names, ['edit_file', 'run_bash', 'write_file']);
   });
 });
+
+// Regression, 2026-08-24: caught live within minutes of the Ghost panel shipping -- app.py
+// used to wrap ghost_sessions.send_message()'s ENTIRE call in apply-task.sh's own
+// git-safety mutex, held for however long the whole turn took (a local-provider turn can
+// legitimately wait minutes on the GPU lock alone), so a second, completely unrelated
+// Ghost message got "the pipeline is mid-apply right now" while nothing was actually
+// applying. Moved the real protection down to withApplyLock, held only around the single
+// git-mutating command execution in runBashTool -- these tests prove withApplyLock itself
+// really uses the SAME fixed lockfile apply-task.sh/api_git_merge_branch already flock
+// (same file, same real interop already proven all session), not an isolated one, since
+// that's the entire point -- it has to coordinate with the real apply-task-loop.
+test('withApplyLock uses the same fixed lockfile apply-task.sh itself flocks', () => {
+  withFixtureRepo((mod) => {
+    assert.equal(mod.APPLY_LOCK_PATH, path.join(os.homedir(), '.local', 'state', 'agent-manager', 'locks', 'apply-task.lock'));
+  });
+});
+
+test('withApplyLock genuinely blocks a concurrent real bash flock attempt on the same file while held', () => {
+  // Deliberately checks ONLY the "blocked while held" half, not "free immediately after" --
+  // this test touches the SAME real, shared, fixed lockfile the actual apply-task-loop
+  // daemon on this machine may legitimately hold at any moment (that's the entire point
+  // of this lock, see withApplyLock's own header), so asserting the file is free the
+  // instant this test releases it would be genuinely flaky if that daemon happens to grab
+  // it in the same window -- not a bug in this code, just real, expected contention this
+  // test has no business asserting away.
+  withFixtureRepo((mod) => {
+    let sawHeld = null;
+    mod.withApplyLock(() => {
+      const result = require('child_process').spawnSync('bash', ['-c', `exec 200>"${mod.APPLY_LOCK_PATH}"; flock -n 200 && echo GOT_IT || echo BLOCKED`]);
+      sawHeld = result.stdout.toString();
+    });
+    assert.match(sawHeld, /BLOCKED/, 'a concurrent flock attempt must fail while withApplyLock holds it');
+  });
+});
