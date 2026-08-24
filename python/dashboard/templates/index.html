@@ -150,6 +150,7 @@
 <header>
   <h1>agent-manager</h1>
   <span class="pipeline-dir" id="pipeline-status">loading...</span>
+  <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
 </header>
 <div class="layout">
   <nav id="nav"></nav>
@@ -1258,6 +1259,49 @@ function renderCaseInfoModal(kase) {
   `;
   backdrop.classList.add('open');
 }
+
+// Global "+ Brain Dump" header button (available on every tab, not just the Brain Dump
+// tab itself) -- reuses the same #modal-backdrop/#modal-content + closeDetail() plumbing
+// renderCaseInfoModal does, and posts to the same /api/brain-dump/capture endpoint the
+// in-tab capture row (renderBrainDumpShell) uses, so entries land in the same place either
+// way. If the Brain Dump tab happens to be open behind this modal, refreshBrainDumpEntries
+// picks the new entry up on its own 5s cycle -- no extra plumbing needed here.
+function openGlobalBrainDumpModal() {
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  content.innerHTML = `
+    <button class="close" onclick="closeDetail()">&times;</button>
+    <h2>Brain Dump</h2>
+    <div class="capture-row">
+      <input id="global-bd-capture-input" placeholder="Brain dump -- capture anything" autocomplete="off">
+      <button class="action" id="global-bd-capture-btn" title="Save this note as a new Brain Dump entry">Capture</button>
+    </div>
+  `;
+  backdrop.classList.add('open');
+  const input = document.getElementById('global-bd-capture-input');
+  input.focus();
+  const submit = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    const btn = document.getElementById('global-bd-capture-btn');
+    btn.disabled = true;
+    try {
+      await fetch('/api/brain-dump/capture', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      closeDetail();
+      if (activeTab === 'brain-dump') refreshBrainDumpEntries(true);
+    } catch (e) {
+      alert('Could not capture: ' + e.message);
+      btn.disabled = false;
+    }
+  };
+  document.getElementById('global-bd-capture-btn').onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
+document.getElementById('global-brain-dump-btn').onclick = openGlobalBrainDumpModal;
 
 // Manual archive/requeue (Job Status > Blocked/Done tabs) and manual apply (Approved tab,
 // three-tier approval mode, 2026-07-26) -- per-row action buttons on renderQueueTab's
