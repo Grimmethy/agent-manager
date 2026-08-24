@@ -27,12 +27,14 @@ import json
 import re
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 import ollama_client
 import claude_client
 import grep_fetch_client
 import model_stats_client
+import single_flight_lock
 
 # session["provider"] is one of these two -- "local" keeps the original Ollama-only
 # behavior; "claude" routes through claude_client.py (Claude Code CLI under a
@@ -139,7 +141,20 @@ def _expand_grep_terms(raw_queries: list) -> list:
     return terms
 
 
-def _local_harness_context(subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None) -> str | None:
+def _maybe_locked(instances_dir):
+    """single_flight_lock.held() (the GPU/local-model lock -- see that module's own
+    header for why there's only one) when instances_dir is known, a real (no-op)
+    contextmanager otherwise -- fails OPEN, same convention every other optional-
+    capability check in this codebase already follows (a caller that can't resolve an
+    active project's instances dir just runs unlocked, same as before this coordination
+    existed, rather than the lock becoming a new way for Discuss to hard-fail)."""
+    if instances_dir is None:
+        return nullcontext()
+    return single_flight_lock.held(Path(instances_dir))
+
+
+def _local_harness_context(subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None,
+                            instances_dir=None) -> str | None:
     """Returns a block of real file content to inject into this turn's prompt, or None
     (Ornith decided it didn't need one, the search came back empty, or the search itself
     failed). Two calls: a short/cheap/low-temperature proposal call decides WHETHER and
@@ -154,9 +169,23 @@ def _local_harness_context(subject_text: str, transcript: list, repo_root: str, 
     was to stop interactive-session calls from being invisible to the Models tab; adding
     a second real call here that skips that recording would quietly reopen the same gap."""
     started = time.time()
-    proposal = ollama_client.generate(
-        _build_search_proposal_prompt(subject_text, transcript), think=False, temperature=0.2, num_predict=120,
-    )
+    try:
+        with _maybe_locked(instances_dir):
+            proposal = ollama_client.generate(
+                _build_search_proposal_prompt(subject_text, transcript), think=False, temperature=0.2, num_predict=120,
+            )
+    except Exception:
+        # 2026-08-24 -- caught live BEFORE the _maybe_locked() coordination above existed:
+        # with no lock, this call queued behind an actively-drafting worker and blew
+        # ollama_client.py's own 240s timeout outright. The lock now makes that the common
+        # case far less likely, but a guard here is still correct on its own merits -- the
+        # grep-fetch call right below this already treats its own failure as best-effort/
+        # non-fatal for the exact same reason ("a broken search must never break the
+        # actual conversation turn"); this one was missing the equivalent guard, so ANY
+        # failure here (a slow Ollama, a real timeout even with the lock held, a
+        # connection error) turned a graceful "no extra context this turn" into a hard 500
+        # for the whole Discuss session instead.
+        return None
     model_stats_client.record_call("discuss-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="discuss-harness-search", result=proposal)
     queries = QUERY_LINE_RE.findall(proposal["response"])[:MAX_HARNESS_QUERIES]
@@ -188,19 +217,20 @@ def _local_harness_context(subject_text: str, transcript: list, repo_root: str, 
     return f"Searched this codebase for: {', '.join(queries)}\n\n" + "\n\n".join(blocks)
 
 
-def _chat_prompt_for_turn(provider: str, subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None) -> str:
+def _chat_prompt_for_turn(provider: str, subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None,
+                           instances_dir=None) -> str:
     """Builds the prompt for one Discuss turn, branching on how each provider gets project
     awareness: Claude reaches for real files itself (tools_available, above), Ornith has
     none, so the harness greps on its behalf first (_local_harness_context) when a
     project is active."""
     if provider == PROVIDER_CLAUDE:
         return _build_chat_prompt(subject_text, transcript, tools_available=bool(repo_root))
-    harness_context = _local_harness_context(subject_text, transcript, repo_root, grep_dirs) if repo_root else None
+    harness_context = _local_harness_context(subject_text, transcript, repo_root, grep_dirs, instances_dir) if repo_root else None
     return _build_chat_prompt(subject_text, transcript, harness_context=harness_context)
 
 
 def _generate(provider: str, model: str, effort: str, prompt: str, temperature: float, num_predict: int,
-               repo_root: str = None) -> dict:
+               repo_root: str = None, instances_dir=None) -> dict:
     """Routes to the right backend and records the call to model-stats.db either way --
     see model_stats_client.py's own header for why interactive sessions weren't tracked
     at all before this, on any provider.
@@ -214,6 +244,15 @@ def _generate(provider: str, model: str, effort: str, prompt: str, temperature: 
     working directory to."""
     started = time.time()
     if provider == PROVIDER_CLAUDE:
+        # 2026-08-24: deliberately NOT locked, unlike the local branch below. The Claude
+        # Code subscription has no single-execution-slot constraint the way Ollama's one
+        # resident model does -- separate `claude -p` calls already run genuinely
+        # concurrently (same as two independent Claude Code sessions), bounded only by
+        # Anthropic's own account-level rate limits, not a local hardware bottleneck.
+        # Locking this against worker-reasoning's own (potentially multi-minute, real
+        # Bash/Edit/Write) adhoc drafts was considered and rejected: it would block a live
+        # chat behind an entire draft session, or vice versa, for a resource conflict that
+        # doesn't actually exist.
         if repo_root:
             result = claude_client.generate(
                 prompt, model=model, effort=effort,
@@ -224,7 +263,8 @@ def _generate(provider: str, model: str, effort: str, prompt: str, temperature: 
         # claude_client.generate() already returns the "claude:"-prefixed label.
         stats_model = result["model"]
     else:
-        result = ollama_client.generate(prompt, think=False, temperature=temperature, num_predict=num_predict)
+        with _maybe_locked(instances_dir):
+            result = ollama_client.generate(prompt, think=False, temperature=temperature, num_predict=num_predict)
         stats_model = ollama_client.MODEL
     latency_ms = int((time.time() - started) * 1000)
     model_stats_client.record_call("discuss-session", stats_model, latency_ms, stage="discuss", result=result)
@@ -335,9 +375,9 @@ def _build_summary_prompt(subject_text: str, transcript: list) -> str:
 
 def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: str = None,
                    provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None,
-                   repo_root: str = None, grep_dirs: str = None) -> dict:
-    prompt = _chat_prompt_for_turn(provider, subject_text, [], repo_root, grep_dirs)
-    result = _generate(provider, model, effort, prompt, 0.6, 400, repo_root=repo_root)
+                   repo_root: str = None, grep_dirs: str = None, instances_dir=None) -> dict:
+    prompt = _chat_prompt_for_turn(provider, subject_text, [], repo_root, grep_dirs, instances_dir)
+    result = _generate(provider, model, effort, prompt, 0.6, 400, repo_root=repo_root, instances_dir=instances_dir)
     opener = result["response"].strip()
 
     session_id = f"discuss-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -355,16 +395,18 @@ def start_session(storage_dir: Path, subject_id: str, subject_text: str, kind: s
         "rawText": subject_text,
         "status": "active",
         # Fixed for the session's lifetime -- see this module's own PROVIDER_* comment
-        # for why this isn't re-selectable per turn. repoRoot/grepDirs ride along the
-        # same way (whatever project was active when the session started, not
+        # for why this isn't re-selectable per turn. repoRoot/grepDirs/instancesDir ride
+        # along the same way (whatever project was active when the session started, not
         # re-resolved per turn) so a mid-conversation project switch can't silently
-        # redirect an in-progress session's tool access (or Ornith's harness-search
-        # scope) to a different codebase.
+        # redirect an in-progress session's tool access (or the local harness-search
+        # scope, or which project's worker lanes it coordinates the model lock with) to
+        # a different codebase.
         "provider": provider,
         "model": model,
         "effort": effort,
         "repoRoot": repo_root,
         "grepDirs": grep_dirs,
+        "instancesDir": str(instances_dir) if instances_dir else None,
         "transcript": [{"role": "assistant", "text": opener}],
         "startedAt": now,
         "endedAt": None,
@@ -396,12 +438,13 @@ def send_message(storage_dir: Path, session_id: str, message: str):
         return session
 
     repo_root = session.get("repoRoot")
+    instances_dir = session.get("instancesDir")
     provider = session.get("provider", PROVIDER_LOCAL)
-    prompt = _chat_prompt_for_turn(provider, session["rawText"], session["transcript"], repo_root, session.get("grepDirs"))
+    prompt = _chat_prompt_for_turn(provider, session["rawText"], session["transcript"], repo_root, session.get("grepDirs"), instances_dir)
     result = _generate(
         provider, session.get("model"), session.get("effort"),
         prompt, 0.6, 400,
-        repo_root=repo_root,
+        repo_root=repo_root, instances_dir=instances_dir,
     )
     session["transcript"].append({"role": "assistant", "text": result["response"].strip()})
     sessions[session_id] = session
@@ -425,6 +468,7 @@ def end_session(storage_dir: Path, session_id: str):
             result = _generate(
                 session.get("provider", PROVIDER_LOCAL), session.get("model"), session.get("effort"),
                 _build_summary_prompt(session["rawText"], session["transcript"]), 0.3, 300,
+                instances_dir=session.get("instancesDir"),
             )
             session["summary"] = result["response"].strip()
         else:

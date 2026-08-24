@@ -295,12 +295,23 @@ def _call_discuss(fn, *args, **kwargs):
     turns claude_client.ClaudeClientError into a clean 4xx/5xx JSON response instead of
     an unhandled-exception 500 -- confirmed live: a Claude-provider discuss/start with
     CLAUDE_CODE_OAUTH_TOKEN unset previously surfaced as Flask's generic "internal
-    error" page with no indication of what actually went wrong or how to fix it."""
+    error" page with no indication of what actually went wrong or how to fix it.
+
+    2026-08-24 -- caught live via an actual Discuss click on the local provider: worker-1
+    was mid-draft on the same Ollama model at that exact moment (Discuss has no
+    coordination with the worker lanes' own use of it -- see the standing, deliberately-
+    deferred discussion on adding a shared lock), the reply call queued behind it and hit
+    ollama_client.py's own 240s timeout, and that raised a bare TimeoutError with no
+    handling here at all -- same raw-500-with-no-explanation failure mode this function
+    already exists to prevent for the Claude side, just never extended to Ollama's own
+    connection/timeout errors."""
     from claude_client import ClaudeClientError
     try:
         return fn(*args, **kwargs)
     except ClaudeClientError as e:
         abort(502, description=str(e))
+    except (TimeoutError, ConnectionError, OSError) as e:
+        abort(502, description=f"local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly or switch to Claude.")
 
 
 def is_claude_token_configured() -> bool:
@@ -2773,7 +2784,7 @@ def api_brain_dump_discuss_start(entry_id):
     provider, model, effort = _discuss_provider_args()
     session = _call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump",
                              provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
-                             grep_dirs=get_active_grep_dirs())
+                             grep_dirs=get_active_grep_dirs(), instances_dir=instances_dir())
     return jsonify(session)
 
 
@@ -2812,7 +2823,7 @@ def api_needs_clarification_discuss_start(task_id):
     provider, model, effort = _discuss_provider_args()
     session = _call_discuss(start_session, pipeline_dir, task_id, subject_text, kind="needs-clarification",
                              provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
-                             grep_dirs=get_active_grep_dirs())
+                             grep_dirs=get_active_grep_dirs(), instances_dir=instances_dir())
     return jsonify(session)
 
 
@@ -2931,7 +2942,7 @@ def api_second_brain_discuss_start():
     provider, model, effort = _discuss_provider_args(body)
     session = _call_discuss(start_session, root, note_path, note_content, kind="second-brain",
                              provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
-                             grep_dirs=get_active_grep_dirs())
+                             grep_dirs=get_active_grep_dirs(), instances_dir=instances_dir())
     return jsonify(session)
 
 
