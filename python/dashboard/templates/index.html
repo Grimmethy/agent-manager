@@ -1737,7 +1737,16 @@ function renderDesignDecisionPicker(task) {
 }
 
 function renderClarificationPicker(task) {
+  // 2026-08-24 (Grimmethy: "I'd like to see this discuss option default to using the
+  // local reasoning model, not claude") -- providerChoices is a single global keyed by
+  // the DOM id, and clarify-discuss-provider is the SAME id reused for every task's
+  // modal. Without this reset, toggling to Claude once for any task left it stuck as the
+  // default for every OTHER task's Discuss button afterward too, silently defeating the
+  // "starts on Ornith" default both this toggle and _discuss_provider_args() otherwise
+  // already have. Force it back to local every time a task's detail view is (re)built,
+  // so only an explicit click within THIS task's own session ever picks Claude.
   const nc = task.needsClarification;
+  providerChoices['clarify-discuss-provider'] = 'local';
   if (nc.reason === 'design-decision') return renderDesignDecisionPicker(task);
   let html = `<div class="field-label">⚠ Needs Clarification</div>`;
   // LLM-assisted fallback suggestion (path_prefetch_resolve, hybrid design 2026-08-16) --
