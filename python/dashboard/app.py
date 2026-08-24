@@ -1050,10 +1050,20 @@ def api_instances():
 def api_models():
     """Aggregate per-model stats for the implement-pass A/B test (see model-stats-db.js).
     Outcome and performance are joined in one query -- a fast-but-always-rejected model
-    must not look like a winner in a raw tok/s-only view."""
+    must not look like a winner in a raw tok/s-only view.
+
+    Also includes every locally-available-but-never-called Ollama model with zeroed/null
+    stats (2026-08-24, Grimmethy: "I need all models available to show here even if we
+    haven't run them yet") -- reuses _fetch_ollama_models(), the SAME real symbol
+    /api/benchmark/models already calls, rather than a second model-listing mechanism.
+    This table has no concept of a fixed Claude-model roster (Claude models aren't
+    locally enumerable the way Ollama's /api/tags is), so only Ollama models get a
+    zero-stats placeholder row here; a Claude model still only appears once it has a
+    real model_calls row, same as before."""
+    ollama_models = set(_fetch_ollama_models())
     db_path = model_stats_db_path()
     if not db_path or not db_path.is_file():
-        return jsonify([])
+        return jsonify([_zero_stats_model_row(m) for m in sorted(ollama_models)])
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -1100,7 +1110,22 @@ def api_models():
             "errorCount": error_count or 0,
             "totalCostUsd": total_cost_usd,
         })
+
+    seen = {r["model"] for r in results}
+    for model in sorted(ollama_models - seen):
+        results.append(_zero_stats_model_row(model))
     return jsonify(results)
+
+
+def _zero_stats_model_row(model: str) -> dict:
+    """A placeholder row for a model api_models() knows is available but has never been
+    called -- same field shape as a real row, with every stat null/zero rather than the
+    row being absent entirely."""
+    return {
+        "model": model, "callCount": 0, "approved": 0, "rejected": 0, "approveRate": None,
+        "avgLatencyMs": None, "avgTokensPerSec": None, "minTokensPerSec": None,
+        "maxTokensPerSec": None, "degenerateCount": 0, "errorCount": 0, "totalCostUsd": None,
+    }
 
 
 @app.route("/api/models/cost-summary")
