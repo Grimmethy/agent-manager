@@ -144,6 +144,13 @@ function getConfig() {
   // rather than suppressed forever.
   const stalenessAuditCoveragePath = process.env.AGENT_MANAGER_STALENESS_AUDIT_COVERAGE_PATH
     || path.join(pipelineDir, 'staleness-audit-coverage.json');
+  // job-type-counters.js (Job List tab, 2026-08-23: "we should add a field that tracks how
+  // many times each job type has been performed") -- a long-term debugging counter, per
+  // source name, that survives independently of any individual task record's lifecycle
+  // (deletion/archiving never touches it). Lives in pipelineDir alongside the other
+  // cross-run state files above, not inside queue/ which gets pruned.
+  const jobTypeCountersPath = process.env.AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH
+    || path.join(pipelineDir, 'job-type-counters.json');
   // product_spec (Grimmethy, 2026-08-20: "it should build its own plugins... is agent-
   // manager ready to start automatically building a CRM plugin?") -- the living spec doc a
   // greenfield target project's feature work is grounded against, same "one doc, versioned
@@ -234,6 +241,7 @@ function getConfig() {
     observabilityFixCandidatesPath, performanceFixCandidatesPath,
     selfAuditCoveragePath,
     stalenessAuditCoveragePath,
+    jobTypeCountersPath,
     performanceCoveragePath,
     productSpecPath,
     backlogCandidatesPath,
