@@ -247,6 +247,36 @@ test('parseSubTaskProposals returns null when there is no JSON array in the text
   assert.equal(parseSubTaskProposals('no json here'), null);
 });
 
+// 2026-08-24: "Why is it declining to do the work?" -- root-caused live on the hardware-
+// tracking-system task: adhoc-agentic-draft.js's own prompt already told the model to
+// explain a genuine product/design decision instead of guessing, but the only resolutions
+// available were implemented/no-changes-needed/decompose -- none of which honestly means
+// "I have real open questions for a human." RESOLUTION: needs-human-decision closes that
+// gap, mirroring local-agentic-draft.js's own needs-capability-i-dont-have.
+test('draftAdhocImplement parses a RESOLUTION: needs-human-decision response and flags needsClarification', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-12', title: 'Hardware tracking system', promptContext: { rawText: 'add hardware monitoring' } };
+
+  const claudeCall = async () => ({
+    response: 'Investigated -- this repo has zero charting infrastructure today.\n\n' +
+      'RESOLUTION: needs-human-decision\n\n' +
+      'Which charting library should the new dashboard tab use, and what retention window for historical samples?',
+    degenerate: null,
+  });
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.blocked, false);
+  assert.equal(result.needsClarification, true);
+  assert.equal(task.adhocResolution, 'needs-human-decision');
+  assert.equal(task.rawDiff, '');
+  assert.match(task.implementResponse, /Which charting library/);
+
+  const worktreeList = git(['worktree', 'list'], repoDir);
+  assert.equal(worktreeList.split('\n').filter(Boolean).length, 1, 'worktree must still be cleaned up');
+});
+
 test('draftAdhocImplement does NOT retry when the response is degenerate rather than turn-exhausted', async () => {
   const { repoDir } = makeRepoWithOrigin();
   const task = { id: 'test-8', title: 'x', promptContext: { rawText: 'x' } };

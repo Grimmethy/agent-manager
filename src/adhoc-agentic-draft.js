@@ -90,7 +90,7 @@ function buildSandboxOpts(resolvedRepoRoot, worktreeDir) {
 const ADHOC_TIMEOUT_MS = Number(process.env.AGENT_MANAGER_ADHOC_TIMEOUT_MS) || 900_000;
 const ADHOC_MAX_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_MAX_TURNS) || 30;
 
-const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose)\b/i;
+const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose|needs-human-decision)\b/i;
 
 // Grimmethy, 2026-08-24: "we had discussed setting up a task that breaks down jobs that
 // are too large" -- the actual task built for this (adhoc "Give agentic adhoc drafting a
@@ -147,9 +147,7 @@ function buildAgenticPrompt(task) {
     'confidently: implement it. Read whatever real files you need first -- do not guess ' +
     'at code you have not actually looked at. Run the real test suite relevant to what ' +
     'you changed (e.g. `npm test`, `python3 -m py_compile <changed .py files>`) before ' +
-    'finishing, and fix any failures your own change introduced. If the task is vague or ' +
-    'requires a product/design decision only a human should make, do not guess -- explain ' +
-    'why in your final summary instead of making a large, unrequested judgment call.',
+    'finishing, and fix any failures your own change introduced.',
     '',
     'If the task is simply TOO LARGE to implement confidently in one pass (touches many ' +
     'files/subsystems, or you can tell you would run out of turns partway through), do ' +
@@ -158,11 +156,20 @@ function buildAgenticPrompt(task) {
     'original task -- each piece should be small enough for a single fresh session to ' +
     'finish on its own.',
     '',
-    'When you are completely done, end your FINAL message with exactly one of these three ' +
+    'If implementing genuinely requires a PRODUCT/DESIGN DECISION only a human should make ' +
+    '(e.g. which library or approach to build on when none exists yet, what data to keep ' +
+    'and for how long, which of several reasonable designs to pick) -- this is NOT the ' +
+    'same as the task being too large (use the split above for that), and NOT the same as ' +
+    'already being resolved (say so above if it is) -- do not guess at an answer and do ' +
+    'not falsely claim nothing needs to change. Stop and say exactly what the real open ' +
+    'question(s) are.',
+    '',
+    'When you are completely done, end your FINAL message with exactly one of these four ' +
     'lines (nothing after it on that line):',
     'RESOLUTION: implemented',
     'RESOLUTION: no-changes-needed',
     'RESOLUTION: decompose',
+    'RESOLUTION: needs-human-decision',
     '',
     'If RESOLUTION: implemented or no-changes-needed -- follow with a short (2-4 sentence) ' +
     'plain-English summary of what you did, or why nothing was needed -- this is what a ' +
@@ -174,6 +181,12 @@ function buildAgenticPrompt(task) {
     'original task to understand it):',
     '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
+    '',
+    'If RESOLUTION: needs-human-decision -- follow it with the specific open question(s), ' +
+    'plainly stated, and enough real context (what you found investigating, what the ' +
+    'actual tradeoffs are) for a human to answer them without having to re-investigate ' +
+    'themselves. This goes straight to a human for a real answer, not through automatic ' +
+    'review -- make it something they can actually act on.',
   ].join('\n');
 }
 
@@ -296,6 +309,24 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
       task.rawDiff = '';
       task.implementResponse = summary;
       return { succeeded: true, blocked: false };
+    }
+
+    if (resolution === 'needs-human-decision') {
+      // 2026-08-24, Grimmethy: "We're here to create permanent systemic fixes... Why is
+      // it declining to do the work?" -- root-caused live: adhoc-agentic-draft.js's own
+      // prompt already told the model to explain itself and not guess at a real product/
+      // design decision, but the only resolutions available were implemented/no-changes-
+      // needed/decompose -- none of which honestly means "I have real open questions for
+      // a human." The model was forced into no-changes-needed, which reads as a flat
+      // refusal and gets rejected every time, regardless of how sound its reasoning was.
+      // No diff, no sub-task list -- this goes straight to a human (see local-draft.js's
+      // own handling of needsClarification, which routes this to queue/needs-
+      // clarification/ instead of the normal review flow) rather than being judged by an
+      // automatic reviewer that has no way to verify a genuinely open question.
+      task.adhocResolution = resolution;
+      task.rawDiff = '';
+      task.implementResponse = summary;
+      return { succeeded: true, blocked: false, needsClarification: true };
     }
 
     let rawDiff = '';

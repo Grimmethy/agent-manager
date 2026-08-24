@@ -28,6 +28,7 @@
 // CLI: node local-draft.js <draft.json>
 // Writes ONE line of JSON to stdout:
 //   { succeeded: true, blocked: false }
+//   { succeeded: true, blocked: false, needsClarification: true }
 //   { succeeded: true, blocked: true, blockedReason: '...', blockedStage?: '...' }
 //   { succeeded: false, reason: '...' }
 // The caller re-reads the (possibly mutated) task file from disk afterward -- this script
@@ -119,7 +120,7 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
  *   AGENT_MANAGER_CLAUDE_SOURCES, in which case claude-client.js's call()).
  * @param {function} [deps.withLockFn] - Defaults to single-flight-lock.js's real withLock.
  *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
- * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, reason?: string}>}
+ * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, needsClarification?: boolean, reason?: string}>}
  */
 async function draftTask(task, {
   ornithCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
@@ -455,6 +456,22 @@ async function draftTask(task, {
         if (agenticResult.blocked) {
           appendHistoryEvent(task, 'blocked', agenticResult.blockedReason);
           return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
+        }
+        // 2026-08-24 (RESOLUTION: needs-human-decision, adhoc-agentic-draft.js): a real
+        // open product/design question, not a diff or a sub-task list -- nothing here for
+        // an automatic reviewer to verify against real repo state, so this skips review-
+        // task.js/apply-task.js entirely and goes straight to queue/needs-clarification/
+        // (local-worker.sh's own move-destination branch) for a human to actually answer.
+        // Reuses `needsClarification`'s FIELD NAME (not path_prefetch_resolve's specific
+        // shape) so the dashboard's existing "does this task have needsClarification"
+        // check and Discuss button pick it up; `reason: 'design-decision'` is what
+        // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
+        // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
+        if (agenticResult.needsClarification) {
+          task.needsClarification = { reason: 'design-decision', openQuestions: task.implementResponse };
+          appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+          appendHistoryEvent(task, 'needs-clarification');
+          return { succeeded: true, blocked: false, needsClarification: true };
         }
         appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
         task.status = 'needs-review';
