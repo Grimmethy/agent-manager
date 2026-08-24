@@ -183,6 +183,45 @@ test('getCostSummary\'s hypothetical total combines real Claude spend AND local-
   });
 });
 
+// hostname/platform/gpu_name (2026-08-24, Grimmethy: "Logs should include what
+// hardware/software was used for each test") -- recordCall must stamp real os.*() values
+// on every row, not just the pre-existing instance_id/cost_usd attribution.
+test('recordCall stamps real hostname/platform on every row', async () => {
+  const dbPath = freshDbPath();
+  await withFreshDb(dbPath, async ({ recordCall }) => {
+    recordCall({ taskId: 't1', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 0.05 } });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare(`SELECT hostname, platform FROM model_calls WHERE task_id = 't1'`).get();
+    db.close();
+    assert.equal(row.hostname, os.hostname());
+    assert.equal(row.platform, `${os.platform()} ${os.release()}`);
+  });
+});
+
+test('a pre-existing database with no hostname/platform/gpu_name columns is migrated cleanly, not crashed on', async () => {
+  const dbPath = freshDbPath();
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE model_calls (
+      call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'implement',
+      model TEXT NOT NULL, candidates TEXT, started_at TEXT NOT NULL, latency_ms INTEGER,
+      eval_duration_ns INTEGER, prompt_eval_count INTEGER, eval_count INTEGER, attempts INTEGER,
+      degenerate TEXT, call_error TEXT, outcome TEXT, outcome_stage TEXT, outcome_reason TEXT, outcome_at TEXT,
+      cost_usd REAL, instance_id TEXT, hypothetical_cost_usd REAL
+    );
+  `);
+  db.prepare(`INSERT INTO model_calls (call_id, task_id, model, started_at) VALUES ('old-1', 'old-task', 'qwen3.8:27b-q4_K_M', '2026-08-01T00:00:00.000Z')`).run();
+  db.close();
+
+  await withFreshDb(dbPath, async ({ recordCall }) => {
+    recordCall({ taskId: 't-new', model: 'claude:sonnet', startedAt: new Date().toISOString(), latencyMs: 1, result: { costUsd: 5.00 } });
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    const row = check.prepare(`SELECT hostname, platform FROM model_calls WHERE task_id = 't-new'`).get();
+    check.close();
+    assert.equal(row.hostname, os.hostname());
+  });
+});
+
 test('a pre-existing database with no hypothetical_cost_usd column is migrated cleanly, not crashed on', async () => {
   const dbPath = freshDbPath();
   const db = new DatabaseSync(dbPath);
