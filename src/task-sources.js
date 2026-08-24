@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
-const { registerTaskSource, getRegisteredSources } = require('./task-source-registry.js');
+const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
@@ -24,6 +24,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
+const { incrementJobTypeCounter } = require('./job-type-counters.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1964,15 +1965,22 @@ function getNextTask({ tierFilter } = {}) {
 // auto-approved against it). ornith-worker.ps1 checks this at claim time, before any
 // Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
-  const { pipelineDir, repoRoot } = getConfig();
+  const { pipelineDir, repoRoot, jobTypeCountersPath } = getConfig();
   const dir = path.join(pipelineDir, 'queue', 'pending');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${task.id}.json`);
+  // jobTypeOccurrence: cumulative "how many times has this job type run" counter (Job List
+  // tab, 2026-08-23). Stamped onto the record at creation time from job-type-counters.js's
+  // persistent store, which is what actually survives this task's own eventual
+  // deletion/archiving -- the field on the record is a point-in-time snapshot for
+  // debugging a specific task, not the source of truth itself.
+  const jobTypeOccurrence = incrementJobTypeCounter(jobTypeCountersPath, resolveSourceName(task));
   const record = {
     ...task,
     generatedForRepoRoot: repoRoot,
     status: 'pending',
     createdAt: new Date().toISOString(),
+    jobTypeOccurrence,
     history: [],
   };
   appendHistoryEvent(record, 'created', task.source);
