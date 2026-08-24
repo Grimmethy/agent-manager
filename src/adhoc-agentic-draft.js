@@ -60,24 +60,47 @@ function resolveClaudeBinDirs() {
 }
 
 function buildSandboxOpts(resolvedRepoRoot, worktreeDir) {
+  // Regression, 2026-08-24 (found live: an adhoc draft's own summary noted "git log isn't
+  // usable in this worktree... gitdir path doesn't exist in this sandbox," confirmed via
+  // direct reproduction) -- git canonicalizes the `gitdir:` pointer a worktree's own .git
+  // FILE contains to the real, symlink-resolved path, not whatever path string repoRoot
+  // happened to be passed in as. This deployment's own AGENT_MANAGER_REPO_ROOT
+  // (/media/wok/model-cache/agent-manager-apply-target) is itself a symlink to
+  // /media/model-cache/github/agent-manager-apply-target -- binding the SYMLINK path (what
+  // this function used to do) left the REAL path git's own gitdir file actually points at
+  // completely unbound, so every git command needing history (the prompt's own first
+  // instruction: "check git log... for evidence the described problem was already
+  // addressed") silently failed inside the sandbox, forcing every affected draft to fall
+  // back to code-only inspection with no history grounding at all. realpathSync() both
+  // paths before building any bind so this always binds where git ACTUALLY looks,
+  // regardless of whether repoRoot (or worktreeDir, same class of risk) was reached via a
+  // symlink or not.
+  const realRepoRoot = fs.realpathSync(resolvedRepoRoot);
+  const realWorktreeDir = fs.realpathSync(worktreeDir);
   const readOnlyBinds = [
     '/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl',
     ...resolveClaudeBinDirs(),
-    path.join(resolvedRepoRoot, '.git'),
+    path.join(realRepoRoot, '.git'),
   ];
   const writableBinds = [
-    worktreeDir,
+    realWorktreeDir,
     // The worktree's own thin git-dir (index/HEAD/logs -- see this module's header on
     // `git worktree`'s real on-disk layout) -- needs to be writable even though the rest
     // of <repoRoot>/.git above is read-only, so `git status`/local `git log` writes from
     // INSIDE the worktree (not the main repo) still work. Bound AFTER the read-only
     // <repoRoot>/.git bind above so it correctly overrides just this one subpath (see
-    // sandbox.js's own comment on bind ordering).
-    path.join(resolvedRepoRoot, '.git', 'worktrees', path.basename(worktreeDir)),
+    // sandbox.js's own comment on bind ordering). basename computed from the REAL
+    // worktree path -- git names this directory after the worktree's own basename, and
+    // that must match whichever path form git itself resolved when creating it.
+    path.join(realRepoRoot, '.git', 'worktrees', path.basename(realWorktreeDir)),
   ];
   return {
     readOnlyBinds,
     writableBinds,
+    // workDir passed to sandbox.js's own --chdir must be the SAME real path these binds
+    // are built against -- chdir-ing into the original (possibly symlinked) worktreeDir
+    // would land outside every bind just constructed above.
+    workDir: realWorktreeDir,
     env: { CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN, PATH: process.env.PATH },
   };
 }
@@ -366,4 +389,4 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   }
 }
 
-module.exports = { draftAdhocImplement, buildAgenticPrompt, parseSubTaskProposals };
+module.exports = { draftAdhocImplement, buildAgenticPrompt, parseSubTaskProposals, buildSandboxOpts };
