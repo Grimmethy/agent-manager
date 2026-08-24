@@ -22,6 +22,20 @@
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
   .layout { display: flex; }
   nav { width: 200px; padding: 16px 0; border-right: 2px solid var(--border); min-height: calc(100vh - 53px); }
+  /* Ghost panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
+     app.py/ghost_sessions.py for the backend. Collapsed state is a plain width/visibility
+     toggle (localStorage-persisted, same convention nav-group expand/collapse already
+     uses) rather than removing the element, so its own scroll position and in-progress
+     draft text survive a collapse/expand cycle. */
+  #ghost-panel { width: 380px; border-left: 2px solid var(--border); min-height: calc(100vh - 53px); display: flex; flex-direction: column; flex-shrink: 0; }
+  #ghost-panel.ghost-collapsed { width: 0; overflow: hidden; border-left: none; }
+  .ghost-header { padding: 12px 16px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ghost-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; }
+  .ghost-body { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
+  .ghost-body .grill-transcript { flex: 1; max-height: none; }
+  .ghost-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
+  #ghost-toggle-tab { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
+  #ghost-toggle-tab:hover { color: var(--text); }
   nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
@@ -159,7 +173,23 @@
 <div class="layout">
   <nav id="nav"></nav>
   <main id="main"><div class="empty">Loading...</div></main>
+  <aside id="ghost-panel">
+    <div class="ghost-header">
+      <h2>Ghost</h2>
+      <span id="ghost-provider-container"></span>
+      <button type="button" class="secondary" id="ghost-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
+      <button type="button" class="secondary" id="ghost-new-btn" title="Start a fresh conversation">New</button>
+    </div>
+    <div class="ghost-body">
+      <div class="grill-transcript" id="ghost-transcript"></div>
+      <textarea class="grill-answer" id="ghost-input" rows="3" placeholder="Talk to the ghost... (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div class="row" style="margin-top:8px;gap:8px">
+        <button type="button" class="action" id="ghost-send-btn">Send</button>
+      </div>
+    </div>
+  </aside>
 </div>
+<button type="button" id="ghost-toggle-tab" title="Show/hide the Ghost panel">Ghost</button>
 
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" id="modal-content"></div>
@@ -774,6 +804,167 @@ function wireProviderToggle(idAttr) {
 function providerPayload(idAttr) {
   const btn = document.getElementById(idAttr);
   return { provider: (btn && btn.dataset.provider) || 'local' };
+}
+
+// Ghost panel (2026-08-24, Brain Dump #153: "a hideable panel on the right side of the
+// app for a conversational AI... make edits to the system... the ghost in the machine").
+// Global and persistent -- unlike Discuss/Grill, not scoped to any task/note/entry, so
+// its own state lives at this top level rather than inside a per-row render function.
+// See app.py's /api/ghost/* routes and ghost_sessions.py for the backend.
+let ghostSession = null;
+
+function ghostSetCollapsed(collapsed) {
+  const panel = document.getElementById('ghost-panel');
+  if (panel) panel.classList.toggle('ghost-collapsed', collapsed);
+  localStorage.setItem('agentManagerGhostPanel', collapsed ? 'collapsed' : 'expanded');
+}
+
+async function ghostPanelInit() {
+  ghostSetCollapsed(localStorage.getItem('agentManagerGhostPanel') === 'collapsed');
+  const tab = document.getElementById('ghost-toggle-tab');
+  if (tab) {
+    tab.onclick = () => {
+      const panel = document.getElementById('ghost-panel');
+      ghostSetCollapsed(!panel.classList.contains('ghost-collapsed'));
+    };
+  }
+  const newBtn = document.getElementById('ghost-new-btn');
+  if (newBtn) newBtn.onclick = ghostStartNew;
+  const sendBtn = document.getElementById('ghost-send-btn');
+  if (sendBtn) sendBtn.onclick = ghostSend;
+  const input = document.getElementById('ghost-input');
+  if (input) {
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ghostSend(); }
+    };
+  }
+  try {
+    ghostSession = await fetchJson('/api/ghost/active');
+  } catch (e) {
+    ghostSession = null;
+  }
+  ghostRender();
+}
+
+async function ghostStartNew() {
+  const newBtn = document.getElementById('ghost-new-btn');
+  if (newBtn) { newBtn.disabled = true; newBtn.textContent = 'Starting...'; }
+  try {
+    const resp = await fetch('/api/ghost/new', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(providerPayload('ghost-provider')),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+    ghostSession = body;
+  } catch (e) {
+    showToast('Could not start a new conversation: ' + e.message);
+  } finally {
+    if (newBtn) { newBtn.disabled = false; newBtn.textContent = 'New'; }
+  }
+  ghostRender();
+}
+
+async function ghostSend() {
+  const input = document.getElementById('ghost-input');
+  const sendBtn = document.getElementById('ghost-send-btn');
+  const message = input && input.value.trim();
+  if (!message || !ghostSession) return;
+  input.value = '';
+  sendBtn.disabled = true;
+  sendBtn.textContent = 'Thinking...';
+  // Optimistic append so the user's own message shows immediately -- a real reply
+  // (local provider especially, under real worker-lane contention) can take a while.
+  ghostSession.transcript.push({ role: 'user', text: message });
+  ghostRender();
+  try {
+    const resp = await fetch(`/api/ghost/${encodeURIComponent(ghostSession.id)}/message`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+    ghostSession = body;
+  } catch (e) {
+    showToast('Ghost message failed: ' + e.message);
+    // Roll back the optimistic append -- the real transcript (without this failed turn)
+    // is whatever's still on disk; simplest correct fix is just re-fetching it.
+    try { ghostSession = await fetchJson('/api/ghost/active'); } catch (e2) { /* leave as-is */ }
+  } finally {
+    sendBtn.disabled = false;
+    sendBtn.textContent = 'Send';
+  }
+  ghostRender();
+}
+
+async function ghostToggleReserve() {
+  if (!ghostSession) return;
+  const btn = document.getElementById('ghost-reserve-btn');
+  const wantOn = !ghostSession.reserved;
+  btn.disabled = true;
+  // Plain fetch, no client-side timeout -- turning reservation ON can genuinely block
+  // server-side for a while (single_flight_lock.acquire() waiting for a busy worker
+  // lane's current call to finish), same as any other real acquire-the-lock wait
+  // discussed at length tonight; an artificial abort here would misreport a legitimately
+  // slow-but-successful reservation as a failure.
+  btn.textContent = wantOn ? 'Reserving...' : 'Releasing...';
+  try {
+    const resp = await fetch(`/api/ghost/${encodeURIComponent(ghostSession.id)}/reserve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: wantOn }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+    ghostSession = body;
+  } catch (e) {
+    showToast('Could not toggle reservation: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+  ghostRender();
+}
+
+function ghostRender() {
+  const container = document.getElementById('ghost-provider-container');
+  if (container && !document.getElementById('ghost-provider')) {
+    container.innerHTML = renderProviderToggle('ghost-provider');
+    wireProviderToggle('ghost-provider');
+  }
+  if (ghostSession && document.getElementById('ghost-provider')) {
+    // Provider is fixed once a session exists (same "no mid-conversation switch"
+    // reasoning as Discuss) -- the header toggle reflects/controls only what the NEXT
+    // "New" conversation will use, so pin it to match the ACTIVE session's own provider
+    // rather than letting it silently drift out of sync with what's actually running.
+    const btn = document.getElementById('ghost-provider');
+    if (btn.dataset.provider !== ghostSession.provider) {
+      btn.dataset.provider = ghostSession.provider;
+      providerChoices['ghost-provider'] = ghostSession.provider;
+      btn.textContent = ghostSession.provider === 'claude' ? 'Claude' : 'Local';
+      btn.classList.toggle('provider-toggle-claude', ghostSession.provider === 'claude');
+    }
+  }
+
+  const reserveBtn = document.getElementById('ghost-reserve-btn');
+  if (reserveBtn) {
+    const showReserve = !!ghostSession && ghostSession.provider === 'local';
+    reserveBtn.style.display = showReserve ? '' : 'none';
+    if (showReserve) {
+      reserveBtn.onclick = ghostToggleReserve;
+      reserveBtn.classList.toggle('active', !!ghostSession.reserved);
+      reserveBtn.textContent = ghostSession.reserved ? 'Reserved' : 'Reserve';
+      reserveBtn.title = ghostSession.reserved
+        ? 'Holding the local model exclusively -- click to release it back to the worker lanes'
+        : 'Hold the local model exclusively for this conversation until you turn it back off';
+    }
+  }
+
+  const transcriptEl = document.getElementById('ghost-transcript');
+  if (transcriptEl) {
+    transcriptEl.innerHTML = ghostSession && ghostSession.transcript.length
+      ? grillRenderTranscript(ghostSession.transcript, ghostSession)
+      : '<div class="empty">Say something to the ghost.</div>';
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
 }
 
 async function renderClaudeSettingsPanel() {
@@ -4184,6 +4375,7 @@ function leaveBrainDumpTab() {
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);
+ghostPanelInit();
 
 // The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever
 // space main's own flex-column layout gives it), but a box change caused by the OUTER

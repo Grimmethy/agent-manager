@@ -147,6 +147,32 @@ test('callOnce passes --tools \'\' when no allowedTools given, so the model can 
   });
 });
 
+// Ghost panel (2026-08-24, Brain Dump #153): real session continuity via the CLI's own
+// --resume, instead of every caller rebuilding a transcript from scratch each turn.
+test('callOnce passes --resume when a caller supplies a prior sessionId', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'follow-up message', resume: 'sess-abc123' }); },
+    );
+    const idx = capturedArgs.indexOf('--resume');
+    assert.ok(idx !== -1, '--resume should be passed when resume is supplied');
+    assert.equal(capturedArgs[idx + 1], 'sess-abc123');
+  });
+});
+
+test('callOnce omits --resume entirely on a first message with no prior session', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'first message' }); },
+    );
+    assert.ok(!capturedArgs.includes('--resume'));
+  });
+});
+
 test('callOnce passes --allowedTools instead of --tools when a caller explicitly opts into tool access', async () => {
   await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
     let capturedArgs = null;

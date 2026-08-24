@@ -40,6 +40,13 @@ off a few seconds before attempting their own acquire, real headroom for Discuss
 already-parked blocking flock() call to win the wakeup race. A DIRECTORY of per-waiter
 files, not one shared flag, so a second concurrent Discuss session doesn't have its
 priority silently cleared the instant the first one gets the lock.
+
+Split into acquire()/release() (2026-08-24, Ghost panel's "fully reserve the reasoning
+model" toggle) plus held(), a thin contextmanager wrapper around them -- a reservation has
+to span multiple separate HTTP requests (toggle on, several chat messages, toggle off),
+which a single `with` block can't do. held() stays the right shape for every OTHER caller
+(Discuss, and Ghost's own per-message calls when NOT reserved), where the lock's whole
+life fits inside one function call.
 """
 import fcntl
 import uuid
@@ -50,13 +57,14 @@ LOCK_NAME = ".pipeline-single-flight.lock"
 PRIORITY_WAIT_DIR_NAME = ".discuss-waiting"
 
 
-@contextmanager
-def held(instances_dir: Path):
+def acquire(instances_dir: Path):
     """Blocking, exclusive acquire -- no timeout, matching single-flight-lock.js's own
-    acquire() exactly (a caller that wants a bounded wait should wrap this itself). Held
-    only for the body of the `with` block -- callers should wrap just the real model call,
-    not any surrounding prompt-building/grep work, same discipline local-draft.js's own
-    withLock() usage already follows."""
+    acquire() exactly (a caller that wants a bounded wait should wrap this itself). Drops
+    a per-waiter priority marker (see this module's own header) for the duration of the
+    wait, clearing it the instant the lock is actually held. Returns the open file object
+    -- it MUST stay open for as long as the lock should be held (the flock is owned by
+    the open file description, not the process) and MUST be passed to release() when
+    done, or the lock leaks for the life of the process."""
     instances_dir.mkdir(parents=True, exist_ok=True)
     wait_dir = instances_dir / PRIORITY_WAIT_DIR_NAME
     wait_dir.mkdir(exist_ok=True)
@@ -64,15 +72,34 @@ def held(instances_dir: Path):
     marker.touch()
     try:
         lock_path = instances_dir / LOCK_NAME
-        with open(lock_path, "w") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            # Acquired -- no longer "waiting", clear this waiter's own marker (not
-            # everyone's: another concurrent Discuss session may still be queued behind
-            # us and its own priority claim must stay intact).
-            marker.unlink(missing_ok=True)
-            try:
-                yield
-            finally:
-                fcntl.flock(fh, fcntl.LOCK_UN)
+        fh = open(lock_path, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fh
     finally:
+        # Acquired (or the open/flock call itself raised) -- either way no longer
+        # "waiting". Not everyone's marker: another concurrent waiter may still be queued
+        # behind us and its own priority claim must stay intact.
         marker.unlink(missing_ok=True)
+
+
+def release(fh):
+    """Releases a lock acquired above. Safe to call with None (best-effort, matching
+    single-flight-lock.js's own release() semantics)."""
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+@contextmanager
+def held(instances_dir: Path):
+    """Preferred entry point when the lock's whole life fits inside one function call --
+    callers should wrap just the real model call, not any surrounding prompt-building/
+    grep work, same discipline local-draft.js's own withLock() usage already follows."""
+    fh = acquire(instances_dir)
+    try:
+        yield
+    finally:
+        release(fh)

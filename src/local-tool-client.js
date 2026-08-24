@@ -8,9 +8,11 @@
 
 const path = require('path');
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 const { grepCodebase } = require('./grep-codebase-tool.js');
 const { getConfig } = require('./config.js');
 const { postJson } = require('./ollama-http.js');
+const { wrapWithSandbox } = require('./sandbox.js');
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
 // capabilities so that the local reasoning model can handle the work... I'd like to see
@@ -84,6 +86,167 @@ function listDirectoryTool({ path: relPath }) {
   };
 }
 
+// 2026-08-24 (Ghost panel, Brain Dump #153, Grimmethy: explicitly chose real local-model
+// write access despite the read-only-only design above) -- write_file/edit_file/run_bash
+// are kept SEPARATE from TOOLS/TOOL_HANDLERS below, not merged into them: the existing
+// arch_discovery caller (runPlanWithTools({..., allowWrite: false})) must stay exactly
+// as read-only as it is today, unaffected by this. A Ghost caller opts in explicitly via
+// allowWrite: true. This is the mitigation for the exact documented failure mode that
+// justified read-only-only in the first place (a stalled 13+-minute tool-calling call,
+// see this file's own header) -- not a bare capability grant:
+//   - a SEPARATE kill switch (queue/.ghost-write-tools-disabled) from arch_discovery's own
+//     queue/.arch-discovery-tools-disabled, checked only when allowWrite is requested
+//   - run_bash executes under sandbox.js's bwrap wrapper (the same real isolation the one
+//     other Bash-capable, materially-less-reliable-than-Claude actor in this codebase --
+//     adhoc-agentic-draft.js's Claude call -- already gets), with its own short per-command
+//     timeout well inside the overall REQUEST_TIMEOUT_MS budget
+//   - maxTurns stays caller-controlled and should be kept tight for Ghost callers (see
+//     ghost_sessions.py)
+const GHOST_BASH_TIMEOUT_MS = 30_000;
+
+function writeFileTool({ path: relPath, content }) {
+  const { repoRoot } = getConfig();
+  if (typeof relPath !== 'string' || !relPath.trim()) {
+    return { error: 'write_file requires a non-empty "path" argument' };
+  }
+  const full = resolveInsideRepo(repoRoot, relPath);
+  if (!full) {
+    return { error: `path escapes the repo root, refusing to write: ${relPath}` };
+  }
+  try {
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, typeof content === 'string' ? content : '');
+  } catch (e) {
+    return { error: `could not write ${relPath}: ${e.message}` };
+  }
+  return { path: relPath, written: true };
+}
+
+function editFileTool({ path: relPath, find, replace }) {
+  const { repoRoot } = getConfig();
+  if (typeof relPath !== 'string' || !relPath.trim()) {
+    return { error: 'edit_file requires a non-empty "path" argument' };
+  }
+  if (typeof find !== 'string' || find === '') {
+    return { error: 'edit_file requires a non-empty "find" argument' };
+  }
+  const full = resolveInsideRepo(repoRoot, relPath);
+  if (!full) {
+    return { error: `path escapes the repo root, refusing to edit: ${relPath}` };
+  }
+  let content;
+  try {
+    content = fs.readFileSync(full, 'utf8');
+  } catch (e) {
+    return { error: `could not read ${relPath}: ${e.message}` };
+  }
+  if (!content.includes(find)) {
+    return { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.` };
+  }
+  const occurrences = content.split(find).length - 1;
+  if (occurrences > 1) {
+    return { error: `"find" text matches ${occurrences} places in ${relPath} -- make it unique (include more surrounding context) before editing.` };
+  }
+  const updated = content.replace(find, replace || '');
+  try {
+    fs.writeFileSync(full, updated);
+  } catch (e) {
+    return { error: `could not write ${relPath}: ${e.message}` };
+  }
+  return { path: relPath, edited: true };
+}
+
+function runBashTool({ command }) {
+  const { repoRoot } = getConfig();
+  if (typeof command !== 'string' || !command.trim()) {
+    return { error: 'run_bash requires a non-empty "command" argument' };
+  }
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const wrapped = wrapWithSandbox('bash', ['-c', command], {
+    workDir: realRepoRoot,
+    readOnlyBinds: ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
+    // The whole live repo, writable -- unlike adhoc-agentic-draft.js's throwaway
+    // worktree, Ghost edits are meant to land directly on the real working tree (see
+    // this feature's own plan: "the same trust model as this session itself").
+    writableBinds: [realRepoRoot],
+  });
+  if (!wrapped.available) {
+    // Fails CLOSED here, not open -- unlike the Claude adhoc path (a hardening layer on
+    // top of an already-trusted actor), an unsandboxed local-model Bash call is new,
+    // meaningfully riskier territory this codebase has never granted before. No bwrap,
+    // no local-model shell access, full stop.
+    return { error: 'sandbox (bwrap) is not available on this host -- run_bash is disabled without it' };
+  }
+  try {
+    const stdout = execFileSync(wrapped.command, wrapped.args, {
+      encoding: 'utf8', timeout: GHOST_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+    });
+    return { command, stdout, exitCode: 0 };
+  } catch (e) {
+    return {
+      command,
+      stdout: (e.stdout || '').toString(),
+      stderr: (e.stderr || e.message || '').toString().slice(0, 2000),
+      exitCode: e.status != null ? e.status : null,
+      timedOut: e.signal === 'SIGTERM' && e.killed === true,
+    };
+  }
+}
+
+const WRITE_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Create a new file or overwrite an existing one with the given content, given a path relative to the repo root.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to the repo root.' },
+          content: { type: 'string', description: 'Full file content to write.' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_file',
+      description: 'Replace one exact, unique occurrence of "find" with "replace" in an existing file. Fails if "find" is not found verbatim or matches more than once -- include enough surrounding context to make it unique.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to the repo root.' },
+          find: { type: 'string', description: 'Exact text to find, must match verbatim and uniquely.' },
+          replace: { type: 'string', description: 'Text to replace it with.' },
+        },
+        required: ['path', 'find', 'replace'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_bash',
+      description: 'Run a shell command in the repo root, inside a filesystem sandbox. Use for git operations, running tests, or anything read_file/write_file/edit_file cannot do directly.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The shell command to run.' },
+        },
+        required: ['command'],
+      },
+    },
+  },
+];
+
+const WRITE_TOOL_HANDLERS = {
+  write_file: (args) => writeFileTool({ path: args.path, content: args.content }),
+  edit_file: (args) => editFileTool({ path: args.path, find: args.find, replace: args.replace }),
+  run_bash: (args) => runBashTool({ command: args.command }),
+};
+
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // No hardcoded fallback tag -- see local-client.js's matching comment. An unset
 // LOCAL_MODEL now surfaces as a real Ollama "model not found" error, not a guessed name.
@@ -154,14 +317,20 @@ const TOOL_HANDLERS = {
   list_directory: (args) => listDirectoryTool({ path: args.path }),
 };
 
-async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
+async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = false }) {
   const { pipelineDir } = getConfig();
-  const killSwitchPath = path.join(pipelineDir, 'queue', '.arch-discovery-tools-disabled');
+  // allowWrite=true (Ghost panel only) checks its OWN kill switch, separate from
+  // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
+  const killSwitchPath = path.join(pipelineDir, 'queue',
+    allowWrite ? '.ghost-write-tools-disabled' : '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
     const { call } = require('./local-client.js');
     const result = await call({ prompt, think: true });
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }
+
+  const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
+  const toolHandlers = allowWrite ? { ...TOOL_HANDLERS, ...WRITE_TOOL_HANDLERS } : TOOL_HANDLERS;
 
   // Same TokenFold session/scope headers local-client.js sends on /api/generate.
   // Without the session header every /api/chat call hashed into its own one-off
@@ -181,7 +350,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
       model: MODEL,
       messages,
-      tools: TOOLS,
+      tools,
       stream: false,
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
 
@@ -197,7 +366,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
     for (const toolCall of toolCalls) {
       const name = toolCall.function && toolCall.function.name;
       const args = (toolCall.function && toolCall.function.arguments) || {};
-      const handler = TOOL_HANDLERS[name];
+      const handler = toolHandlers[name];
       // A malformed/unknown tool call (bad name, missing/wrong-typed args, an escaping
       // path) must degrade gracefully -- a clear error STRING back to the model as the
       // tool result, so it can see it made a mistake and try again, not a thrown
@@ -223,11 +392,15 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source }) {
   return { response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false };
 }
 
-module.exports = { runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS };
+module.exports = {
+  runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS,
+  writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
+};
 
 // CLI: node local-tool-client.js <request.json>
-// request.json: { prompt, maxTurns, source? }  (source: task type, keys the
-// per-task-type TokenFold dictionary -- same meaning as local-client.js's source)
+// request.json: { prompt, maxTurns, source?, allowWrite? }  (source: task type, keys the
+// per-task-type TokenFold dictionary -- same meaning as local-client.js's source.
+// allowWrite: Ghost panel only, see WRITE_TOOLS' own header)
 // Writes the JSON result to stdout.
 if (require.main === module) {
   const requestPath = process.argv[2];
