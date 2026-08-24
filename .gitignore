@@ -2,7 +2,8 @@ node_modules/
 *.log
 agent-manager.env
 *.bak
-.venv/
+.venv
+.venv-broken-*/
 python/dashboard/project_cache/
 .agent-manager-cache/
 __pycache__/
@@ -14,6 +15,7 @@ instances/
 queue/
 graphify-out/
 model-stats.db
+hardware-stats.db
 community-coverage.json
 task-domains.json
 deep-dive-coverage.json
