@@ -43,10 +43,20 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     try:
         tmp_path.write_text(json.dumps(request), encoding="utf-8")
-        result = subprocess.run(
-            ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
-            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
-        )
+        try:
+            result = subprocess.run(
+                ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
+                capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as e:
+            # 2026-08-24 -- caught live: subprocess.TimeoutExpired does NOT inherit from
+            # TimeoutError, so a hang past SUBPROCESS_TIMEOUT_S (here, most often the
+            # local-tool-client.js call queued a long time behind a stuck/misbehaving
+            # worker-lane task via the GPU lock added earlier tonight) fell straight
+            # through every layer of error handling as a raw, unhandled 500. Same fix as
+            # claude_client.py's identical gap -- normalize into this module's own
+            # exception type, the one thing every caller already knows to catch.
+            raise LocalToolClientError(f"local-tool-client.js did not respond within {SUBPROCESS_TIMEOUT_S}s -- it may be queued behind a slow or stuck worker-lane task") from e
     finally:
         try:
             tmp_path.unlink()
