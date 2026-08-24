@@ -56,6 +56,10 @@
   .worker-card .id { font-weight: 600; }
   .worker-model-select { margin-left: 10px; margin-right: auto; font-size: 12px; max-width: 220px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .worker-card.clickable { cursor: pointer; }
+  .recent-tasks-list { list-style: none; padding: 0; margin: 6px 0 0; }
+  .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
+  .recent-tasks-list li:first-child { border-top: none; }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
@@ -518,11 +522,33 @@ async function setWorkerModel(instanceId, model) {
   await renderWorkers();
 }
 
+// Which worker card is expanded to show its last-10-completed-tasks list (2026-08-23,
+// "When I click on a worker to expand it's information I'd like to see a list of the
+// last 10 tasks it completed."). At most one at a time, like a details/summary accordion;
+// not persisted -- same glance-time-only treatment as workersTypeFilter above.
+let expandedWorkerId = null;
+
+async function toggleWorkerExpand(instanceId) {
+  expandedWorkerId = expandedWorkerId === instanceId ? null : instanceId;
+  await renderWorkers();
+}
+
+function renderRecentTasksList(tasks) {
+  if (!tasks.length) return '<div class="meta">No completed tasks recorded for this worker yet.</div>';
+  return `<ul class="recent-tasks-list">${tasks.map(t => `
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtml(t.taskId)}</a>
+      <span class="meta">${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
+    </li>`).join('')}</ul>`;
+}
+
 async function renderWorkers() {
-  const [instances, workerModels, costSummary] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
+    // Only fetch for whichever card is currently expanded -- no point loading this for
+    // every instance on every 5s poll when at most one card shows it at a time.
+    expandedWorkerId ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/recent-tasks`) : Promise.resolve(null),
   ]);
   const overrides = workerModels.overrides || {};
   // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
@@ -547,7 +573,7 @@ async function renderWorkers() {
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
-    <div class="worker-card ${inst.currentTaskId ? 'clickable' : ''}" ${inst.currentTaskId ? `data-task-id="${escapeAttr(inst.currentTaskId)}"` : ''}>
+    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
         ${(() => {
@@ -577,13 +603,18 @@ async function renderWorkers() {
       </div>
       <div class="meta">
         pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
-        ${inst.currentTaskId ? ' · working on <strong>' + inst.currentTaskId + '</strong>' + (inst.currentPass ? ' (' + inst.currentPass + ')' : '') : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
+      ${expandedWorkerId === inst.instanceId ? `
+      <div class="worker-recent-tasks">
+        <div class="meta" style="margin-top:8px; font-weight:600">Last 10 completed tasks</div>
+        ${recentTasks ? renderRecentTasksList(recentTasks.tasks || []) : '<div class="meta">Loading…</div>'}
+      </div>` : ''}
     </div>
   `).join(''));
-  main.querySelectorAll('.worker-card[data-task-id]').forEach((card) => {
-    card.onclick = () => openTaskAnywhere(card.dataset.taskId);
+  main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
+    card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
   main.querySelectorAll('[data-worker-filter]').forEach((btn) => {
     btn.onclick = () => { workersTypeFilter = btn.dataset.workerFilter; renderWorkers(); };
@@ -591,6 +622,9 @@ async function renderWorkers() {
   main.querySelectorAll('.worker-model-select').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
     sel.onchange = (e) => { e.stopPropagation(); setWorkerModel(sel.dataset.instanceId, sel.value); };
+  });
+  main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
+    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
   updateStaleTimers();
 }
