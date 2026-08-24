@@ -25,33 +25,50 @@ function writeDraftingTask(pipelineDir, instanceId, task) {
   fs.writeFileSync(path.join(dir, `${task.id}.json`), JSON.stringify(task));
 }
 
-test('destinationDirFor sends adhoc/research domains back to their own claim source, everything else to pending', () => {
-  assert.equal(destinationDirFor('adhoc'), 'adhoc');
-  assert.equal(destinationDirFor('research'), 'research');
+// CORRECTED 2026-08-24 (same day this file was written): the original version routed
+// adhoc/research domains back to queue/adhoc/queue/research -- found live that this was
+// itself wrong. Those directories are permanent, append-only staging logs (the original
+// candidate a task was PROMOTED from via writeTask() into pending/, never deleted), so a
+// reclaim targeting them collides with the ever-present original and gets silently
+// skipped by the "never clobber" safety -- the exact stuck-forever failure mode this
+// file exists to fix, just relocated. Every domain now goes to pending/, the one place a
+// claimed task's own id is genuinely free once claimed.
+test('destinationDirFor always sends every domain to pending/, including adhoc and research', () => {
+  assert.equal(destinationDirFor('adhoc'), 'pending');
+  assert.equal(destinationDirFor('research'), 'pending');
   assert.equal(destinationDirFor('default'), 'pending');
   assert.equal(destinationDirFor(undefined), 'pending');
 });
 
-test('reclaims an orphaned adhoc task back into queue/adhoc/, not pending/', () => {
+test('reclaims an orphaned adhoc task into queue/pending/, NOT queue/adhoc/ (which still holds the permanent original candidate)', () => {
   const dir = tempPipelineDir();
   writeDraftingTask(dir, 'worker-1', { id: 'adhoc-test-1', domain: 'adhoc', title: 'x', history: [] });
+  // The permanent original this task was promoted from -- confirmed live this always
+  // still exists at reclaim time, which is exactly why routing back to adhoc/ used to
+  // fail (this same id, already present, "never clobber" skips it).
+  const adhocDir = path.join(dir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.writeFileSync(path.join(adhocDir, 'adhoc-test-1.json'), JSON.stringify({ id: 'adhoc-test-1', title: 'the permanent original candidate' }));
 
   const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
 
   assert.equal(result.reclaimed, 1);
   assert.deepEqual(result.ids, ['adhoc-test-1']);
-  assert.ok(fs.existsSync(path.join(dir, 'queue', 'adhoc', 'adhoc-test-1.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'adhoc-test-1.json')));
   assert.ok(!fs.existsSync(path.join(dir, 'queue', 'drafting', 'worker-1', 'adhoc-test-1.json')));
+  // The permanent original is untouched -- still there, unmodified.
+  const original = JSON.parse(fs.readFileSync(path.join(adhocDir, 'adhoc-test-1.json'), 'utf8'));
+  assert.equal(original.title, 'the permanent original candidate');
 });
 
-test('reclaims an orphaned research task back into queue/research/', () => {
+test('reclaims an orphaned research task into queue/pending/, NOT queue/research/', () => {
   const dir = tempPipelineDir();
   writeDraftingTask(dir, 'worker-reasoning', { id: 'research-test-1', domain: 'research', title: 'x', history: [] });
 
   const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-reasoning' });
 
   assert.equal(result.reclaimed, 1);
-  assert.ok(fs.existsSync(path.join(dir, 'queue', 'research', 'research-test-1.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'research-test-1.json')));
 });
 
 test('reclaims a plain-domain task back into queue/pending/', () => {
@@ -132,7 +149,7 @@ test('reclaims multiple orphaned tasks in one pass', () => {
   const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
 
   assert.equal(result.reclaimed, 3);
-  assert.ok(fs.existsSync(path.join(dir, 'queue', 'adhoc', 'multi-1.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-1.json')));
   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));
-  assert.ok(fs.existsSync(path.join(dir, 'queue', 'research', 'multi-3.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));
 });

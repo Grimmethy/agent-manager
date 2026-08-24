@@ -13,10 +13,19 @@
 // Called once, at worker startup, BEFORE the main claim loop begins -- at that exact
 // moment ANY file already sitting in THIS instance's own drafting/<instanceId>/ folder
 // is, by definition, orphaned: a freshly-started process hasn't claimed anything yet.
-// Sent back to the queue it was originally claimed FROM -- nextAdhocTask()/
-// nextResearchTask() only ever scan queue/adhoc//queue/research/ respectively, never
-// pending/, so an adhoc task reclaimed into pending/ would be invisible to its own claim
-// logic forever, the exact same silent-stuck failure mode this exists to fix.
+//
+// Always sent to queue/pending/ -- CORRECTED 2026-08-24 (same day as this file was
+// written) after finding, live, that the original version's adhoc/research routing was
+// itself wrong: queue/adhoc/ and queue/research/ are permanent, append-only staging
+// logs -- nextAdhocTask()/nextResearchTask() read a candidate from there and PROMOTE it
+// into queue/pending/ via writeTask(), but never delete the original file, so it sits
+// there forever as a historical record. A task that reached drafting/ was ALWAYS
+// claimed from its promoted pending/ copy, never the adhoc/research original -- sending
+// a reclaim back to adhoc/research means writing to a path THAT ALREADY EXISTS (the
+// permanent original), which this function's own "never clobber" safety then correctly
+// refuses, silently leaving the orphan stuck forever -- the exact failure mode this
+// whole file exists to fix, just relocated. pending/ is the one directory a promoted
+// task's own id is genuinely gone from once claimed, so it's always safe to write back to.
 //
 // CLI: node reclaim-orphaned-drafts.js <instanceId>
 // Writes one line of JSON to stdout: { reclaimed: N, ids: [...] }
@@ -26,9 +35,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 
-function destinationDirFor(domain) {
-  if (domain === 'adhoc') return 'adhoc';
-  if (domain === 'research') return 'research';
+function destinationDirFor(_domain) {
   return 'pending';
 }
 
