@@ -1,18 +1,18 @@
-"""Ghost panel session logic -- Brain Dump #153 (Grimmethy): "a hideable panel on the
+"""Chat panel session logic -- Brain Dump #153 (Grimmethy): "a hideable panel on the
 right side of the app for a conversational AI, very similar to the claude terminal I have
 been using externally. It should be able to access the project files and make edits to
-the system... the ghost in the machine."
+the system... the chat in the machine."
 
 Deliberately NOT built on discuss_sessions.py's shape despite some surface similarity:
 Discuss is per-subject (a task/note/brain-dump entry), read-only, and rebuilds a fresh
 prompt+transcript every turn because neither provider has real session continuity wired
-in there. Ghost is global (one ongoing conversation per project, not tied to any subject),
+in there. Chat is global (one ongoing conversation per project, not tied to any subject),
 has real Edit/Write/Bash access on both providers, and -- for Claude -- uses the CLI's own
 `--resume` session continuity (see claude_client.py's own header) instead of replaying a
 transcript. The local provider still has no native session-resume (Ollama's /api/generate
 is stateless), so it keeps Discuss's proven transcript-replay approach -- but now through
 local_tool_client.py's tool-calling loop (allow_write=True) instead of a bare completion,
-since Ghost's local provider needs real Read/Grep/Glob/Edit/Write/Bash tool access, not
+since Chat's local provider needs real Read/Grep/Glob/Edit/Write/Bash tool access, not
 just text.
 
 Git safety (edits landing on the LIVE working tree, not an isolated worktree) is handled
@@ -34,23 +34,23 @@ PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
 
 # Real Edit/Write/Bash, unlike Discuss's deliberately read-only CLAUDE_DISCUSS_ALLOWED_TOOLS
-# -- this is the whole point of the Ghost panel (Brain Dump #153: "make edits to the
+# -- this is the whole point of the Chat panel (Brain Dump #153: "make edits to the
 # system"). cwd is the live repoRoot, not an isolated worktree -- see this module's own
 # header on the trust model this mirrors (this actual terminal session).
-GHOST_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
-GHOST_CLAUDE_MAX_TURNS = 30
+CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
+CHAT_CLAUDE_MAX_TURNS = 30
 # Tight cap for the local provider's own tool loop -- matches arch_discovery's existing
 # ceiling (local-tool-client.js's runPlanWithTools default), deliberately not widened for
-# Ghost; see local-tool-client.js's own WRITE_TOOLS header on why hard bounds stay hard.
-GHOST_LOCAL_MAX_TURNS = 5
+# Chat; see local-tool-client.js's own WRITE_TOOLS header on why hard bounds stay hard.
+CHAT_LOCAL_MAX_TURNS = 5
 
 
-def ghost_sessions_path(storage_dir: Path) -> Path:
-    return storage_dir / ".agent-manager-ghost-sessions.json"
+def chat_sessions_path(storage_dir: Path) -> Path:
+    return storage_dir / ".agent-manager-chat-sessions.json"
 
 
 def _read_sessions(storage_dir: Path) -> dict:
-    p = ghost_sessions_path(storage_dir)
+    p = chat_sessions_path(storage_dir)
     if not p.exists():
         return {}
     try:
@@ -60,7 +60,7 @@ def _read_sessions(storage_dir: Path) -> dict:
 
 
 def _write_sessions(storage_dir: Path, sessions: dict):
-    ghost_sessions_path(storage_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    chat_sessions_path(storage_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
 def _now_iso() -> str:
@@ -68,7 +68,7 @@ def _now_iso() -> str:
 
 
 def _new_session(repo_root: str, instances_dir, provider: str, model: str, effort: str) -> dict:
-    session_id = f"ghost-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    session_id = f"chat-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     return {
         "id": session_id,
         "provider": provider,
@@ -134,13 +134,13 @@ def _send_claude(session: dict, message: str) -> str:
     started = time.time()
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
-        cwd=session["repoRoot"], allowed_tools=GHOST_CLAUDE_ALLOWED_TOOLS,
-        max_turns=GHOST_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
+        cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
+        max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
-    model_stats_client.record_call("ghost-session", result["model"], int((time.time() - started) * 1000),
-                                    stage="ghost", result=result)
+    model_stats_client.record_call("chat-session", result["model"], int((time.time() - started) * 1000),
+                                    stage="chat", result=result)
     return result["response"].strip()
 
 
@@ -167,10 +167,10 @@ def _send_local(session: dict, message: str) -> str:
     started = time.time()
     prompt = _build_local_prompt(session["transcript"], message)
     result = local_tool_client.run_plan_with_tools(
-        prompt, max_turns=GHOST_LOCAL_MAX_TURNS, source="ghost", allow_write=True,
+        prompt, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
     )
-    model_stats_client.record_call("ghost-session", ollama_client.MODEL, int((time.time() - started) * 1000),
-                                    stage="ghost", result=result)
+    model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
+                                    stage="chat", result=result)
     return (result.get("response") or "").strip()
 
 

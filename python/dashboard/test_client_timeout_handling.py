@@ -1,9 +1,9 @@
 """Regression test: subprocess.TimeoutExpired does NOT inherit from TimeoutError, so a
 hang past claude_client.py's/local_tool_client.py's own SUBPROCESS_TIMEOUT_S fell straight
-through every layer of error handling (including app.py's _call_discuss/_call_ghost,
+through every layer of error handling (including app.py's _call_discuss/_call_chat,
 which only catch ClaudeClientError/LocalToolClientError plus the builtin
 TimeoutError/ConnectionError/OSError trio) as a raw, unhandled 500 -- caught live via the
-Ghost panel's first real message, queued a long time behind a stuck worker-lane task.
+Chat panel's first real message, queued a long time behind a stuck worker-lane task.
 Both client modules now catch it at the source and normalize it into their own exception
 type, same as every other subprocess failure mode they already handle.
 

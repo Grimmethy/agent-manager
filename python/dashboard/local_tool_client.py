@@ -1,6 +1,6 @@
 """Python-side wrapper for src/local-tool-client.js's CLI mode -- the local model's
-multi-turn tool-calling loop (grep_codebase/read_file/list_directory, plus Ghost's own
-opt-in write_file/edit_file/run_bash), needed by the dashboard's Ghost panel the same way
+multi-turn tool-calling loop (grep_codebase/read_file/list_directory, plus Chat's own
+opt-in write_file/edit_file/run_bash), needed by the dashboard's Chat panel the same way
 claude_client.py already wraps claude-client.js for the Claude provider.
 
 Deliberately shells out to the Node module rather than reimplementing the /api/chat
@@ -31,7 +31,7 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
     """Returns local-tool-client.js's own result shape:
     {response, toolCallLog, turnsUsed, toolsDisabled}.
 
-    allow_write=True (Ghost panel only) opts into write_file/edit_file/run_bash on top
+    allow_write=True (Chat panel only) opts into write_file/edit_file/run_bash on top
     of the always-available read-only tools -- see local-tool-client.js's own WRITE_TOOLS
     header for why this is a deliberate, separate opt-in, not a default."""
     request = {"prompt": prompt, "maxTurns": max_turns}

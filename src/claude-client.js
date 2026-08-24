@@ -130,7 +130,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     args.push('--tools', '');
   }
   if (MAX_BUDGET_USD) args.push('--max-budget-usd', MAX_BUDGET_USD);
-  // 2026-08-24 (Ghost panel, Brain Dump #153: "very similar to the claude terminal I have
+  // 2026-08-24 (Chat panel, Brain Dump #153: "very similar to the claude terminal I have
   // been using externally") -- resume threads --resume <sessionId> so the CLI's OWN
   // session storage carries real conversation context forward between calls, instead of
   // every caller having to rebuild a full prompt+transcript from scratch each turn the

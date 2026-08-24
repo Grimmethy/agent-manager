@@ -41,11 +41,11 @@ already-parked blocking flock() call to win the wakeup race. A DIRECTORY of per-
 files, not one shared flag, so a second concurrent Discuss session doesn't have its
 priority silently cleared the instant the first one gets the lock.
 
-Split into acquire()/release() (2026-08-24, Ghost panel's "fully reserve the reasoning
+Split into acquire()/release() (2026-08-24, Chat panel's "fully reserve the reasoning
 model" toggle) plus held(), a thin contextmanager wrapper around them -- a reservation has
 to span multiple separate HTTP requests (toggle on, several chat messages, toggle off),
 which a single `with` block can't do. held() stays the right shape for every OTHER caller
-(Discuss, and Ghost's own per-message calls when NOT reserved), where the lock's whole
+(Discuss, and Chat's own per-message calls when NOT reserved), where the lock's whole
 life fits inside one function call.
 """
 import fcntl

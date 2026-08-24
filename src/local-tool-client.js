@@ -88,23 +88,23 @@ function listDirectoryTool({ path: relPath }) {
   };
 }
 
-// 2026-08-24 (Ghost panel, Brain Dump #153, Grimmethy: explicitly chose real local-model
+// 2026-08-24 (Chat panel, Brain Dump #153, Grimmethy: explicitly chose real local-model
 // write access despite the read-only-only design above) -- write_file/edit_file/run_bash
 // are kept SEPARATE from TOOLS/TOOL_HANDLERS below, not merged into them: the existing
 // arch_discovery caller (runPlanWithTools({..., allowWrite: false})) must stay exactly
-// as read-only as it is today, unaffected by this. A Ghost caller opts in explicitly via
+// as read-only as it is today, unaffected by this. A Chat caller opts in explicitly via
 // allowWrite: true. This is the mitigation for the exact documented failure mode that
 // justified read-only-only in the first place (a stalled 13+-minute tool-calling call,
 // see this file's own header) -- not a bare capability grant:
-//   - a SEPARATE kill switch (queue/.ghost-write-tools-disabled) from arch_discovery's own
+//   - a SEPARATE kill switch (queue/.chat-write-tools-disabled) from arch_discovery's own
 //     queue/.arch-discovery-tools-disabled, checked only when allowWrite is requested
 //   - run_bash executes under sandbox.js's bwrap wrapper (the same real isolation the one
 //     other Bash-capable, materially-less-reliable-than-Claude actor in this codebase --
 //     adhoc-agentic-draft.js's Claude call -- already gets), with its own short per-command
 //     timeout well inside the overall REQUEST_TIMEOUT_MS budget
-//   - maxTurns stays caller-controlled and should be kept tight for Ghost callers (see
-//     ghost_sessions.py)
-const GHOST_BASH_TIMEOUT_MS = 30_000;
+//   - maxTurns stays caller-controlled and should be kept tight for Chat callers (see
+//     chat_sessions.py)
+const CHAT_BASH_TIMEOUT_MS = 30_000;
 
 function writeFileTool({ path: relPath, content }) {
   const { repoRoot } = getConfig();
@@ -158,11 +158,11 @@ function editFileTool({ path: relPath, find, replace }) {
   return { path: relPath, edited: true };
 }
 
-// 2026-08-24 -- caught live within minutes of the Ghost panel shipping: app.py used to
-// wrap ghost_sessions.send_message()'s ENTIRE call in the same git-safety mutex
+// 2026-08-24 -- caught live within minutes of the Chat panel shipping: app.py used to
+// wrap chat_sessions.send_message()'s ENTIRE call in the same git-safety mutex
 // apply-task.sh/api_git_merge_branch use, held for however long the whole turn took
 // (a local-provider turn can legitimately wait minutes on the GPU lock alone) even
-// though most turns never touch git at all -- a second, unrelated Ghost message got
+// though most turns never touch git at all -- a second, unrelated Chat message got
 // "the pipeline is mid-apply right now" while nothing was actually applying. Moved the
 // real protection down to HERE, the one place in this module that can actually run a
 // git-mutating command, held only around the single execFileSync call below -- not the
@@ -195,7 +195,7 @@ function runBashTool({ command }) {
     workDir: realRepoRoot,
     readOnlyBinds: ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
     // The whole live repo, writable -- unlike adhoc-agentic-draft.js's throwaway
-    // worktree, Ghost edits are meant to land directly on the real working tree (see
+    // worktree, Chat edits are meant to land directly on the real working tree (see
     // this feature's own plan: "the same trust model as this session itself").
     writableBinds: [realRepoRoot],
   });
@@ -208,7 +208,7 @@ function runBashTool({ command }) {
   }
   try {
     const stdout = withApplyLock(() => execFileSync(wrapped.command, wrapped.args, {
-      encoding: 'utf8', timeout: GHOST_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', timeout: CHAT_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
     }));
     return { command, stdout, exitCode: 0 };
   } catch (e) {
@@ -348,10 +348,10 @@ const TOOL_HANDLERS = {
 
 async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = false }) {
   const { pipelineDir } = getConfig();
-  // allowWrite=true (Ghost panel only) checks its OWN kill switch, separate from
+  // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
   const killSwitchPath = path.join(pipelineDir, 'queue',
-    allowWrite ? '.ghost-write-tools-disabled' : '.arch-discovery-tools-disabled');
+    allowWrite ? '.chat-write-tools-disabled' : '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
     const { call } = require('./local-client.js');
     // local-client.js's own call() doesn't self-lock -- local-draft.js's maybeLocked()
@@ -362,7 +362,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
 
   const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
   const toolHandlers = allowWrite ? { ...TOOL_HANDLERS, ...WRITE_TOOL_HANDLERS } : TOOL_HANDLERS;
-  // 2026-08-24 -- caught live via the Ghost panel's first real message: this loop's own
+  // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
   // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
   // work earlier tonight was built to fix, just reintroduced through a different call
@@ -441,7 +441,7 @@ module.exports = {
 // CLI: node local-tool-client.js <request.json>
 // request.json: { prompt, maxTurns, source?, allowWrite? }  (source: task type, keys the
 // per-task-type TokenFold dictionary -- same meaning as local-client.js's source.
-// allowWrite: Ghost panel only, see WRITE_TOOLS' own header)
+// allowWrite: Chat panel only, see WRITE_TOOLS' own header)
 // Writes the JSON result to stdout.
 if (require.main === module) {
   const requestPath = process.argv[2];

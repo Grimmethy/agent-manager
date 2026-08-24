@@ -109,7 +109,7 @@ test('TOOLS declares exactly grep_codebase, read_file, and list_directory -- no 
   });
 });
 
-// Ghost panel (2026-08-24): write_file/edit_file/run_bash, deliberately kept OUT of TOOLS
+// Chat panel (2026-08-24): write_file/edit_file/run_bash, deliberately kept OUT of TOOLS
 // above -- opt-in only via runPlanWithTools({allowWrite: true}), never the arch_discovery
 // default. Exported as standalone functions the same way readFileTool/listDirectoryTool
 // already are, so they're testable as pure functions with no real Ollama call.
@@ -187,11 +187,11 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
   });
 });
 
-// Regression, 2026-08-24: caught live within minutes of the Ghost panel shipping -- app.py
-// used to wrap ghost_sessions.send_message()'s ENTIRE call in apply-task.sh's own
+// Regression, 2026-08-24: caught live within minutes of the Chat panel shipping -- app.py
+// used to wrap chat_sessions.send_message()'s ENTIRE call in apply-task.sh's own
 // git-safety mutex, held for however long the whole turn took (a local-provider turn can
 // legitimately wait minutes on the GPU lock alone), so a second, completely unrelated
-// Ghost message got "the pipeline is mid-apply right now" while nothing was actually
+// Chat message got "the pipeline is mid-apply right now" while nothing was actually
 // applying. Moved the real protection down to withApplyLock, held only around the single
 // git-mutating command execution in runBashTool -- these tests prove withApplyLock itself
 // really uses the SAME fixed lockfile apply-task.sh/api_git_merge_branch already flock

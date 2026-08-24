@@ -1,4 +1,4 @@
-"""Tests for single_flight_lock.py's acquire()/release() (2026-08-24, Ghost panel's
+"""Tests for single_flight_lock.py's acquire()/release() (2026-08-24, Chat panel's
 "fully reserve the reasoning model" toggle -- needs a lock that spans multiple separate
 HTTP requests, which held()'s contextmanager shape can't do). No extra dependencies,
 matching python/test_build_graph.py's own zero-dependency stdlib-unittest convention.
