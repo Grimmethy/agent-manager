@@ -346,12 +346,25 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     source: task.source,
   });
 
-  const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real`;
+  // 2026-08-24, Grimmethy: "are there any efficiency buffs you can think of" -- voteErrors
+  // (added alongside majorityVote()'s own per-vote resilience fix, commit 0ac54b9) was
+  // computed but never actually read anywhere -- real diagnostic signal (which votes
+  // hard-failed, and why) silently discarded on every single review, exactly the kind of
+  // "why did this take 3x longer than expected" trail that took hours of manual log
+  // archaeology to reconstruct by hand earlier tonight. Surfaced into both voteSummary
+  // (so it's visible in the task's own history without opening the raw field) and a new
+  // task.voteErrors (so it's queryable structured data, same convention task.ornithVotes
+  // already uses for the real vote responses).
+  const voteErrorSuffix = voteResult.voteErrors && voteResult.voteErrors.length > 0
+    ? `, ${voteResult.voteErrors.length} vote(s) hard-failed`
+    : '';
+  const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real${voteErrorSuffix}`;
 
   if (!voteResult.confident || !voteResult.verdict) {
     const reason = `Ornith review inconclusive, no confident majority (${voteSummary})`;
     task.reviewProvider = 'ornith';
     task.ornithVotes = voteResult.votes;
+    task.voteErrors = voteResult.voteErrors;
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
@@ -363,6 +376,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     task.reviewProvider = 'ornith';
     task.ornithVerdict = `Confident majority APPROVE (${voteSummary})\n\n${sampleVote ? sampleVote.response : ''}`;
     task.ornithVotes = voteResult.votes;
+    task.voteErrors = voteResult.voteErrors;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
     appendHistoryEvent(task, 'approved', voteSummary);
     return { succeeded: true, verdict: 'approved', factCheckVerdict };
@@ -373,6 +387,7 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   const reason = match ? match[1] : `REJECT (${voteSummary})`;
   task.reviewProvider = 'ornith';
   task.ornithVotes = voteResult.votes;
+  task.voteErrors = voteResult.voteErrors;
   recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
   appendHistoryEvent(task, 'blocked', reason);
   return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };

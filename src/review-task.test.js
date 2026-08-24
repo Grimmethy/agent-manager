@@ -180,6 +180,45 @@ function fakeApprove(capturedPrompts) {
   };
 }
 
+// Regression, 2026-08-24: voteErrors (majorityVote's own per-vote hard-failure record,
+// commit 0ac54b9) was computed but never actually read by reviewTask -- real diagnostic
+// signal (which votes hard-failed, and why) silently discarded on every review.
+test('reviewTask surfaces majorityVote\'s voteErrors onto the task and into the history detail when present', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = baseTask();
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    ornithMajorityVote: async () => ({
+      confident: true, verdict: 'APPROVE',
+      votes: [{ verdict: 'APPROVE', response: 'APPROVE: looks fine' }],
+      realVoteCount: 1, requestedVotes: 3,
+      voteErrors: ['Ollama request timed out after 145000ms', 'Ollama request timed out after 132000ms'],
+    }),
+    recordModelOutcome: () => {},
+  });
+
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(task.voteErrors, ['Ollama request timed out after 145000ms', 'Ollama request timed out after 132000ms']);
+  const approvedEntry = task.history.find((h) => h.stage === 'approved');
+  assert.match(approvedEntry.detail, /2 vote\(s\) hard-failed/);
+});
+
+test('reviewTask leaves the vote-error suffix out entirely when every vote succeeded', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = baseTask();
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    ornithMajorityVote: fakeApprove(captured),
+    recordModelOutcome: () => {},
+  });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(task.voteErrors, undefined);
+  const approvedEntry = task.history.find((h) => h.stage === 'approved');
+  assert.doesNotMatch(approvedEntry.detail, /hard-failed/);
+});
+
 test('reviewTask fact-checks brain_dump_sort secondBrainPath against secondBrainDir, not repoRoot -- exists:true for a note that is only in the vault', async () => {
   const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
   fs.mkdirSync(path.join(secondBrainDir, 'references'), { recursive: true });

@@ -52,10 +52,9 @@ function jsonDeepClone(text, relPath) {
   return require('./maintenance/performance-scan.js').findJsonDeepCloneAntipattern(text, relPath);
 }
 
-// Repo-wide rules (observability_review's missing-reserved-attribute) and
-// function_length_review's length-not-pattern shape are deliberately absent here -- a
-// single-file (text, relPath) recheck isn't the right shape for either; they fall back
-// to the LLM path same as any other unsupported rule.
+// function_length_review's length-not-pattern shape is deliberately absent here -- a
+// single-file (text, relPath) recheck isn't the right shape for it; it falls back to the
+// LLM path same as any other unsupported rule.
 const RULE_DETECTORS = {
   'silent-catch-block': silentCatchBlocks,
   'unguarded-long-running-loop': unguardedLoops,
@@ -63,6 +62,34 @@ const RULE_DETECTORS = {
   'sync-io-in-loop': syncIoInLoop,
   'sequential-await-in-loop': sequentialAwaitInLoop,
   'json-deep-clone-antipattern': jsonDeepClone,
+};
+
+// 2026-08-24, Grimmethy: "Do 1 and 2" (extend the fastpath's rule coverage) -- the one
+// real gap left after the initial pass: missing-reserved-attribute is REPO-WIDE (a
+// project either has service.name/error.type somewhere in its source or it doesn't --
+// there's no single (file, line) to re-check), so it can't share RULE_DETECTORS' per-file
+// (text, relPath) -> findings shape. Re-derives the exact same scan scanProject()
+// (observability-scan.js) runs for this rule: same SCAN_EXTENSIONS list (duplicated
+// locally -- not exported, same small-duplication convention every other maintenance
+// module here already follows), same isLikelyMinified filter, same hasOtelDependency gate
+// (a project with no OTel SDK dependency was never really subject to this rule at all,
+// same as "resolved" -- there's nothing to still be missing).
+const REPO_WIDE_SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
+
+function missingReservedAttribute(repoRoot) {
+  const { hasOtelDependency, findMissingReservedAttributes } = require('./maintenance/observability-scan.js');
+  const { listSourceFiles, isLikelyMinified } = require('./maintenance/scan-utils.js');
+  if (!hasOtelDependency(repoRoot)) return [];
+  const files = listSourceFiles(repoRoot, REPO_WIDE_SCAN_EXTENSIONS).filter((file) => {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { return false; }
+    return !isLikelyMinified(text);
+  });
+  return findMissingReservedAttributes(repoRoot, files);
+}
+
+const REPO_WIDE_RULE_DETECTORS = {
+  'missing-reserved-attribute': missingReservedAttribute,
 };
 
 const SUPPORTED_SOURCES = new Set(['observability_review', 'performance_review']);
@@ -74,8 +101,35 @@ const SUPPORTED_SOURCES = new Set(['observability_review', 'performance_review']
 function deterministicRecheck(task, repoRoot) {
   const ctx = (task && task.promptContext) || {};
   const { originalSource, originalRule, originalFile } = ctx;
-  if (!repoRoot || !originalSource || !originalRule || !originalFile) return null;
+  if (!repoRoot || !originalSource || !originalRule) return null;
   if (!SUPPORTED_SOURCES.has(originalSource)) return null;
+
+  const repoWideDetector = REPO_WIDE_RULE_DETECTORS[originalRule];
+  if (repoWideDetector) {
+    const findings = repoWideDetector(repoRoot);
+    if (findings.length === 0) {
+      return {
+        recommendation: 'archive',
+        hits: [],
+        reportText: [
+          `1. The original concern no longer applies: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content finds nothing missing.`,
+          '2. N/A -- not a fabrication-repeat case.',
+          `3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" no longer fires anywhere in this repo.`,
+        ].join('\n'),
+      };
+    }
+    return {
+      recommendation: 'investigate',
+      hits: findings.map((f) => ({ file: f.file, line: f.line, query: 'deterministic-rescan', text: f.detail })),
+      reportText: [
+        `1. The original concern still holds: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content still finds it missing.`,
+        '2. N/A -- not a fabrication-repeat case.',
+        `3. RECOMMENDATION: worth a fresh investigation -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" still fires in this repo.`,
+      ].join('\n'),
+    };
+  }
+
+  if (!originalFile) return null;
   const detector = RULE_DETECTORS[originalRule];
   if (!detector) return null;
 
@@ -128,4 +182,4 @@ function deterministicRecheck(task, repoRoot) {
   };
 }
 
-module.exports = { deterministicRecheck, RULE_DETECTORS, SUPPORTED_SOURCES };
+module.exports = { deterministicRecheck, RULE_DETECTORS, REPO_WIDE_RULE_DETECTORS, SUPPORTED_SOURCES };
