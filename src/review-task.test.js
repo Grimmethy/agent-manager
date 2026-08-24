@@ -146,6 +146,27 @@ test('buildVerdictPrompt keeps the ordinary manual-source (diff-grounded) carve-
   assert.doesNotMatch(prompt, /DECOMPOSE rather than implement directly/);
 });
 
+// Regression, 2026-08-24: caught live on a real hardware-tracking-tab decompose -- a
+// genuinely clean, well-scoped decomposition got rejected because the SEPARATE, earlier
+// PLAN section (drafted blind, before any real investigation) contained a truncated/
+// malformed illustrative Python snippet. buildVerdictPrompt always shows the PLAN
+// unconditionally (its own fixed structure), so without telling the reviewer explicitly
+// that the PLAN isn't the deliverable for a decompose resolution, a rough or broken plan
+// sketch got read as evidence against the actual (clean) decomposition that followed it.
+test('buildVerdictPrompt tells the reviewer NOT to judge a decompose draft by problems in the separate, blindly-drafted PLAN section', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'manual',
+    adhocResolution: 'decompose',
+    planResponse: '```python\ntry:\n    import psutil\nexcept ImportError:\npsutil = None\n\ns.gpu_mem_used_mb = gpu["mem_used\n```',
+    implementResponse: 'Too large for one pass.\n\n[{"title":"Add a collector module","rawText":"a full, self-contained description"},{"title":"Persist snapshots","rawText":"a full, self-contained description"}]\n\nSplit into 2 pieces.',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /PLAN section above was drafted BLIND/);
+  assert.match(prompt, /Do NOT reject over anything wrong with the PLAN itself/);
+  assert.match(prompt, /judge ONLY the actual DECOMPOSITION/);
+});
+
 test('a short staleness_audit report is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = {
