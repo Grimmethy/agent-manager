@@ -919,15 +919,29 @@ def index():
     return render_template("index.html")
 
 
+def _expected_instance_ids() -> list[str]:
+    """The daemons scripts/launch.sh always starts (worker-1, reviewer, queue-watchdog),
+    plus worker-reasoning whenever it would actually be launched (gated on the same
+    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses). apply-task-loop is deliberately
+    excluded -- it's a single-shot pass with no heartbeat file of its own (see launch.sh's
+    own comment), so it never has a slot to be "offline" in."""
+    ids = ["worker-1", "reviewer", "watchdog"]
+    if is_claude_token_configured():
+        ids.append("worker-reasoning")
+    return ids
+
+
 @app.route("/api/instances")
 def api_instances():
     results = []
+    seen_ids = set()
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
         for f in sorted(inst_dir.glob("*.json")):
             data = read_json_safe(f)
             if not data or not data.get("instanceId") or not data.get("lastHeartbeat"):
                 continue
+            seen_ids.add(data["instanceId"])
             last_hb = parse_hb_timestamp(data["lastHeartbeat"])
             age = (datetime.now(timezone.utc) - last_hb).total_seconds() if last_hb else None
             threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
@@ -945,6 +959,28 @@ def api_instances():
                 "stateAgeSeconds": round(state_age) if state_age is not None else None,
                 "stale": age is not None and age > threshold,
                 "staleThresholdSeconds": threshold,
+            })
+    # Fill in a placeholder "offline" card for every daemon launch.sh would normally start
+    # but that has no (fresh-enough) heartbeat file on disk -- previously the Workers tab
+    # went entirely blank ("No instances found -- is the pipeline running?") whenever the
+    # pipeline was stopped from a clean state, instead of showing operators which workers
+    # exist and that they're simply not running.
+    if inst_dir is not None:
+        for instance_id in _expected_instance_ids():
+            if instance_id in seen_ids:
+                continue
+            results.append({
+                "instanceId": instance_id,
+                "status": "offline",
+                "pid": None,
+                "model": None,
+                "currentTaskId": None,
+                "currentPass": None,
+                "lastHeartbeat": None,
+                "heartbeatAgeSeconds": None,
+                "stateAgeSeconds": None,
+                "stale": False,
+                "staleThresholdSeconds": None,
             })
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
