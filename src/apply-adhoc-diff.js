@@ -25,7 +25,43 @@ const { execFileSync } = require('child_process');
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
 
-function applyAdhocDiff({ task, repoRoot }) {
+function slugify(str) {
+  return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
+}
+
+// 2026-08-24: applies a RESOLUTION: decompose draft (adhoc-agentic-draft.js) by writing
+// each proposed sub-task into queue/adhoc/, the exact schema/location queue-adhoc-task.js
+// already uses -- nextAdhocTask() (task-sources.js) force-overrides domain/source to
+// 'adhoc'/'manual' on anything it picks up from there regardless of what the file itself
+// says, so there's no need to set them here. No git branch/commit involved (same as any
+// other skipped apply) -- this is pipeline bookkeeping, not a code change.
+function queueSubTasks(subTasks, pipelineDir, parentTaskId) {
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  return subTasks.map((sub, i) => {
+    const id = `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`;
+    const record = {
+      id,
+      domain: 'adhoc',
+      source: 'manual',
+      title: sub.title,
+      promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
+    };
+    fs.writeFileSync(path.join(adhocDir, `${id}.json`), JSON.stringify(record, null, 2) + '\n');
+    return id;
+  });
+}
+
+function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
+  if (task && task.adhocResolution === 'decompose') {
+    const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+    if (!subTasks.length) {
+      return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
+    }
+    const ids = queueSubTasks(subTasks, pipelineDir, task.id);
+    return { skipped: true, reason: `Decomposed into ${ids.length} sub-task(s), queued to queue/adhoc/: ${subTasks.map((t) => t.title).join('; ')}` };
+  }
+
   const rawDiff = (task && task.rawDiff) || '';
   if (!rawDiff.trim()) {
     const reason = task && task.adhocResolution === 'no-changes-needed'
@@ -72,4 +108,4 @@ function applyAdhocDiff({ task, repoRoot }) {
   }
 }
 
-module.exports = { applyAdhocDiff };
+module.exports = { applyAdhocDiff, queueSubTasks };

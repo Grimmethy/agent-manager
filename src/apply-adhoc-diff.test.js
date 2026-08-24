@@ -16,6 +16,13 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 
+function readQueuedAdhocTasks(pipelineDir) {
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  return fs.readdirSync(adhocDir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => JSON.parse(fs.readFileSync(path.join(adhocDir, f), 'utf8')));
+}
+
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
 }
@@ -96,6 +103,53 @@ test('applyAdhocDiff applies a real diff whose hunk header line-count is wrong (
 
   assert.deepEqual(result.files, ['tracked.txt']);
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2\n');
+});
+
+// 2026-08-24: applying a RESOLUTION: decompose draft queues each sub-task as a fresh
+// adhoc task in queue/adhoc/ (the same location/schema queue-adhoc-task.js already uses,
+// so nextAdhocTask() picks them up exactly like any human-queued adhoc task) instead of
+// touching git at all -- there is no diff to apply for this resolution.
+test('applyAdhocDiff queues each sub-task into queue/adhoc/ for a RESOLUTION: decompose draft, without touching git', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-1',
+    rawDiff: '',
+    implementResponse: 'Too large. Split into two.',
+    adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Piece one', rawText: 'Do the first independently-implementable piece.' },
+      { title: 'Piece two', rawText: 'Do the second independently-implementable piece.' },
+    ],
+  };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /Decomposed into 2 sub-task/);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n', 'must never touch the target repo');
+
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  assert.equal(queued.length, 2);
+  assert.deepEqual(queued.map((t) => t.title).sort(), ['Piece one', 'Piece two']);
+  for (const q of queued) {
+    assert.equal(q.domain, 'adhoc');
+    assert.equal(q.source, 'manual');
+    assert.equal(q.promptContext.decomposedFrom, 'apply-test-decompose-1');
+    assert.ok(q.promptContext.rawText.length > 0);
+  }
+});
+
+test('applyAdhocDiff returns {skipped} without queuing anything when a decompose draft has no surviving sub-task proposals', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = { id: 'apply-test-decompose-2', rawDiff: '', adhocResolution: 'decompose', subTaskProposals: [] };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /no sub-task proposals survived/);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false);
 });
 
 test('applyAdhocDiff throws a clear error on a malformed diff, without leaving a stray patch file', () => {

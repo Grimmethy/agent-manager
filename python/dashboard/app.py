@@ -3614,7 +3614,7 @@ def _check_merge_conflict(repo_root, main_branch, branch):
     return {"willConflict": None, "conflictFiles": [], "checked": False}
 
 
-_RESOLUTION_LINE_RE = re.compile(r"RESOLUTION:\s*(?:implemented|no-changes-needed)\b", re.IGNORECASE)
+_RESOLUTION_LINE_RE = re.compile(r"RESOLUTION:\s*(?:implemented|no-changes-needed|decompose)\b", re.IGNORECASE)
 _CANDIDATE_METADATA_LINE_RE = re.compile(r"^(?:###.*|Strength:.*|Files?:.*|Source:.*)$", re.MULTILINE)
 _DESCRIPTION_MAX_CHARS = 600
 

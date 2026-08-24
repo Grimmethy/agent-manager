@@ -113,6 +113,39 @@ test('buildVerdictPrompt gives staleness_audit its own carve-out -- hedged prose
   assert.doesNotMatch(prompt, /CLASSIFICATION task/);
 });
 
+// Regression guard, 2026-08-24: a RESOLUTION: decompose draft (adhoc-agentic-draft.js)
+// deliberately contains no diff -- without a carve-out, the generic "does it contain
+// real, complete code" completeness question and the ordinary manual-source carve-out
+// (which assumes every adhoc draft has a diff) would both push a reviewer toward
+// rejecting a genuinely correct decomposition for the same reason the done-archive task
+// got wrongly rejected once already (a degenerate "no changes needed" with no diff).
+test('buildVerdictPrompt gives a RESOLUTION: decompose adhoc draft its own carve-out -- no diff is expected, not a rejection signal', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'manual',
+    adhocResolution: 'decompose',
+    planResponse: '1. Add a daily archive pass for queue/done/.',
+    implementResponse: 'Too large for one pass.\n\n[{"title":"Add src/done-archive.js","rawText":"..."},{"title":"Wire into queue-watcher.sh","rawText":"..."}]\n\nSplit into 2 pieces.',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /DECOMPOSE rather than implement directly/);
+  assert.match(prompt, /do the sub-tasks, together, actually cover everything/);
+  assert.match(prompt, /well-formed JSON array of sub-tasks/);
+  assert.doesNotMatch(prompt, /does it contain real, complete code/i);
+});
+
+test('buildVerdictPrompt keeps the ordinary manual-source (diff-grounded) carve-out for a normal adhoc task, not the decompose one', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'manual',
+    adhocResolution: 'implemented',
+    implementResponse: 'Fixed it.\n\n=== DIFF ===\ndiff --git a/x.js b/x.js\n...\nRESOLUTION: implemented',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /PLAN above was drafted BLIND/);
+  assert.doesNotMatch(prompt, /DECOMPOSE rather than implement directly/);
+});
+
 test('a short staleness_audit report is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = {

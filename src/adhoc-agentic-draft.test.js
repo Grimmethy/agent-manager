@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { draftAdhocImplement } = require('./adhoc-agentic-draft.js');
+const { draftAdhocImplement, parseSubTaskProposals } = require('./adhoc-agentic-draft.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -173,6 +173,78 @@ test('draftAdhocImplement gives up (does not retry a second time) when turns are
   assert.equal(seenMaxTurns.length, 2, 'must not retry a third time -- two exhaustions in a row means a bigger budget alone will not fix it');
   assert.match(result.blockedReason, /ran out of turns twice/);
   assert.match(result.blockedReason, /total_cost_usd=1\.0000/);
+});
+
+// 2026-08-24: "we had discussed setting up a task that breaks down jobs that are too
+// large" -- RESOLUTION: decompose lets the agentic pass split an oversized task into
+// smaller sub-tasks instead of blindly retrying/blocking on the same too-large task
+// forever (the exact bootstrapping trap the task built to do this hit on itself).
+test('draftAdhocImplement parses a valid RESOLUTION: decompose response into subTaskProposals, with no diff captured', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-9', title: 'Huge task', promptContext: { rawText: 'a huge multi-part task' } };
+
+  const claudeCall = async () => ({
+    response: 'Too large for one pass.\n\nRESOLUTION: decompose\n' +
+      '[{"title": "Piece one", "rawText": "Do the first, independently-implementable piece."}, ' +
+      '{"title": "Piece two", "rawText": "Do the second, independently-implementable piece."}]\n\n' +
+      'Split into two independent pieces.',
+    degenerate: null,
+  });
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.blocked, false);
+  assert.equal(task.adhocResolution, 'decompose');
+  assert.equal(task.rawDiff, '');
+  assert.equal(task.subTaskProposals.length, 2);
+  assert.equal(task.subTaskProposals[0].title, 'Piece one');
+  assert.match(task.subTaskProposals[1].rawText, /second, independently-implementable/);
+
+  const worktreeList = git(['worktree', 'list'], repoDir);
+  assert.equal(worktreeList.split('\n').filter(Boolean).length, 1, 'worktree must still be cleaned up');
+});
+
+test('draftAdhocImplement blocks when RESOLUTION: decompose is not followed by a valid sub-task JSON array', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-10', title: 'Huge task', promptContext: { rawText: 'x' } };
+
+  const claudeCall = async () => ({
+    response: 'Too large.\n\nRESOLUTION: decompose\n\nI would split this up but forgot the JSON.',
+    degenerate: null,
+  });
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.blocked, true);
+  assert.match(result.blockedReason, /decompose but did not follow it with a valid JSON array/);
+});
+
+test('draftAdhocImplement blocks when RESOLUTION: decompose only proposes a single sub-task (not a real split)', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-11', title: 'Huge task', promptContext: { rawText: 'x' } };
+
+  const claudeCall = async () => ({
+    response: 'RESOLUTION: decompose\n[{"title": "Only one piece", "rawText": "just this"}]',
+    degenerate: null,
+  });
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.blocked, true);
+  assert.match(result.blockedReason, /at least 2/);
+});
+
+test('parseSubTaskProposals drops malformed entries but keeps valid ones', () => {
+  const text = '[{"title": "Good", "rawText": "fine"}, {"title": ""}, {"rawText": "no title"}, {"title": "Also good", "rawText": "fine too"}]';
+  const parsed = parseSubTaskProposals(text);
+  assert.equal(parsed.length, 2);
+  assert.deepEqual(parsed.map((t) => t.title), ['Good', 'Also good']);
+});
+
+test('parseSubTaskProposals returns null when there is no JSON array in the text', () => {
+  assert.equal(parseSubTaskProposals('no json here'), null);
 });
 
 test('draftAdhocImplement does NOT retry when the response is degenerate rather than turn-exhausted', async () => {
