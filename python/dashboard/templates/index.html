@@ -109,6 +109,16 @@
   .bench-case-stats { color: var(--muted); font-size: 11px; margin-left: 6px; }
   .ok-text { color: var(--ok); }
   .bad-text { color: var(--bad); }
+  /* Reasoning benchmark radar chart: the Responses table (the run's test prompts) sits on
+     the left, the radar comparing every model across those same prompts sits to its right
+     -- wrap lets it drop below on narrow viewports rather than squeezing the table. */
+  .bench-responses-row { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; margin-top: 6px; }
+  .bench-responses-row > .bench-responses-table { flex: 1 1 420px; min-width: 320px; }
+  .bench-radar-wrap { flex: 0 0 auto; width: 320px; }
+  .bench-radar-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 8px; }
+  .bench-radar-legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
+  .bench-radar-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  .bench-radar-axis-label { fill: var(--muted); font-size: 9px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
   .modal-backdrop.open { display: flex; }
   .modal { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 900px; width: 100%; }
@@ -1444,6 +1454,7 @@ function buildSingleRunResultsHtml(run) {
   const perfTable = `<table><thead><tr><th>Model</th><th>Objective</th><th>Judge Avg</th><th>Degenerate</th><th>Avg Latency (ms)</th><th>Avg Tok/s</th><th>Load (ms)</th><th>Unload (ms)</th></tr></thead><tbody>${perfRows}</tbody></table>`;
 
   const responseTable = buildResponseTable(run.results.map(r => ({ ...r, runId: run.runId })));
+  const radarHtml = models.length > 1 ? buildBenchmarkRadarHtml(models, run.results) : '';
 
   return `
     <div class="meta">Run ${escapeHtml(run.runId)} -- ${run.generatedAt ? new Date(run.generatedAt).toLocaleString() : ''}</div>
@@ -1452,8 +1463,114 @@ function buildSingleRunResultsHtml(run) {
     <div class="field-label" style="margin-top:16px">Performance</div>
     ${perfTable}
     <div class="field-label" style="margin-top:16px">Responses (click to view full prompt/response)</div>
-    ${responseTable}
+    <div class="bench-responses-row">
+      <div class="bench-responses-table">${responseTable}</div>
+      ${radarHtml}
+    </div>
   `;
+}
+
+// Fixed-order categorical hues (dark-surface steps, see the dataviz skill's reference
+// palette) -- assigned by each model's position in the run's own model list, never by
+// score/rank, so a model keeps its color across re-renders instead of repainting when
+// another model's score changes.
+const BENCH_RADAR_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
+
+function benchRadarColorFor(index) {
+  return BENCH_RADAR_COLORS[index % BENCH_RADAR_COLORS.length];
+}
+
+// One 0.0-1.0 score per response, same rule as app.py's _case_result_score: a judge's own
+// score wins when present, otherwise an objective pass/fail becomes 1.0/0.0, otherwise
+// (ungraded/ambiguous) excluded from the average rather than counted as a 0.
+function benchResultScore(r) {
+  const grade = r.grade || {};
+  if (grade.score != null) return grade.score;
+  if (grade.pass === true) return 1;
+  if (grade.pass === false) return 0;
+  return null;
+}
+
+// Radar/spider chart: one axis per test case in this run, one polygon per model, plotting
+// each model's average score (0-1) on that case -- "how each model performed relative to
+// each other on the prompts" (2026-08-24). Model key renders ABOVE the chart per spec,
+// using the same fixed per-model color the polygon strokes/fills use, so identity is never
+// carried by color alone (the legend labels it too).
+function buildBenchmarkRadarHtml(models, results) {
+  // {caseId: {model: [scores...]}}
+  const byCase = new Map();
+  for (const r of results) {
+    const score = benchResultScore(r);
+    if (score == null) continue;
+    if (!byCase.has(r.caseId)) byCase.set(r.caseId, new Map());
+    const byModel = byCase.get(r.caseId);
+    if (!byModel.has(r.model)) byModel.set(r.model, []);
+    byModel.get(r.model).push(score);
+  }
+  const caseIds = [...byCase.keys()];
+  if (caseIds.length < 3) return ''; // a radar needs at least 3 axes to read as a shape
+
+  const seriesByModel = models.map((model, i) => ({
+    model,
+    color: benchRadarColorFor(i),
+    values: caseIds.map(caseId => {
+      const scores = byCase.get(caseId)?.get(model);
+      return scores && scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+    }),
+  }));
+
+  const legend = `<div class="bench-radar-legend">${seriesByModel.map(s => `
+    <span class="bench-radar-legend-item"><span class="bench-radar-swatch" style="background:${s.color}"></span>${escapeHtml(s.model)}</span>
+  `).join('')}</div>`;
+
+  return `
+    <div class="bench-radar-wrap">
+      ${legend}
+      ${buildRadarChartSvg(caseIds, seriesByModel)}
+    </div>
+  `;
+}
+
+function buildRadarChartSvg(axisLabels, seriesByModel) {
+  const size = 300;
+  const center = size / 2;
+  const radius = size / 2 - 46; // leave room for axis labels around the rim
+  const n = axisLabels.length;
+  const angleFor = (i) => (Math.PI * 2 * i) / n - Math.PI / 2;
+  const pointAt = (i, frac) => {
+    const a = angleFor(i);
+    return [center + radius * frac * Math.cos(a), center + radius * frac * Math.sin(a)];
+  };
+
+  const ringSteps = [0.25, 0.5, 0.75, 1];
+  const rings = ringSteps.map(frac => {
+    const pts = axisLabels.map((_, i) => pointAt(i, frac).join(',')).join(' ');
+    return `<polygon points="${pts}" fill="none" stroke="#2c2c2a" stroke-width="1"></polygon>`;
+  }).join('');
+
+  const spokes = axisLabels.map((_, i) => {
+    const [x, y] = pointAt(i, 1);
+    return `<line x1="${center}" y1="${center}" x2="${x}" y2="${y}" stroke="#383835" stroke-width="1"></line>`;
+  }).join('');
+
+  const labels = axisLabels.map((label, i) => {
+    const [x, y] = pointAt(i, 1.14);
+    const short = label.length > 16 ? `${label.slice(0, 15)}…` : label;
+    const anchor = Math.abs(Math.cos(angleFor(i))) < 0.15 ? 'middle' : (Math.cos(angleFor(i)) > 0 ? 'start' : 'end');
+    return `<text x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="middle" class="bench-radar-axis-label"><title>${escapeHtml(label)}</title>${escapeHtml(short)}</text>`;
+  }).join('');
+
+  const polygons = seriesByModel.map(s => {
+    const pts = s.values.map((v, i) => pointAt(i, v == null ? 0 : v).join(',')).join(' ');
+    const dots = s.values.map((v, i) => {
+      if (v == null) return '';
+      const [x, y] = pointAt(i, v);
+      return `<circle cx="${x}" cy="${y}" r="3" fill="${s.color}"><title>${escapeHtml(s.model)}: ${Math.round(v * 100)}%</title></circle>`;
+    }).join('');
+    return `<polygon points="${pts}" fill="${s.color}" fill-opacity="0.12" stroke="${s.color}" stroke-width="2"></polygon>${dots}`;
+  }).join('');
+
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">${rings}${spokes}${polygons}${labels}</svg>`;
 }
 
 // Combined view across every saved run -- no re-aggregated chart/performance table (that
