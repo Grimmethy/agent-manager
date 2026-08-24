@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { draftAdhocImplement, parseSubTaskProposals } = require('./adhoc-agentic-draft.js');
+const { draftAdhocImplement, parseSubTaskProposals, buildSandboxOpts } = require('./adhoc-agentic-draft.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -37,6 +37,42 @@ function makeRepoWithOrigin() {
 function fakeRecordModelCall() {
   return 'fake-call-id';
 }
+
+// Regression, 2026-08-24: caught live -- a real adhoc draft's own summary noted "git log
+// isn't usable in this worktree... gitdir path doesn't exist in this sandbox." Confirmed
+// via direct reproduction: this deployment's own AGENT_MANAGER_REPO_ROOT
+// (/media/wok/model-cache/agent-manager-apply-target) is itself a symlink to
+// /media/model-cache/github/agent-manager-apply-target -- git's own gitdir: pointer
+// canonicalizes to the REAL path, so binding the symlink path (what buildSandboxOpts used
+// to do) left the path git actually needed completely unbound inside the sandbox.
+test('buildSandboxOpts resolves repoRoot/worktreeDir through a symlink before building bind paths', () => {
+  const realRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adhoc-sandbox-real-repo-'));
+  git(['init', '-b', 'main', realRepoDir]);
+  git(['config', 'user.email', 'test@example.com'], realRepoDir);
+  git(['config', 'user.name', 'Test'], realRepoDir);
+  fs.writeFileSync(path.join(realRepoDir, 'f.txt'), 'v1\n');
+  git(['add', 'f.txt'], realRepoDir);
+  git(['commit', '-m', 'init'], realRepoDir);
+
+  // The symlink IS what gets passed around as "repoRoot" -- same shape as
+  // AGENT_MANAGER_REPO_ROOT pointing through /media/wok/model-cache's own symlink.
+  const symlinkRepoDir = path.join(os.tmpdir(), `adhoc-sandbox-symlink-repo-${Date.now()}`);
+  fs.symlinkSync(realRepoDir, symlinkRepoDir);
+
+  const worktreeDir = path.join(os.tmpdir(), `adhoc-sandbox-worktree-${Date.now()}`);
+  git(['worktree', 'add', worktreeDir, '-b', 'throwaway/sandbox-test', 'main'], symlinkRepoDir);
+
+  const opts = buildSandboxOpts(symlinkRepoDir, worktreeDir);
+
+  const realRepoRoot = fs.realpathSync(realRepoDir);
+  assert.ok(opts.readOnlyBinds.includes(path.join(realRepoRoot, '.git')), 'must bind the REAL .git path, not the symlink');
+  assert.equal(opts.readOnlyBinds.some((p) => p.includes(symlinkRepoDir)), false, 'must never bind the symlink path itself');
+  const expectedWorktreeGitdir = path.join(realRepoRoot, '.git', 'worktrees', path.basename(fs.realpathSync(worktreeDir)));
+  assert.ok(opts.writableBinds.includes(expectedWorktreeGitdir), 'writable worktree gitdir bind must also use the real, resolved path');
+  assert.equal(opts.workDir, fs.realpathSync(worktreeDir));
+
+  git(['worktree', 'remove', '--force', worktreeDir], realRepoDir);
+});
 
 test('draftAdhocImplement edits a real file in the isolated worktree and captures it as task.rawDiff', async () => {
   const { repoDir } = makeRepoWithOrigin();
