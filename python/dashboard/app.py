@@ -2155,6 +2155,80 @@ def arch_candidates_path() -> Path | None:
     return Path(repo_root) / "Docs" / "ARCH_REVIEW_CANDIDATES.md"
 
 
+def _candidates_doc_path(env_var: str, default_filename: str) -> Path | None:
+    """Shared env-override-else-repoRoot/Docs/<default_filename> resolution -- same shape
+    as arch_candidates_path() above, parameterized for the other *_CANDIDATES.md docs
+    src/config.js resolves the same way (archImportCandidatesPath,
+    observabilityFixCandidatesPath, performanceFixCandidatesPath)."""
+    override = os.environ.get(env_var) or read_env_file(ENV_FILE_PATH).get(env_var)
+    if override:
+        return Path(override)
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        return None
+    return Path(repo_root) / "Docs" / default_filename
+
+
+def arch_import_candidates_path() -> Path | None:
+    """Mirrors src/config.js's archImportCandidatesPath."""
+    return _candidates_doc_path("AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH", "ARCH_IMPORT_CANDIDATES.md")
+
+
+def observability_fix_candidates_path() -> Path | None:
+    """Mirrors src/config.js's observabilityFixCandidatesPath."""
+    return _candidates_doc_path("AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH", "OBSERVABILITY_FIX_CANDIDATES.md")
+
+
+def performance_fix_candidates_path() -> Path | None:
+    """Mirrors src/config.js's performanceFixCandidatesPath."""
+    return _candidates_doc_path("AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH", "PERFORMANCE_FIX_CANDIDATES.md")
+
+
+# Job List tab's "Available" column (Grimmethy: "for tasks like observability and
+# architecture where the number of such tasks available in the project is known I'd like
+# to be able to see in app how many of such task are available") -- only meaningful for
+# a source whose backlog is a real, enumerable doc (the *_CANDIDATES.md files
+# nextCandidateFulfillmentTask, src/task-sources.js, consumes one Strong entry from at a
+# time); every other source's backlog (an inbox folder size, a flags file, external
+# scanner output) isn't covered here and the column just shows nothing for those rows.
+# Maps source name -> (doc-path getter, task-id prefix nextCandidateFulfillmentTask
+# stamps -- `sourceName.replace(/_/g,'-') + '-' + candidateId.toLowerCase()`).
+CANDIDATE_BACKLOG_SOURCES = {
+    "arch_review": (arch_candidates_path, "arch-review"),
+    "arch_import_review": (arch_import_candidates_path, "arch-import-review"),
+    "observability_fix": (observability_fix_candidates_path, "observability-fix"),
+    "performance_fix": (performance_fix_candidates_path, "performance-fix"),
+}
+
+
+def available_candidate_counts() -> dict:
+    """One count per CANDIDATE_BACKLOG_SOURCES entry: Strong-rated candidates in that
+    source's doc that don't already have a fulfillment task somewhere in the queue (any
+    state -- a done/archived one has already been fulfilled, not "available" any more).
+    A candidate doc only ever grows (nothing removes an entry once consumed, see
+    apply-group-a.js's applyArchDiscoveryCandidates), so counting doc entries alone would
+    overstate the real backlog more and more over time -- the queue lookup is what keeps
+    this an honest "still waiting" number instead of a raw, ever-growing doc size."""
+    counts = {name: None for name in CANDIDATE_BACKLOG_SOURCES}
+    task_states = _task_state_index(queue_dir())
+    for name, (path_fn, id_prefix) in CANDIDATE_BACKLOG_SOURCES.items():
+        doc_path = path_fn()
+        if not doc_path or not doc_path.is_file():
+            continue
+        try:
+            text = doc_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        entries = parse_arch_candidates(text)
+        counts[name] = sum(
+            1
+            for e in entries
+            if e.get("strength") == "Strong"
+            and f"{id_prefix}-ac-{e['id']}" not in task_states
+        )
+    return counts
+
+
 def community_coverage_path() -> Path | None:
     """Mirrors src/config.js's communityCoveragePath resolution (env override, else
     <pipelineDir>/community-coverage.json)."""
@@ -4355,6 +4429,7 @@ def api_job_types():
     approval_modes = read_approval_modes()
     worker_types = read_worker_types()
     counters = read_job_type_counters()
+    available_counts = available_candidate_counts()
     return jsonify([
         {
             "name": name,
@@ -4364,6 +4439,10 @@ def api_job_types():
             "approvalMode": approval_modes.get(name),
             "workerType": worker_types.get(name, TASK_SOURCE_DEFAULT_WORKER_TYPES.get(name)),
             "timesPerformed": counters.get(name, 0),
+            # None (-> null) for a source with no enumerable backlog doc -- see
+            # available_candidate_counts()'s own comment; the frontend renders that as a
+            # blank cell rather than a misleading 0.
+            "available": available_counts.get(name),
         }
         for name in TASK_SOURCE_CATALOG
     ])
