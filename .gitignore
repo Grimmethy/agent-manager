@@ -1,6 +1,7 @@
 node_modules/
 *.log
 agent-manager.env
+*.bak
 .venv/
 python/dashboard/project_cache/
 .agent-manager-cache/
@@ -23,6 +24,7 @@ self-audit-coverage.json
 staleness-audit-coverage.json
 function-length-coverage.json
 done-archive-state.json
+job-type-counters.json
 dashboard.pid
 .claude/
 brain-dump.json
