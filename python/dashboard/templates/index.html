@@ -1207,7 +1207,11 @@ async function renderModelsTab() {
     benchModels.forEach(m => benchmarkSelectedModels.add(m));
     benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
   }
-  const viewingRunId = benchmarkViewingRunId || (benchRuns[0] && benchRuns[0].runId) || null;
+  // Default to the combined view across every saved run (2026-08-24, Grimmethy: "results
+  // should default to All Runs (combined)") -- was defaulting to just the single most
+  // recent run, which is also why the radar chart (aggregate-only per the same request
+  // earlier today) wasn't visible without a manual dropdown click.
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
   const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
   const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
 
