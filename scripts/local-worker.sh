@@ -310,6 +310,26 @@ process_drafting_file() {
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
 }
 
+# Reclaim this instance's own orphaned claims from a prior life (2026-08-24, Grimmethy:
+# found live -- 60 real tasks silently stuck in queue/drafting/worker-1/ for as long as
+# ~19 hours, every one predating the current process's own start). Run ONCE, here, before
+# the main loop below ever claims anything new -- at this exact moment any file already
+# sitting in THIS instance's own drafting/<INSTANCE_ID>/ folder is, by definition,
+# orphaned (a freshly-started process hasn't claimed anything yet). See
+# reclaim-orphaned-drafts.js's own header for why dead-process-check.js's restart
+# decision alone was never enough to prevent this.
+reclaim_result="$(node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" "$INSTANCE_ID" 2>>"$LOG_FILE")"
+# Plain grep on the raw JSON, not a second node subprocess -- confirmed live: a FORCE_COLOR
+# set in the parent environment (this daemon inherited it from an interactive launch shell)
+# made node's own console.log colorize a bare number with ANSI escape codes even though
+# stdout was piped, not a TTY, which then broke the `-gt` numeric test below with a
+# "syntax error: operand expected" on every single tick. grep -o on a fixed JSON key
+# shape has no such failure mode.
+reclaim_count="$(echo "$reclaim_result" | grep -o '"reclaimed":[0-9]*' | grep -o '[0-9]*$')"
+if [[ "${reclaim_count:-0}" -gt 0 ]]; then
+  printf '[worker-%s] reclaimed %s orphaned draft(s) from a prior process, sent back to the queue\n' "$INSTANCE_ID" "$reclaim_count" >&2
+fi
+
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
