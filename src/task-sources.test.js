@@ -30,6 +30,13 @@ function freshTaskSources(repoRoot) {
   process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
   const { clearRegistry } = require('./task-source-registry.js');
   clearRegistry();
+  // model-profile-registry.js (2026-08-24) is its own separate singleton, unaffected by
+  // task-source-registry's own clearRegistry() above -- task-sources.js registers a real
+  // profile as a module-load side effect (brain_dump_sort's modelProfile), so a fresh
+  // re-require without also clearing THIS registry throws "already registered" on the
+  // second call in the same test process.
+  const { clearModelProfileRegistry } = require('./model-profile-registry.js');
+  clearModelProfileRegistry();
   delete require.cache[require.resolve('./task-sources.js')];
   delete require.cache[require.resolve('./apply-group-a.js')];
   return require('./task-sources.js');

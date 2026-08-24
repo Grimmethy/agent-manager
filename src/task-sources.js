@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
+const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
@@ -1369,7 +1370,20 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // itself. An `apply` registered here would be dead code: applyTask() intercepts
 // domain==='brain_dump_sort' before writeArtifact() is ever called. See apply-task.js's
 // applyBrainDumpSort branch instead.
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask });
+// 2026-08-24, Grimmethy: "Register a profile and try it on one task type" -- the first
+// real usage of model-profile-registry.js (see that file's own header for the incident
+// this closes: a per-task-source model choice used to require env-var/shell-script
+// plumbing with a stale-read window, not a config line). brain_dump_sort, not review, is
+// the deliberate choice: tonight's earlier qwen2.5:3b-for-review experiment showed a
+// small model hallucinating rejection reasons on a nuanced code-diff judgment call --
+// brain_dump_sort is a much simpler categorization task (pick a folder/file/category/tags
+// for one short note), closer to what a smaller model is actually good at, and its own
+// review carve-out (buildVerdictPrompt's brain_dump_sort branch) already treats this
+// source's output as "JSON metadata, not code" -- low blast radius if the experiment
+// doesn't pan out (same reject-retry bounded budget every other source already has, not a
+// new risk this profile introduces).
+registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192 });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local' });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
