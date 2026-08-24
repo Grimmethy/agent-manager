@@ -499,6 +499,24 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
 
     if (section.length > MAX_ARCH_REVIEW_TASK_CHARS) continue;
 
+    // 2026-08-24 -- caught live: a real task (arch-review-ac-10, "AC-10 · Example
+    // candidate", Files: foo.js) sat permanently un-completable for weeks, repeatedly
+    // bulk-requeued on the assumption it was a "crash-bug casualty" rather than ever
+    // having its own content re-examined -- its Problem/Solution sections were literally
+    // "Problem: ...\nSolution: ..." (an unfilled template placeholder), not a real
+    // finding. Traced to a real, if narrow, gap: this function has always trusted ANY
+    // "Strength: Strong" section as actionable with no check that its content is real.
+    // Deliberately NOT rejecting on "no referenced files exist" (see fetchedFiles'
+    // own comment below -- a candidate proposing a genuinely NEW file is a valid,
+    // intended shape, not a stale one) -- an ellipsis-only Problem/Solution body is a
+    // much more specific, unambiguous signal: no real LLM-drafted finding ever produces
+    // literally just "..." as its entire problem or solution description, regardless of
+    // whether the files it names exist yet.
+    const problemMatch = section.match(/^Problem:\s*\n?([\s\S]*?)(?=\n(?:Solution|Benefits):|$)/m);
+    const solutionMatch = section.match(/^Solution:\s*\n?([\s\S]*?)(?=\nBenefits:|$)/m);
+    const isPlaceholderBody = (m) => !m || m[1].trim() === '' || /^\.{3,}$/.test(m[1].trim());
+    if (isPlaceholderBody(problemMatch) || isPlaceholderBody(solutionMatch)) continue;
+
     const taskId = sourceName.replace(/_/g, '-') + '-' + candidateId.toLowerCase();
     if (taskIdExistsInQueue(taskId)) continue;
 
