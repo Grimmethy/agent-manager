@@ -18,9 +18,11 @@ const { execFileSync } = require('child_process');
 
 // get-grounding-source.js's own require-time ensureRegistered() (config.js) throws if
 // AGENT_MANAGER_REPO_ROOT is unset -- same throwaway-value convention review-task.test.js/
-// apply-task.test.js already use for the identical requirement.
-process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || os.tmpdir();
-process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
+// apply-task.test.js already use for the identical requirement. Forced (not `||`-defaulted)
+// unconditionally -- see apply-task.test.js's own comment on this exact line for why an
+// ambient real AGENT_MANAGER_REPO_ROOT must never be allowed to leak into a test run.
+process.env.AGENT_MANAGER_REPO_ROOT = os.tmpdir();
+process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 const { extractLiveRepoGrounding } = require('./get-grounding-source.js');
 

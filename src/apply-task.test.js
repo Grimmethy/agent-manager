@@ -16,16 +16,22 @@ const fs = require('fs');
 const { createFakeGitRunner } = require('./git-runner.js');
 const { ensureRegistered } = require('./config.js');
 
-// apply-task.js requires AGENT_MANAGER_REPO_ROOT at load time (getConfig()'s one required
-// setting) even though these tests never call getConfig() themselves -- module-level
-// require('./task-sources.js') + ensureRegistered() at the top of apply-task.js run before
-// any test does. A throwaway value is fine; no test here exercises the real repoRoot.
-process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || os.tmpdir();
-
-const { applyTask, recordApplyOutcome } = require('./apply-task.js');
-
 const REPO_ROOT = path.join(os.tmpdir(), 'apply-task-test-repo');
 const PIPELINE_DIR = REPO_ROOT;
+
+// apply-task.js requires AGENT_MANAGER_REPO_ROOT at load time (getConfig()'s one required
+// setting), AND the arch_discovery/arch_import/observability_review/performance_review
+// apply handlers below call getConfig() fresh internally rather than deriving their
+// candidates-doc path from the repoRoot/pipelineDir explicitly passed into applyTask() --
+// so this can NOT be a "default only if unset" (`||`): confirmed live 2026-08-24 that
+// running `npm test` in a shell where AGENT_MANAGER_REPO_ROOT is already set to a real
+// repo (the normal state whenever the live pipeline is configured) silently appended
+// "Example candidate" placeholder fixture content to that real repo's own
+// Docs/ARCH_REVIEW_CANDIDATES.md and friends. Force it to REPO_ROOT unconditionally so
+// these tests can never leak into whatever repo happens to be ambient in the env.
+process.env.AGENT_MANAGER_REPO_ROOT = REPO_ROOT;
+
+const { applyTask, recordApplyOutcome } = require('./apply-task.js');
 
 function baseTask(overrides = {}) {
   return {
