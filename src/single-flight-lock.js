@@ -37,11 +37,41 @@ function lockFilePath(instancesDir) {
   return path.join(instancesDir, '.pipeline-single-flight.lock');
 }
 
+// 2026-08-24 (Grimmethy: "move the user interaction to the highest priority possible...
+// if a user interaction shows up, it's next") -- same .discuss-waiting/ advisory
+// directory agent-manager-common.sh's acquire_single_flight_lock() now checks (Python's
+// single_flight_lock.py drops one marker file per waiting Discuss session in here),
+// mirrored here so worker-1/worker-reasoning's OWN acquire (via draftTask()'s
+// withLockFn, this module, not the bash function) also backs off instead of immediately
+// reclaiming the lock for its next queued task the moment the current holder releases.
+// Can't interrupt an in-flight call (and shouldn't -- that would waste real work), so
+// this only affects who wins the race to acquire NEXT. A directory of per-waiter files,
+// not one shared flag, so a second concurrent Discuss session's priority isn't silently
+// cleared the instant the first one gets the lock.
+const DISCUSS_PRIORITY_DIR_NAME = '.discuss-waiting';
+const DISCUSS_PRIORITY_MAX_WAIT_MS = 8000;
+
+function priorityWaitDirPath(instancesDir) {
+  return path.join(instancesDir, DISCUSS_PRIORITY_DIR_NAME);
+}
+
+function someoneIsWaiting(instancesDir) {
+  try {
+    return fs.readdirSync(priorityWaitDirPath(instancesDir)).length > 0;
+  } catch (e) {
+    return false; // directory doesn't exist yet -- nobody has ever waited.
+  }
+}
+
 // Blocking, exclusive acquire -- no timeout, no -n, matching the bash version exactly
 // (a caller that wants a bounded wait should wrap this in its own timeout, this function
 // itself will wait as long as it takes, same as flock's own default). Returns a real fd;
 // pass it to release().
 function acquire(instancesDir) {
+  const deadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
+  while (someoneIsWaiting(instancesDir) && Date.now() < deadline) {
+    execFileSync('sleep', ['1']);
+  }
   const fd = fs.openSync(lockFilePath(instancesDir), 'w');
   try {
     execFileSync('flock', [String(LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });

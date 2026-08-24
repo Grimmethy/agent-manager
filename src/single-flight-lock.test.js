@@ -12,6 +12,48 @@ function makeInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'single-flight-lock-test-'));
 }
 
+test('acquire() backs off while .discuss-waiting/ is non-empty, then proceeds once the marker is removed', () => {
+  const dir = makeInstancesDir();
+  const waitDir = path.join(dir, '.discuss-waiting');
+  fs.mkdirSync(waitDir);
+  const marker = path.join(waitDir, 'fake-discuss-session');
+  fs.writeFileSync(marker, '');
+
+  // acquire() is synchronous (blocks the calling process), so run it in a real child
+  // process and remove the marker from THIS process after a short delay -- proves the
+  // child's backoff loop actually notices the marker disappearing mid-wait rather than
+  // just running out its own fixed deadline.
+  const child = require('child_process').spawn('node', ['-e', `
+    const { acquire, release } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const start = Date.now();
+    const fd = acquire(${JSON.stringify(dir)});
+    process.stdout.write(String(Date.now() - start));
+    release(fd);
+  `]);
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+
+  setTimeout(() => fs.unlinkSync(marker), 1200);
+
+  return new Promise((resolve) => {
+    child.on('exit', () => {
+      const elapsedMs = Number(out);
+      assert.ok(elapsedMs >= 1000, `expected the child to back off for at least ~1s while the marker existed, took ${elapsedMs}ms`);
+      assert.ok(elapsedMs < 6000, `expected the child to proceed well before the 8s max-wait once the marker was removed, took ${elapsedMs}ms`);
+      resolve();
+    });
+  });
+});
+
+test('acquire() does not back off at all when .discuss-waiting/ is absent or empty', () => {
+  const dir = makeInstancesDir();
+  const start = Date.now();
+  const fd = acquire(dir);
+  const elapsedMs = Date.now() - start;
+  release(fd);
+  assert.ok(elapsedMs < 500, `expected no backoff with nothing waiting, took ${elapsedMs}ms`);
+});
+
 test('lockFilePath matches the exact bash lockfile name (interop depends on this)', () => {
   const dir = makeInstancesDir();
   assert.equal(lockFilePath(dir), path.join(dir, '.pipeline-single-flight.lock'));
