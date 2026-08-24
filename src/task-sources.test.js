@@ -42,6 +42,23 @@ function freshTaskSources(repoRoot) {
   return require('./task-sources.js');
 }
 
+// Regression, 2026-08-24 (done-archive.js): taskIdExistsInQueue() already special-cases
+// done/_archived_no_action/ (a human's manual archive) -- without the same treatment for
+// done-archive.js's own dated month buckets, a task's underlying item (a brain-dump entry,
+// a deep_dive community, an arch_import itemId) would look "never queued" the moment its
+// completed task aged past the retention window and got relocated, and could be
+// regenerated as a live duplicate.
+test('taskIdExistsInQueue finds a task inside a done-archive.js dated month bucket, not just _archived_no_action/', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-archive-test-'));
+  const { taskIdExistsInQueue } = freshTaskSources(dir);
+  const bucketDir = path.join(dir, 'queue', 'done', '_archived', '2026-01');
+  fs.mkdirSync(bucketDir, { recursive: true });
+  fs.writeFileSync(path.join(bucketDir, 'archived-task-1.json'), JSON.stringify({ id: 'archived-task-1' }));
+
+  assert.equal(taskIdExistsInQueue('archived-task-1'), true);
+  assert.equal(taskIdExistsInQueue('never-existed'), false);
+});
+
 function makeFixtureRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-test-'));
   fs.mkdirSync(path.join(dir, 'analysis'), { recursive: true });

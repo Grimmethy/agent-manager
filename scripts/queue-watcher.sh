@@ -124,6 +124,15 @@ while :; do
       printf '[watchdog] %s\n' "$system_report_output" >&2
     fi
 
+    # Daily queue/done/ archive pass (2026-08-22 production incident: done/ grew to ~3900
+    # files with no rotation -- see done-archive.js's own header). Same --check-due shape
+    # as system-report.js just above -- cheap every tick, the real move-files pass only
+    # actually runs once per real day.
+    done_archive_output="$(node "${PACKAGE_SRC_DIR}/done-archive.js" --check-due 2>>"${HOME_LOGS}/done-archive.log")"
+    if [[ -n "$done_archive_output" ]]; then
+      printf '[watchdog] %s\n' "$done_archive_output" >&2
+    fi
+
     # Daily project-graph rebuild (Grimmethy, 2026-08-19: "This should be a daily task so
     # that the review steps keep up with the project" -- graph.json/community-coverage.json
     # feed arch_discovery's candidate generation, see build_graph.py's own check_due()).

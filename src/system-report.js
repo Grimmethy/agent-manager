@@ -34,6 +34,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { readSamplesInWindow } = require('./uptime-log.js');
 const { signatureForTask } = require('./pipeline-self-audit.js');
+const { listArchivedMonthDirs } = require('./done-archive.js');
 
 const PERIOD_MS = { hourly: 60 * 60 * 1000, daily: 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
 
@@ -100,6 +101,11 @@ function scanTaskActivity(pipelineDir, startIso, endIso) {
     { dir: path.join(queueDir, 'done'), state: 'done' },
     { dir: path.join(queueDir, 'done', '_archived_no_action'), state: 'archived' },
     { dir: path.join(queueDir, 'blocked'), state: 'blocked' },
+    // done-archive.js's own dated month buckets (2026-08-24) -- a report window reaching
+    // back past the retention cutoff (default 30 days) would otherwise silently miss any
+    // task that pass already relocated out of done/'s top level. Expanded dynamically
+    // (not a static list) since new month buckets appear over time with no code change.
+    ...listArchivedMonthDirs(pipelineDir).map((dir) => ({ dir, state: 'archived' })),
   ];
 
   const tasks = [];
