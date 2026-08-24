@@ -1496,6 +1496,7 @@ async function renderQueueTab(state) {
       ${showArchiveOnly ? `<td>
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
+        <button type="button" class="secondary task-discuss-btn" data-id="${escapeAttr(t.id)}">Discuss</button>
       </td>` : ''}
       ${showConfirmDeny ? `<td>
         <button type="button" class="secondary task-confirm-delete-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}" data-research="${isResearchConfirm}">${isAdhocConfirm ? 'Confirm & Apply' : isResearchConfirm ? 'Confirm & File' : 'Confirm Delete'}</button>
@@ -1529,6 +1530,19 @@ async function renderQueueTab(state) {
     btn.onclick = (e) => {
       e.stopPropagation();
       postTaskAction(state, btn.dataset.id, 'done', `Mark '${btn.dataset.id}' as done? Use this when the underlying work is already finished (e.g. done by hand) -- unlike Reject, this moves it to the Done tab and stops it from being regenerated.`);
+    };
+  });
+  // 2026-08-24 (Grimmethy: "we also need one on the page where Mark Done and Reject
+  // already are located") -- Discuss previously only lived inside the row's own detail
+  // modal (clarify-discuss-btn, wireClarificationPicker), one extra click away from this
+  // list. Same underlying flow, just reached directly from the list row: open the detail
+  // modal (which builds the clarify-discuss-panel and wires everything Discuss needs) then
+  // immediately start the discussion, instead of making the user click in first.
+  main.querySelectorAll('.task-discuss-btn').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      await openDetail(state, btn.dataset.id);
+      clarifyDiscussStart(btn.dataset.id);
     };
   });
   main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {
