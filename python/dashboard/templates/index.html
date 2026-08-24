@@ -744,15 +744,18 @@ function showToast(message, kind = 'error') {
 
 const providerChoices = {};
 
-// Label says "Ornith", not "Local" -- naming the actual model instead of its deployment
-// mode reads as a real choice between two named things, not a vague default vs. an
-// override (see this function's CSS comment for the same "make it read as a switch, not
-// a stray button" fix applied to the styling).
+// 2026-08-24 (Grimmethy: "Ornith is no longer the default model. It's important that we
+// reference local instead") -- this used to name the actual model ("Ornith") rather than
+// its deployment mode, on the theory that naming a real thing reads better than a vague
+// "default" label. That stopped being true once the local side became swappable (see
+// model-profile-registry.js) -- "Ornith" is no longer necessarily what's actually running
+// locally, so hardcoding that name here would be actively wrong depending on
+// configuration. "Local" is accurate regardless of which model is currently loaded.
 function renderProviderToggle(idAttr) {
   const provider = providerChoices[idAttr] || 'local';
   const claudeClass = provider === 'claude' ? ' provider-toggle-claude' : '';
-  const label = provider === 'claude' ? 'Claude' : 'Ornith';
-  return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Ornith (local model) vs. your Claude subscription -- click to switch">${label}</button>`;
+  const label = provider === 'claude' ? 'Claude' : 'Local';
+  return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Local model vs. your Claude subscription -- click to switch">${label}</button>`;
 }
 
 function wireProviderToggle(idAttr) {
@@ -763,7 +766,7 @@ function wireProviderToggle(idAttr) {
     const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
     providerChoices[idAttr] = next;
     btn.dataset.provider = next;
-    btn.textContent = next === 'local' ? 'Ornith' : 'Claude';
+    btn.textContent = next === 'local' ? 'Local' : 'Claude';
     btn.classList.toggle('provider-toggle-claude', next === 'claude');
   };
 }
@@ -1742,7 +1745,7 @@ function renderClarificationPicker(task) {
   // the DOM id, and clarify-discuss-provider is the SAME id reused for every task's
   // modal. Without this reset, toggling to Claude once for any task left it stuck as the
   // default for every OTHER task's Discuss button afterward too, silently defeating the
-  // "starts on Ornith" default both this toggle and _discuss_provider_args() otherwise
+  // "starts on local" default both this toggle and _discuss_provider_args() otherwise
   // already have. Force it back to local every time a task's detail view is (re)built,
   // so only an explicit click within THIS task's own session ever picks Claude.
   const nc = task.needsClarification;
@@ -3919,9 +3922,10 @@ async function loadSecondBrainFile(filePath) {
 function grillRenderTranscript(transcript, session) {
   // session.provider is only set on Discuss sessions ("local" or "claude" -- see
   // discuss_sessions.py's PROVIDER_* comment); Grill Me sessions never set it and are
-  // always Ornith. Label the assistant turns for whichever model actually generated
-  // them instead of assuming Ornith unconditionally.
-  const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Ornith';
+  // always the local model. Label the assistant turns for whichever model actually
+  // generated them instead of assuming a specific local model unconditionally (2026-08-24,
+  // Grimmethy: "Ornith is no longer the default model... reference local instead").
+  const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Local';
   const rows = transcript.map((t) => {
     const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
     const cls = t.role === 'assistant' ? 'grill-msg-assistant' : 'grill-msg-user';
