@@ -37,8 +37,18 @@
   #ghost-panel.ghost-collapsed { width: 0; overflow: hidden; border-left: none; }
   .ghost-header { padding: 12px 16px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .ghost-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; }
-  .ghost-body { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
-  .ghost-body .grill-transcript { flex: 1; max-height: none; }
+  /* min-height: 0 on BOTH nested flex:1 levels -- the classic flexbox trap (Grimmethy,
+     confirmed live: "When I send a message... the chat scrolls all the way up to the
+     beginning"): a flex item's min-height defaults to auto, which means it won't shrink
+     below its OWN CONTENT's natural height even with flex:1 set. Without this, .ghost-body
+     and .grill-transcript both just grow to fit the whole transcript instead of staying
+     fixed-height with internal scroll -- the newest messages get pushed past #ghost-panel's
+     own fixed, clipped (overflow:hidden) box and are invisibly cut off, while the oldest
+     messages stay visible at the top. transcriptEl.scrollTop = scrollHeight (in ghostRender)
+     was already correct -- there was nothing to actually scroll, since the element had
+     grown instead of staying a fixed box with overflow. */
+  .ghost-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
+  .ghost-body .grill-transcript { flex: 1; min-height: 0; max-height: none; }
   .ghost-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
   #ghost-toggle-tab { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
   #ghost-toggle-tab:hover { color: var(--text); }
