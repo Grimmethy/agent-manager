@@ -91,6 +91,19 @@ while :; do
     reject_retry_result="$(node "${PACKAGE_SRC_DIR}/reject-retry-check.js" 2>>"${HOME_LOGS}/reject-retry-check.log")"
     printf '[watchdog] reject-retry-check: %s\n' "$reject_retry_result" >&2
 
+    # Apply-retry-requeue: the same idea as reject-retry-check.js above, for the apply
+    # stage instead of review (blockedStage:'apply', not 'review' -- recordApplyOutcome
+    # in apply-task.js deliberately stamps its own blockedStage so the two checks never
+    # collide over the same task). 2026-08-24, pipeline hardening: caught live -- an
+    # apply-failed task (a stale diff, conflicting with an unrelated sibling task's own
+    # change landed on the same file in between draft and apply) sat in queue/blocked/
+    # requiring a human to manually diagnose and requeue by hand, exactly the same
+    # permanent-dead-end shape review rejections had before reject-retry-check.js
+    # existed. apply-adhoc-diff.js's own --3way retry already resolves most of this
+    # class automatically; this is the safety net for when even that can't reconcile.
+    apply_retry_result="$(node "${PACKAGE_SRC_DIR}/apply-retry-check.js" 2>>"${HOME_LOGS}/apply-retry-check.log")"
+    printf '[watchdog] apply-retry-check: %s\n' "$apply_retry_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the

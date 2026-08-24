@@ -105,6 +105,75 @@ test('applyAdhocDiff applies a real diff whose hunk header line-count is wrong (
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2\n');
 });
 
+// --- 2026-08-24 (pipeline hardening): --3way fallback ----------------------------------
+// Caught live: a real adhoc task's diff conflicted with an unrelated sibling task's own
+// change that landed on the same file between this draft's worktree being cut and apply
+// actually running. Plain `git apply` only does context-line matching; `git apply --3way`
+// does a real content-based three-way merge using the diff's own base blob, which
+// resolves this class of conflict (the actual edited lines are untouched, something
+// UNRELATED nearby shifted) automatically.
+//
+// Default 3-line diff context (makeRealDiff, same as production) is used for both tests
+// below -- confirmed live while writing these tests that a -U0 (zero-context) diff
+// doesn't work with git's own --3way merge fallback at all (it degrades to "Falling
+// back to direct application" and fails the same way plain apply does), so the fixture
+// has to match what adhoc-agentic-draft.js's real `git diff` capture actually produces,
+// not an artificially minimal one. The unrelated insertion below (3 lines) is enough to
+// exceed plain `git apply`'s own default fuzzy context-search tolerance -- confirmed by
+// this test failing on plain apply before the --3way fallback was added.
+function makeMultilineRepo() {
+  const repoDir = makeRepo();
+  fs.writeFileSync(path.join(repoDir, 'multi.txt'), 'a\nb\nc\nd\ne\nf\ng\nh\n');
+  git(['add', 'multi.txt'], repoDir);
+  git(['commit', '-m', 'add multi.txt'], repoDir);
+  return repoDir;
+}
+
+test('applyAdhocDiff falls back to --3way and still succeeds when an unrelated change elsewhere in the file breaks plain context matching', () => {
+  const repoDir = makeMultilineRepo();
+  const rawDiff = makeRealDiff(repoDir, (dir) => {
+    fs.writeFileSync(path.join(dir, 'multi.txt'), 'a\nb\nc-changed\nd\ne\nf\ng\nh\n');
+  });
+
+  // Simulates a sibling task's own unrelated change landing on the real repo in between
+  // this draft's worktree being cut and apply actually running -- an insertion far from
+  // the line actually being edited, but one that shifts every line number below it,
+  // exactly the shape of the real incident this fix exists for.
+  fs.writeFileSync(path.join(repoDir, 'multi.txt'), 'x\ny\nz\na\nb\nc\nd\ne\nf\ng\nh\n');
+  git(['add', 'multi.txt'], repoDir);
+  git(['commit', '-m', 'unrelated sibling change'], repoDir);
+
+  const task = { id: 'apply-test-3way-1', rawDiff, implementResponse: 'summary', adhocResolution: 'implemented' };
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.deepEqual(result.files, ['multi.txt']);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'multi.txt'), 'utf8'), 'x\ny\nz\na\nb\nc-changed\nd\ne\nf\ng\nh\n', 'both the sibling\'s unrelated insertion AND this draft\'s real edit should survive');
+});
+
+test('applyAdhocDiff still fails (does not silently corrupt the file) when the SAME line was genuinely changed differently -- a real conflict, not just a shift', () => {
+  const repoDir = makeMultilineRepo();
+  const rawDiff = makeRealDiff(repoDir, (dir) => {
+    fs.writeFileSync(path.join(dir, 'multi.txt'), 'a\nb\nc-changed-by-draft\nd\ne\nf\ng\nh\n');
+  });
+
+  // A genuine conflict this time: the SAME line the draft wants to change was ALREADY
+  // changed to something else entirely -- neither plain apply NOR a real 3-way merge can
+  // honestly reconcile two different edits to the same line without a human.
+  fs.writeFileSync(path.join(repoDir, 'multi.txt'), 'a\nb\nc-changed-by-someone-else\nd\ne\nf\ng\nh\n');
+  git(['add', 'multi.txt'], repoDir);
+  git(['commit', '-m', 'conflicting change to the same line'], repoDir);
+
+  const task = { id: 'apply-test-3way-2', rawDiff, implementResponse: 'summary', adhocResolution: 'implemented' };
+
+  assert.throws(() => applyAdhocDiff({ task, repoRoot: repoDir }), /git apply failed/);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'multi.txt'), 'utf8'), 'a\nb\nc-changed-by-someone-else\nd\ne\nf\ng\nh\n', 'a genuine conflict must leave the real file untouched, not half-applied');
+  // The failed --3way attempt marks the index itself unmerged (stage U) before this
+  // cleanup runs -- confirmed live this is a real, separate thing from the working tree
+  // content being right; a leftover unmerged index entry would break whatever git
+  // command runs next in this worktree even with the FILE content already restored.
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'the index must be fully clean after a failed apply, not left mid-conflict');
+});
+
 // 2026-08-24: applying a RESOLUTION: decompose draft queues each sub-task as a fresh
 // adhoc task in queue/adhoc/ (the same location/schema queue-adhoc-task.js already uses,
 // so nextAdhocTask() picks them up exactly like any human-queued adhoc task) instead of
