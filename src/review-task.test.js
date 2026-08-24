@@ -24,10 +24,13 @@ const path = require('path');
 // entry point in this package. reviewTask's own try/catch around that call already
 // swallows the failure into groundingText='' when this isn't set (confirmed harmless --
 // every test below still passes without it), but leaving it unset just means each test
-// run prints a real uncaught-exception stack trace to stderr for no benefit. A
-// throwaway value matches apply-task.test.js's own identical reasoning for the same var.
-process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || require('os').tmpdir();
-process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
+// run prints a real uncaught-exception stack trace to stderr for no benefit. Forced
+// (not `||`-defaulted) unconditionally: confirmed live 2026-08-24 that apply-task.test.js's
+// identical `||` pattern let an ambient real AGENT_MANAGER_REPO_ROOT leak straight through
+// into getConfig() and pollute the real repo's own Docs/*_CANDIDATES.md files -- the same
+// risk applies here even though this file's own tests don't touch that path today.
+process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
+process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
 // each source's emptyApproval/advisoryProse flag off the shared task-source-registry
