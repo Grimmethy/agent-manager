@@ -122,6 +122,12 @@ def get_config():
     grep_dirs = [d.strip() for d in os.environ.get("AGENT_MANAGER_GREP_DIRS", "frontend/src,backend/src").split(",") if d.strip()]
     graph_path = Path(os.environ.get("AGENT_MANAGER_GRAPH_PATH", str(repo_root / "graphify-out" / "graph.json")))
     coverage_path = Path(os.environ.get("AGENT_MANAGER_COMMUNITY_COVERAGE_PATH", str(pipeline_dir / "community-coverage.json")))
+    # 2026-08-24 (Brain Dump #155): per-file mtime/size -> resolved-edges cache, see
+    # build_import_graph's own comment. Lives under instances/ alongside the OTHER
+    # build-scheduling state (.graph-build-schedule.json) this module already writes
+    # there, not next to graph.json itself -- it's build-process bookkeeping, not part of
+    # the graph data any consumer (task-sources.js, the dashboard's graph view) reads.
+    file_cache_path = Path(os.environ.get("AGENT_MANAGER_GRAPH_FILE_CACHE_PATH", str(pipeline_dir / "instances" / ".graph-file-cache.json")))
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     ornith_model = os.environ.get("ORNITH_MODEL", "ornith:9b")
 
@@ -131,6 +137,7 @@ def get_config():
         "grep_dirs": grep_dirs,
         "graph_path": graph_path,
         "coverage_path": coverage_path,
+        "file_cache_path": file_cache_path,
         "ollama_url": ollama_url,
         "ornith_model": ornith_model,
     }
@@ -266,7 +273,58 @@ def resolve_lua_import(spec: str, repo_root: Path, file_set: set[Path]) -> Path 
     return None
 
 
-def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
+def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) -> list[str]:
+    """Returns the list of relative target paths f imports/requires/includes that also
+    exist in file_set (excluding self-edges) -- the actual regex-scan-and-resolve work,
+    pulled out of build_import_graph so it can be called only for files that actually
+    need it (a cache miss) instead of unconditionally for every file on every build."""
+    rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
+    is_python = f.suffix in PY_EXTENSIONS
+    is_lua = f.suffix in LUA_EXTENSIONS
+    edges = []
+
+    if is_python:
+        for match in IMPORT_RE_PY.finditer(text):
+            spec = match.group(1) or match.group(2)
+            if not spec:
+                continue
+            target = resolve_python_import(f, spec, repo_root)
+            if target and target in file_set:
+                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                if rel_to != rel_from:
+                    edges.append(rel_to)
+        for match in TEMPLATE_RE.finditer(text):
+            template_name = match.group(1)
+            target = resolve_template_import(f, template_name)
+            if target and target in file_set:
+                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                if rel_to != rel_from:
+                    edges.append(rel_to)
+    elif is_lua:
+        for match in LUA_INCLUDE_RE.finditer(text):
+            lit_matches = LUA_STRLIT_RE.findall(match.group(1))
+            if not lit_matches:
+                continue
+            target = resolve_lua_import(lit_matches[-1], repo_root, file_set)
+            if target and target in file_set:
+                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                if rel_to != rel_from:
+                    edges.append(rel_to)
+    else:
+        for match in IMPORT_RE.finditer(text):
+            spec = match.group(1) or match.group(2) or match.group(3)
+            if not spec:
+                continue
+            target = resolve_import(f, spec, repo_root)
+            if target and target in file_set:
+                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                if rel_to != rel_from:
+                    edges.append(rel_to)
+
+    return edges
+
+
+def build_import_graph(repo_root: Path, grep_dirs: list[str], file_cache: dict = None) -> nx.Graph:
     # Resolve up front, matching file_set's own f.resolve() below -- repo_root can be a
     # symlink (e.g. this project's own self-hosted setup: AGENT_MANAGER_REPO_ROOT points
     # at /media/wok/model-cache/agent-manager-apply-target, a symlink to
@@ -282,52 +340,51 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str]) -> nx.Graph:
         rel = str(f.relative_to(repo_root)).replace("\\", "/")
         graph.add_node(rel)
 
+    # 2026-08-24 (Grimmethy, Brain Dump #155: "Every time I build a project graph it
+    # starts from scratch. Can we instead build on diff's so that we only have to modify
+    # what has actually been changed"): file_cache (mtime+size -> previously-resolved
+    # edge list), keyed by the SAME relative path used everywhere else in this module.
+    # An unchanged file's edges are reused as-is, skipping the read_text()+regex+resolve
+    # work entirely -- only files that are new or whose mtime/size actually changed since
+    # the last build get re-parsed. file_set membership can shift between builds too (a
+    # file added/removed changes what NEIGHBORS resolve to, even for an untouched file's
+    # own text), but that only affects which of a file's already-extracted target paths
+    # are still valid nodes -- filtered back in below, not by re-parsing.
+    cache_entries = file_cache.setdefault("files", {}) if file_cache is not None else None
+
     for f in file_set:
+        rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
         try:
-            text = f.read_text(encoding="utf-8", errors="ignore")
+            stat = f.stat()
         except OSError:
             continue
-        rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
-        is_python = f.suffix in PY_EXTENSIONS
-        is_lua = f.suffix in LUA_EXTENSIONS
 
-        if is_python:
-            for match in IMPORT_RE_PY.finditer(text):
-                spec = match.group(1) or match.group(2)
-                if not spec:
-                    continue
-                target = resolve_python_import(f, spec, repo_root)
-                if target and target in file_set:
-                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                    if rel_to != rel_from:
-                        graph.add_edge(rel_from, rel_to)
-            for match in TEMPLATE_RE.finditer(text):
-                template_name = match.group(1)
-                target = resolve_template_import(f, template_name)
-                if target and target in file_set:
-                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                    if rel_to != rel_from:
-                        graph.add_edge(rel_from, rel_to)
-        elif is_lua:
-            for match in LUA_INCLUDE_RE.finditer(text):
-                lit_matches = LUA_STRLIT_RE.findall(match.group(1))
-                if not lit_matches:
-                    continue
-                target = resolve_lua_import(lit_matches[-1], repo_root, file_set)
-                if target and target in file_set:
-                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                    if rel_to != rel_from:
-                        graph.add_edge(rel_from, rel_to)
+        cached = cache_entries.get(rel_from) if cache_entries is not None else None
+        if cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size:
+            edges = cached["edges"]
         else:
-            for match in IMPORT_RE.finditer(text):
-                spec = match.group(1) or match.group(2) or match.group(3)
-                if not spec:
-                    continue
-                target = resolve_import(f, spec, repo_root)
-                if target and target in file_set:
-                    rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                    if rel_to != rel_from:
-                        graph.add_edge(rel_from, rel_to)
+            try:
+                text = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            edges = _extract_edges_for_file(f, repo_root, file_set, text)
+            if cache_entries is not None:
+                cache_entries[rel_from] = {"mtime": stat.st_mtime, "size": stat.st_size, "edges": edges}
+
+        for rel_to in edges:
+            # A cached edge's target might no longer be in the CURRENT file_set (the
+            # target file was deleted/moved since this file's own text was last parsed,
+            # even though this file's own content didn't change) -- re-check membership
+            # rather than trusting the cached edge blindly.
+            if graph.has_node(rel_to):
+                graph.add_edge(rel_from, rel_to)
+
+    if cache_entries is not None:
+        # Drop cache entries for files that no longer exist -- otherwise a deleted file's
+        # stale entry lingers in the cache file forever, harmless but unbounded growth.
+        live_rels = {str(f.relative_to(repo_root)).replace("\\", "/") for f in file_set}
+        for stale_rel in [r for r in cache_entries if r not in live_rels]:
+            del cache_entries[stale_rel]
 
     return graph
 
@@ -401,7 +458,9 @@ def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) 
         return None
 
 
-def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, ornith_model: str, progress=print, use_model_naming: bool = True) -> dict:
+def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, ornith_model: str, progress=print,
+                      use_model_naming: bool = True, file_cache: dict = None,
+                      old_coverage: dict = None, old_graph_nodes: list = None) -> dict:
     """Reusable core: everything main() does EXCEPT deciding where to write the result --
     the CLI entry point and the dashboard's on-demand build both call this, writing to
     their own paths (the pipeline's configured graph/coverage paths for the CLI; a
@@ -414,12 +473,31 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
     naming communities in an external, unfamiliar repo (see ADR-0019), unlike
     arch_discovery's default of trying Ornith first.
 
+    file_cache (2026-08-24, Brain Dump #155: "Every time I build a project graph it
+    starts from scratch... build on diff's so that we only have to modify what has
+    actually been changed") is passed straight through to build_import_graph -- see that
+    function's own comment. Mutated in place; the caller is responsible for
+    loading/persisting it (this function has no opinion on where it lives).
+
+    old_coverage/old_graph_nodes (same brain-dump entry, the bigger win): when given, a
+    community whose member-file set is byte-identical to a community from the PREVIOUS
+    build reuses that community's existing name instead of calling
+    name_community_ornith/name_community_heuristic again -- skipping the naming step
+    entirely for the common case where most communities haven't changed. This is the part
+    that actually matters for wall-clock time: confirmed live (see check_due()'s own
+    comment) a real naming pass across this repo's own ~15+ communities took 13+ minutes
+    under real worker-lane GPU contention -- a name is a per-community LLM round-trip,
+    while re-parsing an unchanged file's text (file_cache's own job) is comparatively
+    free. Uses the exact same member-file-set signature merge_coverage() already
+    establishes as a community's stable cross-build identity, so behavior stays
+    consistent with how review-state carry-forward already works.
+
     Returns {"graph": {"nodes": [...], "links": [...]}, "coverage": {"communities": [...]}}.
     """
     scope = ', '.join(grep_dirs) if grep_dirs else "entire tree"
     progress(f"Scanning {scope} under {repo_root} ...")
 
-    graph = build_import_graph(repo_root, grep_dirs)
+    graph = build_import_graph(repo_root, grep_dirs, file_cache=file_cache)
     progress(f"Found {graph.number_of_nodes()} files, {graph.number_of_edges()} import edges.")
 
     isolated = [n for n in graph.nodes if graph.degree(n) == 0]
@@ -434,25 +512,42 @@ def build_graph_data(repo_root: Path, grep_dirs: list[str], ollama_url: str, orn
     communities.sort(key=len, reverse=True)
     progress(f"Found {len(communities)} communities.")
 
+    old_names_by_signature = {}
+    if old_coverage and old_graph_nodes:
+        old_names_by_signature = {
+            _community_member_signature(c["id"], old_graph_nodes): c["name"]
+            for c in old_coverage.get("communities", [])
+            if c.get("name")
+        }
+
     nodes = []
     links = []
     coverage_communities = []
+    reused_names = 0
 
     for community_id, member_files in enumerate(communities):
         member_files = sorted(member_files)
         for f in member_files:
             nodes.append({"id": f, "community": community_id, "source_file": f})
 
-        progress(f"  community {community_id}: {len(member_files)} files -- naming...")
-        name = name_community_ornith(member_files, ollama_url, ornith_model) if use_model_naming else None
-        if not name:
-            name = name_community_heuristic(member_files)
+        name = old_names_by_signature.get(tuple(member_files))
+        if name:
+            reused_names += 1
+            progress(f"  community {community_id}: {len(member_files)} files -- unchanged, reusing existing name.")
+        else:
+            progress(f"  community {community_id}: {len(member_files)} files -- naming...")
+            name = name_community_ornith(member_files, ollama_url, ornith_model) if use_model_naming else None
+            if not name:
+                name = name_community_heuristic(member_files)
         coverage_communities.append({
             "id": community_id,
             "name": name,
             "lastReviewedAt": None,
             "lastCandidateCount": -1,
         })
+
+    if old_names_by_signature:
+        progress(f"Reused {reused_names}/{len(communities)} community names from the previous build (unchanged membership).")
 
     for a, b in graph.edges:
         links.append({"source": a, "target": b})
@@ -522,17 +617,21 @@ def check_due(progress=print) -> bool:
     built) -- called once per queue-watcher.sh tick, same "cheap check, rare real work"
     shape as system-report.js's own --check-due. Returns True if a build actually ran.
 
-    Always runs with use_model_naming=False (the directory-prefix heuristic, same as
-    deep_dive's own default -- see ADR-0019) rather than arch_discovery's usual
-    Ornith-first naming: community.name is purely a display label (task-sources.js's
-    nextArchDiscoveryTask only ever uses it for a task title/prompt string, never for
-    ranking or selection), not worth spending a real Ollama round-trip PER COMMUNITY
-    contending with the live pipeline's actual drafting/review work for the same model
-    slot every single day. Confirmed live 2026-08-19: a manual full run (with naming on)
-    against this repo's own ~15+ communities was still running after 13+ minutes, 0% CPU,
-    genuinely queued behind real worker traffic on the same Ollama instance -- exactly the
-    contention this avoids. A human running the plain `python build_graph.py` (no
-    --check-due) still gets Ornith-named communities if they want them.
+    Used to always run with use_model_naming=False (the directory-prefix heuristic)
+    rather than arch_discovery's usual Ornith-first naming: community.name is purely a
+    display label, not worth spending a real Ollama round-trip PER COMMUNITY contending
+    with the live pipeline's actual drafting/review work every single day. Confirmed live
+    2026-08-19: a manual full run (with naming on) against this repo's own ~15+
+    communities was still running after 13+ minutes, genuinely queued behind real worker
+    traffic on the same Ollama instance.
+
+    2026-08-24 (Brain Dump #155): now runs with use_model_naming=True -- safe again since
+    build_graph_data's own old_coverage/old_graph_nodes params (passed below) skip the
+    naming call entirely for any community whose membership hasn't changed since the last
+    build. The expensive case above only recurs on a genuinely large/first-ever change;
+    routine daily runs now spend real Ollama round-trips only on the FEW communities that
+    actually changed, instead of either all of them (slow) or none of them (the old
+    heuristic-only workaround, real but strictly worse names).
     """
     cfg = get_config()
     schedule_path = _graph_build_schedule_path(cfg["pipeline_dir"])
@@ -550,14 +649,21 @@ def check_due(progress=print) -> bool:
 
     old_graph = _read_json_or_default(cfg["graph_path"], {"nodes": [], "links": []})
     old_coverage = _read_json_or_default(cfg["coverage_path"], {"communities": []})
+    file_cache = _read_json_or_default(cfg["file_cache_path"], {})
 
-    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], progress=progress, use_model_naming=False)
+    result = build_graph_data(
+        cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], progress=progress,
+        use_model_naming=True, file_cache=file_cache,
+        old_coverage=old_coverage, old_graph_nodes=old_graph.get("nodes", []),
+    )
     merged_coverage = merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
 
     cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
     cfg["graph_path"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
     cfg["coverage_path"].parent.mkdir(parents=True, exist_ok=True)
     cfg["coverage_path"].write_text(json.dumps(merged_coverage, indent=2), encoding="utf-8")
+    cfg["file_cache_path"].parent.mkdir(parents=True, exist_ok=True)
+    cfg["file_cache_path"].write_text(json.dumps(file_cache, indent=2), encoding="utf-8")
 
     schedule_path.parent.mkdir(parents=True, exist_ok=True)
     schedule_path.write_text(json.dumps({"lastBuiltAt": now.isoformat()}, indent=2), encoding="utf-8")
@@ -605,8 +711,13 @@ def main():
     cfg = get_config()
     old_graph = _read_json_or_default(cfg["graph_path"], {"nodes": [], "links": []})
     old_coverage = _read_json_or_default(cfg["coverage_path"], {"communities": []})
+    file_cache = _read_json_or_default(cfg["file_cache_path"], {})
 
-    result = build_graph_data(cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"], use_model_naming=not args.no_model_naming)
+    result = build_graph_data(
+        cfg["repo_root"], cfg["grep_dirs"], cfg["ollama_url"], cfg["ornith_model"],
+        use_model_naming=not args.no_model_naming, file_cache=file_cache,
+        old_coverage=old_coverage, old_graph_nodes=old_graph.get("nodes", []),
+    )
     merged_coverage = merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
 
     cfg["graph_path"].parent.mkdir(parents=True, exist_ok=True)
@@ -617,6 +728,9 @@ def main():
     cfg["coverage_path"].write_text(json.dumps(merged_coverage, indent=2), encoding="utf-8")
     carried = sum(1 for c in merged_coverage["communities"] if c.get("lastReviewedAt"))
     print(f"Wrote {cfg['coverage_path']} ({len(merged_coverage['communities'])} communities, {carried} carried forward existing review state)")
+
+    cfg["file_cache_path"].parent.mkdir(parents=True, exist_ok=True)
+    cfg["file_cache_path"].write_text(json.dumps(file_cache, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
