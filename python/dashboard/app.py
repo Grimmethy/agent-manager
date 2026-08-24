@@ -493,42 +493,42 @@ PROJECT_CACHE_DIR = Path(__file__).resolve().parent / "project_cache"
 _build_state = {}
 _build_lock = threading.Lock()
 
-# Ghost panel "fully reserve the reasoning model" (Brain Dump #153) -- in-memory only,
+# Chat panel "fully reserve the reasoning model" (Brain Dump #153) -- in-memory only,
 # same "server restart just drops it" reasoning as _build_state above: an open flock file
-# handle isn't meaningfully persistable anyway. Keyed by ghost session id ->
+# handle isn't meaningfully persistable anyway. Keyed by chat session id ->
 # {"fh": <open file object from single_flight_lock.acquire()>, "lastActivity": float,
-# "storageDir": Path}. _ghost_reservations_lock guards concurrent access from the
+# "storageDir": Path}. _chat_reservations_lock guards concurrent access from the
 # request-handling thread (toggling on/off, refreshing lastActivity) and the watchdog
 # thread below (sweeping for staleness) -- Flask runs threaded=True, so these genuinely
 # race without it.
-_ghost_reservations = {}
-_ghost_reservations_lock = threading.Lock()
+_chat_reservations = {}
+_chat_reservations_lock = threading.Lock()
 # 10 minutes (Grimmethy's choice, discussed live): long enough that a normal pause
 # between messages never trips it, short enough that a crashed tab or forgotten toggle
 # can't starve the pipeline for more than this -- same staleness-window reasoning as
 # worker-instance liveness checks elsewhere in this pipeline.
-GHOST_RESERVATION_IDLE_TIMEOUT_S = 600
+CHAT_RESERVATION_IDLE_TIMEOUT_S = 600
 
 
-def _ghost_reservation_watchdog():
+def _chat_reservation_watchdog():
     """Started once at process init (see the bottom of this file) -- no existing
     scheduler/timer infrastructure runs inside this Flask process to piggyback on
     (confirmed: the only other background thread here, _run_build, is a one-shot
     fire-and-forget worker, not periodic), so this is a small standalone sleep-and-sweep
     loop, same daemon=True fire-and-forget shape as that one."""
-    import ghost_sessions
+    import chat_sessions
     import single_flight_lock
     while True:
         time.sleep(60)
         now = time.time()
-        with _ghost_reservations_lock:
-            stale_ids = [sid for sid, r in _ghost_reservations.items()
-                         if now - r["lastActivity"] > GHOST_RESERVATION_IDLE_TIMEOUT_S]
+        with _chat_reservations_lock:
+            stale_ids = [sid for sid, r in _chat_reservations.items()
+                         if now - r["lastActivity"] > CHAT_RESERVATION_IDLE_TIMEOUT_S]
             for sid in stale_ids:
-                record = _ghost_reservations.pop(sid)
+                record = _chat_reservations.pop(sid)
                 single_flight_lock.release(record["fh"])
                 try:
-                    ghost_sessions.set_reserved(record["storageDir"], sid, False)
+                    chat_sessions.set_reserved(record["storageDir"], sid, False)
                 except Exception:
                     pass  # best-effort -- the lock is already released, which is what matters
 
@@ -3135,13 +3135,14 @@ def api_discuss_end(session_id):
     return jsonify({"session": session, "entry": entry, "noteUpdated": note_updated, "heldTask": held_task})
 
 
-# Ghost panel (Brain Dump #153, Grimmethy: "a hideable panel on the right side of the app
-# for a conversational AI... make edits to the system... the ghost in the machine") --
-# deliberately NOT built on _call_discuss/discuss_sessions.py's shape: see
-# ghost_sessions.py's own header for why this is a global, persistent, real-Edit/Write/
-# Bash-capable conversation instead of Discuss's per-subject, read-only one.
+# Chat panel (Brain Dump #153, Grimmethy: "a hideable panel on the right side of the app
+# for a conversational AI... make edits to the system... the ghost in the machine" --
+# renamed to "Chat Panel" per Grimmethy's later request; original brain-dump text quoted
+# verbatim, unchanged) -- deliberately NOT built on _call_discuss/discuss_sessions.py's
+# shape: see chat_sessions.py's own header for why this is a global, persistent,
+# real-Edit/Write/Bash-capable conversation instead of Discuss's per-subject, read-only one.
 
-def _call_ghost(fn, *args, **kwargs):
+def _call_chat(fn, *args, **kwargs):
     """Same reasoning as _call_discuss -- turn a known, actionable failure into a clean
     4xx/5xx instead of a raw 500. Local-provider tool loops and Claude calls can both fail
     the same ways Discuss's already do (auth missing, Ollama busy/timed out)."""
@@ -3157,36 +3158,36 @@ def _call_ghost(fn, *args, **kwargs):
         abort(502, description=f"local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.")
 
 
-@app.route("/api/ghost/active", methods=["GET"])
-def api_ghost_active():
+@app.route("/api/chat/active", methods=["GET"])
+def api_chat_active():
     """Loads (or creates, if none exists yet) the single ongoing conversation for the
     active project -- called on dashboard load so the panel shows where you left off."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
-    from ghost_sessions import get_active_session, PROVIDER_LOCAL
-    session = _call_ghost(get_active_session, pipeline_dir, get_active_repo_root(),
+    from chat_sessions import get_active_session, PROVIDER_LOCAL
+    session = _call_chat(get_active_session, pipeline_dir, get_active_repo_root(),
                            instances_dir(), provider=PROVIDER_LOCAL)
     return jsonify(session)
 
 
-@app.route("/api/ghost/new", methods=["POST"])
-def api_ghost_new():
+@app.route("/api/chat/new", methods=["POST"])
+def api_chat_new():
     """Starts a fresh conversation, ending whatever's currently active. Body:
     {provider?, model?, effort?} -- same _discuss_provider_args fallback (local by
     default) every other Discuss-family start route already uses."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
-    from ghost_sessions import start_new_conversation
+    from chat_sessions import start_new_conversation
     provider, model, effort = _discuss_provider_args()
-    session = _call_ghost(start_new_conversation, pipeline_dir, get_active_repo_root(),
+    session = _call_chat(start_new_conversation, pipeline_dir, get_active_repo_root(),
                            instances_dir(), provider=provider, model=model, effort=effort)
     return jsonify(session)
 
 
-@app.route("/api/ghost/<session_id>/message", methods=["POST"])
-def api_ghost_message(session_id):
+@app.route("/api/chat/<session_id>/message", methods=["POST"])
+def api_chat_message(session_id):
     """The actual chat turn.
 
     2026-08-24 -- this used to wrap the WHOLE call in the same git-safety mutex the
@@ -3194,7 +3195,7 @@ def api_ghost_message(session_id):
     app.py:3979-3999). Caught live within minutes of shipping: a local-provider turn can
     legitimately wait minutes just for the GPU lock (a busy worker lane), and held the
     apply-lock that entire time even though most turns never touch git at all -- a second,
-    completely unrelated Ghost message (or a real click from Grimmethy, confirmed live)
+    completely unrelated Chat message (or a real click from Grimmethy, confirmed live)
     got "the pipeline is mid-apply right now" while nothing was actually applying,
     because THIS request was sitting on the mutex for no reason. Exactly the lesson
     single-flight-lock.js's own header already documents from an earlier incident:
@@ -3218,22 +3219,22 @@ def api_ghost_message(session_id):
     if not message:
         abort(400, description="message is required")
 
-    from ghost_sessions import send_message
-    session = _call_ghost(send_message, pipeline_dir, session_id, message)
+    from chat_sessions import send_message
+    session = _call_chat(send_message, pipeline_dir, session_id, message)
     if not session:
         abort(404)
 
     # Reserved sessions refresh their own idle clock on every real message -- same
     # liveness-refresh shape a worker instance's own heartbeat already follows.
-    with _ghost_reservations_lock:
-        if session_id in _ghost_reservations:
-            _ghost_reservations[session_id]["lastActivity"] = time.time()
+    with _chat_reservations_lock:
+        if session_id in _chat_reservations:
+            _chat_reservations[session_id]["lastActivity"] = time.time()
 
     return jsonify(session)
 
 
-@app.route("/api/ghost/<session_id>/reserve", methods=["POST"])
-def api_ghost_reserve(session_id):
+@app.route("/api/chat/<session_id>/reserve", methods=["POST"])
+def api_chat_reserve(session_id):
     """Toggles "fully reserving the reasoning model" (Brain Dump #153) for this session --
     holding instances/.pipeline-single-flight.lock across turns, not just for the span of
     one call, so the whole local pipeline goes idle until you release it. Body: {on: bool}.
@@ -3242,7 +3243,7 @@ def api_ghost_reserve(session_id):
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
-    from ghost_sessions import get_session, set_reserved, PROVIDER_LOCAL
+    from chat_sessions import get_session, set_reserved, PROVIDER_LOCAL
     import single_flight_lock
 
     session = get_session(pipeline_dir, session_id)
@@ -3256,31 +3257,31 @@ def api_ghost_reserve(session_id):
 
     # single_flight_lock.acquire() BLOCKS (it's the real GPU/model mutex, can wait as
     # long as a worker lane's current call takes) -- must never be called while holding
-    # _ghost_reservations_lock, or every other Ghost request (another session's own
+    # _chat_reservations_lock, or every other Chat request (another session's own
     # message, another reserve toggle) would stall for the same duration. Two short,
     # separate critical sections instead: check-and-claim first, do the real (possibly
     # slow) acquire/release outside the lock, then record the result.
-    with _ghost_reservations_lock:
-        already_on = session_id in _ghost_reservations
+    with _chat_reservations_lock:
+        already_on = session_id in _chat_reservations
         claiming = want_on and not already_on
-        releasing_record = _ghost_reservations.pop(session_id) if (not want_on and already_on) else None
+        releasing_record = _chat_reservations.pop(session_id) if (not want_on and already_on) else None
         if claiming:
             # Reserve the dict slot now (before the blocking acquire below) so a second,
             # concurrent toggle-on request for the SAME session can't also start
             # acquiring -- filled in with the real fh once acquire() returns.
-            _ghost_reservations[session_id] = {"fh": None, "lastActivity": time.time(), "storageDir": pipeline_dir}
+            _chat_reservations[session_id] = {"fh": None, "lastActivity": time.time(), "storageDir": pipeline_dir}
 
     if releasing_record is not None:
         single_flight_lock.release(releasing_record["fh"])
     if claiming:
         inst_dir = instances_dir()
         if not inst_dir:
-            with _ghost_reservations_lock:
-                _ghost_reservations.pop(session_id, None)
+            with _chat_reservations_lock:
+                _chat_reservations.pop(session_id, None)
             abort(500, description="no active project's instances dir resolvable")
         fh = single_flight_lock.acquire(inst_dir)  # blocking -- may wait for a worker lane's current call
-        with _ghost_reservations_lock:
-            _ghost_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": pipeline_dir}
+        with _chat_reservations_lock:
+            _chat_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": pipeline_dir}
 
     session = set_reserved(pipeline_dir, session_id, want_on)
     return jsonify(session)
@@ -5063,9 +5064,9 @@ if __name__ == "__main__":
     # state fresh from disk on each call (see the comment just above -- no shared
     # in-memory state to race on), so allowing overlapping requests is safe, not just a
     # speed hack.
-    # Ghost panel reservation idle-timeout sweep -- daemon=True, same fire-and-forget
-    # shape as _run_build's own background thread; see _ghost_reservation_watchdog's own
+    # Chat panel reservation idle-timeout sweep -- daemon=True, same fire-and-forget
+    # shape as _run_build's own background thread; see _chat_reservation_watchdog's own
     # docstring for why this has to be built here rather than reused from elsewhere.
-    threading.Thread(target=_ghost_reservation_watchdog, daemon=True).start()
+    threading.Thread(target=_chat_reservation_watchdog, daemon=True).start()
 
     app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True)

@@ -50,7 +50,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     project directory instead of claude-client.js's isolated scratch dir. Omitting them
     keeps the existing plain-text-completion behavior (no tools, no real cwd).
 
-    `resume` (2026-08-24, Ghost panel -- Brain Dump #153) is a prior call's own
+    `resume` (2026-08-24, Chat panel -- Brain Dump #153) is a prior call's own
     `sessionId` (returned below), threaded through to claude-client.js's `--resume` flag
     so the CLI's own session storage carries real conversation state forward -- the
     caller doesn't need to rebuild a transcript from scratch each turn the way
@@ -78,10 +78,10 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
                 capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired as e:
-            # 2026-08-24 -- caught live via the Ghost panel's sibling module
+            # 2026-08-24 -- caught live via the Chat panel's sibling module
             # (local_tool_client.py had the identical gap): subprocess.TimeoutExpired
             # does NOT inherit from TimeoutError, so it was never caught by any of this
-            # module's own error handling OR by app.py's _call_discuss/_call_ghost
+            # module's own error handling OR by app.py's _call_discuss/_call_chat
             # (which only know to catch ClaudeClientError/LocalToolClientError plus the
             # builtin TimeoutError/ConnectionError/OSError trio) -- it fell all the way
             # through as a raw, unhandled 500 with no indication of what happened. Every
@@ -116,7 +116,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
         "thinking": parsed.get("thinking", ""),
         "degenerate": parsed.get("degenerate"),
         "model": f"claude:{resolved_model}",
-        # 2026-08-24 (Ghost panel) -- the CLI's own session id, for a caller that wants
+        # 2026-08-24 (Chat panel) -- the CLI's own session id, for a caller that wants
         # real multi-turn continuity to pass back in as `resume` on its next call.
         "sessionId": parsed.get("sessionId"),
     }

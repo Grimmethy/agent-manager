@@ -147,7 +147,7 @@ test('callOnce passes --tools \'\' when no allowedTools given, so the model can 
   });
 });
 
-// Ghost panel (2026-08-24, Brain Dump #153): real session continuity via the CLI's own
+// Chat panel (2026-08-24, Brain Dump #153): real session continuity via the CLI's own
 // --resume, instead of every caller rebuilding a transcript from scratch each turn.
 test('callOnce passes --resume when a caller supplies a prior sessionId', async () => {
   await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
