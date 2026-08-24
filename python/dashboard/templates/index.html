@@ -3224,6 +3224,7 @@ async function enterProjectTab() {
         <datalist id="project-history-list"></datalist>
         <button class="secondary" id="history-toggle">History...</button>
         <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward this checkout onto it">Sync with GitHub</button>
         <button class="action" id="build-btn">Build Graph</button>
       </div>
       <div id="history-panel" class="browser-panel" style="display:none"></div>
@@ -3291,6 +3292,7 @@ async function enterProjectTab() {
     localStorage.setItem('agentManagerGrepDirs', grepDirs);
   });
   document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
 
   await loadProjectHistory();
   await loadProjectDropdown();
@@ -3562,6 +3564,36 @@ async function triggerBuild() {
     const area = document.getElementById('project-status-area');
     area.innerHTML = `<div class="empty">Could not start build: ${e.message}</div>`;
     buildBtn.disabled = false;
+  }
+}
+
+async function triggerSync() {
+  if (!projectPath) return;
+  const syncBtn = document.getElementById('sync-btn');
+  syncBtn.disabled = true;
+  const originalLabel = syncBtn.textContent;
+  syncBtn.textContent = 'Syncing...';
+  try {
+    const res = await fetch('/api/project/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectPath }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.description || res.statusText);
+    if (!data.synced) {
+      showToast(data.reason || 'could not sync', 'error');
+    } else if (data.changed) {
+      showToast(`Synced '${data.branch}' -- pulled ${data.behind} commit(s)`, 'info');
+      await refreshProjectStatus();
+    } else {
+      showToast(`'${data.branch}' is already up to date with GitHub`, 'info');
+    }
+  } catch (e) {
+    showToast(`Sync failed: ${e.message}`, 'error');
+  } finally {
+    syncBtn.disabled = false;
+    syncBtn.textContent = originalLabel;
   }
 }
 
