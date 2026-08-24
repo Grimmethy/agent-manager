@@ -7,6 +7,7 @@
 // array and tool_calls response field.
 
 const path = require('path');
+const os = require('os');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { grepCodebase } = require('./grep-codebase-tool.js');
@@ -157,6 +158,33 @@ function editFileTool({ path: relPath, find, replace }) {
   return { path: relPath, edited: true };
 }
 
+// 2026-08-24 -- caught live within minutes of the Ghost panel shipping: app.py used to
+// wrap ghost_sessions.send_message()'s ENTIRE call in the same git-safety mutex
+// apply-task.sh/api_git_merge_branch use, held for however long the whole turn took
+// (a local-provider turn can legitimately wait minutes on the GPU lock alone) even
+// though most turns never touch git at all -- a second, unrelated Ghost message got
+// "the pipeline is mid-apply right now" while nothing was actually applying. Moved the
+// real protection down to HERE, the one place in this module that can actually run a
+// git-mutating command, held only around the single execFileSync call below -- not the
+// surrounding sandbox setup, not the calling turn. Same fixed lockfile
+// apply-task.sh/api_git_merge_branch already flock (cross-language-compatible, same
+// mechanism proven interoperable all session), acquired via the identical
+// open-fd-then-flock-the-child pattern single-flight-lock.js already uses for its own
+// (different) lock file.
+const APPLY_LOCK_PATH = path.join(os.homedir(), '.local', 'state', 'agent-manager', 'locks', 'apply-task.lock');
+const APPLY_LOCK_CHILD_FD = 3;
+
+function withApplyLock(fn) {
+  fs.mkdirSync(path.dirname(APPLY_LOCK_PATH), { recursive: true });
+  const fd = fs.openSync(APPLY_LOCK_PATH, 'w');
+  try {
+    execFileSync('flock', [String(APPLY_LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function runBashTool({ command }) {
   const { repoRoot } = getConfig();
   if (typeof command !== 'string' || !command.trim()) {
@@ -179,9 +207,9 @@ function runBashTool({ command }) {
     return { error: 'sandbox (bwrap) is not available on this host -- run_bash is disabled without it' };
   }
   try {
-    const stdout = execFileSync(wrapped.command, wrapped.args, {
+    const stdout = withApplyLock(() => execFileSync(wrapped.command, wrapped.args, {
       encoding: 'utf8', timeout: GHOST_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
-    });
+    }));
     return { command, stdout, exitCode: 0 };
   } catch (e) {
     return {
@@ -407,6 +435,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
 module.exports = {
   runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
+  withApplyLock, APPLY_LOCK_PATH,
 };
 
 // CLI: node local-tool-client.js <request.json>

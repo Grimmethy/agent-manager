@@ -3181,13 +3181,29 @@ def api_ghost_new():
 
 @app.route("/api/ghost/<session_id>/message", methods=["POST"])
 def api_ghost_message(session_id):
-    """The actual chat turn. Wrapped in the SAME git-safety mutex the merge-branch
-    endpoint uses (_acquire_apply_lock/_release_apply_lock, app.py:3979-3999) -- Ghost
-    edits land directly on the live working tree (see ghost_sessions.py's own header on
-    why), so a turn that runs a real git operation must not race apply-task-loop's own
-    ~30s fetch/reset/branch cycle on the same repo. apply-task-loop simply retries with
-    its own existing backoff if a Ghost turn is mid-flight -- the exact transient
-    contention this lock was already built to absorb, nothing new."""
+    """The actual chat turn.
+
+    2026-08-24 -- this used to wrap the WHOLE call in the same git-safety mutex the
+    merge-branch endpoint uses (_acquire_apply_lock/_release_apply_lock,
+    app.py:3979-3999). Caught live within minutes of shipping: a local-provider turn can
+    legitimately wait minutes just for the GPU lock (a busy worker lane), and held the
+    apply-lock that entire time even though most turns never touch git at all -- a second,
+    completely unrelated Ghost message (or a real click from Grimmethy, confirmed live)
+    got "the pipeline is mid-apply right now" while nothing was actually applying,
+    because THIS request was sitting on the mutex for no reason. Exactly the lesson
+    single-flight-lock.js's own header already documents from an earlier incident:
+    holding a lock across a call's ENTIRE span instead of just the piece that needs it
+    turns a narrow, real protection into broad, needless contention.
+
+    Fix: git safety now lives at the point a git-mutating command actually runs, not
+    here. local-tool-client.js's runBashTool acquires the SAME apply-task.lock (flock,
+    cross-language-compatible, same file apply-task.sh/api_git_merge_branch already use)
+    for just the span of each individual command -- see that function's own comment.
+    Claude's own Edit/Write/Bash tool calls happen inside the `claude` CLI's own internal
+    tool loop, which this codebase has no hook into at the per-call level, so they are
+    NOT covered by this -- a known, real, narrower gap (git's own index.lock still turns
+    a genuine collision into a clean failure to retry, not silent corruption) rather than
+    a solved one; revisit if it causes a real incident."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
@@ -3197,13 +3213,7 @@ def api_ghost_message(session_id):
         abort(400, description="message is required")
 
     from ghost_sessions import send_message
-    lock_fd = _acquire_apply_lock(timeout_seconds=30)
-    if lock_fd is None:
-        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
-    try:
-        session = _call_ghost(send_message, pipeline_dir, session_id, message)
-    finally:
-        _release_apply_lock(lock_fd)
+    session = _call_ghost(send_message, pipeline_dir, session_id, message)
     if not session:
         abort(404)
 
