@@ -82,7 +82,7 @@ test('buildVerdictPrompt gives adhoc (source: manual) tasks a grounded-deviation
     implementResponse: 'Investigated and the real bug was in bar.js, not foo.js.\n\n=== DIFF ===\ndiff --git a/bar.js b/bar.js\n...\nRESOLUTION: implemented',
   });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
-  assert.match(prompt, /PLAN above was drafted BLIND/);
+  assert.match(prompt, /PLAN section above was drafted BLIND/);
   assert.match(prompt, /do NOT reject the implement draft merely because it touches different files/);
   assert.doesNotMatch(prompt, /CLASSIFICATION task/);
 });
@@ -142,7 +142,7 @@ test('buildVerdictPrompt keeps the ordinary manual-source (diff-grounded) carve-
     implementResponse: 'Fixed it.\n\n=== DIFF ===\ndiff --git a/x.js b/x.js\n...\nRESOLUTION: implemented',
   });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
-  assert.match(prompt, /PLAN above was drafted BLIND/);
+  assert.match(prompt, /PLAN section above was drafted BLIND/);
   assert.doesNotMatch(prompt, /DECOMPOSE rather than implement directly/);
 });
 
@@ -163,8 +163,27 @@ test('buildVerdictPrompt tells the reviewer NOT to judge a decompose draft by pr
   });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
   assert.match(prompt, /PLAN section above was drafted BLIND/);
-  assert.match(prompt, /Do NOT reject over anything wrong with the PLAN itself/);
-  assert.match(prompt, /judge ONLY the actual DECOMPOSITION/);
+  assert.match(prompt, /NEVER reject over a problem in the PLAN itself/);
+  assert.match(prompt, /Judge ONLY the actual DECOMPOSITION/);
+});
+
+// Proves the fix is actually systemic, not just a third copy-pasted carve-out: the
+// "PLAN was drafted blind" protection fires for ANY source==='manual' task, including a
+// resolution value that doesn't match decompose OR the plain diff carve-out below it (a
+// stand-in for whatever adhoc resolution gets added next) -- because it's now stated
+// once, unconditionally, ahead of the per-resolution branch chain, not duplicated inside
+// each individual carve-out where a future addition could forget to repeat it.
+test('buildVerdictPrompt protects the PLAN section for source==="manual" even under a resolution no specific carve-out recognizes', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'manual',
+    adhocResolution: 'some-future-resolution-type-not-yet-invented',
+    planResponse: 'some rough, possibly broken blind sketch',
+    implementResponse: 'whatever this future resolution type actually produces',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /PLAN section above was drafted BLIND/);
+  assert.match(prompt, /NEVER reject over a problem in the PLAN itself/);
 });
 
 test('a short staleness_audit report is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead', async () => {

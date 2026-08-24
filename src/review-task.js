@@ -161,6 +161,21 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('');
   lines.push('Judge whether this draft is correct, narrowly scoped, and safe to apply as-is. Reject if it is fabricated, over-broad, or the fact-check flags a real problem.');
   lines.push('Also REJECT if the draft consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") standing in for the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine." IMPORTANT EXCEPTION: this rule is about hedging PROSE, not about a genuinely EMPTY response (zero characters, or effectively so) -- several task types below are explicitly instructed to output nothing when there is nothing real to report, and that is NOT the same failure as writing evasive text instead of answering. If the draft is truly empty, judge it ONLY by the source-specific rule below (if any); do not reject an empty draft under this rule merely for containing no implementation.');
+  // 2026-08-24: stated ONCE, unconditionally, for every adhoc (source==='manual') task
+  // regardless of which resolution branch fires below -- NOT duplicated inside each
+  // individual carve-out the way it used to be. Caught live: the decompose carve-out
+  // originally had its own copy of this exact instruction, added only after a real
+  // decomposition got wrongly rejected over a broken snippet in the (unrelated, blind)
+  // PLAN section; the plain manual/diff carve-out already had its own independent copy.
+  // Two copies of the same guarantee, easy to keep in sync by accident today -- but the
+  // NEXT new adhoc resolution type (or any future source-specific carve-out that forgets
+  // to repeat it) would silently reintroduce the identical bug, since nothing actually
+  // GUARANTEES this protection exists beyond each carve-out author remembering to restate
+  // it. Hoisted here so it structurally can't be missed again, and removed from both
+  // carve-outs below (each keeps only its own resolution-specific judging criteria).
+  if (task.source === 'manual') {
+    lines.push('The PLAN section above was drafted BLIND, by an earlier and separate pass, before any real investigation happened -- true for EVERY adhoc task here, regardless of how it ultimately resolved (implemented, decomposed, or otherwise). It is exploratory scratch work, not the deliverable, and may itself be rough, incomplete, wrong, or even contain broken/truncated example code. NEVER reject over a problem in the PLAN itself (a syntax error in an illustrative snippet there, a design the real work ends up doing differently, a file or approach it guessed at that turned out wrong) -- judge ONLY the actual IMPLEMENT draft below, produced after real investigation.');
+  }
   if (task.source === 'arch_discovery') {
     lines.push('This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).');
   } else if (task.source === 'project_search') {
@@ -179,21 +194,12 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     // completeness question and the manual-source carve-out just below it (which assumes
     // every adhoc draft either has a diff or is wrong) would reject every correct
     // decomposition on sight for containing no code -- the exact false-reject failure mode
-    // that motivated writing this carve-out in the first place.
-    //
-    // Regression, 2026-08-24 (caught live on a real hardware-tracking-tab decompose): a
-    // genuinely clean, well-scoped 4-piece decomposition got rejected because the
-    // SEPARATE, earlier PLAN section (shown above, unconditionally, by this prompt's own
-    // fixed structure) contained a truncated/malformed illustrative Python snippet -- the
-    // PLAN is drafted BLIND by a different, earlier pass before any real investigation
-    // happens (same as the sibling manual-source carve-out just below already tells the
-    // reviewer for the diff case), so a rough or even broken PLAN sketch says nothing
-    // about whether the actual DECOMPOSITION that came after it is sound. Without saying
-    // this explicitly here too, the reviewer has no way to know the PLAN isn't the
-    // deliverable being judged.
-    lines.push('This is an adhoc task the drafter chose to DECOMPOSE rather than implement directly: it judged the task too large/broad to implement confidently in one pass and produced a JSON array of smaller sub-tasks instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. The PLAN section above was drafted BLIND, by an earlier and separate pass, before any real investigation happened -- it is exploratory scratch work, not the deliverable, and may itself be rough, incomplete, or even contain broken/truncated example code. Do NOT reject over anything wrong with the PLAN itself (a syntax error in an illustrative code snippet there, a design the actual decomposition ends up doing differently, etc.) -- judge ONLY the actual DECOMPOSITION in the IMPLEMENT draft below. Is it sound: do the sub-tasks, together, actually cover everything the original TASK asked for (no silently dropped requirement)? Is each sub-task concrete and independently implementable on its own (not still vague, not itself obviously too large)? Is the JSON well-formed with a real title and a self-contained rawText for each entry? Reject if a requirement was dropped, a sub-task is too vague/large to actually help, or the JSON itself is malformed -- never because of something in the PLAN, and never merely because no code was written.');
+    // that motivated writing this carve-out in the first place. The "PLAN was drafted
+    // blind, don't judge it" instruction lives in the unconditional source==='manual'
+    // block above now, not repeated here -- see its own comment for why.
+    lines.push('This is an adhoc task the drafter chose to DECOMPOSE rather than implement directly: it judged the task too large/broad to implement confidently in one pass and produced a JSON array of smaller sub-tasks instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual DECOMPOSITION in the IMPLEMENT draft below. Is it sound: do the sub-tasks, together, actually cover everything the original TASK asked for (no silently dropped requirement)? Is each sub-task concrete and independently implementable on its own (not still vague, not itself obviously too large)? Is the JSON well-formed with a real title and a self-contained rawText for each entry? Reject if a requirement was dropped, a sub-task is too vague/large to actually help, or the JSON itself is malformed -- never because of something in the PLAN, and never merely because no code was written.');
   } else if (task.source === 'manual') {
-    lines.push("This is an adhoc task: the PLAN above was drafted BLIND, with no real repo access -- a guess at what the fix might involve, written before anyone actually looked at the code. The IMPLEMENT draft, in contrast, comes from a real agentic pass that ran Read/Grep/Glob/Bash against the actual repo and produced the real `git diff` shown (see the DIFF section of the implement draft). Grounded investigation is frequently more accurate than the blind plan that preceded it -- do NOT reject the implement draft merely because it touches different files, a different number of files, or a narrower/broader scope than the plan named; that is the expected, normal outcome of the plan being wrong about something the real investigation then corrected, not a sign of an over-broad or off-task draft. Judge the diff against the TASK's actual request and the real repo state (fact-check/grounding above), not against the plan's stated scope. Reject only if the diff itself is wrong given the real repo state, contradicts the task's actual ask, or the draft's own RESOLUTION/summary text is inconsistent with what the diff actually does.");
+    lines.push("This is an adhoc task: the IMPLEMENT draft comes from a real agentic pass that ran Read/Grep/Glob/Bash against the actual repo and produced the real `git diff` shown (see the DIFF section of the implement draft). Grounded investigation is frequently more accurate than the blind plan that preceded it -- do NOT reject the implement draft merely because it touches different files, a different number of files, or a narrower/broader scope than the plan named; that is the expected, normal outcome of the plan being wrong about something the real investigation then corrected, not a sign of an over-broad or off-task draft. Judge the diff against the TASK's actual request and the real repo state (fact-check/grounding above), not against the plan's stated scope. Reject only if the diff itself is wrong given the real repo state, contradicts the task's actual ask, or the draft's own RESOLUTION/summary text is inconsistent with what the diff actually does.");
   } else if (task.source === 'staleness_audit') {
     // Fix, 2026-08-22 (Grimmethy: caught this live -- a real staleness_audit report got
     // rejected as "meta-commentary and hedging... rather than providing the requested
