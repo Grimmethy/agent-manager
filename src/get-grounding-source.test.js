@@ -117,3 +117,52 @@ test('CLI end-to-end: an adhoc task referencing a real repo-tracked file gets it
   assert.match(stdout, /--- src\/model-stats-client\.js ---/);
   assert.match(stdout, /candidates = null/);
 });
+
+// Regression, 2026-08-24: caught investigating a real blocked task whose draft correctly
+// cited `python/dashboard/templates/index.html:882-895` as proof a feature already
+// existed -- .html was never in the allowed extension list, so the ONE file that actually
+// contained the cited code never got fetched, and review kept rejecting a true
+// "no-changes-needed" verdict as unconfirmed even after this whole mechanism had shipped.
+test('extractLiveRepoGrounding matches .html and .json files too, not just js/py/sh/md', () => {
+  const repoRoot = makeRepoWithFile('python/dashboard/templates/index.html', '<html>real content</html>\n');
+  const found = extractLiveRepoGrounding('see python/dashboard/templates/index.html for the UI', repoRoot);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].path, 'python/dashboard/templates/index.html');
+  assert.match(found[0].content, /real content/);
+});
+
+// Same incident, second half of the bug: the OTHER cited file (app.py) DID match the old
+// extension list, but flat-truncating from the start of a large file never reached the
+// actually-cited line, so the "grounding" was functionally empty for it too.
+test('extractLiveRepoGrounding centers the fetched window on a cited line number instead of truncating from the start', () => {
+  const lines = [];
+  for (let i = 1; i <= 500; i++) lines.push(`line ${i}`);
+  lines[398] = 'line 399: the actually relevant route lives here, THE_MARKER';
+  const repoRoot = makeRepoWithFile('python/dashboard/app.py', lines.join('\n'));
+
+  const found = extractLiveRepoGrounding('see python/dashboard/app.py:399-405 for the route', repoRoot);
+
+  assert.equal(found.length, 1);
+  assert.match(found[0].content, /THE_MARKER/, 'the cited line must actually be present, not truncated away');
+  assert.match(found[0].content, /showing lines/);
+});
+
+test('extractLiveRepoGrounding falls back to flat truncation from the start when no line number is cited', () => {
+  const repoRoot = makeRepoWithFile('python/dashboard/app.py', 'x'.repeat(5000));
+  const found = extractLiveRepoGrounding('mentions python/dashboard/app.py with no line ref', repoRoot);
+  assert.equal(found.length, 1);
+  assert.doesNotMatch(found[0].content, /showing lines/);
+  assert.match(found[0].content, /\.\.\.\[truncated\]$/);
+});
+
+test('extractLiveRepoGrounding keeps the first real line reference when the same file is cited more than once', () => {
+  const lines = [];
+  for (let i = 1; i <= 500; i++) lines.push(`line ${i}`);
+  lines[198] = 'line 199: MARKER_A';
+  const repoRoot = makeRepoWithFile('python/dashboard/app.py', lines.join('\n'));
+
+  const found = extractLiveRepoGrounding('see python/dashboard/app.py:199 and also python/dashboard/app.py generally', repoRoot);
+
+  assert.equal(found.length, 1);
+  assert.match(found[0].content, /MARKER_A/);
+});

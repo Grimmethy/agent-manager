@@ -43,14 +43,52 @@ ensureRegistered();
 // mention many paths can't blow up the review prompt's size.
 const LIVE_FETCH_MAX_FILES = 5;
 const LIVE_FETCH_MAX_CHARS_PER_FILE = 4000;
-const REPO_FILE_PATH_RE = /\b(?:src|python|scripts|docs)\/[\w./-]+\.(?:js|py|sh|md)\b/g;
+// 2026-08-24 regression, caught investigating a real blocked task: the draft correctly
+// cited `python/dashboard/templates/index.html:882-895` as proof a feature already
+// existed -- .html was never in this extension list, so the ONE file that actually
+// contained the cited code never got fetched at all, and review kept rejecting a true
+// "no-changes-needed" verdict as unconfirmed even after this whole live-grounding
+// mechanism shipped. Added html/json -- the other real file types this codebase's own
+// citable sources (dashboard templates, config) actually use.
+const REPO_FILE_PATH_RE = /\b((?:src|python|scripts|docs)\/[\w./-]+\.(?:js|py|sh|md|html|json))(?::(\d+)(?:-(\d+))?)?/g;
+// Same incident, second half of the bug: the OTHER file the draft cited (app.py) DID
+// match, but flat-truncating from the start of a 4600-line/231KB file never reached line
+// 399 where the actually-relevant route lived -- the "grounding" was still functionally
+// empty. When a citation carries a line number (`file.py:399-427`, the exact shape this
+// pipeline's own draft prompts ask for), center the fetched window on it instead.
+const LIVE_FETCH_CONTEXT_LINES = 60;
+
+function extractContentWindow(content, startLine, endLine) {
+  if (content.length <= LIVE_FETCH_MAX_CHARS_PER_FILE) return content;
+  if (!startLine) return `${content.slice(0, LIVE_FETCH_MAX_CHARS_PER_FILE)}\n...[truncated]`;
+
+  const lines = content.split('\n');
+  const from = Math.max(0, startLine - 1 - LIVE_FETCH_CONTEXT_LINES);
+  const to = Math.min(lines.length, (endLine || startLine) + LIVE_FETCH_CONTEXT_LINES);
+  const windowed = lines.slice(from, to).join('\n');
+  const header = `...[showing lines ${from + 1}-${to}, around the cited line(s)]...\n`;
+  return windowed.length <= LIVE_FETCH_MAX_CHARS_PER_FILE
+    ? `${header}${windowed}`
+    : `${header}${windowed.slice(0, LIVE_FETCH_MAX_CHARS_PER_FILE)}\n...[truncated]`;
+}
 
 function extractLiveRepoGrounding(text, repoRoot) {
   if (!text || !repoRoot) return [];
   const resolvedRoot = path.resolve(repoRoot);
-  const candidates = new Set(text.match(REPO_FILE_PATH_RE) || []);
+  // Keyed by path so a file cited more than once keeps the FIRST real line reference seen
+  // for it, rather than the regex's own Set-of-strings dedup (pre-this-fix) silently
+  // discarding whichever line number happened to not be on the first mention.
+  const byPath = new Map();
+  for (const m of text.matchAll(REPO_FILE_PATH_RE)) {
+    const [, candidate, startLine, endLine] = m;
+    const existing = byPath.get(candidate);
+    if (!existing || (!existing.startLine && startLine)) {
+      byPath.set(candidate, { startLine: startLine ? Number(startLine) : null, endLine: endLine ? Number(endLine) : null });
+    }
+  }
+
   const found = [];
-  for (const candidate of candidates) {
+  for (const [candidate, lineRef] of byPath) {
     if (found.length >= LIVE_FETCH_MAX_FILES) break;
     const full = path.join(resolvedRoot, candidate);
     // Path-traversal guard -- a candidate matched by the regex could still contain '..'
@@ -63,12 +101,7 @@ function extractLiveRepoGrounding(text, repoRoot) {
     } catch (e) {
       continue; // matched a path SHAPE but isn't a real file -- not evidence either way, skip.
     }
-    found.push({
-      path: candidate,
-      content: content.length > LIVE_FETCH_MAX_CHARS_PER_FILE
-        ? `${content.slice(0, LIVE_FETCH_MAX_CHARS_PER_FILE)}\n...[truncated]`
-        : content,
-    });
+    found.push({ path: candidate, content: extractContentWindow(content, lineRef.startLine, lineRef.endLine) });
   }
   return found;
 }
