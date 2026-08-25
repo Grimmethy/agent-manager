@@ -222,13 +222,18 @@ process_drafting_file() {
   # task's long real Claude implement call no longer holds this lock at all, since only
   # its plan pass ever touches local Ornith).
   #
-  # This does mean the "queued" (waiting on the lock) vs "working" (actively computing)
-  # heartbeat distinction added 2026-08-19 is coarser now for this call specifically --
-  # bash itself no longer blocks on anything before starting the node process, so real
-  # lock-wait time now happens INSIDE the "working" state instead of a separate "queued"
-  # one. Accepted tradeoff: the actual wait is now much shorter and more targeted (only
-  # around the one real local sub-call that needs it, not the whole draft), so precisely
-  # distinguishing it matters less than it did when the whole call used to sit behind it.
+  # This "working"/"draft" write is immediately superseded once local-draft.js actually
+  # starts a real local-model call: src/heartbeat.js + local-draft.js's own maybeLocked()
+  # (2026-08-25, restoring the 2026-08-19 "queued" vs "working" distinction this comment
+  # used to say was lost here) write "queued" right before blocking on the per-sub-call
+  # lock and "working" (with a specific currentPass -- plan/implement/critique/revise/
+  # harness-search/local-agentic) the instant it's actually acquired, from INSIDE the
+  # node process, since that's the only place left that can see the real wait now that
+  # locking is scoped per-sub-call instead of around the whole draft. This bash-level
+  # write still matters as the FIRST heartbeat for this task (covers the window before
+  # local-draft.js's own require()s even finish loading) and as the fallback for any
+  # domain/branch that never calls maybeLocked at all (e.g. a fully-deterministic
+  # short-circuit).
   write_heartbeat_file "$INSTANCE_ID" "working" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"

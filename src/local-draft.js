@@ -54,6 +54,7 @@ const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { isClaudePaused } = require('./claude-pause.js');
+const { writeHeartbeatFile } = require('./heartbeat.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -207,7 +208,26 @@ async function draftTask(task, {
   // IS the resolved local model name whenever resolvedCallIsLocal is true (labelFor()
   // returns the bare model string for local, "claude:<model>" otherwise), so it's reused
   // directly as the lock key -- no separate resolution needed.
-  const maybeLocked = (isLocal, fn) => (isLocal ? withLockFn(instancesDir, fn, resolvedLabel) : fn());
+  // Restores the 2026-08-19 "queued" (waiting on the lock) vs "working" (actually
+  // computing) heartbeat distinction that the 2026-08-22 plan/implement lock split
+  // (see the header comment on local-worker.sh's own draft_display_model block) made
+  // bash unable to report any more -- the real wait now happens right here, inside this
+  // node process, so this is the one place that can still see it. `pass` labels which
+  // sub-call is queued/working (plan/implement/critique/revise/...), same convention
+  // local-worker.sh's own write_heartbeat_file calls already use for currentPass.
+  // AGENT_MANAGER_INSTANCE_ID is exported by local-worker.sh specifically so a node
+  // child can identify itself this way (see review-runner.sh's own identical export and
+  // comment) -- best-effort no-op when absent (e.g. a direct CLI/test invocation with no
+  // real daemon wrapper) rather than a hard requirement.
+  const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID;
+  const maybeLocked = (isLocal, fn, pass) => {
+    if (!isLocal) return fn();
+    if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', resolvedLabel, task.id, pass);
+    return withLockFn(instancesDir, () => {
+      if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'working', resolvedLabel, task.id, pass);
+      return fn();
+    }, resolvedLabel);
+  };
 
   try {
     appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
@@ -291,7 +311,7 @@ async function draftTask(task, {
       // task.domain === 'research' -- every other source's plan pass is unaffected, kept as
       // a plain no-tool completion exactly as before.
       const researchPlanTools = task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
-      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, ...researchPlanTools }));
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, ...researchPlanTools }), 'plan');
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
@@ -511,14 +531,14 @@ async function draftTask(task, {
         // adhoc is registered high-tier so that would always read false here), so both
         // are unconditionally lock-wrapped, same reasoning the abLocalCall branch above
         // already documents for the same "always local regardless of resolvedCallIsLocal" case.
-        const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task));
+        const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
         if (!harnessResult.applied && harnessResult.succeeded === false) {
           return { succeeded: false, reason: harnessResult.reason };
         }
 
         let localTierApplied = harnessResult.applied;
         if (!localTierApplied) {
-          const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task));
+          const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
           if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
             return { succeeded: false, reason: localAgenticResult.reason };
           }
@@ -758,9 +778,9 @@ async function draftTask(task, {
           numCtx: implNumCtx,
           allowEmpty: allowEmptyImplement,
           model: abModel,
-        }));
+        }), 'implement');
       } else {
-        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+        implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement');
       }
 
       // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -815,7 +835,7 @@ async function draftTask(task, {
         const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
         if (unverified) {
           const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
-          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }));
+          const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement-retry');
           if (!retryResult.degenerate) {
             task.implementResponse = retryResult.response;
           }
@@ -855,7 +875,7 @@ async function draftTask(task, {
       appendHistoryEvent(task, 'critique-done', task.critiqueOutcome);
     } else {
       const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-      const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }));
+      const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }), 'critique');
 
       if (critiqueResult.degenerate) {
         task.critiqueOutcome = 'critique-degenerate';
@@ -870,7 +890,7 @@ async function draftTask(task, {
         // reviewer might want to verify it really addressed those specific points.
         task.critiqueText = critiqueResult.response;
         const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-        const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
+        const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }), 'revise');
         if (!reviseResult.degenerate) {
           task.implementResponse = reviseResult.response;
           task.revisionApplied = true;
