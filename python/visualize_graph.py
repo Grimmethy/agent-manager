@@ -175,6 +175,10 @@ COMMUNITY_DRAG_TOGGLE_HTML = _read_asset("community-drag-toggle.html")
 CROSSING_CHECK_BADGE_HTML = _read_asset("crossing-check-badge.html")
 AUTOSORT_TOGGLE_HTML = _read_asset("autosort-toggle.html")
 LEGEND_PANEL_HTML = _read_asset("legend-panel.html")
+PANEL_TOGGLES_HTML = _read_asset("panel-toggles.html")
+SEARCH_BOX_HTML = _read_asset("search-box.html")
+NODE_DETAIL_PANEL_HTML = _read_asset("node-detail-panel.html")
+COMMUNITY_STATS_PANEL_HTML = _read_asset("community-stats-panel.html")
 
 
 def _build_legend_html(nodes: list[dict], names_by_id: dict) -> str:
@@ -193,6 +197,39 @@ def _build_legend_html(nodes: list[dict], names_by_id: dict) -> str:
             f'<span style="flex:0 0 10px;width:10px;height:10px;border-radius:50%;background:{color};"></span>'
             f'<span style="overflow-wrap:break-word;" title="{name} ({len(members)} files)">{name} ({len(members)})</span>'
             f'</div>'
+        )
+    return "".join(rows)
+
+
+def _build_community_stats_html(nodes: list[dict], links: list[dict], names_by_id: dict, communities_by_id: dict) -> str:
+    """One row per community -- file count, average in/out-degree (computed from this
+    render's own directed source-imports-target links, the same semantics the node-detail
+    sidebar uses) and review staleness (that community's own coverage lastReviewedAt, None
+    until arch_discovery has ever reviewed it). Sorted by count descending, same reasoning
+    as the legend -- the biggest communities are worth glancing at first."""
+    out_degree: dict[str, int] = {}
+    in_degree: dict[str, int] = {}
+    for link in links:
+        out_degree[link["source"]] = out_degree.get(link["source"], 0) + 1
+        in_degree[link["target"]] = in_degree.get(link["target"], 0) + 1
+
+    by_community = _group_by_community(nodes)
+    rows = []
+    for community_id, members in sorted(by_community.items(), key=lambda kv: len(kv[1]), reverse=True):
+        name = names_by_id.get(community_id, community_id)
+        count = len(members)
+        avg_in = sum(in_degree.get(n["id"], 0) for n in members) / count if count else 0
+        avg_out = sum(out_degree.get(n["id"], 0) for n in members) / count if count else 0
+        last_reviewed = communities_by_id.get(community_id, {}).get("lastReviewedAt")
+        reviewed_label = last_reviewed if last_reviewed else "Never"
+        rows.append(
+            f'<tr style="border-bottom:1px solid #262626;">'
+            f'<td style="padding:3px 4px;overflow-wrap:break-word;" title="{name}">{name}</td>'
+            f'<td style="padding:3px 4px;text-align:right;">{count}</td>'
+            f'<td style="padding:3px 4px;text-align:right;">{avg_in:.1f}</td>'
+            f'<td style="padding:3px 4px;text-align:right;">{avg_out:.1f}</td>'
+            f'<td style="padding:3px 4px;" title="{reviewed_label}">{reviewed_label}</td>'
+            f'</tr>'
         )
     return "".join(rows)
 
@@ -218,8 +255,10 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     persisted, instead of only ever falling back to the community-ring seed layout
     forever once any one position exists in the cache."""
     names_by_id = {}
+    communities_by_id = {}
     if coverage_data:
-        names_by_id = {c["id"]: c["name"] for c in coverage_data.get("communities", [])}
+        communities_by_id = {c["id"]: c for c in coverage_data.get("communities", [])}
+        names_by_id = {cid: c["name"] for cid, c in communities_by_id.items()}
 
     # height="100%" (not a fixed px value) -- the iframe embedding this page already sizes
     # itself to fill whatever room is available in the dashboard window, and vis-network's
@@ -332,7 +371,28 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
     # network, unlike every other injected overlay here (position:fixed, so flow order
     # doesn't matter for those).
     legend_html = LEGEND_PANEL_HTML.replace("__LEGEND_ROWS__", _build_legend_html(graph_data["nodes"], names_by_id))
-    html = html.replace("</body>", legend_html + "</body>", 1)
+    community_stats_html = COMMUNITY_STATS_PANEL_HTML.replace(
+        "__COMMUNITY_STATS_ROWS__",
+        _build_community_stats_html(graph_data["nodes"], graph_data["links"], names_by_id, communities_by_id),
+    )
+    html = html.replace("</body>", legend_html + community_stats_html + NODE_DETAIL_PANEL_HTML + "</body>", 1)
+
+    # Brain-dump entry, 2026-08-24 (HUMAN DESIGN DECISION): search box, node-detail
+    # sidebar, and community-stats panel above are each independently toggleable so all
+    # three existing at once doesn't permanently re-cramp the space the legend-width fix
+    # (see fill-ancestor-height.css) already clawed back. panel-toggles.js persists which
+    # ones are visible via localStorage, same convention as autosort's own toggle in
+    # crossing-check.js.
+    html = html.replace("</body>", PANEL_TOGGLES_HTML + SEARCH_BOX_HTML + "</body>", 1)
+
+    community_info_json = json.dumps({cid: {"name": c.get("name"), "lastReviewedAt": c.get("lastReviewedAt")} for cid, c in communities_by_id.items()})
+    node_detail_script = _read_asset("node-detail.js").replace("__COMMUNITY_INFO_JSON__", community_info_json)
+    html = html.replace("</body>", f"<script>{node_detail_script}</script>" + "</body>", 1)
+
+    search_script = _read_asset("search-filter.js").replace("__NAMES_BY_ID_JSON__", json.dumps(names_by_id))
+    html = html.replace("</body>", f"<script>{search_script}</script>" + "</body>", 1)
+
+    html = html.replace("</body>", f"<script>{_read_asset('panel-toggles.js')}</script>" + "</body>", 1)
 
     encoded_grep_dirs = quote(",".join(grep_dirs or []), safe="")
 
