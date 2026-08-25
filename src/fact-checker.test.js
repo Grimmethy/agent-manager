@@ -378,3 +378,28 @@ test('checkGroundedValues still flags a real comparison (NAME == value) rather t
   const flags = checkGroundedValues(draftText, sourceText);
   assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
+
+// checkGroundedValues: named-external-service URL exemption -----------------------------
+// 2026-08-25, root-caused live via a real blocked adhoc task: a human design-decision note
+// in the task's own promptContext.rawText named a real third-party webhook service by name
+// ("Default to ntfy") without ever spelling out its literal URL. The draft correctly cited
+// https://ntfy.sh and https://ntfy.sh/docs/publish/ as documentation for that choice, and
+// both got flagged ungrounded-url -- a literal URL for a service that lives entirely
+// outside this repo can never appear in local grounding material, no matter how legitimate
+// the citation is.
+
+test('checkGroundedValues does not flag a URL whose domain was named by the human in the source material', () => {
+  const draftText = 'POST the alert payload to https://ntfy.sh/docs/publish/ as documented.';
+  const sourceText = 'HUMAN DESIGN DECISION: Default to ntfy (self-hostable, no account/API-key required).';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues still flags a fabricated URL whose domain was never named anywhere in the source material', () => {
+  const draftText = 'POST the alert payload to https://totally-invented-service.example-real-tld.com/api.';
+  const sourceText = 'HUMAN DESIGN DECISION: Default to ntfy (self-hostable, no account/API-key required).';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
+});

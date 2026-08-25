@@ -302,6 +302,38 @@ function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
 }
 
+// 2026-08-25, root-caused live via a real blocked adhoc task: a human design-decision note
+// in the task's own promptContext.rawText named a real third-party webhook service by name
+// ("Default to ntfy") without ever spelling out its literal URL -- the draft correctly cited
+// https://ntfy.sh and https://ntfy.sh/docs/publish/ as justification/documentation for that
+// choice, and both got flagged ungrounded-url, because the literal URL string can never
+// appear in local grounding material for a service that lives entirely outside this repo.
+// Same category of false positive as the newly-declared-field exemption above: a value the
+// human's OWN material authorized by name is not the same thing as a value the draft invented
+// out of nothing, even though a literal substring match can't tell those apart. Narrowly
+// scoped: only exempts a URL whose domain's own name was independently named somewhere in the
+// source material the drafter was given (a fabricated domain the human never mentioned still
+// gets flagged, same as before). Root length>=3 guard avoids a short/common label (e.g. a "co"
+// or "io" TLD-adjacent segment) incidentally matching unrelated prose.
+function extractDomainRoot(url) {
+  let hostname;
+  try {
+    ({ hostname } = new URL(url));
+  } catch (e) {
+    return null;
+  }
+  const labels = hostname.split('.').filter(Boolean);
+  if (labels.length < 2) return labels[0] || null;
+  return labels[labels.length - 2];
+}
+
+function isNamedServiceUrl(url, sourceText) {
+  const root = extractDomainRoot(url);
+  if (!root || root.length < 3) return false;
+  const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(sourceText);
+}
+
 function checkGroundedValues(draftText, sourceText) {
   if (!sourceText) return [];
   const flags = [];
@@ -311,9 +343,9 @@ function checkGroundedValues(draftText, sourceText) {
   for (const raw of urls) {
     const url = raw.replace(/[.,;:]+$/, ''); // strip trailing sentence punctuation
     if (PLACEHOLDER_RE.test(url)) continue;
-    if (!sourceText.includes(url)) {
-      flags.push({ type: 'ungrounded-url', detail: url });
-    }
+    if (sourceText.includes(url)) continue;
+    if (isNamedServiceUrl(url, sourceText)) continue;
+    flags.push({ type: 'ungrounded-url', detail: url });
   }
 
   const fields = [...new Set(draftText.match(GIS_FIELD_RE) || [])];
