@@ -59,9 +59,29 @@ refresh_active_model() {
   if "$IS_CLAUDE_LANE"; then
     case "$override" in
       ollama:*)
-        LOCAL_MODEL="${override#ollama:}"
-        export LOCAL_MODEL AGENT_MANAGER_FORCE_PROVIDER=local
-        HEARTBEAT_MODEL="$LOCAL_MODEL"
+        # Budget-aware, 2026-08-25 (Grimmethy: "The override exists because when we don't
+        # have claude tokens available at the time, the worker and reasoning need to
+        # share a lane rather than working in parallel" -- confirmed live this was NOT
+        # what the code actually did: this override was a static on/off toggle with no
+        # regard for whether Claude tokens were actually unavailable at the moment, so it
+        # unconditionally routed every plan call to local Ollama, fighting worker-1 for
+        # the same single GPU-resident model slot even while Claude budget was perfectly
+        # healthy -- confirmed via repeated real "Ollama request timed out" failures on a
+        # research_task plan call while the dashboard's own Workers tab showed the
+        # (override-exempt) IMPLEMENT call routing to Claude just fine). Reuses
+        # check_budget_healthy() (already used identically, same per-tick cost, for the
+        # Claude-lane budget gate a few lines below) rather than inventing a second
+        # mechanism -- only actually shares the local lane when Claude tokens are
+        # genuinely constrained right now, matching the override's own stated intent.
+        if check_budget_healthy >/dev/null 2>&1; then
+          unset AGENT_MANAGER_FORCE_PROVIDER
+          export CLAUDE_MODEL
+          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+        else
+          LOCAL_MODEL="${override#ollama:}"
+          export LOCAL_MODEL AGENT_MANAGER_FORCE_PROVIDER=local
+          HEARTBEAT_MODEL="$LOCAL_MODEL"
+        fi
         ;;
       claude:*)
         CLAUDE_MODEL="${override#claude:}"
