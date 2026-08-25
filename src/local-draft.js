@@ -53,6 +53,7 @@ const { resolveSourceName, getRegisteredSource } = require('./task-source-regist
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { isClaudePaused } = require('./claude-pause.js');
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
@@ -531,6 +532,21 @@ async function draftTask(task, {
           return { succeeded: true, blocked: false };
         }
 
+        // Manual pause kill switch (2026-08-25, Grimmethy: "I need a way to pause the
+        // claude use... preserve the tokens since I know I'm very likely to hit my
+        // weekly limit" -- see claude-pause.js's own header). This real Claude call is
+        // the biggest single token spend in this whole pipeline (a full multi-turn
+        // agentic Read/Grep/Glob/Edit/Write/Bash session) and, unlike the plan pass,
+        // NEVER goes through resolvedLocalCall/providerFor() -- it's unconditional by
+        // design (see this branch's own header above), so it's the one call site the
+        // budget-aware override/IS_CLAUDE_LANE gate genuinely cannot protect on their
+        // own; checked here explicitly instead. Phrased to match local-worker.sh's own
+        // INFRA_FAILURE_PATTERN ("service unavailable") so a paused task gets the same
+        // bounded-requeue-then-hold treatment a real transient outage already gets,
+        // rather than inventing a third failure-handling path for one more reason string.
+        if (isClaudePaused(getConfig().pipelineDir)) {
+          return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
+        }
         const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
         if (!agenticResult.succeeded) {
           return { succeeded: false, reason: agenticResult.reason };
@@ -577,6 +593,12 @@ async function draftTask(task, {
       // "revision" of a research write-up the model already finished is redundant with
       // the normal review-task.js pass this still flows into afterward).
       if (task.domain === 'research') {
+        // Same manual pause kill switch as the adhoc branch above -- research's own
+        // implement call is ALSO an unconditional real Claude call with no local
+        // fallback path, so it needs the same explicit check.
+        if (isClaudePaused(getConfig().pipelineDir)) {
+          return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
+        }
         const researchResult = await draftResearchImplementFn(task, { recordModelCall });
         if (!researchResult.succeeded) {
           return { succeeded: false, reason: researchResult.reason };

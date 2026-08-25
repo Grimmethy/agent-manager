@@ -1361,6 +1361,7 @@ def api_worker_models():
         "overrides": overrides,
         "ollamaModels": ollama_models,
         "claudeModels": CLAUDE_MODEL_CHOICES,
+        "claudePaused": read_dashboard_settings().get("claudePaused", False) is True,
     })
 
 
@@ -1377,6 +1378,24 @@ def api_set_worker_model(instance_id):
         overrides.pop(instance_id, None)
     write_dashboard_settings({"workerModelOverrides": overrides})
     return jsonify({"instanceId": instance_id, "model": model or None})
+
+
+# Manual "pause Claude" kill switch (Grimmethy, 2026-08-25: "I need a way to pause the
+# claude use... preserve the tokens since I know I'm very likely to hit my weekly
+# limit"). Distinct from budget-monitor.js's own reactive rate-limit detection -- this is
+# a deliberate, proactive stop a human can flip from the Workers tab before actually
+# hitting the cap. Global (not per-instance): src/claude-pause.js's own header explains
+# why -- adhoc's real Claude spend happens on whichever lane's task escalates there, not
+# exclusively worker-reasoning, so a per-instance checkbox would leave a real spend path
+# unprotected. Read via src/claude-pause.js (Node call sites) and
+# agent-manager-common.sh's get_claude_paused (bash call sites) -- both read this exact
+# same dashboard-settings.json field, no separate plumbing.
+@app.route("/api/claude-pause", methods=["POST"])
+def api_set_claude_paused():
+    body = request.get_json(silent=True) or {}
+    paused = body.get("paused") is True
+    write_dashboard_settings({"claudePaused": paused})
+    return jsonify({"claudePaused": paused})
 
 
 # Model benchmark panel (Models tab, 2026-08-19, Grimmethy: "benchmarking needs to be a

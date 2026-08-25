@@ -198,6 +198,71 @@ test('an adhoc task where harness-search declines but local-agentic applies -- n
   });
 });
 
+// Manual "pause Claude" kill switch, 2026-08-25 (Grimmethy: "I need a way to pause the
+// claude use... preserve the tokens since I know I'm very likely to hit my weekly
+// limit") -- see claude-pause.js's own header. adhoc's real Claude implement call and
+// research's own implement call are both unconditional (no local fallback, bypass every
+// other budget gate by design), so they're the two call sites this pause has to check
+// directly rather than relying on the plan-call routing alone.
+test('an adhoc task declines the Claude fallback (never calls it) when Claude use is manually paused, after both local tiers decline', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+    const task = { id: 'adhoc-test-paused', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
+    const draftAdhocViaLocalAgenticFn = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
+    const draftAdhocImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
+
+    const result = await draftTask(task, {
+      localCall: fakeLocalCall('confident match: none -- no real match'),
+      withLockFn: async (dir2, fn) => fn(), draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+    });
+
+    assert.equal(result.succeeded, false);
+    assert.match(result.reason, /manually paused/);
+  });
+});
+
+test('a research task declines the Claude implement call (never calls it) when Claude use is manually paused', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+    const task = {
+      id: 'research-test-paused', domain: 'research', source: 'research_task', title: 'test',
+      promptContext: { rawText: 'investigate something', tags: [] },
+    };
+
+    const localCall = async () => ({ response: 'plan text (paused, no tool access needed for this test)', degenerate: null, attempts: 1 });
+    const draftResearchImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn });
+
+    assert.equal(result.succeeded, false);
+    assert.match(result.reason, /manually paused/);
+  });
+});
+
+test('an adhoc task falls through to Claude normally when Claude use is NOT paused', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-test-not-paused', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
+    const draftAdhocViaLocalAgenticFn = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
+    let claudeCalled = false;
+    const draftAdhocImplementFn = async (t) => {
+      claudeCalled = true;
+      t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+      return { succeeded: true, blocked: false };
+    };
+
+    await draftTask(task, {
+      localCall: fakeLocalCall('confident match: none -- no real match'),
+      withLockFn: async (dir2, fn) => fn(), draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+    });
+
+    assert.equal(claudeCalled, true, 'must still reach Claude normally when not paused');
+  });
+});
+
 test('a non-adhoc/research task locks around EVERY real call (plan, implement, critique) since all of them share the same resolved local backend', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();

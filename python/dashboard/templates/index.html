@@ -610,6 +610,25 @@ async function setWorkerModel(instanceId, model) {
   await renderWorkers();
 }
 
+// Manual "pause Claude" kill switch (Grimmethy, 2026-08-25: "I need a way to pause the
+// claude use... preserve the tokens since I know I'm very likely to hit my weekly
+// limit"). Global, not per-instance -- see src/claude-pause.js's own header for why
+// (adhoc's real Claude spend happens on whichever lane's task escalates there, not
+// exclusively worker-reasoning). Every Claude-lane gate this pipeline already has
+// (the plan-call budget-aware override, worker-reasoning's own whole-tick gate,
+// review-runner.sh's per-item gate, and adhoc/research's own unconditional implement
+// calls) checks this same dashboard-settings.json field -- flipping it here takes effect
+// on those daemons' very next tick, no restart needed, same as the per-instance model
+// override above.
+async function setClaudePaused(paused) {
+  await fetch('/api/claude-pause', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paused }),
+  });
+  await renderWorkers();
+}
+
 // Which worker card is expanded to show its last-10-completed-tasks list (2026-08-23,
 // "When I click on a worker to expand it's information I'd like to see a list of the
 // last 10 tasks it completed."). At most one at a time, like a details/summary accordion;
@@ -650,10 +669,16 @@ async function renderWorkers() {
   instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
   instancesForTimers = instances;
   const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:10px">
-      ${[['all', 'All'], ['local', 'Local (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
-        <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
-      `).join('')}
+    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+      <div>
+        ${[['all', 'All'], ['local', 'Local (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
+          <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
+        `).join('')}
+      </div>
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
     </div>
   `;
   const shown = instances.filter(inst => workersTypeFilter === 'all' || laneForInstance(inst) === workersTypeFilter);
@@ -707,6 +732,10 @@ async function renderWorkers() {
   main.querySelectorAll('[data-worker-filter]').forEach((btn) => {
     btn.onclick = () => { workersTypeFilter = btn.dataset.workerFilter; renderWorkers(); };
   });
+  const claudePauseToggle = main.querySelector('#claude-pause-toggle');
+  if (claudePauseToggle) {
+    claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);
+  }
   main.querySelectorAll('.worker-model-select').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
     sel.onchange = (e) => { e.stopPropagation(); setWorkerModel(sel.dataset.instanceId, sel.value); };
