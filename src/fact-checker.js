@@ -1,6 +1,6 @@
 'use strict';
 
-// Deterministic, non-LLM pre-filter that runs on an Ornith draft before a Claude review
+// Deterministic, non-LLM pre-filter that runs on a local-model draft before a Claude review
 // pass spends any tokens on it. Per Docs/agents/local-delegation.md's own hard-won
 // finding from the prior overnight run: "the file exists" is necessary but NOT
 // sufficient -- a design once cited a real file and a real function name that were
@@ -209,9 +209,9 @@ function checkRelationships(text, repoRoot, extraRoots = []) {
 }
 
 // Third tier, added 2026-07-08 from the agenticloops-ai eval-harness plan (case 6 of the
-// golden-dataset design): a documented Ornith failure mode is proposing the architecturally
+// golden-dataset design): a documented local-model failure mode is proposing the architecturally
 // heavier/riskier fix over a narrow one with no apparent sense of blast radius (see
-// Docs/agents/local-delegation.md, "What Ornith is bad at"). This is a cheap keyword-adjacency
+// Docs/agents/local-delegation.md, "What the local model is bad at"). This is a cheap keyword-adjacency
 // heuristic, not a real risk analysis -- same "necessary but not sufficient" caveat as the two
 // checks above. It flags drafts that use broad/heavy-change language without ANY nearby
 // scoping or risk-acknowledgment language, so Claude's review pass looks at blast radius first
@@ -250,17 +250,17 @@ function checkBlastRadiusBias(text) {
 // constrained decoding structurally CANNOT prevent -- confident fabrication of a plausible,
 // grammatically-valid value (a made-up GIS URL or field name). Docs/agents/local-delegation.md
 // records this as the worst, most-repeated failure ("fabricated a specific vendor attribution",
-// "invented classification codes/filenames"). The prompts explicitly instruct Ornith to use a
+// "invented classification codes/filenames"). The prompts explicitly instruct the local model to use a
 // placeholder + note rather than invent an unverified URL/field -- an instruction it is
 // documented to ignore. This check flags any URL or GIS-style field token in the draft that does
-// NOT appear verbatim in the source material Ornith was actually given, so a hallucinated value
+// NOT appear verbatim in the source material the local model was actually given, so a hallucinated value
 // surfaces for Claude's review pass instead of riding through as plausible-looking JSON.
 //
 // Scope is deliberately high-precision (flag-only, necessary-not-sufficient, same as the tiers
 // above): URLs (a fabricated one is almost never a false positive) and ALLCAPS_UNDERSCORE tokens
 // (the shape of real GIS column names like FCV_CUR / MAIL_ADDR1 -- canonical output field names
 // are lowerCamelCase and won't match). Obvious placeholders are exempt because the prompt WANTS
-// Ornith to use them when it can't verify. A value that appears anywhere in the source (even in a
+// the local model to use them when it can't verify. A value that appears anywhere in the source (even in a
 // sibling example) is treated as grounded -- this catches wholesale invention, not the subtler
 // case of copying a real value from the wrong sibling.
 const URL_RE = /https?:\/\/[^\s"'`)\]}<>]+/gi;
@@ -397,7 +397,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
 
 // Returns a flat list of flags Claude's review pass should look at first. An empty
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
-// draft is correct. `sourceText` (optional) is the material Ornith was actually given for
+// draft is correct. `sourceText` (optional) is the material the local model was actually given for
 // this task; when provided, the grounded-value check runs against it.
 function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
   const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);

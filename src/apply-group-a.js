@@ -213,11 +213,11 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
 // the external project + deep_dive item this was promoted from) -- optional here since
 // arch_discovery's own candidates never have one; harmless to look for either way, same
 // as Strength:/Files: already being optional-with-fallback below. Deliberately does NOT
-// trust the AC-NNN number Ornith picked -- applyArchDiscoveryCandidates re-derives it
+// trust the AC-NNN number the local model picked -- applyArchDiscoveryCandidates re-derives it
 // below instead (see that function's comment).
 //
 // Lenient on the AC-NNN/title separator specifically: replaying the two real
-// arch_discovery tasks that failed apply live (2026-07-21) showed Ornith reliably drops
+// arch_discovery tasks that failed apply live (2026-07-21) showed the local model reliably drops
 // the "·" the prompt asks for ("### AC-042 Extract Git..." with a plain space, not
 // "### AC-042 · Extract Git...") -- a strict match here would have silently produced ZERO
 // candidates from real-world output, not an error, which is worse (looks like a clean "no
@@ -225,9 +225,9 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
 // none) on READ, while still always WRITING the canonical "· " format below, keeps
 // nextArchReviewTask()'s own strict reader (task-sources.js) untouched and correct --
 // normalize inconsistency at this one boundary instead of loosening every downstream
-// consumer to match Ornith's inconsistency.
+// consumer to match the local model's inconsistency.
 // A response that's just a JSON-style empty-string LITERAL (`""` or `''`, two characters)
-// is Ornith representing "intentionally nothing" the same way `""` reads in code -- not
+// is the local model representing "intentionally nothing" the same way `""` reads in code -- not
 // gibberish, not a malformed candidate. Confirmed live 2026-07-21: 4 of 6 arch_import
 // "structural check failed" blocks were exactly this, the model correctly following the
 // implement prompt's "output the empty string and nothing else" instruction, just typing
@@ -283,7 +283,7 @@ function nextAvailableCandidateId(existingText) {
 // these two functions' expectations of the format must stay in sync.
 //
 // Re-derives each candidate's AC-NNN id from the doc's own current max, instead of
-// trusting the id Ornith wrote in its markdown. archDiscoveryImplementPrompt only asks it
+// trusting the id the local model wrote in its markdown. archDiscoveryImplementPrompt only asks it
 // to avoid colliding with IDs visible in its OWN plan-time context (one community's worth
 // of "candidates already proposed for other communities"), which is a real, observed
 // collision source, not hypothetical: two communities drafted around the same time, or a
@@ -372,7 +372,7 @@ function parseBrainDumpSortResult(implementResponse) {
   if (!text) return null;
   let parsed;
   try {
-    // Was a bare JSON.parse(text) -- threw on the extremely common case of Ornith wrapping
+    // Was a bare JSON.parse(text) -- threw on the extremely common case of the local model wrapping
     // its output in a ```json fence despite the prompt asking for none, silently swallowed
     // by the catch below, leaving the entry stuck as 'captured' forever with no automatic
     // retry. Confirmed live 2026-07-26 on a fully-approved (3/3 APPROVE) classification for
@@ -406,7 +406,7 @@ function parseBrainDumpSortResult(implementResponse) {
 }
 
 // Bare, undifferentiated filenames that give no hint what the note is actually about --
-// confirmed live 2026-08-16: Ornith filed a real note (a feature idea about brain-dump
+// confirmed live 2026-08-16: the local model filed a real note (a feature idea about brain-dump
 // job context) under plain "ideas.md", indistinguishable at a glance from any other idea
 // ever captured. Checked against the FINAL path segment's stem only (no extension) --
 // a folder named e.g. "Ideas/" is fine (that's a category), a FILE named "ideas.md" is

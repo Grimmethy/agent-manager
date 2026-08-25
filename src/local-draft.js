@@ -1,7 +1,7 @@
 'use strict';
 
 // Draft step: runs a claimed task through plan -> implement -> critique -> (revision)
-// against the local Ornith model, then files the result into queue/review/ (success) or
+// against the local model, then files the result into queue/review/ (success) or
 // queue/blocked/ (degenerate response at any pass). No file-moving is done here -- the
 // caller (local-worker.sh) owns claim/move, same division of labor as apply-task.js vs.
 // apply-task.sh.
@@ -17,7 +17,7 @@
 // implement (real GitHub/Hugging Face search results for the queries the plan pass
 // proposed, via project-search-fetch.js) -- missed on the first pass of this port.
 // Confirmed live 2026-08-14: without it, task.promptContext.searchResults stayed
-// `undefined` for every project_search draft, and Ornith -- explicitly told "write 0 to N
+// `undefined` for every project_search draft, and the local model -- explicitly told "write 0 to N
 // findings from the REAL results above -- do not invent a project that is not listed" --
 // responded by inventing well-known project names from its own training data instead
 // (one draft's own text: "actual web search tools are not available in this interface"),
@@ -324,10 +324,10 @@ async function draftTask(task, {
       task.planResponse = planResult.response;
       appendHistoryEvent(task, 'plan-done', `${planResult.attempts} attempt(s), ${task.planResponse.length} chars`);
 
-      // project_search's plan pass proposes search queries only (Ornith has no network
+      // project_search's plan pass proposes search queries only (the local model has no network
       // access); the HARNESS runs them here, between plan and implement, and hands real
       // results to the implement pass -- see ADR-0018 / docs/project-search-pipeline.md.
-      // Without this, task.promptContext.searchResults stays undefined and Ornith invents
+      // Without this, task.promptContext.searchResults stays undefined and the local model invents
       // projects from training data instead of reporting on real search results, despite
       // being explicitly told not to (confirmed live 2026-08-14, see this file's header).
       if (task.source === 'project_search') {
@@ -608,7 +608,7 @@ async function draftTask(task, {
       // research_task (Brain Dump #1 follow-up, 2026-08-17): same reasoning as the adhoc
       // branch above -- a real agentic Claude call (WebSearch/WebFetch this time, not
       // Read/Grep/Glob/Edit/Write/Bash against a code repo) already did its own
-      // investigation and produced the final write-up; Ornith's own plan/critique/
+      // investigation and produced the final write-up; the local model's own plan/critique/
       // revision loop would add nothing (there's no repo state to reason about, and
       // "revision" of a research write-up the model already finished is redundant with
       // the normal review-task.js pass this still flows into afterward).
@@ -643,7 +643,7 @@ async function draftTask(task, {
       // came back empty. Skipping the implement call entirely on a genuine zero-hit
       // search removes the temptation altogether -- deterministic, not a prompt tweak the
       // model can still ignore. arch_import is in EMPTY_APPROVAL_SOURCES (review-task.js),
-      // so this empty implementResponse auto-approves with zero further Ornith spend, the
+      // so this empty implementResponse auto-approves with zero further local-model spend, the
       // exact outcome a compliant model would have produced anyway.
       if (task.source === 'arch_import' && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
         task.implementResponse = '';
@@ -727,7 +727,7 @@ async function draftTask(task, {
       // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
       // output budget plus a fixed margin for the thinking trace.
       const implNumCtx = Math.min(32768, Math.max(8192, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
-      // Several sources' implement prompts explicitly tell Ornith to output the empty
+      // Several sources' implement prompts explicitly tell the local model to output the empty
       // string when nothing genuinely applies (see prompts.js) -- an empty response from
       // them is a valid, intended answer, not a failed call, so the degenerate-output
       // detector's 'empty' check must not fire for them (see local-client.js's call()
@@ -794,7 +794,7 @@ async function draftTask(task, {
         taskId: task.id,
         // Reflects whichever backend actually served this call -- was hardcoded
         // 'ornith' from before model-provider.js's per-task-source routing existed,
-        // which would have silently mislabeled every Claude-served call as Ornith in
+        // which would have silently mislabeled every Claude-served call as the local model in
         // model-stats.db (the Models tab's own data source) the moment that routing
         // was used for anything. abModel (when an A/B candidate was actually selected)
         // takes precedence over labelFor(task) the same way it took precedence over
@@ -809,7 +809,7 @@ async function draftTask(task, {
       // Stamped onto the task itself (not just recorded into model-stats.db, which
       // apply-task.js has no access path back to via just task.abCallId) so its commit
       // message can attribute Co-Authored-By to whichever backend actually drafted the
-      // change instead of always crediting Ornith -- see apply-task.js's own comment.
+      // change instead of always crediting the local model -- see apply-task.js's own comment.
       task.draftModel = abModel || labelFor(task.source);
 
       if (implResult.degenerate) {

@@ -1,6 +1,6 @@
 'use strict';
 
-// GPU headroom guard: before spending an Ornith call, check whether the GPU actually has
+// GPU headroom guard: before spending a local-model call, check whether the GPU actually has
 // room for it, and if not, proactively stop the known apps that could be sitting on VRAM
 // unused. Added 2026-08-16 after a live incident: ComfyUI (a completely separate project,
 // not run in hours -- confirmed by the user, not just idle-looking) was still holding

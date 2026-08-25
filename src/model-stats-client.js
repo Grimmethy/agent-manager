@@ -90,7 +90,7 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
     // tasks would cost using anthropic API?"): claude-client.js's call() has always
     // computed this (Claude Code CLI's own total_cost_usd, a client-side estimate
     // against real Anthropic API pricing, independent of subscription billing) -- it
-    // just never reached this far. Undefined/null for every Ornith result (that
+    // just never reached this far. Undefined/null for every local-model result (that
     // module's result shape has no costUsd field at all), which is exactly what should
     // happen: a null cost_usd row means "free local call," not "unknown cost."
     costUsd: result && result.costUsd != null ? result.costUsd : null,

@@ -87,7 +87,7 @@ try {
   // hostname/platform/gpu_name (2026-08-24, Grimmethy: "We need to start acquiring more
   // models within the system and A/B testing them against certain jobs... Logs should
   // include what hardware/software was used for each test") -- the A/B mechanism
-  // (ab-model-select.js, ORNITH_AB_MODELS) and outcome/latency tracking already existed;
+  // (ab-model-select.js, LOCAL_AB_MODELS) and outcome/latency tracking already existed;
   // this was the one real gap -- a call's row said WHICH model ran but nothing about WHERE
   // (which physical box/GPU) or on what OS, both of which matter for comparing candidates
   // fairly across a mixed-hardware fleet. Same ALTER-guarded-by-pragma migration shape as

@@ -2,7 +2,7 @@
 
 // Agentic drafting for adhoc-domain tasks (Brain Dump #67: "formalize the workflow
 // pattern [for processing Brain Dump entries]... entirely and predictably within the
-// agent manager app itself"). Ornith has no tool-calling path at all (confirmed while
+// agent manager app itself"). The local model has no tool-calling path at all (confirmed while
 // building the Discuss harness-search feature, 2026-08-17) -- only Claude Code CLI mode
 // can actually investigate a real repo, implement a real fix, and run real tests before
 // finishing, the way a human session (this one, all of today) has been doing by hand
@@ -176,7 +176,7 @@ function parseClarificationOptions(text) {
 // Same "claude:<model>" label format model-provider.js's labelFor()/local-worker.sh's
 // HEARTBEAT_MODEL use -- stamped onto task.draftModel below so apply-task.js's commit
 // message can attribute Co-Authored-By to whichever model actually drafted the change,
-// instead of always crediting Ornith (this path never calls Ornith at all).
+// instead of always crediting the local model (this path never calls the local model at all).
 const DRAFT_MODEL_LABEL = `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 
 function buildAgenticPrompt(task) {

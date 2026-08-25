@@ -1,7 +1,8 @@
 'use strict';
 
-// Thin wrapper over the local Ollama HTTP API for the `ornith` model, encoding the
-// mechanics and guardrails documented in Docs/agents/local-delegation.md so no caller
+// Thin wrapper over the local Ollama HTTP API for whichever model LOCAL_MODEL names,
+// encoding the mechanics and guardrails documented in Docs/agents/local-delegation.md so
+// no caller
 // has to rediscover them: explicit num_ctx/num_predict (the `ollama run` CLI silently
 // truncates), a degenerate-output detector for the failure modes that fail *silently*
 // (done_reason: stop, syntactically fine, semantically garbage), retry-on-degenerate
@@ -51,7 +52,7 @@ const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE
 function detectDegenerate(text, { allowEmpty = false } = {}) {
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
-  // Ornith sometimes writes the literal two-character JSON-style empty-string
+  // The local model sometimes writes the literal two-character JSON-style empty-string
   // representation ('""' or "''") instead of a genuinely empty response -- review-task.js's
   // own isEffectivelyEmpty() already treats these the same as a real empty string for its
   // review-stage check. Without the same handling here, this quirk skips the check above
@@ -197,19 +198,21 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
   });
 }
 
-// Calls Ornith once, retrying up to maxRetries times if the degenerate-output detector
-// fires — per the doc, degeneracy is usually a transient inference-state glitch that
-// self-heals on a later call with identical input, not a stable property of the prompt.
+// Calls the local model once, retrying up to maxRetries times if the degenerate-output
+// detector fires — per the doc, degeneracy is usually a transient inference-state glitch
+// that self-heals on a later call with identical input, not a stable property of the
+// prompt.
 //
 // opts.allowEmpty: several prompt templates (archDiscoveryImplementPrompt,
 // deepDiveImplementPrompt, archImportImplementPrompt, projectSearchImplementPrompt --
-// see prompts.js) explicitly instruct Ornith to "output the empty string and nothing
-// else" when there is genuinely nothing to report, rather than force a fabricated
-// candidate. Without this flag, detectDegenerate's 'empty' check can't tell that apart
-// from a real empty-output failure, so a correct "nothing applies here" response burned
-// 3 attempts (all correctly empty) before permanently blocking the task with
-// "Implement pass degenerate: empty" -- confirmed live 2026-08-16: 64 of 181 blocked
-// tasks, the single largest group in queue/blocked/, were exactly this -- Ornith
+// see prompts.js) explicitly instruct the local model to "output the empty string and
+// nothing else" when there is genuinely nothing to report, rather than force a
+// fabricated candidate. Without this flag, detectDegenerate's 'empty' check can't tell
+// that apart from a real empty-output failure, so a correct "nothing applies here"
+// response burned 3 attempts (all correctly empty) before permanently blocking the task
+// with "Implement pass degenerate: empty" -- confirmed live 2026-08-16: 64 of 181
+// blocked tasks, the single largest group in queue/blocked/, were exactly this -- the
+// local model
 // following its own instructions, not a model or resource problem.
 // 2026-08-23, Grimmethy: "Why are 17 tasks sitting in review instead of being processed
 // fully?" -- traced to review-runner's majorityVote() aborting its ENTIRE 3-vote call the

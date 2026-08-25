@@ -7,8 +7,8 @@
 // full spec this implements).
 //
 // local-draft.js's draftTask() currently hardcodes EVERY domain:'adhoc' task through a
-// real Claude Code CLI call (adhoc-agentic-draft.js), unconditionally -- because Ornith/
-// local Ollama has no tool-calling access via the old /api/generate-only path. But this
+// real Claude Code CLI call (adhoc-agentic-draft.js), unconditionally -- because the
+// local Ollama model has no tool-calling access via the old /api/generate-only path. But this
 // pipeline already has a real, PROVEN local-only alternative for exactly this class of
 // problem: pipeline_self_audit (see its own header) runs the SAME "propose search terms,
 // harness greps the real repo, ground a blind implement pass" pattern this module reuses.

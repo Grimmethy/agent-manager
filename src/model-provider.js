@@ -13,7 +13,7 @@
 //
 // AGENT_MANAGER_CLAUDE_SOURCES: comma-separated task.source values that should draft
 // (and, for review-task.js, vote) using Claude instead of the local model. Empty/unset
-// means every source stays on Ornith -- i.e. this integration is fully opt-in per
+// means every source stays on the local model -- i.e. this integration is fully opt-in per
 // source, never a silent default switch.
 
 const local = require('./local-client.js');
@@ -35,7 +35,7 @@ function normalizeTask(sourceOrTask) {
 }
 
 // Single source of truth for "should this task run on the high-reasoning (Claude) or
-// low-reasoning (Ornith) tier" -- used by providerFor()/labelFor() below AND by
+// low-reasoning (local model) tier" -- used by providerFor()/labelFor() below AND by
 // local-worker.sh's worker-lane claim filter (via a `node -e` call into this module), so
 // the two can never disagree about which lane a task belongs on. Checked in order:
 //   1. task.reasoningTier -- a per-instance override, e.g. the Brain Dump #77 automatic
@@ -91,7 +91,7 @@ function reasoningTierFor(task) {
 // but adhoc/research_task's agentic implement calls (local-draft.js's own
 // resolveSourceName()==='adhoc'/'research_task' branches) bypass providerFor() entirely
 // and are never affected either way; those need Claude Code CLI's real tool access
-// (Read/Edit/Bash/WebSearch), which Ornith cannot provide, so forcing them onto a local
+// (Read/Edit/Bash/WebSearch), which the local model cannot provide, so forcing them onto a local
 // model would silently produce garbage instead of a real implementation -- this override
 // only ever reaches the generic, non-agentic call/majorityVote path.
 function forcedProvider() {
