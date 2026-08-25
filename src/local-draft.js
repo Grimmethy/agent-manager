@@ -74,6 +74,14 @@ function isEmptyApprovalSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.emptyApproval);
 }
+// Same shape as isEmptyApprovalSource/isCandidateFulfillmentSource above -- reads the
+// advisoryProse flag straight off each source's own registerTaskSource() entry (same
+// flag review-task.js's own isAdvisoryProseSource() already reads, not exported from
+// there so re-declared here rather than reached into a sibling module's internals).
+function isAdvisoryProseSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.advisoryProse);
+}
 
 // 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
 // given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
@@ -786,31 +794,56 @@ async function draftTask(task, {
 
     // Critique + revision: a second, independent model call reviews the drafter's own
     // implement output before it ever reaches the review queue.
-    const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-    const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }));
-
-    if (critiqueResult.degenerate) {
-      task.critiqueOutcome = 'critique-degenerate';
-    } else if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
-      task.critiqueOutcome = 'no-issues';
+    //
+    // Skipped for advisoryProse sources (2026-08-25, "look for other opportunities" to
+    // shave draft-side time -- observability_review/performance_review dominate ALL
+    // draft-side wall-clock time across this pipeline's history by volume, 1341+453 runs).
+    // Measured against real historical data before changing this: critique was a
+    // measurable no-op (NO ISSUES FOUND or the critique call itself degenerating, either
+    // way changing nothing) 90.9% of the time for observability_review and 94.9% for
+    // performance_review -- 12.2 combined hours of real wall-clock time spent on a
+    // self-review pass whose own output almost never mattered, for exactly the source
+    // TYPE this makes the most sense for: an advisoryProse draft is a short prose verdict
+    // or a small fixed-format candidate block, not a code diff -- the failure modes
+    // critique exists to catch (a missed edge case, a wrong assumption baked into a code
+    // change) don't really apply to "did I phrase this false-positive explanation
+    // correctly," and the SAME judgment already goes through the full independent
+    // majority-vote review immediately afterward regardless, providing the actual
+    // "catch a bad verdict" safety net this critique pass was redundantly duplicating.
+    // Unlike the cheap-model experiment from the same investigation (which changed WHICH
+    // model does the judgment and measurably made it worse), this changes nothing about
+    // model choice or the judgment itself -- it only removes a self-review layer already
+    // shown, on real data, to almost never do anything.
+    if (isAdvisoryProseSource(resolveSourceName(task))) {
+      task.critiqueOutcome = 'skipped-advisory-prose';
+      appendHistoryEvent(task, 'critique-done', task.critiqueOutcome);
     } else {
-      task.critiqueOutcome = 'issues-flagged';
-      // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
-      // function -- the actual critique text was discarded the moment the revision call
-      // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
-      // what the critique actually found, even when a revision WAS applied and the
-      // reviewer might want to verify it really addressed those specific points.
-      task.critiqueText = critiqueResult.response;
-      const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-      const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
-      if (!reviseResult.degenerate) {
-        task.implementResponse = reviseResult.response;
-        task.revisionApplied = true;
+      const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
+      const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }));
+
+      if (critiqueResult.degenerate) {
+        task.critiqueOutcome = 'critique-degenerate';
+      } else if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
+        task.critiqueOutcome = 'no-issues';
+      } else {
+        task.critiqueOutcome = 'issues-flagged';
+        // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
+        // function -- the actual critique text was discarded the moment the revision call
+        // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
+        // what the critique actually found, even when a revision WAS applied and the
+        // reviewer might want to verify it really addressed those specific points.
+        task.critiqueText = critiqueResult.response;
+        const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
+        const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
+        if (!reviseResult.degenerate) {
+          task.implementResponse = reviseResult.response;
+          task.revisionApplied = true;
+        }
+        // Revision came back degenerate: bounded to one attempt, leave original draft
+        // intact rather than lose a working draft to a bad revision call.
       }
-      // Revision came back degenerate: bounded to one attempt, leave original draft
-      // intact rather than lose a working draft to a bad revision call.
+      appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
     }
-    appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 
     task.status = 'needs-review';
     appendHistoryEvent(task, 'needs-review');
