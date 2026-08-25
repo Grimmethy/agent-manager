@@ -12,6 +12,16 @@ export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                 
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 check_instance_liveness "$INSTANCE_ID" || exit 1
 
+# Claim-the-heartbeat-immediately fix (2026-08-25) -- same race, same fix, as
+# local-worker.sh's identical write_heartbeat_file call added right after its own
+# check_instance_liveness (see that file's own comment for the full incident: a
+# stale pre-restart heartbeat left uncorrected long enough for queue-watchdog's
+# dead-process-check to spawn a duplicate instance believing this one was dead).
+# This script's own gap before its first heartbeat write (previously at the top of the
+# main loop) is smaller than local-worker.sh's, but not zero -- write it here too rather
+# than rely on that margin staying small.
+write_heartbeat_file "$INSTANCE_ID" "starting" "${LOCAL_MODEL:-}" "" "" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"
+
 # Graceful stop: same reasoning as local-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
 trap 'printf "[review-%s] SIGTERM/SIGINT received -- exiting after current tick.\n" "$INSTANCE_ID" >&2; exit 0' TERM INT
