@@ -57,23 +57,25 @@ refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
   if "$IS_CLAUDE_LANE"; then
+    # Budget-aware (2026-08-25, Grimmethy: "The override exists because when we don't
+    # have claude tokens available at the time, the worker and reasoning need to share a
+    # lane rather than working in parallel" -- confirmed live this was NOT what the code
+    # actually did: an "ollama:" override was a static on/off toggle with no regard for
+    # whether Claude tokens were actually unavailable, unconditionally routing every plan
+    # call to local Ollama and fighting worker-1 for the same GPU slot even while Claude
+    # budget was healthy). check_budget_healthy() now also covers a manual pause (Grimmethy,
+    # same day: "I need a way to pause the claude use... preserve the tokens" -- see
+    # get_claude_paused's own comment), so ONE call here correctly falls back to local for
+    # BOTH a real rate-limit hit AND a deliberate pause, applied uniformly across all three
+    # override shapes below (previously only the "ollama:" branch checked this at all --
+    # an explicit "claude:" override or no override at all ignored budget health entirely,
+    # which meant pausing Claude did nothing for an instance without an "ollama:" override
+    # already configured, the opposite of what a global pause switch should do).
+    local claude_ok=true
+    check_budget_healthy >/dev/null 2>&1 || claude_ok=false
     case "$override" in
       ollama:*)
-        # Budget-aware, 2026-08-25 (Grimmethy: "The override exists because when we don't
-        # have claude tokens available at the time, the worker and reasoning need to
-        # share a lane rather than working in parallel" -- confirmed live this was NOT
-        # what the code actually did: this override was a static on/off toggle with no
-        # regard for whether Claude tokens were actually unavailable at the moment, so it
-        # unconditionally routed every plan call to local Ollama, fighting worker-1 for
-        # the same single GPU-resident model slot even while Claude budget was perfectly
-        # healthy -- confirmed via repeated real "Ollama request timed out" failures on a
-        # research_task plan call while the dashboard's own Workers tab showed the
-        # (override-exempt) IMPLEMENT call routing to Claude just fine). Reuses
-        # check_budget_healthy() (already used identically, same per-tick cost, for the
-        # Claude-lane budget gate a few lines below) rather than inventing a second
-        # mechanism -- only actually shares the local lane when Claude tokens are
-        # genuinely constrained right now, matching the override's own stated intent.
-        if check_budget_healthy >/dev/null 2>&1; then
+        if "$claude_ok"; then
           unset AGENT_MANAGER_FORCE_PROVIDER
           export CLAUDE_MODEL
           HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
@@ -84,14 +86,27 @@ refresh_active_model() {
         fi
         ;;
       claude:*)
-        CLAUDE_MODEL="${override#claude:}"
-        export CLAUDE_MODEL AGENT_MANAGER_FORCE_PROVIDER=claude
-        HEARTBEAT_MODEL="claude:${CLAUDE_MODEL}"
+        if "$claude_ok"; then
+          CLAUDE_MODEL="${override#claude:}"
+          export CLAUDE_MODEL AGENT_MANAGER_FORCE_PROVIDER=claude
+          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL}"
+        else
+          # An explicit per-instance "use Claude" choice still loses to a global pause or
+          # a real rate-limit hit -- neither is something one instance's dropdown should
+          # be able to override.
+          export AGENT_MANAGER_FORCE_PROVIDER=local
+          HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
+        fi
         ;;
       *)
-        unset AGENT_MANAGER_FORCE_PROVIDER
-        export CLAUDE_MODEL
-        HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+        if "$claude_ok"; then
+          unset AGENT_MANAGER_FORCE_PROVIDER
+          export CLAUDE_MODEL
+          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
+        else
+          export AGENT_MANAGER_FORCE_PROVIDER=local
+          HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
+        fi
         ;;
     esac
   else
@@ -420,7 +435,18 @@ while :; do                                                                     
   # straight to the budget-gate sleep tier (matching review-runner.ps1/apply-runner.ps1's
   # own 10-minute 'budget' backoff) rather than the normal idle/busy tick interval, so a
   # known rate-limit window doesn't get hammered with a fresh attempt every 30-60s.
-  if "$IS_CLAUDE_LANE"; then
+  #
+  # Skipped entirely when refresh_active_model already fell back to local this tick
+  # (2026-08-25, root-caused live while building the manual-pause feature): this gate
+  # used to run UNCONDITIONALLY for the Claude lane, even when the "ollama:" override's
+  # own budget-aware check just decided to fall back to local -- meaning an unhealthy
+  # budget (or now, a manual pause) made this lane go fully IDLE instead of doing the
+  # local work it was just configured to share, defeating the entire "share a lane rather
+  # than working in parallel" point of having a local fallback at all. If
+  # AGENT_MANAGER_FORCE_PROVIDER is already "local", there is real local work this tick
+  # CAN still do -- only skip the tick when Claude is unhealthy/paused AND there is no
+  # local fallback in play at all (no override configured for this instance).
+  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
     budget_reason="$(check_budget_healthy)"
     budget_rc=$?
     if [[ $budget_rc -ne 0 ]]; then

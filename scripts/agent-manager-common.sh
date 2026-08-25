@@ -64,6 +64,23 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
+# Manual "pause Claude" kill switch (2026-08-25 -- see src/claude-pause.js's own header
+# for the full rationale: a checkbox in the Workers tab, distinct from budget-monitor.js's
+# real rate-limit detection, so a human can proactively stop Claude spend before actually
+# hitting their weekly cap). Prints "true" (and only "true") when paused; empty otherwise,
+# same boolean-via-stdout convention get_model_override above already uses.
+get_claude_paused() {
+  local settings_path="${PACKAGE_SRC_DIR}/../dashboard-settings.json"
+  [[ -f "$settings_path" ]] || return 0
+  node -e '
+    try {
+      const fs = require("fs");
+      const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (d.claudePaused === true) process.stdout.write("true");
+    } catch (e) {}
+  ' "$settings_path"
+}
+
 # Single-flight / model-swap-thrashing guard (2026-08-18, Grimmethy: "make sure that all
 # the tasks that the currently loaded model has available to them is completed before
 # switching to the next model"; widened 2026-08-19, Grimmethy: "it's still running two
@@ -411,6 +428,17 @@ write_heartbeat_file() {
 # failing here must never block the tick" rule gpu-guard.js's own header documents --
 # this is a budget hint, not a correctness gate.
 check_budget_healthy() {
+  # Manual pause (2026-08-25 -- see get_claude_paused's own comment) short-circuits
+  # BEFORE the real rate-limit check: a deliberate "don't spend tokens right now" must
+  # win regardless of whether Claude Code's own transcripts say there's still headroom
+  # left -- that's the whole point of a proactive pause versus a reactive rate-limit
+  # detector. Every existing caller of this function (the plan-call budget-aware
+  # override, worker-reasoning's own whole-tick gate, review-runner.sh's per-item gate)
+  # gets pause support for free from this one chokepoint.
+  if [[ "$(get_claude_paused)" == "true" ]]; then
+    echo "Claude use is manually paused from the Workers tab"
+    return 1
+  fi
   local budget_script="${PACKAGE_SRC_DIR}/../budget-monitor.js"
   [[ -f "$budget_script" ]] || return 0
   node -e '
