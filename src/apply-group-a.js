@@ -21,7 +21,6 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { resolveAnchors } = require('./path-prefetch.js');
 const { resolveGraphPath } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
-const { syncTaskToRepo } = require('./task-repo-sync.js');
 
 function applySecondBrainNote({ implementResponse, notePath, secondBrainDir }) {
   const resolvedPath = path.isAbsolute(notePath) ? notePath : path.join(secondBrainDir, notePath);
@@ -676,32 +675,10 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         };
       }
 
-      // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific
-      // tasks go into that repo instead of the second brain") -- stamped here (not just
-      // relying on task-sources.js's writeTask(), which this apply-step write bypasses
-      // entirely) so this task's OWN later 'blocked'/'needs-clarification' transitions --
-      // handled by matchedProject's own separate daemon process -- know which task-data
-      // repo to sync into (task-history.js's appendHistoryEvent hook reads this exact
-      // field). matchedProject.taskRepoUrl is a per-project projects.json field, same
-      // convention as repoRoot/pipelineDir/domainsPath -- unset for a project with no
-      // dedicated task-data repo configured yet, in which case syncTaskToRepo below (and
-      // every later hook reading this field) just no-ops, same fail-open shape as
-      // everywhere else this integration is optional.
       adhocTask.generatedForRepoRoot = matchedProject.repoRoot;
-      adhocTask.taskRepoUrl = matchedProject.taskRepoUrl || null;
 
       fs.mkdirSync(adhocDir, { recursive: true });
       writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
-
-      // Commits the task's own record directly into the matched project's task-data repo
-      // instead of the old Second-Brain cross-reference line -- "repo specific tasks go
-      // into that repo instead of the second brain," not a duplicate of both. Best-effort,
-      // fails open: a sync failure must never block the entry from being marked actioned.
-      try {
-        syncTaskToRepo(adhocTask, { taskRepoUrl: matchedProject.taskRepoUrl });
-      } catch (e) {
-        console.error(`[apply-group-a] syncTaskToRepo failed for ${queuedId}: ${e.message}`);
-      }
 
       entry.status = 'actioned';
       entry.queuedTaskId = queuedId;
