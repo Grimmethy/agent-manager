@@ -19,7 +19,6 @@ const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
-const { syncTaskToRepo } = require('./task-repo-sync.js');
 const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -2178,7 +2177,7 @@ function getNextTask({ tierFilter } = {}) {
 // auto-approved against it). local-worker.ps1 checks this at claim time, before any
 // Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
-  const { pipelineDir, repoRoot, taskRepoUrl, jobTypeCountersPath } = getConfig();
+  const { pipelineDir, repoRoot, jobTypeCountersPath } = getConfig();
   const dir = path.join(pipelineDir, 'queue', 'pending');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${task.id}.json`);
@@ -2191,11 +2190,6 @@ function writeTask(task) {
   const record = {
     ...task,
     generatedForRepoRoot: repoRoot,
-    // task-repo-sync.js (2026-08-24) -- stamped here (not just read from config at the
-    // moment of each later sync) so a LATER 'blocked'/'needs-clarification' transition,
-    // handled by a possibly-different process, still knows which task-data repo this task
-    // belongs to (task-history.js's appendHistoryEvent hook reads this exact field).
-    taskRepoUrl,
     status: 'pending',
     createdAt: new Date().toISOString(),
     jobTypeOccurrence,
@@ -2203,17 +2197,6 @@ function writeTask(task) {
   };
   appendHistoryEvent(record, 'created', task.source);
   fs.writeFileSync(file, JSON.stringify(record, null, 2));
-  // 2026-08-24 (task-repo-sync.js, Grimmethy: "start saving the tasks directly to repo...
-  // so collaborators can access not only future work but the history as well") -- best-
-  // effort, fails open: a network blip on the commit/push must never block real task
-  // generation, the same "a capability check failing here must never block real work"
-  // convention this codebase already applies everywhere else (gpu-guard.js, reasoning-
-  // TierFor()'s own getConfig() try/catch, etc.).
-  try {
-    syncTaskToRepo(record, { taskRepoUrl });
-  } catch (e) {
-    console.error(`[task-sources] syncTaskToRepo failed for ${record.id}: ${e.message}`);
-  }
   return file;
 }
 
