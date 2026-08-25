@@ -711,3 +711,51 @@ test('draftTask does NOT grant tool access to the plan call for a non-research d
     assert.equal(capturedOpts.maxTurns, undefined);
   });
 });
+
+// Restores the 2026-08-19 queued/working heartbeat distinction the 2026-08-22 lock
+// split had made bash unable to report (2026-08-25, Grimmethy: "Is there a way we can
+// maintain the improved speed but get that extra status differentiation back?"). The
+// real wait now happens inside this node process (single-flight-lock.js's withLock), so
+// maybeLocked() writes "queued" right before blocking on the lock and "working" (with
+// the real currentPass) the instant it's actually acquired -- see heartbeat.js's own
+// tests for the write shape itself; this covers the transition actually firing at the
+// right moments during a real draftTask() call.
+test('draftTask writes a queued heartbeat before the lock is held and a working one (with the real pass) once acquired', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    process.env.AGENT_MANAGER_INSTANCE_ID = 'worker-test';
+    const task = { id: 'hb-test-1', domain: 'default', source: 'observability_fix', title: 'test', promptContext: { candidateId: 'AC-9', title: 'x', files: [], fetchedFiles: [], body: '' } };
+    const instancesDir = path.join(dir, 'instances');
+    const hbPath = path.join(instancesDir, 'worker-test.json');
+    const readHb = () => JSON.parse(fs.readFileSync(hbPath, 'utf8'));
+
+    const seen = [];
+    const withLockFn = async (instancesDir2, fn) => {
+      seen.push(readHb()); // must already be "queued" -- fn() (which writes "working") hasn't run yet
+      const result = await fn();
+      seen.push(readHb()); // must now be "working"
+      return result;
+    };
+
+    const localCall = async () => ({ response: 'plan text (no real change needed)', degenerate: null, attempts: 1 });
+    await draftTask(task, { localCall, withLockFn });
+
+    assert.equal(seen[0].status, 'queued');
+    assert.equal(seen[0].currentPass, 'plan');
+    assert.equal(seen[0].currentTaskId, 'hb-test-1');
+    assert.equal(seen[1].status, 'working');
+    assert.equal(seen[1].currentPass, 'plan');
+    delete process.env.AGENT_MANAGER_INSTANCE_ID;
+  });
+});
+
+test('draftTask writes no queued/working heartbeat at all when AGENT_MANAGER_INSTANCE_ID is unset', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    delete process.env.AGENT_MANAGER_INSTANCE_ID;
+    const task = { id: 'hb-test-2', domain: 'default', source: 'observability_fix', title: 'test', promptContext: { candidateId: 'AC-9', title: 'x', files: [], fetchedFiles: [], body: '' } };
+    const localCall = async () => ({ response: 'plan text', degenerate: null, attempts: 1 });
+
+    await draftTask(task, { localCall, withLockFn: async (instancesDir2, fn) => fn() });
+
+    assert.equal(fs.existsSync(path.join(dir, 'instances', 'undefined.json')), false, 'must not write a heartbeat keyed on a missing instance id');
+  });
+});
