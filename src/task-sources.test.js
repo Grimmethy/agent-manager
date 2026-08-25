@@ -1657,3 +1657,23 @@ test('nextPipelineHealthAuditTask returns null (does nothing) when the hourly ch
 
   assert.equal(nextPipelineHealthAuditTask(), null);
 });
+
+// nextUiVisibilityAuditTask (2026-08-24, Grimmethy: "How do we look for functions and
+// code that should have a display in the ui?") -- ui-visibility-audit.js's own test file
+// covers the actual detection logic in isolation; this just proves the due-gating wiring
+// works through the real task-sources.js registration, same shape as the
+// nextPipelineHealthAuditTask wiring test right above.
+test('nextUiVisibilityAuditTask returns null (does nothing) when the hourly check is not due yet', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ui-visibility-wiring-test-'));
+  const { nextUiVisibilityAuditTask } = freshTaskSources(dir);
+  const { markChecked } = require('./ui-visibility-audit.js');
+  markChecked(path.join(dir, 'instances'), new Date());
+
+  assert.equal(nextUiVisibilityAuditTask(), null);
+});
+
+test('nextUiVisibilityAuditTask returns null and does not throw when app.py does not exist in this fixture repo', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ui-visibility-wiring-test-'));
+  const { nextUiVisibilityAuditTask } = freshTaskSources(dir);
+  assert.equal(nextUiVisibilityAuditTask(), null);
+});

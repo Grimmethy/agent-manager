@@ -626,6 +626,60 @@ function pipelineHealthAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// ui_visibility_audit (2026-08-24, Grimmethy: "How do we look for functions and code
+// that should have a display in the ui?") -- same two-call harness-search shape as
+// pipeline_health_audit right above. The evidence here is a route with no reference in
+// any scanned frontend source file, which the implement pass must actively distinguish
+// from "deliberately not a dashboard concern" (confirmed live on this exact codebase:
+// /api/ping and /api/alerts's own docstrings say they're the companion Android app's
+// endpoints, not this dashboard's) before treating it as a real gap.
+function uiVisibilityAuditPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'A deterministic text-level scan cross-referenced every Flask route this dashboard defines against every frontend source file that could call it, and found route(s) with no reference anywhere -- see the evidence below. This is a CANDIDATE, not a confirmed gap: some backend endpoints are deliberately not meant to have a dashboard UI (e.g. a route documented as serving a different client entirely).',
+    '',
+    ctx.evidenceText,
+    '',
+    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the route\'s own definition and docstring in app.py, plus whatever dashboard tab/panel would be the natural place to surface it if it genuinely needs one.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function uiVisibilityAuditImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this pipeline\'s own code)';
+  const filesText = files.length > 0
+    ? formatFileContents(files)
+    : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms to find the route(s) this candidate finding points at:',
+    '',
+    planText,
+    '',
+    'ORIGINAL EVIDENCE:',
+    ctx.evidenceText,
+    '',
+    'The harness ran those searches against THIS PIPELINE\'S OWN repo. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'First, using ONLY the real matched content above, decide whether this route is genuinely a dashboard gap or deliberately not a dashboard concern (read its docstring/comments -- a route documented as serving a different client, an internal-only endpoint, or a health check is NOT a gap). If it is deliberately non-dashboard, output the empty string and nothing else -- do not force a UI change onto a route that was never meant to have one. If it genuinely looks like backend logic a human would want to see and there is enough grounded context to know what to build, write ONE small, safely-scoped addition to the dashboard template that surfaces it -- grounded ONLY in the real file content shown above. If the route looks like a real gap but you cannot tell what the display should look like from the grounded content alone, output the empty string and nothing else rather than guessing at a UI design.',
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
+}
+
 function pipelineSelfAuditImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const hits = ctx.harnessHits || [];
@@ -1090,6 +1144,7 @@ updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplem
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
 updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAuditPlanPrompt, buildImplementPrompt: pipelineHealthAuditImplementPrompt });
+updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositionPlanPrompt, buildImplementPrompt: backlogDecompositionImplementPrompt });

@@ -1767,6 +1767,60 @@ function markPipelineHealthAuditChecked() {
   require('./pipeline-health-audit.js').markChecked(instancesDir);
 }
 
+// ui_visibility_audit (2026-08-24, Grimmethy: "How do we look for functions and code
+// that should have a display in the ui?" -> "build 1 now" for the endpoint-audit half;
+// see ui-visibility-audit.js's own header for the full detection design and its
+// confirmed-live tradeoffs). Same time-gated (hourly), candidate-not-verdict, harness-
+// grounded shape as nextPipelineHealthAuditTask() right above -- the finding here is a
+// Flask route with no reference in any scanned frontend source file, which may be a
+// real "backend logic with no UI display" gap (confirmed live: /api/hardware/stats) or
+// a deliberately non-dashboard endpoint (confirmed live: /api/ping, /api/alerts -- both
+// allowlisted in ui-visibility-audit.js itself once their own docstrings explained why),
+// so the plan/implement prompts explicitly ask the harness-grounded model to read the
+// route's own code before concluding anything, same discipline pipeline_health_audit's
+// "transient hiccup vs. real bug" framing already established.
+function nextUiVisibilityAuditTask() {
+  const { pipelineDir, repoRoot, defaultDomain } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const uiVisibilityAudit = require('./ui-visibility-audit.js');
+  if (!uiVisibilityAudit.isDue(instancesDir)) return null;
+
+  const { candidates, evidence } = uiVisibilityAudit.auditUiVisibility({ repoRoot });
+
+  if (candidates.length === 0) {
+    uiVisibilityAudit.markChecked(instancesDir);
+    return null;
+  }
+
+  const id = `ui-visibility-audit-${Date.now()}`;
+  if (taskIdExistsInQueue(id)) return null;
+
+  const evidenceText = [
+    `${candidates.length} backend route(s) found with no reference in any scanned frontend source file:`,
+    ...candidates.map((c) => `- ${c.methods.join(',')} ${c.path} (app.py:${c.line})`),
+    '',
+    'Raw evidence:',
+    JSON.stringify(evidence, null, 2),
+  ].join('\n');
+
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'ui_visibility_audit',
+    title: `UI visibility audit: ${candidates[0].path}${candidates.length > 1 ? ` (+${candidates.length - 1} more)` : ''} has no dashboard caller`,
+    promptContext: { evidenceText },
+  };
+}
+
+// Called once from the CLI, only after writeTask() has actually persisted a
+// ui_visibility_audit task to pending/ -- same reasoning as markPipelineHealthAuditChecked
+// above.
+function markUiVisibilityAuditChecked() {
+  const { pipelineDir } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  require('./ui-visibility-audit.js').markChecked(instancesDir);
+}
+
 // Called once from the CLI, only after writeTask() has actually persisted a
 // pipeline_self_audit task to pending/ -- see nextPipelineSelfAuditTask()'s own comment
 // for why the write moved here instead of living inside the generator.
@@ -1900,6 +1954,12 @@ registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_sel
 // staleness_audit's "is this still worth chasing" recheck than pipeline_self_audit's
 // slower blocked-task-cluster pattern.
 registerTaskSource('pipeline_health_audit', { priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true });
+// Priority 63, just under staleness_audit's own recheck neighborhood but well above the
+// large background-generation sources (arch_import/arch_discovery etc, 79-83) -- a
+// missing-UI finding is a real gap worth surfacing promptly, but (unlike
+// pipeline_health_audit) it's never actively costing throughput or compute the way a
+// live operational incident is, so it doesn't need to outrank those.
+registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibility_audit', 63), next: nextUiVisibilityAuditTask, emptyApproval: true });
 // apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
 // part of that step") -- this source's implement pass writes an advisory report, never a
 // diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
@@ -2168,6 +2228,7 @@ module.exports = {
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
+  nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
   nextProductSpecTask,
   nextBacklogDecompositionTask,
@@ -2397,6 +2458,7 @@ if (require.main === module) {
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
+      if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();
       if (task.source === 'staleness_audit') markStalenessAuditReported(task);
       if (task.domain === 'adhoc') {
         try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}
