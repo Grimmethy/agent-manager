@@ -468,6 +468,17 @@ while :; do                                                                     
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       process_drafting_file "$wpath"
       did_work=true
+      # Intra-tick backoff gap fix (2026-08-25, proven live: an infra-shaped failure here
+      # left this same loop free to immediately resume the NEXT leftover item with zero
+      # delay -- the exponential backoff at the bottom of the outer `while :; do` loop only
+      # ever runs once, after this whole tick's work is done, so it can't pace anything
+      # WITHIN a tick. Stop claiming more work this tick the moment an infra failure is
+      # seen, so the tick actually ends and the backoff sleep below gets a chance to run
+      # before this worker touches Ollama again.
+      if "$TICK_HAD_INFRA_FAILURE"; then
+        printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of resuming more leftover items\n' "$INSTANCE_ID" >&2
+        break
+      fi
     done < <(ls -1 "$drafting_instance_dir" 2>/dev/null)
   fi
 
@@ -590,6 +601,19 @@ while :; do                                                                     
         # tick, not just this one's) picks the file back up automatically.
         process_drafting_file "$new_wpath"
         did_work=true
+        # Intra-tick backoff gap fix (2026-08-25, proven live: worker-1 claimed a fresh
+        # pending item 0.63s after an infra-shaped draft-call failure on the PREVIOUS item,
+        # same tick -- the exponential backoff at the bottom of the outer loop only runs
+        # once per tick, after this whole `for name in items` loop already finished, so it
+        # never had a chance to pace anything WITHIN a tick that claims several items back
+        # to back). Stop claiming more items this tick the moment an infra failure is seen;
+        # whatever's left in `items` stays in pending/ untouched and is simply picked up
+        # again -- via the same priority/mtime sort -- once this worker's next tick starts,
+        # by which point the backoff sleep below has actually run.
+        if "$TICK_HAD_INFRA_FAILURE"; then
+          printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of claiming more pending items\n' "$INSTANCE_ID" >&2
+          break
+        fi
       fi
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).
