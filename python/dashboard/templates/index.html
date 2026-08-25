@@ -256,6 +256,7 @@
 const TABS = [
   { key: 'project', label: 'Project', description: 'Pick the target repo and grep dirs, then start, stop, or force-stop the pipeline against it and watch its live run status.' },
   { key: 'workers', label: 'Workers', description: 'See every running agent instance across the ornith and reasoning lanes, with per-instance status and model selection.' },
+  { key: 'hardware', label: 'Hardware', description: 'Live CPU/RAM/disk/GPU utilization, VRAM used vs total, and CPU/GPU temperature vs their 24h rolling average, with a temperature history graph.' },
   { key: 'models', label: 'Models', description: 'Configure which models are used for each pipeline stage, review implement-pass quality and usage stats, and run reasoning benchmarks.' },
   { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted.' },
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
@@ -3220,9 +3221,103 @@ async function renderTokenfoldTab() {
     ${modelRows ? `<table><thead><tr><th>Model</th><th>Requests</th><th>Tokens saved</th><th>Avg %</th></tr></thead><tbody>${modelRows}</tbody></table>` : '<div class="empty">No model calls have gone through the proxy yet -- numbers appear as soon as the pipeline makes its first call.</div>'}`;
 }
 
+// --- Hardware tab --------------------------------------------------------------------
+// Read-only view of hardware_stats.py's background sampler (a daemon thread app.py
+// starts on boot, 10s interval / 24h retention -- see start_sampler() there) via
+// /api/hardware/stats. No dedicated poll loop: this tab has no in-progress user input to
+// protect (unlike Project/Brain Dump), so it just rides the generic 5s refresh() cycle
+// every other read-only tab already uses.
+
+function fmtBytes(n) {
+  if (n == null) return '-';
+  const gb = n / (1024 ** 3);
+  return gb >= 1 ? gb.toFixed(1) + ' GB' : (n / (1024 ** 2)).toFixed(0) + ' MB';
+}
+
+function fmtMiB(n) {
+  if (n == null) return '-';
+  return n >= 1024 ? (n / 1024).toFixed(1) + ' GB' : Math.round(n) + ' MiB';
+}
+
+function fmtTemp(c) { return c == null ? '-' : Math.round(c) + '°C'; }
+function fmtPercent(p) { return p == null ? '-' : Math.round(p) + '%'; }
+
+// Hand-rolled inline SVG line chart -- this repo vendors no charting library (no Chart.js/
+// D3/Plotly) and every other tab is plain HTML/vanilla JS, so the temperature history
+// graph follows suit instead of pulling one in for a single chart. `history` is
+// oldest-first (same order /api/hardware/stats' "history" array is already in). The 24h
+// average renders as a dashed reference line -- solid-vs-dashed distinguishes it from the
+// current-value line structurally, not by color alone, so it still reads in a screenshot
+// or under a color-vision deficiency.
+function renderTempSparkline(history, getValue, avg, label) {
+  const W = 300, H = 60, PAD = 3;
+  const points = history
+    .map((entry, i) => ({ i, v: getValue(entry) }))
+    .filter(p => p.v != null);
+  if (points.length < 2) return `<div class="meta">Not enough history yet to graph ${escapeHtml(label)}.</div>`;
+  const values = points.map(p => p.v);
+  const min = Math.min(...values, avg != null ? avg : values[0]);
+  const max = Math.max(...values, avg != null ? avg : values[0]);
+  const span = Math.max(max - min, 1);
+  const x = (i) => PAD + (i / (history.length - 1)) * (W - PAD * 2);
+  const y = (v) => PAD + (1 - (v - min) / span) * (H - PAD * 2);
+  const linePoints = points.map(p => `${x(p.i).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
+  const last = points[points.length - 1];
+  const avgY = avg != null ? y(avg) : null;
+  return `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:60px;display:block">
+      ${avgY != null ? `<line x1="${PAD}" y1="${avgY.toFixed(1)}" x2="${W - PAD}" y2="${avgY.toFixed(1)}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4,3" vector-effect="non-scaling-stroke"/>` : ''}
+      <polyline points="${linePoints}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+      <circle cx="${x(last.i).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="3" fill="var(--accent)"/>
+    </svg>
+    <div class="meta">&#8212; current &nbsp;&nbsp; &#8901;&#8901;&#8901; 24h average</div>`;
+}
+
+async function renderHardwareTab() {
+  const main = document.getElementById('main');
+  const data = await fetchJson('/api/hardware/stats');
+  const cur = data.current || {};
+  const avg = data.averages || {};
+  const history = data.history || [];
+  const ram = cur.ram || {};
+  const disk = cur.disk || {};
+  const gpu = cur.gpu;
+
+  const tempStat = (label, curVal, avgVal) => `
+    <div class="stat"><strong>${fmtTemp(curVal)}</strong>${escapeHtml(label)} temp (24h avg ${fmtTemp(avgVal)})</div>`;
+
+  main.innerHTML = `
+    <div class="stat-row">
+      <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization</div>
+      <div class="stat"><strong>${fmtBytes(ram.usedBytes)} / ${fmtBytes(ram.totalBytes)}</strong>RAM used</div>
+      <div class="stat"><strong>${fmtBytes(disk.usedBytes)} / ${fmtBytes(disk.totalBytes)}</strong>disk used</div>
+      ${gpu
+        ? `<div class="stat"><strong>${fmtPercent(gpu.utilizationPercent)}</strong>GPU utilization</div>
+      <div class="stat"><strong>${fmtMiB(gpu.vramUsedMiB)} / ${fmtMiB(gpu.vramTotalMiB)}</strong>VRAM used</div>`
+        : `<div class="stat"><strong>--</strong>no GPU detected</div>`}
+    </div>
+
+    <div class="field-label">Temperature -- current vs 24h average</div>
+    <div class="stat-row">
+      ${tempStat('CPU', cur.cpuTemperatureCelsius, avg.cpuTemperatureCelsius)}
+      ${gpu ? tempStat('GPU', gpu.temperatureCelsius, avg.gpuTemperatureCelsius) : ''}
+    </div>
+
+    <div class="field-label">CPU temperature -- last 24h</div>
+    ${renderTempSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
+
+    ${gpu ? `
+    <div class="field-label">GPU temperature -- last 24h</div>
+    ${renderTempSparkline(history, e => e.gpu ? e.gpu.temperatureCelsius : null, avg.gpuTemperatureCelsius, 'GPU temperature')}` : ''}
+
+    <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
+  `;
+}
+
 async function renderMain() {
   try {
     if (activeTab === 'workers') await renderWorkers();
+    else if (activeTab === 'hardware') await renderHardwareTab();
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
