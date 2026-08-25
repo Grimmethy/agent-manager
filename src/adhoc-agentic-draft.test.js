@@ -131,6 +131,37 @@ test('draftAdhocImplement clears a stranded branch from a prior interrupted atte
   assert.equal(branches.trim(), '', 'branch must be cleaned up again after the real run, not just before it');
 });
 
+// Regression, 2026-08-25: root-caused live on the SAME task's very next requeue after the
+// branch fix above landed -- `git worktree remove --force` only un-registers a directory
+// git still recognizes as a real worktree. The exact interruption this block exists for (a
+// kill -9 mid-`worktree add`) can leave a full, real, populated directory on disk WITHOUT
+// git ever finishing registration, in which case `worktree remove` correctly no-ops ("is
+// not a working tree") and the stray directory survives -- `worktree add` then refuses to
+// reuse that same path ("already exists"), a second dead end hit immediately after the
+// first was fixed.
+test('draftAdhocImplement clears a stray un-registered directory at the worktree path (not just a registered worktree)', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-stray-dir', title: 'Bump the version comment', promptContext: { rawText: 'Change v1 to v2 in tracked.txt' } };
+
+  // Simulate the exact live state: a plain leftover directory sits at the deterministic
+  // worktree path, with real file content, but git has no record of it as a worktree at
+  // all (matching "is not a working tree" from a real `worktree remove --force` attempt).
+  const worktreeDir = path.join(os.tmpdir(), `agent-manager-adhoc-worktree-${task.id}`);
+  fs.mkdirSync(worktreeDir, { recursive: true });
+  fs.writeFileSync(path.join(worktreeDir, 'leftover.txt'), 'stray content from a killed prior attempt\n');
+
+  const claudeCall = async ({ cwd }) => {
+    fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'v2\n');
+    return { response: 'Updated tracked.txt.\n\nRESOLUTION: implemented', degenerate: null };
+  };
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true, `expected the stray directory to be cleared automatically, got: ${result.reason}`);
+  assert.match(task.rawDiff, /\+v2/);
+  assert.equal(fs.existsSync(worktreeDir), false, 'the worktree dir must be cleaned up again after the real run');
+});
+
 test('draftAdhocImplement leaves task.rawDiff empty when the agentic call makes no edits (no-changes-needed)', async () => {
   const { repoDir } = makeRepoWithOrigin();
   const task = { id: 'test-2', title: 'Already fixed', promptContext: { rawText: 'This was already fixed by an earlier commit' } };

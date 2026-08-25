@@ -291,7 +291,20 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   // names are unique to this one task, anything found here can only be OUR OWN stale
   // leftover from a prior interrupted attempt at this same task -- never another task's or
   // another lane's real work -- so force-clearing it before creating fresh is always safe.
+  //
+  // Confirmed live (2026-08-25, same task, second requeue): `git worktree remove --force`
+  // alone isn't enough -- it only un-registers a directory git STILL considers a real
+  // worktree. The exact interruption this whole block exists for (a kill -9 mid-`worktree
+  // add`) can leave a full, real checkout populated on disk at worktreeDir WITHOUT ever
+  // completing registration in the main repo's own .git/worktrees/ metadata, in which case
+  // `worktree remove` correctly no-ops ("is not a working tree") and leaves the directory
+  // behind -- `worktree add` then refuses to reuse that same path on the next attempt
+  // ("already exists"), a second dead end this task hit immediately after the first one
+  // was fixed. fs.rmSync as an unconditional fallback closes it for real: whether or not
+  // git still recognizes the directory as a worktree, nothing should be left there before
+  // the fresh `worktree add` below.
   try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* no stale worktree registered */ }
+  try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { /* nothing left to remove */ }
   try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* no stale branch */ }
 
   try {
