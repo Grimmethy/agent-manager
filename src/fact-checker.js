@@ -283,7 +283,20 @@ const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|
 // diff -- narrowly scoped to an actual new declaration, not merely "the token appears
 // somewhere in the diff" (which would exempt a genuinely fabricated field too, if it
 // happened to also be referenced in prose elsewhere in the same draft).
-const NEW_DECLARATION_RE = /^\+\s*(?:const|let|var)\s+([A-Z][A-Z0-9]*_[A-Z0-9_]+)\s*=/gm;
+//
+// 2026-08-25, second pass, same day: the JS-only const/let/var requirement above was a
+// real, live gap -- adhoc tasks touch the WHOLE repo, not just JS, and this pipeline is
+// half Python. Confirmed live: WIKILINK_RE = re.compile(...) and PANEL_TOGGLES_HTML =
+// _read_asset(...) -- real, legitimate new Python module-level constants, still blocked
+// after the fix above shipped, because Python has no const/let/var keyword at all; a
+// top-level `NAME = value` IS the declaration. Made the keyword optional (still matches
+// the JS shape exactly as before) rather than adding a second, Python-specific regex --
+// one pattern, one thing to keep correct. `(?!=)` excludes a comparison (`NAME == x`) from
+// matching as a declaration. Anchored to the start of the added line (after only the diff
+// `+` and leading whitespace, same as before) so this still can't match a kwarg
+// (`func(NAME=value)`) or a dict entry (`"key": NAME`) -- the identifier must be the
+// first real token on the line, same discipline as the original keyword-only version.
+const NEW_DECLARATION_RE = /^\+\s*(?:(?:const|let|var)\s+)?([A-Z][A-Z0-9]*_[A-Z0-9_]+)\s*=(?!=)/gm;
 
 function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));

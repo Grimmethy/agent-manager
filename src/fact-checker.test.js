@@ -348,3 +348,33 @@ test('checkGroundedValues does not exempt a field that merely APPEARS on a diff 
   const flags = checkGroundedValues(draftText, sourceText);
   assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
+
+// Regression, 2026-08-25, same day: the const/let/var-only version above was itself a
+// real, live false-positive gap -- confirmed on two real blocked adhoc tasks (WIKILINK_RE
+// = re.compile(...), PANEL_TOGGLES_HTML = _read_asset(...)), both legitimate new Python
+// module-level constants that no JS keyword could ever match.
+test('checkGroundedValues does not flag a newly-declared Python constant with no const/let/var keyword', () => {
+  const draftText = [
+    '=== DIFF ===',
+    'diff --git a/build_notes.py b/build_notes.py',
+    '@@ -5,0 +6,1 @@',
+    '+WIKILINK_RE = re.compile(r"\\[\\[([^\\]\\|#]+)")',
+  ].join('\n');
+  const sourceText = 'unrelated grounding material that never mentions that pattern at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues still flags a real comparison (NAME == value) rather than treating it as a declaration', () => {
+  const draftText = [
+    '=== DIFF ===',
+    'diff --git a/check.py b/check.py',
+    '@@ -5,0 +6,1 @@',
+    '+if FCV_CUR == expected:',
+  ].join('\n');
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
+});
