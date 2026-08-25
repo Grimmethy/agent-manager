@@ -249,14 +249,28 @@ function adhocPlanPrompt(task) {
 // kicks in at the IMPLEMENT stage, further down), so every research task fell through to
 // genericFallbackPlanPrompt's throw and died on its very first tick, forever (found live
 // 2026-08-17: 3 research tasks retried and failed identically every tick, up to 6+ hours).
-// This plan is intentionally throwaway -- draftResearchImplement()/buildResearchPrompt()
-// build their agentic prompt straight from task.promptContext/task.title, never from
-// task.planResponse -- it only needs to be non-empty so the mandatory plan stage can pass
-// and the task can reach the real research call.
+//
+// 2026-08-25, second incident, same underlying task type: this plan pass used to be
+// "intentionally throwaway" (no tool access, output never even read by the implement
+// pass) -- confirmed to be a REAL problem, not just an unused nicety, on a real blocked
+// research_task (Toregem BioPharma tooth-regrowth trial lookup): with nothing to check
+// itself against, the plan pass invented a plausible-looking-but-fake clinical trial
+// registry ID and site before any real research had happened. That fabrication then
+// leaked into review as ground truth (buildVerdictPrompt hands the reviewer
+// task.planResponse directly, unconditionally, for every source), and three straight
+// implement attempts got rejected for "failing" to reproduce a record that never
+// existed -- no amount of redrafting implement could have fixed a bad premise living one
+// stage upstream. Now grounded the same way draftResearchImplement() already is: given
+// real WebSearch/WebFetch tool access (see local-draft.js's own research-domain branch
+// wiring this in), and explicitly instructed to verify before stating anything specific.
 function researchPlanPrompt(task) {
   const ctx = task.promptContext || {};
   return [
-    'A note has been classified as requiring real web research (not a code change). You will not do the research yourself here -- a separate pass with real web-search tools handles that next. Just write a short PLAN (2-4 numbered points) for what that research pass should look into and what a good write-up should cover.',
+    'A note has been classified as requiring real web research (not a code change). You have real WebSearch/WebFetch tool access RIGHT NOW -- use it. Your job here is NOT to write the final report (a separate, more thorough research pass does that next) -- it is to scope the investigation and pin down anything specific enough to verify.',
+    '',
+    'Write a short PLAN (2-5 numbered points) for what the follow-up research pass should investigate and what a good write-up should cover.',
+    '',
+    'CRITICAL: do not state a specific identifier, registry number, date, name, or URL as a known fact unless you actually found it via a real search/fetch in this pass just now. If you looked and could not confirm something specific (an exact registry ID, an exact site, an exact date), say so explicitly ("the research pass should look for X; I could not confirm it") rather than guessing a plausible-looking value -- a guessed-but-wrong specific here becomes a false requirement the next pass gets graded against, not a helpful lead.',
     '',
     `Title: ${task.title || ''}`,
     '',

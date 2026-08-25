@@ -586,3 +586,63 @@ test('draftTask still runs the critique+revision pass for a non-advisoryProse so
     assert.equal(callCount, 3, 'plan, implement, AND critique -- a real code-diff source must be unaffected by the advisoryProse skip');
   });
 });
+
+// Plan-grounding fix, 2026-08-25: research_task's plan pass now gets real WebSearch/
+// WebFetch tool access (see prompts.js's researchPlanPrompt for the incident this
+// fixes -- an ungrounded plan pass fabricated a fake clinical trial registry ID/site,
+// and review then held every implement attempt to it as if it were verified). This test
+// covers the wiring half: local-draft.js must actually pass allowedTools/maxTurns
+// through to the plan call for domain==='research', and must NOT do so for any other
+// domain (a plain no-tool completion is correct everywhere else).
+test('draftTask grants the plan call real WebSearch/WebFetch tool access for a research-domain task', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'research-test-1', domain: 'research', source: 'research_task', title: 'test',
+      promptContext: { rawText: 'investigate something', tags: [] },
+    };
+
+    let capturedOpts = null;
+    const localCall = async (opts) => {
+      capturedOpts = opts;
+      return { response: 'grounded plan text', degenerate: null, attempts: 1 };
+    };
+    const draftResearchImplementFn = async (t) => {
+      t.researchDoc = '# write-up';
+      t.implementResponse = t.researchDoc;
+      return { succeeded: true, blocked: false };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn(), draftResearchImplementFn });
+
+    assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
+    assert.equal(capturedOpts.maxTurns, 8);
+  });
+});
+
+test('draftTask does NOT grant tool access to the plan call for a non-research domain', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-no-tools', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-4', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let capturedOpts = null;
+    let callCount = 0;
+    const localCall = async (opts) => {
+      callCount += 1;
+      if (callCount === 1) capturedOpts = opts;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(capturedOpts.allowedTools, undefined);
+    assert.equal(capturedOpts.maxTurns, undefined);
+  });
+});

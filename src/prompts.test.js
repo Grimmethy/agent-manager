@@ -248,3 +248,31 @@ test('buildImplementPrompt only flags the files that actually failed to fetch, n
   assert.match(prompt, /NOTE: src\/missing\.js/);
   assert.doesNotMatch(prompt, /NOTE: src\/apply-group-a\.js/);
 });
+
+// research_task's plan prompt: grounding fix, 2026-08-25 -----------------------------
+// Root-caused live on a real blocked research_task (Toregem BioPharma): the plan pass
+// used to have no tool access and no instruction against guessing, so it fabricated a
+// plausible-looking-but-fake jRCT registry ID and site, which review then held every
+// implement attempt to as if it were a verified requirement. Fixed by giving the plan
+// pass real WebSearch/WebFetch access (wired in local-draft.js, not testable from a pure
+// prompt-text unit test) and by explicitly forbidding stating an unverified specific as
+// fact -- this test covers the prompt-text half of that fix.
+function researchTask(overrides = {}) {
+  return {
+    domain: 'research',
+    source: 'research_task',
+    title: 'Toregem BioPharma tooth regrowth trial',
+    promptContext: { rawText: 'Figure out what it would take to join the trial.', tags: ['medical'] },
+    ...overrides,
+  };
+}
+
+test('buildPlanPrompt for research_task tells the model it has real WebSearch/WebFetch access', () => {
+  const prompt = buildPlanPrompt(researchTask());
+  assert.match(prompt, /WebSearch\/WebFetch tool access/);
+});
+
+test('buildPlanPrompt for research_task explicitly forbids stating an unverified specific as fact', () => {
+  const prompt = buildPlanPrompt(researchTask());
+  assert.match(prompt, /do not state a specific identifier, registry number, date, name, or URL as a known fact unless you actually found it via a real search\/fetch/i);
+});

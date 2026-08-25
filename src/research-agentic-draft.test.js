@@ -8,7 +8,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { draftResearchImplement, extractGithubRepoUrl } = require('./research-agentic-draft.js');
+const { draftResearchImplement, extractGithubRepoUrl, buildResearchPrompt } = require('./research-agentic-draft.js');
 
 function fakeRecordModelCall() {
   return 'fake-call-id';
@@ -159,4 +159,26 @@ test('draftResearchImplement falls back to web-only tools when the clone fails (
 
   assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
   assert.equal(capturedOpts.cwd, undefined);
+});
+
+// Plan-grounding fix, 2026-08-25 (see prompts.js's researchPlanPrompt for the incident):
+// the plan pass now runs with its own real tool access and is required to verify rather
+// than guess -- feed its findings into the implement prompt so this pass builds on what's
+// already confirmed instead of duplicating the same searches from scratch.
+test('buildResearchPrompt includes a verified plan when task.planResponse is present', () => {
+  const task = {
+    title: 'Toregem BioPharma tooth regrowth trial',
+    promptContext: { rawText: 'Figure out what it would take to join the trial.' },
+    planResponse: 'Confirmed via jRCT: registry ID jRCT2051240154, Kyoto University Hospital.',
+  };
+  const prompt = buildResearchPrompt(task, null);
+  assert.match(prompt, /=== PLAN /);
+  assert.match(prompt, /jRCT2051240154/);
+  assert.match(prompt, /re-confirm anything load-bearing yourself/);
+});
+
+test('buildResearchPrompt omits the PLAN section entirely when task.planResponse is absent', () => {
+  const task = { title: 'x', promptContext: { rawText: 'y' } };
+  const prompt = buildResearchPrompt(task, null);
+  assert.doesNotMatch(prompt, /=== PLAN /);
 });
