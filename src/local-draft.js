@@ -276,7 +276,21 @@ async function draftTask(task, {
       }
     } else {
       const planPrompt = buildPlanPrompt(task);
-      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }));
+      // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
+      // trial lookup): researchPlanPrompt's own header used to call the research plan pass
+      // "intentionally throwaway" and never gave it tool access -- so it could (and did)
+      // invent a plausible-looking-but-fake registry ID and site with nothing to check it
+      // against, before any real research had happened. That fabrication then leaked into
+      // review as if it were a verified requirement (buildVerdictPrompt hands the reviewer
+      // task.planResponse directly), and three straight implement attempts got rejected for
+      // "failing" to reproduce a record that never existed. Same class of fix as
+      // draftResearchImplement's own WebSearch/WebFetch grant: give the PLAN pass real tool
+      // access too, for research_task only, so any specific fact-like claim it makes (an
+      // ID, a date, a site) has actually been looked up, not guessed. Scoped narrowly to
+      // task.domain === 'research' -- every other source's plan pass is unaffected, kept as
+      // a plain no-tool completion exactly as before.
+      const researchPlanTools = task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, ...researchPlanTools }));
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);

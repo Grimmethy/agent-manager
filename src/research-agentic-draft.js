@@ -81,6 +81,24 @@ function buildResearchPrompt(task, repoClone) {
     ctx.rawText || '',
     '',
   ];
+  // 2026-08-25: the plan pass (prompts.js's researchPlanPrompt) now runs with its own
+  // real WebSearch/WebFetch access and is required to verify, not guess, any specific
+  // fact it states -- feed its findings in here so this pass builds on what's already
+  // confirmed instead of re-searching the same ground from scratch, and so a plan point
+  // phrased as "could not confirm X" reads as a lead to chase, not a settled fact to
+  // reproduce. This pass still does its own independent verification -- the plan's own
+  // prompt describes it as a scoping pass, not the final word, and this instruction
+  // reflects that explicitly rather than asking the model to defer to it.
+  if (task.planResponse) {
+    lines.push(
+      '=== PLAN (from an earlier scoping pass with its own real search access -- verified ' +
+      'findings are a head start, but re-confirm anything load-bearing yourself rather ' +
+      'than taking it on faith; anything the plan flagged as unconfirmed is a lead to ' +
+      'chase, not a fact) ===',
+      task.planResponse,
+      '',
+    );
+  }
   if (repoClone) {
     lines.push(
       'The GitHub repo this task asks about has been cloned for real, read-only ' +
