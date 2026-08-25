@@ -58,6 +58,51 @@ const REPO_FILE_PATH_RE = /\b((?:src|python|scripts|docs)\/[\w./-]+\.(?:js|py|sh
 // pipeline's own draft prompts ask for), center the fetched window on it instead.
 const LIVE_FETCH_CONTEXT_LINES = 60;
 
+// 2026-08-25, third round of the same underlying bug -- caught live via a real blocked
+// task: a pure UI change to a ~4700-line index.html added new constants (JOB_TYPE_FAMILIES
+// etc.) around line 2478, but the draft's own prose summary ("Only index.html changed, as
+// expected") carried no `file.ext:line` citation -- REPO_FILE_PATH_RE above only ever
+// recognizes THAT prose shape, never a real diff's own line info, so with no citation to
+// center on, extractContentWindow fell back to the file's first 4000 characters (nowhere
+// near line 2478). The fact-checker then correctly-per-its-own-logic flagged the new
+// constants as "not found in source" -- a structural false positive for any real diff deep
+// in a large file with no matching prose citation, not an actual hallucination.
+//
+// adhoc-agentic-draft.js's own implementResponse ALWAYS carries a real, standard unified
+// diff when there's a diff at all (`=== DIFF ===\n${task.rawDiff}`, task.rawDiff captured
+// via a real `git diff`) -- that diff's own `@@ -a,b +c,d @@` hunk header already states
+// exactly which lines changed, far more reliably than hoping the model's prose summary
+// happens to also cite a line number. Parsed here as a second, independent source of line
+// info for the SAME byPath map extractLiveRepoGrounding builds below, keyed by the diff
+// header's own b/<path> (the post-change file) -- only used to FILL IN a path that has no
+// prose-citation line number yet, never overrides a real citation that's already present.
+const DIFF_GIT_HEADER_RE = /^diff --git a\/(?:\S+) b\/(\S+)/;
+const DIFF_HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+
+function extractDiffHunkLineRefs(text) {
+  const refs = new Map();
+  let currentPath = null;
+  for (const line of text.split('\n')) {
+    const headerMatch = line.match(DIFF_GIT_HEADER_RE);
+    if (headerMatch) {
+      currentPath = headerMatch[1];
+      continue;
+    }
+    if (!currentPath) continue;
+    const hunkMatch = line.match(DIFF_HUNK_RE);
+    // Only the FIRST hunk per file -- same "first reference wins" convention as byPath's
+    // own dedup below; a file touched by several scattered hunks still gets a real,
+    // in-the-right-neighborhood window instead of no window at all, which is the actual
+    // bug being fixed here.
+    if (hunkMatch && !refs.has(currentPath)) {
+      const startLine = Number(hunkMatch[1]);
+      const lineCount = hunkMatch[2] ? Number(hunkMatch[2]) : 1;
+      refs.set(currentPath, { startLine, endLine: startLine + Math.max(lineCount - 1, 0) });
+    }
+  }
+  return refs;
+}
+
 function extractContentWindow(content, startLine, endLine) {
   if (content.length <= LIVE_FETCH_MAX_CHARS_PER_FILE) return content;
   if (!startLine) return `${content.slice(0, LIVE_FETCH_MAX_CHARS_PER_FILE)}\n...[truncated]`;
@@ -85,6 +130,15 @@ function extractLiveRepoGrounding(text, repoRoot) {
     if (!existing || (!existing.startLine && startLine)) {
       byPath.set(candidate, { startLine: startLine ? Number(startLine) : null, endLine: endLine ? Number(endLine) : null });
     }
+  }
+
+  // Fill in a real diff hunk's own line info for any path REPO_FILE_PATH_RE found (or
+  // missed entirely) with no prose citation -- see DIFF_GIT_HEADER_RE/DIFF_HUNK_RE's own
+  // header comment for the incident this closes. Never overrides a real prose citation
+  // that's already present.
+  for (const [candidate, ref] of extractDiffHunkLineRefs(text)) {
+    const existing = byPath.get(candidate);
+    if (!existing || !existing.startLine) byPath.set(candidate, ref);
   }
 
   const found = [];

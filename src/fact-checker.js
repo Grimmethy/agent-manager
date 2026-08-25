@@ -267,9 +267,32 @@ const URL_RE = /https?:\/\/[^\s"'`)\]}<>]+/gi;
 const GIS_FIELD_RE = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g;
 const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?/i;
 
+// 2026-08-25, root-caused live via a real blocked task: a pure UI change legitimately
+// introduced two brand-new JS constants (JOB_TYPE_FAMILIES, JOB_TYPE_FAMILY_BY_SOURCE) as
+// part of a real `+const NAME = ...` declaration in its own diff -- both got flagged
+// ungrounded-field, correctly-per-the-check's-own-logic (a NEW identifier can never appear
+// in a fetch of the CURRENT, unmodified repo, no matter how well-targeted that fetch is;
+// see get-grounding-source.js's diff-hunk-header fix from the same investigation, which
+// closes the windowing half of this but not this half). This check was built for a
+// genuinely different failure mode -- a fabricated EXTERNAL data field (a GIS column name
+// like FCV_CUR that's supposed to already exist in some upstream dataset) -- and that
+// distinction matters: a value claimed to already exist is fair game to demand grounding
+// for; a value the draft's own diff is DEFINING right now cannot be judged against
+// grounding that, by construction, predates the definition. Exempts any ALLCAPS_UNDERSCORE
+// token that's the subject of a real `+const/let/var NAME = ...` line in the draft's own
+// diff -- narrowly scoped to an actual new declaration, not merely "the token appears
+// somewhere in the diff" (which would exempt a genuinely fabricated field too, if it
+// happened to also be referenced in prose elsewhere in the same draft).
+const NEW_DECLARATION_RE = /^\+\s*(?:const|let|var)\s+([A-Z][A-Z0-9]*_[A-Z0-9_]+)\s*=/gm;
+
+function extractNewlyDeclaredIdentifiers(text) {
+  return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
+}
+
 function checkGroundedValues(draftText, sourceText) {
   if (!sourceText) return [];
   const flags = [];
+  const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
 
   const urls = [...new Set(draftText.match(URL_RE) || [])];
   for (const raw of urls) {
@@ -283,6 +306,7 @@ function checkGroundedValues(draftText, sourceText) {
   const fields = [...new Set(draftText.match(GIS_FIELD_RE) || [])];
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
+    if (newlyDeclared.has(field)) continue;
     if (!sourceText.includes(field)) {
       flags.push({ type: 'ungrounded-field', detail: field });
     }

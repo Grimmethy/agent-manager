@@ -157,6 +157,62 @@ test('extractLiveRepoGrounding falls back to flat truncation from the start when
   assert.match(found[0].content, /\.\.\.\[truncated\]$/);
 });
 
+// Regression, 2026-08-25: root-caused live -- a real blocked task added new constants
+// around line 2478 of a ~4700-line index.html, but its own prose summary ("Only
+// index.html changed, as expected") carried no `file:line` citation, so the flat-
+// truncation fallback above fetched only the file's first 4000 characters -- nowhere near
+// the real change -- and the fact-checker correctly-per-its-own-logic flagged the new
+// constants as "not found in source". A real unified diff's own `@@ -a,b +c,d @@` hunk
+// header already states exactly which lines changed; this must be used to center the
+// window even when the prose summary cites nothing.
+test('extractLiveRepoGrounding centers the window on a real diff hunk header when the prose summary cites no line number', () => {
+  const lines = [];
+  for (let i = 1; i <= 4700; i++) lines.push(`line ${i}`);
+  lines[2477] = 'line 2478: const JOB_TYPE_FAMILIES = [...], THE_MARKER';
+  const repoRoot = makeRepoWithFile('python/dashboard/templates/index.html', lines.join('\n'));
+
+  const draftText = [
+    'Only index.html changed, as expected for a pure UI grouping change.',
+    '',
+    'RESOLUTION: implemented',
+    '',
+    '=== DIFF ===',
+    'diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html',
+    'index eee803d..05dc767 100644',
+    '--- a/python/dashboard/templates/index.html',
+    '+++ b/python/dashboard/templates/index.html',
+    '@@ -2475,6 +2475,26 @@ const JOB_TYPES = [',
+    '+const JOB_TYPE_FAMILIES = [',
+  ].join('\n');
+
+  const found = extractLiveRepoGrounding(draftText, repoRoot);
+
+  assert.equal(found.length, 1);
+  assert.match(found[0].content, /THE_MARKER/, 'the real diff region must be fetched, not the file\'s first 4000 chars');
+  assert.match(found[0].content, /showing lines/);
+});
+
+test('extractLiveRepoGrounding prefers a real prose citation over a diff hunk header when both are present', () => {
+  const lines = [];
+  for (let i = 1; i <= 4700; i++) lines.push(`line ${i}`);
+  lines[98] = 'line 99: MARKER_FROM_PROSE_CITATION';
+  const repoRoot = makeRepoWithFile('python/dashboard/templates/index.html', lines.join('\n'));
+
+  const draftText = [
+    'see python/dashboard/templates/index.html:99 for the real change',
+    '',
+    '=== DIFF ===',
+    'diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html',
+    '@@ -2475,6 +2475,26 @@ const JOB_TYPES = [',
+    '+const JOB_TYPE_FAMILIES = [',
+  ].join('\n');
+
+  const found = extractLiveRepoGrounding(draftText, repoRoot);
+
+  assert.equal(found.length, 1);
+  assert.match(found[0].content, /MARKER_FROM_PROSE_CITATION/, 'an explicit prose citation must win over the diff hunk fallback');
+});
+
 test('extractLiveRepoGrounding keeps the first real line reference when the same file is cited more than once', () => {
   const lines = [];
   for (let i = 1; i <= 500; i++) lines.push(`line ${i}`);
