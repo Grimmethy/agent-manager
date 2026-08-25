@@ -148,8 +148,19 @@ while :; do                                                                     
     # priority ranking governs which task a lane picks up, not whether it then has to wait
     # its turn behind unrelated local work once picked. $resolved_label is already
     # computed just above for the budget gate, so this costs nothing extra to check.
+    #
+    # Keyed by $resolved_label (2026-08-25, root-caused live: this used to acquire the
+    # bare, unkeyed global lock while worker-1's OWN local calls (single-flight-lock.js)
+    # already used a per-model-keyed one -- two different lockfiles guarding the SAME
+    # physical model/GPU, so they never actually serialized against each other. Confirmed
+    # live via Ollama's own log: repeated "timed out waiting for llama-server to start:
+    # context canceled" -- concurrent load attempts colliding, not a rare/low-cost race
+    # the old comment here assumed Ollama would absorb on its own). $resolved_label IS
+    # the resolved local model name for a non-Claude item (labelFor()'s own contract),
+    # identical in shape to the key local-draft.js's withLockFn already passes -- same
+    # model name in, same sanitized lockfile out, on both sides.
     if [[ "$resolved_label" != claude:* ]]; then
-      acquire_single_flight_lock
+      acquire_single_flight_lock "$resolved_label"
     fi
     write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
     review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"

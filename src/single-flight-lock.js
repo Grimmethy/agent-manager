@@ -45,17 +45,22 @@ const LOCK_CHILD_FD = 3; // arbitrary -- just needs to not collide with the chil
 // serialize against each other, while two calls against the SAME model still correctly
 // do (same key -> same lockfile -> same flock). Omitting `key` preserves the exact
 // original global lockfile name -- every caller not yet migrated to pass a key keeps
-// today's behavior unchanged. bash's acquire_single_flight_lock/release_single_flight_lock
-// (agent-manager-common.sh, used by review-runner.sh) is intentionally NOT migrated to
-// per-key locking in this pass -- it locks around a whole `node review-task.js` subprocess
-// invocation before knowing which model that process will actually resolve to, so there's
-// no clean key to pass without a bigger refactor. It keeps using the global (no-key)
-// lockfile, which stays correct for review of any source with no registered cheap model
-// profile (the common case, since only brain_dump_sort has one today) -- the residual
-// gap (a cheap-profiled source's review vote racing that same profile's own draft call)
-// is a known, accepted, low-frequency risk: Ollama's own llama-server still serializes
-// same-model requests at its own -np 1 slot regardless, so a race here costs at worst a
-// little scheduling fairness, not correctness.
+// today's behavior unchanged.
+//
+// UPDATE, 2026-08-25, same day: this comment used to say bash's own
+// acquire_single_flight_lock/release_single_flight_lock (agent-manager-common.sh, used by
+// review-runner.sh) was "intentionally NOT migrated" and that the gap for the common
+// (no cheap-model-profile) case was "a known, accepted, low-frequency risk" because
+// "Ollama's own llama-server still serializes same-model requests at its own -np 1 slot
+// regardless." Confirmed live, same day, that assumption was wrong: reviewer (still on
+// the old global lockfile) and worker-1 (already on this module's per-model one) hitting
+// the SAME default model produced a real, repeating "timed out waiting for llama-server
+// to start: context canceled" cycle in Ollama's own log -- concurrent LOAD attempts
+// collide and get cancelled, not just generation slots, so this was the common case
+// racing on every single review, not a rare edge case. agent-manager-common.sh's
+// acquire_single_flight_lock now also accepts an optional key (same lockFileName scheme
+// as here, kept in sync by hand) and review-runner.sh passes it $resolved_label -- the
+// gap this comment used to describe as accepted is closed, not just documented.
 function lockFileName(key) {
   if (!key) return '.pipeline-single-flight.lock';
   // Model names can contain ':' (e.g. "qwen3.8:27b-q4_K_M") -- not filesystem-hostile on
