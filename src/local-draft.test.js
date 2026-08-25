@@ -527,3 +527,62 @@ test('a task with NO model profile still defaults to think:true, unaffected by t
     assert.ok(seenThinkValues.every((v) => v === true), `a task with no model profile must keep the existing think:true default, got: ${JSON.stringify(seenThinkValues)}`);
   });
 });
+
+// 2026-08-25 ("look for other opportunities" to shave draft-side time): critique+revision
+// is skipped entirely for an advisoryProse source -- measured against real historical
+// data first (observability_review/performance_review: critique was a no-op, either "NO
+// ISSUES FOUND" or the critique call itself degenerating, 90.9%/94.9% of the time,
+// 12.2 combined hours of real wall-clock time for a self-review pass whose own output
+// almost never mattered). staleness_audit is also advisoryProse:true and, unlike
+// observability_review/performance_review, is already registered in task-sources.js's own
+// base set this fixture loads -- no custom source registration needed.
+test('draftTask skips the critique+revision pass entirely for an advisoryProse source', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        // plan pass: staleness_audit's harness-search branch reads QUERY: lines.
+        return { response: 'QUERY: nothing to find here', degenerate: null, attempts: 1 };
+      }
+      // implement pass: a plain advisory report, no RESOLUTION/DIFF machinery involved.
+      return { response: 'The original concern still appears to hold.', degenerate: null, attempts: 1 };
+    };
+    const task = {
+      id: 'advisory-prose-skip-test', domain: 'default', source: 'staleness_audit', title: 'test',
+      promptContext: { evidenceText: 'some prior finding' },
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(callCount, 2, 'only plan + implement -- no third (critique) call for an advisoryProse source');
+    assert.equal(task.critiqueOutcome, 'skipped-advisory-prose');
+    assert.equal(task.revisionApplied, undefined, 'no revision pass ran, so this must stay unset, not falsely imply one ran and found nothing');
+  });
+});
+
+test('draftTask still runs the critique+revision pass for a non-advisoryProse source (observability_fix, unaffected)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-critique-still-runs', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-3', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 3, 'plan, implement, AND critique -- a real code-diff source must be unaffected by the advisoryProse skip');
+  });
+});
