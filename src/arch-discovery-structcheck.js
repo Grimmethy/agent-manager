@@ -31,7 +31,7 @@ function checkStructure(implementResponse) {
   const text = (implementResponse || '').trim();
   // isEffectivelyEmptyResponse also catches a bare `""`/`''` -- confirmed live
   // 2026-07-21: 4 of 6 real arch_import "structural check failed" blocks were exactly
-  // this, Ornith correctly following "output the empty string" by typing its literal
+  // this, the local model correctly following "output the empty string" by typing its literal
   // representation instead of a truly empty response. Without this, a CORRECTLY-followed
   // instruction was being reported as a structural failure.
   if (isEffectivelyEmptyResponse(text)) return { ok: true, reason: 'empty response -- valid outcome, means no real friction found' };
@@ -52,7 +52,7 @@ function checkStructure(implementResponse) {
   return { ok: true };
 }
 
-// Matches queue-watchdog.ps1's own $MaxOrnithRejectRetries=2 (a total of 3 failures
+// Matches queue-watchdog.ps1's own local-model reject-retry limit (a total of 3 failures
 // before giving up) -- same tolerance, different failure axis.
 const MAX_STRUCT_FAILURES = 3;
 

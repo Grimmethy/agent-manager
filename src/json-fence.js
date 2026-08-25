@@ -1,6 +1,6 @@
 'use strict';
 
-// Ornith drafts intended as raw JSON (county index files, Group B change objects) sometimes
+// Local-model drafts intended as raw JSON (county index files, Group B change objects) sometimes
 // wrap the JSON in a markdown code fence (```json ... ``` or plain ```), and sometimes add
 // trailing prose commentary AFTER the closing fence (confirmed live 2026-07-14 on a
 // state_targets draft: "```json\n{...}\n```\n\nNOTE: Flag #7 was applied by..."). Shared by

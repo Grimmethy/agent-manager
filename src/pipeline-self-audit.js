@@ -13,7 +13,7 @@
 // even if local" -- confirmed live: it was, structurally, since domain:'adhoc' always
 // routes to the real agentic Claude Code CLI pass, and a Claude rate-limit that stalled
 // worker-reasoning's whole high-tier lane was directly why self-audit hadn't fired since
-// the prior restart). Now uses the SAME harness-grounded Ornith flow arch_import already
+// the prior restart). Now uses the SAME harness-grounded local-model flow arch_import already
 // runs successfully against this pipeline's own repo (task-sources.js's arch-import-fetch.js
 // via grep-codebase-tool.js): a plan pass proposes search terms from the evidence below,
 // the harness greps this pipeline's OWN repo for real matches, and the implement pass

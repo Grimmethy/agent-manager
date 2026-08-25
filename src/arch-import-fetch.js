@@ -1,7 +1,7 @@
 'use strict';
 
 // Harness-side search execution for the arch_import task source (see ADR-0020,
-// docs/arch-import-pipeline.md). Mirrors project-search-fetch.js's role (Ornith proposes
+// docs/arch-import-pipeline.md). Mirrors project-search-fetch.js's role (the local model proposes
 // search terms in the plan pass, the harness runs them, the implement pass gets real
 // results) but the search target here is agent-manager's OWN repo, not an external API --
 // so this is synchronous local grep via grep-codebase-tool.js's grepCodebase(), not an

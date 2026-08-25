@@ -718,7 +718,7 @@ function nextArchDiscoveryTask() {
 // source's fallback-chain behavior): it only fires once every higher-priority source has
 // nothing to offer. A fresh task is generated each time it's this source's turn -- there is
 // no time-based dedup by design (see the grill session this was designed in); dedup against
-// already-known leads happens via the INDEX.md content embedded below, read by Ornith
+// already-known leads happens via the INDEX.md content embedded below, read by the local model
 // itself when proposing queries and synthesizing findings.
 function nextProjectSearchTask() {
   // Real GitHub/HuggingFace search happens later, in local-draft.js's harness-fetch step
@@ -780,7 +780,7 @@ const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 24000;
 //
 // Also extracts the "Relevant to" column (the 3rd cell after the name/url one; table shape
 // is | Project | Source | Description | Relevant to | Status |) -- nextProjectSearchTask()
-// writes this as "<projectTag> -- <reason>" (Ornith fills in the reason, projectTag is
+// writes this as "<projectTag> -- <reason>" (the local model fills in the reason, projectTag is
 // exactly path.basename(repoRoot), same convention used everywhere else in this file), so
 // the leading token before " -- " recovers which consumer project a lead was discovered
 // FOR. Added 2026-07-27 after this field existed in the data but was silently discarded
@@ -815,7 +815,7 @@ function parseStrongLeadsFromIndex(indexText) {
 // Lazy onboarding for one newly-Strong lead: clone it (shallow -- only current history is
 // needed for reading, not the project's own git log) and run build_graph.py against the
 // clone with --no-model-naming (see ADR-0019: naming a community here is a free heuristic,
-// never a spent Ornith round-trip) and --target-dir so this repo's own graphify-out/
+// never a spent local-model round-trip) and --target-dir so this repo's own graphify-out/
 // graph.json is never touched. Both the clone and the graph-build are slow/blocking --
 // deliberately done here, inline in the normal local-worker.ps1 tick, and NOT in
 // queue-watchdog.ps1's tight poll loop (see docs/deep-dive-pipeline.md's "Clone management"
@@ -1093,7 +1093,7 @@ function listSecondBrainTopLevel(secondBrainDir) {
 }
 
 // Registered projects (projects.json, at the package root -- one level up from src/), used
-// so brain_dump_sort can tell Ornith which tracked codebases exist. Best-effort: a
+// so brain_dump_sort can tell the local model which tracked codebases exist. Best-effort: a
 // missing/corrupt registry just yields an empty list, same convention as
 // listSecondBrainTopLevel above -- this is context for the model, not a hard dependency.
 // AGENT_MANAGER_PROJECTS_REGISTRY_PATH override exists purely for this file's own tests
@@ -1230,7 +1230,7 @@ function nextPathPrefetchResolveTask() {
     // from their first attempt) -- nextPathPrefetchResolveTask() returned null for all of
     // them instead of offering the intended retry.
     // Brain Dump #77: two automatic attempts per held task, not one -- a low-reasoning
-    // (Ornith) attempt first, same as always, then ONE automatic high-reasoning (Claude)
+    // (local model) attempt first, same as always, then ONE automatic high-reasoning (Claude)
     // retry if that first attempt didn't land a confident suggestion. Only once both flags
     // are set does this fall back to requiring a human (Discuss, which resets both --
     // see app.py's discuss-end handler).
@@ -1416,7 +1416,7 @@ function taskPriority(name, def) {
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high' });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
 // task" priority tier as adhoc, and reasoningTier: 'high' is UNCONDITIONAL (unlike
-// path_prefetch_resolve's two-tier design) -- Ornith has no web tools at all, so there is
+// path_prefetch_resolve's two-tier design) -- the local model has no web tools at all, so there is
 // no meaningful low-tier attempt to make. No `apply` registered here -- its target
 // (SecondBrain) is outside repoRoot and has nothing to do with the tracked code repo's
 // git state, the same "non-git write target" shape as secondbrain/brain_dump_sort/
@@ -1583,7 +1583,7 @@ function nextArchImportTask() {
       }
       const itemCoverage = coverage.items[itemId];
       if (itemCoverage.promotedAt) continue; // a REAL candidate was produced -- genuinely done
-      // A skipped (zero-harness-grounding, or Ornith declined) attempt is retryable, not
+      // A skipped (zero-harness-grounding, or the local model declined) attempt is retryable, not
       // terminal -- agent-manager's own codebase keeps growing, so a query with zero hits
       // today can find a real match later. Confirmed live 2026-07-26: the old unconditional
       // promotedAt stamp had permanently blocked 134/134 real attempts, none of which ever
@@ -1699,7 +1699,7 @@ function nextPipelineSelfAuditTask() {
   // function marked its signature "reported" forever, and getNextTask() then threw the
   // task away without ever calling writeTask(). Confirmed live: all 6 real clusters found
   // 2026-08-20 04:19-04:40 had a coverage entry but no task file anywhere in the queue --
-  // every one silently burned. Now that this runs via domain:'default' (Ornith, 'low'
+  // every one silently burned. Now that this runs via domain:'default' (local model, 'low'
   // tier, see this function's own header for the 2026-08-20 move off Claude), the SAME
   // discipline still matters -- every next() function here is documented as a pure read
   // with no queue-write side effect (see getNextTask()'s own comment), and this honors it
@@ -1941,7 +1941,7 @@ registerTaskSource('project_search', { priority: taskPriority('project_search', 
 // actually running.
 registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
-// 2026-08-20 to run on the local Ornith model instead of requiring Claude) means this
+// 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
 // right above. apply-task.js's own explicit `task.source === 'pipeline_self_audit'`
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
@@ -1983,7 +1983,7 @@ registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit'
 // backlog-decomposition source) drops a request file into queue/product-spec-requests/,
 // this claims the oldest unclaimed one, oldest-first, same "skip an in-queue id and keep
 // looking" rule every other inbox-style source here already uses. Unlike adhoc, this
-// always runs domain:defaultDomain (Ornith, 'low' tier, same as pipeline_self_audit) --
+// always runs domain:defaultDomain (local model, 'low' tier, same as pipeline_self_audit) --
 // there is no code-repo tool access to justify Claude's agentic path here, only reading the
 // current spec doc and the request text, both handed to the model directly as context, no
 // harness search needed (the "grounding" IS the doc itself, already in hand).
@@ -2175,7 +2175,7 @@ function getNextTask({ tierFilter } = {}) {
 // pipeline gets repointed in between (reproduced live 2026-07-27: repointing at a fresh
 // throwaway repo caused ~48 unrelated cross-project import candidates to be drafted and
 // auto-approved against it). local-worker.ps1 checks this at claim time, before any
-// Ornith compute is spent, and blocks rather than silently proceeding on a mismatch.
+// local-model compute is spent, and blocks rather than silently proceeding on a mismatch.
 function writeTask(task) {
   const { pipelineDir, repoRoot, jobTypeCountersPath } = getConfig();
   const dir = path.join(pipelineDir, 'queue', 'pending');

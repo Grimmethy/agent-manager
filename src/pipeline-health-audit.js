@@ -22,7 +22,7 @@
 // completed in the check window. The other signals (duplicate daemon instances, a GPU
 // lock held with no corresponding "working" heartbeat, known error-log signatures) are
 // supplementary evidence folded into the SAME filed task rather than separate triggers
-// of their own -- a human/Ornith investigating "why did throughput stop" needs all of
+// of their own -- a human/local-model investigating "why did throughput stop" needs all of
 // this at once, not four separate half-informed tasks.
 
 const fs = require('fs');

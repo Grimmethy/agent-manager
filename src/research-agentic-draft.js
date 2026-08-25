@@ -3,7 +3,7 @@
 // Agentic drafting for research-domain tasks (Brain Dump #1 follow-up, 2026-08-17: "how
 // can we turn [a note that requires investigating something on the web] into an
 // actionable task"). Mirrors adhoc-agentic-draft.js's shape (a real agentic Claude Code
-// CLI call instead of Ornith's plain-text-only path -- Ornith has no tool-calling
+// CLI call instead of the local model's plain-text-only path -- the local model has no tool-calling
 // capability at all, confirmed while building the Discuss harness-search feature) but is
 // simpler: a research task never touches the tracked code repo, so there is no git
 // worktree, no branch, no diff to capture -- just a real WebSearch/WebFetch-backed

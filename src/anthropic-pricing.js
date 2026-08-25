@@ -7,7 +7,7 @@
 // we had used the API. Even if we used the local models." -- claude-client.js's own
 // costUsd (Claude Code CLI's own total_cost_usd) already answers this for a call that
 // genuinely WAS made to Claude; this module is the other half, for a call that ran on
-// Ornith/qwen locally instead, computed from the real prompt_eval_count/eval_count token
+// the local model instead, computed from the real prompt_eval_count/eval_count token
 // counts Ollama already reports for every call (see model-stats-client.js's own
 // evalCount/promptEvalCount fields, recorded since before this feature existed).
 //

@@ -340,7 +340,7 @@ function unusedExportImplementPrompt(task, planText) {
 // project_search's plan pass has a different JOB than every other source's plan pass: it
 // doesn't plan a change, it proposes SEARCH QUERIES for the harness to execute against
 // GitHub/Hugging Face between plan and implement (see local-worker.ps1's project_search
-// branch and project-search-fetch.js). Ornith has no internet access, so this is the one
+// branch and project-search-fetch.js). The local model has no internet access, so this is the one
 // place its judgment actually adds value in this source's pipeline -- picking good queries
 // from project context is a reasoning task, not something worth hardcoding as keyword
 // extraction (see ADR-0018).
@@ -450,7 +450,7 @@ function deepDivePlanPrompt(task) {
   const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
   const fileContents = formatFileContents(ctx.files);
   return [
-    `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, Ornith-based workers, majority-vote review gates).`,
+    `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, local-model-based workers, majority-vote review gates).`,
     '',
     `COMMUNITY: ${ctx.communityName} (id ${ctx.communityId}, from ${ctx.projectName})`,
     '',
@@ -491,7 +491,7 @@ function deepDiveImplementPrompt(task, planText) {
 // external project's files; arch_import's job is narrower -- find out where in
 // agent-manager's OWN code this idea would actually land, then draft a real,
 // agent-manager-grounded candidate. Same two-call shape as project_search (plan proposes
-// search terms Ornith itself can't run, the harness runs them, implement gets real
+// search terms the local model itself can't run, the harness runs them, implement gets real
 // results) but searching agent-manager's own repo instead of GitHub/Hugging Face -- see
 // local-worker.ps1's arch_import branch and arch-import-fetch.js.
 function archImportPlanPrompt(task) {
@@ -561,7 +561,7 @@ function archImportImplementPrompt(task, planText) {
 // pipeline_self_audit (2026-08-20, Grimmethy: "Is pipeline self audit dependent entirely
 // on using the claude subscription? If so, change it to rely on the reasoning model
 // itself, even if local"): same two-call shape as arch_import immediately above (plan
-// proposes search terms Ornith can't run itself, the harness greps agent-manager's own
+// proposes search terms the local model can't run itself, the harness greps agent-manager's own
 // repo, implement gets real results) -- but unlike arch_import, this writes a REAL diff
 // directly (groupBJsonInstructions, same as archReviewImplementPrompt) rather than a
 // candidate for a separate fulfillment stage, since the goal here is closing the loop
@@ -1021,7 +1021,7 @@ function troubleLogImplementPrompt(task, planText) {
 // General pipeline pattern, added 2026-08-03: some data an implement pass needs is not
 // something to GENERATE at all -- it's already fully known (an exact field list, an API
 // call shape copied verbatim from real code, a connection-string pattern). Live testing
-// this session found Ornith substitutes a plausible-looking but WRONG version of exactly
+// this session found the local model substitutes a plausible-looking but WRONG version of exactly
 // this kind of data on every attempt (4 separate redrafts of the same field-list array,
 // 4 different wrong lists, none matching the one given verbatim in the prompt) -- not
 // random hallucination, but confidently reaching for a generic prior over the specific
@@ -1032,7 +1032,7 @@ function troubleLogImplementPrompt(task, planText) {
 // task.promptContext.fixedLiterals: optional array of { name, content } -- content is
 // required to appear character-for-character in the final draft. Paired with a
 // deterministic post-implement grep gate in review-runner.ps1 that verifies compliance
-// before spending an Ornith review call, and gives a specific expected-vs-found diff back
+// before spending a local-model review call, and gives a specific expected-vs-found diff back
 // to the next redraft attempt instead of vague prose criticism.
 function fixedLiteralsBlock(task) {
   const literals = task.promptContext && Array.isArray(task.promptContext.fixedLiterals)

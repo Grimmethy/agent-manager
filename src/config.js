@@ -215,7 +215,7 @@ function getConfig() {
   });
 
   // Three-tier approval mode (harnss's per-tool approval_mode pattern, adapted
-  // 2026-07-26): 'auto' (apply-runner.ps1 applies automatically once Ornith approves),
+  // 2026-07-26): 'auto' (apply-runner.ps1 applies automatically once the local model approves),
   // 'approve' (waits in queue/approved/ for a human to manually apply via the dashboard's
   // per-task Apply button), 'prompt' (same as 'approve' -- still requires an explicit
   // human click, never auto-applies on a timeout -- but the dashboard actively badges it
@@ -234,7 +234,7 @@ function getConfig() {
   const defaultApprovalMode = process.env.AGENT_MANAGER_INCLUDE_APPLY === 'true' ? 'auto' : 'approve';
 
   // Per-source worker-type (reasoning tier) overrides -- lets the dashboard's Job List tab
-  // make "which worker (Ornith/low-reasoning vs the Claude-backed reasoning worker) claims
+  // make "which worker (local-model/low-reasoning vs the Claude-backed reasoning worker) claims
   // this source's tasks" live-editable without a code change. Same sparse-override format
   // as AGENT_MANAGER_TASK_PRIORITIES/AGENT_MANAGER_APPROVAL_MODES ("name:tier,name:tier").
   // Consulted by model-provider.js's reasoningTierFor() BEFORE a source's own static
@@ -242,7 +242,7 @@ function getConfig() {
   // (e.g. the automatic high-reasoning retry) -- an explicit human override should win over
   // a source's baked-in default, but never override a one-off automatic escalation for a
   // task that already failed once. Note adhoc/research_task's actual draft call is hardcoded
-  // to Claude regardless (see model-provider.js) -- overriding those two to 'ornith' here
+  // to Claude regardless (see model-provider.js) -- overriding those two to 'low' here
   // only changes which worker's claim filter picks the task up, not what drafts it.
   const rawTaskTiers = process.env.AGENT_MANAGER_TASK_TIERS || '';
   const taskTierOverrides = {};

@@ -7,7 +7,7 @@
 // temperature/numPredict/think regardless of which model is actually running -- if a
 // second model (Hermes3, benchmarked against ornith:9b per Grimmethy) genuinely needs
 // different settings to perform well, there was previously no way to express that without
-// hardcoding an if/else at every Invoke-OrnithClient call site.
+// hardcoding an if/else at every Invoke-LocalClient call site.
 //
 // Deliberately conservative on content: neither registered strategy below carries
 // temperature/numPredict/think overrides yet -- there is no real benchmarking evidence yet

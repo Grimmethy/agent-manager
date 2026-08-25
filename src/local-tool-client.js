@@ -284,11 +284,11 @@ const MODEL = process.env.LOCAL_MODEL;
 // Matches local-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
 // reasoning that a tool-calling turn can legitimately run longer than a plain generation
 // call. That reasoning turned out to be actively harmful, not just generous: this exact
-// path is why Invoke-OrnithToolClient is disabled in local-worker.ps1 (see that file's
+// path is why Invoke-LocalToolClient is disabled in local-worker.ps1 (see that file's
 // comment) -- a real call through here stalled a worker for 13+ minutes with no progress,
 // and a 30-min ceiling meant nothing would have caught it for a very long time if the
-// disable hadn't happened first. 5 minutes is the formalized ceiling for every Ornith-call-
-// or liveness-related timeout in this pipeline as of 2026-07-19 (see
+// disable hadn't happened first. 5 minutes is the formalized ceiling for every local-model-
+// call- or liveness-related timeout in this pipeline as of 2026-07-19 (see
 // docs/pipeline-incident-2026-07-19.md and queue-watchdog.ps1's $WorkerZombieThresholdSeconds)
 // -- repeated-failure downtime compounds fast, and no legitimate call needs longer than
 // this. Do not raise this again "to be safe" without revisiting that reasoning first.

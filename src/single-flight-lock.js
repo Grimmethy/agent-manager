@@ -10,7 +10,7 @@
 //
 // Built to fix a real, observed problem (2026-08-22, Grimmethy: "build [a real plan/
 // implement lock split] now"): local-draft.js's draftTask() runs an adhoc/research
-// task's PLAN pass through local Ornith (genuinely needs this lock) then unconditionally
+// task's PLAN pass through the local model (genuinely needs this lock) then unconditionally
 // bypasses to a real Claude call for IMPLEMENT (never touches the local GPU at all) --
 // but the OLD bash-level lock in local-worker.sh had to choose ONE lock decision for the
 // whole `node local-draft.js` call, so it either protected the plan pass and then kept
