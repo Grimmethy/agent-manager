@@ -458,8 +458,7 @@ function nextSecondBrainTask() {
   }
 
   const notes = entries
-    .filter((e) => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('_')
-      && !e.name.toLowerCase().startsWith('ornith live log'))
+    .filter((e) => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('_'))
     .map((e) => {
       const full = path.join(inboxDir, e.name);
       return { name: e.name, full, mtime: fs.statSync(full).mtimeMs };
