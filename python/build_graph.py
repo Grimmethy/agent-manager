@@ -49,6 +49,13 @@ from networkx.algorithms.community import greedy_modularity_communities
 JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
 PY_EXTENSIONS = {".py"}
 LUA_EXTENSIONS = {".lua"}
+# Zig (2026-08-25, Grimmethy: "If Zig is going to exist in our project we need to be able
+# to map it and work with it. We need to be able to pass anything we use through the
+# Hygiene Plugin" -- deep_dive onboarded nullclaw/nullboiler, a Zig codebase, and this
+# module came back with zero communities: every other language here had a parser, Zig had
+# none, so the whole file-walk found nodes but no edges to cluster them by). See
+# ZIG_IMPORT_RE/resolve_zig_import below for the resolution rules.
+ZIG_EXTENSIONS = {".zig"}
 # HTML (2026-08-18, needs-clarification sweep): added specifically so Flask template files
 # (python/dashboard/templates/*.html) can appear in the graph at all -- confirmed live that
 # this project's own dashboard UI (buttons, columns, worker panels, the graph view, theme
@@ -61,7 +68,7 @@ LUA_EXTENSIONS = {".lua"}
 # and pruned right back out by build_graph_data's isolated-node cleanup, same fate the
 # python/dashboard/*.py files had before that fix.
 HTML_EXTENSIONS = {".html"}
-MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS | LUA_EXTENSIONS | HTML_EXTENSIONS
+MATCH_EXTENSIONS = JS_EXTENSIONS | PY_EXTENSIONS | LUA_EXTENSIONS | HTML_EXTENSIONS | ZIG_EXTENSIONS
 EXCLUDE_DIRS = {
     "node_modules", ".git", "queue",
     # Only matters when walk_source_files falls back to scanning the whole repo_root
@@ -100,6 +107,16 @@ LUA_INCLUDE_RE = re.compile(
     r"""(?:VFS\.Include|dofile|require|VFS\.LoadFile)\s*\(\s*([^\)]*?)\s*[,\)]"""
 )
 LUA_STRLIT_RE = re.compile(r'"([^"]*\.lua)"')
+
+# Zig's @import("...") takes exactly one string literal argument (Zig has no single-quote
+# strings and no dynamic import -- the argument is always a compile-time-known literal),
+# covering two genuinely different things: a FILE import ('@import("foo.zig")',
+# '@import("sub/bar.zig")' -- always ends in .zig, resolved relative to the importing
+# file's own directory, no leading "./" required unlike JS) and a MODULE import
+# ('@import("std")', '@import("build_options")', or any name declared as a dependency in
+# build.zig/build.zig.zon -- never ends in .zig, not a local file at all). See
+# resolve_zig_import below for how the two are told apart.
+ZIG_IMPORT_RE = re.compile(r'@import\(\s*"([^"]+)"\s*\)')
 
 # Flask's render_template('index.html', ...) is the one real link from a Python file to a
 # .html template -- not an `import`, so IMPORT_RE_PY never sees it, but it's the exact
@@ -273,6 +290,20 @@ def resolve_lua_import(spec: str, repo_root: Path, file_set: set[Path]) -> Path 
     return None
 
 
+def resolve_zig_import(from_file: Path, spec: str) -> Path | None:
+    """A spec ending in '.zig' is always a file import, resolved relative to from_file's
+    own directory -- unlike JS, Zig requires NO leading './'/'../' to distinguish a local
+    file from a named module ('foo.zig' and './foo.zig' are equally valid and identical in
+    meaning); the '.zig' suffix itself is the only signal. Anything else ('std',
+    'build_options', or a name declared as a dependency in build.zig/build.zig.zon) is a
+    module/package reference with no single local file to point at -- correctly ignored,
+    same as a bare JS package name or Python stdlib/third-party import above."""
+    if not spec.endswith(".zig"):
+        return None
+    candidate = (from_file.parent / spec).resolve()
+    return candidate if candidate.is_file() else None
+
+
 def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) -> list[str]:
     """Returns the list of relative target paths f imports/requires/includes that also
     exist in file_set (excluding self-edges) -- the actual regex-scan-and-resolve work,
@@ -281,6 +312,7 @@ def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) 
     rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
     is_python = f.suffix in PY_EXTENSIONS
     is_lua = f.suffix in LUA_EXTENSIONS
+    is_zig = f.suffix in ZIG_EXTENSIONS
     edges = []
 
     if is_python:
@@ -306,6 +338,16 @@ def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) 
             if not lit_matches:
                 continue
             target = resolve_lua_import(lit_matches[-1], repo_root, file_set)
+            if target and target in file_set:
+                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+                if rel_to != rel_from:
+                    edges.append(rel_to)
+    elif is_zig:
+        for match in ZIG_IMPORT_RE.finditer(text):
+            spec = match.group(1)
+            if not spec:
+                continue
+            target = resolve_zig_import(f, spec)
             if target and target in file_set:
                 rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
                 if rel_to != rel_from:
