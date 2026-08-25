@@ -154,3 +154,24 @@ test('isEnabled reflects AGENT_MANAGER_LOCAL_AGENTIC_ADHOC exactly', () => {
   assert.equal(require('./local-agentic-draft.js').isEnabled(), true);
   delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
 });
+
+// Structural-capability gap fix, 2026-08-25 -- same incident/reasoning as
+// adhoc-harness-draft.js's own identical check: this tier is read-only by design (see
+// this file's own header, "the model NEVER gets a direct write_file/edit_file/bash-
+// execution tool"), so it can never satisfy a task that requires actually running a
+// verification command, regardless of the opt-in flag being on.
+test('applied:false immediately, with zero runPlan calls, when the task requires running a verification command (even when enabled)', async () => {
+  process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC = 'true';
+  await withFixtureRepo(async (mod) => {
+    const task = makeTask({
+      promptContext: { rawText: 'Add a new module and a test file. Run `python3 -m py_compile` on new files and run the new test module before finishing.' },
+    });
+    let calls = 0;
+    const runPlan = async () => { calls++; return { response: 'RESOLUTION: implemented\n{}' }; };
+    const result = await mod.draftAdhocViaLocalAgentic(task, { runPlan });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /cannot execute/);
+    assert.equal(calls, 0, 'must decline before spending any runPlan call');
+  });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
+});

@@ -52,6 +52,21 @@ function isEnabled() {
   return process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC === 'true';
 }
 
+// 2026-08-25, root-caused live via a real blocked adhoc task (wikilink note-graph
+// builder): the task explicitly required running `python3 -m py_compile` and a new test
+// module before finishing -- structurally impossible here too, per this file's own header
+// above ("the model NEVER gets a direct write_file/edit_file/bash-execution tool... it
+// only investigates read-only"). Same check, same reasoning, as adhoc-harness-draft.js's
+// own REQUIRES_COMMAND_EXECUTION_RE -- duplicated rather than shared (small, static,
+// rarely-changed literal; see local-worker.sh's own INFRA_FAILURE_PATTERN comment for the
+// precedent on why two short copies beat one shared indirection here).
+const REQUIRES_COMMAND_EXECUTION_RE = /\bpy_compile\b|\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
+
+function requiresCommandExecution(task) {
+  const rawText = (task.promptContext && task.promptContext.rawText) || '';
+  return REQUIRES_COMMAND_EXECUTION_RE.test(rawText);
+}
+
 // Deliberately NOT model-provider.js's labelFor(task) -- same reasoning
 // adhoc-harness-draft.js's own localDraftModelLabel() documents (adhoc is registered
 // high-tier, so labelFor(task) always says "claude:..." regardless of which backend
@@ -103,6 +118,9 @@ function buildLocalAgenticPrompt(task) {
 async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = {}) {
   if (!isEnabled()) {
     return { applied: false, succeeded: true, reason: 'AGENT_MANAGER_LOCAL_AGENTIC_ADHOC is not enabled' };
+  }
+  if (requiresCommandExecution(task)) {
+    return { applied: false, succeeded: true, reason: 'task explicitly requires running a verification command (compile/test) this read-only tier cannot execute -- deferring to a tier with real command access' };
   }
 
   const { repoRoot, pipelineDir } = getConfig();
