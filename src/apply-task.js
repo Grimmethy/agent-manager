@@ -297,7 +297,21 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // normal throwaway agent/<id> branch.
     const commitsDirectlyToMain = DIRECT_TO_MAIN_SOURCES.has(task.source);
     const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
-    if (branchName) gitRunner.createBranch(branchName);
+    if (branchName) {
+      // Defensive pre-cleanup (2026-08-25 -- same fix, same root cause, as adhoc-agentic-
+      // draft.js's own scratch-worktree branch: confirmed live via apply-task-loop.log,
+      // "fatal: a branch named 'agent/adhoc-add-a-hardware-tab-...' already exists" on
+      // every single retry, forever). branchName is deterministic (task.id only) and
+      // createBranch() below has no surrounding try/catch of its own -- if it throws
+      // because a PRIOR interrupted apply attempt (a kill, a crash, a host reboot) left
+      // this exact branch behind, the exception propagates straight out of applyTask()
+      // with no cleanup at all, and every future retry for this same task fails
+      // identically. We're guaranteed to already be on main here (resetToMain() above
+      // just checked it out), so deleting any stale same-named branch is always safe --
+      // it can only ever be THIS task's own abandoned leftover, never another task's.
+      try { gitRunner.deleteBranch(branchName); } catch (_) { /* no stale branch */ }
+      gitRunner.createBranch(branchName);
+    }
 
     let artifact;
     try {
