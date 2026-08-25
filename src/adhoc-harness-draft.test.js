@@ -157,3 +157,40 @@ test('applied:false when the implement pass produces a Group-B diff that fails t
     assert.equal(task.rawDiff, undefined, 'a failed attempt must not leave partial state on the task');
   });
 });
+
+// Structural-capability gap fix, 2026-08-25 (root-caused live: wikilink note-graph
+// builder task required a second new test file plus actually running `python3 -m
+// py_compile` and the new tests -- this tier has no Bash/command-execution access at
+// all, ever, so it confidently produced an incomplete single-file diff instead of
+// declining). Declines immediately, before spending any local-model call at all.
+test('applied:false immediately, with zero local calls, when the task requires running a verification command', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask({
+      promptContext: { rawText: 'Add a new module and a test file. Run `python3 -m py_compile` on new files and run the new test module before finishing.' },
+    });
+    let calls = 0;
+    const localCall = async () => { calls++; return { response: 'QUERY: RATE', degenerate: null, attempts: 1 }; };
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /cannot execute/);
+    assert.equal(calls, 0, 'must decline before spending any local-model call -- it can never satisfy this requirement regardless of what the model says');
+  });
+});
+
+test('applied:false immediately when the task requires pytest specifically', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask({ promptContext: { rawText: 'Add a function and cover it with pytest.' } });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall: async () => { throw new Error('must not be called'); } });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /cannot execute/);
+  });
+});
+
+test('a task that merely mentions "test" without demanding command execution is unaffected', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask({ promptContext: { rawText: 'Add a unit test for the RATE constant in widget.js.' } });
+    const localCall = async () => ({ response: 'QUERY: RATE', degenerate: null, attempts: 1 });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.notEqual(result.reason, 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access');
+  });
+});

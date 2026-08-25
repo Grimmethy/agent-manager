@@ -46,6 +46,27 @@ function extractQueries(planText) {
   return [...(planText || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
 }
 
+// 2026-08-25, root-caused live via a real blocked adhoc task (wikilink note-graph
+// builder): the task explicitly required a SECOND new file (a test module) plus actually
+// RUNNING `python3 -m py_compile` and the new tests before finishing -- a real,
+// unmeetable requirement for this tier, which is a single-shot text completion with no
+// Bash/command-execution access at all, ever (see this file's own header: "cheap,
+// single-shot, no iteration"). It confidently produced a complete-looking single file,
+// never wrote the required test module, and never ran anything -- not because it made a
+// mistake, but because doing so is structurally outside what a no-tool text completion
+// can do. Two retries independently landed back on this same tier and failed the exact
+// same way both times, since nothing about a fresh attempt changes what this tier is
+// capable of. Same INFRA_FAILURE_PATTERN-style "small, static, rarely-changed literal,
+// duplicated rather than shared" reasoning as local-worker.sh's own comment -- kept in
+// sync manually with local-agentic-draft.js's identical check, since neither tier can
+// execute a command regardless of how it drafts.
+const REQUIRES_COMMAND_EXECUTION_RE = /\bpy_compile\b|\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
+
+function requiresCommandExecution(task) {
+  const rawText = (task.promptContext && task.promptContext.rawText) || '';
+  return REQUIRES_COMMAND_EXECUTION_RE.test(rawText);
+}
+
 /**
  * Attempts to draft an adhoc task's implementation via the harness-search-first tier.
  * Mutates `task` in place (implementResponse, rawDiff, adhocResolution, draftModel) ONLY
@@ -65,6 +86,10 @@ function extractQueries(planText) {
  *     block the task outright.
  */
 async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
+  if (requiresCommandExecution(task)) {
+    return { applied: false, succeeded: true, reason: 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access' };
+  }
+
   const { repoRoot, pipelineDir } = getConfig();
   // Deliberately NOT model-provider.js's providerFor(task).call -- adhoc is registered
   // high-tier, so providerFor(task) resolves to Claude by default (unless
