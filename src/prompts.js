@@ -569,6 +569,63 @@ function pipelineSelfAuditPlanPrompt(task) {
   ].join('\n');
 }
 
+// pipeline_health_audit (2026-08-24, Grimmethy: "that going looking needs to be an
+// automated process. A task that happens just like any other hygiene task") -- same
+// two-call harness-search shape as pipeline_self_audit right above (arguably worth
+// consolidating into one shared helper someday; kept as its own explicit copy for now,
+// consistent with how staleness_audit's identical branch was added the same way). The
+// evidence here comes from pipeline-health-audit.js's live process/queue/log inspection
+// instead of a blocked-task cluster -- a live-system incident (a broken model profile,
+// orphaned processes holding a lock, a masked bash error) rather than a code-only bug a
+// blocked-task pattern could point at, so the plan explicitly asks for BOTH: real code
+// investigation AND an assessment of whether the anomaly is still ongoing right now.
+function pipelineHealthAuditPlanPrompt(task) {
+  const ctx = task.promptContext;
+  return [
+    'A deterministic health check of THIS PIPELINE\'S OWN live daemons, queue throughput, and recent logs found something that looks anomalous -- see the evidence below. This may be a real bug in this pipeline\'s own code, a transient operational hiccup already resolved, or evidence a human already fixed by hand since this check ran.',
+    '',
+    ctx.evidenceText,
+    '',
+    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the pipeline code responsible for whatever the evidence points at -- think about which daemon script, lock, or model-call path the anomaly implicates.',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function pipelineHealthAuditImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this pipeline\'s own code)';
+  const filesText = files.length > 0
+    ? formatFileContents(files)
+    : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms to find the pipeline code behind this anomaly:',
+    '',
+    planText,
+    '',
+    'ORIGINAL EVIDENCE:',
+    ctx.evidenceText,
+    '',
+    'The harness ran those searches against THIS PIPELINE\'S OWN repo. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'If the real matches above clearly show a root cause worth fixing, write ONE small, safely-scoped fix for it -- grounded ONLY in the real file content shown above, never a guessed or invented file/line/symbol. Stay inside exactly the anomaly the evidence points at; do not expand scope to adjacent cleanup even if something else nearby looks wrong. If the anomaly looks like a transient/already-resolved hiccup rather than a real code bug (e.g. a since-restarted daemon, a since-cleared lock), or the searches did not find anything that clearly explains it, output the empty string and nothing else -- do not force a change onto files you have not actually seen grounded content for, and do not "fix" something that already fixed itself.',
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
+}
+
 function pipelineSelfAuditImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const hits = ctx.harnessHits || [];
@@ -1032,6 +1089,7 @@ updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, b
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
 updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
+updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAuditPlanPrompt, buildImplementPrompt: pipelineHealthAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositionPlanPrompt, buildImplementPrompt: backlogDecompositionImplementPrompt });

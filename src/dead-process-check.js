@@ -159,6 +159,52 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
   return actions;
 }
 
+// Orphaned model-call child process detection (2026-08-24, pipeline hardening --
+// Grimmethy: "that going looking needs to be an automated process"). Caught live: killing
+// a worker daemon's own bash loop (e.g. to pick up a code fix) does NOT kill its
+// in-flight `node local-draft.js` child -- that process just keeps running, one seen
+// stuck 11+ minutes, still holding the GPU single-flight lock, silently blocking every
+// NEW draft call pipeline-wide with no error anywhere. dead-process-check.js above
+// already handles "this daemon INSTANCE looks dead, restart it" via heartbeat staleness;
+// this is the complementary case its own heartbeat mechanism can't see at all -- the
+// PARENT is confirmed gone, but a CHILD it spawned is still alive and unaccounted for.
+//
+// Detection is the standard, portable Unix orphan signal: when a parent process dies,
+// its children are re-parented to PID 1 (the init/reaper process) rather than being
+// killed automatically. A `node local-draft.js` process with ppid===1 is therefore, by
+// construction, no longer under ANY daemon's control -- there is no legitimate
+// "in-flight call the current worker is waiting on" story for it, since a live worker's
+// real in-flight call always has that worker's own bash PID as its parent. No heartbeat
+// cross-referencing needed (and none attempted) -- ppid===1 alone is sufficient and
+// avoids the fragile alternative of trying to match a specific expected PPID across
+// bash's own subshell/command-substitution process nesting.
+//
+// Killing an orphan is unambiguously safe: by definition nothing is waiting on its
+// result (its own parent, the only thing that could have been, is gone), and the task
+// file it was working from is untouched on disk, so a fresh worker claim just starts a
+// real new attempt -- same "always reversible, never lose real queued work" property
+// dead-process-check.js's own daemon restarts already have.
+const MODEL_CALL_SCRIPT_RE = /\blocal-draft\.js\b/;
+
+function listProcessesWithPpid() {
+  const { execFileSync } = require('child_process');
+  const out = execFileSync('ps', ['-eo', 'pid,ppid,cmd', '--no-headers'], { encoding: 'utf8' });
+  return out.split('\n').map((line) => {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    return m ? { pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] } : null;
+  }).filter(Boolean);
+}
+
+function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid } = {}) {
+  let processes;
+  try {
+    processes = listProcesses();
+  } catch (e) {
+    return []; // `ps` unavailable/failed -- best-effort, same as every other check here.
+  }
+  return processes.filter((p) => p.ppid === 1 && MODEL_CALL_SCRIPT_RE.test(p.cmd));
+}
+
 function main() {
   const { pipelineDir } = getConfig();
   const instancesDir = path.join(pipelineDir, 'instances');
@@ -166,9 +212,14 @@ function main() {
 
   const actions = deadProcessCheck({ instancesDir, cooldownPath });
   for (const action of actions) process.stdout.write(`${JSON.stringify(action)}\n`);
+
+  const orphans = findOrphanedModelCallProcesses();
+  for (const orphan of orphans) {
+    process.stdout.write(`${JSON.stringify({ action: 'kill-orphan', pid: orphan.pid, reason: `orphaned model-call process (ppid=1, cmd: ${orphan.cmd.slice(0, 120)})` })}\n`);
+  }
 }
 
-module.exports = { deadProcessCheck, restartTargetFor, isProcessAlive };
+module.exports = { deadProcessCheck, restartTargetFor, isProcessAlive, findOrphanedModelCallProcesses };
 
 if (require.main === module) {
   main();

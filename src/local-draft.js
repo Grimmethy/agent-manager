@@ -355,6 +355,29 @@ async function draftTask(task, {
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
+      // pipeline_health_audit (2026-08-24, see pipeline-health-audit.js's own header):
+      // exact same two-call harness-search shape as pipeline_self_audit right above --
+      // the evidence here comes from a live-system check (process/queue/log inspection)
+      // instead of a blocked-task cluster, but the "propose search terms, ground the fix
+      // in real matched file content" mechanism is identical.
+      if (task.source === 'pipeline_health_audit') {
+        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+        let harnessHits = [];
+        let harnessFiles = [];
+        if (queries.length > 0) {
+          try {
+            const result = archImportFetch(queries);
+            harnessHits = result.hits || [];
+            harnessFiles = result.files || [];
+          } catch (e) {
+            // Non-fatal -- same try/catch treatment pipeline_self_audit's own branch above gives.
+          }
+        }
+        task.promptContext.harnessHits = harnessHits;
+        task.promptContext.harnessFiles = harnessFiles;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      }
+
       // staleness_audit (2026-08-22, see staleness-audit.js's own header): same
       // harness-grounded two-call shape as pipeline_self_audit/arch_import right above --
       // the premise recheck this source exists for genuinely needs to see CURRENT real
