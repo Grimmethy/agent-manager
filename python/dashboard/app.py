@@ -3437,10 +3437,16 @@ def api_chat_message(session_id):
 @app.route("/api/chat/<session_id>/reserve", methods=["POST"])
 def api_chat_reserve(session_id):
     """Toggles "fully reserving the reasoning model" (Brain Dump #153) for this session --
-    holding instances/.pipeline-single-flight.lock across turns, not just for the span of
-    one call, so the whole local pipeline goes idle until you release it. Body: {on: bool}.
-    Only meaningful for the local provider (Claude has no shared-resource lock, per the
-    earlier decision not to lock Claude calls against each other)."""
+    holding the reasoning model's own per-model lock (instances/.pipeline-single-flight.
+    <model>.lock -- see single_flight_lock.py's own header for the 2026-08-25 per-model
+    keying this relies on) across turns, not just for the span of one call. Since
+    2026-08-25 this only idles whatever else is contending for THAT specific model
+    (worker-reasoning, local-tool-client.js's arch_discovery/Chat-with-tools calls,
+    Discuss's local provider) -- a cheap-model lane like worker-1's brain_dump_sort
+    traffic keeps running unaffected, unlike before this locking was split per-model.
+    Body: {on: bool}. Only meaningful for the local provider (Claude has no shared-
+    resource lock, per the earlier decision not to lock Claude calls against each
+    other)."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
@@ -3480,7 +3486,8 @@ def api_chat_reserve(session_id):
             with _chat_reservations_lock:
                 _chat_reservations.pop(session_id, None)
             abort(500, description="no active project's instances dir resolvable")
-        fh = single_flight_lock.acquire(inst_dir)  # blocking -- may wait for a worker lane's current call
+        import ollama_client
+        fh = single_flight_lock.acquire(inst_dir, ollama_client.MODEL)  # blocking -- may wait for a worker lane's current call on this same model
         with _chat_reservations_lock:
             _chat_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": pipeline_dir}
 

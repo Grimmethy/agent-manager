@@ -150,7 +150,11 @@ def _maybe_locked(instances_dir):
     existed, rather than the lock becoming a new way for Discuss to hard-fail)."""
     if instances_dir is None:
         return nullcontext()
-    return single_flight_lock.held(Path(instances_dir))
+    # Keyed by ollama_client.MODEL (2026-08-25 -- see single_flight_lock.py's own header)
+    # so this shares a lockfile with worker-reasoning's own calls against the SAME model,
+    # instead of the old global lockfile that also serialized against unrelated-model
+    # calls (e.g. brain_dump_sort's cheap qwen2.5:3b) for no reason.
+    return single_flight_lock.held(Path(instances_dir), ollama_client.MODEL)
 
 
 def _local_harness_context(subject_text: str, transcript: list, repo_root: str, grep_dirs: str = None,

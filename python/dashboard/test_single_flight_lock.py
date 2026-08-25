@@ -33,6 +33,49 @@ class AcquireReleaseTest(unittest.TestCase):
     def test_release_none_is_a_safe_noop(self):
         single_flight_lock.release(None)  # must not raise
 
+    def test_acquire_with_no_key_uses_the_original_global_lockfile(self):
+        d = Path(tempfile.mkdtemp())
+        fh = single_flight_lock.acquire(d)
+        self.assertTrue((d / single_flight_lock.LOCK_NAME).exists())
+        single_flight_lock.release(fh)
+
+    def test_acquire_with_a_key_uses_a_separate_per_model_lockfile(self):
+        d = Path(tempfile.mkdtemp())
+        fh = single_flight_lock.acquire(d, "qwen2.5:3b")
+        expected = d / ".pipeline-single-flight.qwen2.5_3b.lock"
+        self.assertTrue(expected.exists())
+        self.assertFalse((d / single_flight_lock.LOCK_NAME).exists())
+        single_flight_lock.release(fh)
+
+    def test_two_different_keys_do_not_block_each_other(self):
+        d = Path(tempfile.mkdtemp())
+        fh_a = single_flight_lock.acquire(d, "model-a")
+        try:
+            # A real bash flock -n against model-b's own lockfile must succeed even while
+            # model-a's lock is held -- this is the actual throughput fix: two different
+            # models no longer serialize against each other.
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'exec 200>"{d / single_flight_lock._lock_name("model-b")}"; flock -n 200 && echo GOT_IT || echo BLOCKED'],
+                capture_output=True, text=True,
+            )
+            self.assertIn("GOT_IT", result.stdout)
+        finally:
+            single_flight_lock.release(fh_a)
+
+    def test_the_same_key_still_serializes_against_itself(self):
+        d = Path(tempfile.mkdtemp())
+        fh_a = single_flight_lock.acquire(d, "model-a")
+        try:
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'exec 200>"{d / single_flight_lock._lock_name("model-a")}"; flock -n 200 && echo GOT_IT || echo BLOCKED'],
+                capture_output=True, text=True,
+            )
+            self.assertIn("BLOCKED", result.stdout)
+        finally:
+            single_flight_lock.release(fh_a)
+
     def test_acquire_spans_multiple_separate_calls_a_real_bash_flock_blocks_until_release(self):
         d = Path(tempfile.mkdtemp())
         fh = single_flight_lock.acquire(d)

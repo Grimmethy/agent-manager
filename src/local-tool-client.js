@@ -356,7 +356,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
     const { call } = require('./local-client.js');
     // local-client.js's own call() doesn't self-lock -- local-draft.js's maybeLocked()
     // wraps it externally for its own plan pass, same discipline applied here.
-    const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }));
+    const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }), MODEL);
     return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
   }
 
@@ -392,7 +392,7 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
       messages,
       tools,
       stream: false,
-    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders));
+    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
 
     const message = res.message || {};
     lastMessage = message;
