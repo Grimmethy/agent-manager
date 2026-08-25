@@ -110,6 +110,30 @@ refresh_active_model
 # both racing to claim from the same drafting/worker-1/ folder).
 check_instance_liveness "$INSTANCE_ID" || exit 1
 
+STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
+
+# Claim-the-heartbeat-immediately fix (2026-08-25, root-caused live: a full pipeline
+# restart left TWO real worker-reasoning processes alive at once, racing to claim/draft
+# the SAME tasks -- one legitimately started by launch.sh, a second spawned moments later
+# by queue-watchdog's dead-process-check believing the instance was dead). The gap:
+# check_instance_liveness above only protects against starting a SECOND process while an
+# OLD one is still alive; it does nothing once this (legitimate, sole) process has already
+# started, because this script's first real write_heartbeat_file call used to happen deep
+# inside the main loop below (after reclaim-orphaned-drafts and a task-sources.js
+# generation pass, both real node subprocess spawns) -- easily several seconds, sometimes
+# much longer under load. In that window, instances/<id>.json still holds the OLD,
+# pre-restart process's heartbeat; if a graceful stop.sh shutdown (SIGTERM + up to 90s
+# grace) plus this startup gap together push that heartbeat's age past
+# dead-process-check.js's own 300s staleness threshold before THIS process ever gets to
+# overwrite it with its own live pid, queue-watchdog's next tick has no way to tell "the
+# old holder is dead" apart from "a new, legitimate holder just hasn't reported in yet" --
+# it sees a stale heartbeat, confirms the OLD pid is gone (true), and spawns a replacement,
+# never knowing one already exists. Writing a real heartbeat (this process's own $$, via
+# write_heartbeat_file) THE MOMENT liveness is confirmed -- before any of that slower
+# setup work -- closes the window: any dead-process-check tick from here on sees a fresh
+# heartbeat with a genuinely alive pid and correctly leaves this instance alone.
+write_heartbeat_file "$INSTANCE_ID" "starting" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
+
 # Graceful stop: bash defers a trapped signal until the current foreground command
 # (e.g. the node local-draft.js call below) returns control to the shell, so this exits
 # right after finishing whatever draft is in flight rather than mid-call -- no orphaned
@@ -121,7 +145,6 @@ HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"                                              
 LOG_FILE="${HOME_LOGS}/local-worker-${INSTANCE_ID}.log"          # per-instance log file for daemon status; keeps logs grouped by worker so user can grep / watch progress of specific loop instance without wading through others' output (same pattern as PowerShell's `Start-Transcript -Path $logFile` per-job pattern).
 
 # Infinite polling loop mimicking PowerShell's `while ($true) { ... Start-Sleep -Seconds 60 }` block structure exactly — same design philosophy: simple poll-and-do is easier to debug than event-driven alternatives for file-based state (which agent-manager uses exclusively, not databases or message queues that would benefit from true push mechanisms).
-STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
 # Runs the plan -> implement -> critique -> (revision) passes (local-draft.js) against a
 # task JSON already sitting in queue/drafting/${INSTANCE_ID}/, then files the result into
