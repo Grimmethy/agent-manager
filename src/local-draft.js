@@ -378,6 +378,28 @@ async function draftTask(task, {
         appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
       }
 
+      // ui_visibility_audit (2026-08-24, see ui-visibility-audit.js's own header): same
+      // two-call harness-search shape as pipeline_health_audit right above -- the
+      // evidence here is a route with no reference in any scanned frontend source file,
+      // needing the same "ground the verdict in real matched file content" treatment.
+      if (task.source === 'ui_visibility_audit') {
+        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+        let harnessHits = [];
+        let harnessFiles = [];
+        if (queries.length > 0) {
+          try {
+            const result = archImportFetch(queries);
+            harnessHits = result.hits || [];
+            harnessFiles = result.files || [];
+          } catch (e) {
+            // Non-fatal -- same try/catch treatment pipeline_health_audit's own branch above gives.
+          }
+        }
+        task.promptContext.harnessHits = harnessHits;
+        task.promptContext.harnessFiles = harnessFiles;
+        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      }
+
       // staleness_audit (2026-08-22, see staleness-audit.js's own header): same
       // harness-grounded two-call shape as pipeline_self_audit/arch_import right above --
       // the premise recheck this source exists for genuinely needs to see CURRENT real
