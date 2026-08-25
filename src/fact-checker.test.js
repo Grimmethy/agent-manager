@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits } = require('./fact-checker.js');
+const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -298,4 +298,53 @@ test('checkDraft does NOT flag a real, existing commit hash', () => {
   const result = checkDraft(`This was already resolved in commit ${realHash}, no changes needed.`, dir);
   const fabricated = result.flags.filter((f) => f.type === 'fabricated-commit-reference');
   assert.deepEqual(fabricated, []);
+});
+
+// checkGroundedValues: newly-declared identifier exemption ------------------------------
+// 2026-08-25, root-caused live via a real blocked task: a pure UI change legitimately
+// introduced two brand-new JS constants (JOB_TYPE_FAMILIES, JOB_TYPE_FAMILY_BY_SOURCE) as
+// part of a real `+const NAME = ...` line in its own diff, and both got flagged
+// ungrounded-field -- a category error, not a false positive of the check's ORIGINAL
+// purpose (a fabricated EXTERNAL data field, e.g. a GIS column name that's supposed to
+// already exist upstream). A value the draft's own diff is DEFINING right now can never
+// appear in grounding material that, by construction, predates the definition.
+
+test('checkGroundedValues does not flag a newly-declared constant from a real +const line in the draft\'s own diff', () => {
+  const draftText = [
+    'Added grouping support.',
+    '',
+    '=== DIFF ===',
+    'diff --git a/index.html b/index.html',
+    '@@ -10,0 +11,3 @@',
+    '+const JOB_TYPE_FAMILIES = [',
+    '+  { key: "arch", members: ["arch_discovery"] },',
+    '+];',
+  ].join('\n');
+  const sourceText = 'unrelated grounding material that never mentions that constant at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues still flags a genuinely fabricated field that is NOT declared anywhere in the diff', () => {
+  const draftText = 'The response includes the FCV_CUR field for current value.';
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
+});
+
+test('checkGroundedValues does not exempt a field that merely APPEARS on a diff line without being declared', () => {
+  // A reference to an ungrounded field inside a comment or a call, not a real declaration
+  // of it, must still be flagged -- only an actual `const/let/var NAME =` counts.
+  const draftText = [
+    '=== DIFF ===',
+    'diff --git a/index.html b/index.html',
+    '@@ -10,0 +11,1 @@',
+    '+  console.log(FCV_CUR);',
+  ].join('\n');
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
