@@ -1,9 +1,8 @@
 'use strict';
 
 // Unit tests for model-strategies.js -- the load-bearing guarantee here is backward
-// compatibility: an unregistered name (the exact pre-existing LOCAL_AB_MODELS=ornith:9b,
-// hermes3:8b bare-tag usage) must resolve to zero overrides, byte-identical to before this
-// registry existed.
+// compatibility: an unregistered name (a bare LOCAL_AB_MODELS=<tag>,<tag> usage) must
+// resolve to zero overrides, byte-identical to before this registry existed.
 //
 // Run: node --test src/model-strategies.test.js  (or `npm test`)
 
@@ -12,14 +11,14 @@ const assert = require('node:assert/strict');
 const { MODEL_STRATEGIES, resolveStrategy } = require('./model-strategies.js');
 
 test('resolveStrategy returns a registered strategy\'s full entry', () => {
-  const result = resolveStrategy('ornith-9b');
-  assert.equal(result.model, 'ornith:9b');
+  const result = resolveStrategy('qwen3-27b-q4');
+  assert.equal(result.model, 'qwen3.8:27b-q4_K_M');
   assert.match(result.summary, /baseline/i);
 });
 
 test('resolveStrategy treats an unregistered name as a bare model tag with no overrides', () => {
-  const result = resolveStrategy('ornith:9b');
-  assert.deepEqual(result, { model: 'ornith:9b', summary: null });
+  const result = resolveStrategy('qwen3.8:27b-q4_K_M');
+  assert.deepEqual(result, { model: 'qwen3.8:27b-q4_K_M', summary: null });
 });
 
 test('resolveStrategy treats a hypothetical future model tag the same way (backward compatibility)', () => {
@@ -28,9 +27,9 @@ test('resolveStrategy treats a hypothetical future model tag the same way (backw
 });
 
 test('resolveStrategy does not mutate the shared registry entry it returns', () => {
-  const result = resolveStrategy('ornith-9b');
+  const result = resolveStrategy('qwen3-27b-q4');
   result.model = 'mutated';
-  assert.equal(MODEL_STRATEGIES['ornith-9b'].model, 'ornith:9b');
+  assert.equal(MODEL_STRATEGIES['qwen3-27b-q4'].model, 'qwen3.8:27b-q4_K_M');
 });
 
 test('neither seeded strategy carries temperature/numPredict/think overrides yet (no fabricated tuning data)', () => {
@@ -41,8 +40,8 @@ test('neither seeded strategy carries temperature/numPredict/think overrides yet
   }
 });
 
-test('hermes3-8b is registered, ready for real overrides once benchmarking data exists', () => {
-  const result = resolveStrategy('hermes3-8b');
-  assert.equal(result.model, 'hermes3:8b');
+test('qwen3-27b-q8 is registered, ready for real overrides once benchmarking data exists', () => {
+  const result = resolveStrategy('qwen3-27b-q8');
+  assert.equal(result.model, 'qwen3.8:27b-q8_0');
   assert.ok(result.summary);
 });

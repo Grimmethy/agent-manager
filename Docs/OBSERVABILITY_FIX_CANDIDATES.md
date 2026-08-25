@@ -209,13 +209,13 @@ An on-call engineer investigating an incident will see a timestamped log line wi
 
 ### AC-16 · Silent search-fetch failure is unobservable
 Strength: Strong
-Files: src/ornith-draft.js
+Files: src/local-draft.js
 
 Problem:
 The `catch` block around `projectSearchFetch` contains only a comment. When the fetch fails (auth rotation, backend 500, transient DNS), `searchResults` stays empty and the downstream prompt renders "(no results …)" with no log line, counter, or structured event. In a fan-out agent pipeline the operator has zero signal that search is degraded until end-user answer quality drops.
 
 Solution:
-Replace the comment-only catch body with a single `console.warn` (or the project's existing logger, e.g. `logger.warn`) that includes the error message: `console.warn('[ornith-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e)`. Control flow is unchanged—`searchResults` remains `[]` and execution falls through. If a metrics sink (Prometheus, Datadog, etc.) is already wired, increment a `search_fetch_errors` counter in the same block.
+Replace the comment-only catch body with a single `console.warn` (or the project's existing logger, e.g. `logger.warn`) that includes the error message: `console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e)`. Control flow is unchanged—`searchResults` remains `[]` and execution falls through. If a metrics sink (Prometheus, Datadog, etc.) is already wired, increment a `search_fetch_errors` counter in the same block.
 
 Benefits:
 Every silent degradation becomes a greppable, alertable log line. On-call can correlate a spike in `projectSearchFetch failed` warnings with the underlying cause (auth, DNS, 500) within seconds instead of waiting for user complaints. The fix is additive; no behavioral or API change, so regression risk is nil.
@@ -248,18 +248,18 @@ Operators can immediately identify which task and which file path failed, the OS
 
 ### AC-19 · Log non-fatal archImportFetch failure in catch block
 Strength: Strong
-Files: src/ornith-draft.js
+Files: src/local-draft.js
 
 Problem:
-At `src/ornith-draft.js:157` the `catch` block for `archImportFetch` swallows the exception entirely—no `console.*` call, no metric, no rethrow. A throw here signals a network timeout, auth expiry, 500, or parse error, yet the pipeline proceeds with an empty hits list and leaves zero log line in the entire run. In a batch/agent context that is the only observable trace of *why* the search step contributed nothing, and the existing comment documents the intent to proceed without hits but provides no diagnostic signal.
+At `src/local-draft.js:157` the `catch` block for `archImportFetch` swallows the exception entirely—no `console.*` call, no metric, no rethrow. A throw here signals a network timeout, auth expiry, 500, or parse error, yet the pipeline proceeds with an empty hits list and leaves zero log line in the entire run. In a batch/agent context that is the only observable trace of *why* the search step contributed nothing, and the existing comment documents the intent to proceed without hits but provides no diagnostic signal.
 
 Solution:
 Insert a single `console.debug` line as the first statement inside the existing `catch (e)` block at line 157, before the implicit fall-through to the empty-hits path. The exact change:
 
 ```js
-// src/ornith-draft.js:157  (the catch block)
+// src/local-draft.js:157  (the catch block)
 } catch (e) {
-  console.debug(`[ornith-draft] archImportFetch non-fatal failure: ${e?.message ?? e}`);
+  console.debug(`[local-draft] archImportFetch non-fatal failure: ${e?.message ?? e}`);
   // Non-fatal -- implement proceeds with no hits (its own prompt already handles
   // an empty hits list: "(no matches -- the searches found nothing ...)"), same
   // try/catch treatment project_search's branch above gives its own fetch call.
