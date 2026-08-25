@@ -187,16 +187,25 @@ process_drafting_file() {
   # heartbeat needs to surface, not the override that only ever governed the cheaper plan
   # pass. Recomputed fresh (not derived from draft_label) so it can never silently drift
   # from what draftAdhocImplement/draftResearchImplement will actually do.
+  # 2026-08-25: alwaysClaude used to be unconditional for adhoc/research -- correct
+  # before the manual pause existed (that call really did always reach Claude), but
+  # confirmed live to actively mislead once it didn't: a paused adhoc task correctly
+  # declined its Claude implement call (see local-draft.js's own pause check) and fell
+  # back to local, yet this heartbeat kept showing "claude:sonnet" as if it were still
+  # spending tokens -- exactly the "is Claude actually being avoided" question a human
+  # checking this pause feature would be trying to answer from this display. Checks the
+  # same isClaudePaused() gate local-draft.js's own implement-call check already uses.
   draft_display_model="$(node -e '
     try {
       require(process.argv[1]);
       const { resolveSourceName } = require(process.argv[2]);
       const { labelFor } = require(process.argv[3]);
+      const { isClaudePaused } = require(process.argv[5]);
       const t = JSON.parse(require("fs").readFileSync(process.argv[4], "utf8"));
-      const alwaysClaude = resolveSourceName(t) === "adhoc" || t.domain === "research";
+      const alwaysClaude = (resolveSourceName(t) === "adhoc" || t.domain === "research") && !isClaudePaused(process.argv[6]);
       console.log(alwaysClaude ? `claude:${process.env.CLAUDE_MODEL || "sonnet"}` : labelFor(t));
     } catch (e) { /* leave stdout empty -- the bash fallback just below covers this */ }
-  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
+  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" "${PACKAGE_SRC_DIR}/claude-pause.js" "${PACKAGE_SRC_DIR}/.." 2>/dev/null)"
   [[ -n "$draft_display_model" ]] || draft_display_model="$HEARTBEAT_MODEL"
 
   # No bash-level single-flight lock around this call anymore (2026-08-22, Grimmethy:
