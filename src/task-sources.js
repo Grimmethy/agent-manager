@@ -1708,6 +1708,65 @@ function nextPipelineSelfAuditTask() {
   return task;
 }
 
+// pipeline_health_audit (2026-08-24, Grimmethy: "that going looking needs to be an
+// automated process. A task that happens just like any other hygiene task") -- see
+// pipeline-health-audit.js's own header for the full incident this automates (three real
+// live bugs found by hand in one investigation session: a structurally-broken model
+// profile, a masked bash syntax error, orphaned processes holding the GPU lock). Time-
+// gated (hourly, pipeline-health-audit.js's own isDue()/markChecked()), not signature-
+// gated like pipeline_self_audit above -- there's no "cluster of similarly-failing
+// blocked tasks" here, just a periodic live-system check.
+//
+// Same "don't mark done before the write persists" discipline as
+// nextPipelineSelfAuditTask() above, with one addition specific to time-gating: a CLEAN
+// check (no anomalies -- the common case) has no task/write to defer marking behind at
+// all, so it marks checked immediately, right here, rather than leaving the pipeline
+// re-running this same check every single tick for the rest of the hour with nothing to
+// show for it.
+function nextPipelineHealthAuditTask() {
+  const { pipelineDir, defaultDomain } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const pipelineHealthAudit = require('./pipeline-health-audit.js');
+  if (!pipelineHealthAudit.isDue(instancesDir)) return null;
+
+  const logDir = path.join(require('os').homedir(), '.local', 'state', 'agent-manager', 'logs');
+  const { anomalies, evidence } = pipelineHealthAudit.checkPipelineHealth({ pipelineDir, instancesDir, logDir });
+
+  if (anomalies.length === 0) {
+    pipelineHealthAudit.markChecked(instancesDir);
+    return null;
+  }
+
+  const id = `pipeline-health-audit-${Date.now()}`;
+  if (taskIdExistsInQueue(id)) return null;
+
+  const evidenceText = [
+    `${anomalies.length} anomal${anomalies.length === 1 ? 'y' : 'ies'} found by a deterministic live-system check:`,
+    ...anomalies.map((a) => `- ${a}`),
+    '',
+    'Raw evidence:',
+    JSON.stringify(evidence, null, 2),
+  ].join('\n');
+
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'pipeline_health_audit',
+    title: `Pipeline health audit: ${anomalies[0].slice(0, 100)}${anomalies.length > 1 ? ` (+${anomalies.length - 1} more)` : ''}`,
+    promptContext: { evidenceText },
+  };
+}
+
+// Called once from the CLI, only after writeTask() has actually persisted a
+// pipeline_health_audit task to pending/ -- same reasoning as
+// markPipelineSelfAuditReported below (avoid marking the hourly clock forward before
+// the finding is confirmed to have actually reached the queue).
+function markPipelineHealthAuditChecked() {
+  const { pipelineDir } = getConfig();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  require('./pipeline-health-audit.js').markChecked(instancesDir);
+}
+
 // Called once from the CLI, only after writeTask() has actually persisted a
 // pipeline_self_audit task to pending/ -- see nextPipelineSelfAuditTask()'s own comment
 // for why the write moved here instead of living inside the generator.
@@ -1835,6 +1894,12 @@ registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true });
+// Priority 90, just under staleness_audit(91) -- an operational incident (today's real
+// example: every draft of one task type silently failing outright) can be actively
+// costing real throughput/compute for as long as it goes unnoticed, closer in urgency to
+// staleness_audit's "is this still worth chasing" recheck than pipeline_self_audit's
+// slower blocked-task-cluster pattern.
+registerTaskSource('pipeline_health_audit', { priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true });
 // apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
 // part of that step") -- this source's implement pass writes an advisory report, never a
 // diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
@@ -2102,6 +2167,7 @@ module.exports = {
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
+  nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
   nextProductSpecTask,
   nextBacklogDecompositionTask,
@@ -2330,6 +2396,7 @@ if (require.main === module) {
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
+      if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'staleness_audit') markStalenessAuditReported(task);
       if (task.domain === 'adhoc') {
         try { fs.unlinkSync(path.join(adhocDir, task.id + '.json')); } catch {}

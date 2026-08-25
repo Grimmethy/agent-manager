@@ -87,3 +87,49 @@ test('a healthy, recently-updated worker heartbeat produces no action', () => {
   const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, []);
 });
+
+// --- findOrphanedModelCallProcesses (2026-08-24, pipeline hardening: "that going
+// looking needs to be an automated process") ---------------------------------------------
+const { findOrphanedModelCallProcesses } = require('./dead-process-check.js');
+
+test('flags a local-draft.js process reparented to pid 1 as an orphan', () => {
+  const listProcesses = () => [
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  assert.equal(orphans.length, 1);
+  assert.equal(orphans[0].pid, 100);
+});
+
+test('does not flag a local-draft.js process whose parent is a real, live daemon (ppid != 1)', () => {
+  const listProcesses = () => [
+    { pid: 100, ppid: 555, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  assert.deepEqual(orphans, []);
+});
+
+test('does not flag an unrelated process reparented to pid 1 -- only local-draft.js matters', () => {
+  const listProcesses = () => [
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/dead-process-check.js' },
+    { pid: 101, ppid: 1, cmd: 'sshd: some-unrelated-daemon' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  assert.deepEqual(orphans, []);
+});
+
+test('returns an empty list (never throws) when `ps` itself fails', () => {
+  const listProcesses = () => { throw new Error('ps: command not found'); };
+  assert.doesNotThrow(() => findOrphanedModelCallProcesses({ listProcesses }));
+  assert.deepEqual(findOrphanedModelCallProcesses({ listProcesses }), []);
+});
+
+test('flags multiple real orphans in one pass', () => {
+  const listProcesses = () => [
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/a.json' },
+    { pid: 200, ppid: 999, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/b.json' },
+    { pid: 300, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/c.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);
+});

@@ -66,6 +66,18 @@ while :; do
         continue
       fi
 
+      # kill-orphan (2026-08-24, pipeline hardening): dead-process-check.js's own
+      # findOrphanedModelCallProcesses() -- a `node local-draft.js` reparented to pid 1
+      # (its real daemon parent confirmed gone) still holding real resources (the GPU
+      # single-flight lock, most critically) with nothing left waiting on its result.
+      # No script/pidfileName fields on this action kind at all -- just kill and move on,
+      # never fall through to the restart logic below which expects those fields.
+      if [[ "$action_kind" == "kill-orphan" && -n "$action_pid" ]]; then
+        kill -9 "$action_pid" 2>/dev/null
+        printf '[watchdog] killed orphaned model-call process pid %s (%s)\n' "$action_pid" "$action_reason" >&2
+        continue
+      fi
+
       action_script="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.script||"")}catch(e){}')"
       action_pidfile_name="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.pidfileName||"")}catch(e){}')"
       mapfile -t action_args < <(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));(o.args||[]).forEach(a=>console.log(a))}catch(e){}')

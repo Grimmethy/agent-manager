@@ -1644,3 +1644,16 @@ test('existingQueuedTaskTitles skips a malformed JSON file rather than throwing'
   fs.writeFileSync(path.join(dir, 'queue', 'adhoc', 'good.json'), JSON.stringify({ title: 'A real title' }));
   assert.deepEqual(existingQueuedTaskTitles(dir), ['A real title']);
 });
+
+// nextPipelineHealthAuditTask (2026-08-24, pipeline hardening: "that going looking needs
+// to be an automated process") -- pipeline-health-audit.js's own test file covers the
+// actual detection logic in isolation; this just proves the due-gating wiring works
+// through the real task-sources.js registration.
+test('nextPipelineHealthAuditTask returns null (does nothing) when the hourly check is not due yet', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-wiring-test-'));
+  const { nextPipelineHealthAuditTask } = freshTaskSources(dir);
+  const { markChecked } = require('./pipeline-health-audit.js');
+  markChecked(path.join(dir, 'instances'), new Date());
+
+  assert.equal(nextPipelineHealthAuditTask(), null);
+});
