@@ -287,6 +287,35 @@ powershell -File .\src\apply-runner.ps1
 powershell -File .\src\queue-watchdog.ps1
 ```
 
+## Mobile / remote access
+
+The dashboard is reachable from a phone the same way it's reachable from anywhere off the
+host: over a [Tailscale](https://tailscale.com) tunnel, not a separate app (see
+[ADR-0021](docs/adr/0021-mobile-access-architecture.md) for why — no PWA, no native app,
+no new API surface).
+
+To reproduce on a fresh install:
+
+1. Install and authenticate Tailscale on the host running the dashboard:
+   ```
+   tailscale up
+   ```
+2. Start the dashboard as usual (it binds to `127.0.0.1:7420` by default — see
+   [Launching](#launching) above).
+3. Expose it over the tailnet:
+   ```
+   tailscale serve --bg http://127.0.0.1:7420
+   ```
+4. On the phone (on the same tailnet), open the Tailscale-assigned HTTPS URL for the
+   host. Tailscale terminates TLS and enforces tailnet membership; `AGENT_MANAGER_DASHBOARD_TOKEN`
+   still gates mutating requests from non-loopback callers on top of that.
+
+To stop the tunnel:
+
+```
+tailscale serve --https=off
+```
+
 ## Testing
 
 `npm test` runs the (currently small, growing) unit test suite via Node's built-in test
