@@ -483,3 +483,42 @@ test('reviewTask reaches the real vote when every URL in the draft actually appe
   assert.equal(result.verdict, 'approved');
   assert.equal(captured.length, 1);
 });
+
+// Decompose-proposal exemption, 2026-08-25: root-caused live via a real blocked adhoc
+// task (second-brain review sweep) -- a RESOLUTION: decompose sub-task proposal
+// suggesting a FUTURE config name (e.g. "add AGENT_MANAGER_SECOND_BRAIN_REVIEW_PATH,
+// following the pattern of X") got hard-blocked by the same ungrounded-field gate a real
+// diff would, even though it never claims that name already exists anywhere.
+test('reviewTask does NOT deterministically block a decompose proposal for suggesting a future config field name', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'decompose-field-test', domain: 'default', source: 'manual', adhocResolution: 'decompose',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'RESOLUTION: decompose\n\n[{"title": "Add config plumbing", "rawText": "Add a new path, e.g. AGENT_MANAGER_SECOND_BRAIN_REVIEW_PATH, following the pattern of existing paths in config.js."}]',
+    promptContext: { body: 'Background material with no mention of that field at all.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'a decompose proposal must still reach a real review vote, not skip review entirely');
+});
+
+test('reviewTask STILL deterministically blocks a non-decompose manual task citing the same kind of ungrounded field', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'non-decompose-field-test', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'The response includes the AGENT_MANAGER_SECOND_BRAIN_REVIEW_PATH field for review output.',
+    promptContext: { body: 'Background material with no mention of that field at all.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-ungrounded-value');
+  assert.equal(captured.length, 0, 'the exemption must be scoped to decompose only, not manual tasks in general');
+});
