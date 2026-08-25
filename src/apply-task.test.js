@@ -58,14 +58,33 @@ test.after(() => {
   fs.rmSync(REPO_ROOT, { recursive: true, force: true });
 });
 
-test('happy path: fetch/reset/branch/add/commit/push/checkout in order, succeeds', () => {
+test('happy path: fetch/reset/(delete stale branch)/branch/add/commit/push/checkout in order, succeeds', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+});
+
+// Regression, 2026-08-25: root-caused live via apply-task-loop.log -- a real task
+// (adhoc-add-a-hardware-tab-...) failed every single apply attempt with "fatal: a branch
+// named 'agent/adhoc-add-a-hardware-tab-...' already exists", forever, after a prior
+// interrupted apply attempt left the branch behind (createBranch() had no surrounding
+// try/catch at all -- an exception there propagated straight out of applyTask() with zero
+// cleanup, unlike every other failure point in this function). The deleteBranch() call
+// added right before createBranch() (asserted by name above) is unconditional and
+// best-effort -- must not throw even when there is genuinely nothing to delete (the
+// overwhelmingly common case, a task's very first apply attempt).
+test('a pre-existing stale branch with the same name is deleted before creating a fresh one, without failing', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  const deleteCall = gitRunner.calls.find((c) => c.name === 'deleteBranch');
+  assert.ok(deleteCall, 'deleteBranch must be called defensively before createBranch');
+  assert.equal(deleteCall.args[0], 'agent/test-task-1');
 });
 
 test('skipPush ("Implement" mode): still pushes the branch (durability), but stays checked out on it instead of returning to main', () => {
@@ -78,7 +97,7 @@ test('skipPush ("Implement" mode): still pushes the branch (durability), but sta
   const names = gitRunner.calls.map((c) => c.name);
   // push happens either way now; skipPush's only remaining effect is no checkoutMain
   // afterward, so the branch stays checked out for local inspection.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push']);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('happy path (push enabled) reports pushed: true', () => {
@@ -97,9 +116,11 @@ test('push failure after a successful commit keeps the branch instead of deletin
   assert.match(result.reason, /remote: permission denied/);
 
   const names = gitRunner.calls.map((c) => c.name);
-  // commit happened, push was attempted and failed -- no checkoutMain/deleteBranch:
-  // the branch and its real commit are deliberately left in place, not discarded.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push']);
+  // commit happened, push was attempted and failed -- no checkoutMain/deleteBranch AFTER
+  // the failure: the branch and its real commit are deliberately left in place, not
+  // discarded. The one deleteBranch call present is the defensive pre-cleanup BEFORE
+  // createBranch, unconditional and unrelated to this test's own push failure.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('artifact write failure rolls back the branch before any add/commit/push', () => {
@@ -110,7 +131,9 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
 
   assert.equal(result.succeeded, false);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'checkoutMain', 'deleteBranch']);
+  // First deleteBranch is the defensive pre-cleanup before createBranch; second is the
+  // real rollback after the artifact write failure.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch']);
 });
 
 // Regression, 2026-08-22: an empty implementResponse (several Group B sources are
@@ -328,7 +351,7 @@ test('deleteConfirmedAt lets a previously-held delete batch proceed for real', (
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
   assert.equal(fs.existsSync(path.join(REPO_ROOT, 'foo.js')), false);
 });
 
