@@ -33,8 +33,39 @@ const { execFileSync } = require('child_process');
 
 const LOCK_CHILD_FD = 3; // arbitrary -- just needs to not collide with the child's own 0/1/2
 
-function lockFilePath(instancesDir) {
-  return path.join(instancesDir, '.pipeline-single-flight.lock');
+// Per-model locking (2026-08-25, Grimmethy: "boost throughput" -- see nullboiler's
+// ConcurrencyConfig.per_role for the reference shape this borrows). Originally ONE
+// lockfile for every local-model call regardless of which model it targeted, which meant
+// a long call on the reasoning model (e.g. a big arch_review) blocked a completely
+// unrelated cheap-model call (e.g. brain_dump_sort's qwen2.5:3b) for its entire duration
+// even after OLLAMA_MAX_LOADED_MODELS=2 let both models stay resident in VRAM at once --
+// confirmed live: this was the literal "worker-1 and reasoning are taking turns" report.
+// `key` (typically the resolved model name, e.g. labelFor(task) for a local call) scopes
+// the lockfile to that specific model, so two calls against DIFFERENT models no longer
+// serialize against each other, while two calls against the SAME model still correctly
+// do (same key -> same lockfile -> same flock). Omitting `key` preserves the exact
+// original global lockfile name -- every caller not yet migrated to pass a key keeps
+// today's behavior unchanged. bash's acquire_single_flight_lock/release_single_flight_lock
+// (agent-manager-common.sh, used by review-runner.sh) is intentionally NOT migrated to
+// per-key locking in this pass -- it locks around a whole `node review-task.js` subprocess
+// invocation before knowing which model that process will actually resolve to, so there's
+// no clean key to pass without a bigger refactor. It keeps using the global (no-key)
+// lockfile, which stays correct for review of any source with no registered cheap model
+// profile (the common case, since only brain_dump_sort has one today) -- the residual
+// gap (a cheap-profiled source's review vote racing that same profile's own draft call)
+// is a known, accepted, low-frequency risk: Ollama's own llama-server still serializes
+// same-model requests at its own -np 1 slot regardless, so a race here costs at worst a
+// little scheduling fairness, not correctness.
+function lockFileName(key) {
+  if (!key) return '.pipeline-single-flight.lock';
+  // Model names can contain ':' (e.g. "qwen3.8:27b-q4_K_M") -- not filesystem-hostile on
+  // Linux, but sanitized anyway so this never depends on a particular OS's path rules.
+  const safeKey = String(key).replace(/[^A-Za-z0-9._-]+/g, '_');
+  return `.pipeline-single-flight.${safeKey}.lock`;
+}
+
+function lockFilePath(instancesDir, key) {
+  return path.join(instancesDir, lockFileName(key));
 }
 
 // 2026-08-24 (Grimmethy: "move the user interaction to the highest priority possible...
@@ -67,12 +98,12 @@ function someoneIsWaiting(instancesDir) {
 // (a caller that wants a bounded wait should wrap this in its own timeout, this function
 // itself will wait as long as it takes, same as flock's own default). Returns a real fd;
 // pass it to release().
-function acquire(instancesDir) {
+function acquire(instancesDir, key) {
   const deadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
   while (someoneIsWaiting(instancesDir) && Date.now() < deadline) {
     execFileSync('sleep', ['1']);
   }
-  const fd = fs.openSync(lockFilePath(instancesDir), 'w');
+  const fd = fs.openSync(lockFilePath(instancesDir, key), 'w');
   try {
     execFileSync('flock', [String(LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
   } catch (err) {
@@ -95,8 +126,8 @@ function release(fd) {
 
 // Preferred entry point: acquire, run fn, always release -- even if fn throws. Awaits fn
 // (sync or async) and re-throws whatever it throws, after releasing.
-async function withLock(instancesDir, fn) {
-  const fd = acquire(instancesDir);
+async function withLock(instancesDir, fn, key) {
+  const fd = acquire(instancesDir, key);
   try {
     return await fn();
   } finally {

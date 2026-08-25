@@ -57,7 +57,21 @@ LOCK_NAME = ".pipeline-single-flight.lock"
 PRIORITY_WAIT_DIR_NAME = ".discuss-waiting"
 
 
-def acquire(instances_dir: Path):
+def _lock_name(key: str | None) -> str:
+    """Per-model locking (2026-08-25 -- see src/single-flight-lock.js's matching header
+    for the full incident and reasoning; this mirrors it exactly so a Python caller and a
+    JS caller hitting the SAME model still share the SAME lockfile). `key` is normally
+    ollama_client.MODEL (== LOCAL_MODEL) -- the model this call will actually hit. Omitted
+    (None), this returns the original global LOCK_NAME unchanged, so any caller not
+    passing a key keeps today's behavior exactly."""
+    if not key:
+        return LOCK_NAME
+    import re
+    safe_key = re.sub(r"[^A-Za-z0-9._-]+", "_", str(key))
+    return f".pipeline-single-flight.{safe_key}.lock"
+
+
+def acquire(instances_dir: Path, key: str | None = None):
     """Blocking, exclusive acquire -- no timeout, matching single-flight-lock.js's own
     acquire() exactly (a caller that wants a bounded wait should wrap this itself). Drops
     a per-waiter priority marker (see this module's own header) for the duration of the
@@ -71,7 +85,7 @@ def acquire(instances_dir: Path):
     marker = wait_dir / uuid.uuid4().hex
     marker.touch()
     try:
-        lock_path = instances_dir / LOCK_NAME
+        lock_path = instances_dir / _lock_name(key)
         fh = open(lock_path, "w")
         fcntl.flock(fh, fcntl.LOCK_EX)
         return fh
@@ -94,11 +108,14 @@ def release(fh):
 
 
 @contextmanager
-def held(instances_dir: Path):
+def held(instances_dir: Path, key: str | None = None):
     """Preferred entry point when the lock's whole life fits inside one function call --
     callers should wrap just the real model call, not any surrounding prompt-building/
-    grep work, same discipline local-draft.js's own withLock() usage already follows."""
-    fh = acquire(instances_dir)
+    grep work, same discipline local-draft.js's own withLock() usage already follows.
+    Pass `key` (normally ollama_client.MODEL) so this shares a lockfile with every other
+    caller -- JS or Python -- hitting the SAME model; omitted, this locks against the
+    original global lockfile."""
+    fh = acquire(instances_dir, key)
     try:
         yield
     finally:

@@ -198,6 +198,24 @@ process_drafting_file() {
     # nothing else to do) the whole time, with no error anywhere that looked like the
     # real cause.
     printf '[worker-%s] draft call failed for %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
+
+    # Worker-level infra-failure backoff signal (2026-08-25, Grimmethy: "boost throughput"
+    # -- see nullboiler's retry_base_delay_ms/retry_max_delay_ms/retry_jitter_ms for the
+    # reference shape). Separate from, and additive to, the per-TASK draftFailureCount/
+    # infraRequeueCount bookkeeping just below (which decides whether THIS task gets
+    # requeued or blocked) -- this instead paces how fast THIS WORKER moves on to its next
+    # claim after an infra-shaped failure. Confirmed live 2026-08-24: with no backoff here,
+    # worker-1 burned through 10 different brain_dump_sort tasks over ~90 minutes, each
+    # taking ~150s to time out, sleeping only the flat 1s "did work" pause between them --
+    # continuously re-hammering an Ollama instance that was already struggling to load a
+    # second model, the whole time. Same INFRA_FAILURE_PATTERN local-worker.sh's own
+    # requeue-vs-block decision below already uses (kept in sync manually -- both are
+    # small, static, rarely-changed literals; a shared source would cost more indirection
+    # than it saves for two copies this short).
+    if grep -qEi 'timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b' <<< "$draft_result"; then
+      TICK_HAD_INFRA_FAILURE=true
+    fi
+
     failure_count="$(node -e '
       const fs = require("fs");
       const p = process.argv[1];
@@ -330,8 +348,16 @@ if [[ "${reclaim_count:-0}" -gt 0 ]]; then
   printf '[worker-%s] reclaimed %s orphaned draft(s) from a prior process, sent back to the queue\n' "$INSTANCE_ID" "$reclaim_count" >&2
 fi
 
+# Consecutive-infra-failure counter for the exponential backoff at the bottom of the loop
+# (2026-08-25 -- see that comment for the full incident this fixes). Declared OUTSIDE the
+# loop, unlike TICK_HAD_INFRA_FAILURE below, because it must persist and grow ACROSS
+# ticks for the backoff to actually lengthen; reset to 0 the moment any tick's work is
+# NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
+CONSECUTIVE_INFRA_FAILURES=0
+
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
+  TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
@@ -576,9 +602,29 @@ while :; do                                                                     
   # still spent the majority of wall-clock time asleep between them, under 50% utilization.
   # A brief sleep even when work was done avoids a true zero-delay busy-loop hammering the
   # filesystem tick after tick when a large backlog is draining.
-  if "$did_work"; then
+  if "$did_work" && "$TICK_HAD_INFRA_FAILURE"; then
+    # Jittered exponential backoff (2026-08-25, Grimmethy: "boost throughput" -- shape
+    # borrowed from nullboiler's retry_base_delay_ms=1000/retry_max_delay_ms=30000/
+    # retry_jitter_ms=250, see single-flight-lock.js's per-model-lock change from the same
+    # request for the sibling half of this fix). Confirmed live 2026-08-24: with the flat
+    # `sleep 1` this replaces, a struggling Ollama instance got re-hammered by this same
+    # worker's very next claim every ~150s (the timeout duration) for 90 minutes straight,
+    # zero backoff, zero recovery room. Doubles (1s, 2s, 4s, ... capped at 30s) with each
+    # consecutive infra-failure tick, plus up to 250ms of jitter so multiple lanes backing
+    # off at once don't re-hammer in lockstep; resets to 0 (flat 1s again) the instant a
+    # tick's work is NOT an infra failure. This only paces THIS worker's own next claim --
+    # it does not change DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT's existing,
+    # separate give-up bounds at all.
+    CONSECUTIVE_INFRA_FAILURES=$((CONSECUTIVE_INFRA_FAILURES + 1))
+    backoff_secs=$((1 << (CONSECUTIVE_INFRA_FAILURES - 1)))                        # 1,2,4,8,16,32,... (bit-shift doubling)
+    if (( backoff_secs > 30 )); then backoff_secs=30; fi
+    jitter_ms=$((RANDOM % 250))
+    sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
+  elif "$did_work"; then
+    CONSECUTIVE_INFRA_FAILURES=0
     sleep 1
   else
+    CONSECUTIVE_INFRA_FAILURES=0
     sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
   fi
 done                                                                             # end top-level 'while' loop here — bash `do...done` syntax pair; mirror of PowerShell's `while (...){ ... }` curly-brace structure we're replacing (bash has no native boolean true so ':' used as the always-true condition).

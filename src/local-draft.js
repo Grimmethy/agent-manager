@@ -190,9 +190,15 @@ async function draftTask(task, {
   // unresolved label ("assume local, lock" rather than risk skipping a real local call's
   // protection): `(label || '')` so `.startsWith` never throws on undefined, and an empty
   // string correctly fails the 'claude:' prefix check.
-  const resolvedCallIsLocal = !(labelFor(task) || '').startsWith('claude:');
+  const resolvedLabel = labelFor(task) || '';
+  const resolvedCallIsLocal = !resolvedLabel.startsWith('claude:');
   const instancesDir = path.join(getConfig().pipelineDir, 'instances');
-  const maybeLocked = (isLocal, fn) => (isLocal ? withLockFn(instancesDir, fn) : fn());
+  // Locked per-model, not globally (2026-08-25 -- see single-flight-lock.js's own header
+  // for the full "worker-1 and reasoning taking turns" incident this fixes): resolvedLabel
+  // IS the resolved local model name whenever resolvedCallIsLocal is true (labelFor()
+  // returns the bare model string for local, "claude:<model>" otherwise), so it's reused
+  // directly as the lock key -- no separate resolution needed.
+  const maybeLocked = (isLocal, fn) => (isLocal ? withLockFn(instancesDir, fn, resolvedLabel) : fn());
 
   try {
     appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);

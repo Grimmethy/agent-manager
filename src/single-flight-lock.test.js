@@ -59,6 +59,42 @@ test('lockFilePath matches the exact bash lockfile name (interop depends on this
   assert.equal(lockFilePath(dir), path.join(dir, '.pipeline-single-flight.lock'));
 });
 
+test('lockFilePath with a key returns a distinct per-model lockfile', () => {
+  const dir = makeInstancesDir();
+  assert.equal(lockFilePath(dir, 'qwen2.5:3b'), path.join(dir, '.pipeline-single-flight.qwen2.5_3b.lock'));
+  assert.notEqual(lockFilePath(dir, 'qwen2.5:3b'), lockFilePath(dir));
+});
+
+test('two different keys can be held concurrently -- the actual throughput fix', () => {
+  const dir = makeInstancesDir();
+  const fdA = acquire(dir, 'model-a');
+  try {
+    const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir, 'model-b')}"; timeout 1 flock -n 200 && echo GOT_IT || echo BLOCKED`]);
+    assert.match(result.stdout.toString(), /GOT_IT/, 'a lock held on model-a must not block a real flock attempt on model-b\'s own lockfile');
+  } finally {
+    release(fdA);
+  }
+});
+
+test('the same key still serializes against itself, same as the old global lock did', () => {
+  const dir = makeInstancesDir();
+  const fdA = acquire(dir, 'model-a');
+  try {
+    const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir, 'model-a')}"; timeout 1 flock -n 200 && echo GOT_IT || echo BLOCKED`]);
+    assert.match(result.stdout.toString(), /BLOCKED/, 'a lock held on model-a must still block another attempt on the SAME key');
+  } finally {
+    release(fdA);
+  }
+});
+
+test('withLock passes its key through to acquire', async () => {
+  const dir = makeInstancesDir();
+  await withLock(dir, async () => {
+    const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir, 'model-a')}"; timeout 1 flock -n 200 && echo GOT_IT || echo BLOCKED`]);
+    assert.match(result.stdout.toString(), /BLOCKED/, 'withLock(dir, fn, "model-a") must actually lock model-a\'s own lockfile');
+  }, 'model-a');
+});
+
 test('acquire then release: a second acquire() in the SAME process succeeds only after release()', () => {
   const dir = makeInstancesDir();
   const fd1 = acquire(dir);
