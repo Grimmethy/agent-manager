@@ -279,6 +279,21 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
     return { succeeded: false, reason: `could not fetch origin/${mainBranch} before starting adhoc worktree: ${e.message}` };
   }
 
+  // Defensive pre-cleanup (2026-08-25, root-caused live: this exact task looping forever
+  // on "a branch named '...' already exists") -- worktreeDir/branchName are BOTH
+  // deterministic, derived only from task.id, and the real cleanup below only runs inside
+  // the finally block guarding the SECOND try (the actual agentic call). A process killed
+  // between here and there (a kill -9, dead-process-check.js's own zombie-restart, an OOM,
+  // a host reboot -- this file's own finally comment already documented the risk, just
+  // never closed the loop) strands the branch with no path back: `git worktree add -b`
+  // always tries to CREATE the branch, so every future retry for the SAME task.id fails at
+  // this exact step, forever, before ever reaching the finally cleanup at all. Since both
+  // names are unique to this one task, anything found here can only be OUR OWN stale
+  // leftover from a prior interrupted attempt at this same task -- never another task's or
+  // another lane's real work -- so force-clearing it before creating fresh is always safe.
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* no stale worktree registered */ }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* no stale branch */ }
+
   try {
     runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], resolvedRepoRoot);
   } catch (e) {

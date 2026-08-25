@@ -100,6 +100,37 @@ test('draftAdhocImplement edits a real file in the isolated worktree and capture
   assert.equal(branches.trim(), '');
 });
 
+// Regression, 2026-08-25: root-caused live -- a real task looped on "a branch named
+// '...' already exists" forever after its own worktree-lifecycle process got killed
+// mid-call (a kill -9 during an unrelated daemon cleanup this session, but dead-process-
+// check.js's own zombie-restart or a host reboot would strand it identically). The
+// `git worktree add -b` call has its OWN try/catch, separate from the finally block that
+// does real cleanup -- once the branch exists, EVERY retry fails at that exact step,
+// before ever reaching cleanup, forever. Reproduced here by creating the exact stranded
+// branch by hand (matching worktree already gone, same shape confirmed live) before
+// calling draftAdhocImplement -- must now self-heal instead of failing.
+test('draftAdhocImplement clears a stranded branch from a prior interrupted attempt and succeeds anyway', async () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const task = { id: 'test-stranded', title: 'Bump the version comment', promptContext: { rawText: 'Change v1 to v2 in tracked.txt' } };
+
+  // Simulate the exact live state: the branch survived a prior crash, the worktree did
+  // not (already cleaned up, or never registered before the crash).
+  git(['branch', 'throwaway/adhoc-test-stranded'], repoDir);
+
+  const claudeCall = async ({ cwd }) => {
+    fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'v2\n');
+    return { response: 'Updated tracked.txt.\n\nRESOLUTION: implemented', degenerate: null };
+  };
+
+  const result = await draftAdhocImplement(task, { claudeCall, recordModelCall: fakeRecordModelCall, repoRoot: repoDir });
+
+  assert.equal(result.succeeded, true, `expected the stranded branch to be cleared automatically, got: ${result.reason}`);
+  assert.match(task.rawDiff, /\+v2/);
+
+  const branches = git(['branch', '--list', 'throwaway/adhoc-test-stranded'], repoDir);
+  assert.equal(branches.trim(), '', 'branch must be cleaned up again after the real run, not just before it');
+});
+
 test('draftAdhocImplement leaves task.rawDiff empty when the agentic call makes no edits (no-changes-needed)', async () => {
   const { repoDir } = makeRepoWithOrigin();
   const task = { id: 'test-2', title: 'Already fixed', promptContext: { rawText: 'This was already fixed by an earlier commit' } };
