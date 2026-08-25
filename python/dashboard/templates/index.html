@@ -3243,13 +3243,15 @@ function fmtTemp(c) { return c == null ? '-' : Math.round(c) + '°C'; }
 function fmtPercent(p) { return p == null ? '-' : Math.round(p) + '%'; }
 
 // Hand-rolled inline SVG line chart -- this repo vendors no charting library (no Chart.js/
-// D3/Plotly) and every other tab is plain HTML/vanilla JS, so the temperature history
-// graph follows suit instead of pulling one in for a single chart. `history` is
-// oldest-first (same order /api/hardware/stats' "history" array is already in). The 24h
-// average renders as a dashed reference line -- solid-vs-dashed distinguishes it from the
-// current-value line structurally, not by color alone, so it still reads in a screenshot
-// or under a color-vision deficiency.
-function renderTempSparkline(history, getValue, avg, label) {
+// D3/Plotly) and every other tab is plain HTML/vanilla JS, so every hardware history
+// graph follows suit instead of pulling one in. `history` is oldest-first (same order
+// /api/hardware/stats' "history" array is already in). The rolling average renders as a
+// dashed reference line -- solid-vs-dashed distinguishes it from the current-value line
+// structurally, not by color alone, so it still reads in a screenshot or under a
+// color-vision deficiency. getValue may return null for a given entry (e.g. no GPU
+// present for that sample) -- those points are simply left out of the polyline, which
+// gaps the line across missing stretches rather than erroring or plotting a false 0.
+function renderSparkline(history, getValue, avg, label) {
   const W = 300, H = 60, PAD = 3;
   const points = history
     .map((entry, i) => ({ i, v: getValue(entry) }))
@@ -3304,11 +3306,27 @@ async function renderHardwareTab() {
     </div>
 
     <div class="field-label">CPU temperature -- last 24h</div>
-    ${renderTempSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
+    ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
 
     ${gpu ? `
     <div class="field-label">GPU temperature -- last 24h</div>
-    ${renderTempSparkline(history, e => e.gpu ? e.gpu.temperatureCelsius : null, avg.gpuTemperatureCelsius, 'GPU temperature')}` : ''}
+    ${renderSparkline(history, e => e.gpu ? e.gpu.temperatureCelsius : null, avg.gpuTemperatureCelsius, 'GPU temperature')}` : ''}
+
+    <div class="field-label">CPU utilization -- last 24h</div>
+    ${renderSparkline(history, e => e.cpuPercent, avg.cpuPercent, 'CPU utilization')}
+
+    <div class="field-label">RAM used -- last 24h</div>
+    ${renderSparkline(history, e => e.ram ? e.ram.usedBytes : null, avg.ramUsedBytes, 'RAM used')}
+
+    <div class="field-label">Disk used -- last 24h</div>
+    ${renderSparkline(history, e => e.disk ? e.disk.usedBytes : null, avg.diskUsedBytes, 'disk used')}
+
+    ${gpu ? `
+    <div class="field-label">GPU utilization -- last 24h</div>
+    ${renderSparkline(history, e => e.gpu ? e.gpu.utilizationPercent : null, avg.gpuUtilizationPercent, 'GPU utilization')}
+
+    <div class="field-label">GPU VRAM used -- last 24h</div>
+    ${renderSparkline(history, e => e.gpu ? e.gpu.vramUsedMiB : null, avg.gpuVramUsedMiB, 'GPU VRAM used')}` : ''}
 
     <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
   `;
