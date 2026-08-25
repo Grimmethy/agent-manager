@@ -355,7 +355,31 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   // same "known-bad signal, only advisory" shape every OTHER deterministic gate in this
   // function already treats as disqualifying. Hard-blocks before spending a review call,
   // same as the empty-response/non-implementation/fixed-literals gates below.
-  const highPrecisionFlags = (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
+  // 2026-08-25, root-caused live via a real blocked adhoc task (second-brain review
+  // sweep): RESOLUTION: decompose (adhoc-agentic-draft.js's "task judged too large,
+  // propose sub-tasks instead of a diff" outcome, carved out in buildVerdictPrompt below
+  // -- see its own comment) got hard-blocked here anyway, before ever reaching that
+  // carve-out, because a decompose proposal's sub-task rawText routinely SUGGESTS names
+  // for config/paths a FUTURE sub-task should create (e.g. "add
+  // AGENT_MANAGER_SECOND_BRAIN_REVIEW_COVERAGE_PATH, following the pattern of
+  // stalenessAuditCoveragePath" -- explicitly marked as a proposal, "e.g.", never a claim
+  // that it already exists). checkGroundedValues' whole premise is "a value cited as
+  // already-real that appears nowhere in the grounding source is fabricated" -- a
+  // category error against text that is deliberately proposing something new, the exact
+  // same "new declaration, not a claimed-existing value" distinction NEW_DECLARATION_RE
+  // already carves out for a real diff's own `+const NAME = ...` line, just for a
+  // decompose proposal's prose instead of a diff. Scoped ONLY to the two high-precision
+  // flags that hard-block with no review call at all -- factCheck's OTHER checks (missing-
+  // file, fabricated-commit-reference, unconfirmed-relationship) still run and still hard-
+  // block a decompose response exactly as before: those check "does this cite something
+  // that claims to already exist," which stays a real fabrication signal even in a
+  // decompose proposal's prose. And the full factCheck (including these two flags) is
+  // still handed to the reviewer model via buildVerdictPrompt below regardless -- this
+  // only removes the automatic no-review-call block, not the information itself.
+  const isDecomposeProposal = task.source === 'manual' && task.adhocResolution === 'decompose';
+  const highPrecisionFlags = isDecomposeProposal
+    ? []
+    : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
   if (highPrecisionFlags.length > 0) {
     const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
