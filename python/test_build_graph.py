@@ -112,6 +112,64 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             self.assertNotIn("src/b.js", file_cache["files"], "a deleted file's stale cache entry must not linger forever")
 
 
+class ResolveZigImportTest(unittest.TestCase):
+    """2026-08-25, Grimmethy: "If Zig is going to exist in our project we need to be able
+    to map it and work with it" -- deep_dive onboarding nullclaw/nullboiler (a Zig repo)
+    came back with 0 communities before this: build_graph.py had no Zig parser at all, so
+    every .zig file was walked but never linked to anything. Confirmed against nullboiler's
+    real source before writing these (37 files, 106 real edges, 4 communities)."""
+
+    def test_a_zig_suffixed_spec_resolves_relative_to_the_importing_files_own_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            (repo / "src" / "compat.zig").write_text("pub const X = 1;\n")
+            target = build_graph.resolve_zig_import(repo / "src" / "api.zig", "compat.zig")
+            self.assertEqual(target, (repo / "src" / "compat.zig").resolve())
+
+    def test_a_zig_suffixed_spec_with_no_leading_dot_still_resolves_unlike_js(self):
+        # Zig requires no './' to distinguish a local file from a module -- 'foo.zig' and
+        # './foo.zig' mean the same thing. Confirmed this is NOT rejected the way
+        # resolve_import() (JS) rejects a bare, dot-less spec.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src" / "compat").mkdir(parents=True)
+            (repo / "src" / "compat" / "shared.zig").write_text("pub const Y = 2;\n")
+            target = build_graph.resolve_zig_import(repo / "src" / "compat.zig", "compat/shared.zig")
+            self.assertEqual(target, (repo / "src" / "compat" / "shared.zig").resolve())
+
+    def test_a_spec_with_no_zig_suffix_is_a_module_reference_and_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            # No file named "std" or "builtin" exists -- these are compiler-builtin /
+            # build.zig-declared modules, never a real file in the repo.
+            target = build_graph.resolve_zig_import(repo / "src" / "api.zig", "std")
+            self.assertIsNone(target)
+
+    def test_build_import_graph_links_two_real_zig_files_via_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            (repo / "src" / "main.zig").write_text('const std = @import("std");\nconst config = @import("config.zig");\n')
+            (repo / "src" / "config.zig").write_text("pub const Config = struct {};\n")
+            graph = build_graph.build_import_graph(repo, ["src"])
+            self.assertEqual(graph.number_of_nodes(), 2)
+            self.assertEqual(graph.number_of_edges(), 1)
+            self.assertTrue(graph.has_edge("src/main.zig", "src/config.zig"))
+
+    def test_import_used_as_part_of_a_larger_expression_still_resolves(self):
+        # Real nullboiler shape: `const Store = @import("store.zig").Store;` -- the regex
+        # must not be thrown off by trailing `.Store` after the closing paren.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            (repo / "src" / "api.zig").write_text('const Store = @import("store.zig").Store;\n')
+            (repo / "src" / "store.zig").write_text("pub const Store = struct {};\n")
+            graph = build_graph.build_import_graph(repo, ["src"])
+            self.assertTrue(graph.has_edge("src/api.zig", "src/store.zig"))
+
+
 class BuildGraphDataCommunityNameReuseTest(unittest.TestCase):
     """The bigger win from Brain Dump #155 -- see check_due()'s own comment: a real
     per-community Ornith naming pass took 13+ minutes under real worker-lane contention.
