@@ -403,3 +403,50 @@ test('checkGroundedValues still flags a fabricated URL whose domain was never na
   const flags = checkGroundedValues(draftText, sourceText);
   assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
 });
+
+// checkGroundedValues: real-but-elsewhere-in-the-repo exemption --------------------------
+// 2026-08-25, root-caused live via a real blocked adhoc task (a Hardware tab UI diff): the
+// draft's own comment correctly cited AGENT_MANAGER_MIN_FREE_VRAM_MB -- a real, pre-
+// existing env var defined in gpu-guard.js -- as justification for a design choice, and
+// got flagged ungrounded-field anyway, because sourceText only ever covers files the DIFF
+// itself touches/cites; a frontend-only diff never touches gpu-guard.js. More general than
+// the newly-declared-field and named-service-URL exemptions above: this covers ANY real
+// identifier that exists literally ANYWHERE in the actual tracked repo, via a real
+// `git grep`, not just ones the task's own rawText happened to name.
+
+test('checkGroundedValues does not flag a field that exists literally elsewhere in the real repo, even though the diff never touches that file', () => {
+  const { dir } = makeGitRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'gpu-guard.js'), "const MIN_FREE_VRAM_MB = Number(process.env.AGENT_MANAGER_MIN_FREE_VRAM_MB) || 4096;\n");
+  execFileSync('git', ['add', 'src/gpu-guard.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'add gpu-guard'], { cwd: dir });
+
+  const draftText = '// GPU VRAM headroom: gpu-guard.js already stops idle apps below its AGENT_MANAGER_MIN_FREE_VRAM_MB threshold.';
+  const sourceText = 'unrelated frontend grounding material that never mentions VRAM at all';
+
+  const flags = checkGroundedValues(draftText, sourceText, dir);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues still flags a field that does not exist anywhere in the real repo', () => {
+  const { dir } = makeGitRepo();
+
+  const draftText = 'The response includes the TOTALLY_FABRICATED_FIELD_XYZ for support.';
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText, dir);
+  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'TOTALLY_FABRICATED_FIELD_XYZ' }]);
+});
+
+test('checkGroundedValues does not flag a URL that exists literally elsewhere in the real repo', () => {
+  const { dir } = makeGitRepo();
+  fs.writeFileSync(path.join(dir, 'config.js'), "const DOCS_URL = 'https://real-internal-docs.example.test/page';\n");
+  execFileSync('git', ['add', 'config.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'add config'], { cwd: dir });
+
+  const draftText = 'See https://real-internal-docs.example.test/page for details.';
+  const sourceText = 'unrelated grounding material';
+
+  const flags = checkGroundedValues(draftText, sourceText, dir);
+  assert.deepEqual(flags, []);
+});

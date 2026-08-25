@@ -334,7 +334,41 @@ function isNamedServiceUrl(url, sourceText) {
   return new RegExp(`\\b${escaped}\\b`, 'i').test(sourceText);
 }
 
-function checkGroundedValues(draftText, sourceText) {
+// 2026-08-25, root-caused live via a real blocked adhoc task (a Hardware tab UI diff):
+// the draft's own comment correctly cited AGENT_MANAGER_MIN_FREE_VRAM_MB -- a real,
+// pre-existing env var defined in gpu-guard.js -- as justification for surfacing VRAM
+// headroom in the new UI, and got flagged ungrounded-field anyway. sourceText is built
+// from files the DIFF itself touches/cites (get-grounding-source.js's own windowing);
+// a frontend-only diff never touches gpu-guard.js, so the live-repo grounding fetch never
+// had a chance to include it, even though the field is completely real. Same root shape
+// as the ntfy.sh URL fix and the newly-declared-field fix -- a literal-substring-match
+// check can't distinguish "fabricated" from "real, just defined somewhere the fetch
+// didn't happen to look" -- but more general than either: this covers ANY real existing
+// identifier from ANYWHERE in the actual tracked repo, not just ones the task's own
+// rawText happened to name or ones newly declared in this same diff. Uses `git grep`
+// (same "shell out to git for a real repo-content check" convention checkCommitClaims
+// above already uses) rather than a hand-rolled directory walk -- fast, respects
+// .gitignore, and this is already a git repo by the time review ever runs. Same
+// non-fatal, fail-toward-still-flagging treatment as checkCommitClaims: any failure
+// (no repo, git missing, timeout) means "could not confirm," not "confirmed grounded" --
+// a check that silently stopped protecting against real fabrication on an environment
+// hiccup would be worse than the false positive this exists to fix.
+const REPO_GREP_TIMEOUT_MS = 15_000;
+
+function existsLiterallyInRepo(value, repoRoot) {
+  if (!repoRoot) return false;
+  const { execFileSync } = require('child_process');
+  try {
+    execFileSync('git', ['grep', '-q', '-F', '-e', value], {
+      cwd: repoRoot, timeout: REPO_GREP_TIMEOUT_MS, stdio: 'ignore',
+    });
+    return true; // exit 0 -- git grep found at least one match.
+  } catch (e) {
+    return false; // exit 1 (no match) or any other failure -- treat as unconfirmed, not grounded.
+  }
+}
+
+function checkGroundedValues(draftText, sourceText, repoRoot) {
   if (!sourceText) return [];
   const flags = [];
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
@@ -345,6 +379,7 @@ function checkGroundedValues(draftText, sourceText) {
     if (PLACEHOLDER_RE.test(url)) continue;
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
+    if (existsLiterallyInRepo(url, repoRoot)) continue;
     flags.push({ type: 'ungrounded-url', detail: url });
   }
 
@@ -352,9 +387,9 @@ function checkGroundedValues(draftText, sourceText) {
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
-    if (!sourceText.includes(field)) {
-      flags.push({ type: 'ungrounded-field', detail: field });
-    }
+    if (sourceText.includes(field)) continue;
+    if (existsLiterallyInRepo(field, repoRoot)) continue;
+    flags.push({ type: 'ungrounded-field', detail: field });
   }
 
   return flags;
@@ -368,7 +403,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
   const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
-  const groundedFlags = checkGroundedValues(draftText, sourceText);
+  const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot);
   const createModeTargets = extractCreateModeTargets(draftText);
   const commitChecks = checkCommitClaims(draftText, repoRoot);
 
