@@ -212,7 +212,31 @@ acquire_single_flight_lock() {
   # once the current holder lets go. A directory of per-waiter files, not one shared
   # flag, so a second concurrent Discuss session's priority isn't silently cleared the
   # instant the first one gets the lock.
-  local lockfile="${INSTANCES_DIR}/.pipeline-single-flight.lock"
+  #
+  # Optional $1 key (2026-08-25, root-caused live): single-flight-lock.js's own
+  # per-model locking (2026-08-25, same day) switched worker-1/worker-reasoning's real
+  # Ollama calls to a MODEL-KEYED lockfile (.pipeline-single-flight.<model>.lock) but
+  # this bash function stayed hardcoded to the old global, unkeyed one -- its own header
+  # comment called the gap "a known, accepted, low-frequency risk" on the theory that
+  # Ollama's own -np 1 slot would still serialize same-model requests as a fallback.
+  # Confirmed live that assumption is wrong: reviewer and worker-1 hitting the SAME
+  # default model through two DIFFERENT lockfiles produced a real, repeating "timed out
+  # waiting for llama-server to start: context canceled" cycle in Ollama's own log --
+  # concurrent LOAD attempts collide and cancel each other, not just generation slots,
+  # so this was never actually rare or low-cost. Sanitization mirrors single-flight-
+  # lock.js's lockFileName() exactly (same regex, same collapsing, same default-to-global
+  # when no key given) so both sides compute the IDENTICAL path for the same model name --
+  # that identity is the entire mechanism; a bash `sed` step that drifted from the JS
+  # regex even slightly would silently recreate this exact bug.
+  local key="${1:-}"
+  local lockfile
+  if [[ -n "$key" ]]; then
+    local safe_key
+    safe_key="$(printf '%s' "$key" | sed -E 's/[^A-Za-z0-9._-]+/_/g')"
+    lockfile="${INSTANCES_DIR}/.pipeline-single-flight.${safe_key}.lock"
+  else
+    lockfile="${INSTANCES_DIR}/.pipeline-single-flight.lock"
+  fi
   local priority_dir="${INSTANCES_DIR}/.discuss-waiting"
   local waited=0
   while [[ -n "$(ls -A "$priority_dir" 2>/dev/null)" && "$waited" -lt "${DISCUSS_PRIORITY_MAX_WAIT_SEC:-8}" ]]; do
