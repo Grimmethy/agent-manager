@@ -256,10 +256,9 @@
 const TABS = [
   { key: 'project', label: 'Project', description: 'Pick the target repo and grep dirs, then start, stop, or force-stop the pipeline against it and watch its live run status.' },
   { key: 'workers', label: 'Workers', description: 'See every running agent instance across the local-model and reasoning lanes, with per-instance status and model selection.' },
-  { key: 'pipelinemap', label: '🗺️ Pipeline Map', description: 'Every registered task source, its priority and behavior flags, and live counts of where real tasks currently sit -- read straight off the source registry and the queue, so it can never drift out of sync with the Job List tab\'s own hand-maintained lists.' },
   { key: 'hardware', label: 'Hardware', description: 'Live CPU/RAM/disk/GPU utilization, VRAM used vs total, and CPU/GPU temperature vs their 24h rolling average, with a temperature history graph.' },
   { key: 'models', label: 'Models', description: 'Configure which models are used for each pipeline stage, review implement-pass quality and usage stats, and run reasoning benchmarks.' },
-  { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted.' },
+  { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted -- plus live per-stage counts and behavior flags for every registered source, read straight off the source registry and the queue so they can never drift out of sync.' },
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
   { key: 'discovery', label: 'Discovery', description: 'Watch the architecture-discovery job work through the project\'s code communities, and read the candidate write-ups it has produced.' },
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
@@ -2651,6 +2650,21 @@ async function renderJobListTab() {
   } catch (e) {
     jobTypes = null;
   }
+  // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
+  // should just be an extension of Job List instead of a new tab entirely" -- folded in
+  // here rather than kept as its own tab. Also fixes the exact drift queue-watchdog's own
+  // scan flagged the same night: JOB_TYPES below is a hand-maintained client-side list
+  // (missing backlog_decomposition/backlog_fulfillment/pipeline_health_audit/product_spec/
+  // ui_visibility_audit), while pipelineMap.sources comes straight off the real
+  // src/task-sources.js registry via /api/pipeline-map -- used as the authoritative row
+  // list below, with JOB_TYPES now only consulted as a best-effort description lookup for
+  // the sources it happens to know about.
+  let pipelineMap;
+  try {
+    pipelineMap = await fetchJson('/api/pipeline-map');
+  } catch (e) {
+    pipelineMap = null;
+  }
   const activeByName = {};
   const alwaysActiveByName = {};
   const priorityByName = {};
@@ -2667,17 +2681,48 @@ async function renderJobListTab() {
     timesPerformedByName[j.name] = j.timesPerformed;
     availableByName[j.name] = j.available;
   });
+  const descByName = {};
+  const domainByName = {};
+  JOB_TYPES.forEach((j) => { descByName[j.source] = j.description; domainByName[j.source] = j.domain; });
 
-  // Sort by the EFFECTIVE priority (server override if any, else JOB_TYPES' static
-  // default) -- not the bare static default -- so an edit actually reorders the table.
-  const rows = JOB_TYPES.slice()
-    .map((j) => ({ ...j, priority: priorityByName[j.source] ?? j.priority }))
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  // Fall back to JOB_TYPES' own (staler, but still-usable) list when /api/pipeline-map
+  // itself is unavailable (node not on PATH, script error, etc.) -- same "degrade, don't
+  // blank the tab" treatment jobTypes-null already gets throughout this function.
+  const sourceList = mapAvailable
+    ? pipelineMap.sources
+    : JOB_TYPES.map((j) => ({ name: j.source, priority: j.priority, liveCounts: {} }));
+
+  // Backbone strip: total live count per stage, summed across every source at once.
+  const stageTotals = {};
+  for (const stage of PIPELINE_STAGE_ORDER) stageTotals[stage] = 0;
+  for (const s of sourceList) {
+    for (const [stage, count] of Object.entries(s.liveCounts || {})) {
+      stageTotals[stage] = (stageTotals[stage] || 0) + count;
+    }
+  }
+  const backboneHtml = mapAvailable ? `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
+      ${PIPELINE_STAGE_ORDER.map((stage) => `
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
+          <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
+        </div>
+      `).join('<div style="align-self:center; color:var(--muted); font-size:18px;">→</div>')}
+    </div>
+  ` : '';
+
+  // Sort by the EFFECTIVE priority (server override if any, else the registry/JOB_TYPES
+  // static default) -- not the bare static default -- so an edit actually reorders the
+  // table.
+  const rows = sourceList.slice()
+    .map((j) => ({ ...j, priority: priorityByName[j.name] ?? j.priority }))
     .sort((a, b) => a.priority - b.priority)
     .map(j => {
-    const alwaysActive = !!alwaysActiveByName[j.source];
-    const isActive = jobTypes ? (activeByName[j.source] ?? true) : true;
+    const alwaysActive = !!alwaysActiveByName[j.name];
+    const isActive = jobTypes ? (activeByName[j.name] ?? true) : true;
     const checkbox = jobTypes
-      ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.source)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
+      ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.name)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
       : `<span class="meta">?</span>`;
     // Priority cell: click-to-type input, relying on the browser's own native number-input
     // spinner for the "up1/down1" arrows the Brain Dump request asked for -- a separate
@@ -2686,7 +2731,7 @@ async function renderJobListTab() {
     // entirely when /api/job-types failed to load, same convention the checkbox already
     // uses for that case.
     const priorityCell = jobTypes
-      ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.source)}" value="${j.priority}">`
+      ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.name)}" value="${j.priority}">`
       : `<span class="meta">${j.priority}</span>`;
     // Approval mode (three-tier approval mode, 2026-07-26): a plain native <select> --
     // there's no custom-dropdown component anywhere in this dashboard, and a 3-option
@@ -2694,9 +2739,9 @@ async function renderJobListTab() {
     // Ornith approves; 'approve'/'prompt' both wait for a manual Apply click on the
     // Approved tab -- 'prompt' only differs in getting an active badge there instead of
     // a plain count, never in whether this automatic loop touches it.
-    const approvalMode = approvalModeByName[j.source] ?? 'auto';
+    const approvalMode = approvalModeByName[j.name] ?? 'auto';
     const approvalModeCell = jobTypes
-      ? `<select class="approval-mode-select" data-source="${escapeAttr(j.source)}">
+      ? `<select class="approval-mode-select" data-source="${escapeAttr(j.name)}">
           ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
         </select>`
       : `<span class="meta">${approvalMode}</span>`;
@@ -2706,9 +2751,9 @@ async function renderJobListTab() {
     // hardcoded to Claude regardless of this setting (see model-provider.js's
     // reasoningTierFor() comment), so overriding those two rows to 'ornith' only changes
     // which worker's claim filter picks the task up, not what drafts it.
-    const workerType = workerTypeByName[j.source] ?? 'ornith';
+    const workerType = workerTypeByName[j.name] ?? 'ornith';
     const workerTypeCell = jobTypes
-      ? `<select class="worker-type-select" data-source="${escapeAttr(j.source)}">
+      ? `<select class="worker-type-select" data-source="${escapeAttr(j.name)}">
           ${['ornith', 'reasoning'].map((w) => `<option value="${w}" ${w === workerType ? 'selected' : ''}>${w}</option>`).join('')}
         </select>`
       : `<span class="meta">${workerType}</span>`;
@@ -2717,7 +2762,7 @@ async function renderJobListTab() {
     // Approval Mode columns above, which only affect FUTURE tasks. Read-only here; the
     // one way to change it is the "Reset counts" button below, which zeroes every row at
     // once (see /api/job-types/reset-counts's own comment for why never a single row).
-    const timesPerformed = timesPerformedByName[j.source] ?? 0;
+    const timesPerformed = timesPerformedByName[j.name] ?? 0;
     // Available: how many Strong-rated candidates this source's own backlog doc (e.g.
     // ARCH_REVIEW_CANDIDATES.md) still has waiting, not yet claimed by any in-queue
     // fulfillment task (app.py's available_candidate_counts()). Only a handful of sources
@@ -2725,24 +2770,67 @@ async function renderJobListTab() {
     // observability_fix, performance_fix) -- null for everything else, shown as a blank
     // cell rather than a misleading 0 for a source whose real backlog size just isn't
     // tracked anywhere (an inbox folder, a flags file, external scanner output, ...).
-    const available = jobTypes ? availableByName[j.source] : null;
+    const available = jobTypes ? availableByName[j.name] : null;
     const availableCell = available == null ? '' : String(available);
+    const behaviorCell = mapAvailable ? pipelineFlagBadges(j) : '<span class="meta">?</span>';
+    const liveCell = mapAvailable
+      ? (Object.entries(j.liveCounts || {}).filter(([, c]) => c > 0)
+          .map(([stage, c]) => `<span class="badge warn" title="${PIPELINE_STAGE_LABELS[stage] || stage}">${PIPELINE_STAGE_LABELS[stage] || stage}: ${c}</span>`)
+          .join(' ') || '<span class="meta">idle</span>')
+      : '<span class="meta">?</span>';
     return `
     <tr>
       <td>${checkbox}</td>
       <td>${priorityCell}</td>
       <td>${approvalModeCell}</td>
       <td>${workerTypeCell}</td>
-      <td>${j.source}</td>
-      <td>${j.domain}</td>
+      <td>${j.name}</td>
+      <td>${domainByName[j.name] ?? '—'}</td>
+      <td>${behaviorCell}</td>
+      <td>${liveCell}</td>
       <td>${timesPerformed}</td>
       <td>${availableCell}</td>
-      <td>${escapeHtml(j.description)}</td>
+      <td>${escapeHtml(descByName[j.name] ?? '')}</td>
     </tr>
   `;
   }).join('');
+
+  const unregistered = mapAvailable ? (pipelineMap.unregistered || []) : [];
+  const unregisteredHtml = unregistered.length ? `
+    <p class="meta" style="margin-top:16px;">Tasks in the queue under a source name with no matching registry entry (a renamed/retired source with old work still sitting around):</p>
+    <table><thead><tr><th>Source name</th><th>Live counts</th></tr></thead><tbody>
+      ${unregistered.map((u) => `<tr><td>${escapeHtml(u.name)}</td><td>${Object.entries(u.liveCounts).map(([st, c]) => `${PIPELINE_STAGE_LABELS[st] || st}: ${c}`).join(', ')}</td></tr>`).join('')}
+    </tbody></table>
+  ` : '';
+
+  // Hand-authored detail insets: the two real multi-tier paths that don't reduce to a
+  // single registry flag, kept as static text/boxes reviewed by hand (rare-changing)
+  // rather than auto-generated.
+  const detailInsetsHtml = mapAvailable ? `
+    <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:24px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+        <div style="font-weight:600; margin-bottom:8px;">Adhoc draft escalation (domain:'adhoc', source:'manual')</div>
+        <div class="meta" style="line-height:1.7;">
+          1. <b>harness-search</b> (adhoc-harness-draft.js) — cheap, single-shot local-model pass. Declines (falls through) if it can't confidently ground a change.<br>
+          2. <b>local-agentic</b> (local-agentic-draft.js) — multi-turn local-model pass with real read-only Read/Grep/Glob tool access. Opt-in via <code>AGENT_MANAGER_LOCAL_AGENTIC_ADHOC=true</code>. Declines the same way.<br>
+          3. <b>Claude agentic</b> (adhoc-agentic-draft.js) — real Claude Code CLI call with Read/Grep/Glob/Edit/Write/Bash, the only tier that can actually run verification commands. Always available, blocked only by the manual Claude-pause kill switch.<br>
+          Any tier can resolve to <b>decompose</b> (task judged too large — queues 2+ fresh adhoc sub-tasks to <code>queue/adhoc/</code> instead of a diff) or <b>needs-human-decision</b> (routes to <code>queue/needs-clarification/</code>, never judged by an automatic reviewer).
+        </div>
+      </div>
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+        <div style="font-weight:600; margin-bottom:8px;">Split escape hatch (candidate-fulfillment sources — see "split-capable" badge)</div>
+        <div class="meta" style="line-height:1.7;">
+          Implement can output <code>{"mode":"split","candidates":[...]}</code> instead of a diff when the real candidate genuinely doesn't fit one atomic JSON edit (prompts.js's candidateSplitInstructions). Skips critique (no diff to critique) and goes straight to review, judged on scope-coverage rather than "does it contain code." At apply time, the sub-candidates are written back into the <i>same</i> candidates doc the original came from (the exact appender arch_discovery's own apply already uses) — each one then flows through the normal pickup loop on a later tick, small enough to land as its own single edit.
+        </div>
+      </div>
+    </div>
+  ` : '';
+
   main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+    + backboneHtml
+    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
+    + unregisteredHtml
+    + detailInsetsHtml;
 
   const resetButton = document.getElementById('reset-job-type-counts');
   if (resetButton) {
@@ -2849,14 +2937,16 @@ async function renderJobListTab() {
   });
 }
 
-// Pipeline Map tab (2026-08-26, Grimmethy: "I want a live pipeline map for architecture
-// review... right now I don't have any way of visualizing the process"). Topology comes
-// straight from /api/pipeline-map, which shells out to src/task-sources.js's own
-// --dump-topology CLI mode -- read fresh off the real registry every call, so this can
-// never drift out of sync with the actual pipeline the way the Job List tab's own
-// hand-maintained JOB_TYPES/TASK_SOURCE_CATALOG lists already have (confirmed live via
-// queue-watchdog's drift-scan the same night: several real sources missing from both).
-// Live counts are real queue/ contents, correlated by each task's own recorded source.
+// Pipeline-map helpers, shared by the Job List tab above (2026-08-26, Grimmethy: "I want a
+// live pipeline map for architecture review... right now I don't have any way of
+// visualizing the process" -- then, after seeing it as its own tab: "it really should just
+// be an extension of Job List instead of a new tab entirely"). Topology comes straight from
+// /api/pipeline-map, which shells out to src/task-sources.js's own --dump-topology CLI
+// mode -- read fresh off the real registry every call, so this can never drift out of sync
+// with the actual pipeline the way JOB_TYPES/TASK_SOURCE_CATALOG already have (confirmed
+// live via queue-watchdog's drift-scan the same night: several real sources missing from
+// both). Live counts are real queue/ contents, correlated by each task's own recorded
+// source.
 //
 // STAGE_ORDER/STAGE_LABELS: the backbone every source flows through, in queue-state order
 // -- not every source passes through every stage (advisoryProse skips critique inside
@@ -2879,96 +2969,6 @@ function pipelineFlagBadges(s) {
   if (s.advisoryProse) badges.push('<span class="badge idle" title="Deliverable is a prose verdict, not a diff -- critique is skipped">advisory-prose</span>');
   if (s.hasCustomApply && !s.directToMain) badges.push('<span class="badge idle" title="Has its own registered apply() instead of the generic Group B diff path">custom-apply</span>');
   return badges.join(' ') || '<span class="meta">—</span>';
-}
-
-async function renderPipelineMapTab() {
-  const main = document.getElementById('main');
-  let data;
-  try {
-    data = await fetchJson('/api/pipeline-map');
-  } catch (e) {
-    main.innerHTML = `<p class="meta">Could not load the pipeline map: ${escapeHtml(e.message)}</p>`;
-    return;
-  }
-  if (!data || !data.available) {
-    main.innerHTML = `<p class="meta">Pipeline map unavailable: ${escapeHtml((data && data.reason) || 'unknown error')}</p>`;
-    return;
-  }
-
-  const sources = (data.sources || []).slice().sort((a, b) => (a.priority ?? 1e9) - (b.priority ?? 1e9));
-
-  // Backbone strip: total live count per stage, summed across every source at once --
-  // the "how much is actually moving through the pipeline right now, and where" answer
-  // the tab exists to give at a glance, before ever looking at a single source's row.
-  const stageTotals = {};
-  for (const stage of PIPELINE_STAGE_ORDER) stageTotals[stage] = 0;
-  for (const s of sources) {
-    for (const [stage, count] of Object.entries(s.liveCounts || {})) {
-      stageTotals[stage] = (stageTotals[stage] || 0) + count;
-    }
-  }
-  const backboneHtml = `
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
-      ${PIPELINE_STAGE_ORDER.map((stage) => `
-        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
-          <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
-          <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
-        </div>
-      `).join('<div style="align-self:center; color:var(--muted); font-size:18px;">→</div>')}
-    </div>
-  `;
-
-  const rows = sources.map((s) => {
-    const liveBadges = Object.entries(s.liveCounts || {})
-      .filter(([, count]) => count > 0)
-      .map(([stage, count]) => `<span class="badge warn" title="${PIPELINE_STAGE_LABELS[stage] || stage}">${PIPELINE_STAGE_LABELS[stage] || stage}: ${count}</span>`)
-      .join(' ') || '<span class="meta">idle</span>';
-    return `
-      <tr>
-        <td>${escapeHtml(s.name)}</td>
-        <td>${s.priority ?? '—'}</td>
-        <td>${pipelineFlagBadges(s)}</td>
-        <td>${liveBadges}</td>
-      </tr>
-    `;
-  }).join('');
-
-  const unregistered = data.unregistered || [];
-  const unregisteredHtml = unregistered.length ? `
-    <p class="meta" style="margin-top:16px;">Tasks in the queue under a source name with no matching registry entry (a renamed/retired source with old work still sitting around):</p>
-    <table><thead><tr><th>Source name</th><th>Live counts</th></tr></thead><tbody>
-      ${unregistered.map((u) => `<tr><td>${escapeHtml(u.name)}</td><td>${Object.entries(u.liveCounts).map(([st, c]) => `${PIPELINE_STAGE_LABELS[st] || st}: ${c}`).join(', ')}</td></tr>`).join('')}
-    </tbody></table>
-  ` : '';
-
-  // Hand-authored detail insets: the two real multi-tier paths that don't reduce to a
-  // single registry flag, kept as static text/boxes reviewed by hand (last touched
-  // 2026-08-25/26, both rare-changing) rather than auto-generated -- see this tab's own
-  // module comment for why the backbone above is generated and these two are not.
-  const detailInsetsHtml = `
-    <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:24px;">
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
-        <div style="font-weight:600; margin-bottom:8px;">Adhoc draft escalation (domain:'adhoc', source:'manual')</div>
-        <div class="meta" style="line-height:1.7;">
-          1. <b>harness-search</b> (adhoc-harness-draft.js) — cheap, single-shot local-model pass. Declines (falls through) if it can't confidently ground a change.<br>
-          2. <b>local-agentic</b> (local-agentic-draft.js) — multi-turn local-model pass with real read-only Read/Grep/Glob tool access. Opt-in via <code>AGENT_MANAGER_LOCAL_AGENTIC_ADHOC=true</code>. Declines the same way.<br>
-          3. <b>Claude agentic</b> (adhoc-agentic-draft.js) — real Claude Code CLI call with Read/Grep/Glob/Edit/Write/Bash, the only tier that can actually run verification commands. Always available, blocked only by the manual Claude-pause kill switch.<br>
-          Any tier can resolve to <b>decompose</b> (task judged too large — queues 2+ fresh adhoc sub-tasks to <code>queue/adhoc/</code> instead of a diff) or <b>needs-human-decision</b> (routes to <code>queue/needs-clarification/</code>, never judged by an automatic reviewer).
-        </div>
-      </div>
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
-        <div style="font-weight:600; margin-bottom:8px;">Split escape hatch (candidate-fulfillment sources — see "split-capable" badge)</div>
-        <div class="meta" style="line-height:1.7;">
-          Implement can output <code>{"mode":"split","candidates":[...]}</code> instead of a diff when the real candidate genuinely doesn't fit one atomic JSON edit (prompts.js's candidateSplitInstructions). Skips critique (no diff to critique) and goes straight to review, judged on scope-coverage rather than "does it contain code." At apply time, the sub-candidates are written back into the <i>same</i> candidates doc the original came from (the exact appender arch_discovery's own apply already uses) — each one then flows through the normal pickup loop on a later tick, small enough to land as its own single edit.
-        </div>
-      </div>
-    </div>
-  `;
-
-  main.innerHTML = backboneHtml
-    + `<table><thead><tr><th>Source</th><th>Priority</th><th>Behavior</th><th>Live (in-flight)</th></tr></thead><tbody>${rows}</tbody></table>`
-    + unregisteredHtml
-    + detailInsetsHtml;
 }
 
 // Scouted Repos tab (deep_dive, ADR-0019): list of every project_search Strong lead
@@ -3490,7 +3490,6 @@ async function renderMain() {
     else if (activeTab === 'hardware') await renderHardwareTab();
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
-    else if (activeTab === 'pipelinemap') await renderPipelineMapTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
     else if (activeTab === 'discovery') await renderDiscoveryTab();
     else if (activeTab === 'branches') await renderBranchesTab();
