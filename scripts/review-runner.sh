@@ -215,7 +215,14 @@ while :; do                                                                     
           const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
           let o;
           try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
-          const isInfra = INFRA_FAILURE_PATTERN.test(reviewResult || "");
+          // 2026-08-26, Grimmethy: "we have one big problem that keeps repeating" -- same
+          // fix as local-worker.sh own identical INFRA_FAILURE_PATTERN copy: a review
+          // call whose process gets killed before writing ANY output produces
+          // reviewResult === "", which can never match a regex, so it always fell through
+          // to "genuinely failed" and permanently blocked regardless of how transient/
+          // external the real cause was. Zero output is itself strong evidence of an
+          // external kill/crash, not a content failure -- treated as infra-shaped here.
+          const isInfra = INFRA_FAILURE_PATTERN.test(reviewResult || "") || !(reviewResult || "").trim();
           const infraRequeueCount = o.reviewInfraRequeueCount || 0;
           o.history = o.history || [];
           if (isInfra && infraRequeueCount < infraRequeueLimit) {

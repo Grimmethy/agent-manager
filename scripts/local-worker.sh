@@ -373,7 +373,18 @@ process_drafting_file() {
         const isManualPause = MANUAL_PAUSE_PATTERN.test(draftResult || "");
         let o;
         try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
-        const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "");
+        // 2026-08-26, Grimmethy: "we have one big problem that keeps repeating" -- caught
+        // live, again: a draft call whose Node process gets killed before writing ANY
+        // output (SIGKILL from a zombie-restart, an uncaught exception that crashes the
+        // process outright -- see ollama-http.js own res-on-error fix for the earlier
+        // incident this exact symptom already caused once) produces draftResult === "".
+        // An empty string can never match INFRA_FAILURE_PATTERN -- no regex can match
+        // nothing -- so this ALWAYS fell through to "genuinely failed" and permanently
+        // blocked, no matter how obviously transient/external the real cause was. A
+        // process producing truly zero output is itself strong evidence of an external
+        // kill/crash, not a content failure the model produced -- treated as infra-shaped
+        // here for exactly that reason.
+        const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
         if (isManualPause) {
