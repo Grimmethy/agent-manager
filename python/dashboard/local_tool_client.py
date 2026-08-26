@@ -16,9 +16,16 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
 LOCAL_TOOL_CLIENT_JS = SRC_DIR / "local-tool-client.js"
 
-# local-tool-client.js's own REQUEST_TIMEOUT_MS default is 240s; headroom for Node
-# startup itself, matching claude_client.py's identical SUBPROCESS_TIMEOUT_S convention.
-SUBPROCESS_TIMEOUT_S = 270
+# local-tool-client.js's own REQUEST_TIMEOUT_MS default is 240s per TURN, not per call --
+# this was originally sized as "one slow turn plus headroom for Node startup," which was
+# fine back when every caller passed a small max_turns. 2026-08-26, Grimmethy: raised
+# Chat's own CHAT_LOCAL_MAX_TURNS well past that assumption (see chat_sessions.py's own
+# comment for the incident) -- a real multi-turn investigative call can legitimately need
+# several turns at ~15-20s each (confirmed live via model-stats.db: 65s/16s/75s/102s for
+# 5-turn runs, ~15-20s/turn average), so the ceiling now needs real headroom for the
+# WHOLE loop, not one turn. 900s comfortably covers 15 turns at 3x the observed average
+# pace before this becomes a real bound rather than a rubber stamp.
+SUBPROCESS_TIMEOUT_S = 900
 
 
 class LocalToolClientError(RuntimeError):
