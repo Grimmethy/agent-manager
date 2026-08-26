@@ -195,14 +195,57 @@ function listProcessesWithPpid() {
   }).filter(Boolean);
 }
 
-function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid } = {}) {
+// 2026-08-26 (Grimmethy: "Please look at the watchdogs restart mechanism" -- an 8.5-hour
+// stuck-lock incident this investigates). CORRECTED assumption: this used to filter on
+// `p.ppid === 1`, on the theory that a dead parent's child always reparents to true init.
+// Confirmed live this box does NOT reparent orphans to PID 1 -- it runs under a
+// `systemd --user` session, which (like most modern desktop/session-managed Linux setups)
+// acts as its own subreaper, so an orphan lands on that session's own scope/manager
+// process instead. That process is itself NOT permanent (confirmed live: the one from
+// this exact incident, PPID 902699, was ALSO gone by the time this was diagnosed), so
+// hardcoding any single "the real reaper is PID X" assumption would just move the same
+// bug rather than fix it. This never fired ONCE across an entire 8.5-hour incident that
+// it exists specifically to catch (44 accumulated zombie local-worker.sh loops, each with
+// its own stuck local-draft.js child, none ever reparented to 1) -- confirmed live via
+// `ps -ejH` during the incident: every stuck child's ppid was 902699, never 1.
+//
+// Robust fix: don't guess the reaper's identity at all. A `local-draft.js` process is
+// legitimate exactly when SOME currently-alive worker daemon's own heartbeat file
+// records it as that worker's real child (heartbeat.pid === the child's ppid, since a
+// worker's own bash `$$` never changes across its lifetime, including while its child is
+// running). Anything else -- ppid 1, ppid some other now-dead reaper, ppid a completely
+// unrelated live process -- has, by construction, no live worker that considers it "my
+// current in-flight call," which is the actual property this function has always cared
+// about (see this section's own header comment above).
+function currentWorkerHeartbeatPids(instancesDir) {
+  const pids = new Set();
+  let names;
+  try {
+    names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
+  } catch (e) {
+    return pids; // instances/ unreadable -- best-effort, same as deadProcessCheck() above.
+  }
+  for (const name of names) {
+    try {
+      const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, name), 'utf8'));
+      if (hb.instanceId && hb.instanceId.startsWith('worker-') && hb.pid) pids.add(hb.pid);
+    } catch (e) {
+      // Unreadable/mid-write heartbeat file -- skip it this pass, same per-item tolerance
+      // deadProcessCheck() already gives this exact class of file.
+    }
+  }
+  return pids;
+}
+
+function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid, instancesDir } = {}) {
   let processes;
   try {
     processes = listProcesses();
   } catch (e) {
     return []; // `ps` unavailable/failed -- best-effort, same as every other check here.
   }
-  return processes.filter((p) => p.ppid === 1 && MODEL_CALL_SCRIPT_RE.test(p.cmd));
+  const liveWorkerPids = currentWorkerHeartbeatPids(instancesDir);
+  return processes.filter((p) => MODEL_CALL_SCRIPT_RE.test(p.cmd) && !liveWorkerPids.has(p.ppid));
 }
 
 function main() {
@@ -213,7 +256,7 @@ function main() {
   const actions = deadProcessCheck({ instancesDir, cooldownPath });
   for (const action of actions) process.stdout.write(`${JSON.stringify(action)}\n`);
 
-  const orphans = findOrphanedModelCallProcesses();
+  const orphans = findOrphanedModelCallProcesses({ instancesDir });
   for (const orphan of orphans) {
     process.stdout.write(`${JSON.stringify({ action: 'kill-orphan', pid: orphan.pid, reason: `orphaned model-call process (ppid=1, cmd: ${orphan.cmd.slice(0, 120)})` })}\n`);
   }

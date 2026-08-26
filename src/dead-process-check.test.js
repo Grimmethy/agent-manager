@@ -89,47 +89,84 @@ test('a healthy, recently-updated worker heartbeat produces no action', () => {
 });
 
 // --- findOrphanedModelCallProcesses (2026-08-24, pipeline hardening: "that going
-// looking needs to be an automated process") ---------------------------------------------
+// looking needs to be an automated process"; CORRECTED 2026-08-26 after an 8.5-hour
+// live incident -- see dead-process-check.js's own comment on this function. The old
+// `ppid === 1` heuristic never fired once during that whole incident: this box runs
+// under a `systemd --user` session, which acts as its own subreaper, so orphans land on
+// some session-scope process instead of true init -- confirmed live via `ps -ejH`, every
+// stuck child's ppid was a non-1, itself-since-dead reaper pid. The fix cross-references
+// against currently-tracked worker heartbeat pids instead of assuming any specific
+// numeric ppid -- these tests now exercise THAT contract.) ------------------------------
 const { findOrphanedModelCallProcesses } = require('./dead-process-check.js');
 
-test('flags a local-draft.js process reparented to pid 1 as an orphan', () => {
+test('flags a local-draft.js process whose ppid matches no currently-live worker heartbeat (e.g. reparented to pid 1)', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 }); // the REAL, current worker-1 -- a different pid than the orphan's ppid below.
   const listProcesses = () => [
     { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
   ];
-  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.equal(orphans.length, 1);
   assert.equal(orphans[0].pid, 100);
 });
 
-test('does not flag a local-draft.js process whose parent is a real, live daemon (ppid != 1)', () => {
+// Regression, 2026-08-26: the exact live-incident shape -- a stuck child's ppid was
+// NEITHER 1 nor the current worker's real pid (it was a now-dead intermediate reaper).
+// The old ppid===1 check would have missed this entirely.
+test('flags a local-draft.js process whose ppid is a non-1, non-worker pid (reparented to a now-dead session reaper, not init)', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  const listProcesses = () => [
+    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
+  assert.equal(orphans.length, 1);
+  assert.equal(orphans[0].pid, 100);
+});
+
+test('does not flag a local-draft.js process whose parent IS the currently-live worker recorded in its own heartbeat', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 });
   const listProcesses = () => [
     { pid: 100, ppid: 555, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
   ];
-  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans, []);
 });
 
-test('does not flag an unrelated process reparented to pid 1 -- only local-draft.js matters', () => {
+test('does not flag an unrelated process with no matching worker -- only local-draft.js matters', () => {
+  const dir = tempInstancesDir();
   const listProcesses = () => [
     { pid: 100, ppid: 1, cmd: 'node /repo/src/dead-process-check.js' },
     { pid: 101, ppid: 1, cmd: 'sshd: some-unrelated-daemon' },
   ];
-  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans, []);
 });
 
 test('returns an empty list (never throws) when `ps` itself fails', () => {
+  const dir = tempInstancesDir();
   const listProcesses = () => { throw new Error('ps: command not found'); };
-  assert.doesNotThrow(() => findOrphanedModelCallProcesses({ listProcesses }));
-  assert.deepEqual(findOrphanedModelCallProcesses({ listProcesses }), []);
+  assert.doesNotThrow(() => findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir }));
+  assert.deepEqual(findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir }), []);
 });
 
-test('flags multiple real orphans in one pass', () => {
+test('returns an empty list (never throws) when instancesDir itself is unreadable', () => {
+  const listProcesses = () => [
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  assert.doesNotThrow(() => findOrphanedModelCallProcesses({ listProcesses, instancesDir: '/no/such/dir' }));
+});
+
+test('flags multiple real orphans in one pass, leaving the one real live worker child alone', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  writeHeartbeat(dir, 'worker-reasoning', { pid: 777 });
   const listProcesses = () => [
     { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/a.json' },
-    { pid: 200, ppid: 999, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/b.json' },
-    { pid: 300, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/c.json' },
+    { pid: 200, ppid: 777, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/b.json' }, // legitimate -- ppid matches worker-reasoning's real, current pid.
+    { pid: 300, ppid: 999, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/c.json' },
   ];
-  const orphans = findOrphanedModelCallProcesses({ listProcesses });
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);
 });
