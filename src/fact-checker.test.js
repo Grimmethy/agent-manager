@@ -428,6 +428,36 @@ test('checkGroundedValues does not flag a field that exists literally elsewhere 
   assert.deepEqual(flags, []);
 });
 
+// checkGroundedValues: unchanged diff context/removed lines are not new claims -----------
+// 2026-08-26, root-caused live via a real blocked adhoc task (the Job List family-grouping
+// change): PERFORMANCE_FIX_CANDIDATES -- a field that had existed in the target file for
+// six days before this draft touched it -- got flagged ungrounded-field anyway, because it
+// happened to sit in an UNCHANGED context line of the draft's own embedded diff (the git-
+// grep repo fallback above is a real safety net, but depends on a live repoRoot at review
+// time and isn't a substitute for not flagging a context line in the first place). A field
+// that only ever appears on an unchanged (' ') or removed ('-') diff line -- never on a
+// real '+' addition -- is never a new claim the draft is making, regardless of whether
+// sourceText or the repo happen to confirm it too.
+test('checkGroundedValues does not flag a field that only appears in an unchanged diff context line', () => {
+  const draftText = [
+    'RESOLUTION: implemented',
+    '',
+    '=== DIFF ===',
+    'diff --git a/index.html b/index.html',
+    'index 1111111..2222222 100644',
+    '--- a/index.html',
+    '+++ b/index.html',
+    '@@ -10,3 +10,5 @@ const JOB_TYPES = [',
+    "   { source: 'performance_fix', description: 'against PERFORMANCE_FIX_CANDIDATES.md.' },",
+    ' ];',
+    '+const JOB_TYPE_FAMILIES = [];',
+  ].join('\n');
+  const sourceText = 'unrelated grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
 test('checkGroundedValues still flags a field that does not exist anywhere in the real repo', () => {
   const { dir } = makeGitRepo();
 
