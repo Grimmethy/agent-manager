@@ -42,14 +42,31 @@
      confirmed live: "When I send a message... the chat scrolls all the way up to the
      beginning"): a flex item's min-height defaults to auto, which means it won't shrink
      below its OWN CONTENT's natural height even with flex:1 set. Without this, .chat-body
-     and .grill-transcript both just grow to fit the whole transcript instead of staying
+     and #chat-transcript both just grow to fit the whole transcript instead of staying
      fixed-height with internal scroll -- the newest messages get pushed past #chat-panel's
      own fixed, clipped (overflow:hidden) box and are invisibly cut off, while the oldest
-     messages stay visible at the top. transcriptEl.scrollTop = scrollHeight (in chatRender)
-     was already correct -- there was nothing to actually scroll, since the element had
-     grown instead of staying a fixed box with overflow. */
+     messages stay visible at the top. */
   .chat-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
-  .chat-body .grill-transcript { flex: 1; min-height: 0; max-height: none; }
+  /* 2026-08-26, Grimmethy: "Whenever I press enter... it resets to the top of the scroll
+     instead of the bottom" -- root-caused live: #chat-transcript's own static markup
+     ALREADY carries class="grill-transcript" (for exactly this flex-sizing rule), but
+     grillRenderTranscript() (shared with Discuss/Grill, called by chatRender() below)
+     unconditionally wraps its rows in ANOTHER "grill-transcript"-classed div -- fine for
+     every OTHER caller (their container element doesn't already carry that class, so
+     grillRenderTranscript's own div is the only one), but Chat alone ends up with the
+     class on both #chat-transcript AND the freshly-rendered div nested one level inside
+     it. Both then match the base .grill-transcript rule's own `overflow-y: auto`, so BOTH
+     become independently scrollable -- the flex:1/min-height:0 sizing here means the OUTER
+     one (#chat-transcript) never actually has anything to scroll (its single child fills
+     it exactly), so the REAL scrolling happens on the INNER, freshly-created div instead,
+     whose scrollTop chatRender() never touched (it only ever set scrollTop on the outer
+     #chat-transcript) -- so every fresh render (i.e. every message, whichever way it was
+     sent) left that inner div sitting at its default post-render scrollTop of 0. Targeting
+     #chat-transcript by ID instead of the shared class here (rather than .grill-transcript)
+     keeps this sizing rule from ALSO matching that inner div a second time; overflow:hidden
+     on the outer makes it explicit that only the inner div should ever show a scrollbar.
+     See chatRender()'s own comment for the matching JS-side fix. */
+  .chat-body #chat-transcript { flex: 1; min-height: 0; overflow: hidden; }
   .chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
   #chat-toggle-tab { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
   #chat-toggle-tab:hover { color: var(--text); }
@@ -238,7 +255,7 @@
       <button type="button" class="secondary" id="chat-new-btn" title="Start a fresh conversation">New</button>
     </div>
     <div class="chat-body">
-      <div class="grill-transcript" id="chat-transcript"></div>
+      <div id="chat-transcript"></div>
       <textarea class="grill-answer" id="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
       <div class="row" style="margin-top:8px;gap:8px">
         <button type="button" class="action" id="chat-send-btn">Send</button>
@@ -1080,7 +1097,14 @@ function chatRender() {
     transcriptEl.innerHTML = chatSession && chatSession.transcript.length
       ? grillRenderTranscript(chatSession.transcript, chatSession)
       : '<div class="empty">Say something to the chat.</div>';
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    // 2026-08-26: the ACTUAL scrollable box is the .grill-transcript div
+    // grillRenderTranscript() just created one level inside #chat-transcript, not
+    // #chat-transcript itself -- see the CSS comment above #chat-transcript's own rule
+    // for the full incident. Setting scrollTop on the wrong (outer) element was a
+    // silent no-op every single render, which is why every new message left the inner
+    // box sitting at its default post-render scrollTop of 0 (top) instead of the bottom.
+    const scrollBox = transcriptEl.querySelector('.grill-transcript');
+    if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
   }
 }
 
