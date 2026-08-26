@@ -15,6 +15,7 @@ const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { withLock } = require('./single-flight-lock.js');
+const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
 // capabilities so that the local reasoning model can handle the work... I'd like to see
@@ -358,10 +359,26 @@ const TOOL_HANDLERS = {
 // a user watching real tokens land never has to wonder if it's hung. Tool-call turns
 // still resolve in one shot either way (Ollama emits tool_calls fully-formed, not
 // token-by-token), so onChunk simply never fires for those turns.
+// 2026-08-26 (Chat panel "stuck thinking" + blank reply, Grimmethy): confirmed live via
+// journalctl that the running llama-server was launched with `-c 8192` -- this call path
+// never sent an explicit num_ctx at all, so it inherited whatever context size some
+// earlier caller happened to establish. A real tool-heavy investigation reached 8033-8114
+// tokens against that 8192 ceiling; llama.cpp's own context-shift (`--context-shift --keep
+// 4` on the runner) then evicts the OLDEST tokens to make room -- which can shift the
+// original user message itself out of the window, matching Ollama's "no user query found
+// in messages" check exactly. Confirmed live: this reproduced on a tight loop (succeed,
+// hit the ceiling, flake x3, roll back one turn, succeed, immediately hit the ceiling
+// again) that never actually escaped the 8192 boundary, burning the whole turn budget on
+// churn. gpu-capacity.js's PINNED_NUM_CTX is the SAME hard-won fix local-client.js's own
+// /api/generate path already uses for exactly this class of problem (see that module's
+// own header: "pin num_ctx to ONE stable value and never vary it by request" -- varying it
+// per-call is what causes an expensive reload-triggered hang, not the fix for one).
+// Reusing the existing pinned constant instead of picking a new number keeps every local-
+// provider caller on the one value this pipeline has already vetted.
 async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL, messages, tools, stream: false,
+      model: MODEL, messages, tools, stream: false, options: { num_ctx: PINNED_NUM_CTX },
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
     return res.message || {};
   }
@@ -369,7 +386,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   let toolCalls = null;
   let streamError = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
-    model: MODEL, messages, tools,
+    model: MODEL, messages, tools, options: { num_ctx: PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
     if (obj.error || obj.done_reason === 'error') {
       streamError = obj.error || obj.done_reason || 'unknown stream error';
@@ -493,7 +510,14 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         toolCallLog.length = priorLogStart;
         turnStartLengths.pop();
         turnStartLogLengths.pop();
-        turnsUsed -= 1;
+        // NOT decrementing turnsUsed here: a rollback still consumes a real outer-loop
+        // iteration slot (the `for` loop's own `turn` counter doesn't rewind), so
+        // turnsUsed must keep tracking that real count. 2026-08-26 bug, caught live:
+        // decrementing it here meant a request that repeatedly flaked-rolled-back-
+        // succeeded could exhaust the entire maxTurns budget while turnsUsed stayed
+        // artificially low -- chat_sessions.py's `turnsUsed >= CHAT_LOCAL_MAX_TURNS`
+        // check never fired, so a maxTurns-exhausted call returned a silent BLANK reply
+        // instead of the "ran out of its turn budget" explainer.
         rollbackAttempts += 1;
         continue;
       }
