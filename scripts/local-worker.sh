@@ -359,12 +359,33 @@ process_drafting_file() {
         const failureCount = process.argv[3];
         const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
         const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
+        // 2026-08-25, Grimmethy: found live -- a real overnight adhoc/research backlog
+        // (draft calls hitting claude-pause.js manual pause, worded to match
+        // INFRA_FAILURE_PATTERN "service unavailable" on purpose -- see that module own
+        // header) burned all 3 infraRequeueLimit rounds in a few hours and landed
+        // permanently in blocked/, even though a manual pause is a deliberate, open-ended
+        // human decision (preserve tokens until the weekly limit resets), not a transient
+        // outage that either clears in minutes or never will. Checked separately, BEFORE
+        // the bounded infra path, and never bounded: a paused task should sit and wait for
+        // as many rounds as it takes, not get treated as unfixable just because a human
+        // has not come back yet.
+        const MANUAL_PAUSE_PATTERN = /manually paused/i;
+        const isManualPause = MANUAL_PAUSE_PATTERN.test(draftResult || "");
         let o;
         try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "");
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
-        if (isInfra && infraRequeueCount < infraRequeueLimit) {
+        if (isManualPause) {
+          o.draftFailureCount = 0;
+          o.history.push({
+            stage: "requeued",
+            at: new Date().toISOString(),
+            detail: `draft call failed ${failureCount} times in a row because Claude is manually paused -- requeued (uncapped; a manual pause is intentional and open-ended, not a bounded infra outage) instead of blocking`,
+          });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("requeue");
+        } else if (isInfra && infraRequeueCount < infraRequeueLimit) {
           o.infraRequeueCount = infraRequeueCount + 1;
           o.draftFailureCount = 0;
           o.history.push({
