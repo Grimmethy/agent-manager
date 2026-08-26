@@ -39,10 +39,18 @@ PROVIDER_CLAUDE = "claude"
 # header on the trust model this mirrors (this actual terminal session).
 CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CHAT_CLAUDE_MAX_TURNS = 30
-# Tight cap for the local provider's own tool loop -- matches arch_discovery's existing
-# ceiling (local-tool-client.js's runPlanWithTools default), deliberately not widened for
-# Chat; see local-tool-client.js's own WRITE_TOOLS header on why hard bounds stay hard.
-CHAT_LOCAL_MAX_TURNS = 5
+# 2026-08-26, Grimmethy: "Seems like qwen got hung up" -- root-caused live, not actually
+# hung: model-stats.db showed 4 real completed calls (65s/16s/75s/102s), zero errors, zero
+# degenerate flags. It genuinely ran out of its 5-turn budget mid-investigation ("look at
+# AC-3, what went wrong" needs locate-doc -> find-AC-3 -> check-git-log -> read-source,
+# comfortably more than 5 read-only-plus-bash tool calls for a model this size) and
+# returned whatever text happened to be attached to its LAST tool-calling turn -- "I'll
+# check X next," not a real answer, since local-tool-client.js's own loop only returns a
+# synthesized final response when a turn comes back with NO tool calls at all. Raised well
+# past the old arch_discovery-matching 5 (that ceiling was sized for a single grounded
+# review, not an open-ended user-directed investigation) -- see local_tool_client.py's own
+# SUBPROCESS_TIMEOUT_S comment for the matching wall-clock headroom this needed too.
+CHAT_LOCAL_MAX_TURNS = 15
 
 
 def chat_sessions_path(storage_dir: Path) -> Path:
@@ -171,7 +179,24 @@ def _send_local(session: dict, message: str) -> str:
     )
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result)
-    return (result.get("response") or "").strip()
+    reply = (result.get("response") or "").strip()
+    # 2026-08-26, same incident as CHAT_LOCAL_MAX_TURNS above: local-tool-client.js's own
+    # loop only ever returns a real synthesized answer when a turn comes back with NO tool
+    # calls -- hitting the turn cap while the model still wanted to keep investigating
+    # means `reply` is whatever text rode along with its LAST tool call ("I'll check X
+    # next"), not a considered answer, and there was previously no signal anywhere
+    # (including this session's own JSON) that this happened. turnsUsed >= max_turns is
+    # the same heuristic local-tool-client.js's own maxTurns-reached branch uses to detect
+    # this case; the one false-positive edge (a real final answer that happens to land
+    # with no tool calls on exactly the last allowed turn) errs toward over-labeling
+    # rather than silently presenting a cut-off status update as a finished answer.
+    if result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
+        reply += (
+            f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation -- "
+            "the above may be a status update rather than a finished answer. Ask again, or "
+            "narrow the question, to let it continue.)*"
+        )
+    return reply
 
 
 def send_message(storage_dir: Path, session_id: str, message: str) -> dict:
