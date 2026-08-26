@@ -426,9 +426,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // instead of chat_sessions.py's old approach of flattening the whole transcript into
   // one giant string inside a single {role:'user'} message. Plain single-shot callers
   // (local-agentic-draft.js) still pass `prompt` and get the old one-message behavior,
-  // unchanged. This also happens to be why the single-message TokenFold cache-mint flake
-  // documented below almost never fires for Chat anymore: a real conversation's first
-  // turn is the only one ever length-1 now, same as it always was for one-shot callers.
+  // unchanged.
   const messages = Array.isArray(reqMessages) && reqMessages.length
     ? reqMessages.slice()
     : [{ role: 'user', content: prompt }];
@@ -436,27 +434,59 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   let turnsUsed = 0;
   let lastMessage = null;
 
+  // 2026-08-26 (Chat panel 502, Grimmethy): a real Ollama /api/chat call can
+  // intermittently come back "Ollama HTTP 500: {"error":"no user query found in
+  // messages"}". CORRECTED root cause (an earlier version of this comment wrongly
+  // blamed the vendored TokenFold proxy -- ruled out live: OLLAMA_URL is unset for this
+  // caller, so TokenFold was never actually in the request path): confirmed via
+  // `journalctl -u ollama` that this is Ollama's OWN renderer failing --
+  // `source=routes.go:2684 msg="chat prompt error" error="no user query found in
+  // messages"` -- on longer, tool-heavy conversations. It's genuinely transient, not
+  // content-triggered: the exact same messages array, resent unchanged moments later,
+  // can succeed. A single retry isn't reliable enough -- confirmed live, it failed twice
+  // in a row on a real multi-tool-call chat turn -- so this retries up to
+  // CHAT_FLAKE_MAX_ATTEMPTS times total per turn (not counted against
+  // maxTurns/turnsUsed), the same bounded-retry-on-known-transient-failure treatment
+  // this pipeline already gives other infra flakiness (see local-worker.sh's
+  // INFRA_FAILURE_PATTERN).
+  const CHAT_FLAKE_MAX_ATTEMPTS = 3;
+
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
-    // 2026-08-26 (Chat panel 502, Grimmethy): a single-message /api/chat call --
-    // exactly this loop's first turn, every time, for a one-shot caller -- can
-    // intermittently come back "Ollama HTTP 500: {"error":"no user query found in
-    // messages"}" even though the real Ollama server never sees a malformed request:
-    // TokenFold's proxy (see vendor/tokenfold/core/tokenfold/engine.py's encode(),
-    // len(messages)==1 branch) runs its dictionary-mint step inline inside encode() for
-    // that shape, and a race there can occasionally hand back a mangled `messages`
-    // array. Confirmed live: the exact same prompt/session, resent unchanged moments
-    // later, succeeds -- not a content-triggered failure, a transient one in the
-    // vendored proxy's encode path. One immediate retry of the SAME turn (not counted
-    // against maxTurns/turnsUsed) is the same bounded-retry-on-known-transient-failure
-    // treatment this pipeline already gives other infra flakiness (see
-    // local-worker.sh's INFRA_FAILURE_PATTERN).
     let message;
-    try {
-      message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
-    } catch (e) {
-      if (!/no user query found in messages/i.test(e.message)) throw e;
-      message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+    let flakeErr = null;
+    for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
+      try {
+        message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+        flakeErr = null;
+        break;
+      } catch (e) {
+        if (!/no user query found in messages/i.test(e.message)) throw e;
+        flakeErr = e;
+      }
+    }
+    if (flakeErr) {
+      // Retries exhausted. A LATER turn (turn > 0) means the model already said
+      // something real on earlier turns -- onChunk already streamed it to the browser.
+      // Throwing here would silently discard all of that (confirmed live: a whole
+      // streamed AC-3 investigation vanished and the Chat panel quietly rolled back to
+      // its pre-message state) for a failure that has nothing to do with what was
+      // already said. Same graceful-degrade shape as the maxTurns-reached return below.
+      if (lastMessage) {
+        // The already-streamed content (if any) already reached onChunk on earlier
+        // turns -- this note is NEW text the model never said, so it needs its own
+        // onChunk call to actually reach the browser (the CLI's own "emittedAny"
+        // fallback only fires when NOTHING streamed yet, which isn't this case).
+        const note = '\n\n*(Lost the connection to the local model mid-investigation -- '
+          + "Ollama's own renderer hit a known intermittent fault. The above is what it "
+          + 'had said so far; ask again to let it continue.)*';
+        if (onChunk) onChunk(note);
+        return {
+          response: (lastMessage.content || '') + note,
+          toolCallLog, turnsUsed: turnsUsed - 1, toolsDisabled: false,
+        };
+      }
+      throw flakeErr;
     }
 
     lastMessage = message;
