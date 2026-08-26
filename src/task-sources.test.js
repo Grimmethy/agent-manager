@@ -1570,6 +1570,33 @@ test('nextCandidateFulfillmentTask still queues a real candidate that legitimate
   assert.deepEqual(task.promptContext.fetchedFiles, []);
 });
 
+// Regression, 2026-08-26: caught live -- arch-review-ac-7 listed 5 files (none with a
+// directory prefix, two of them not real files at all -- both actually live together in
+// one other file) despite the discovery prompt's own explicit instruction to copy paths
+// exactly as given. Every one of the 5 silently failed to resolve, but the task was
+// queued anyway, doomed to the same "no real implementation code" degenerate/blocked
+// cycle every single pass -- the identical shape of gap the AC-10 placeholder-body fix
+// above already closed for the Problem/Solution text, just never closed for "Files:".
+test('nextCandidateFulfillmentTask skips a candidate that lists multiple files where NONE resolve (path hallucination, not a legitimate new-file proposal)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'madeUpFile.js, alsoMadeUp.js, thirdOne.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.equal(task, null, 'a multi-file candidate where nothing resolves must never become a real task');
+});
+
+test('nextCandidateFulfillmentTask still queues a candidate with multiple files when AT LEAST ONE resolves', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'a.js'), 'const a = 1;');
+  const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'a.js, madeUpFile.js');
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.ok(task, 'a candidate with at least one real, grounded file must not be rejected just because another listed file does not exist');
+  assert.equal(task.promptContext.fetchedFiles.length, 1);
+});
+
 test('nextCandidateFulfillmentTask skips a candidate when only Problem (not Solution) is an unfilled placeholder', () => {
   const dir = makeAdhocFixtureRepo();
   const candidatesPath = path.join(dir, 'CANDIDATES.md');

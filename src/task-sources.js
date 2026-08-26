@@ -598,6 +598,26 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
       })
       .filter(Boolean);
 
+    // Path-hallucination guard (2026-08-26, Grimmethy: "Can we answer why it didn't get
+    // correct files to begin with?" -- arch-review-ac-7 investigation). Same shape as the
+    // isPlaceholderBody skip above (a real, precedented gap: arch-review-ac-10 sat
+    // permanently un-completable for weeks because this function trusted ANY
+    // "Strength: Strong" section as actionable with no check its content was real) but for
+    // the "Files:" line instead of the Problem/Solution body. Confirmed live: AC-7 listed
+    // 5 files (none with a directory prefix, two -- resolveGraphPath.js/getConfig.js --
+    // not real files at all, both actually live together in src/config.js) despite
+    // archReviewImplementPrompt's own explicit instruction to copy paths exactly as given
+    // -- the model just didn't follow it. Every one of the 5 silently failed to resolve
+    // above, leaving fetchedFiles empty, and the task was queued anyway, doomed to the same
+    // "no real implementation code" degenerate/blocked cycle every single pass. Deliberately
+    // NOT skipping on filesArray.length === 1 with zero fetchedFiles -- see this function's
+    // own comment above: a candidate proposing ONE genuinely brand-new file is a valid,
+    // intended shape (fetchedFiles' own promptContext meaning is "ground a create, or flag
+    // the mismatch"). Multiple listed files where NONE resolve is a much stronger signal --
+    // no real architectural finding proposes touching several already-existing-sounding
+    // files that are ALL, simultaneously, brand new.
+    if (filesArray.length >= 2 && fetchedFiles.length === 0) continue;
+
     return {
       id: taskId,
       domain: defaultDomain,
