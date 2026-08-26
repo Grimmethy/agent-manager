@@ -1495,12 +1495,21 @@ registerTaskSource('path_prefetch_resolve', {
 // applyArchDiscoveryCandidates (apply-group-a.js), the same appender arch_discovery's own
 // apply already uses. A lazy getter, not a plain value, since getConfig() isn't callable
 // at module-load time.
+// reasoningTier: 'high' (2026-08-26, Grimmethy: "default to qwen reasoning to high...
+// across the board" -- root-caused live via arch-review-ac-5, whose local (low-tier)
+// implement pass produced 0 chars on its 3rd and final attempt, exhausting retries with
+// nothing usable). This moves arch_review onto the worker-reasoning lane instead of
+// worker-1's -- NOT a route to Claude: refresh_active_model()'s own budget/pause check
+// (local-worker.sh) already forces that lane back to local Ollama whenever Claude is
+// rate-limited or manually paused (which it currently is, deliberately, per that same
+// conversation), so this stays qwen-only as long as that pause holds.
 registerTaskSource('arch_review', {
   priority: taskPriority('arch_review', 70),
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
   emptyApproval: true, candidateFulfillment: true,
   candidatesPath: () => getConfig().archReviewCandidatesPath,
   candidateDocTitle: '# Architecture Review Candidates',
+  reasoningTier: 'high',
 });
 // arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
 // against arch_import's own candidates doc instead of arch_discovery's. Priority 71 --
@@ -1513,6 +1522,7 @@ registerTaskSource('arch_import_review', {
   emptyApproval: true, candidateFulfillment: true,
   candidatesPath: () => getConfig().archImportCandidatesPath,
   candidateDocTitle: '# Architecture Import Candidates',
+  reasoningTier: 'high', // same reasoning as arch_review's own registration just above.
 });
 // apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
 // markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
