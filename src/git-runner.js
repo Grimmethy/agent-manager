@@ -73,6 +73,34 @@ function createRealGitRunner(repoRoot) {
         throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
       }
       run(['checkout', mainBranch]);
+      // 2026-08-27, Grimmethy: "This reset has consistently caused us to lose work and
+      // reintroduces bugs after we fix them." Root-caused live: the plain `git reset
+      // --hard origin/<mainBranch>` below discards ANY local commit on mainBranch that
+      // was never pushed, exactly as readily as it discards uncommitted debris -- the
+      // auto-stash above only ever protected the latter. Confirmed live losing 5 real
+      // commits this way in one incident, including a same-day critical fix
+      // (MIN_TIMEOUT_MS's cold-load timeout) that had been committed locally on master
+      // but not yet pushed when the next apply's resetToMain() ran: the fix was
+      // silently reverted out from under the pipeline, reintroducing the exact bug it
+      // had just fixed, recoverable only because git hadn't pruned the reflog yet. A
+      // local commit ahead of origin here is real, intentional work (this repo is
+      // sometimes committed to directly in the shared working tree, same premise the
+      // auto-stash fix above already accepted at the uncommitted-changes layer, and the
+      // same premise pushMain()'s own comment already documented for the narrower
+      // DIRECT_TO_MAIN_SOURCES case) -- never something to discard by default. Push it
+      // forward to origin FIRST: a plain, non-force push, safe by construction whenever
+      // mainBranch is a fast-forward superset of origin (the overwhelmingly common
+      // case -- exits 0 as a no-op "Everything up-to-date" when there's nothing to
+      // push), so the hard reset just below becomes a no-op for any real commit. Only
+      // genuinely diverged history (origin has a commit mainBranch doesn't) fails a
+      // plain push, and that failure is surfaced as a thrown error -- caught by
+      // applyTask()'s own top-level try/catch, which blocks this one task for a human
+      // to reconcile -- rather than silently resolved by throwing local history away.
+      try {
+        run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+      } catch (e) {
+        throw new Error(`resetToMain: local ${mainBranch} has commit(s) origin doesn't, and fast-forwarding them to origin failed (likely genuinely diverged history -- needs a human to reconcile, not an automatic reset): ${e.message}`);
+      }
       run(['reset', '--hard', `origin/${mainBranch}`]);
     },
     createBranch: (name) => run(['checkout', '-b', name]),
