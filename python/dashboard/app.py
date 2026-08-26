@@ -5065,8 +5065,16 @@ def api_pipeline_map():
         return jsonify({"available": False, "reason": "task-sources.js --dump-topology returned non-JSON output"})
 
     live_counts = _pipeline_live_counts(queue_dir())
+    # turnsStats (2026-08-26, Grimmethy: "add turnsUsed recording... a data point we
+    # track for each job type in the Job List itself (min/max/average)") -- same
+    # merge-by-source-name shape as liveCounts just below; None for any source that has
+    # never recorded a real turnsUsed count (not instrumented, or a non-agentic source
+    # that has no concept of "turns" at all), not a fabricated zero.
+    from model_stats_client import get_turns_summary
+    turns_by_source = {row["source"]: row for row in (get_turns_summary() or {}).get("bySource", [])}
     for source in topology:
         source["liveCounts"] = live_counts.pop(source["name"], {})
+        source["turnsStats"] = turns_by_source.pop(source["name"], None)
     # Anything left in live_counts belongs to a source no longer registered (a renamed/
     # retired source with old tasks still sitting in the queue, or the "(unknown)" bucket
     # from a corrupt/pre-source-field file) -- surfaced separately rather than silently

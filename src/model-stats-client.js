@@ -67,7 +67,7 @@ function runEvent(event, payload) {
 // had this column (the PowerShell reference always populated it), it just had no way to
 // reach it through this JS wrapper until ab-model-select.js gave local-draft.js a real
 // selection to record.
-function recordCall({ taskId, stage = 'implement', model, candidates = null, startedAt, latencyMs, result }) {
+function recordCall({ taskId, stage = 'implement', model, candidates = null, startedAt, latencyMs, result, source = null }) {
   const callId = require('crypto').randomUUID();
   runEvent('record-call', {
     callId,
@@ -77,6 +77,14 @@ function recordCall({ taskId, stage = 'implement', model, candidates = null, sta
     candidates,
     startedAt,
     latencyMs,
+    // turnsUsed/source (2026-08-26, Grimmethy: "add turnsUsed recording... a data point
+    // we track for each job type in the Job List itself (min/max/average)" -- see
+    // model-stats-db.js's own migration comment for the full incident this follows).
+    // Only runPlanWithTools()-backed callers ever populate result.turnsUsed; every other
+    // caller's result shape has no such field, so this is null (not a fabricated 0) for
+    // them, matching costUsd's own "null means doesn't apply" convention just above.
+    turnsUsed: result && result.turnsUsed != null ? result.turnsUsed : null,
+    source,
     evalDurationNs: result && result.eval_duration != null ? result.eval_duration : null,
     promptEvalCount: result && result.prompt_eval_count != null ? result.prompt_eval_count : null,
     evalCount: result && result.eval_count != null ? result.eval_count : null,
@@ -146,4 +154,17 @@ function getCostSummary() {
   }
 }
 
-module.exports = { recordCall, recordOutcome, getCostSummary };
+// Reads back per-source MIN/MAX/AVG(turns_used) (2026-08-26, see recordCall's own
+// turnsUsed comment) -- same real-stdout-capture shape as getCostSummary() above, same
+// best-effort fail-to-null philosophy: a Job List column failing to render a turns stat
+// is not worth breaking the page over.
+function getTurnsSummary() {
+  try {
+    const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'turns-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
+    return JSON.parse(stdout);
+  } catch (e) {
+    return null;
+  }
+}
+
+module.exports = { recordCall, recordOutcome, getCostSummary, getTurnsSummary };

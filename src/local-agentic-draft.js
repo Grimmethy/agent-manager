@@ -37,6 +37,7 @@
 const { getConfig } = require('./config.js');
 const { runPlanWithTools } = require('./local-tool-client.js');
 const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+const modelStatsClient = require('./model-stats-client.js');
 
 // Deliberately smaller than adhoc-agentic-draft.js's own ADHOC_MAX_TURNS (30) -- this
 // engine's own REQUEST_TIMEOUT_MS=240s-per-turn ceiling (local-tool-client.js) is not
@@ -125,12 +126,25 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
 
   const { repoRoot, pipelineDir } = getConfig();
 
+  // 2026-08-26 (Grimmethy: "add turnsUsed recording... a data point we track for each
+  // job type in the Job List itself (min/max/average)"): this tier never called
+  // model_stats_client.record_call() at all before now -- the arch-review turn-budget
+  // question that prompted this had zero real telemetry to answer it from. Recorded on
+  // any result that actually came back (implemented, no-changes-needed, or declined for
+  // lack of a RESOLUTION line -- all three carry a real turnsUsed count worth keeping);
+  // a call that errored out entirely (the catch below) has no result to record.
+  const started = Date.now();
   let result;
   try {
     result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source });
   } catch (e) {
     return { applied: false, succeeded: true, reason: `local agentic investigation failed: ${e.message}` };
   }
+  modelStatsClient.recordCall({
+    taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
+    startedAt: new Date(started).toISOString(), latencyMs: Date.now() - started,
+    result, source: task.source,
+  });
 
   const responseText = (result && result.response) || '';
   const resolutionMatch = responseText.match(RESOLUTION_RE);
