@@ -2130,6 +2130,24 @@ function renderTaskDetailModal(task) {
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
+  // bit of meta data. How much machine time was spent on the task and a list of all the
+  // files it touched") -- totalLatencyMs sums real wall-clock time across every model
+  // call this task made (see _task_cost_summary's own comment: recorded for local Ollama
+  // calls the same as Claude ones, unlike totalCostUsd which is $0, not absent, for an
+  // all-local task). _filesTouched is server-computed from whichever shape this task's
+  // actual on-disk change came in (a unified diff, or a Group B JSON change list) --
+  // empty for a task that never wrote to the filesystem at all (a verdict-only audit, a
+  // split proposal), not an error.
+  if (task._costSummary && task._costSummary.totalLatencyMs != null) {
+    html += `<div class="field-label">Machine Time</div><div>${fmtDuration(task._costSummary.totalLatencyMs / 1000)} across ${task._costSummary.totalCalls} model call(s)</div>`;
+  }
+  if (task._filesTouched) {
+    const filesLabel = task._filesTouched.length
+      ? task._filesTouched.map(f => `<code>${escapeHtml(f)}</code>`).join('<br>')
+      : '<span class="meta">no files touched</span>';
+    html += `<div class="field-label">Files Touched (${task._filesTouched.length})</div><div>${filesLabel}</div>`;
+  }
   // Estimated Anthropic API cost for this ONE task (2026-08-23, Grimmethy: "We should
   // include estimated cost tracking in the job page itself") -- api_task_detail/
   // api_task_anywhere sum every model_calls row for this task_id server-side (a task can

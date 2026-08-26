@@ -1841,7 +1841,8 @@ def _task_cost_summary(task_id: str) -> dict | None:
         if not _has_cost_usd_column(conn):
             return None
         row = conn.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) "
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END), "
+            "COALESCE(SUM(latency_ms), 0) "
             "FROM model_calls WHERE task_id = ?",
             (task_id,),
         ).fetchone()
@@ -1859,13 +1860,118 @@ def _task_cost_summary(task_id: str) -> dict | None:
             hypothetical_cost_usd = h_row[0]
     finally:
         conn.close()
-    total_cost, total_calls, calls_with_cost = row
+    total_cost, total_calls, calls_with_cost, total_latency_ms = row
     if total_calls == 0:
         return None
     return {
         "totalCostUsd": total_cost, "totalCalls": total_calls, "callsWithCost": calls_with_cost or 0,
         "hypotheticalCostUsd": hypothetical_cost_usd,
+        # Real wall-clock time spent across every model call this task made (plan,
+        # implement, critique, revision, ...) -- latency_ms is recorded for local Ollama
+        # calls the same as Claude ones (see model-stats-db.js), so this covers both,
+        # unlike totalCostUsd which is $0 (not "no data") for an all-local task.
+        "totalLatencyMs": total_latency_ms,
     }
+
+
+# Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a bit
+# of meta data... a list of all the files it touched") -- a task's actual on-disk change
+# is expressed in one of two shapes depending on which applier handles it (see
+# apply-task.js's own dispatch): Group A/adhoc tasks carry a real unified diff in
+# task.rawDiff (`diff --git a/X b/Y` headers); Group B tasks carry a JSON change object
+# (or array of them) with a `file` field per change in task.implementResponse, same
+# format apply-group-b.js itself parses. A task that never touches the filesystem at all
+# (a verdict-only observability/performance audit, an arch_discovery/arch_review "split"
+# proposal) legitimately has neither -- returns [] for those, not an error.
+#
+# Mirrors src/json-fence.js's fenced/balanced-JSON recovery (already proven live against
+# real local-model drafts that wrap JSON in a code fence, or add prose before/after it)
+# in Python rather than shelling out to node per task view -- keep the two in sync if
+# either's recovery logic changes.
+_DIFF_GIT_HEADER_RE = re.compile(r'^diff --git a/(.+?) b/(.+?)$', re.MULTILINE)
+_FENCED_JSON_RE = re.compile(r'```(?:json)?\s*([\s\S]*?)```')
+
+
+def _extract_balanced_json(text: str) -> str | None:
+    m = re.search(r'[\[{]', text)
+    if not m:
+        return None
+    start = m.start()
+    open_ch = text[start]
+    close_ch = '}' if open_ch == '{' else ']'
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _parse_json_maybe_fenced(text: str | None):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    m = _FENCED_JSON_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    extracted = _extract_balanced_json(text)
+    if extracted:
+        try:
+            return json.loads(extracted)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _files_touched_for(task: dict) -> list[str]:
+    raw_diff = task.get("rawDiff")
+    if raw_diff:
+        seen: set[str] = set()
+        out: list[str] = []
+        for a, b in _DIFF_GIT_HEADER_RE.findall(raw_diff):
+            # `b` is /dev/null for a deletion (the new side doesn't exist) -- fall back to
+            # `a` so a deleted file still shows up in the list instead of as "dev/null".
+            f = b if b and b != "/dev/null" else a
+            if f and f not in seen:
+                seen.add(f)
+                out.append(f)
+        return out
+
+    parsed = _parse_json_maybe_fenced(task.get("implementResponse"))
+    if parsed is None:
+        return []
+    items = parsed if isinstance(parsed, list) else [parsed]
+    seen = set()
+    out = []
+    for item in items:
+        f = item.get("file") if isinstance(item, dict) else None
+        if f and f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 
 @app.route("/api/task/<state>/<task_id>")
@@ -1880,7 +1986,7 @@ def api_task_detail(state, task_id):
             for candidate in drafting_root.rglob(f"{task_id}.json"):
                 data = read_json_safe(candidate)
                 if data:
-                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id)})
+                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
         abort(404)
 
     if state not in QUEUE_STATES:
@@ -1889,7 +1995,7 @@ def api_task_detail(state, task_id):
     data = read_json_safe(f)
     if not data:
         abort(404)
-    return jsonify({**data, "_costSummary": _task_cost_summary(task_id)})
+    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
 
 
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
@@ -2292,12 +2398,12 @@ def api_task_anywhere(task_id):
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id)})
+                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
 
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id)})
+            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
 
     abort(404, description=f"task {task_id} not found in any queue state")
 
