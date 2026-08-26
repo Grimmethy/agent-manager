@@ -29,7 +29,26 @@ const PINNED_NUM_CTX = 16384;
 // a call legitimately needing longer than this is a signal to change the workload, not to
 // raise the number. A computed timeout must respect that ceiling, never exceed it.
 const HARD_TIMEOUT_CEILING_MS = 300_000;
-const MIN_TIMEOUT_MS = 45_000; // floor, not a target -- confirmed live 2026-08-20: even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts.
+// 2026-08-26, Grimmethy: "The GPU isn't running... looks like the GPU fired up for a
+// little bit then it crashed again" -- root-caused live: this floor was calibrated
+// against lock-QUEUEING contention (see its original 2026-08-20 comment, preserved
+// below), never against a genuine COLD MODEL LOAD, which resolveTimeoutMs's whole
+// formula has no separate term for at all (baseOverheadMs below is about queueing, not
+// disk I/O). Measured directly against this exact model (qwen3.8:27b-q4_K_M) via
+// isolated /api/generate calls once every worker/reviewer process was stopped: a clean,
+// uncontended cold load took 51s; the SAME load under two-lane contention (worker-1 +
+// worker-reasoning both cold-loading at once, competing for disk I/O) took 90s. The old
+// 45s floor was already short of the *clean* case, let alone the contended one -- any
+// short/cheap call (small prompt, small numPredict, e.g. this box's own diagnostic
+// pings) whose computed timeout got clamped up to just this floor was cancelling the
+// connection mid-load, every single time, which is exactly what "aborting load: client
+// connection closed before llama-server finished loading" in Ollama's own log means.
+// Once a lane hangs up early, Ollama frees the partial load and the model never
+// actually becomes resident, so the NEXT call needs another full cold load too -- a
+// livelock that never recovers on its own. Raised well past the worst contended
+// measurement above, with real margin, while staying under this file's existing
+// 240s/300s ceilings so nothing else here needs to change.
+const MIN_TIMEOUT_MS = 150_000; // floor, not a target -- was 45_000 ("even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts," confirmed live 2026-08-20), too short for a genuine cold model load as this same comment's 2026-08-26 update above found live.
 const DEFAULT_TIMEOUT_MS = 240_000; // fallback when throughput hasn't been measured yet -- this system's previous fixed value.
 
 // overheadMiB = VRAM Ollama is using beyond the model weights themselves (KV cache + prompt
