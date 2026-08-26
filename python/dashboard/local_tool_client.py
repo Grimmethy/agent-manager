@@ -23,9 +23,12 @@ LOCAL_TOOL_CLIENT_JS = SRC_DIR / "local-tool-client.js"
 # comment for the incident) -- a real multi-turn investigative call can legitimately need
 # several turns at ~15-20s each (confirmed live via model-stats.db: 65s/16s/75s/102s for
 # 5-turn runs, ~15-20s/turn average), so the ceiling now needs real headroom for the
-# WHOLE loop, not one turn. 900s comfortably covers 15 turns at 3x the observed average
-# pace before this becomes a real bound rather than a rubber stamp.
-SUBPROCESS_TIMEOUT_S = 900
+# WHOLE loop, not one turn. This MUST scale with CHAT_LOCAL_MAX_TURNS -- it was 900s for
+# a 15-turn budget (15 * ~20s/turn * 3x margin); CHAT_LOCAL_MAX_TURNS is now 100, so this
+# is scaled proportionally to 6000s (100 minutes) to keep the same 3x margin. A message
+# that genuinely uses the whole budget can now legitimately take up to that long before
+# this fires -- that's the deliberate tradeoff of a 100-turn budget, not a bug.
+SUBPROCESS_TIMEOUT_S = 6000
 
 
 class LocalToolClientError(RuntimeError):

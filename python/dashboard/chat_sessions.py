@@ -46,11 +46,14 @@ CHAT_CLAUDE_MAX_TURNS = 30
 # comfortably more than 5 read-only-plus-bash tool calls for a model this size) and
 # returned whatever text happened to be attached to its LAST tool-calling turn -- "I'll
 # check X next," not a real answer, since local-tool-client.js's own loop only returns a
-# synthesized final response when a turn comes back with NO tool calls at all. Raised well
-# past the old arch_discovery-matching 5 (that ceiling was sized for a single grounded
-# review, not an open-ended user-directed investigation) -- see local_tool_client.py's own
-# SUBPROCESS_TIMEOUT_S comment for the matching wall-clock headroom this needed too.
-CHAT_LOCAL_MAX_TURNS = 15
+# synthesized final response when a turn comes back with NO tool calls at all. Raised
+# from 5 to 15 first, then to 100 the same night after a live AC-3 test still ran out of
+# the 15-turn budget mid-investigation without reaching a conclusion (a multi-hop
+# investigation -- locate doc, read doc, read referenced source, read a second file,
+# check a third -- can legitimately need more than 15 read-only-plus-bash calls for a
+# model this size). See local_tool_client.py's own SUBPROCESS_TIMEOUT_S comment for the
+# matching wall-clock headroom this needed too -- that value MUST scale with this one.
+CHAT_LOCAL_MAX_TURNS = 100
 
 
 def chat_sessions_path(storage_dir: Path) -> Path:
