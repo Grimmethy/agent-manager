@@ -148,6 +148,28 @@ test('buildVerdictPrompt gives a RESOLUTION: decompose adhoc draft its own carve
   assert.doesNotMatch(prompt, /does it contain real, complete code/i);
 });
 
+// Regression, 2026-08-26: candidateSplitProposals (local-draft.js's parseCandidateSplit,
+// see prompts.js's candidateSplitInstructions for the full incident/design) is the same
+// "deliberately no diff" shape as RESOLUTION: decompose above, for the candidate-
+// fulfillment sources (arch_review, observability_fix, etc.) instead of adhoc.
+test('buildVerdictPrompt gives a candidateSplitProposals draft its own carve-out -- no diff is expected, not a rejection signal', () => {
+  const task = baseTask({
+    domain: 'default',
+    source: 'arch_review',
+    candidateSplitProposals: [
+      { title: 'Extract git path', problem: 'p1', solution: 's1', benefits: 'b1' },
+      { title: 'Extract direct-write path', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+    planResponse: '1. Extract git vs direct-write apply paths.',
+    implementResponse: JSON.stringify({ mode: 'split', candidates: [{ title: 'a' }, { title: 'b' }] }),
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /judged the original candidate too large\/risky/);
+  assert.match(prompt, /do the sub-candidates, together, actually cover/);
+  assert.match(prompt, /well-formed JSON array of sub-candidates/);
+  assert.doesNotMatch(prompt, /does it contain real, complete code/i);
+});
+
 test('buildVerdictPrompt keeps the ordinary manual-source (diff-grounded) carve-out for a normal adhoc task, not the decompose one', () => {
   const task = baseTask({
     domain: 'default',
@@ -504,6 +526,33 @@ test('reviewTask does NOT deterministically block a decompose proposal for sugge
   assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value');
   assert.equal(result.verdict, 'approved');
   assert.equal(captured.length, 1, 'a decompose proposal must still reach a real review vote, not skip review entirely');
+});
+
+test('reviewTask does NOT deterministically block a candidateSplitProposals draft for suggesting a future config field name', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'split-field-test', domain: 'default', source: 'arch_review',
+    candidateSplitProposals: [
+      { title: 'Add config plumbing', problem: 'p', solution: 'Add a new path, e.g. AGENT_MANAGER_SECOND_BRAIN_REVIEW_PATH, following the pattern of existing paths in config.js.', benefits: 'b' },
+      { title: 'Wire it in', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+    title: 'test', planResponse: 'plan',
+    implementResponse: JSON.stringify({
+      mode: 'split',
+      candidates: [
+        { title: 'Add config plumbing', problem: 'p', solution: 'Add a new path, e.g. AGENT_MANAGER_SECOND_BRAIN_REVIEW_PATH, following the pattern of existing paths in config.js.', benefits: 'b' },
+        { title: 'Wire it in', problem: 'p2', solution: 's2', benefits: 'b2' },
+      ],
+    }),
+    promptContext: { body: 'Background material with no mention of that field at all.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'a split proposal must still reach a real review vote, not skip review entirely');
 });
 
 test('reviewTask STILL deterministically blocks a non-decompose manual task citing the same kind of ungrounded field', async () => {

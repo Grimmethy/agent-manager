@@ -24,7 +24,7 @@ const path = require('path');
 const { scanProject } = require('./function-length-scan.js');
 const { registerTaskSource, updateTaskSource } = require('../task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('../apply-group-a.js');
-const { groupBJsonInstructions, formatFileContents } = require('../prompts.js');
+const { groupBJsonInstructions, candidateSplitInstructions, formatFileContents } = require('../prompts.js');
 
 const RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000; // same cadence observability_review/performance_review settled on
 
@@ -135,6 +135,8 @@ function functionLengthFixImplementPrompt(task, planText) {
       : '',
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up. Preserve behavior exactly: this is a pure decomposition (extract sub-functions, call them from the original site), not a rewrite -- do not change what the code does, only how it is organized.',
+    '',
+    candidateSplitInstructions,
     '',
     groupBJsonInstructions,
   ].join('\n');
@@ -263,6 +265,13 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
     // real decomposition here after all" once the fix stage sees real file content.
     // candidateFulfillment: opts into local-draft.js's find-verification retry for free.
     emptyApproval: true, candidateFulfillment: true,
+    // candidatesPath/candidateDocTitle: where a `{"mode": "split"}` implement response
+    // (prompts.js's candidateSplitInstructions) writes its sub-candidates back to. Same
+    // env-var-or-default resolution as this source's own `next` above, duplicated rather
+    // than shared per this file's own stated convention for tiny same-file helpers.
+    candidatesPath: () => process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
+      || path.join(getConfig().repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md'),
+    candidateDocTitle: '# Function Length Decomposition Candidates',
   });
   updateTaskSource('function_length_fix', { buildPlanPrompt: functionLengthFixPlanPrompt, buildImplementPrompt: functionLengthFixImplementPrompt });
 }

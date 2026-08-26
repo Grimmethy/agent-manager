@@ -120,6 +120,36 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
   return null;
 }
 
+// 2026-08-26, root-caused live via arch-review-ac-4 (see prompts.js's
+// candidateSplitInstructions for the full incident/design) -- detects a `{"mode":
+// "split"}` implement response for a candidate-fulfillment source before it ever reaches
+// critique (there's no diff to critique, same reasoning adhoc-agentic-draft.js's own
+// RESOLUTION: decompose already established). Returns null for anything that isn't a
+// split attempt at all (the normal edit/create/delete/empty paths continue exactly as
+// before); { invalid: true, reason } if the model said "split" but didn't follow through
+// with well-formed sub-candidates (a real, distinguishable failure -- blocked outright,
+// same "fail loud, don't silently downgrade" treatment RESOLUTION: decompose's own
+// invalid-JSON case gets); { candidates } on a genuine, well-formed split.
+function parseCandidateSplit(implementResponse) {
+  const trimmed = (implementResponse || '').trim();
+  if (!trimmed || trimmed === '""' || trimmed === "''") return null;
+  let parsed;
+  try {
+    parsed = parseJsonMaybeFenced(trimmed);
+  } catch {
+    return null; // malformed JSON is a separate, pre-existing failure mode -- not this check's job
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.mode !== 'split') return null;
+  const raw = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+  const valid = raw.filter((c) => c && typeof c.title === 'string' && c.title.trim()
+    && typeof c.problem === 'string' && c.problem.trim()
+    && typeof c.solution === 'string' && c.solution.trim());
+  if (valid.length < 2) {
+    return { invalid: true, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
+  }
+  return { candidates: valid };
+}
+
 /**
  * The actual draft logic, independent of the CLI/stdout wrapper below -- exported so tests
  * can call it directly with a fake localCall.
@@ -832,6 +862,18 @@ async function draftTask(task, {
       // candidate whose Problem no longer matches current code, etc.), not something a
       // third guess would likely fix either.
       if (isCandidateFulfillmentSource(task.source)) {
+        const split = parseCandidateSplit(task.implementResponse);
+        if (split) {
+          if (split.invalid) {
+            appendHistoryEvent(task, 'blocked', split.reason);
+            return { succeeded: true, blocked: true, blockedReason: split.reason };
+          }
+          task.candidateSplitProposals = split.candidates;
+          appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
+          task.status = 'needs-review';
+          appendHistoryEvent(task, 'needs-review');
+          return { succeeded: true, blocked: false };
+        }
         const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
         if (unverified) {
           const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
@@ -938,7 +980,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit };
+module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit };
 
 if (require.main === module) {
   main();
