@@ -267,6 +267,22 @@ function hasLiveWorkerAncestor(pid, pidToPpid, liveWorkerPids) {
   return false;
 }
 
+// 2026-08-26, third pass at this same function, same day: the ancestor-walk fix above was
+// STILL wrong, for a different reason. `instances/<id>.json`'s `pid` field is not the
+// stable value that fix (and the one before it) assumed -- src/heartbeat.js's
+// writeHeartbeatFile, called from INSIDE local-draft.js during its own plan/implement
+// passes (added 2026-08-22/25 for queued-vs-working status, see that file's own header),
+// intentionally overwrites it with `process.pid`, i.e. the in-flight local-draft.js
+// child's OWN pid -- not the daemon's. So for most of a real call's lifetime, the
+// "live worker pid" IS the exact pid of the process being checked, not an ancestor of it.
+// An ancestor-only walk can never match that (it only ever looks upward, never at the
+// node itself), so it kept killing real in-flight calls exactly as before. Confirmed
+// live: instances/worker-reasoning.json's recorded pid was identical to the running
+// local-draft.js process's own pid, sampled 3x while draft/implement was actively
+// running. Fix: legitimate if EITHER the process's own pid is a live worker heartbeat
+// pid (the common case once local-draft.js's own heartbeat write has fired) OR any
+// ancestor is (the brief window between bash's pre-spawn heartbeat write, using the
+// daemon's real pid, and local-draft.js's first internal heartbeat write).
 function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid, instancesDir } = {}) {
   let processes;
   try {
@@ -277,6 +293,7 @@ function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid,
   const liveWorkerPids = currentWorkerHeartbeatPids(instancesDir);
   const pidToPpid = new Map(processes.map((p) => [p.pid, p.ppid]));
   return processes.filter((p) => MODEL_CALL_SCRIPT_RE.test(p.cmd)
+    && !liveWorkerPids.has(p.pid)
     && !hasLiveWorkerAncestor(p.ppid, pidToPpid, liveWorkerPids));
 }
 
