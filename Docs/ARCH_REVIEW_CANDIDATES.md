@@ -157,3 +157,29 @@ Solution:
 
 Benefits:
 Completes the breaking-change migration so no caller silently receives a Promise where it expects a plain object; the cascading async in task-sources.js is contained to that one file's internal call graph (all nextTask functions are already called from a single async worker loop, so the propagation is mechanical); apply-task.js's CLI entry point already runs in an async context (it's a top-level script), so adding await is straightforward; no PowerShell-side change is needed, keeping the worker's invocation contract unchanged.
+
+### AC-13 · Export a reusable degenerate-detection/retry helper from local-client.js
+Strength: Strong
+Files: src/local-client.js
+
+Problem:
+local-client.js contains the canonical degenerate-output detector (detectDegenerate) and the retry-on-degenerate contract described in Docs/agents/local-delegation.md, but this logic is only exposed as an internal implementation detail of callOnce/the module's own retry loop -- there is no exported, standalone entry point another caller (such as local-tool-client.js) can invoke to get the same degenerate-classification and retry behavior without re-deriving it independently.
+
+Solution:
+Add an explicit, exported helper (e.g. module.exports.detectDegenerate and a small exported retryOnDegenerate(fn, opts) wrapper built on the existing detectDegenerate logic and the same retry semantics already used internally) so the degenerate-detection rules (empty/quirky-empty, repeated-character, repetition-loop, non-ascii-gibberish) and the decision of when to retry live in exactly one place with one public surface.
+
+Benefits:
+Establishes a single source of truth for what counts as a degenerate local-model response and how retries are attempted, so any other caller can depend on the same tested behavior instead of re-implementing an approximation of it.
+
+### AC-14 · Have local-tool-client.js's no-tools path reuse local-client.js's degenerate/retry helper instead of its own copy
+Strength: Strong
+Files: src/local-tool-client.js
+
+Problem:
+When tools are disabled, local-tool-client.js currently falls back to its own degenerate-detection and retry handling for the /api/chat response rather than delegating to local-client.js's existing, already-audited detectDegenerate/retry contract, producing two independent implementations of the same failure-handling rules that can silently drift out of sync.
+
+Solution:
+Once local-client.js exposes a reusable exported helper for degenerate detection and retry (see the companion candidate for local-client.js), update local-tool-client.js's tools-disabled code path to call that shared helper on the model's response text instead of running its own separate degenerate-check/retry logic, removing the duplicated implementation from this file.
+
+Benefits:
+Eliminates a second, independently-maintained copy of the degenerate-detection/retry contract, so a future fix or tuning of the detection rules in local-client.js automatically applies to the tools-disabled path here too, instead of requiring the same fix to be made twice.
