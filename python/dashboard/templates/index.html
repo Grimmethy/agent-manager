@@ -2836,6 +2836,16 @@ async function renderJobListTab() {
           .map(([stage, c]) => `<span class="badge warn" title="${PIPELINE_STAGE_LABELS[stage] || stage}">${PIPELINE_STAGE_LABELS[stage] || stage}: ${c}</span>`)
           .join(' ') || '<span class="meta">idle</span>')
       : '<span class="meta">?</span>';
+    // Turns (min/avg/max) (2026-08-26, Grimmethy: "add turnsUsed recording... a data
+    // point we track for each job type in the Job List itself (min/max/average)" --
+    // prompted by the Chat-panel turn-budget investigation finding zero telemetry for
+    // whether ANY runPlanWithTools()-backed source's turn cap is actually enough). Only
+    // populated for sources that have gone through a real recorded call at least once
+    // (model-stats.db's turns_used column, model-stats-db.js's own turns-summary event)
+    // -- a blank cell means "not instrumented yet or never called," not "uses 0 turns."
+    const turnsCell = j.turnsStats
+      ? `${j.turnsStats.minTurns} / ${Math.round(j.turnsStats.avgTurns * 10) / 10} / ${j.turnsStats.maxTurns}<span class="meta"> (n=${j.turnsStats.calls})</span>`
+      : '<span class="meta">—</span>';
     return `
     <tr>
       <td>${checkbox}</td>
@@ -2846,6 +2856,7 @@ async function renderJobListTab() {
       <td>${domainByName[j.name] ?? '—'}</td>
       <td>${behaviorCell}</td>
       <td>${liveCell}</td>
+      <td>${turnsCell}</td>
       <td>${timesPerformed}</td>
       <td>${availableCell}</td>
       <td>${escapeHtml(descByName[j.name] ?? '')}</td>
@@ -2886,7 +2897,7 @@ async function renderJobListTab() {
 
   main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
     + backboneHtml
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
     + unregisteredHtml
     + detailInsetsHtml;
 

@@ -35,11 +35,18 @@ def _run_event(event: str, payload: dict):
 
 
 def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss",
-                 result: dict = None, started_at: str = None) -> str:
+                 result: dict = None, started_at: str = None, source: str = None) -> str:
     """Call once per interactive-session model call. Returns a callId for a later
     record_outcome() (there usually isn't one for free-form chat -- discuss/grill
     sessions have no approve/reject verdict -- so most callers just keep the callId
-    unused; it's still useful as a stable row identifier if a caller wants it)."""
+    unused; it's still useful as a stable row identifier if a caller wants it).
+
+    turnsUsed/source (2026-08-26, Grimmethy: "add turnsUsed recording... a data point we
+    track for each job type in the Job List itself (min/max/average)"): chat_sessions.py's
+    own local_tool_client.stream_plan_with_tools() result always carries a real turnsUsed
+    count -- it just never reached this far before. result.get("turnsUsed") is None for
+    every shape that isn't a runPlanWithTools()-backed result (e.g. a bare Claude Code
+    reply), matching this file's own existing degenerate-field convention."""
     call_id = str(uuid.uuid4())
     result = result or {}
     _run_event("record-call", {
@@ -54,8 +61,27 @@ def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss
         "evalCount": None,
         "attempts": None,
         "degenerate": result.get("degenerate"),
+        "turnsUsed": result.get("turnsUsed"),
+        "source": source,
     })
     return call_id
+
+
+def get_turns_summary() -> dict | None:
+    """Per-source MIN/MAX/AVG(turns_used) (2026-08-26, see record_call's own turnsUsed
+    comment) -- for the Job List tab. Same best-effort-returns-None shape as the JS
+    wrapper's getTurnsSummary(), captures real stdout instead of the fire-and-forget
+    _run_event() pattern above since this actually needs the result."""
+    try:
+        proc = subprocess.run(
+            ["node", "--no-warnings", str(MODEL_STATS_DB_JS), "turns-summary"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
 
 
 def record_outcome(call_id: str, outcome: str, outcome_stage: str = "discuss", outcome_reason: str = None):

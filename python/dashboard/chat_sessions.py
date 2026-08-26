@@ -151,7 +151,7 @@ def _send_claude(session: dict, message: str) -> str:
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
     model_stats_client.record_call("chat-session", result["model"], int((time.time() - started) * 1000),
-                                    stage="chat", result=result)
+                                    stage="chat", result=result, source="chat")
     return result["response"].strip()
 
 
@@ -196,7 +196,7 @@ def _stream_local(session: dict, message: str):
         elif event.get("type") == "final":
             result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
-                                    stage="chat", result=result or {})
+                                    stage="chat", result=result or {}, source="chat")
     # 2026-08-26, same incident as CHAT_LOCAL_MAX_TURNS above: local-tool-client.js's own
     # loop only ever returns a real synthesized answer when a turn comes back with NO tool
     # calls -- hitting the turn cap while the model still wanted to keep investigating

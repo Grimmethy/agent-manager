@@ -105,10 +105,33 @@ try {
     db.exec(`ALTER TABLE model_calls ADD COLUMN gpu_name TEXT`)
   }
 
+  // turns_used/source (2026-08-26, Grimmethy: "add turnsUsed recording... a data point we
+  // track for each job type in the Job List itself (min/max/average)" -- the arch-review
+  // turn-budget investigation this followed found ZERO telemetry for how many
+  // runPlanWithTools() turns a real call actually used, for any caller: local-agentic-
+  // draft.js's own multi-turn tier never called record_call() at all, and Chat's calls
+  // (chat_sessions.py) recorded latency/tokens but dropped result.turnsUsed on the floor.
+  // `source` is deliberately separate from the existing `stage` column -- stage already
+  // carries real, distinct meaning (implement/discuss/chat/ghost, the PIPELINE PHASE a
+  // call happened in), while `source` is the task-type/job-type (arch_discovery,
+  // secondbrain, chat, ...) the Job List tab groups by -- overloading `stage` with both
+  // meanings would make neither query clean. Same ALTER-guarded-by-pragma migration shape
+  // as every column above.
+  const hasTurnsUsedColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'turns_used'`).get().c > 0
+  if (!hasTurnsUsedColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN turns_used INTEGER`)
+  }
+  const hasSourceColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'source'`).get().c > 0
+  if (!hasSourceColumn) {
+    db.exec(`ALTER TABLE model_calls ADD COLUMN source TEXT`)
+  }
+
   const [event, payloadPath] = process.argv.slice(2)
-  if (!event || (event !== 'cost-summary' && !payloadPath)) {
+  const NO_PAYLOAD_EVENTS = new Set(['cost-summary', 'turns-summary'])
+  if (!event || (!NO_PAYLOAD_EVENTS.has(event) && !payloadPath)) {
     console.error('Usage: node model-stats-db.js <record-call|record-outcome> <payloadPath>')
     console.error('       node model-stats-db.js cost-summary')
+    console.error('       node model-stats-db.js turns-summary')
     db.close()
     process.exit(1)
   }
@@ -168,6 +191,23 @@ try {
     process.exit(0)
   }
 
+  if (event === 'turns-summary') {
+    // Read-only, no payload file needed (same shape as cost-summary above) -- per-source
+    // MIN/MAX/AVG(turns_used), for the Job List tab's "is this job type's turn budget
+    // actually enough?" question. Only rows that recorded a real turnsUsed count at all
+    // (runPlanWithTools()-backed callers) show up; a source with no rows here just means
+    // nothing on that path has been instrumented yet, not that it uses zero turns.
+    const bySource = db.prepare(`
+      SELECT COALESCE(source, '(unknown)') AS source,
+        MIN(turns_used) AS minTurns, MAX(turns_used) AS maxTurns,
+        AVG(turns_used) AS avgTurns, COUNT(*) AS calls
+      FROM model_calls WHERE turns_used IS NOT NULL GROUP BY source ORDER BY source
+    `).all()
+    console.log(JSON.stringify({ bySource }))
+    db.close()
+    process.exit(0)
+  }
+
   const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'))
 
   if (event === 'record-call') {
@@ -175,11 +215,11 @@ try {
       INSERT INTO model_calls (
         call_id, task_id, stage, model, candidates, started_at, latency_ms,
         eval_duration_ns, prompt_eval_count, eval_count, attempts, degenerate, call_error, cost_usd, instance_id, hypothetical_cost_usd,
-        hostname, platform, gpu_name
+        hostname, platform, gpu_name, turns_used, source
       ) VALUES (
         @callId, @taskId, @stage, @model, @candidates, @startedAt, @latencyMs,
         @evalDurationNs, @promptEvalCount, @evalCount, @attempts, @degenerate, @callError, @costUsd, @instanceId, @hypotheticalCostUsd,
-        @hostname, @platform, @gpuName
+        @hostname, @platform, @gpuName, @turnsUsed, @source
       )
     `).run({
       callId: payload.callId,
@@ -201,6 +241,8 @@ try {
       hostname: payload.hostname != null ? payload.hostname : null,
       platform: payload.platform != null ? payload.platform : null,
       gpuName: payload.gpuName != null ? payload.gpuName : null,
+      turnsUsed: payload.turnsUsed != null ? payload.turnsUsed : null,
+      source: payload.source != null ? payload.source : null,
     })
   } else if (event === 'record-outcome') {
     if (!payload.callId) {
