@@ -368,12 +368,42 @@ function existsLiterallyInRepo(value, repoRoot) {
   }
 }
 
+// 2026-08-26, root-caused live via a real blocked adhoc task (the Job List family-
+// grouping change): PERFORMANCE_FIX_CANDIDATES -- a real field that had existed in
+// index.html for six days before this draft touched the file -- got flagged
+// ungrounded-field anyway, because it happened to sit in an UNCHANGED context line of
+// the draft's own diff (the very first line of its first hunk). checkGroundedValues
+// scans draftText as one undifferentiated blob, so a diff's context/removed lines --
+// which by construction already existed in the pre-diff file and can never be
+// something the draft newly claims -- get scanned exactly like a real `+` addition.
+// The existsLiterallyInRepo git-grep fallback is supposed to catch real-but-elsewhere
+// values like this, but it depends on a live, populated repoRoot at review time (a
+// torn-down task worktree makes it silently fail-closed) -- worth having, but not a
+// substitute for not flagging a context line in the first place. Strips diff
+// metadata/context/removed lines down to blank before the URL/field regexes ever see
+// them; a genuine `+` addition (or non-diff prose, which passes through untouched --
+// this is deliberately NOT a diff-only check, since a plain implementResponse with no
+// embedded diff at all should keep scanning every line same as before) still gets
+// scanned exactly as before.
+const DIFF_META_RE = /^(?:diff --git |index [0-9a-f]|--- |\+\+\+ |@@ )/;
+
+function stripUnchangedDiffLines(text) {
+  let inDiff = false;
+  return text.split('\n').map((line) => {
+    if (DIFF_META_RE.test(line)) { inDiff = true; return ''; }
+    if (!inDiff) return line; // prose (or a plain-text draft with no diff at all)
+    if (line.startsWith('+')) return line; // real addition -- a genuine new claim
+    return ''; // removed or unchanged context -- pre-existing, never a new claim
+  }).join('\n');
+}
+
 function checkGroundedValues(draftText, sourceText, repoRoot) {
   if (!sourceText) return [];
   const flags = [];
+  const scannableText = stripUnchangedDiffLines(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
 
-  const urls = [...new Set(draftText.match(URL_RE) || [])];
+  const urls = [...new Set(scannableText.match(URL_RE) || [])];
   for (const raw of urls) {
     const url = raw.replace(/[.,;:]+$/, ''); // strip trailing sentence punctuation
     if (PLACEHOLDER_RE.test(url)) continue;
@@ -383,7 +413,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
     flags.push({ type: 'ungrounded-url', detail: url });
   }
 
-  const fields = [...new Set(draftText.match(GIS_FIELD_RE) || [])];
+  const fields = [...new Set(scannableText.match(GIS_FIELD_RE) || [])];
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
