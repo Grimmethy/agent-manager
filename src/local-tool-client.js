@@ -439,34 +439,71 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // messages"}". CORRECTED root cause (an earlier version of this comment wrongly
   // blamed the vendored TokenFold proxy -- ruled out live: OLLAMA_URL is unset for this
   // caller, so TokenFold was never actually in the request path): confirmed via
-  // `journalctl -u ollama` that this is Ollama's OWN renderer failing --
-  // `source=routes.go:2684 msg="chat prompt error" error="no user query found in
-  // messages"` -- on longer, tool-heavy conversations. It's genuinely transient, not
-  // content-triggered: the exact same messages array, resent unchanged moments later,
-  // can succeed. A single retry isn't reliable enough -- confirmed live, it failed twice
-  // in a row on a real multi-tool-call chat turn -- so this retries up to
-  // CHAT_FLAKE_MAX_ATTEMPTS times total per turn (not counted against
-  // maxTurns/turnsUsed), the same bounded-retry-on-known-transient-failure treatment
-  // this pipeline already gives other infra flakiness (see local-worker.sh's
-  // INFRA_FAILURE_PATTERN).
+  // `journalctl -u ollama` this is Ollama's OWN renderer failing --
+  // `source=routes.go:2702 msg="chat prompt error" error="no user query found in
+  // messages"` -- and confirmed live a SECOND time that it is NOT a live-inference race:
+  // the failing calls returned in <100ms, far too fast to have reached the model at all,
+  // and retrying the IDENTICAL messages array failed 3/3 times, deterministically, every
+  // time. Matches a documented Ollama renderer bug (github.com/ollama/ollama#17647): a
+  // tool-call-only assistant turn (empty content, just tool_calls) leaves the rendered
+  // `<think>` block unclosed, and that corruption is baked into the STORED history from
+  // then on -- every later request that replays it trips the same "no user query" check,
+  // no matter how many times it's retried unchanged. A plain retry (still done first,
+  // CHAT_FLAKE_MAX_ATTEMPTS times, in case it's a genuine one-off) can never fix this
+  // specific shape of failure; only dropping the poisoned turn and making the model
+  // regenerate it (a fresh sample can easily come out with content this time, or a
+  // properly-closed think block) can.
   const CHAT_FLAKE_MAX_ATTEMPTS = 3;
+  // Bounded separately from CHAT_FLAKE_MAX_ATTEMPTS -- each rollback re-asks the model to
+  // redo a whole prior turn (a real generation, not a cheap resend), so this stays small.
+  const MAX_ROLLBACK_ATTEMPTS = 2;
+  // messages.length / toolCallLog.length as of the START of each turn, in order -- lets a
+  // later turn's unrecoverable flake roll back exactly the PRIOR turn's own additions
+  // (the ones most likely to be the corrupting tool-call-only turn) rather than just the
+  // current turn's, since the corruption always lives in already-stored history, never in
+  // the turn that's actively failing.
+  const turnStartLengths = [];
+  const turnStartLogLengths = [];
 
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+
     let message;
     let flakeErr = null;
-    for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
-      try {
-        message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
-        flakeErr = null;
-        break;
-      } catch (e) {
-        if (!/no user query found in messages/i.test(e.message)) throw e;
-        flakeErr = e;
+    let rollbackAttempts = 0;
+    for (;;) {
+      let attemptErr = null;
+      for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
+        try {
+          message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+          attemptErr = null;
+          break;
+        } catch (e) {
+          if (!/no user query found in messages/i.test(e.message)) throw e;
+          attemptErr = e;
+        }
       }
+      if (!attemptErr) break;
+      if (rollbackAttempts < MAX_ROLLBACK_ATTEMPTS && turnStartLengths.length >= 2) {
+        const priorStart = turnStartLengths[turnStartLengths.length - 2];
+        const priorLogStart = turnStartLogLengths[turnStartLengths.length - 2];
+        messages.length = priorStart;
+        toolCallLog.length = priorLogStart;
+        turnStartLengths.pop();
+        turnStartLogLengths.pop();
+        turnsUsed -= 1;
+        rollbackAttempts += 1;
+        continue;
+      }
+      flakeErr = attemptErr;
+      break;
     }
     if (flakeErr) {
-      // Retries exhausted. A LATER turn (turn > 0) means the model already said
+      // Rollback exhausted too (or there was no prior turn to roll back -- this failed
+      // on the very first turn of the conversation, which is a genuinely different,
+      // unexplained case). A LATER turn (turn > 0) means the model already said
       // something real on earlier turns -- onChunk already streamed it to the browser.
       // Throwing here would silently discard all of that (confirmed live: a whole
       // streamed AC-3 investigation vanished and the Chat panel quietly rolled back to
@@ -483,7 +520,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         if (onChunk) onChunk(note);
         return {
           response: (lastMessage.content || '') + note,
-          toolCallLog, turnsUsed: turnsUsed - 1, toolsDisabled: false,
+          toolCallLog, turnsUsed: Math.max(turnsUsed - 1, 0), toolsDisabled: false,
         };
       }
       throw flakeErr;
