@@ -4946,6 +4946,113 @@ def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
         pass
 
 
+def _resolve_source_name(data: dict) -> str | None:
+    """Mirrors src/task-source-registry.js's resolveSourceName() exactly -- most sources
+    register under the same name as task.source, but three built-ins don't: adhoc tasks
+    carry domain:'adhoc'/source:'manual', secondbrain tasks carry domain:'secondbrain'
+    (source:'inbox'), and deadcode_triage was renamed to unused_export post-launch. Without
+    this, every real adhoc task (a real, common, human-originated task type) would show up
+    under an "(unregistered)" bucket labeled "manual" instead of the adhoc node on the map
+    -- confirmed live building this: exactly that happened on the first real test."""
+    domain = data.get("domain")
+    source = data.get("source")
+    if domain == "adhoc" or source == "manual":
+        return "adhoc"
+    if domain == "secondbrain":
+        return "secondbrain"
+    if source == "deadcode_triage":
+        return "unused_export"
+    return source
+
+
+def _pipeline_live_counts(qdir) -> dict:
+    """{source: {state: count}} across every in-flight queue state -- deliberately excludes
+    done/ (thousands of historical records -- see queue_dir()'s own caller sites for the
+    3700+ count confirmed live 2026-08-25) since the Pipeline Map tab shows the pipeline IN
+    MOTION, not lifetime volume (that's what the Job List tab's timesPerformed counter is
+    for). 'drafting' mirrors _task_state_index's own per-worker-subfolder-plus-legacy-flat
+    handling. A task file with no readable/parseable `source` field (corrupt, mid-write, or
+    predates this field existing) is bucketed under "(unknown)" rather than silently
+    dropped or crashing the whole tab over one bad file."""
+    counts: dict = {}
+    if not qdir:
+        return counts
+
+    def bump(source, state):
+        counts.setdefault(source or "(unknown)", {}).setdefault(state, 0)
+        counts[source or "(unknown)"][state] += 1
+
+    for state in QUEUE_STATES:
+        if state == "done":
+            continue
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                bump(None, state)
+                continue
+            bump(_resolve_source_name(data), state)
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        drafting_files = list(drafting_root.glob("*.json"))
+        for sub in drafting_root.iterdir():
+            if sub.is_dir():
+                drafting_files.extend(sub.glob("*.json"))
+        for f in drafting_files:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                bump(None, "drafting")
+                continue
+            bump(_resolve_source_name(data), "drafting")
+
+    return counts
+
+
+@app.route("/api/pipeline-map")
+def api_pipeline_map():
+    """Pipeline Map tab (2026-08-26, Grimmethy: "I want a live pipeline map for
+    architecture review... right now I don't have any way of visualizing the process").
+    Topology comes straight from src/task-sources.js's own registry via `--dump-topology`
+    (see that CLI mode's own header for why this, not another hand-maintained catalog like
+    TASK_SOURCE_CATALOG below) -- read fresh on every call, so it can never drift the way
+    the Job List tab's own hand-maintained lists already have (confirmed live via
+    queue-watchdog's drift-scan the same night: missing backlog_decomposition/
+    backlog_fulfillment/pipeline_health_audit/product_spec/ui_visibility_audit). Live counts
+    come straight from the real queue/ directories, correlated by each task's own recorded
+    `source` field -- never estimated, never cached across requests."""
+    script_path = SRC_DIR / "task-sources.js"
+    try:
+        result = subprocess.run(
+            ["node", str(script_path), "--dump-topology"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(SRC_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"available": False, "reason": "task-sources.js --dump-topology timed out"}), 504
+    if result.returncode != 0:
+        return jsonify({"available": False, "reason": (result.stderr or "task-sources.js exited non-zero").strip()[:500]})
+    try:
+        topology = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return jsonify({"available": False, "reason": "task-sources.js --dump-topology returned non-JSON output"})
+
+    live_counts = _pipeline_live_counts(queue_dir())
+    for source in topology:
+        source["liveCounts"] = live_counts.pop(source["name"], {})
+    # Anything left in live_counts belongs to a source no longer registered (a renamed/
+    # retired source with old tasks still sitting in the queue, or the "(unknown)" bucket
+    # from a corrupt/pre-source-field file) -- surfaced separately rather than silently
+    # dropped, so a real orphaned backlog stays visible instead of vanishing from the map.
+    unregistered = [{"name": name, "liveCounts": c} for name, c in live_counts.items()]
+
+    return jsonify({"available": True, "sources": topology, "unregistered": unregistered})
+
+
 @app.route("/api/job-types")
 def api_job_types():
     """Job List tab's isActive checkboxes: one row per src/task-sources.js registered

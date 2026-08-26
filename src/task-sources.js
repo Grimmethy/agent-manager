@@ -2286,6 +2286,60 @@ if (require.main === module) {
     return;
   }
 
+  // `node task-sources.js --dump-topology` (2026-08-26, Grimmethy: "I want a live pipeline
+  // map... right now I don't have any way of visualizing the process") -- prints the REAL
+  // registered source topology as JSON, read directly off the registry every time this
+  // runs, so the dashboard's Pipeline Map tab can never drift out of sync with the actual
+  // pipeline the way python/dashboard/app.py's own hand-maintained TASK_SOURCE_CATALOG (and
+  // templates/index.html's JOB_TYPES, and README.md's own table) already have -- confirmed
+  // live via queue-watchdog's own drift-scan the same night this was built: all three are
+  // missing backlog_decomposition/backlog_fulfillment/pipeline_health_audit/product_spec/
+  // ui_visibility_audit and still list observability_fix/performance_review as if they were
+  // still registered the OLD way. Same "compute it once in JS, consume it elsewhere" split
+  // as --priority-map/--approval-modes above, just carrying more per-source shape (the
+  // flags/apply-hook/prompt-sharing detail those two thinner dumps don't).
+  //
+  // promptGroup: sources with reference-identical buildPlanPrompt/buildImplementPrompt
+  // functions render as one shape in the map instead of duplicated boxes (e.g. arch_review/
+  // arch_import_review/backlog_fulfillment all share archReviewPlanPrompt/
+  // archReviewImplementPrompt) -- computed by object identity, never by name matching,
+  // so it can't silently drift the way a hand-maintained "these three are the same" list
+  // would.
+  //
+  // directToMain: DIRECT_TO_MAIN_SOURCES itself lives in apply-task.js, not the registry --
+  // duplicated here as a small literal (same "tiny, rarely-changing, duplicated rather than
+  // reached for across an inappropriate module boundary" convention this package already
+  // uses elsewhere, e.g. function-length-review.js's own candidatesPath) rather than
+  // requiring apply-task.js back into task-sources.js (which itself requires task-sources.js
+  // for registration -- avoidable circularity, not worth it for 4 literal names). Keep in
+  // sync with apply-task.js's own DIRECT_TO_MAIN_SOURCES if that set ever changes.
+  if (process.argv.includes('--dump-topology')) {
+    const DIRECT_TO_MAIN_SOURCES = new Set(['arch_discovery', 'arch_import', 'observability_review', 'performance_review']);
+    const sources = getRegisteredSources();
+    const planGroupIds = new Map();
+    const implementGroupIds = new Map();
+    let nextGroupId = 1;
+    const groupIdFor = (fn, map) => {
+      if (fn == null) return null;
+      if (!map.has(fn)) map.set(fn, `g${nextGroupId++}`);
+      return map.get(fn);
+    };
+    const dump = sources.map((source) => ({
+      name: source.name,
+      priority: source.priority ?? null,
+      candidateFulfillment: !!source.candidateFulfillment,
+      emptyApproval: !!source.emptyApproval,
+      advisoryProse: !!source.advisoryProse,
+      hasCustomApply: typeof source.apply === 'function',
+      directToMain: DIRECT_TO_MAIN_SOURCES.has(source.name),
+      hasCandidatesPath: typeof source.candidatesPath === 'function',
+      planPromptGroup: groupIdFor(source.buildPlanPrompt, planGroupIds),
+      implementPromptGroup: groupIdFor(source.buildImplementPrompt, implementGroupIds),
+    }));
+    console.log(JSON.stringify(dump));
+    return;
+  }
+
   // `node task-sources.js --tier=low|high` -- restricts generation to that reasoning
   // tier (see getNextTask()'s own comment). Omitted entirely = no filter, generates
   // whichever source is highest priority regardless of tier, matching this CLI's
