@@ -237,6 +237,36 @@ function currentWorkerHeartbeatPids(instancesDir) {
   return pids;
 }
 
+// 2026-08-26, same day as the fix above: that fix was ITSELF broken. `p.ppid` is the
+// immediate parent only, but a worker script invokes local-draft.js as
+// `draft_result="$(node local-draft.js ...)"` -- bash `$(...)` command substitution always
+// forks an intermediate subshell to run the command, so the node process's REAL kernel
+// ppid is that ephemeral subshell's own pid, never the worker script's own `$$` (which is
+// what gets written into the heartbeat file and never changes across the worker's life).
+// Confirmed live: every currently-running local-draft.js process's ppid failed to match
+// its own worker's heartbeat pid, 100% of the time -- meaning `!liveWorkerPids.has(p.ppid)`
+// was true for every single legitimate in-flight call, not just real orphans. Any watchdog
+// tick landing while a call was still running would kill it mid-flight, which is what
+// actually produced the "draft call failed" / empty-output pattern this was investigating.
+// Fix: walk the full ancestor chain (following ppid repeatedly through as many intermediate
+// subshells as bash happens to have forked) instead of only checking the immediate parent.
+// A process is a legitimate in-flight call if ANY ancestor is a live worker's heartbeat
+// pid; it's a genuine orphan only if the chain runs out (hits an unknown/missing pid)
+// without ever matching one. Capped at a generous depth so a `ps` result with a pid/ppid
+// cycle or a bug elsewhere can't spin this forever.
+const MAX_ANCESTOR_DEPTH = 25;
+
+function hasLiveWorkerAncestor(pid, pidToPpid, liveWorkerPids) {
+  let current = pid;
+  for (let i = 0; i < MAX_ANCESTOR_DEPTH; i += 1) {
+    if (liveWorkerPids.has(current)) return true;
+    const parent = pidToPpid.get(current);
+    if (!parent || parent === current) return false; // chain ends (pid 1, unknown, or self-loop)
+    current = parent;
+  }
+  return false;
+}
+
 function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid, instancesDir } = {}) {
   let processes;
   try {
@@ -245,7 +275,9 @@ function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid,
     return []; // `ps` unavailable/failed -- best-effort, same as every other check here.
   }
   const liveWorkerPids = currentWorkerHeartbeatPids(instancesDir);
-  return processes.filter((p) => MODEL_CALL_SCRIPT_RE.test(p.cmd) && !liveWorkerPids.has(p.ppid));
+  const pidToPpid = new Map(processes.map((p) => [p.pid, p.ppid]));
+  return processes.filter((p) => MODEL_CALL_SCRIPT_RE.test(p.cmd)
+    && !hasLiveWorkerAncestor(p.ppid, pidToPpid, liveWorkerPids));
 }
 
 function main() {
@@ -258,7 +290,7 @@ function main() {
 
   const orphans = findOrphanedModelCallProcesses({ instancesDir });
   for (const orphan of orphans) {
-    process.stdout.write(`${JSON.stringify({ action: 'kill-orphan', pid: orphan.pid, reason: `orphaned model-call process (ppid=1, cmd: ${orphan.cmd.slice(0, 120)})` })}\n`);
+    process.stdout.write(`${JSON.stringify({ action: 'kill-orphan', pid: orphan.pid, reason: `orphaned model-call process (no live worker in its ancestor chain, ppid=${orphan.ppid}, cmd: ${orphan.cmd.slice(0, 120)})` })}\n`);
   }
 }
 

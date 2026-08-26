@@ -134,6 +134,37 @@ test('does not flag a local-draft.js process whose parent IS the currently-live 
   assert.deepEqual(orphans, []);
 });
 
+// Regression, 2026-08-26 (same day, second incident): the fix above was ITSELF broken --
+// it only checked the IMMEDIATE ppid, but a worker invokes local-draft.js via bash
+// `$(...)` command substitution, which always forks an intermediate subshell. The node
+// process's real ppid is that ephemeral subshell's pid, never the worker's own heartbeat
+// pid -- so the direct-parent check flagged every legitimate in-flight call as an orphan
+// and got it killed mid-run. Confirmed live on this exact box. Fix: walk the whole
+// ancestor chain, not just the immediate parent.
+test('does not flag a local-draft.js process reached through an intermediate command-substitution subshell', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  const listProcesses = () => [
+    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-1' },
+    { pid: 700, ppid: 555, cmd: 'bash -c node /repo/src/local-draft.js ...' }, // the subshell $(...) forks
+    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
+  assert.deepEqual(orphans, []);
+});
+
+test('still flags a genuine orphan reached through a dead intermediate process (chain never reaches a live worker)', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  const listProcesses = () => [
+    { pid: 902699, ppid: 1, cmd: 'session-scope-manager' }, // the now-dead reaper, still present this ps snapshot
+    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
+  assert.equal(orphans.length, 1);
+  assert.equal(orphans[0].pid, 100);
+});
+
 test('does not flag an unrelated process with no matching worker -- only local-draft.js matters', () => {
   const dir = tempInstancesDir();
   const listProcesses = () => [
