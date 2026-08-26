@@ -153,6 +153,25 @@ test('does not flag a local-draft.js process reached through an intermediate com
   assert.deepEqual(orphans, []);
 });
 
+// Regression, 2026-08-26 (third pass, same day): src/heartbeat.js's writeHeartbeatFile,
+// called from INSIDE local-draft.js during its own plan/implement passes, overwrites the
+// heartbeat's pid field with the CHILD's own process.pid (for queued/working status), not
+// the daemon's -- so for most of a real call's life the "live worker pid" IS the exact
+// process being checked, not an ancestor of it. Confirmed live: instances/worker-
+// reasoning.json's recorded pid matched the running local-draft.js process's own pid
+// exactly, sampled repeatedly while a draft call was actively in progress.
+test('does not flag a local-draft.js process whose OWN pid is the live worker heartbeat pid (heartbeat.js self-write during an active call)', () => {
+  const dir = tempInstancesDir();
+  writeHeartbeat(dir, 'worker-reasoning', { pid: 100 }); // heartbeat.js overwrote this to the child's own pid mid-call.
+  const listProcesses = () => [
+    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-reasoning' },
+    { pid: 700, ppid: 555, cmd: 'bash local-worker.sh worker-reasoning' }, // command-substitution subshell, still showing the parent's own argv pre-exec.
+    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/some-task.json' },
+  ];
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
+  assert.deepEqual(orphans, []);
+});
+
 test('still flags a genuine orphan reached through a dead intermediate process (chain never reaches a live worker)', () => {
   const dir = tempInstancesDir();
   writeHeartbeat(dir, 'worker-1', { pid: 555 });
