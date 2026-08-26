@@ -152,69 +152,96 @@ def _send_claude(session: dict, message: str) -> str:
     return result["response"].strip()
 
 
-def _build_local_prompt(transcript: list, message: str) -> str:
-    lines = [
-        "You are a coding assistant embedded in this project's own dashboard, with real "
-        "Read/Grep/Glob/Edit/Write/Bash access to the live repository via your tools -- "
-        "not a sandbox, not a draft that goes through review. A human is directly present "
-        "and watching, the same way they would be pairing with you in a terminal. Make "
-        "real changes when asked; explain what you did.",
-        "",
-    ]
-    if transcript:
-        lines.append("=== CONVERSATION SO FAR ===")
-        for turn in transcript:
-            role = "You" if turn["role"] == "assistant" else "User"
-            lines.append(f"{role}: {turn['text']}")
-        lines.append("")
-    lines.append(f"User: {message}")
-    return "\n".join(lines)
+_LOCAL_SYSTEM_PROMPT = (
+    "You are a coding assistant embedded in this project's own dashboard, with real "
+    "Read/Grep/Glob/Edit/Write/Bash access to the live repository via your tools -- "
+    "not a sandbox, not a draft that goes through review. A human is directly present "
+    "and watching, the same way they would be pairing with you in a terminal. Make "
+    "real changes when asked; explain what you did."
+)
 
 
-def _send_local(session: dict, message: str) -> str:
+def _build_local_messages(transcript: list, message: str) -> list:
+    """2026-08-26 (Open WebUI investigation, Grimmethy): replaces the old approach of
+    flattening the whole conversation into one giant string inside a single
+    {role:'user'} message -- Ollama's /api/chat (like every real chat frontend, Open
+    WebUI included) expects the actual conversation as a per-turn array of
+    {role, content} objects, not narrated "You:"/"User:" text glued together. This also
+    incidentally means only a session's very first-ever message is ever a length-1
+    request now -- see local-tool-client.js's own comment on why that shape is the one
+    that can hit TokenFold's flaky single-message cache path."""
+    messages = [{"role": "system", "content": _LOCAL_SYSTEM_PROMPT}]
+    for turn in transcript:
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": turn["text"]})
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _stream_local(session: dict, message: str):
+    """Yields plain text chunks as the local model generates them (Open WebUI-style live
+    streaming, see this module's own recent header note) -- the caller accumulates them
+    into the final transcript entry."""
     started = time.time()
-    prompt = _build_local_prompt(session["transcript"], message)
-    result = local_tool_client.run_plan_with_tools(
-        prompt, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
-    )
+    messages = _build_local_messages(session["transcript"], message)
+    result = None
+    for event in local_tool_client.stream_plan_with_tools(
+        messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
+    ):
+        if event.get("type") == "chunk":
+            yield event["text"]
+        elif event.get("type") == "final":
+            result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
-                                    stage="chat", result=result)
-    reply = (result.get("response") or "").strip()
+                                    stage="chat", result=result or {})
     # 2026-08-26, same incident as CHAT_LOCAL_MAX_TURNS above: local-tool-client.js's own
     # loop only ever returns a real synthesized answer when a turn comes back with NO tool
     # calls -- hitting the turn cap while the model still wanted to keep investigating
-    # means `reply` is whatever text rode along with its LAST tool call ("I'll check X
-    # next"), not a considered answer, and there was previously no signal anywhere
+    # means the streamed text was whatever rode along with its LAST tool call ("I'll
+    # check X next"), not a considered answer, and there was previously no signal anywhere
     # (including this session's own JSON) that this happened. turnsUsed >= max_turns is
     # the same heuristic local-tool-client.js's own maxTurns-reached branch uses to detect
     # this case; the one false-positive edge (a real final answer that happens to land
     # with no tool calls on exactly the last allowed turn) errs toward over-labeling
     # rather than silently presenting a cut-off status update as a finished answer.
-    if result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
-        reply += (
+    if result and result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
+        yield (
             f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation -- "
             "the above may be a status update rather than a finished answer. Ask again, or "
             "narrow the question, to let it continue.)*"
         )
-    return reply
 
 
-def send_message(storage_dir: Path, session_id: str, message: str) -> dict:
+def stream_message(storage_dir: Path, session_id: str, message: str):
+    """Generator sibling of the old send_message -- yields {"type": "chunk", "text"} as
+    the reply generates, then exactly one {"type": "final", "session": {...}} carrying
+    the same updated-session shape send_message() used to return in one shot, once the
+    transcript is persisted. Claude sessions still resolve in a single blocking
+    _send_claude() call (Claude-side token streaming isn't wired up here) but go through
+    this same generator shape so app.py's SSE route doesn't need to special-case either
+    provider."""
     sessions = _read_sessions(storage_dir)
     session = sessions.get(session_id)
     if not session or session["status"] != "active":
-        return session
+        yield {"type": "final", "session": session}
+        return
 
     session["transcript"].append({"role": "user", "text": message})
+    reply_parts = []
     if session["provider"] == PROVIDER_CLAUDE:
         reply = _send_claude(session, message)
+        reply_parts.append(reply)
+        yield {"type": "chunk", "text": reply}
     else:
-        reply = _send_local(session, message)
+        for chunk in _stream_local(session, message):
+            reply_parts.append(chunk)
+            yield {"type": "chunk", "text": chunk}
+    reply = "".join(reply_parts).strip()
     session["transcript"].append({"role": "assistant", "text": reply})
 
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
-    return session
+    yield {"type": "final", "session": session}
 
 
 def get_session(storage_dir: Path, session_id: str):

@@ -77,3 +77,65 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
         return json.loads(result.stdout)
     except json.JSONDecodeError as e:
         raise LocalToolClientError(f"local-tool-client.js returned non-JSON stdout: {result.stdout[:500]}") from e
+
+
+def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns: int = 5,
+                            source: str = None, allow_write: bool = False):
+    """Generator sibling of run_plan_with_tools for the Chat panel's live-streamed replies
+    (2026-08-26, Grimmethy: "vastly improve the chat system... Open WebUI" investigation --
+    Open WebUI streams tokens over Socket.IO/SSE as they generate instead of blocking for
+    the whole reply). Mirrors local-tool-client.js's own CLI `stream: true` mode: yields
+    {"type": "chunk", "text": ...} as each piece arrives, then exactly one
+    {"type": "final", response, toolCallLog, turnsUsed, toolsDisabled} -- the same result
+    shape run_plan_with_tools returns in one shot, just delivered incrementally.
+
+    Uses Popen instead of run_plan_with_tools' subprocess.run: the whole point is reading
+    stdout line-by-line AS the child writes it, not waiting for it to exit first."""
+    request = {"maxTurns": max_turns, "stream": True}
+    if messages is not None:
+        request["messages"] = messages
+    else:
+        request["prompt"] = prompt
+    if source:
+        request["source"] = source
+    if allow_write:
+        request["allowWrite"] = True
+
+    tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
+    tmp_path.write_text(json.dumps(request), encoding="utf-8")
+    proc = subprocess.Popen(
+        ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        final = None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "final":
+                final = obj
+            else:
+                yield obj
+        try:
+            returncode = proc.wait(timeout=SUBPROCESS_TIMEOUT_S)
+        except subprocess.TimeoutExpired as e:
+            proc.kill()
+            raise LocalToolClientError(f"local-tool-client.js did not respond within {SUBPROCESS_TIMEOUT_S}s -- it may be queued behind a slow or stuck worker-lane task") from e
+        if returncode != 0:
+            stderr = proc.stderr.read()
+            raise LocalToolClientError((stderr or "local-tool-client.js failed with no stderr output").strip())
+        if final is None:
+            raise LocalToolClientError("local-tool-client.js streaming mode ended without a final result")
+        yield final
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.kill()

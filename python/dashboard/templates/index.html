@@ -982,15 +982,49 @@ async function chatSend() {
   // Optimistic append so the user's own message shows immediately -- a real reply
   // (local provider especially, under real worker-lane contention) can take a while.
   chatSession.transcript.push({ role: 'user', text: message });
+  // 2026-08-26 (Open WebUI investigation: "vastly improve the chat system... streaming")
+  // -- a live in-progress assistant entry that fills in as SSE chunks arrive, instead of
+  // one blocking fetch()+json() that left the user staring at nothing until the whole
+  // reply (or the turn budget) was done.
+  const assistantEntry = { role: 'assistant', text: '' };
+  chatSession.transcript.push(assistantEntry);
   chatRender();
   try {
     const resp = await fetch(`/api/chat/${encodeURIComponent(chatSession.id)}/message`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message }),
     });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
-    chatSession = body;
+    if (!resp.ok || !resp.body) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.description || `HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let finalSession = null;
+    let streamErr = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const frames = buf.split('\n\n');
+      buf = frames.pop(); // keep the last, possibly-incomplete frame for next read
+      for (const frame of frames) {
+        const line = frame.split('\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        const evt = JSON.parse(line.slice(6));
+        if (evt.type === 'chunk') {
+          assistantEntry.text += evt.text;
+          chatRender();
+        } else if (evt.type === 'final') {
+          finalSession = evt.session;
+        } else if (evt.type === 'error') {
+          streamErr = evt.error;
+        }
+      }
+    }
+    if (streamErr) throw new Error(streamErr);
+    if (finalSession) chatSession = finalSession;
   } catch (e) {
     showToast('Chat message failed: ' + e.message);
     // Roll back the optimistic append -- the real transcript (without this failed turn)

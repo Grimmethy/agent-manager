@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, abort, request
+from flask import Flask, jsonify, render_template, abort, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 # build_graph.py / visualize_graph.py live one directory up (python/), not inside
@@ -3439,10 +3439,33 @@ def api_chat_message(session_id):
     if not message:
         abort(400, description="message is required")
 
-    from chat_sessions import send_message
-    session = _call_chat(send_message, pipeline_dir, session_id, message)
-    if not session:
+    from chat_sessions import get_session
+    existing = get_session(pipeline_dir, session_id)
+    if not existing or existing.get("status") != "active":
         abort(404)
+
+    # 2026-08-26 (Open WebUI investigation, Grimmethy: "vastly improve the chat
+    # system... streaming"): this used to be a single blocking send_message() call
+    # returning the whole updated session as one JSON body -- the user stared at nothing
+    # until the model finished (or the turn budget ran out), which is exactly why the
+    # "ran out of its turn budget" explainer had to exist in the first place. Now
+    # streamed as SSE: one `data:` frame per {"type":"chunk"} as text arrives, then one
+    # {"type":"final","session":{...}} carrying the same shape this route used to return
+    # in one shot, so the frontend still ends up with the same authoritative session.
+    from chat_sessions import stream_message
+    from claude_client import ClaudeClientError
+    from local_tool_client import LocalToolClientError
+
+    def generate():
+        try:
+            for event in stream_message(pipeline_dir, session_id, message):
+                yield f"data: {json.dumps(event)}\n\n"
+        except ClaudeClientError as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        except LocalToolClientError as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        except (TimeoutError, ConnectionError, OSError) as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
 
     # Reserved sessions refresh their own idle clock on every real message -- same
     # liveness-refresh shape a worker instance's own heartbeat already follows.
@@ -3450,7 +3473,7 @@ def api_chat_message(session_id):
         if session_id in _chat_reservations:
             _chat_reservations[session_id]["lastActivity"] = time.time()
 
-    return jsonify(session)
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 
 @app.route("/api/chat/<session_id>/reserve", methods=["POST"])

@@ -108,4 +108,67 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
   });
 }
 
-module.exports = { postJson };
+/**
+ * Streaming sibling of postJson, for callers that want to relay tokens live (Chat panel's
+ * onChunk, 2026-08-26: Open WebUI does the same over Socket.IO/SSE -- this is the
+ * equivalent for our http.request-based client). Ollama's stream:true response is NDJSON,
+ * one JSON object per line -- TokenFold's proxy (vendor/tokenfold/.../ollama_native.py's
+ * own _stream_ndjson) already speaks this shape, so no new upstream contract is needed.
+ * Calls onLine(obj) for every parsed line as it arrives; resolves once the response body
+ * ends. Errors mid-body (a dropped connection, a non-JSON line) reject the same as
+ * postJson's own error paths -- a bad HTTP status is still a hard reject, but a mid-stream
+ * failure the proxy already turned into an {error, done_reason:"error"} NDJSON frame is
+ * left for the caller to notice via onLine, same as any other line.
+ */
+function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
+  const url = new URL(urlString);
+  const payload = JSON.stringify(Object.assign({}, bodyObj, { stream: true }));
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname,
+      method: 'POST',
+      headers: Object.assign(
+        { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        extraHeaders || {}
+      ),
+      timeout: timeoutMs,
+      agent: false, // same stale-pooled-socket reasoning as postJson above
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        let data = '';
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => reject(new Error(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`)));
+        res.on('error', reject);
+        return;
+      }
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        buf += chunk;
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          try { onLine(JSON.parse(line)); } catch (e) { reject(new Error(`Ollama returned unparseable NDJSON line: ${e.message}`)); }
+        }
+      });
+      res.on('end', () => {
+        const line = buf.trim();
+        if (line) {
+          try { onLine(JSON.parse(line)); } catch (e) { reject(new Error(`Ollama returned unparseable NDJSON line: ${e.message}`)); }
+        }
+        resolve();
+      });
+      res.on('error', reject);
+    });
+    req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${timeoutMs}ms`)); });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+module.exports = { postJson, postJsonStream };
