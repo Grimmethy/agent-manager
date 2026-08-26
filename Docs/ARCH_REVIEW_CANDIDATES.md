@@ -105,3 +105,29 @@ Make `writeSecretFile` explicitly POSIX-only by renaming it to `writeSecretFileP
 
 Benefits:
 The API contract becomes honest about its actual security guarantees, preventing callers from assuming cross-platform protection where none exists. Tests now cover both platform-specific semantics (POSIX mode enforcement) and cross-platform baselines (content integrity), catching regressions on either axis. The design decision is explicit rather than implicit, reducing the cognitive load for maintainers evaluating whether to extend support or document limitations.
+
+### AC-9 · Async-ify resolveGraphPath with repoRoot-keyed memoization in config.js
+Strength: Strong
+Files: src/config.js
+
+Problem:
+resolveGraphPath(repoRoot) performs eager synchronous filesystem I/O (fs.existsSync, fs.readdirSync, fs.statSync) on every single getConfig() call, with no caching. In a long-lived worker process that calls getConfig() repeatedly (every task-source tick, every apply-task invocation), this re-walks .agent-manager-cache/ from scratch each time, blocking the event loop and doing redundant stat/readdir work. There is also no way to invalidate a cached result when the dashboard writes a new graph.json, so a memoized version needs an explicit invalidation hook.
+
+Solution:
+1) Add a module-level Map keyed by path.resolve(repoRoot) storing the resolved graph-path string. 2) Convert resolveGraphPath to an async function using fs.promises (readdir, stat, access) instead of the sync variants; on entry, check the Map and return the cached value on a hit; on a miss, perform the async walk and store the result before returning. 3) Export a new invalidateGraphPathCache(repoRoot?) function that deletes a single key or clears the whole Map. 4) Change getConfig() from function to async function and replace the bare resolveGraphPath(repoRoot) call with await resolveGraphPath(repoRoot). 5) Keep the AGENT_MANAGER_GRAPH_PATH env-var short-circuit before the await so an explicitly-set path never touches the cache or the filesystem.
+
+Benefits:
+Eliminates redundant synchronous readdir/stat walks on every getConfig() call in long-lived worker processes; frees the event loop during the (now async) filesystem I/O; gives downstream code (e.g. a task-completion handler that writes a new graph.json) a deterministic one-line call to force a re-scan on the next getConfig() invocation; the env-var override path remains zero-cost and synchronous.
+
+### AC-10 · Adopt async getConfig() in apply-task.js and task-sources.js
+Strength: Strong
+Files: src/apply-task.js,src/task-sources.js
+
+Problem:
+After config.js's getConfig() becomes async (returns a Promise), every call site that does const { pipelineDir } = getConfig(); or similar destructuring will silently receive a Promise instead of a plain object, causing undefined property reads and runtime failures. In task-sources.js, taskIdExistsInQueue(id) calls getConfig() synchronously and is itself called from many nextTask generators throughout the file; making it async cascades to every caller. In apply-task.js, getConfig() is required at the top and called in the (truncated) apply logic. All of these call sites must be converted to await getConfig() and their enclosing functions made async (or wrapped in an IIFE / .then chain) to complete the migration.
+
+Solution:
+1) In src/task-sources.js: change taskIdExistsInQueue to async function taskIdExistsInQueue(id) and add await before getConfig(); then propagate async/await up through every function that calls taskIdExistsInQueue (the nextTask generators for each of the 10 built-in sources, the adhoc/research title-scanning helper, and any other internal callers visible in the file). 2) In src/apply-task.js: add await before every getConfig() call site in the apply/writeArtifact/branch logic; make the enclosing functions async where they are not already. 3) Verify no other module in the package calls getConfig() without await (grep for require('./config.js') and getConfig() across src/). 4) local-worker.ps1 needs no change — it invokes Node scripts (local-client.js, prompts.js, local-tool-client.js) via & node and reads stdout; it does not itself call getConfig() or resolveGraphPath.
+
+Benefits:
+Completes the breaking-change migration so no caller silently receives a Promise where it expects a plain object; the cascading async in task-sources.js is contained to that one file's internal call graph (all nextTask functions are already called from a single async worker loop, so the propagation is mechanical); apply-task.js's CLI entry point already runs in an async context (it's a top-level script), so adding await is straightforward; no PowerShell-side change is needed, keeping the worker's invocation contract unchanged.
