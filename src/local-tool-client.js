@@ -12,7 +12,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { grepCodebase } = require('./grep-codebase-tool.js');
 const { getConfig } = require('./config.js');
-const { postJson } = require('./ollama-http.js');
+const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { withLock } = require('./single-flight-lock.js');
 
@@ -346,7 +346,47 @@ const TOOL_HANDLERS = {
   list_directory: (args) => listDirectoryTool({ path: args.path }),
 };
 
-async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = false }) {
+// One /api/chat turn, normalized to a plain {content, tool_calls} message object
+// regardless of whether it streamed or not -- keeps runPlanWithTools' own loop below
+// completely unaware of which transport carried the turn.
+//
+// 2026-08-26 (Chat panel streaming, Grimmethy: "vastly improve the chat system... Open
+// WebUI does this over Socket.IO/SSE" -- see that investigation): onChunk, when given,
+// switches this turn to Ollama's stream:true NDJSON form and calls onChunk(text) with
+// each content delta as it arrives, the same "show it thinking live" fix that made the
+// old CHAT_LOCAL_MAX_TURNS "ran out of budget" explainer necessary in the first place --
+// a user watching real tokens land never has to wonder if it's hung. Tool-call turns
+// still resolve in one shot either way (Ollama emits tool_calls fully-formed, not
+// token-by-token), so onChunk simply never fires for those turns.
+async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
+  if (!onChunk) {
+    const res = await postJson(`${OLLAMA_URL}/api/chat`, {
+      model: MODEL, messages, tools, stream: false,
+    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
+    return res.message || {};
+  }
+  let contentAcc = '';
+  let toolCalls = null;
+  let streamError = null;
+  await postJsonStream(`${OLLAMA_URL}/api/chat`, {
+    model: MODEL, messages, tools,
+  }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
+    if (obj.error || obj.done_reason === 'error') {
+      streamError = obj.error || obj.done_reason || 'unknown stream error';
+      return;
+    }
+    const msg = obj.message || {};
+    if (typeof msg.content === 'string' && msg.content) {
+      contentAcc += msg.content;
+      onChunk(msg.content);
+    }
+    if (msg.tool_calls && msg.tool_calls.length) toolCalls = msg.tool_calls;
+  });
+  if (streamError) throw new Error(streamError);
+  return { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined };
+}
+
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk }) {
   const { pipelineDir } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -380,7 +420,18 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
   const tokenFoldHeaders = { 'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}` };
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
 
-  const messages = [{ role: 'user', content: prompt }];
+  // 2026-08-26 (Chat panel, Grimmethy: "vastly improve the chat system... Open WebUI"
+  // investigation) -- callers with real conversation history now pass a proper per-turn
+  // `messages` array (chat_sessions.py builds it with real system/user/assistant roles)
+  // instead of chat_sessions.py's old approach of flattening the whole transcript into
+  // one giant string inside a single {role:'user'} message. Plain single-shot callers
+  // (local-agentic-draft.js) still pass `prompt` and get the old one-message behavior,
+  // unchanged. This also happens to be why the single-message TokenFold cache-mint flake
+  // documented below almost never fires for Chat anymore: a real conversation's first
+  // turn is the only one ever length-1 now, same as it always was for one-shot callers.
+  const messages = Array.isArray(reqMessages) && reqMessages.length
+    ? reqMessages.slice()
+    : [{ role: 'user', content: prompt }];
   const toolCallLog = [];
   let turnsUsed = 0;
   let lastMessage = null;
@@ -388,36 +439,26 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
     // 2026-08-26 (Chat panel 502, Grimmethy): a single-message /api/chat call --
-    // exactly this loop's first turn, every time -- can intermittently come back
-    // "Ollama HTTP 500: {"error":"no user query found in messages"}" even though the
-    // real Ollama server never sees a malformed request: TokenFold's proxy (see
-    // vendor/tokenfold/core/tokenfold/engine.py's encode(), len(messages)==1 branch)
-    // runs its dictionary-mint step inline inside encode() for that shape, and a race
-    // there can occasionally hand back a mangled `messages` array. Confirmed live: the
-    // exact same prompt/session, resent unchanged moments later, succeeds -- not a
-    // content-triggered failure, a transient one in the vendored proxy's encode path.
-    // One immediate retry of the SAME turn (not counted against maxTurns/turnsUsed)
-    // is the same bounded-retry-on-known-transient-failure treatment this pipeline
-    // already gives other infra flakiness (see local-worker.sh's INFRA_FAILURE_PATTERN).
-    let res;
+    // exactly this loop's first turn, every time, for a one-shot caller -- can
+    // intermittently come back "Ollama HTTP 500: {"error":"no user query found in
+    // messages"}" even though the real Ollama server never sees a malformed request:
+    // TokenFold's proxy (see vendor/tokenfold/core/tokenfold/engine.py's encode(),
+    // len(messages)==1 branch) runs its dictionary-mint step inline inside encode() for
+    // that shape, and a race there can occasionally hand back a mangled `messages`
+    // array. Confirmed live: the exact same prompt/session, resent unchanged moments
+    // later, succeeds -- not a content-triggered failure, a transient one in the
+    // vendored proxy's encode path. One immediate retry of the SAME turn (not counted
+    // against maxTurns/turnsUsed) is the same bounded-retry-on-known-transient-failure
+    // treatment this pipeline already gives other infra flakiness (see
+    // local-worker.sh's INFRA_FAILURE_PATTERN).
+    let message;
     try {
-      res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
-        model: MODEL,
-        messages,
-        tools,
-        stream: false,
-      }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
+      message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
     } catch (e) {
       if (!/no user query found in messages/i.test(e.message)) throw e;
-      res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
-        model: MODEL,
-        messages,
-        tools,
-        stream: false,
-      }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
+      message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
     }
 
-    const message = res.message || {};
     lastMessage = message;
     const toolCalls = message.tool_calls || [];
 
@@ -474,10 +515,33 @@ if (require.main === module) {
   }
   const req = JSON.parse(fs.readFileSync(requestPath, 'utf8'));
 
+  // req.stream: true (Chat panel only, local_tool_client.py's stream_plan_with_tools) --
+  // instead of one final JSON blob on stdout, write one NDJSON line per content chunk as
+  // it arrives ({"type":"chunk","text":...}), then exactly one closing
+  // {"type":"final", ...same shape runPlanWithTools always returns}. Non-streaming
+  // callers (arch_discovery, local-agentic-draft.js's one-shot drafts) are completely
+  // unaffected -- this branch only exists when the request explicitly opts in.
   (async () => {
     try {
-      const result = await runPlanWithTools(req);
-      process.stdout.write(JSON.stringify(result));
+      if (req.stream) {
+        let emittedAny = false;
+        const onChunk = (text) => {
+          emittedAny = true;
+          process.stdout.write(`${JSON.stringify({ type: 'chunk', text })}\n`);
+        };
+        const result = await runPlanWithTools(Object.assign({}, req, { onChunk }));
+        // The tools-disabled kill-switch path (and, in principle, a turn whose only
+        // content arrived on a turn where onChunk was never wired) never streams --
+        // give the browser SOMETHING to show rather than a silent jump straight to
+        // "final" with an empty-looking transcript entry.
+        if (!emittedAny && result.response) {
+          process.stdout.write(`${JSON.stringify({ type: 'chunk', text: result.response })}\n`);
+        }
+        process.stdout.write(`${JSON.stringify(Object.assign({ type: 'final' }, result))}\n`);
+      } else {
+        const result = await runPlanWithTools(req);
+        process.stdout.write(JSON.stringify(result));
+      }
     } catch (err) {
       console.error(err.message);
       process.exit(1);
