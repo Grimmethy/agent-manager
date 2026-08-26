@@ -175,6 +175,13 @@ test('applyArchDiscoveryCandidates appends to an existing doc without disturbing
 test('a Strong candidate written by applyArchDiscoveryCandidates is correctly picked up by the real nextArchReviewTask()', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-roundtrip-'));
   const candidatesPath = path.join(dir, 'ARCH_REVIEW_CANDIDATES.md');
+  // Real files, not just listed paths -- 2026-08-26, the multi-file path-hallucination
+  // guard added to nextCandidateFulfillmentTask() (arch-review-ac-7 investigation) now
+  // correctly skips a candidate whose "Files:" line lists 2+ paths where NONE resolve,
+  // which this round-trip fixture would otherwise look exactly like.
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'const x = 1;\n');
+  fs.writeFileSync(path.join(dir, 'src', 'y.js'), 'const y = 2;\n');
 
   applyArchDiscoveryCandidates({
     implementResponse: candidateBlock({ id: 'AC-1', title: 'Round Trip Target', strength: 'Strong', files: 'src/x.js, src/y.js' }),
