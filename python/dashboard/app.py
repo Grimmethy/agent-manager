@@ -4366,6 +4366,25 @@ def _describe_change(data: dict) -> str | None:
         cleaned = _CANDIDATE_METADATA_LINE_RE.sub("", text).strip()
         return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
+    # 2026-08-26, Grimmethy: "Does the record in the dashboard properly reflect all the
+    # information about this entry?" -- caught live on arch-review-ac-4: a split-resolution
+    # task (implementResponse is raw {"mode":"split",...} JSON, no RESOLUTION line, no
+    # plain-prose implement) fell all the way through to strategy 2 below and showed the
+    # ORIGINAL candidate's problem/solution write-up as the branch's description -- reading
+    # exactly like a completed refactor (title unchanged too) even though the branch
+    # contains ZERO code changes, only two new sub-candidates appended to the doc. Checked
+    # FIRST, ahead of every other strategy: candidateSplitProposals is set exclusively by
+    # this exact outcome (see apply-task.js's applyCandidateSplit / local-draft.js's
+    # parseCandidateSplit) and is unambiguous where implementResponse's shape is not.
+    split_proposals = data.get("candidateSplitProposals")
+    if split_proposals:
+        titles = [p.get("title") for p in split_proposals if isinstance(p, dict) and p.get("title")]
+        titles_text = "; ".join(titles) if titles else f"{len(split_proposals)} sub-candidates"
+        return (
+            f"Split into {len(split_proposals)} sub-candidate(s), not yet implemented: "
+            f"{titles_text}"
+        )[:_DESCRIPTION_MAX_CHARS]
+
     implement = (data.get("implementResponse") or "").strip()
 
     m = _RESOLUTION_LINE_RE.search(implement)
