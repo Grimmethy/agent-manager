@@ -157,3 +157,29 @@ Solution:
 
 Benefits:
 Completes the breaking-change migration so no caller silently receives a Promise where it expects a plain object; the cascading async in task-sources.js is contained to that one file's internal call graph (all nextTask functions are already called from a single async worker loop, so the propagation is mechanical); apply-task.js's CLI entry point already runs in an async context (it's a top-level script), so adding await is straightforward; no PowerShell-side change is needed, keeping the worker's invocation contract unchanged.
+
+### AC-13 · Async-ify resolveGraphPath and getConfig in src/config.js
+Strength: Strong
+Files: src/config.js
+
+Problem:
+resolveGraphPath uses three synchronous fs calls (fs.existsSync, fs.readdirSync, fs.statSync) that block the Node event loop on every getConfig() invocation. getConfig() itself is synchronous and calls resolveGraphPath(repoRoot) inline, so any consumer that needs a config object must wait on a blocking syscall. This is fine for a one-shot CLI but blocks the event loop in the long-running drafting daemon and dashboard server that import this module.
+
+Solution:
+Convert resolveGraphPath to an async function that uses fs.promises.access (for the existsSync check), fs.promises.readdir (for the directory listing), and fs.promises.stat (for mtimeMs). Preserve the exact three-tier resolution order: (1) .agent-manager-cache/default/graph.json, (2) most-recently-modified graph.json across .agent-manager-cache/<hash>/ subdirs, (3) graphify-out/graph.json fallback. Convert getConfig to an async function and prepend await before the resolveGraphPath(repoRoot) call on the line 'const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);'. The returned object shape (all keys, types) is unchanged; callers simply await it.
+
+Benefits:
+Non-blocking filesystem I/O in the daemon and server processes; no behavioral change to the resolution logic or the returned config object; paves the way for callers to do useful work while the stat/readdir round-trip is in flight.
+
+### AC-14 · Propagate await getConfig() through taskIdExistsInQueue (task-sources.js) and all getConfig() call sites in apply-task.js
+Strength: Strong
+Files: src/apply-task.js, src/task-sources.js
+
+Problem:
+Once getConfig() returns a Promise, every existing call site that destructures it synchronously (e.g. 'const { pipelineDir } = getConfig();' inside taskIdExistsInQueue in task-sources.js, and the one or more call sites in apply-task.js that import getConfig from ./config.js) will receive a Promise object instead of the config object, causing undefined property access and runtime errors. taskIdExistsInQueue is called from multiple source-generator functions in task-sources.js, so making it async cascades to those callers as well.
+
+Solution:
+In src/task-sources.js: change taskIdExistsInQueue to 'async function taskIdExistsInQueue(id)' and change 'const { pipelineDir } = getConfig();' to 'const { pipelineDir } = await getConfig();'. Then find every caller of taskIdExistsInQueue within task-sources.js (the source-generator tick functions that call it for dedup) and add await, making those enclosing functions async if they are not already. In src/apply-task.js: locate every call site of getConfig() (the file imports it via 'const { getConfig, ensureRegistered } = require("./config.js");') and add await; make the enclosing function async if it is not already, and propagate await up through any further callers in the same file. Verify no top-level (module-scope) call to getConfig() exists that would need restructuring into an async IIFE or a top-level await.
+
+Benefits:
+All consumers of getConfig() correctly await the Promise, preserving the same runtime values they received before; the async propagation is minimal (one await per call site) and does not change any business logic; the daemon and CLI both work correctly with the now-async config lookup.
