@@ -387,12 +387,35 @@ async function runPlanWithTools({ prompt, maxTurns = 5, source, allowWrite = fal
 
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
-    const res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL,
-      messages,
-      tools,
-      stream: false,
-    }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
+    // 2026-08-26 (Chat panel 502, Grimmethy): a single-message /api/chat call --
+    // exactly this loop's first turn, every time -- can intermittently come back
+    // "Ollama HTTP 500: {"error":"no user query found in messages"}" even though the
+    // real Ollama server never sees a malformed request: TokenFold's proxy (see
+    // vendor/tokenfold/core/tokenfold/engine.py's encode(), len(messages)==1 branch)
+    // runs its dictionary-mint step inline inside encode() for that shape, and a race
+    // there can occasionally hand back a mangled `messages` array. Confirmed live: the
+    // exact same prompt/session, resent unchanged moments later, succeeds -- not a
+    // content-triggered failure, a transient one in the vendored proxy's encode path.
+    // One immediate retry of the SAME turn (not counted against maxTurns/turnsUsed)
+    // is the same bounded-retry-on-known-transient-failure treatment this pipeline
+    // already gives other infra flakiness (see local-worker.sh's INFRA_FAILURE_PATTERN).
+    let res;
+    try {
+      res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
+        model: MODEL,
+        messages,
+        tools,
+        stream: false,
+      }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
+    } catch (e) {
+      if (!/no user query found in messages/i.test(e.message)) throw e;
+      res = await withLock(instancesDir, () => postJson(`${OLLAMA_URL}/api/chat`, {
+        model: MODEL,
+        messages,
+        tools,
+        stream: false,
+      }, REQUEST_TIMEOUT_MS, tokenFoldHeaders), MODEL);
+    }
 
     const message = res.message || {};
     lastMessage = message;
