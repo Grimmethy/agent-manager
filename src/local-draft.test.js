@@ -485,6 +485,114 @@ test('findUnverifiedEdit does not flag effectively-empty, malformed JSON, create
   assert.equal(findUnverifiedEdit(JSON.stringify({ mode: 'edit', file: 'unfetched.js', find: 'anything', replace: 'x' }), fetchedFiles), null, 'no fetched content for this file -- not this checks job');
 });
 
+// Regression, 2026-08-26 -- see prompts.js's candidateSplitInstructions for the full
+// incident (arch-review-ac-4: a real candidate that genuinely didn't fit one atomic
+// JSON edit, and had no escape hatch other than under-delivering or exhausting).
+test('parseCandidateSplit recognizes a well-formed split and returns its sub-candidates', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const response = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'Extract git apply path', files: 'src/apply-task.js', problem: 'p1', solution: 's1', benefits: 'b1' },
+      { title: 'Extract direct-write apply path', files: 'src/apply-task.js', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+  });
+  const result = parseCandidateSplit(response);
+  assert.equal(result.invalid, undefined);
+  assert.equal(result.candidates.length, 2);
+  assert.equal(result.candidates[0].title, 'Extract git apply path');
+});
+
+test('parseCandidateSplit returns invalid:true when mode is "split" but fewer than 2 sub-candidates are well-formed', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const oneReal = JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one', problem: 'p', solution: 's' }] });
+  const result1 = parseCandidateSplit(oneReal);
+  assert.equal(result1.invalid, true);
+  assert.match(result1.reason, /at least 2/);
+
+  const missingFields = JSON.stringify({ mode: 'split', candidates: [{ title: 'a' }, { title: 'b' }] });
+  const result2 = parseCandidateSplit(missingFields);
+  assert.equal(result2.invalid, true);
+
+  const noCandidatesArray = JSON.stringify({ mode: 'split' });
+  assert.equal(parseCandidateSplit(noCandidatesArray).invalid, true);
+});
+
+test('parseCandidateSplit returns null for anything that is not a split attempt (normal edit/create/delete/empty responses pass through untouched)', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  assert.equal(parseCandidateSplit(''), null);
+  assert.equal(parseCandidateSplit('""'), null);
+  assert.equal(parseCandidateSplit('not json at all'), null);
+  assert.equal(parseCandidateSplit(JSON.stringify({ mode: 'edit', file: 'x.js', find: 'a', replace: 'b' })), null);
+  assert.equal(parseCandidateSplit(JSON.stringify([{ mode: 'edit', file: 'x.js', find: 'a', replace: 'b' }])), null, 'a plain array (multi-file edit) is not a split object');
+});
+
+test('draftTask recognizes a split implement response, skips critique, and goes straight to needs-review', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-split-test-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: {
+        candidateId: 'AC-4', title: 'x', files: ['src/apply-task.js'],
+        fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }],
+        body: 'Files: src/apply-task.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) {
+        return {
+          response: JSON.stringify({
+            mode: 'split',
+            candidates: [
+              { title: 'Extract git path', problem: 'p1', solution: 's1', benefits: 'b1' },
+              { title: 'Extract direct-write path', problem: 'p2', solution: 's2', benefits: 'b2' },
+            ],
+          }),
+          degenerate: null, attempts: 1,
+        }; // implement, split
+      }
+      throw new Error('critique should never be called for a split response');
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 2, 'plan + implement only -- critique must be skipped');
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.candidateSplitProposals[0].title, 'Extract git path');
+    assert.equal(task.status, 'needs-review');
+    assert.equal(task.history.some((h) => h.stage === 'critique-done'), false);
+    assert.match(task.history.find((h) => h.stage === 'implement-done').detail, /split into 2 sub-candidate/);
+  });
+});
+
+test('draftTask blocks a candidate-fulfillment source that says mode "split" but does not follow through with well-formed sub-candidates', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-split-test-2', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: {
+        candidateId: 'AC-5', title: 'x', files: ['src/apply-task.js'],
+        fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }],
+        body: 'Files: src/apply-task.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one' }] }), degenerate: null, attempts: 1 };
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /at least 2/);
+  });
+});
+
 test('draftTask retries the implement call once when a candidate-fulfillment source writes an unverifiable find, and accepts the corrected retry', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {

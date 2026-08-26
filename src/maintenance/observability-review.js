@@ -130,7 +130,7 @@ function observabilityFixImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const fetched = ctx.fetchedFiles || [];
   const namedButMissing = (ctx.files || []).filter((f) => !fetched.some((ff) => ff.path === f));
-  const { formatFileContents, groupBJsonInstructions } = require('../prompts.js');
+  const { formatFileContents, groupBJsonInstructions, candidateSplitInstructions } = require('../prompts.js');
   return [
     'Earlier you wrote this PLAN for a narrow observability-hygiene fix:',
     '',
@@ -147,6 +147,8 @@ function observabilityFixImplementPrompt(task, planText) {
       : '',
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up.',
+    '',
+    candidateSplitInstructions,
     '',
     groupBJsonInstructions,
   ].join('\n');
@@ -256,6 +258,8 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       return nextCandidateFulfillmentTask(observabilityFixCandidatesPath, 'observability_fix');
     },
     emptyApproval: true, candidateFulfillment: true,
+    candidatesPath: () => getConfig().observabilityFixCandidatesPath,
+    candidateDocTitle: '# Observability Fix Candidates',
   });
   updateTaskSource('observability_fix', { buildPlanPrompt: observabilityFixPlanPrompt, buildImplementPrompt: observabilityFixImplementPrompt });
 }

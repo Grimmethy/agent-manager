@@ -44,7 +44,7 @@ function formatFileContents(files) {
 const groupBJsonInstructions = [
   'Now output ONLY JSON describing the concrete file change(s) your corrected plan calls for -- nothing else, no explanation before or after the JSON, no markdown code fences.',
   '',
-  'If the change touches exactly ONE file, output a single JSON object. If it touches MORE than one file, output a JSON ARRAY of these objects instead (one per file) -- do not combine multiple files into one object.',
+  'If the change touches exactly ONE file with exactly one logical edit, output a single JSON object. Otherwise output a JSON ARRAY of these objects instead -- one per logically distinct edit, including MULTIPLE edits against the SAME file when the change has more than one independent part there (they apply in the order listed, each against the result of the one before it) -- do not cram unrelated edits into one object\'s find/replace just to keep the output to one item.',
   '',
   'Each object must be shaped like exactly ONE of these three forms:',
   '  {"mode": "create", "file": "relative/path/from/repo/root.js", "content": "full file content"}',
@@ -58,6 +58,34 @@ const groupBJsonInstructions = [
   '  [{"mode": "create", "file": "backend/utils/shared.js", "content": "..."}, {"mode": "edit", "file": "backend/utils/caller.js", "find": "...", "replace": "..."}]',
   '',
   '"find" must be an EXACT substring that appears in the real current file content shown in your plan above -- copy it character for character, do not paraphrase or reformat it, or the edit will fail to apply. "file" must be a real path relative to the repository root. Stay inside exactly the files and scope the plan named -- do not touch anything the plan did not call out, even if it looks related.',
+].join('\n');
+
+// 2026-08-26, Grimmethy: "how do we make that split happen the moment it realizes the
+// scope is too large... should split it into smaller parts" -- root-caused live via
+// arch-review-ac-4 (extract git vs. direct-write apply paths into separate functions):
+// two attempts in a row either produced a disconnected fragment or correctly extracted
+// ONLY the smaller half of the ask, because the full candidate genuinely doesn't fit
+// safely into one atomic JSON edit for a model this size -- and there was no escape
+// hatch other than silently under-delivering or retrying the exact same oversized ask
+// until it exhausted. Modeled directly on adhoc-agentic-draft.js's own RESOLUTION:
+// decompose (the identical problem for agentic adhoc tasks), adapted to this shape's
+// JSON-only output contract instead of a free-text RESOLUTION line. local-draft.js
+// detects this shape before critique (there's no diff to critique, same reasoning
+// decompose already established); review-task.js judges it on completeness/coverage,
+// not "does it contain code"; apply-task.js writes the sub-candidates back into the
+// SAME candidates doc the original came from (reusing applyArchDiscoveryCandidates,
+// the exact appender arch_discovery already uses) instead of applying a diff -- each
+// sub-candidate then flows through the normal pickup loop on a later tick, small enough
+// to land as one atomic edit on its own.
+const candidateSplitInstructions = [
+  'If the change above genuinely does not fit safely into one or a few JSON file-change objects -- e.g. it requires extracting multiple independent functions, updating call sites in several places, or otherwise more surface than a handful of edits can capture correctly in one atomic pass -- do NOT force it into an incomplete or fragile diff. Output this instead:',
+  '',
+  '{"mode": "split", "candidates": [',
+  '  {"title": "...", "files": "comma, separated, paths", "problem": "...", "solution": "...", "benefits": "..."},',
+  '  {"title": "...", "files": "comma, separated, paths", "problem": "...", "solution": "...", "benefits": "..."}',
+  ']}',
+  '',
+  'Requirements: at least 2 sub-candidates; together they must cover the FULL original scope with nothing dropped; each must be independently small enough to land as its own single JSON file-change object later, on its own; write each one as a real, self-contained Problem/Solution/Benefits write-up (a future drafting pass will only ever see the sub-candidate\'s own text, not this one). Do NOT use this escape hatch for anything that genuinely fits in the file-change JSON below -- splitting a change that didn\'t need it just adds review overhead for no reason.',
 ].join('\n');
 
 // ---- Per-source plan-prompt builders ----
@@ -402,6 +430,8 @@ function archReviewImplementPrompt(task, planText) {
       : '',
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up. If the real content above does not actually contain what the plan assumed, the plan was wrong about the file\'s current state; do not force a `find` that only approximately matches.',
+    '',
+    candidateSplitInstructions,
     '',
     groupBJsonInstructions,
   ].join('\n');
@@ -1266,7 +1296,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 }
 
 module.exports = {
-  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, formatFileContents,
+  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt,
 };
 

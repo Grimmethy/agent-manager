@@ -1468,10 +1468,19 @@ registerTaskSource('path_prefetch_resolve', {
   priority: taskPriority('path_prefetch_resolve', 45),
   next: nextPathPrefetchResolveTask,
 });
+// candidatesPath/candidateDocTitle (2026-08-26): where a `{"mode": "split"}` implement
+// response (see prompts.js's candidateSplitInstructions -- "how do we make that split
+// happen the moment it realizes the scope is too large" -- root-caused live via
+// arch-review-ac-4) gets its sub-candidates written back to, via
+// applyArchDiscoveryCandidates (apply-group-a.js), the same appender arch_discovery's own
+// apply already uses. A lazy getter, not a plain value, since getConfig() isn't callable
+// at module-load time.
 registerTaskSource('arch_review', {
   priority: taskPriority('arch_review', 70),
   next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
   emptyApproval: true, candidateFulfillment: true,
+  candidatesPath: () => getConfig().archReviewCandidatesPath,
+  candidateDocTitle: '# Architecture Review Candidates',
 });
 // arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
 // against arch_import's own candidates doc instead of arch_discovery's. Priority 71 --
@@ -1482,6 +1491,8 @@ registerTaskSource('arch_import_review', {
   priority: taskPriority('arch_import_review', 71),
   next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
   emptyApproval: true, candidateFulfillment: true,
+  candidatesPath: () => getConfig().archImportCandidatesPath,
+  candidateDocTitle: '# Architecture Import Candidates',
 });
 // apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
 // markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
@@ -2104,6 +2115,8 @@ registerTaskSource('backlog_fulfillment', {
   priority: taskPriority('backlog_fulfillment', 16),
   next: () => nextCandidateFulfillmentTask(getConfig().backlogCandidatesPath, 'backlog_fulfillment'),
   emptyApproval: true, candidateFulfillment: true,
+  candidatesPath: () => getConfig().backlogCandidatesPath,
+  candidateDocTitle: '# Backlog Candidates',
 });
 
 // function_length_review / function_length_fix (2026-08-23, Grimmethy: "Let's start with

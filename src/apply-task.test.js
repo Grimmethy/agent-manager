@@ -239,6 +239,53 @@ test('arch_import: a genuinely thrown write error resets main again for cleanup 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'resetToMain']);
 });
 
+// --- candidateSplitProposals: a task judged too large for one atomic edit writes its
+// sub-candidates back into the candidates doc instead of applying a diff (2026-08-26, see
+// prompts.js's candidateSplitInstructions and local-draft.js's parseCandidateSplit for the
+// full incident/design, root-caused live via arch-review-ac-4). arch_review is NOT a
+// DIRECT_TO_MAIN_SOURCE, so this goes through the normal branch-per-task flow above, not
+// arch_discovery's direct-to-main path -- the split result just replaces the diff at the
+// writeArtifact step.
+function arSplitTask(overrides = {}) {
+  return baseTask({
+    domain: 'default',
+    source: 'arch_review',
+    candidateSplitProposals: [
+      { title: 'Extract git path', files: 'src/apply-task.js', problem: 'p1', solution: 's1', benefits: 'b1' },
+      { title: 'Extract direct-write path', files: 'src/apply-task.js', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+    ...overrides,
+  });
+}
+
+test('candidateSplitProposals: writes both sub-candidates into ARCH_REVIEW_CANDIDATES.md and applies through the normal branch flow (no diff needed)', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(arSplitTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.branch, 'agent/test-task-1');
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+
+  const doc = fs.readFileSync(path.join(REPO_ROOT, 'Docs', 'ARCH_REVIEW_CANDIDATES.md'), 'utf8');
+  assert.match(doc, /# Architecture Review Candidates/);
+  assert.match(doc, /Extract git path/);
+  assert.match(doc, /Extract direct-write path/);
+  assert.match(doc, /Files: src\/apply-task\.js/);
+});
+
+test('candidateSplitProposals: throws (rolls back the branch) when the resolved source has no registered candidatesPath', () => {
+  const gitRunner = createFakeGitRunner();
+  // trouble_log is a real registered source with no candidatesPath field.
+  const task = arSplitTask({ source: 'trouble_log' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.match(result.reason, /no registered candidatesPath/);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch']);
+});
+
 test('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({

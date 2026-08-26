@@ -196,7 +196,15 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   if (task.source === 'manual') {
     lines.push('The PLAN section above was drafted BLIND, by an earlier and separate pass, before any real investigation happened -- true for EVERY adhoc task here, regardless of how it ultimately resolved (implemented, decomposed, or otherwise). It is exploratory scratch work, not the deliverable, and may itself be rough, incomplete, wrong, or even contain broken/truncated example code. NEVER reject over a problem in the PLAN itself (a syntax error in an illustrative snippet there, a design the real work ends up doing differently, a file or approach it guessed at that turned out wrong) -- judge ONLY the actual IMPLEMENT draft below, produced after real investigation.');
   }
-  if (task.source === 'arch_discovery') {
+  if (task.candidateSplitProposals) {
+    // 2026-08-26, root-caused live via arch-review-ac-4 -- see prompts.js's
+    // candidateSplitInstructions and local-draft.js's parseCandidateSplit for the full
+    // incident/design. Same reasoning as the manual/decompose carve-out below: a split
+    // proposal deliberately has no diff, and the generic "does it contain real, complete
+    // code" completeness question would reject every correct split on sight for exactly
+    // that reason.
+    lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. Is it sound: do the sub-candidates, together, actually cover the FULL original candidate scope (no silently dropped requirement)? Is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
+  } else if (task.source === 'arch_discovery') {
     lines.push('This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).');
   } else if (task.source === 'project_search') {
     lines.push('This is a project-search task: the drafter was told it is correct to report zero findings when none of the real, harness-fetched GitHub/HuggingFace search results were genuinely useful -- do not reject a draft merely for reporting no findings. Only reject an empty result if the draft invents a project/URL not present in the actual search results given to it, or if the search results plainly did contain something usable that the draft ignored.');
@@ -233,7 +241,12 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     // generic hedging rule, regardless of how accurate its analysis actually is.
     lines.push('This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," verify that call is actually earned by the real evidence shown above (the harness search genuinely supports the concern being resolved/ungrounded), not just asserted -- reject an under-supported "archive" the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without the real evidence above actually supporting that conclusion.');
   }
-  const completenessQuestion = task.source === 'brain_dump_sort'
+  const completenessQuestion = task.candidateSplitProposals
+    // Same reasoning as the manual/decompose and brain_dump_sort carve-outs below --
+    // "real, complete code" directly contradicts the split carve-out above, whose whole
+    // point is that no code was written yet.
+    ? 'Does it contain a well-formed JSON array of sub-candidates, each with a real title/problem/solution, that together cover the original candidate with nothing dropped?'
+    : task.source === 'brain_dump_sort'
     // Deliberately NOT "does it contain real, complete code" -- confirmed live
     // 2026-08-16: that phrasing, left unconditional, directly contradicted the
     // brain_dump_sort carve-out above (a reviewer told two conflicting things in the
@@ -376,7 +389,12 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   // decompose proposal's prose. And the full factCheck (including these two flags) is
   // still handed to the reviewer model via buildVerdictPrompt below regardless -- this
   // only removes the automatic no-review-call block, not the information itself.
-  const isDecomposeProposal = task.source === 'manual' && task.adhocResolution === 'decompose';
+  // 2026-08-26: a `{"mode": "split"}` proposal (see candidateSplitInstructions) is the
+  // exact same category as a decompose proposal above -- prose describing FUTURE
+  // sub-candidates, which routinely names config/field values a future drafting pass
+  // should create, not a claim that something already exists. Same carve-out, same
+  // "still checked, just not auto-blocked" scoping.
+  const isDecomposeProposal = (task.source === 'manual' && task.adhocResolution === 'decompose') || !!task.candidateSplitProposals;
   const highPrecisionFlags = isDecomposeProposal
     ? []
     : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');

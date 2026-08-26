@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse } = require('./apply-group-a.js');
+const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -101,7 +101,70 @@ function usesGroupB(task) {
   return !(source && typeof source.apply === 'function');
 }
 
+// 2026-08-26, root-caused live via arch-review-ac-4 -- see prompts.js's
+// candidateSplitInstructions and local-draft.js's parseCandidateSplit for the full
+// incident/design. A resolved `{"mode": "split"}` task has no diff to apply -- its
+// implementResponse is candidate-write-up JSON, not Group-B create/edit/delete JSON, so
+// it must be intercepted here BEFORE usesGroupB's own dispatch, which would otherwise
+// hand it straight to applyGroupB's JSON.parse and fail with a confusing "invalid mode"
+// error. Writes each sub-candidate back into the SAME candidates doc the original came
+// from -- reusing applyArchDiscoveryCandidates (apply-group-a.js), the exact appender
+// arch_discovery's own apply already uses -- via the resolved source's own
+// candidatesPath()/candidateDocTitle (task-sources.js/maintenance/*.js registrations),
+// never a hardcoded path here, so a new candidate-fulfillment source only needs to
+// register those two fields to get split support for free.
+// Throws rather than returning {succeeded:false} on either failure path below -- the
+// caller's own try/catch around writeArtifact() (see its own comment) already does the
+// right cleanup (abandon the throwaway branch, or reset main's working tree) for a
+// thrown apply error, exactly the same treatment a Group B parse failure gets; returning
+// a bare {succeeded:false} here instead would fall through to the untouched
+// `filesToAdd = artifact.files || [artifact.file]` line with neither present, a worse
+// and less diagnosable failure than the one this function is trying to report clearly.
+function applyCandidateSplit(task, source) {
+  if (!source || typeof source.candidatesPath !== 'function') {
+    throw new Error(`task ${task.id} has candidateSplitProposals but its source ("${resolveSourceName(task)}") has no registered candidatesPath to write them back to`);
+  }
+  // AC-1, AC-2, ... placeholder numbering -- parseArchDiscoveryCandidates (apply-group-a.js)
+  // requires a real digit after "AC-" just to recognize a block boundary at all
+  // (`/(?=^#{1,6}\s*AC-\d+)/m`); applyArchDiscoveryCandidates re-derives the REAL id from
+  // whatever already exists in the target doc regardless of what's written here (same
+  // "the real numbering is assigned when this is written to the doc" convention
+  // backlogDecompositionImplementPrompt already tells the model directly), so these only
+  // need to be valid enough to parse, never actually correct.
+  const markdown = task.candidateSplitProposals.map((c, i) => [
+    `### AC-${i + 1} · ${c.title}`,
+    'Strength: Strong',
+    c.files ? `Files: ${c.files}` : '',
+    '',
+    'Problem:', c.problem,
+    '',
+    'Solution:', c.solution,
+    '',
+    'Benefits:', c.benefits || '(not specified)',
+  ].join('\n')).join('\n\n');
+  const result = applyArchDiscoveryCandidates({
+    implementResponse: markdown,
+    candidatesPath: source.candidatesPath(),
+    ...(source.candidateDocTitle ? { docTitle: source.candidateDocTitle } : {}),
+  });
+  if (result.skipped) {
+    // parseArchDiscoveryCandidates found nothing parseable -- parseCandidateSplit already
+    // validated title/problem/solution are non-empty strings, so this would mean a
+    // markdown-escaping edge case, not a legitimately-empty split.
+    throw new Error(`candidate split approved but produced no parseable sub-candidate(s): ${result.reason}`);
+  }
+  // Same shape applyArchDiscoveryCandidates always returns ({file, candidateCount,
+  // candidateIds}) -- identical to what arch_discovery's own registered `apply` hands
+  // back for the exact same appender, so the generic "Group A returns {file: '...'}"
+  // handling a few lines below this function's own caller already has picks it up with
+  // no special-casing needed.
+  return result;
+}
+
 function writeArtifact(task, repoRoot, pipelineDir) {
+  if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
+    return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
+  }
   if (!usesGroupB(task)) {
     const source = getRegisteredSource(resolveSourceName(task));
     return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
