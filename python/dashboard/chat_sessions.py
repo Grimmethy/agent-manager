@@ -230,18 +230,36 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
         return
 
     session["transcript"].append({"role": "user", "text": message})
+    # In-progress placeholder, rewritten and PERSISTED after every chunk (not just once
+    # at the end) -- 2026-08-26, Grimmethy: "It thought a lot and then the chat record
+    # just disappeared." Root-caused live: a 30+-minute real investigation was killed
+    # outright when the dashboard's own file-watcher reloader restarted this process
+    # mid-stream (chat_sessions.py itself got edited while that turn was still running)
+    # -- the old persist-once-at-the-end design meant the ENTIRE turn vanished, not just
+    # whatever hadn't streamed yet. Any interruption now loses at most the last unwritten
+    # chunk, regardless of cause (a reloader restart, a crash, a dropped connection) --
+    # the whole point is not depending on reaching a specific line of code at the end.
+    session["transcript"].append({"role": "assistant", "text": ""})
+    sessions[session_id] = session
+    _write_sessions(storage_dir, sessions)
+
     reply_parts = []
     if session["provider"] == PROVIDER_CLAUDE:
         reply = _send_claude(session, message)
         reply_parts.append(reply)
+        session["transcript"][-1]["text"] = reply
+        sessions[session_id] = session
+        _write_sessions(storage_dir, sessions)
         yield {"type": "chunk", "text": reply}
     else:
         for chunk in _stream_local(session, message):
             reply_parts.append(chunk)
+            session["transcript"][-1]["text"] = "".join(reply_parts)
+            sessions[session_id] = session
+            _write_sessions(storage_dir, sessions)
             yield {"type": "chunk", "text": chunk}
-    reply = "".join(reply_parts).strip()
-    session["transcript"].append({"role": "assistant", "text": reply})
 
+    session["transcript"][-1]["text"] = "".join(reply_parts).strip()
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     yield {"type": "final", "session": session}
