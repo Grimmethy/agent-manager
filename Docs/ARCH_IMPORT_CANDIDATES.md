@@ -43,3 +43,29 @@ Adapt the OutputGuard pattern into a lightweight `ResponseParser` protocol in `g
 
 Benefits:
 The silent-degradation path (raw text including status markers leaking into the transcript and the enriched note) becomes an explicit, logged fallback rather than an invisible data-quality bug. New LLM sources or prompt-format changes are additive—register a strategy—rather than requiring edits to the two call sites in `start_session` and `submit_answer`. The parsing logic becomes unit-testable in isolation (feed a fenced response, a case-variant, a missing-marker response) without exercising the full session lifecycle.
+
+### AC-4 · Add provider-aware base URL defaults and internal getEndpoint() lookup to model-provider.js
+Strength: Strong
+Files: src/model-provider.js
+
+Problem:
+model-provider.js routes tasks between the local (ornith/Ollama) and Claude backends via providerFor(), but there is no single, documented place that resolves each backend's base URL. Base URL resolution is currently scattered or duplicated across individual client modules (local-client.js, claude-client.js), so there's no shared source of truth for defaults, and no way to override a provider's endpoint (e.g. per-environment or per-deployment) without editing those client modules directly.
+
+Solution:
+Add a provider-to-endpoint lookup map inside model-provider.js, colocated with the existing routing logic, keyed by the same provider identifiers providerFor() already uses ('local'/'ornith' vs 'claude' -- confirm exact keys by reading local-client.js/claude-client.js's current base-URL handling before implementing). Add an internal, non-exported function getEndpoint(source, override) that: returns override immediately if provided; otherwise checks a per-provider environment variable override (following whatever env var naming convention already exists in the client modules, discovered by reading them -- do not invent a new one if a convention already exists); otherwise falls back to the documented default URL for that provider; and returns null for an unrecognized source. Do not export getEndpoint from the module, and do not modify providerFor()'s existing routing behavior -- this addition lives alongside routing, not intertwined with it. Do not modify local-client.js, claude-client.js, or any other consumer module in this change.
+
+Benefits:
+Centralizes base URL defaults and override behavior in one auditable, testable location without disturbing existing routing logic or requiring changes to consumer modules, reducing duplication risk and making future endpoint changes a one-place edit.
+
+### AC-5 · Add unit tests for model-provider.js's new getEndpoint() endpoint-resolution logic
+Strength: Strong
+Files: src/model-provider.test.js
+
+Problem:
+Once model-provider.js gains an internal getEndpoint(source, override) function for resolving each backend's base URL, that logic needs test coverage matching the file's existing node:test/assert-strict style and its withEnv()/freshModelProvider() helper conventions for stubbing environment variables and reloading the module fresh between tests.
+
+Solution:
+Add test cases to model-provider.test.js, using the file's existing freshModelProvider() and withEnv() helpers, covering: each known provider returning its correct default endpoint when no override or env var is set; an unrecognized source returning null; an explicit override argument taking precedence over both the env var and the hardcoded default; and (if implemented) a per-provider environment variable override being used when no explicit override argument is passed. Since getEndpoint is not exported, access it only through require.cache reload of the module in the same way the file's other internal-function tests (e.g. reasoningTierFor, resolveModelProfile) already do, or via whatever export pattern the implementation actually uses -- do not add a new public export solely to make it testable if the implementation keeps it module-private and internally referenced.
+
+Benefits:
+Ensures the new endpoint-resolution behavior is verified against the same precedence and edge-case rules as the rest of model-provider.js's routing logic, using established test conventions already in the file, with no risk of accidentally exporting new public API surface.
