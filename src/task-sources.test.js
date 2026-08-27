@@ -1560,6 +1560,52 @@ test('windowFetchedFileContent falls back to flat truncation from the start when
   assert.match(windowed, /\[truncated\]$/);
 });
 
+// 2026-08-27, root-caused live via observability-fix-ac-26: its quoted code snippet
+// (`catch (err) { return null; }`) was a paraphrase, not a verbatim match of the real
+// bare `catch {` / `return null;` on separate lines -- the quoted-symbol anchor above
+// correctly fails to match, but the candidate's prose still reliably cites "at line NNN",
+// a second, more permissive anchor for exactly this case.
+test('windowFetchedFileContent falls back to a cited line number when no quoted symbol matches real content', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction theRealTarget() { return 1; }\n${padding}`;
+  const targetLine = content.split('\n').findIndex((l) => l.includes('theRealTarget')) + 1;
+  const section = `Problem:\nThe function at line ${targetLine} has a bug (quotes a paraphrase, not a real match: \`somethingElseEntirely()\`).\n\nSolution:\nFix it.`;
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /theRealTarget/, 'the cited line must actually be present, not truncated away');
+});
+
+test('windowFetchedFileContent prefers a matching quoted symbol over a cited line number when both are present', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction realQuotedTarget() {}\n${padding}\nfunction wrongLineTarget() {}\n${padding}`;
+  const wrongLine = content.split('\n').findIndex((l) => l.includes('wrongLineTarget')) + 1;
+  const section = `Problem:\nSee \`function realQuotedTarget() {}\` (also mentioned near line ${wrongLine}).`;
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /realQuotedTarget/, 'a real quoted-symbol match must win over a line citation');
+});
+
+test('windowFetchedFileContent ignores a line citation that is out of range for the file, falling back to flat truncation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const content = `start-marker\n${'x'.repeat(9000)}`;
+  const section = 'Problem:\nSomething at line 999999 (`aSymbolThatIsNotInTheFile`).';
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /^start-marker/);
+  assert.match(windowed, /\[truncated\]$/);
+});
+
 test('windowFetchedFileContent returns content unchanged when it is already under the size cap', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
   const { windowFetchedFileContent } = freshTaskSources(dir);
