@@ -93,6 +93,60 @@ test('resetToMain auto-stashes an untracked file too (stash -u), not just tracke
   assert.equal(fs.readFileSync(path.join(repoDir, 'untracked.txt'), 'utf8'), 'new work in progress\n');
 });
 
+// resetToMain: local-only COMMITS on mainBranch -----------------------------------------
+// 2026-08-27, root-caused live: unlike the uncommitted-edit case above (protected by the
+// auto-stash since the second 2026-07 incident), a real local COMMIT on mainBranch that
+// was never pushed got silently discarded by the plain `git reset --hard
+// origin/<mainBranch>` -- confirmed live losing 5 real commits in one incident, including
+// a same-day critical fix that had to be recovered from the reflog by hand. resetToMain()
+// now pushes mainBranch to origin before the hard reset, so a real commit either survives
+// (the common case: local was strictly ahead) or the operation fails loudly instead of
+// discarding either side (local and origin had genuinely diverged).
+
+test('resetToMain pushes a local-only commit to origin instead of discarding it', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- a real local fix\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'a real local fix, not yet pushed'], repoDir);
+  const localCommit = git(['rev-parse', 'HEAD'], repoDir).trim();
+
+  runner.resetToMain();
+
+  // The commit is not just still present locally -- it actually reached origin, so a
+  // FUTURE resetToMain() elsewhere (or a fresh clone) also sees it.
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2 -- a real local fix\n');
+  const originTip = git(['rev-parse', 'main'], bareDir).trim();
+  assert.equal(originTip, localCommit);
+});
+
+test('resetToMain throws instead of discarding history when local and origin have genuinely diverged', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+
+  // Local commits a fix...
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'local fix\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'local fix'], repoDir);
+
+  // ...while origin independently received a DIFFERENT commit in the meantime (e.g. a
+  // human pushed straight to GitHub) -- a genuine divergence, not a simple fast-forward.
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'tracked.txt'), 'someone else\'s change\n');
+  git(['commit', '-am', 'a different change pushed independently'], otherClone);
+  git(['push', 'origin', 'main'], otherClone);
+
+  assert.throws(() => runner.resetToMain(), /diverged/);
+
+  // Neither side got silently thrown away -- the local commit is still right there.
+  const log = git(['log', '--oneline', 'main'], repoDir);
+  assert.match(log, /local fix/);
+});
+
 test('resetToMain still lands on a real, clean checkout of the default branch', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
