@@ -503,6 +503,24 @@ function quotedSymbolsFromSection(section) {
   return [...(section || '').matchAll(QUOTED_SYMBOL_RE)].map((m) => m[1]).filter(Boolean);
 }
 
+// Candidate prose reliably says "at line NNN" / "lines NNN-MMM" even when its own
+// backtick-quoted code snippet has drifted from the real file (paraphrased rather than
+// copy-pasted -- see windowFetchedFileContent's own header for why that quote match can
+// fail). Takes the FIRST number after "line"/"lines" -- a range's start is close enough
+// to center a window on, and matches this doc format's own convention of citing the
+// start of a block ("lines 1255-1270" for a try, "line 1271" for its catch).
+const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
+
+function windowAroundIndex(content, idx, matchLen, maxChars) {
+  const half = Math.floor(maxChars / 2);
+  const from = Math.max(0, idx - half);
+  const to = Math.min(content.length, idx + matchLen + half);
+  const windowed = content.slice(from, to);
+  const prefix = from > 0 ? '...[truncated]...\n' : '';
+  const suffix = to < content.length ? '\n...[truncated]' : '';
+  return `${prefix}${windowed}${suffix}`;
+}
+
 // 2026-08-27 (Grimmethy, investigating a fresh round of blocked observability_fix/
 // arch_review tasks after the AC-3 grounding-staleness fix): a flat truncation from byte 0
 // -- what this used to be -- routinely cut a large file (task-sources.js is 136KB,
@@ -514,28 +532,41 @@ function quotedSymbolsFromSection(section) {
 // plausible-sounding but nonexistent src/pipeline/processor.js instead.
 //
 // Fix: same "center the window on the actual thing being discussed" principle
-// get-grounding-source.js's extractContentWindow already applies for a cited line number
-// -- here there's no line number (the candidate doc was written before any file was
-// fetched), but its Problem/Solution prose reliably backtick-quotes the real symbol/
-// snippet it's about. Search the file for the first quoted span that's an exact
-// substring match and center the window there; only fall back to flat
-// truncation-from-start when nothing quoted actually matches real content (e.g. a
-// candidate whose prose never quotes anything, or quotes something not verbatim in the
-// file -- same "stale grounding beats no grounding" tolerance used elsewhere in this
-// pipeline).
+// get-grounding-source.js's extractContentWindow already applies for a cited line number.
+// Two anchor strategies, tried in order: (1) the candidate's own backtick-quoted
+// symbol/snippet, if it's an exact substring of the real file -- the strongest signal when
+// it holds; (2) a "line NNN" citation from its Problem/Solution prose, for when the quoted
+// code has drifted from reality but the cited line number is still close to the real
+// target. Only falls back to flat truncation-from-start when NEITHER anchor is present or
+// matches -- same "stale grounding beats no grounding" tolerance used elsewhere in this
+// pipeline.
+//
+// The line-citation fallback is a real improvement but not a guarantee: investigating
+// observability-fix-ac-26 live, its quoted `catch (err) { return null; }` doesn't match
+// the real bare `catch {` / `return null;` on separate lines (quote-match fails, as
+// expected), and its own "at line 1271" citation had drifted ~80 lines / ~4800 chars from
+// the real target -- just outside this function's half-window radius, so THAT specific
+// candidate still misses even with this fallback. A candidate doc whose line citation has
+// drifted by more than half of MAX_FETCHED_FILE_CHARS from current reality is a real,
+// accepted gap, not something worth chasing with an ever-larger window at the cost of
+// every other candidate's prompt size.
 function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
   if (content.length <= maxChars) return content;
 
   for (const symbol of quotedSymbolsFromSection(section)) {
     const idx = content.indexOf(symbol);
     if (idx === -1) continue;
-    const half = Math.floor(maxChars / 2);
-    const from = Math.max(0, idx - half);
-    const to = Math.min(content.length, idx + symbol.length + half);
-    const windowed = content.slice(from, to);
-    const prefix = from > 0 ? '...[truncated]...\n' : '';
-    const suffix = to < content.length ? '\n...[truncated]' : '';
-    return `${prefix}${windowed}${suffix}`;
+    return windowAroundIndex(content, idx, symbol.length, maxChars);
+  }
+
+  const lineMatch = (section || '').match(LINE_CITATION_RE);
+  if (lineMatch) {
+    const lineNum = Number(lineMatch[1]);
+    const lines = content.split('\n');
+    if (lineNum >= 1 && lineNum <= lines.length) {
+      const idx = lines.slice(0, lineNum - 1).join('\n').length + (lineNum > 1 ? 1 : 0);
+      return windowAroundIndex(content, idx, 0, maxChars);
+    }
   }
 
   return `${content.slice(0, maxChars)}\n...[truncated]`;
