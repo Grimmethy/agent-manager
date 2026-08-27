@@ -489,6 +489,58 @@ function nextSecondBrainTask() {
 // arch_discovery below. Only Strong-rated candidates are eligible for auto-queue.
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
+const MAX_FETCHED_FILE_CHARS = 8000;
+
+// Backtick-quoted spans in a candidate's Problem/Solution prose -- review-task.js's own
+// blockedReason prose already leans on this exact "`identifier`" convention (see
+// app.py's _quoted_symbols, same idea, JS side), and arch_review/observability_fix
+// candidates write the same way: they quote the actual code symbol or snippet they're
+// pointing at ("the `catch (e)` block", "`taskIdExistsInQueue`"), not just a description
+// of it.
+const QUOTED_SYMBOL_RE = /`([^`]{3,80})`/g;
+
+function quotedSymbolsFromSection(section) {
+  return [...(section || '').matchAll(QUOTED_SYMBOL_RE)].map((m) => m[1]).filter(Boolean);
+}
+
+// 2026-08-27 (Grimmethy, investigating a fresh round of blocked observability_fix/
+// arch_review tasks after the AC-3 grounding-staleness fix): a flat truncation from byte 0
+// -- what this used to be -- routinely cut a large file (task-sources.js is 136KB,
+// apply-task.js 35KB) off before the actual catch block / function the candidate names
+// ever appeared, especially since MAX_FETCHED_FILE_CHARS is only 8000. Confirmed live via
+// observability-fix-ac-9: the candidate named a specific catch block in
+// dead-process-check.js, the flat-truncated snapshot cut off before it, and the drafter --
+// given no real evidence of where the real target was -- hallucinated an edit to a
+// plausible-sounding but nonexistent src/pipeline/processor.js instead.
+//
+// Fix: same "center the window on the actual thing being discussed" principle
+// get-grounding-source.js's extractContentWindow already applies for a cited line number
+// -- here there's no line number (the candidate doc was written before any file was
+// fetched), but its Problem/Solution prose reliably backtick-quotes the real symbol/
+// snippet it's about. Search the file for the first quoted span that's an exact
+// substring match and center the window there; only fall back to flat
+// truncation-from-start when nothing quoted actually matches real content (e.g. a
+// candidate whose prose never quotes anything, or quotes something not verbatim in the
+// file -- same "stale grounding beats no grounding" tolerance used elsewhere in this
+// pipeline).
+function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
+  if (content.length <= maxChars) return content;
+
+  for (const symbol of quotedSymbolsFromSection(section)) {
+    const idx = content.indexOf(symbol);
+    if (idx === -1) continue;
+    const half = Math.floor(maxChars / 2);
+    const from = Math.max(0, idx - half);
+    const to = Math.min(content.length, idx + symbol.length + half);
+    const windowed = content.slice(from, to);
+    const prefix = from > 0 ? '...[truncated]...\n' : '';
+    const suffix = to < content.length ? '\n...[truncated]' : '';
+    return `${prefix}${windowed}${suffix}`;
+  }
+
+  return `${content.slice(0, maxChars)}\n...[truncated]`;
+}
+
 // Shared by arch_review (candidatesPath=archReviewCandidatesPath) and arch_import_review
 // (candidatesPath=archImportCandidatesPath) -- both consume an identically-shaped
 // "### AC-NNN · Title / Strength: ... / Files: ..." candidates doc and turn the oldest
@@ -584,14 +636,13 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // error -- see fetchedFiles' own promptContext field, which the implement prompt is
     // told explicitly means "ground a create, or flag the mismatch, don't invent content."
     const { repoRoot } = getConfig();
-    const MAX_FETCHED_FILE_CHARS = 8000;
     const fetchedFiles = filesArray
       .map((relPath) => {
         try {
           const full = path.resolve(repoRoot, relPath);
           if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
           const content = fs.readFileSync(full, 'utf8');
-          return { path: relPath, content: content.length > MAX_FETCHED_FILE_CHARS ? `${content.slice(0, MAX_FETCHED_FILE_CHARS)}\n...[truncated]` : content };
+          return { path: relPath, content: windowFetchedFileContent(content, section) };
         } catch {
           return null; // doesn't exist / unreadable -- not an error, see comment above
         }
@@ -2245,7 +2296,7 @@ function writeTask(task) {
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
-  nextCandidateFulfillmentTask, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
+  nextCandidateFulfillmentTask, windowFetchedFileContent, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
   nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
