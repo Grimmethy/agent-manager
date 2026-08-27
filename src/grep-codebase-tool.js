@@ -47,7 +47,8 @@ function grepCodebase({ query, dir }) {
     let entries;
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      console.warn(`grep-codebase: skipped ${current}: ${err.message}`);
       return;
     }
     for (const entry of entries) {
