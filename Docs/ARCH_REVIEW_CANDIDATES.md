@@ -209,3 +209,29 @@ Once local-client.js exposes a reusable exported helper for degenerate detection
 
 Benefits:
 Eliminates a second, independently-maintained copy of the degenerate-detection/retry contract, so a future fix or tuning of the detection rules in local-client.js automatically applies to the tools-disabled path here too, instead of requiring the same fix to be made twice.
+
+### AC-17 · AC-16a — Confirm/export the shared degenerate-detection + retry helper from local-client.js
+Strength: Strong
+Files: src/local-client.js
+
+Problem:
+local-tool-client.js's no-tools (tools-disabled) path carries its own inline copy of degenerate-output detection and retry logic for the /api/chat response. local-client.js already implements the same detectDegenerate/retry contract for its /api/generate path, but the helper is not yet exported as a reusable named function that another module can import. Until it is, local-tool-client.js cannot drop its local copy without duplicating the logic in a third place.
+
+Solution:
+In src/local-client.js, extract (or confirm the companion candidate already extracted) the degenerate-detection predicate and the retry loop into a single named export (e.g. `detectDegenerateAndRetry(responseText, { maxRetries, callFn })`) that encapsulates: (1) the exact pattern/condition that marks a response as degenerate, (2) the retry policy (max attempts, what is re-sent, back-off if any), and (3) the return shape (final text or thrown error). Export it so a sibling module can `require('./local-client.js')` and pull the helper by name. If the logic is already a private function, simply add it to the module's `module.exports`.
+
+Benefits:
+Single source of truth for the degenerate/retry contract; any future tweak to what counts as degenerate or how many retries are allowed is made in one place; removes the prerequisite blocker for AC-16b.
+
+### AC-18 · AC-16b — Replace local-tool-client.js no-tools path degenerate/retry with the shared helper
+Strength: Strong
+Files: src/local-tool-client.js
+
+Problem:
+The tools-disabled branch in local-tool-client.js re-implements degenerate-output detection and retry inline (its own pattern check on the model's response text, its own retry counter / re-invocation loop). This duplicates the already-audited logic in local-client.js, so a fix or policy change in one file silently diverges from the other. The file's own header comment stresses that this module is deliberately narrow and should lean on existing, already-audited helpers rather than growing its own copies.
+
+Solution:
+1) Add `const { detectDegenerateAndRetry } = require('./local-client.js');` (exact export name to be confirmed against local-client.js's module.exports at implementation time) to the import block near the top of local-tool-client.js. 2) In the no-tools / tools-disabled branch (the code path that fires when the caller passes no tools or tools are disabled, located after the tool-handler definitions and before/inside the main `runPlanWithTools`-style function — the section not visible in the truncated excerpt), delete the local degenerate-detection predicate, the local retry counter, and the local re-invocation loop. 3) Replace that block with a single call to `detectDegenerateAndRetry(responseText, { maxRetries: <same value as before>, callFn: <the existing /api/chat call closure> })`, preserving the exact observable behaviour (same degenerate rule, same max attempts, same return value passed to the caller). 4) Remove any now-orphaned private helper functions in this file that existed solely to support the old local retry (e.g. a private `isDegenerate()` or a module-level retry counter). 5) Verify no other branch in this file references the removed local helpers.
+
+Benefits:
+Eliminates a second, possibly-divergent copy of the degenerate/retry logic; the no-tools path now inherits the already-audited behaviour from local-client.js automatically; smaller surface area in local-tool-client.js (fewer lines to review, test, and keep in sync); satisfies the plan's A5 requirement of zero observable behavioural change.
