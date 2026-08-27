@@ -237,11 +237,18 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       const { repoRoot, pipelineDir, defaultDomain } = getConfig();
       return nextFunctionLengthReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue });
     },
-    apply: ({ implementResponse }) => {
+    apply: ({ implementResponse, task }) => {
       const { repoRoot } = getConfig();
       const candidatesPath = process.env.AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH
         || path.join(repoRoot, 'Docs', 'FUNCTION_LENGTH_CANDIDATES.md');
-      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle: '# Function Length Decomposition Candidates' });
+      // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
+      // review-time-fresh snippet is threaded through deterministically.
+      return applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath,
+        docTitle: '# Function Length Decomposition Candidates',
+        snippet: task && task.promptContext && task.promptContext.snippet,
+      });
     },
     // 2026-08-23: review-task.js/local-draft.js now read these two flags directly off
     // the registry entry instead of a hardcoded array a plugin author would otherwise

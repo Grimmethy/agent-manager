@@ -1606,6 +1606,75 @@ test('windowFetchedFileContent ignores a line citation that is out of range for 
   assert.match(windowed, /\[truncated\]$/);
 });
 
+// Snippet: field ------------------------------------------------------------------------
+// 2026-08-27, Grimmethy: "we should be looking for code content instead of the line
+// itself." A Snippet: field is real code text the scanner/reviewer already read at
+// review time (applyArchDiscoveryCandidates writes it deterministically, never touched
+// by the model), so it's a stronger anchor than a quoted-in-prose symbol that can be a
+// paraphrase (observability-fix-ac-26) or a line citation that can drift.
+test('windowFetchedFileContent uses a Snippet: field as the primary anchor when present', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction realTarget() { return 1; }\n${padding}`;
+  const section = [
+    'Files: foo.js',
+    'Snippet:',
+    '```',
+    'function realTarget() { return 1; }',
+    '```',
+    '',
+    'Problem:\nSomething paraphrased and unhelpful, quoting `wrongSymbolEntirely`.',
+  ].join('\n');
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /realTarget/, 'the snippet must locate the real target even though the prose quote is wrong');
+});
+
+test('windowFetchedFileContent matches a Snippet: field even when real code has been reformatted (whitespace-only drift)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction   realTarget( )  {  return 1;  }\n${padding}`;
+  const section = [
+    'Files: foo.js',
+    'Snippet:',
+    '```',
+    'function realTarget() { return 1; }',
+    '```',
+    '',
+    'Problem:\nSomething.',
+  ].join('\n');
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /realTarget/, 'whitespace-only reformatting must not defeat the match');
+});
+
+test('windowFetchedFileContent falls through to the quoted-symbol anchor when the Snippet: field does not match real content at all', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction realTarget() { return 1; }\n${padding}`;
+  const section = [
+    'Files: foo.js',
+    'Snippet:',
+    '```',
+    'totallyDifferentCodeNotInTheFile()',
+    '```',
+    '',
+    'Problem:\nSee `realTarget` for the bug.',
+  ].join('\n');
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /realTarget/, 'a non-matching snippet must not block the weaker fallback anchors from still working');
+});
+
 test('windowFetchedFileContent returns content unchanged when it is already under the size cap', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
   const { windowFetchedFileContent } = freshTaskSources(dir);
@@ -1634,6 +1703,39 @@ test('nextCandidateFulfillmentTask centers a large fetched file\'s window on the
   const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
 
   assert.match(task.promptContext.fetchedFiles[0].content, /realTargetSymbol/, 'the real target symbol must survive truncation, not just the file\'s first bytes');
+});
+
+// Round-trip: applyArchDiscoveryCandidates (the writer, apply-group-a.js) through
+// nextCandidateFulfillmentTask (the reader, here) -- confirms the two independent
+// parsers actually agree on the Snippet: field's shape, not just that each one
+// individually does something with a hand-written fixture string.
+test('nextCandidateFulfillmentTask uses a Snippet: field written by applyArchDiscoveryCandidates to locate the real target in a large file', () => {
+  const dir = makeAdhocFixtureRepo();
+  const padding = 'x'.repeat(9000);
+  fs.writeFileSync(path.join(dir, 'big.js'), `${padding}\n  } catch {\n    return [];\n  }\n${padding}`);
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+
+  const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
+  applyArchDiscoveryCandidates({
+    implementResponse: [
+      '### AC-1 · Silent catch swallows the error',
+      'Strength: Strong',
+      'Files: big.js',
+      '',
+      'Problem:\nA paraphrased description that never quotes the real code (`somethingElseParaphrased`).\n\nSolution:\nFix it.\n\nBenefits:\nBetter.',
+    ].join('\n'),
+    candidatesPath,
+    snippet: '  } catch {\n    return [];\n  }',
+  });
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+
+  assert.match(
+    task.promptContext.fetchedFiles[0].content,
+    /return \[\];/,
+    'the real Snippet: field must locate the target even though the prose quote is unrelated',
+  );
 });
 
 test('nextCandidateFulfillmentTask fetches multiple named files, skipping only the ones that fail', () => {

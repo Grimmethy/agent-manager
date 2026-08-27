@@ -88,9 +88,13 @@ not a bug, it's a real conflict, and the fix is a fresh draft (delete + let it r
 not a requeue (which reuses the stale snapshot the draft was already written against).
 
 Snapshotted files over ~8000 chars get windowed, not sent in full
-(`windowFetchedFileContent`, fixed 2026-08-27): it centers the window on the first
-backtick-quoted symbol from the candidate's own Problem/Solution prose that's a real
-substring of the file, falling back to flat truncation-from-byte-0 only when nothing quoted
-matches. A candidate doc entry that describes its target in prose without ever quoting the
-actual symbol/snippet degrades to the old blind-truncation behavior for a large file --
-worth quoting the real identifier when hand-writing or editing a candidates doc entry.
+(`windowFetchedFileContent`, fixed 2026-08-27): it centers the window on the first anchor
+that matches, strongest first -- (1) a `Snippet:` field (real code text a scanner/reviewer
+read, written deterministically by `applyArchDiscoveryCandidates` and matched fuzzily, so
+it survives whitespace-only reformatting); (2) the first backtick-quoted symbol from the
+candidate's own Problem/Solution prose that's a real substring of the file; (3) a "line
+NNN" citation from that prose. It falls back to flat truncation-from-byte-0 only when none
+of the three match. A candidate doc entry that describes its target in prose without a
+`Snippet:` field and without ever quoting the actual symbol/snippet degrades to the old
+blind-truncation behavior for a large file -- when hand-writing or editing a candidates doc
+entry, include a `Snippet:` fenced block (or at least quote the real identifier).
