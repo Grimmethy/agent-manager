@@ -167,3 +167,46 @@ test('release(null) is a safe no-op', () => {
   assert.doesNotThrow(() => release(null));
   assert.doesNotThrow(() => release(undefined));
 });
+
+// acquire(): bounded wait ------------------------------------------------------------
+// 2026-08-27, root-caused live: `lslocks` reported this exact lockfile held by a PID
+// that no longer existed -- some prior holder died in a way that left the flock()
+// unreleased, and every real waiter across all three daemons sat blocked for 20+
+// minutes with zero recovery path. acquire() used to be a genuinely unbounded blocking
+// call; this proves the new SINGLE_FLIGHT_LOCK_TIMEOUT_SECS-bounded wait actually times
+// out (rather than hanging the test suite itself) and that the thrown message contains
+// "timed out" -- the literal word local-worker.sh's/review-runner.sh's shared
+// INFRA_FAILURE_PATTERN matches on, without which a lock timeout would have been
+// miscategorized as a permanent content failure instead of a retryable infra one.
+test('acquire() times out (instead of hanging forever) when the lock is genuinely stuck, with a message matching INFRA_FAILURE_PATTERN', async () => {
+  const dir = makeInstancesDir();
+  const fd1 = acquire(dir); // held for the whole test, never released -- simulates the stuck-holder incident.
+  const prevTimeout = process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS;
+  process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS = '1';
+  try {
+    assert.throws(() => acquire(dir), /timed out/);
+  } finally {
+    if (prevTimeout === undefined) delete process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS;
+    else process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS = prevTimeout;
+    release(fd1);
+  }
+});
+
+test('acquire() timing out does not leak the fd it opened for the failed attempt', () => {
+  const dir = makeInstancesDir();
+  const fd1 = acquire(dir);
+  const prevTimeout = process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS;
+  process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS = '1';
+  try {
+    assert.throws(() => acquire(dir));
+  } finally {
+    if (prevTimeout === undefined) delete process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS;
+    else process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS = prevTimeout;
+  }
+  release(fd1);
+
+  // The lock must be immediately acquirable now -- if the failed attempt's fd leaked,
+  // a stray open file description could keep the kernel lock table confused.
+  const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir)}"; timeout 1 flock -n 200 && echo FREE || echo STILL_HELD`]);
+  assert.match(result.stdout.toString(), /FREE/);
+});

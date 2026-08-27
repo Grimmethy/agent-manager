@@ -261,7 +261,22 @@ acquire_single_flight_lock() {
     waited=$((waited + 1))
   done
   eval "exec ${SINGLE_FLIGHT_LOCK_FD}>\"\$lockfile\""
-  flock "$SINGLE_FLIGHT_LOCK_FD"   # blocking, exclusive -- waits for the current holder; no -n, no race window.
+  # Bounded wait (2026-08-27, root-caused live): this used to be a plain blocking
+  # `flock "$SINGLE_FLIGHT_LOCK_FD"` with no timeout, by deliberate original design ("no
+  # timeout, no -n, matching the bash version exactly" -- see single-flight-lock.js's own
+  # comment on the same choice). Confirmed live via `lslocks`: the kernel reported this
+  # exact lockfile held by a PID that no longer existed (`kill -0` on it: "No such
+  # process") -- some prior holder died in a way that left the flock() unreleased, and
+  # three real waiters (reviewer, worker-1, worker-reasoning) sat blocked on it for 20+
+  # minutes with zero recovery path, stalling the entire pipeline (not just one lane) and
+  # producing the multi-hour queue/review backlog this was root-caused from. `-w` bounds
+  # the wait; a real, non-stale holder legitimately finishing its call well within this
+  # window is completely unaffected (this only ever fires on the failure path). On
+  # timeout, returns non-zero instead of hanging forever -- the caller must check this
+  # and treat it as an infra-shaped failure (same "requeue a bounded number of times,
+  # then give up loudly" contract every other infra failure in this pipeline already
+  # gets), not silently retry the exact same blocking call.
+  flock -w "${SINGLE_FLIGHT_LOCK_TIMEOUT_SECS:-600}" "$SINGLE_FLIGHT_LOCK_FD"
 }
 
 release_single_flight_lock() {

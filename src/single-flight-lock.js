@@ -99,21 +99,47 @@ function someoneIsWaiting(instancesDir) {
   }
 }
 
-// Blocking, exclusive acquire -- no timeout, no -n, matching the bash version exactly
-// (a caller that wants a bounded wait should wrap this in its own timeout, this function
-// itself will wait as long as it takes, same as flock's own default). Returns a real fd;
-// pass it to release().
+// 2026-08-27, root-caused live: this used to be a genuinely unbounded blocking acquire
+// ("no timeout, no -n, matching the bash version exactly" -- see agent-manager-common.sh's
+// own matching fix for the full incident). Confirmed via `lslocks`: the kernel reported
+// this exact lockfile held by a PID that no longer existed -- some prior holder died in a
+// way that left the flock() unreleased, and every real caller across all three daemons
+// (bash and Node both, since they share one kernel-level lock -- see this file's own
+// header) sat blocked for 20+ minutes with zero recovery path, stalling the whole
+// pipeline. `-w` bounds the wait via the same underlying `flock` binary the bash version
+// uses (interoperable timeout semantics, not just interoperable locking); a real, non-
+// stale holder finishing well within this window is unaffected. On timeout, `flock`
+// exits non-zero, execFileSync throws, and this function's own catch below closes the fd
+// and rethrows -- callers already going through withLock() get that exception the normal
+// way, which is exactly what its "MUST be released -- an uncaught throw ... would leak
+// the fd" header already documents as the expected failure contract.
+// Read at call time, not module-load time (a test needs to override it per-call via
+// process.env without needing a fresh require of this module each time).
+function lockTimeoutSecs() {
+  return Number(process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS) || 600;
+}
+
+// Blocking, exclusive acquire, bounded by SINGLE_FLIGHT_LOCK_TIMEOUT_SECS (a caller that
+// wants a different bound can wrap this in its own timeout too). Returns a real fd; pass
+// it to release().
 function acquire(instancesDir, key) {
   const deadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
   while (someoneIsWaiting(instancesDir) && Date.now() < deadline) {
     execFileSync('sleep', ['1']);
   }
+  const timeoutSecs = lockTimeoutSecs();
   const fd = fs.openSync(lockFilePath(instancesDir, key), 'w');
   try {
-    execFileSync('flock', [String(LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
+    execFileSync('flock', ['-w', String(timeoutSecs), String(LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
   } catch (err) {
     fs.closeSync(fd);
-    throw err;
+    // execFileSync's own error message is just "Command failed: flock -w 600 3" -- it
+    // doesn't say WHY, and critically doesn't contain the word "timed out" that
+    // local-worker.sh's/review-runner.sh's shared INFRA_FAILURE_PATTERN matches on to
+    // decide "requeue and retry" vs "permanently block as a real content failure." A
+    // lock timeout must read as infra-shaped, not as this task's own fault -- rethrowing
+    // verbatim would have silently miscategorized it as the latter.
+    throw new Error(`single-flight lock acquisition timed out after ${timeoutSecs}s waiting for lock '${key || '(default)'}': ${err.message}`);
   }
   return fd;
 }
