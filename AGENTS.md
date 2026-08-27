@@ -43,3 +43,54 @@ commit and push a branch from there. That checkout is physically immune to anyth
 checkout directly when there's a specific reason to (e.g. inspecting exactly what state
 the live pipeline is in right now) -- and treat anything you leave there as ephemeral,
 never as the durable copy of the fix.
+
+## queue/ is live pipeline state, not a source tree -- never hand-edit it
+
+`queue/*/*.json` (gitignored) is mutated continuously by `worker-1`, `reviewer`, and
+`watchdog` while the pipeline is live -- moving a task file between state directories,
+rewriting it in place, isn't a safe filesystem op the way it looks; go through the
+dashboard's `/api/task/...` endpoints (`python/dashboard/app.py`) instead, which encode
+real invariants a hand-move skips:
+
+- **Requeue** (`POST /api/task/blocked/<id>/requeue`) checks the new `blockedReason`
+  against `priorRejectionFeedback` first (`_repeated_blocker_match`) and 409s if this looks
+  like the same underlying problem recurring -- `{"force": true}` overrides it, but only
+  reach for that once you've actually diagnosed why it'll be different this time, not as a
+  reflex unblock.
+- **Requeue carries the OLD `promptContext` forward, verbatim** -- it resets status/history,
+  not the task's material. If the actual fix is downstream of how `promptContext` gets
+  built (see the grounding-freshness gotcha below), requeuing alone reproduces the exact
+  same failure. The task needs to not exist at all -- delete the file outright -- so the
+  next scan of its source (a candidates doc, an arch-discovery pass, whatever generated it)
+  builds it fresh. Confirm the underlying finding is still open before deleting (e.g. still
+  `Strength: Strong` in the relevant `Docs/*_CANDIDATES.md`) -- deleting a task whose source
+  finding has since been resolved just discards it.
+
+## Grounding freshness: promptContext is frozen at creation, not live
+
+`nextCandidateFulfillmentTask()` (`src/task-sources.js`) snapshots each named file's
+content into `promptContext.fetchedFiles` once, at task-creation time. Two different
+consumers read that snapshot with two different freshness guarantees, and conflating them
+costs a wasted retry cycle:
+
+- **`local-draft.js`** (the plan/implement passes) reads `promptContext.fetchedFiles`
+  directly, as frozen -- it never re-fetches. If a sibling candidate touching the same file
+  merges in while this task is still queued, the draft is being written against code that
+  no longer exists.
+- **`get-grounding-source.js`** (the review/fact-check pass) re-reads each `fetchedFiles`
+  path's *current* content from `repoRoot` at review time (fixed 2026-08-27 -- see
+  `refreshFetchedFileContent`), so review always fact-checks against reality regardless of
+  how stale the snapshot is.
+
+The practical effect: a task can get correctly re-rejected at review even after a perfectly
+good draft, if a sibling branch changed the target file between draft and review -- that's
+not a bug, it's a real conflict, and the fix is a fresh draft (delete + let it regenerate),
+not a requeue (which reuses the stale snapshot the draft was already written against).
+
+Snapshotted files over ~8000 chars get windowed, not sent in full
+(`windowFetchedFileContent`, fixed 2026-08-27): it centers the window on the first
+backtick-quoted symbol from the candidate's own Problem/Solution prose that's a real
+substring of the file, falling back to flat truncation-from-byte-0 only when nothing quoted
+matches. A candidate doc entry that describes its target in prose without ever quoting the
+actual symbol/snippet degrades to the old blind-truncation behavior for a large file --
+worth quoting the real identifier when hand-writing or editing a candidates doc entry.
