@@ -224,3 +224,60 @@ test('extractLiveRepoGrounding keeps the first real line reference when the same
   assert.equal(found.length, 1);
   assert.match(found[0].content, /MARKER_A/);
 });
+
+// promptContext.fetchedFiles -----------------------------------------------------------
+// 2026-08-27, root-caused live via 3 real blocked observability_fix candidates (AC-3,
+// AC-4, AC-11): nextCandidateFulfillmentTask() (task-sources.js) populates
+// promptContext.fetchedFiles -- {path, content} pairs holding each named file's real
+// current content, the exact material local-draft.js grounds its find/replace edits
+// against -- but this file never read that field at all, so review's fact-check had
+// NOTHING to confirm a candidate-fulfillment draft's claims against. Confirmed live: a
+// draft correctly quoted budget-monitor.js's real `const os = require('os');` verbatim
+// and got rejected as "the grounding source ... do[es] not confirm this specific line
+// exists" -- root-level files (budget-monitor.js has no src/python/scripts/docs/ prefix)
+// are hit hardest, since extractLiveRepoGrounding's own live-fetch fallback can't reach
+// them either (REPO_FILE_PATH_RE requires that prefix) and the fallback only runs for
+// domain:'adhoc' tasks in the first place, never candidate-fulfillment sources like
+// observability_fix.
+test('CLI end-to-end: a candidate-fulfillment task\'s promptContext.fetchedFiles is included as real grounding', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
+  const task = {
+    domain: 'default',
+    source: 'observability_fix',
+    promptContext: {
+      candidateId: 'AC-4',
+      title: 'Silent JSON-parse skip in budget-monitor leaves total data-source failure undetectable',
+      files: ['budget-monitor.js'],
+      fetchedFiles: [{ path: 'budget-monitor.js', content: "const os = require('os');\n\nlet parseFailures = 0;\n" }],
+      body: 'candidate doc problem/solution text',
+    },
+    implementResponse: JSON.stringify([{ mode: 'edit', file: 'budget-monitor.js', find: "const os = require('os');", replace: "const os = require('os');\n\nlet parseFailures = 0;" }]),
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+  });
+
+  assert.match(stdout, /const os = require\('os'\);/, 'fetchedFiles\' real content must reach the grounding text review\'s fact-check runs against');
+});
+
+test('a fetchedFiles entry with no content (a create-target that does not exist yet) is skipped, not thrown on', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
+  const task = {
+    domain: 'default',
+    source: 'observability_fix',
+    promptContext: { fetchedFiles: [{ path: 'brand-new-file.js', content: null }], body: 'text' },
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  assert.doesNotThrow(() => {
+    execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+    });
+  });
+});

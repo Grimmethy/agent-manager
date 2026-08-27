@@ -178,6 +178,27 @@ function main() {
         if (f.content) parts.push(String(f.content));
       }
     }
+    // 2026-08-27, root-caused live via 3 real blocked observability_fix candidates
+    // (AC-3, AC-4, AC-11): nextCandidateFulfillmentTask() (task-sources.js) populates
+    // promptContext.fetchedFiles -- {path, content} pairs holding the REAL current
+    // content of each file the candidate names -- and local-draft.js reads it to ground
+    // the draft's find/replace edits. This function never looked at that field at all
+    // (pc.files above is a DIFFERENT, unrelated shape for a different set of sources --
+    // a plain array of filename strings here, so `f.content` on a string is always
+    // undefined and silently contributes nothing). The practical effect: a
+    // candidate-fulfillment draft that correctly quoted a real file verbatim (confirmed
+    // live: budget-monitor.js's actual `const os = require('os');` and a real bare
+    // `catch {}` block, byte-for-byte) got reviewed with NO grounding for that file at
+    // all, and the reviewer -- correctly per what it was actually given -- rejected the
+    // edit as unconfirmed. Every root-level file (no src/python/scripts/docs/ prefix)
+    // was hit hardest: extractLiveRepoGrounding's own live-fetch fallback below can't
+    // reach those either (REPO_FILE_PATH_RE requires that prefix), so there was no
+    // fallback catching this the way there is for adhoc's own equivalent gap.
+    if (pc.fetchedFiles) {
+      for (const f of [].concat(pc.fetchedFiles)) {
+        if (f && f.content) parts.push(String(f.content));
+      }
+    }
     // toolCallLog lives directly on the task object, not inside promptContext -- it's
     // added by a plan pass that used a tool (see local-tool-client.js), not pre-fetched
     // deterministically like the fields above. Without this, a plan pass that used a tool
