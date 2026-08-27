@@ -120,6 +120,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       fs.unlinkSync(filePath);
       summary.requeued++;
     } catch (e) {
+      console.warn('[reject-retry-check] requeue failed for', filePath, e.message, e.code);
       summary.errors++;
     }
   }
