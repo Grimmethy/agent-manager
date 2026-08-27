@@ -63,7 +63,9 @@ function listJsonlFiles(dir) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    if (err.code === 'ENOENT') return out;
+    console.warn(`[budget-monitor] readdir failed for ${dir}: ${err.code} (partial: ${out.length} files)`);
     return out;
   }
   for (const entry of entries) {
