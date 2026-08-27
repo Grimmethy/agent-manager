@@ -261,3 +261,29 @@ Solution:
 
 Benefits:
 The apply pipeline correctly resolves the config object before using pipelineDir, git branch names, and artifact paths. All downstream logic (writeArtifact, group-A/group-B dispatch, git runner, history append) receives a real string path instead of undefined, eliminating the class of failures where apply silently writes to the wrong location or crashes with a TypeError on the first path.join call.
+
+### AC-21 · Async-ify resolveGraphPath and getConfig in src/config.js
+Strength: Strong
+Files: src/config.js
+
+Problem:
+resolveGraphPath performs three synchronous filesystem calls (fs.existsSync, fs.readdirSync, fs.statSync) that block the Node.js event loop every time a graph path is resolved. getConfig calls resolveGraphPath synchronously on the line `const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);`, so every consumer of getConfig (the drafting daemon, the dashboard server, and any other importer) inherits that blocking behavior. In a server process handling concurrent requests, a single statSync or readdirSync on a slow filesystem can stall the entire event loop.
+
+Solution:
+Convert resolveGraphPath to `async function resolveGraphPath(repoRoot)`. Replace the `fs.existsSync(defaultCacheGraph)` guard with a try/catch around `await fs.promises.access(defaultCacheGraph)`. Replace the synchronous `.filter().map().sort()` chain (which embeds `fs.existsSync` and `fs.statSync` inside callbacks) with an async for-loop over `await fs.promises.readdir(cacheDir, { withFileTypes: true })`, using `await fs.promises.stat(p)` for each candidate and collecting results into an array before sorting. Preserve the exact three-tier resolution order (default/graph.json → freshest hashed-dir graph.json → graphify-out/graph.json) and the returned string path. Convert getConfig to `async function getConfig()`. Change the graphPath line to `const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH ?? (await resolveGraphPath(repoRoot));` so the env-var short-circuit is evaluated before the await. All other keys and types in the returned config object are unchanged.
+
+Benefits:
+Eliminates event-loop blocking during config and graph-path resolution, allowing the drafting daemon and dashboard server to handle concurrent I/O without stalling. The resolution algorithm, its three-tier priority order, and the shape of the returned config object are all preserved, so no consumer logic changes beyond adding `await`.
+
+### AC-22 · Update all callers of getConfig and resolveGraphPath to await the now-async functions
+Strength: Strong
+Files: (to be enumerated: every file that imports src/config.js and calls getConfig or resolveGraphPath -- known consumers include the drafting daemon and the dashboard server; exact file paths must be discovered via repository search)
+
+Problem:
+After the async conversion in src/config.js, every existing call site that invokes `getConfig()` or `resolveGraphPath(repoRoot)` without `await` will receive a Promise instead of a resolved value. Downstream code that expects a string path (e.g., passing it to `fs.readFile`, `path.join`, or an HTTP header) will silently receive a Promise object, causing runtime errors or incorrect behavior. Because the call sites span multiple files whose paths are not yet known, this cannot be captured in the same atomic edit as the config.js conversion.
+
+Solution:
+Search the repository for all occurrences of `require('…/config')`, `import … from '…/config'`, `getConfig(`, and `resolveGraphPath(`. For each call site, add `await` before the call and ensure the enclosing function is declared `async` (or wrap in `.then()` if the context cannot be made async). Verify that no caller relies on the synchronous return value in a way that `await` would break (e.g., a synchronous event handler in a framework). Flag any caller in a context that cannot be made async as a risk and decide whether a top-level `await` or a microtask wrapper is appropriate.
+
+Benefits:
+All consumers correctly await the async config resolution, preserving identical runtime behavior (same resolved values, same error semantics) while gaining non-blocking I/O. Completing this step is required before the async conversion in src/config.js can be safely merged, since omitting it would break every caller at runtime.
