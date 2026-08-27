@@ -53,8 +53,9 @@ function writeCache(result) {
   try {
     fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
     fs.writeFileSync(CACHE_PATH, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
-  } catch {
+  } catch (err) {
     // best-effort -- a failed cache write must not fail the health check itself
+    console.warn(`[budget-monitor] cache write to ${CACHE_PATH} failed (non-fatal): ${err && err.message ? err.message : String(err)}`);
   }
 }
 
