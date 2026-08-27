@@ -39,7 +39,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { checkDraft } = require('./fact-checker.js');
-const { providerFor, resolveModelProfile } = require('./model-provider.js');
+const { resolveModelProfile } = require('./model-provider.js');
+const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -313,7 +314,22 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
       effort: modelProfile.effort, timeoutMs: modelProfile.timeoutMs,
     }
     : null;
-  const baseMajorityVote = localMajorityVote || providerFor(task).majorityVote;
+  // 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
+  // the local model to review them" -- ALWAYS the local backend, never providerFor(task)
+  // (which would route a high-reasoning-tier task to Claude). Root-caused live: this
+  // review call had, in practice, ALREADY always run local regardless of tier -- nothing
+  // in review-task.js's own require graph ever loaded task-sources.js, so
+  // providerFor()'s tier lookup silently saw an empty registry and defaulted to local
+  // every time -- but review-runner.sh's separate bash-side pre-check DID load that
+  // registry (to compute its own Claude-budget gate), correctly saw a high-tier task,
+  // and skipped it whenever Claude was paused/rate-limited: a real task that would have
+  // reviewed successfully in seconds sat unreviewed for hours, purely because of a
+  // mismatch between what the pre-check assumed would happen and what actually would
+  // have. Making this the real, intentional behavior (not an accidental side effect of
+  // a missing require) instead of just deleting review-runner.sh's now-dead gate --
+  // review-runner.sh's own header already documented the intent ("Reviewer is always
+  // Ornith (never Claude)"), this just makes the code match it for real.
+  const baseMajorityVote = localMajorityVote || localMajorityVoteBackend;
   const resolvedMajorityVote = profileOverrides && !localMajorityVote
     ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
     : baseMajorityVote;
