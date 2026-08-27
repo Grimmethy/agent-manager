@@ -86,8 +86,11 @@ function readEntries(filePath, sinceMs) {
   let text;
   try {
     text = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return [];
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return [];
+    const codePart = err && err.code ? ` code=${err.code}` : '';
+    console.error(`[budget-monitor] readFileSync failed for ${filePath}: ${err.message}${codePart}`);
+    throw err;
   }
   const out = [];
   for (const line of text.split('\n')) {
