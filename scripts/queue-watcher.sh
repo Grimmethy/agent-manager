@@ -84,6 +84,29 @@ while :; do
 
       if [[ "$action_kind" == "restart-after-kill" && -n "$action_pid" ]]; then
         kill -9 "$action_pid" 2>/dev/null    # zombie: the pid is still real and running (that's the whole problem) -- force-kill before restarting, or it keeps squatting the drafting claim/heartbeat file identity alongside the fresh replacement.
+
+        # Verify the kill actually took before spawning a replacement -- confirmed live
+        # 2026-08-26/27: a real duplicate worker-1 (spawned right here, believing the
+        # original was a zombie) survived alongside its supposedly-killed predecessor
+        # for over an hour, completely undetected, because this line never checked
+        # whether action_pid actually died before moving on. Doubled GPU contention
+        # from the two lanes independently drafting the same tasks is what caused that
+        # night's whole run of blocked tasks (empty draft responses misclassified as
+        # "infra outage"). SIGKILL can't be caught or ignored, so if the pid is still
+        # here a moment later, action_pid was never the right target in the first
+        # place (already stale/reused by the time dead-process-check.js read it) --
+        # proceeding to spawn a replacement anyway recreates the exact incident.
+        # Refuses instead of silently pressing on; a human should look at a pid that
+        # won't die, not get a silent second daemon.
+        kill_confirmed=false
+        for _ in 1 2 3 4 5; do
+          kill -0 "$action_pid" 2>/dev/null || { kill_confirmed=true; break; }
+          sleep 1
+        done
+        if ! "$kill_confirmed"; then
+          printf '[watchdog] REFUSING to restart %s -- kill -9 on pid %s did not take effect after 5s (still alive). Spawning a replacement now would create a duplicate daemon (confirmed live 2026-08-27: exactly this ran undetected for over an hour). Skipping this restart; investigate pid %s manually.\n' "$action_instance" "$action_pid" "$action_pid" >&2
+          continue
+        fi
       fi
 
       nohup bash "${SCRIPT_DIR}/${action_script}" "${action_args[@]}" > "${LOG_DIR}/${action_instance}.log" 2>&1 &
