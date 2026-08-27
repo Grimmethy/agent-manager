@@ -209,3 +209,29 @@ Once local-client.js exposes a reusable exported helper for degenerate detection
 
 Benefits:
 Eliminates a second, independently-maintained copy of the degenerate-detection/retry contract, so a future fix or tuning of the detection rules in local-client.js automatically applies to the tools-disabled path here too, instead of requiring the same fix to be made twice.
+
+### AC-17 · Provider dispatch in _generate: extract per-provider call path
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+
+Problem:
+_generate currently inlines both the Ollama (local) call and the Claude CLI call in one function body, branching on session["provider"] mid-function. The Claude path needs cwd, allowed_tools (CLAUDE_DISCUSS_ALLOWED_TOOLS), and max_turns (CLAUDE_DISCUSS_MAX_TURNS); the local path needs the harness-mediated grep context (QUERY_LINE_RE, MAX_HARNESS_QUERIES, _expand_grep_terms, MAX_HARNESS_CONTEXT_CHARS) plus the ollama_client.generate() call. Because both paths share one function, adding or adjusting either provider's call shape means wading through the other's logic, and the function is long enough that a reader must track two unrelated call conventions simultaneously.
+
+Solution:
+Introduce two thin adapter functions -- _call_local(session, prompt, transcript) and _call_claude(session, prompt, transcript) -- each with a clean signature carrying only its own provider-specific parameters (local: instances_dir for the lock, harness-context budget; claude: cwd, allowed_tools, max_turns). _generate becomes a short dispatch: read session["provider"], call the matching adapter, and record stats (latency, model id) uniformly after the call returns. The adapters live directly above _generate in the same file; no new module, no new class. The existing constants (CLAUDE_DISCUSS_ALLOWED_TOOLS, CLAUDE_DISCUSS_MAX_TURNS, MAX_HARNESS_CONTEXT_CHARS, etc.) are referenced inside their respective adapter and are not moved.
+
+Benefits:
+Each provider's call path is independently readable and testable; a future third provider adds one more adapter without touching the other two; _generate shrinks to a ~5-line dispatch that is trivially reviewable; the stats-recording convention (latency + model identifier) is written once at the dispatch level rather than duplicated in each branch.
+
+### AC-18 · Provider-aware prompt building in _chat_prompt_for_turn
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+
+Problem:
+_chat_prompt_for_turn builds a single prompt string used by both providers, but the two paths have different prompt conventions: the local (Ornith) path prepends harness-grep context (the real file content gathered by _build_search_proposal_prompt + _expand_grep_terms + grep_fetch_client) before the note text, while the Claude path does not need that preamble because Claude can Read/Grep/Glob its own files via CLAUDE_DISCUSS_ALLOWED_TOOLS. Currently the function either includes the harness-context block unconditionally (wasting Ornith's 8192-token num_ctx window on a Claude turn that ignores it) or conditionally branches on provider mid-string-concatenation, which is fragile and hard to extend.
+
+Solution:
+Split _chat_prompt_for_turn into a shared skeleton (system instruction, note text, transcript turns) plus a provider-specific preamble slot. For PROVIDER_LOCAL the preamble is the harness-grep context block (built by the existing _build_search_proposal_prompt / _expand_grep_terms / grep_fetch_client pipeline, capped at MAX_HARNESS_CONTEXT_CHARS). For PROVIDER_CLAUDE the preamble is empty (or a one-line note that file access is available via tools). The function signature gains no new parameters -- it already receives the session dict and reads session["provider"] -- but the internal branching is moved to the top of the function so the two prompt shapes are visually distinct blocks rather than interleaved conditionals.
+
+Benefits:
+The prompt shape for each provider is a single contiguous block that can be read, copied, and tested in isolation; the 8192-token budget for Ornith is no longer silently consumed by a Claude-only preamble; adding a new provider means adding one more preamble branch at the top of the function rather than threading a conditional through every string-concatenation line.
