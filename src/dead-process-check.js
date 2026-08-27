@@ -150,6 +150,7 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
       cooldowns[hb.instanceId] = now;
       cooldownsChanged = true;
     } catch (e) {
+      console.warn(`[dead-process-check] skipping unreadable heartbeat: ${name} -- ${e.message}`);
       // Unreadable/mid-write heartbeat file -- skip it this pass, same "don't let one bad
       // file stop the rest" treatment the reference gives this per-item try/catch.
     }
