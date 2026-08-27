@@ -15,6 +15,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+let parseFailures = 0;
+
 const PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR
   || path.join(os.homedir(), '.claude', 'projects');
 
@@ -94,6 +96,13 @@ function readEntries(filePath, sinceMs) {
     try {
       obj = JSON.parse(line);
     } catch {
+      parseFailures++;
+      if (parseFailures % 1000 === 1) {
+        console.warn(`budget-monitor: JSON parse failure #${parseFailures}; sample: ${line.substring(0, 120)}`);
+      }
+      if (typeof metrics !== 'undefined' && metrics && typeof metrics.increment === 'function') {
+        metrics.increment('budget_monitor.parse_failures');
+      }
       continue;
     }
     const ts = obj.timestamp ? Date.parse(obj.timestamp) : NaN;
