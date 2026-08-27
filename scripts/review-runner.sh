@@ -159,13 +159,28 @@ while :; do                                                                     
     # the resolved local model name for a non-Claude item (labelFor()'s own contract),
     # identical in shape to the key local-draft.js's withLockFn already passes -- same
     # model name in, same sanitized lockfile out, on both sides.
+    # 2026-08-27, root-caused live: acquire_single_flight_lock now has a bounded wait
+    # (see its own comment) instead of blocking forever -- this checks that return code
+    # rather than calling straight through into review-task.js regardless. Confirmed
+    # live: the kernel-level lock was held by a PID that no longer existed, and three
+    # real waiters (this daemon included) sat blocked for 20+ minutes with no recovery.
+    # On a timeout, skip the real review-task.js call entirely (there's no lock to run
+    # it safely under) and synthesize a review_result the SAME infra-failure handling
+    # below already knows how to bound-retry-then-give-up on -- "timed out" matches
+    # INFRA_FAILURE_PATTERN, so this task gets exactly the same requeue-round treatment
+    # a genuinely transient Ollama timeout already gets, not a silent permanent hang.
     if [[ "$resolved_label" != claude:* ]]; then
-      acquire_single_flight_lock "$resolved_label"
-    fi
-    write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
-    review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
-    if [[ "$resolved_label" != claude:* ]]; then
-      release_single_flight_lock
+      if acquire_single_flight_lock "$resolved_label"; then
+        write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
+        review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
+        release_single_flight_lock
+      else
+        printf '[review-%s] single-flight lock timed out for %s -- treating as an infra failure instead of hanging further.\n' "$INSTANCE_ID" "$task_id" >&2
+        review_result="lock acquisition timed out waiting for the single-flight lock"
+      fi
+    else
+      write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
+      review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
     fi
     review_succeeded="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
     review_verdict="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.verdict||"")}catch(e){console.log("")}')"
