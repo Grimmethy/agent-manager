@@ -106,30 +106,17 @@ while :; do                                                                     
 
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
 
-    # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy). Unlike
-    # local-worker.sh's lane-wide gate, this has to be per-item: review/ mixes drafts from
-    # both lanes, and review-task.js's own majorityVote call routes through the SAME
-    # per-task reasoningTierFor() tier local-draft.js used to draft it (model-provider.js's
-    # providerFor()) -- a high-tier item lands here having been drafted by Claude, and its
-    # review vote also calls Claude. Skip (don't consume) just this item and leave it in
-    # review/ for a later tick if Claude's rate-limited; low-tier items keep reviewing
-    # normally regardless, since they never touch Claude.
-    # labelFor(), not reasoningTierFor() alone -- AGENT_MANAGER_FORCE_PROVIDER (this
-    # script's own refresh_active_model dashboard-override hook) can force a high-tier
-    # item onto local Ornith or a low-tier item onto Claude regardless of its registered
-    # tier; only labelFor() accounts for that override, so it's the one accurate source
-    # for both "will this touch Claude's budget" and "will this touch the local GPU"
-    # below.
-    resolved_label="$(node -e 'try{require(process.argv[2]);const {labelFor}=require(process.argv[3]);const t=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(labelFor(t))}catch(e){}' "$file" "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
-    if [[ "$resolved_label" == claude:* ]]; then
-      budget_reason="$(check_budget_healthy)"
-      budget_rc=$?
-      if [[ $budget_rc -ne 0 ]]; then
-        printf '[review-%s] Claude budget not healthy: %s -- skipping %s this tick.\n' "$INSTANCE_ID" "$budget_reason" "$task_id" >&2
-        continue
-      fi
-    fi
-
+    # 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
+    # the local model to review them." Review-task.js's own majorityVote call is now
+    # ALWAYS the local backend (see its own matching comment) -- never Claude, regardless
+    # of the task's registered reasoning tier. There is therefore no Claude rate-limit
+    # gate here any more: this used to skip an item whenever Claude was paused/rate-
+    # limited on the theory that a high-tier item's review vote would also call Claude,
+    # but that was never actually true in practice (review-task.js's own require graph
+    # never loaded the tier registry that theory depended on) -- the net effect of the
+    # old gate was real, immediately-reviewable local work sitting unreviewed for hours
+    # any time Claude happened to be paused, confirmed live via a multi-hour
+    # queue/review/ backlog with items unreviewed since 2026-08-25.
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     # "queued" until the single-flight lock is actually held, then "working" -- see
     # local-worker.sh's process_drafting_file for the full rationale (2026-08-19,
@@ -137,28 +124,14 @@ while :; do                                                                     
     write_heartbeat_file "$INSTANCE_ID" "queued" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
     # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
-    # own header) -- ONLY for a low-tier item, whose review vote calls local Ornith and
-    # genuinely needs to serialize against every other local GPU call. A high-tier item's
-    # review vote routes to Claude (the cloud, no local GPU contention at all) -- taking
-    # this lock for it used to mean a Claude review vote sat waiting behind whatever local
-    # Ornith call worker-1 happened to be running, and vice versa, purely because they
-    # shared one lock with no regard for which physical resource each call actually used.
-    # Grimmethy, 2026-08-22: "With the current setup worker-1 and reasoning are taking
-    # turns... as is with local only we are losing priority" -- adhoc/high-tier work's
-    # priority ranking governs which task a lane picks up, not whether it then has to wait
-    # its turn behind unrelated local work once picked. $resolved_label is already
-    # computed just above for the budget gate, so this costs nothing extra to check.
+    # own header), keyed by LOCAL_MODEL -- every review now genuinely uses the local
+    # model, so this always needs to serialize against every other local GPU call the
+    # same way local-draft.js's own withLockFn does (2026-08-25, root-caused live: two
+    # different lockfiles guarding the SAME physical model/GPU never actually serialized
+    # against each other -- confirmed live via Ollama's own "timed out waiting for
+    # llama-server to start: context canceled"). Same key shape local-draft.js passes, so
+    # both sides compute the identical lockfile for the same model name.
     #
-    # Keyed by $resolved_label (2026-08-25, root-caused live: this used to acquire the
-    # bare, unkeyed global lock while worker-1's OWN local calls (single-flight-lock.js)
-    # already used a per-model-keyed one -- two different lockfiles guarding the SAME
-    # physical model/GPU, so they never actually serialized against each other. Confirmed
-    # live via Ollama's own log: repeated "timed out waiting for llama-server to start:
-    # context canceled" -- concurrent load attempts colliding, not a rare/low-cost race
-    # the old comment here assumed Ollama would absorb on its own). $resolved_label IS
-    # the resolved local model name for a non-Claude item (labelFor()'s own contract),
-    # identical in shape to the key local-draft.js's withLockFn already passes -- same
-    # model name in, same sanitized lockfile out, on both sides.
     # 2026-08-27, root-caused live: acquire_single_flight_lock now has a bounded wait
     # (see its own comment) instead of blocking forever -- this checks that return code
     # rather than calling straight through into review-task.js regardless. Confirmed
@@ -169,18 +142,13 @@ while :; do                                                                     
     # below already knows how to bound-retry-then-give-up on -- "timed out" matches
     # INFRA_FAILURE_PATTERN, so this task gets exactly the same requeue-round treatment
     # a genuinely transient Ollama timeout already gets, not a silent permanent hang.
-    if [[ "$resolved_label" != claude:* ]]; then
-      if acquire_single_flight_lock "$resolved_label"; then
-        write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
-        review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
-        release_single_flight_lock
-      else
-        printf '[review-%s] single-flight lock timed out for %s -- treating as an infra failure instead of hanging further.\n' "$INSTANCE_ID" "$task_id" >&2
-        review_result="lock acquisition timed out waiting for the single-flight lock"
-      fi
-    else
+    if acquire_single_flight_lock "${LOCAL_MODEL:-}"; then
       write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
       review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
+      release_single_flight_lock
+    else
+      printf '[review-%s] single-flight lock timed out for %s -- treating as an infra failure instead of hanging further.\n' "$INSTANCE_ID" "$task_id" >&2
+      review_result="lock acquisition timed out waiting for the single-flight lock"
     fi
     review_succeeded="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
     review_verdict="$(echo "$review_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.verdict||"")}catch(e){console.log("")}')"
