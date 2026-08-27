@@ -503,6 +503,66 @@ function quotedSymbolsFromSection(section) {
   return [...(section || '').matchAll(QUOTED_SYMBOL_RE)].map((m) => m[1]).filter(Boolean);
 }
 
+// 2026-08-27 (Grimmethy: "we should be looking for code content instead of the line
+// itself"): a `Snippet:` field, when present, is a deterministic pass-through of the
+// REAL code text observability-review.js/performance-review.js/function-length-review.js
+// already read at review time to ground their own genuine/false-positive judgment (see
+// apply-group-a.js's applyArchDiscoveryCandidates for where this gets written) -- never
+// touched by the model, so it doesn't carry the paraphrase risk a quoted-symbol-in-prose
+// citation does. Fenced (see that same header for why), so this just extracts what's
+// between the fence markers.
+const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
+
+function snippetFromSection(section) {
+  const m = (section || '').match(SNIPPET_FIELD_RE);
+  return m ? m[1] : null;
+}
+
+function stripWhitespace(s) {
+  return s.replace(/\s+/g, '');
+}
+
+// Maps an index into stripWhitespace(content) back to the corresponding index in the
+// real content, by walking content and counting non-whitespace chars until reaching
+// targetStrippedCount of them. O(content.length); fine at this pipeline's file sizes
+// (low hundreds of KB at most).
+function realIndexForStrippedIndex(content, targetStrippedCount) {
+  let count = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (count === targetStrippedCount) return i;
+    if (!/\s/.test(content[i])) count++;
+  }
+  return content.length;
+}
+
+// Exact match first (fast path, the common case for a snippet that hasn't been touched
+// since it was captured). Falls back to a whitespace-tolerant match -- real code
+// reformatted by an unrelated change (re-indented, re-wrapped, a stray space added or
+// removed) still has the same tokens in the same order, so comparing both sides with ALL
+// whitespace stripped finds it without requiring byte-for-byte whitespace to match too
+// (a regex that only collapses whitespace the snippet ALREADY had misses a spot where
+// formatting ADDED whitespace the snippet never had at all -- confirmed by direct test,
+// not just reasoned about). Still fails closed (returns null) on genuinely different
+// code, e.g. observability-fix-ac-26's paraphrased `catch (err)` vs the real bare `catch
+// {` -- that's a real, accepted gap (see windowFetchedFileContent's own header), not
+// something a formatting-only tolerance should try to paper over.
+function findFuzzyMatch(content, snippet) {
+  const trimmed = (snippet || '').trim();
+  if (!trimmed) return null;
+  const idx = content.indexOf(trimmed);
+  if (idx !== -1) return { index: idx, length: trimmed.length };
+
+  const strippedSnippet = stripWhitespace(trimmed);
+  if (!strippedSnippet) return null;
+  const strippedContent = stripWhitespace(content);
+  const strippedIdx = strippedContent.indexOf(strippedSnippet);
+  if (strippedIdx === -1) return null;
+
+  const realStart = realIndexForStrippedIndex(content, strippedIdx);
+  const realEnd = realIndexForStrippedIndex(content, strippedIdx + strippedSnippet.length);
+  return { index: realStart, length: Math.max(realEnd - realStart, 1) };
+}
+
 // Candidate prose reliably says "at line NNN" / "lines NNN-MMM" even when its own
 // backtick-quoted code snippet has drifted from the real file (paraphrased rather than
 // copy-pasted -- see windowFetchedFileContent's own header for why that quote match can
@@ -533,33 +593,53 @@ function windowAroundIndex(content, idx, matchLen, maxChars) {
 //
 // Fix: same "center the window on the actual thing being discussed" principle
 // get-grounding-source.js's extractContentWindow already applies for a cited line number.
-// Two anchor strategies, tried in order: (1) the candidate's own backtick-quoted
-// symbol/snippet, if it's an exact substring of the real file -- the strongest signal when
-// it holds; (2) a "line NNN" citation from its Problem/Solution prose, for when the quoted
-// code has drifted from reality but the cited line number is still close to the real
-// target. Only falls back to flat truncation-from-start when NEITHER anchor is present or
-// matches -- same "stale grounding beats no grounding" tolerance used elsewhere in this
-// pipeline.
+// Three anchor strategies, tried in order, strongest first: (1) a `Snippet:` field --
+// real code text a scanner/reviewer actually read, never touched by the model, matched
+// fuzzily (see findFuzzyMatch) rather than requiring byte-identical text; (2) the
+// candidate's own backtick-quoted symbol/snippet FROM PROSE, if it's an exact substring
+// of the real file -- weaker than (1) because it's the model's own transcription, which
+// can paraphrase (see observability-fix-ac-26 below); (3) a "line NNN" citation from its
+// Problem/Solution prose, for when neither code-content anchor matches but the cited line
+// number is still close to the real target. Only falls back to flat truncation-from-start
+// when NONE of the three are present or match -- same "stale grounding beats no
+// grounding" tolerance used elsewhere in this pipeline.
 //
-// The line-citation fallback is a real improvement but not a guarantee: investigating
-// observability-fix-ac-26 live, its quoted `catch (err) { return null; }` doesn't match
-// the real bare `catch {` / `return null;` on separate lines (quote-match fails, as
-// expected), and its own "at line 1271" citation had drifted ~80 lines / ~4800 chars from
-// the real target -- just outside this function's half-window radius, so THAT specific
-// candidate still misses even with this fallback. A candidate doc whose line citation has
+// (1) is the durable fix -- (2) and (3) predate it and stay as fallbacks for any
+// candidate written before a source carried Snippet: through (or arch_review/
+// arch_import_review candidates, which have no scan finding to source one from at all).
+// Neither fallback is a guarantee: investigating observability-fix-ac-26 live (created
+// before this file's own Snippet: support existed), its quoted `catch (err) { return
+// null; }` doesn't match the real bare `catch {` / `return null;` on separate lines
+// (quote-match fails, as expected), and its own "at line 1271" citation had drifted ~80
+// lines / ~4800 chars from the real target -- just outside this function's half-window
+// radius, so that specific candidate still misses even with the line fallback. A citation
 // drifted by more than half of MAX_FETCHED_FILE_CHARS from current reality is a real,
-// accepted gap, not something worth chasing with an ever-larger window at the cost of
-// every other candidate's prompt size.
+// accepted gap for (2)/(3), not something worth chasing with an ever-larger window at the
+// cost of every other candidate's prompt size.
 function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
   if (content.length <= maxChars) return content;
 
-  for (const symbol of quotedSymbolsFromSection(section)) {
+  const snippet = snippetFromSection(section);
+  if (snippet) {
+    const match = findFuzzyMatch(content, snippet);
+    if (match) return windowAroundIndex(content, match.index, match.length, maxChars);
+  }
+
+  // The fenced Snippet: block's own triple backticks otherwise confuse
+  // QUOTED_SYMBOL_RE's single-backtick pairing (a real bug, caught by direct test: it
+  // matched STARTING from the fence's third backtick THROUGH the next real prose
+  // backtick, swallowing an actual `quoted symbol` whole instead of finding it) -- prose
+  // fallbacks below only ever look for material outside the fence anyway, so stripping
+  // it first is correct, not just a workaround.
+  const prose = (section || '').replace(SNIPPET_FIELD_RE, '');
+
+  for (const symbol of quotedSymbolsFromSection(prose)) {
     const idx = content.indexOf(symbol);
     if (idx === -1) continue;
     return windowAroundIndex(content, idx, symbol.length, maxChars);
   }
 
-  const lineMatch = (section || '').match(LINE_CITATION_RE);
+  const lineMatch = prose.match(LINE_CITATION_RE);
   if (lineMatch) {
     const lineNum = Number(lineMatch[1]);
     const lines = content.split('\n');
