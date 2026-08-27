@@ -30,13 +30,22 @@
 // anyone who already has one from manually running build_graph.py's CLI -- not
 // regressing that existing (if rare) usage just because the dashboard button now has
 // its own, preferred path.
+const graphPathCache = new Map();
+
 function resolveGraphPath(repoRoot) {
   const fs = require('fs');
   const path = require('path');
+
+  const key = path.resolve(repoRoot);
+  if (graphPathCache.has(key)) return graphPathCache.get(key);
+
   const cacheDir = path.join(repoRoot, '.agent-manager-cache');
 
   const defaultCacheGraph = path.join(cacheDir, 'default', 'graph.json');
-  if (fs.existsSync(defaultCacheGraph)) return defaultCacheGraph;
+  if (fs.existsSync(defaultCacheGraph)) {
+    graphPathCache.set(key, defaultCacheGraph);
+    return defaultCacheGraph;
+  }
 
   try {
     const candidates = fs.readdirSync(cacheDir, { withFileTypes: true })
@@ -45,12 +54,17 @@ function resolveGraphPath(repoRoot) {
       .filter((p) => fs.existsSync(p))
       .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
       .sort((a, b) => b.mtime - a.mtime);
-    if (candidates.length > 0) return candidates[0].p;
+    if (candidates.length > 0) {
+      graphPathCache.set(key, candidates[0].p);
+      return candidates[0].p;
+    }
   } catch {
     // cacheDir itself doesn't exist -- fall through to the legacy default below.
   }
 
-  return path.join(repoRoot, 'graphify-out', 'graph.json');
+  const fallback = path.join(repoRoot, 'graphify-out', 'graph.json');
+  graphPathCache.set(key, fallback);
+  return fallback;
 }
 
 function getConfig() {
