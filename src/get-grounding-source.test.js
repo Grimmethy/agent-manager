@@ -24,7 +24,7 @@ const { execFileSync } = require('child_process');
 process.env.AGENT_MANAGER_REPO_ROOT = os.tmpdir();
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
-const { extractLiveRepoGrounding } = require('./get-grounding-source.js');
+const { extractLiveRepoGrounding, refreshFetchedFileContent } = require('./get-grounding-source.js');
 
 function makeRepoWithFile(relPath, content) {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
@@ -262,6 +262,71 @@ test('CLI end-to-end: a candidate-fulfillment task\'s promptContext.fetchedFiles
   });
 
   assert.match(stdout, /const os = require\('os'\);/, 'fetchedFiles\' real content must reach the grounding text review\'s fact-check runs against');
+});
+
+// 2026-08-27, root-caused live from a real "pipeline was running smoothly until we merged
+// 9 branches, now everything is going to blocked" report: candidate-fulfillment grounding
+// used to trust fetchedFiles' frozen creation-time content verbatim. When a sibling
+// candidate branch touching the same file merged in after the snapshot was taken, review
+// kept fact-checking a still-in-flight task against pre-merge content -- see
+// observability-fix-ac-3's real retry history for the incident this closes.
+test('refreshFetchedFileContent re-reads each path\'s current content from repoRoot instead of trusting the frozen snapshot', () => {
+  const repoRoot = makeRepoWithFile('budget-monitor.js', 'const os = require(\'os\');\n\nlet parseFailures = 0;\n');
+  const stale = [{ path: 'budget-monitor.js', content: 'const os = require(\'os\');\n' }];
+
+  const refreshed = refreshFetchedFileContent(stale, repoRoot);
+
+  assert.equal(refreshed.length, 1);
+  assert.match(refreshed[0].content, /let parseFailures = 0;/, 'must reflect content added by a sibling merge after the snapshot was taken');
+});
+
+test('refreshFetchedFileContent falls back to the frozen snapshot when the file has since been deleted/moved', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
+  const stale = [{ path: 'gone-now.js', content: 'stale but still useful content' }];
+
+  const refreshed = refreshFetchedFileContent(stale, repoRoot);
+
+  assert.equal(refreshed[0].content, 'stale but still useful content');
+});
+
+test('refreshFetchedFileContent returns the input unchanged when repoRoot is not available', () => {
+  const stale = [{ path: 'budget-monitor.js', content: 'frozen content' }];
+  assert.equal(refreshFetchedFileContent(stale, null), stale);
+});
+
+test('refreshFetchedFileContent refuses a path that would resolve outside repoRoot, falling back to the frozen copy', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
+  const stale = [{ path: '../../../../etc/passwd', content: 'frozen content' }];
+
+  const refreshed = refreshFetchedFileContent(stale, repoRoot);
+
+  assert.equal(refreshed[0].content, 'frozen content');
+});
+
+// CLI end-to-end: confirms main() actually wires the refresh in, not just the unit-level
+// helper -- a sibling merge changing budget-monitor.js after fetchedFiles was snapshotted
+// must show up in the assembled grounding text review's fact-check runs against.
+test('CLI end-to-end: a candidate-fulfillment task\'s grounding reflects a sibling merge that landed after fetchedFiles was snapshotted', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-test-repo-'));
+  fs.writeFileSync(path.join(repoRoot, 'budget-monitor.js'), 'const os = require(\'os\');\n\nlet parseFailures = 0; // added by sibling AC merge\n');
+  const task = {
+    domain: 'default',
+    source: 'observability_fix',
+    promptContext: {
+      candidateId: 'AC-3',
+      fetchedFiles: [{ path: 'budget-monitor.js', content: 'const os = require(\'os\');\n' }],
+      body: 'candidate doc problem/solution text',
+    },
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+  });
+
+  assert.match(stdout, /added by sibling AC merge/, 'grounding must reflect the live file, not the pre-merge snapshot');
 });
 
 test('a fetchedFiles entry with no content (a create-target that does not exist yet) is skipped, not thrown on', () => {

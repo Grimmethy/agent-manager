@@ -117,6 +117,49 @@ function extractContentWindow(content, startLine, endLine) {
     : `${header}${windowed.slice(0, LIVE_FETCH_MAX_CHARS_PER_FILE)}\n...[truncated]`;
 }
 
+// Path-traversal guard shared by extractLiveRepoGrounding and refreshFetchedFileContent
+// below -- a candidate path could still contain '..' segments even when it came from a
+// deterministic source (nextCandidateFulfillmentTask()'s own files list), so both call
+// sites refuse anything that resolves outside repoRoot rather than trust the source alone.
+function resolveWithinRoot(resolvedRoot, candidate) {
+  const full = path.join(resolvedRoot, candidate);
+  return full.startsWith(resolvedRoot + path.sep) ? full : null;
+}
+
+// 2026-08-27 (Grimmethy: "pipeline was running smoothly until we merged 9 branches, now
+// everything is going to blocked") -- root-caused live: observability_fix/arch_review
+// candidate-fulfillment tasks ground their draft against promptContext.fetchedFiles, a
+// snapshot of each named file's content taken once at CANDIDATE-CREATION time
+// (nextCandidateFulfillmentTask(), task-sources.js). That snapshot is never refreshed
+// before review runs. When several sibling candidates (e.g. 8+ observability-fix/
+// arch-review ACs) all touch the same few files and get merged serially, a task still
+// in flight keeps getting fact-checked against an increasingly stale pre-merge snapshot --
+// confirmed live via observability-fix-ac-3's retry history: re-drafted 4 times over ~20
+// hours as sibling ACs (ac-4, ac-11, ac-18, ...) merged in around it, blocked each time on
+// slightly different grounds about the same catch block in budget-monitor.js.
+//
+// Fix: at review time, re-read each fetchedFiles path's CURRENT content straight from
+// repoRoot instead of trusting the frozen snapshot -- same "check the claim against
+// reality right now" principle extractLiveRepoGrounding already applies for adhoc tasks
+// below, just applied to a deterministic path list instead of regex-extracted ones. Falls
+// back to the frozen snapshot content when a live read isn't possible (repoRoot unset in
+// this environment, or the file has since been deleted/moved by a merge) -- stale grounding
+// beats no grounding at all, same reasoning extractLiveRepoGrounding's own catch uses.
+function refreshFetchedFileContent(fetchedFiles, repoRoot) {
+  if (!repoRoot) return fetchedFiles;
+  const resolvedRoot = path.resolve(repoRoot);
+  return fetchedFiles.map((f) => {
+    if (!f || !f.path) return f;
+    const full = resolveWithinRoot(resolvedRoot, f.path);
+    if (!full) return f;
+    try {
+      return { ...f, content: fs.readFileSync(full, 'utf8') };
+    } catch (e) {
+      return f; // deleted/moved since the snapshot was taken -- fall back to the frozen copy.
+    }
+  });
+}
+
 function extractLiveRepoGrounding(text, repoRoot) {
   if (!text || !repoRoot) return [];
   const resolvedRoot = path.resolve(repoRoot);
@@ -144,11 +187,8 @@ function extractLiveRepoGrounding(text, repoRoot) {
   const found = [];
   for (const [candidate, lineRef] of byPath) {
     if (found.length >= LIVE_FETCH_MAX_FILES) break;
-    const full = path.join(resolvedRoot, candidate);
-    // Path-traversal guard -- a candidate matched by the regex could still contain '..'
-    // segments; refuse anything that resolves outside repoRoot rather than trust the regex
-    // alone to have excluded it.
-    if (!full.startsWith(resolvedRoot + path.sep)) continue;
+    const full = resolveWithinRoot(resolvedRoot, candidate);
+    if (!full) continue;
     let content;
     try {
       content = fs.readFileSync(full, 'utf8');
@@ -165,6 +205,18 @@ function main() {
   const task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
   const pc = task.promptContext;
   const parts = [];
+
+  // Resolved once, used both to refresh fetchedFiles below and for the adhoc live-fetch
+  // block further down. Fails open (getConfig() can throw if AGENT_MANAGER_REPO_ROOT is
+  // unset -- a context/test-environment gap, not a reason to fail this whole grounding
+  // assembly) same as reasoningTierFor()'s own established try/catch treatment of the
+  // identical getConfig() call.
+  let repoRoot = null;
+  try {
+    ({ repoRoot } = getConfig());
+  } catch (e) {
+    repoRoot = null;
+  }
 
   if (pc) {
     if (pc.existingStub) parts.push(String(pc.existingStub));
@@ -195,7 +247,12 @@ function main() {
     // reach those either (REPO_FILE_PATH_RE requires that prefix), so there was no
     // fallback catching this the way there is for adhoc's own equivalent gap.
     if (pc.fetchedFiles) {
-      for (const f of [].concat(pc.fetchedFiles)) {
+      // Re-read each path's CURRENT content from repoRoot rather than trusting the frozen
+      // creation-time snapshot -- see refreshFetchedFileContent's own comment for the
+      // incident (sibling candidate branches merging out from under a still-queued task)
+      // this closes. Falls back to the frozen f.content when a live read isn't possible.
+      const refreshed = refreshFetchedFileContent([].concat(pc.fetchedFiles), repoRoot);
+      for (const f of refreshed) {
         if (f && f.content) parts.push(String(f.content));
       }
     }
@@ -230,17 +287,8 @@ function main() {
   // Live current-repo enrichment (see this file's own comment above) -- unconditional for
   // every adhoc task with a real implement draft, not just the parts.length===0 fallback
   // case, since even a task WITH other grounding fields can still make a claim about a
-  // file none of those fields happen to cover. Fails open (getConfig() can throw if
-  // AGENT_MANAGER_REPO_ROOT is unset -- a context/test-environment gap, not a reason to
-  // fail this whole grounding assembly) same as reasoningTierFor()'s own established
-  // try/catch treatment of the identical getConfig() call.
+  // file none of those fields happen to cover.
   if (task.domain === 'adhoc' && task.implementResponse) {
-    let repoRoot = null;
-    try {
-      ({ repoRoot } = getConfig());
-    } catch (e) {
-      repoRoot = null;
-    }
     const liveFiles = extractLiveRepoGrounding(task.implementResponse, repoRoot);
     if (liveFiles.length > 0) {
       parts.push([
@@ -256,7 +304,7 @@ function main() {
   process.stdout.write(parts.join('\n\n'));
 }
 
-module.exports = { extractLiveRepoGrounding, main };
+module.exports = { extractLiveRepoGrounding, refreshFetchedFileContent, main };
 
 if (require.main === module) {
   main();
