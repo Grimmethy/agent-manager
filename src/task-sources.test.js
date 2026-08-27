@@ -1525,6 +1525,71 @@ test('nextCandidateFulfillmentTask truncates an individually oversized fetched f
   assert.match(task.promptContext.fetchedFiles[0].content, /\[truncated\]/);
 });
 
+// windowFetchedFileContent -----------------------------------------------------------
+// 2026-08-27, root-caused live via observability-fix-ac-9: a flat truncation from byte 0
+// cut off task-sources.js/dead-process-check.js before the candidate's own named catch
+// block ever appeared in the snapshot, and the drafter -- given no real evidence of where
+// the real target was -- hallucinated an edit to a nonexistent file instead. Candidate
+// prose reliably backtick-quotes the real symbol/snippet it's about; centering the window
+// on the first quoted span that's a real substring match fixes this without needing any
+// line-number info (which doesn't exist yet at candidate-creation time).
+test('windowFetchedFileContent centers the window on a backtick-quoted symbol from the candidate section instead of truncating from byte 0', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const padding = 'x'.repeat(9000);
+  const content = `${padding}\nfunction theRealTarget() { return 1; }\n${padding}`;
+  const section = 'Problem:\nThe `theRealTarget` function has a bug.\n\nSolution:\nFix it.';
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /theRealTarget/, 'the quoted symbol must actually be present, not truncated away');
+  assert.match(windowed, /\[truncated\]/);
+});
+
+test('windowFetchedFileContent falls back to flat truncation from the start when no quoted symbol matches real content', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const content = `start-marker\n${'x'.repeat(9000)}`;
+  const section = 'Problem:\nSomething about `aSymbolThatIsNotInTheFile`.\n\nSolution:\nFix it.';
+
+  const windowed = windowFetchedFileContent(content, section, 2000);
+
+  assert.match(windowed, /^start-marker/);
+  assert.match(windowed, /\[truncated\]$/);
+});
+
+test('windowFetchedFileContent returns content unchanged when it is already under the size cap', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const content = 'small content, well under the cap';
+  assert.equal(windowFetchedFileContent(content, 'Problem:\n`whatever`', 2000), content);
+});
+
+// CLI/round-trip: confirms nextCandidateFulfillmentTask actually wires the windowing in,
+// not just the unit-level helper -- the exact observability-fix-ac-9 shape (candidate
+// names a symbol deep in a large file, past where flat truncation used to cut off).
+test('nextCandidateFulfillmentTask centers a large fetched file\'s window on the candidate\'s own quoted target symbol', () => {
+  const dir = makeAdhocFixtureRepo();
+  const padding = 'x'.repeat(9000);
+  fs.writeFileSync(path.join(dir, 'big.js'), `${padding}\nfunction realTargetSymbol() { return 1; }\n${padding}`);
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-1 · A real finding',
+    'Strength: Strong',
+    'Files: big.js',
+    '',
+    'Problem:\nThe `realTargetSymbol` function swallows errors.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.',
+  ].join('\n'));
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+
+  assert.match(task.promptContext.fetchedFiles[0].content, /realTargetSymbol/, 'the real target symbol must survive truncation, not just the file\'s first bytes');
+});
+
 test('nextCandidateFulfillmentTask fetches multiple named files, skipping only the ones that fail', () => {
   const dir = makeAdhocFixtureRepo();
   fs.writeFileSync(path.join(dir, 'a.js'), 'const a = 1;');
