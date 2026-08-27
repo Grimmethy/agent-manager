@@ -80,7 +80,7 @@ Static analysis can now see all imports; library consumers no longer risk accide
 
 ### AC-7 · `resolveGraphPath` performs eager filesystem I/O inside `getConfig()` with no repoRoot-keyed memoization
 Strength: Strong
-Files: resolveGraphPath.js, getConfig.js, apply-task.js, task-sources.js, local-worker.ps1
+Files: src/config.js, src/apply-task.js, src/task-sources.js, src/local-worker.ps1
 
 Problem:
 `resolveGraphPath` reads `.agent-manager-cache/` via `readdirSync` and probes each subdirectory with `statSync` on every invocation. It is called from `getConfig()`, which itself is invoked by multiple consumers within the same process -- notably `apply-task.js`, `task-sources.js`, and the Node side of `local-worker.ps1`. Because the result depends only on `repoRoot` (which rarely changes mid-run) and there is no memoization keyed to that input, every consumer re-scans the cache directory even when a previous call already produced the answer. The synchronous I/O also blocks the event loop for any caller that could otherwise be doing work in parallel.
