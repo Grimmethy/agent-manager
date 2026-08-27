@@ -420,3 +420,29 @@ Replace the empty catch body with a `console.error` call that includes the task 
 
 Benefits:
 Every failed enqueue now emits a single log line containing the task id and the OS error, giving operators a grep-able trace. The rethrow (or falsy return) lets the caller's retry loop or abort path engage, so a transient ENOSPC is retried rather than lost. The queue invariant—"every task that entered `writeTask` either exists in `queue/pending/` or the failure is recorded"—is restored, closing the silent-loss gap in the deployment pipeline.
+
+### AC-29 · Add structured warn log and error counter to the domains-file load-failure catch in src/apply-group-a.js
+Strength: Strong
+Files: src/apply-group-a.js
+
+Problem:
+The IIFE in src/apply-group-a.js that reads matchedProject.domainsPath currently ends with a bare `catch { return []; }` that swallows every exception (ENOENT, EACCES, JSON parse errors, network hiccups on a remote path, etc.) with zero observability. No log line is emitted, no metric is incremented, and no signal reaches the operator or any dashboard. A guardrail file that fails to load is indistinguishable from a project that simply has no domain restrictions, which is exactly the silent guardrail-loss scenario AC-5 calls out.
+
+Solution:
+In that IIFE's catch clause (the one wrapping the read/parse of matchedProject.domainsPath), change the parameterless `catch {` to `catch (err) {`. Inside the new body, before any return or throw, (1) call the project's logger at warn level with a stable event name such as `domains-file-unreadable` and a structured payload containing the resolved matchedProject.domainsPath value, err.code, err.name, and err.message (adapt field names to the project's logger API—confirm whether it is key-value or object-keyed); (2) increment a dedicated counter metric (e.g. `agent_manager_domains_load_errors_total`) with a single label for the project identifier (matchedProject.name or equivalent—confirm the exact field from the matchedProject shape). Do not log the full stack trace at warn level to avoid bloat on a per-apply hot path. Do not add labels beyond the project name to keep cardinality bounded. Leave the try block, the path expression, and the success-path return value untouched.
+
+Benefits:
+Every non-successful domains-file load now produces a structured, greppable log line and a countable metric. Operators can correlate a sudden spike in `agent_manager_domains_load_errors_total` with a deploy or infrastructure change. The warn-level log gives enough context (path, OS error code, message) to diagnose without dumping full stacks on a hot path. The metric enables alerting and SLO tracking on guardrail-file availability.
+
+### AC-30 · Replace the silent empty-array return with explicit failure propagation (rethrow or ENOENT-scoped allow-all) in the same catch
+Strength: Strong
+Files: src/apply-group-a.js
+
+Problem:
+After the bare `catch { return []; }` in the domains-file IIFE, the caller receives an empty array and proceeds as if the project has no domain restrictions (allow-all). This is correct only if a missing file is an intentional 'no restriction' signal. For every other failure mode—permission denied, corrupt JSON, network timeout on a remote path, a typo in the path—the empty array silently disables the guardrail while the apply step reports success. The operator never sees the failure in the apply result, in CI logs, or in any upstream alerting channel.
+
+Solution:
+In the same catch body (after the log and metric added by the first sub-candidate), inspect err.code. If err.code === 'ENOENT' (or 'MODULE_NOT_FOUND' if the loader is a module-system read), treat it as the intentional 'no domain restriction' case: log at info level with event name `domains-file-absent-allow-all`, do NOT increment the error counter (undo the increment if the first sub-candidate already ran, or guard the increment in the first sub-candidate with `err.code !== 'ENOENT'`), and return [] as before. For all other error codes (EACCES, EISDIR, parse errors, etc.), rethrow the original error object (`throw err`) so the caller's existing error-handling path fires, the apply result reflects the failure, and upstream alerting is triggered. Do not wrap in a new Error unless the project convention requires a specific error class; if it does, set `cause: err` to preserve the original stack. Confirm the caller's error-handling contract (try/catch, .catch(), or thrown-error) before finalizing the rethrow shape.
+
+Benefits:
+Non-ENOENT failures (permissions, corruption, network) become visible in the apply result and any upstream alerting, closing the silent guardrail-loss gap. A genuinely absent file can still be treated as 'no restriction' if that is the product intent, without conflating it with a real I/O or parse failure. The rethrow preserves the original stack trace for debugging. Operators can distinguish 'project has no domains file' (info log) from 'project's domains file is broken' (warn log + error in apply result) at a glance.
