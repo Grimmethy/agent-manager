@@ -209,3 +209,29 @@ Once local-client.js exposes a reusable exported helper for degenerate detection
 
 Benefits:
 Eliminates a second, independently-maintained copy of the degenerate-detection/retry contract, so a future fix or tuning of the detection rules in local-client.js automatically applies to the tools-disabled path here too, instead of requiring the same fix to be made twice.
+
+### AC-17 · Make taskIdExistsInQueue async and propagate await to all its callers in task-sources.js
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+config.js's getConfig() now returns a Promise<Config> instead of a plain object. taskIdExistsInQueue (line ~100) calls `const { pipelineDir } = getConfig();` synchronously, which would destructure a Promise and yield undefined for pipelineDir, causing every fs.existsSync check to throw or silently miss. Every caller of taskIdExistsInQueue in this file — the nextTask generator for each of the 10 built-in sources (priorities 10/20/40/70/71/80/81/82/85/90), the adhoc/research title-scanning helper, and any other internal call sites — invokes it without await, so they would receive a Promise instead of a boolean and their truthiness checks would always be truthy (a Promise is always truthy), breaking dedup entirely.
+
+Solution:
+1) Change the declaration from `function taskIdExistsInQueue(id)` to `async function taskIdExistsInQueue(id)` and change `const { pipelineDir } = getConfig();` to `const { pipelineDir } = await getConfig();`. 2) Walk every call site of taskIdExistsInQueue in the file (each built-in source's nextTask generator, the title-scanning helper, and any other internal callers) and add `await` before the call. 3) For each caller that is not already declared `async`, add the `async` keyword to its function declaration. 4) If any of those callers are themselves invoked by another function in the file, repeat the async/await propagation one level up until reaching the module's exported entry points. 5) Verify that any top-level or IIFE code that calls the exported nextTask functions already handles a returned Promise (e.g., is inside an async wrapper or uses .then).
+
+Benefits:
+Restores correct synchronous-looking dedup semantics: taskIdExistsInQueue returns a real boolean again (via await), callers correctly skip already-queued tasks, and the 10 built-in sources plus the title-scanning helper all work with the new async getConfig() contract without TypeError or silent truthiness bugs.
+
+### AC-18 · Add await to every getConfig() call site in apply-task.js and make enclosing functions async
+Strength: Strong
+Files: src/apply-task.js
+
+Problem:
+config.js's getConfig() now returns a Promise<Config>. apply-task.js imports getConfig (line 14: `const { getConfig, ensureRegistered } = require('./config.js');`) and calls it in multiple places throughout the apply logic, the writeArtifact path, and the branch/commit/push sequence. Each call site currently does `const { pipelineDir } = getConfig()` (or similar destructuring) without await, so it destructures a Promise object, yielding undefined for pipelineDir and any other config fields. This causes path.join to throw, git commands to target the wrong directory, and the entire apply pipeline to fail with a confusing TypeError or write artifacts to 'undefined' paths.
+
+Solution:
+1) Locate every call site of getConfig() in the file (the apply dispatch logic, the writeArtifact helper, the branch/commit/push sequence, and any other internal usage). 2) At each site, change `getConfig()` to `await getConfig()` (e.g., `const { pipelineDir } = getConfig()` becomes `const { pipelineDir } = await getConfig()`). 3) For each call site, walk up to the nearest enclosing function: if it is not already declared `async`, add the `async` keyword. 4) If that function is called by another function in the file, repeat the async/await propagation one level up until reaching the top-level entry point. 5) Verify the CLI entry point (the file is invoked as `node apply-task.js <task.json>`) already runs in an async context — either via top-level await (ESM, Node ≥ 14.8) or an `async main().catch(…)` / IIFE pattern — so the await chain resolves before the process exits and the single-line JSON result is written to stdout.
+
+Benefits:
+The apply pipeline correctly resolves the config object before using pipelineDir, git branch names, and artifact paths. All downstream logic (writeArtifact, group-A/group-B dispatch, git runner, history append) receives a real string path instead of undefined, eliminating the class of failures where apply silently writes to the wrong location or crashes with a TypeError on the first path.join call.
