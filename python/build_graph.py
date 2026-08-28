@@ -2,8 +2,14 @@
 """Stripped-down, self-contained replacement for the graphify dependency arch_discovery
 used to require. Walks the configured source directories, extracts a file-level import/
 require graph (JS/TS + Python, see below), runs community detection, and writes graph.json
-in the exact {nodes, links} shape task-sources.js's nextArchDiscoveryTask() already
-consumes -- no changes needed there.
+in the exact {nodes, links} shape nextArchDiscoveryTask() consumes.
+
+CROSS-REPO CONTRACT (2026-08-27): arch_discovery moved to the agent-manager-hygiene
+plugin, but this producer stays HERE -- it's Python, it backs the dashboard "Build Graph"
+button and `queue-watcher.sh --check-due`, and the plugin only reads its output
+(graph.json + community-coverage.json) read-only via getConfig().graphPath /
+.communityCoveragePath. Keep the {nodes, links} / {communities} shapes stable; see
+docs/PLUGIN_API.md.
 
 Usage: python build_graph.py
        python build_graph.py --check-due
