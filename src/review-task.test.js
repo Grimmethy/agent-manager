@@ -122,6 +122,38 @@ test('buildVerdictPrompt does not fabricate a carve-out for a source with none d
   assert.doesNotMatch(prompt, /CLASSIFICATION task/);
 });
 
+// ADR-0022 Stage A2: buildVerdictPrompt no longer carries an if (task.source === ...) chain;
+// it reads each source's carve-out + completeness question off the registry
+// (source.reviewGuidance / source.reviewCompletenessQuestion). Guard the seam itself so a
+// future refactor can't silently drop it -- register an ad-hoc source and prove both fields
+// reach the prompt, including the (task) => string function form.
+test('buildVerdictPrompt surfaces reviewGuidance / reviewCompletenessQuestion from the registry', () => {
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('sa2_probe_source')) {
+    registerTaskSource('sa2_probe_source', {
+      priority: 50,
+      next: () => null,
+      reviewGuidance: (t) => `PROBE GUIDANCE for ${t.title}`,
+      reviewCompletenessQuestion: 'Does the PROBE draft answer every probe point?',
+    });
+  }
+  const task = baseTask({ domain: 'default', source: 'sa2_probe_source', title: 'probe run' });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /PROBE GUIDANCE for probe run/);
+  assert.match(prompt, /Does the PROBE draft answer every probe point\?/);
+  assert.doesNotMatch(prompt, /does it contain real, complete code/i);
+});
+
+// arch_discovery / arch_import register their reviewGuidance in the agent-manager-hygiene
+// plugin, which isn't loaded in this suite. review-task.js keeps a FALLBACK_REVIEW_GUIDANCE
+// map so core's gate stays correct standalone (removed in Stage G).
+test('buildVerdictPrompt falls back to the built-in arch guidance when the hygiene plugin is not loaded', () => {
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  assert.equal(getRegisteredSource('arch_discovery'), undefined, 'precondition: plugin not loaded here');
+  const prompt = buildVerdictPrompt(baseTask({ domain: 'default', source: 'arch_discovery' }), { flags: [] }, '');
+  assert.match(prompt, /architecture-discovery task: finding ZERO real issues/);
+});
+
 // Regression, 2026-08-22: caught live -- a real staleness_audit advisory report
 // (hedged, uncertain prose by design -- see stalenessAuditImplementPrompt, prompts.js)
 // got rejected by review as "meta-commentary and hedging... rather than providing the
