@@ -28,39 +28,18 @@ const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 require('./task-sources.js');
 ensureRegistered();
 
-// Shared by writeArtifact (which needs to know WHICH apply to call) and the
-// awaiting-confirm gate below (which needs to know whether one's coming, before calling
-// it) -- a source with its own registered `apply` (arch_discovery, arch_import,
-// unused_export, etc.) never touches applyGroupB at all, so the delete gate has nothing to
-// check for those; only a source with no custom apply falls through to the generic Group B
-// JSON-change-object path.
-// arch_discovery/arch_import/observability_review/performance_review's apply is a
-// low-risk, additive-only append to a candidates-tracking doc -- never real application
-// code (the actual code-writing follow-up -- arch_review, arch_import_review,
-// observability_fix, performance_fix -- goes through the normal branch+review flow below
-// like everything else). Confirmed live 2026-08-16: with every domain going through the
-// same throwaway agent/<task.id> branch + skipPush's "commit locally, stop there" mode,
-// these commits had nowhere durable to land -- ~311 such branches were created over
-// time, only 10 ever survived to be reviewed, and NONE had ever reached main.
+// A source whose apply is a low-risk, additive-only append to a candidates-tracking doc
+// (never real application code) declares `directToMain: true` on its registration and
+// skips the throwaway agent/<id> branch + review + merge cycle entirely -- it commits
+// straight to main. The candidate-generating hygiene sources (arch_discovery, arch_import,
+// observability_review, performance_review) all set it; the code-writing follow-ups
+// (arch_review, observability_fix, ...) do NOT -- they go through the normal branch flow.
 //
-// BUG FIXED 2026-08-21 (Grimmethy: "observability review seems to be requiring a branch
-// merge before observability fix -- is this necessary?"): this set was checked against
-// task.domain, but every task built by these four sources stamps domain: defaultDomain
-// (near-always the literal string "default" -- see config.js) and carries the actual
-// source name in task.source instead (the field every OTHER per-source gate in this
-// file already checks -- see the pipeline_self_audit/product_spec gates above). So
-// DIRECT_TO_MAIN_DOMAINS.has(task.domain) was comparing "default" against
-// {"arch_discovery","arch_import"} and NEVER matched -- confirmed live via git history:
-// every arch_discovery/arch_import commit has a corresponding "Merge ... (via
-// dashboard)" commit, meaning the direct-to-main fast path this comment describes had
-// been dead code since the day it was written; these two sources went through the exact
-// same slow branch+review+merge cycle as real code changes the whole time, and so did
-// observability_review/performance_review once they shipped in the same shape. Checking
-// task.source instead is what actually makes this fast path fire, for all four sources
-// this note originally meant to cover.
-const DIRECT_TO_MAIN_SOURCES = new Set([
-  'arch_discovery', 'arch_import', 'observability_review', 'performance_review',
-]);
+// History: this was DIRECT_TO_MAIN_DOMAINS checked against task.domain, which every one of
+// those sources stamps as "default" -- so it never matched, and the fast path was dead
+// code from the day it was written (~311 throwaway branches created, 10 reviewed, 0 merged
+// before 2026-08-21). Fixed to check task.source, then (ADR-0022 Stage A1) moved onto the
+// registry as `directToMain`, and (Stage G) the source-name literal was dropped entirely.
 
 // task.draftModel (stamped by local-draft.js/adhoc-agentic-draft.js at draft time, same
 // "claude:<model>"-or-"<real ollama tag>" label model-provider.js's labelFor() and the
@@ -355,15 +334,12 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     gitRunner.fetchMain();
     gitRunner.resetToMain();
 
-    // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) --
-    // see DIRECT_TO_MAIN_SOURCES' own header comment for why. Everything else keeps the
-    // normal throwaway agent/<id> branch. A source declares this via `directToMain: true`
-    // on its registration now (so an out-of-tree plugin's source can opt in without
-    // editing this file); DIRECT_TO_MAIN_SOURCES stays as a fallback for the built-ins
-    // until Stage G of the plugin extraction removes it.
+    // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) and
+    // commit straight to main -- see the `directToMain` header comment above. Everything
+    // else keeps the normal throwaway agent/<id> branch. Declared per source on its
+    // registration, so an out-of-tree plugin's source opts in without editing this file.
     const registered = getRegisteredSource(resolveSourceName(task));
-    const commitsDirectlyToMain = (registered && registered.directToMain === true)
-      || DIRECT_TO_MAIN_SOURCES.has(task.source);
+    const commitsDirectlyToMain = !!(registered && registered.directToMain === true);
     const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
     if (branchName) {
       // Defensive pre-cleanup (2026-08-25 -- same fix, same root cause, as adhoc-agentic-

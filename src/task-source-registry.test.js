@@ -34,8 +34,11 @@ test('resolveSourceName resolves domain:"secondbrain" tasks to "secondbrain"', (
   assert.equal(resolveSourceName({ domain: 'secondbrain', source: 'inbox' }), 'secondbrain');
 });
 
-test('resolveSourceName resolves source:"deadcode_triage" tasks to "unused_export"', () => {
+test('resolveSourceName resolves a plugin-declared alias (deadcode_triage -> unused_export)', () => {
+  clearRegistry();
+  registerSourceAlias('deadcode_triage', 'unused_export'); // agent-manager-hygiene's unused-export.js does this
   assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'unused_export');
+  clearRegistry();
 });
 
 test('resolveSourceName falls back to task.source unchanged for everything else', () => {
@@ -52,7 +55,7 @@ test('registerSourceAlias: a plugin can declare its own source-field quirk witho
   assert.equal(resolveSourceName({ source: 'my_weird_label' }), 'my_weird_label', 'clearRegistry() also clears aliases');
 });
 
-test('deadcode_triage still resolves via the legacy hardcoded fallback even without an alias registered', () => {
+test('deadcode_triage is NOT special-cased in core -- with no alias registered it passes through unchanged', () => {
   clearRegistry();
-  assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'unused_export');
+  assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'deadcode_triage');
 });

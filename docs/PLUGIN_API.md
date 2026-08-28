@@ -30,15 +30,28 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 | `deterministic-recheck-registry.js` | `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry` | ADR-0022 Stage B. The plugin registers `{ perFileRules, repoWideRules }` per `originalSource`; core's `staleness-fastpath.js` looks them up with zero source-name knowledge. `clear` / `get*` are for the plugin's own tests. The deterministic scanner rule functions themselves live in the plugin (ADR-0022 Stage C) — core imports nothing from `src/maintenance/` any more; that directory is gone. |
 | `model-profile-registry.js` | `clearModelProfileRegistry` | plugin tests only (fresh-registry setup). |
 
+## No source-name literals in core
+
+As of ADR-0022 Stage G, no core `src/*.js` production file names a plugin-owned task source.
+Every behaviour that used to switch on `task.source === 'arch_review'` (etc.) reads a field
+off the source's registration — `directToMain`, `reviewGuidance` / `reviewCompletenessQuestion`,
+`reportClass`, `harnessSearch` / `skipImplementWhenNoHarnessHits` — or a purpose-built registry
+(`deterministic-recheck-registry.js`). `src/no-plugin-source-names.test.js` enforces this.
+
+Known, deliberate exceptions:
+
+- **`src/arch-discovery-structcheck.js`** names `arch_discovery` / `arch_import` — it is
+  invoked by hardcoded path from `src/local-worker.ps1` (the Windows worker) and is
+  arch-specific by nature. Allowlisted in the guard test. Not reached on the Linux path.
+- **`python/dashboard/app.py`'s `SOURCE_DESCRIPTIONS` / `_SOURCE_TO_DOMAIN_KEY`** name every
+  source, plugin ones included. This is the dashboard's server-side *display* catalog for a
+  unified Job List across all loaded plugins — human-authored one-line copy plus a
+  domain-key map with a documented silent-failure mode if wrong. Making it fully
+  topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
+  fallback) is a self-contained dashboard refactor, tracked separately.
+
 ## Known warts
 
-- **`resolveSourceName`'s `deadcode_triage → unused_export` line** (`task-source-registry.js`)
-  is core-side knowledge of a plugin source's task-label aliasing. It's pure data and
-  harmless, kept as a fallback rather than replaced with a `registerSourceAlias()` call.
-- **`--dump-topology`'s `DIRECT_TO_MAIN_SOURCES` literal** (`task-sources.js`) and
-  `apply-task.js`'s copy both name `arch_discovery` / `arch_import` explicitly. They match
-  by `task.source` string, so they keep working across the plugin boundary, but the two
-  literals must stay in sync with each other and with the plugin's registrations.
 - **Deep imports, no `exports` map.** A plugin reaching past this contract into a private
   internal is unsupported and may break without notice. If the surface needs to grow, add
   the export here and to `plugin-api.test.js` in the same change.

@@ -58,15 +58,10 @@ test('plugin API: candidate-docs.js exports are the same objects apply-group-a.j
   }
 });
 
-test('plugin API: DIRECT_TO_MAIN literals in task-sources.js and apply-task.js agree', () => {
+test('plugin API: apply-task.js reads directToMain off the registry, not a source-name literal (ADR-0022 Stage G)', () => {
   const fs = require('fs');
   const path = require('path');
-  const grab = (file) => {
-    const m = fs.readFileSync(path.join(__dirname, file), 'utf8').match(/DIRECT_TO_MAIN_SOURCES\s*=\s*new Set\(\[([^\]]+)\]\)/);
-    return m ? new Set(m[1].match(/'([^']+)'/g).map((s) => s.slice(1, -1))) : null;
-  };
-  const a = grab('task-sources.js');
-  const b = grab('apply-task.js');
-  assert.ok(a && b, 'both files must still declare a DIRECT_TO_MAIN_SOURCES literal');
-  assert.deepEqual([...a].sort(), [...b].sort(), 'task-sources.js and apply-task.js DIRECT_TO_MAIN_SOURCES must match (see docs/PLUGIN_API.md "Known warts")');
+  const applySrc = fs.readFileSync(path.join(__dirname, 'apply-task.js'), 'utf8');
+  assert.doesNotMatch(applySrc, /DIRECT_TO_MAIN_SOURCES\s*=\s*new Set/, 'the source-name literal must be gone');
+  assert.match(applySrc, /registered\.directToMain === true/, 'must gate on the registry field');
 });

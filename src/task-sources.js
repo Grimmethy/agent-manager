@@ -1873,15 +1873,9 @@ if (require.main === module) {
   // so it can't silently drift the way a hand-maintained "these three are the same" list
   // would.
   //
-  // directToMain: DIRECT_TO_MAIN_SOURCES itself lives in apply-task.js, not the registry --
-  // duplicated here as a small literal (same "tiny, rarely-changing, duplicated rather than
-  // reached for across an inappropriate module boundary" convention this package already
-  // uses elsewhere, e.g. function-length-review.js's own candidatesPath) rather than
-  // requiring apply-task.js back into task-sources.js (which itself requires task-sources.js
-  // for registration -- avoidable circularity, not worth it for 4 literal names). Keep in
-  // sync with apply-task.js's own DIRECT_TO_MAIN_SOURCES if that set ever changes.
+  // directToMain: read straight off each source's registration (ADR-0022 Stage G removed
+  // the source-name literal this used to keep in sync with apply-task.js).
   if (process.argv.includes('--dump-topology')) {
-    const DIRECT_TO_MAIN_SOURCES = new Set(['arch_discovery', 'arch_import', 'observability_review', 'performance_review']);
     const sources = getRegisteredSources();
     const planGroupIds = new Map();
     const implementGroupIds = new Map();
@@ -1914,7 +1908,7 @@ if (require.main === module) {
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
         hasCustomApply: typeof source.apply === 'function',
-        directToMain: source.directToMain === true || DIRECT_TO_MAIN_SOURCES.has(source.name),
+        directToMain: source.directToMain === true,
         hasCandidatesPath: typeof source.candidatesPath === 'function',
         candidatesPath,
         candidateDocTitle: source.candidateDocTitle ?? null,
