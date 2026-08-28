@@ -2194,7 +2194,7 @@ if (require.main === module) {
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
         hasCustomApply: typeof source.apply === 'function',
-        directToMain: DIRECT_TO_MAIN_SOURCES.has(source.name),
+        directToMain: source.directToMain === true || DIRECT_TO_MAIN_SOURCES.has(source.name),
         hasCandidatesPath: typeof source.candidatesPath === 'function',
         candidatesPath,
         candidateDocTitle: source.candidateDocTitle ?? null,
