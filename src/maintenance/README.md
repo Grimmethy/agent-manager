@@ -19,6 +19,14 @@ and `staleness-audit.js`, which never load the plugin. Moving the detectors woul
 add a plugin-load failure mode to that deterministic path or force a drifting second copy
 of the rules — so they stay.
 
+**ADR-0022 Stage B:** `staleness-fastpath.js` no longer imports these directly. The plugin
+wraps each detector in a `registerDeterministicRecheck('observability_review', { perFileRules,
+repoWideRules })` call (`deterministic-recheck-registry.js`), and `staleness-fastpath.js`
+looks the config up by the finding's `originalSource` with no source-name or `maintenance/`
+knowledge. When the plugin isn't loaded, the recheck simply returns null and the LLM path
+runs — exactly as it did before the fastpath existed. Stage C moves the detector files
+themselves into the plugin.
+
 `scan-utils.js` is the bottom of the tree (zero `src/` imports) and is imported by all
 three scanners plus `staleness-fastpath.js`.
 
