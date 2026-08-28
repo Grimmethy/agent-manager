@@ -293,7 +293,21 @@ function nextAvailableCandidateId(existingText) {
 // dropped as "already in queue"). Assigned sequentially against the text as it grows
 // within this same call, so multiple candidates in one implementResponse never collide
 // with each other either.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates' }) {
+//
+// `snippet` (2026-08-27, Grimmethy: "we should be looking for code content instead of
+// the line itself" -- root-caused live via observability-fix-ac-26): the real code text a
+// candidate is about is available and FRESH at review time (observability-review.js and
+// its siblings already compute it as promptContext.snippet, to ground the genuine/
+// false-positive judgment), but used to dead-end there -- only the model's own free-text
+// Problem/Solution prose survived into the doc, and a model transcribing remembered code
+// into prose routinely paraphrases it (confirmed: AC-26's quoted `catch (err) { return
+// null; }` vs the real bare `catch {` / `return null;` on separate lines). Writing it here
+// as its own deterministic field -- never touched by the model, a straight pass-through of
+// what the scanner/reviewer actually read -- means windowFetchedFileContent
+// (task-sources.js) gets a real, current anchor instead of reverse-engineering position
+// from lossy prose. Optional: arch_review/arch_import_review's own candidates (hand-authored
+// or drafted without a pre-existing scan finding) have no such snippet to pass.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null }) {
   const candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
@@ -307,6 +321,10 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
     const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
     if (c.source) lines.push(`Source: ${c.source}`);
     if (c.files) lines.push(`Files: ${c.files}`);
+    // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
+    // contain backticks (template literals are common in this codebase), so a fence is
+    // the only delimiter that can't collide with the content it's wrapping.
+    if (snippet) lines.push('Snippet:', '```', snippet, '```');
     lines.push('', c.body);
     text += '\n' + lines.join('\n') + '\n';
     candidateIds.push(id);

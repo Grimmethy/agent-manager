@@ -135,6 +135,32 @@ test('applyArchDiscoveryCandidates omits the Source: line entirely when absent (
   assert.doesNotMatch(text, /Source:/);
 });
 
+// snippet param ---------------------------------------------------------------------
+// 2026-08-27, Grimmethy: "we should be looking for code content instead of the line
+// itself." The real code text a scanner/reviewer already read at review time is passed
+// through here as its own deterministic field -- never touched by the model -- so
+// task-sources.js's windowFetchedFileContent gets a real anchor instead of reverse-
+// engineering position from the model's own (sometimes paraphrased) prose.
+test('applyArchDiscoveryCandidates writes a Snippet: field when snippet is provided', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const candidatesPath = path.join(dir, 'OBSERVABILITY_FIX_CANDIDATES.md');
+  applyArchDiscoveryCandidates({
+    implementResponse: candidateBlock({ title: 'Silent catch' }),
+    candidatesPath,
+    snippet: "  } catch {\n    return [];\n  }",
+  });
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.match(text, /Snippet:\n```\n {2}\} catch \{\n {4}return \[\];\n {2}\}\n```/);
+});
+
+test('applyArchDiscoveryCandidates omits the Snippet: field entirely when no snippet is provided', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const candidatesPath = path.join(dir, 'ARCH_REVIEW_CANDIDATES.md');
+  applyArchDiscoveryCandidates({ implementResponse: candidateBlock({ title: 'No snippet here' }), candidatesPath });
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.doesNotMatch(text, /Snippet:/);
+});
+
 test('applyArchDiscoveryCandidates re-derives the AC-NNN id instead of trusting Ornith\'s, avoiding a collision', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
   const candidatesPath = path.join(dir, 'ARCH_REVIEW_CANDIDATES.md');

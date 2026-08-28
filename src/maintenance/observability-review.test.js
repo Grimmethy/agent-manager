@@ -215,6 +215,49 @@ test('observability_review genuine verdict -> apply writes a candidate -> observ
   assert.deepEqual(fixTask.promptContext.files, ['worker.js']);
 });
 
+// 2026-08-27, Grimmethy: "we should be looking for code content instead of the line
+// itself." The review task already carries the real code text it judged as
+// promptContext.snippet; apply must thread it through to applyArchDiscoveryCandidates so
+// it lands in the candidate doc as a deterministic Snippet: field (see apply-group-a.js),
+// giving windowFetchedFileContent a real anchor instead of the model's own prose.
+test('observability_review apply threads task.promptContext.snippet into the candidate doc as a Snippet: field', () => {
+  const dir = makeObservabilityFixtureRepo();
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const candidatesPath = path.join(dir, 'OBSERVABILITY_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH = candidatesPath;
+  const { clearRegistry, getRegisteredSource } = require('../task-source-registry.js');
+  clearRegistry();
+  const { clearModelProfileRegistry } = require('../model-profile-registry.js');
+  clearModelProfileRegistry();
+  delete require.cache[require.resolve('../task-sources.js')];
+  require('../task-sources.js');
+
+  const genuineImplementResponse = [
+    '### AC-001 · Silent catch swallows fetch errors',
+    'Strength: Strong',
+    'Files: worker.js',
+    '',
+    'Problem:',
+    'The catch block hides network failures -- prose paraphrases it as `catch (err)`.',
+    '',
+    'Solution:',
+    'Log the error.',
+    '',
+    'Benefits:',
+    'Debuggable.',
+  ].join('\n');
+
+  const observabilityReview = getRegisteredSource('observability_review');
+  observabilityReview.apply({
+    implementResponse: genuineImplementResponse,
+    task: { promptContext: { snippet: '  } catch {\n    return [];\n  }' } },
+  });
+
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.match(text, /Snippet:\n```\n {2}\} catch \{\n {4}return \[\];\n {2}\}\n```/);
+});
+
 test('observability_review false-positive verdict -> apply is a clean no-op, no candidate written', () => {
   const dir = makeObservabilityFixtureRepo();
   process.env.AGENT_MANAGER_REPO_ROOT = dir;
