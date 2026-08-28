@@ -446,3 +446,29 @@ In the same catch body (after the log and metric added by the first sub-candidat
 
 Benefits:
 Non-ENOENT failures (permissions, corruption, network) become visible in the apply result and any upstream alerting, closing the silent guardrail-loss gap. A genuinely absent file can still be treated as 'no restriction' if that is the product intent, without conflating it with a real I/O or parse failure. The rethrow preserves the original stack trace for debugging. Operators can distinguish 'project has no domains file' (info log) from 'project's domains file is broken' (warn log + error in apply result) at a glance.
+
+### AC-31 · Identify the exact catch-block text around the projectSearchFetch call in src/local-draft.js
+Strength: Strong
+Files: src/local-draft.js
+
+Problem:
+The plan targets a catch block in draftTask() that wraps the projectSearchFetch call and currently contains only a comment. The provided file excerpt is truncated at both ends and the draftTask() body (where the try/catch lives) is not visible, so the exact comment text, surrounding lines, and whether a project logger or metrics sink is imported cannot be confirmed. Forcing a find/replace against guessed text risks a non-applying diff or an edit to the wrong catch block.
+
+Solution:
+Open src/local-draft.js in full, locate the single try/catch (or try/finally + nested catch) that wraps the projectSearchFetch(...) call inside draftTask(). Record the exact catch-line and its body (the comment-only line) verbatim. Also confirm whether any logger (winston, pino, pino-logger, etc.) or metrics helper (promClient, counter.add, metrics.inc) is imported at the top of the file. Report the exact 3–6 line snippet (the catch { … } block plus one line of context above and below) so the next pass can produce a character-exact find string.
+
+Benefits:
+Guarantees the subsequent edit's find string is grounded in real file content, eliminates the risk of a non-applying or mis-targeted diff, and resolves the plan's Step-2 (logger) and Step-3 (metrics) unknowns before any code is written.
+
+### AC-32 · Add a warning-level log line to the identified catch block in src/local-draft.js
+Strength: Strong
+Files: src/local-draft.js
+
+Problem:
+Once the exact catch-block text is confirmed (see sibling candidate), the block still swallows the projectSearchFetch failure silently—only a comment sits in the catch body, so operators have no signal that the search fetch failed and the draft proceeded with empty results.
+
+Solution:
+Replace the comment-only catch body with a single console.warn (or the project logger's .warn, if one is confirmed imported) call: console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results:', err && err.message || err); Preserve any existing rationale comment above the log line. Do NOT add return, throw, break, or any control-flow statement—execution must fall through so searchResults retains its [] value. If a metrics counter is confirmed in the file, add one counter-increment line after the log; otherwise omit it. Run the project's lint and any local-draft tests afterward.
+
+Benefits:
+Makes the previously silent failure greppable in logs with a stable [local-draft] prefix, preserves existing control flow and downstream behavior exactly, and introduces no new dependencies or refactoring.
