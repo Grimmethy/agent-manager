@@ -6,6 +6,24 @@ const fs = require('fs');
 const path = require('path');
 const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt, formatFileContents } = require('./prompts.js');
 
+// arch_review / arch_import moved to the agent-manager-hygiene plugin (2026-08-27), so
+// requiring ./prompts.js no longer wires their builders. These tests exercise
+// archReview*/archImport*Prompt's own behaviour (still defined and exported by prompts.js),
+// so register minimal sources here so buildPlanPrompt/buildImplementPrompt resolve to them.
+{
+  const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const p = require('./prompts.js');
+  for (const [name, plan, impl] of [
+    ['arch_review', p.archReviewPlanPrompt, p.archReviewImplementPrompt],
+    ['arch_import', p.archImportPlanPrompt, p.archImportImplementPrompt],
+  ]) {
+    if (!getRegisteredSource(name)) {
+      registerTaskSource(name, { priority: 70, next: () => null, emptyApproval: true, candidateFulfillment: true });
+      updateTaskSource(name, { buildPlanPrompt: plan, buildImplementPrompt: impl });
+    }
+  }
+}
+
 // Real failing content, not synthetic: this is the actual blocked task found live
 // 2026-07-21 (deep-dive-autogen-microsoft-20, still sitting in queue/blocked/ at the time
 // this test was written). Its promptContext serializes to ~13.6KB -- comfortably over the
