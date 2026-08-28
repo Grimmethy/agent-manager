@@ -198,12 +198,16 @@ function getConfig() {
   // not configurable, since their whole identity IS their domain.
   const defaultDomain = process.env.AGENT_MANAGER_DEFAULT_DOMAIN || 'default';
 
-  // Side-effect require: the consumer's own file that calls registerTaskSource/
-  // updateTaskSource for every task source it wants (both fully local ones and ones built
+  // Side-effect require: the consumer's own file(s) that call registerTaskSource/
+  // updateTaskSource for every task source they want (both fully local ones and ones built
   // from this package's exported prompt-builder/apply helpers). Every CLI entry point in
   // this package that needs a populated registry (get-grounding-source.js, apply-task.js,
   // task-sources.js's getNextTask) requires it via this single hook instead of each
   // hardcoding a sibling file name -- the old single-consumer-only pattern this replaces.
+  //
+  // Comma-separated: a deployment can point at more than one independently-versioned
+  // plugin (e.g. `.../agent-manager-hygiene/register.js,.../my-other-plugin/register.js`).
+  // ensureRegistered() requires each in listed order; a single path is the common case.
   const registerPath = process.env.AGENT_MANAGER_REGISTER_PATH;
 
   // Optional allowlist restricting getNextTask() (task-sources.js) to specific source
@@ -290,7 +294,10 @@ function ensureRegistered() {
   if (registered) return;
   registered = true;
   const { registerPath } = getConfig();
-  if (registerPath) require(registerPath);
+  if (!registerPath) return;
+  for (const p of registerPath.split(',').map((s) => s.trim()).filter(Boolean)) {
+    require(p);
+  }
 }
 
 module.exports = { getConfig, ensureRegistered, resolveGraphPath };
