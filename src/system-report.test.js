@@ -6,6 +6,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// system-report.js now calls ensureRegistered() at load (classifyTask reads each source's
+// reportClass off the registry) -- that path requires AGENT_MANAGER_REPO_ROOT the same as
+// every other CLI entry point, and the real registerTaskSource() calls in task-sources.js
+// have to have run for classifyTask's assertions to mean anything. Matches review-task.test.js.
+process.env.AGENT_MANAGER_REPO_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'system-report-root-'));
+process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+require('./task-sources.js');
+
 const {
   classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting,
   computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns, buildPlainEnglishSummary, fmtLocal,
@@ -42,6 +50,27 @@ test('classifyTask: manual/adhoc and arch_import/discovery/deep_dive/project_sea
 test('classifyTask: brain_dump_sort/path_prefetch_resolve are housekeeping', () => {
   assert.equal(classifyTask({ source: 'brain_dump_sort' }, 'done'), 'housekeeping');
   assert.equal(classifyTask({ source: 'path_prefetch_resolve' }, 'done'), 'housekeeping');
+});
+
+// ADR-0022 Stage A3: classifyTask no longer hardcodes the source->bucket mapping; it reads
+// reportClass off the registry (string, or a (task) => bucket for the review split). Guard
+// the seam so a future refactor can't silently drop it.
+test('classifyTask: reads reportClass off the registry -- string and (task) => bucket forms', () => {
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('sa3_probe_static')) {
+    registerTaskSource('sa3_probe_static', { priority: 50, next: () => null, reportClass: 'filtering' });
+  }
+  if (!getRegisteredSource('sa3_probe_dynamic')) {
+    registerTaskSource('sa3_probe_dynamic', {
+      priority: 50, next: () => null,
+      reportClass: (t) => (t.implementResponse === 'good' ? 'benefit' : 'unclear'),
+    });
+  }
+  assert.equal(classifyTask({ source: 'sa3_probe_static' }, 'done'), 'filtering');
+  assert.equal(classifyTask({ source: 'sa3_probe_dynamic', implementResponse: 'good' }, 'done'), 'benefit');
+  assert.equal(classifyTask({ source: 'sa3_probe_dynamic', implementResponse: 'meh' }, 'done'), 'unclear');
+  // a registered source with no reportClass still falls through to the hardcoded fallback
+  assert.equal(classifyTask({ source: 'sa3_probe_static' }, 'blocked'), 'junk');
 });
 
 test('scanTaskActivity: only includes tasks whose terminal history timestamp falls in the window', () => {
