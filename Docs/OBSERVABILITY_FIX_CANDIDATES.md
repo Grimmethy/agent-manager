@@ -472,3 +472,29 @@ Replace the comment-only catch body with a single console.warn (or the project l
 
 Benefits:
 Makes the previously silent failure greppable in logs with a stable [local-draft] prefix, preserves existing control flow and downstream behavior exactly, and introduces no new dependencies or refactoring.
+
+### AC-33 · AC-32: Add console.warn log line to the projectSearchFetch catch block in src/local-draft.js
+Strength: Strong
+Files: src/local-draft.js
+
+Problem:
+The catch block that handles a runSearches (project-search-fetch.js) failure in src/local-draft.js currently has a comment-only body with no executable statement. When the fetch fails, the failure is silently swallowed with no log output, making it invisible in production/CI logs. The target catch block sits in the truncated portion of the file (beyond the visible findUnverifiedEdit function), so the exact existing comment text, the catch-parameter name, and whether a project-level logger import exists at the top of the file are all unconfirmed from the visible content. A safe edit requires first opening the file and reading the exact catch-clause text verbatim.
+
+Solution:
+Open src/local-draft.js and locate the catch clause whose surrounding context references runSearches / project-search-fetch. Record the exact catch-parameter name and the exact existing comment text. Confirm no project logger (logger/log import) is present in the visible import block (lines 1–50 show only fs, path, and domain-specific requires — no generic logger). Insert one line immediately after the existing comment: console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results', <catchParam>); Do not add return, throw, break, continue, await, or any control-flow statement. Do not modify any line outside this catch body. Do not introduce a new import.
+
+Benefits:
+A single warning-level log line makes the previously silent fetch failure visible in stdout/stderr logs, enabling operators to correlate a degraded project_search draft (empty searchResults) with the underlying network/API error. The [local-draft] prefix keeps it greppable alongside other local-draft.js log lines. No new dependency, no control-flow change, searchResults still retains its pre-catch value of [].
+
+### AC-34 · AC-32 (contingent): Add metrics counter increment alongside the log line if a counter helper is already in scope
+Strength: Strong
+Files: src/local-draft.js
+
+Problem:
+The plan's step 3 calls for a metrics counter increment only if a counter helper (e.g. metrics.increment, a stats client, etc.) is already imported or in-scope in src/local-draft.js. The visible import block (lines 1–50) includes recordCall from model-stats-client.js and appendHistoryEvent from task-history.js, but no generic metrics.increment or counter helper. If no such helper exists, this step is a no-op. If one does exist (perhaps imported in the truncated portion), a one-line counter increment should follow the log line to give observability dashboards a numeric signal of fetch-failure frequency.
+
+Solution:
+Search the full file (including the truncated portion) for an existing metrics/counter helper import or in-scope binding (e.g. metrics.increment, stats.bump, a counter object). If found, insert one line immediately after the console.warn line added by the first candidate, using that helper with a key consistent with the file's existing naming convention (e.g. local_draft_search_fetch_fail). If no such helper is confirmed, omit this line entirely — do not introduce a new import or dependency. This candidate is entirely conditional and may resolve to a no-op.
+
+Benefits:
+If a counter helper already exists, a one-line increment gives dashboards and alerting a numeric rate of search-fetch failures without adding any new dependency. If it does not exist, the candidate is safely skipped with zero surface area added, preserving the narrow scope of the fix.
