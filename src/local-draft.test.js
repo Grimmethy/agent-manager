@@ -35,7 +35,7 @@ function registerHygieneStubs() {
   stub('observability_review', { apply: () => ({ skipped: true }), advisoryProse: true });
   stub('observability_fix', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
   stub('arch_review', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath, candidateDocTitle: '# Architecture Review Candidates', reasoningTier: 'high' });
-  stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }) }, p.archImportPlanPrompt, p.archImportImplementPrompt);
+  stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }), harnessSearch: 'archImport', skipImplementWhenNoHarnessHits: true }, p.archImportPlanPrompt, p.archImportImplementPrompt);
 }
 
 function withFixtureRepo(fn) {
@@ -336,6 +336,44 @@ test('arch_import skips the implement call entirely (deterministic empty, not le
     assert.equal(task.implementResponse, '');
     assert.equal(callCount, 1, 'only the plan call should have happened');
     assert.equal(task.status, 'needs-review');
+  });
+});
+
+// ADR-0022 Stage A4: the between-plan-and-implement harness-search step is driven by the
+// source's `harnessSearch` registry field, not a per-source `if` chain in draftTask. Guard
+// both the dispatch (a 'projectSearch' source runs projectSearchFetch and stashes
+// searchResults) and the negative case (a source with no field runs no search).
+test('draftTask runs harness search iff the source declares harnessSearch, and picks the fetch by its value', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    // Prompt builders are irrelevant here (localCall is injected) -- reuse two the registry
+    // exports so buildPlanPrompt/buildImplementPrompt don't throw before the harness step.
+    registerTaskSource('sa4_probe_psearch', { priority: 80, next: () => null, emptyApproval: true, harnessSearch: 'projectSearch' });
+    updateTaskSource('sa4_probe_psearch', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+
+    let fetchArgs = null;
+    const projectSearchFetch = async (queries) => { fetchArgs = queries; return [{ name: 'real/result', url: 'u' }]; };
+    const localCall = async () => ({ response: 'QUERY: some real query\nQUERY: another', degenerate: null, attempts: 1 });
+
+    const task = { id: 'sa4-psearch', domain: 'default', source: 'sa4_probe_psearch', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, projectSearchFetch, withLockFn: async (d, fn) => fn() });
+
+    assert.deepEqual(fetchArgs, ['some real query', 'another'], 'QUERY: lines parsed and passed to the declared fetch');
+    assert.equal(task.promptContext.searchResults.length, 1);
+    assert.ok((task.history || []).some((e) => e.stage === 'harness-search'), 'a harness-search history event was appended');
+  });
+});
+
+test('draftTask runs NO harness search for a source without harnessSearch (searchResults/harnessHits stay unset)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const localCall = async () => ({ response: 'QUERY: this must be ignored', degenerate: null, attempts: 1 });
+    // trouble_log: an ordinary local source with no harnessSearch field.
+    const task = { id: 'sa4-none', domain: 'default', source: 'trouble_log', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    assert.equal(task.promptContext.searchResults, undefined);
+    assert.equal(task.promptContext.harnessHits, undefined);
+    assert.ok(!(task.history || []).some((e) => e.stage === 'harness-search'));
   });
 });
 
