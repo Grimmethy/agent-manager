@@ -31,10 +31,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { readSamplesInWindow } = require('./uptime-log.js');
 const { signatureForTask } = require('./pipeline-self-audit.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+
+// classifyTask() reads each source's own reportClass off the registry (see its comment).
+// Populate it with this repo's built-ins + any AGENT_MANAGER_REGISTER_PATH plugin sources,
+// same as the loop entry points do -- queue-watcher.sh runs this CLI with the env sourced.
+ensureRegistered();
 
 const PERIOD_MS = { hourly: 60 * 60 * 1000, daily: 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
 
@@ -73,6 +79,18 @@ function terminalTimestamp(task) {
 //                    as everywhere else in this pipeline.
 function classifyTask(task, queueState) {
   if (queueState === 'blocked' || queueState === 'archived') return 'junk';
+
+  // A task source declares how its completed tasks count toward this accounting via
+  // reportClass on its registration -- a plain bucket string, or a (task) => bucket|null
+  // for a source that decides from the draft text (observability/performance review split
+  // filtering vs. benefit on what the verdict actually said). ADR-0022 Stage A3: the
+  // hardcoded branches below are the fallback for sources that don't declare it, and for
+  // when a plugin that would isn't loaded; Stage G removes them.
+  const registered = getRegisteredSource(resolveSourceName(task));
+  const declared = typeof registered?.reportClass === 'function'
+    ? registered.reportClass(task)
+    : registered?.reportClass;
+  if (declared) return declared;
 
   const source = task.source;
   if (source === 'observability_review' || source === 'performance_review') {

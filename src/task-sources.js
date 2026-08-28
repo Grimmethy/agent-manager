@@ -1494,7 +1494,7 @@ function adhocReviewCompletenessQuestion(task) {
   return task.adhocResolution === 'decompose' ? ADHOC_DECOMPOSE_COMPLETENESS_QUESTION : null;
 }
 
-registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion });
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'benefit' });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
 // task" priority tier as adhoc, and reasoningTier: 'high' is UNCONDITIONAL (unlike
 // path_prefetch_resolve's two-tier design) -- the local model has no web tools at all, so there is
@@ -1537,7 +1537,7 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // profile existed, since local-draft.js's own call sites unconditionally requested
 // think:true and had no way to know this profile's model couldn't honor it).
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', reviewGuidance: BRAIN_DUMP_SORT_REVIEW_GUIDANCE, reviewCompletenessQuestion: BRAIN_DUMP_SORT_COMPLETENESS_QUESTION });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', reviewGuidance: BRAIN_DUMP_SORT_REVIEW_GUIDANCE, reviewCompletenessQuestion: BRAIN_DUMP_SORT_COMPLETENESS_QUESTION, reportClass: 'housekeeping' });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -1549,6 +1549,7 @@ registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort'
 registerTaskSource('path_prefetch_resolve', {
   priority: taskPriority('path_prefetch_resolve', 45),
   next: nextPathPrefetchResolveTask,
+  reportClass: 'housekeeping',
 });
 // observability_review/observability_fix, performance_review/performance_fix -- moved
 // to src/maintenance/observability-review.js and src/maintenance/performance-review.js
@@ -1831,8 +1832,8 @@ function markStalenessAuditReported(task) {
 }
 
 
-registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE });
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit' });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit' });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
