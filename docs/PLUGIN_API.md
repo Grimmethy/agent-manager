@@ -21,26 +21,37 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 |---|---|---|
 | `task-source-registry.js` | `registerTaskSource`, `updateTaskSource`, `getRegisteredSource`, `getRegisteredSources`, `clearRegistry` | the wiring seam. `clearRegistry` / `getRegisteredSource(s)` are for the plugin's own tests. |
 | `config.js` | `getConfig`, `resolveGraphPath` | the plugin passes `getConfig` into each module's `register(deps)`. It never calls `ensureRegistered` — core does. |
-| `task-sources.js` | `nextCandidateFulfillmentTask`, `taskIdExistsInQueue`, `taskPriority`, `windowFetchedFileContent` | `nextCandidateFulfillmentTask` + its windowing helpers stay in core because `backlog_fulfillment` also uses them. Injected via `register(deps)`. |
-| `candidate-docs.js` | `applyArchDiscoveryCandidates`, `parseArchDiscoveryCandidates`, `nextAvailableCandidateId`, `isEffectivelyEmptyResponse` | AC-NNN candidate-doc primitives, shared with core `backlog_decomposition`. `apply-group-a.js` re-exports them for back-compat. |
+| `task-sources.js` | `taskIdExistsInQueue`, `taskPriority` | `taskIdExistsInQueue` is a general queue primitive; `taskPriority` reads the priority-override map. Injected via `register(deps)`. `nextCandidateFulfillmentTask` / `windowFetchedFileContent` are still re-exported here for back-compat but the SDK path below is canonical. |
+| **`sdk/candidate-fulfillment.js`** | `nextCandidateFulfillmentTask`, `windowFetchedFileContent`, plus all of `candidate-docs.js` re-exported | **SDK helpers (ADR-0022 Stage D).** The candidate-fulfillment lifecycle in one module: read an `### AC-NNN` doc, pick the oldest actionable Strong candidate, ground it in real windowed file content. Core ships and documents this but registers nothing with it — `backlog_fulfillment` and the plugin's `arch_review` / `*_fix` are all consumers. Also lower-level grounding helpers (`findFuzzyMatch`, `windowAroundIndex`, `snippetFromSection`, `quotedSymbolsFromSection`, `MAX_FETCHED_FILE_CHARS`, `MAX_ARCH_REVIEW_TASK_CHARS`) for a plugin's own grounding tests. |
+| `candidate-docs.js` | `applyArchDiscoveryCandidates`, `parseArchDiscoveryCandidates`, `nextAvailableCandidateId`, `isEffectivelyEmptyResponse` | AC-NNN candidate-doc *write* primitives, shared with core `backlog_decomposition`. `apply-group-a.js` and `sdk/candidate-fulfillment.js` both re-export them. |
 | `apply-group-a.js` | `applyVerdictOnly` | shared with core `staleness_audit` — a plain prose verdict is a documented no-op at apply. |
 | `prompts.js` | `groupBJsonInstructions`, `candidateSplitInstructions`, `formatFileContents`, `archReviewPlanPrompt`, `archReviewImplementPrompt`, `archDiscoveryPlanPrompt`, `archDiscoveryImplementPrompt`, `archImportPlanPrompt`, `archImportImplementPrompt`, `unusedExportPlanPrompt` | the arch/unused prompt-builder *bodies* stay here (core `backlog_fulfillment` still reuses `archReview*`); the plugin does their `updateTaskSource` wiring itself. |
 | `atomic-write.js` | `writeAtomicSync`, `writeJsonAtomicSync` | dependency-free; safe. |
-| `maintenance/observability-scan.js` | `scanProject`, `findSilentCatchBlocks`, `findUnguardedLoops`, `findOtelNamingViolations`, `hasOtelDependency`, `findMissingReservedAttributes` | **pure detectors stay in core** — `staleness-fastpath.js` re-runs their rules for the deterministic staleness recheck (see `src/maintenance/README.md`). The plugin imports them for its own `*-review.js` scan step. |
-| `maintenance/performance-scan.js` | `scanProject`, `findLoopBodyIssues`, `findJsonDeepCloneAntipattern` | same. |
-| `maintenance/function-length-scan.js` | `scanProject`, `findLongFunctions`, `countLines`, `maxFunctionLines`, `DEFAULT_MAX_FUNCTION_LINES` | same (no `staleness-fastpath` rule, but kept in core for symmetry). |
-| `maintenance/scan-utils.js` | `listSourceFiles`, `isLikelyMinified`, `lineOfIndex`, `extractBraceBody`, `MINIFIED_LINE_LENGTH_THRESHOLD`, `SKIP_DIRS` | the shared scanner toolkit. Zero `src/` deps — the bottom of the tree. |
+| `deterministic-recheck-registry.js` | `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry` | ADR-0022 Stage B. The plugin registers `{ perFileRules, repoWideRules }` per `originalSource`; core's `staleness-fastpath.js` looks them up with zero source-name knowledge. `clear` / `get*` are for the plugin's own tests. The deterministic scanner rule functions themselves live in the plugin (ADR-0022 Stage C) — core imports nothing from `src/maintenance/` any more; that directory is gone. |
 | `model-profile-registry.js` | `clearModelProfileRegistry` | plugin tests only (fresh-registry setup). |
+
+## No source-name literals in core
+
+As of ADR-0022 Stage G, no core `src/*.js` production file names a plugin-owned task source.
+Every behaviour that used to switch on `task.source === 'arch_review'` (etc.) reads a field
+off the source's registration — `directToMain`, `reviewGuidance` / `reviewCompletenessQuestion`,
+`reportClass`, `harnessSearch` / `skipImplementWhenNoHarnessHits` — or a purpose-built registry
+(`deterministic-recheck-registry.js`). `src/no-plugin-source-names.test.js` enforces this.
+
+Known, deliberate exceptions:
+
+- **`src/arch-discovery-structcheck.js`** names `arch_discovery` / `arch_import` — it is
+  invoked by hardcoded path from `src/local-worker.ps1` (the Windows worker) and is
+  arch-specific by nature. Allowlisted in the guard test. Not reached on the Linux path.
+- **`python/dashboard/app.py`'s `SOURCE_DESCRIPTIONS` / `_SOURCE_TO_DOMAIN_KEY`** name every
+  source, plugin ones included. This is the dashboard's server-side *display* catalog for a
+  unified Job List across all loaded plugins — human-authored one-line copy plus a
+  domain-key map with a documented silent-failure mode if wrong. Making it fully
+  topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
+  fallback) is a self-contained dashboard refactor, tracked separately.
 
 ## Known warts
 
-- **`resolveSourceName`'s `deadcode_triage → unused_export` line** (`task-source-registry.js`)
-  is core-side knowledge of a plugin source's task-label aliasing. It's pure data and
-  harmless, kept as a fallback rather than replaced with a `registerSourceAlias()` call.
-- **`--dump-topology`'s `DIRECT_TO_MAIN_SOURCES` literal** (`task-sources.js`) and
-  `apply-task.js`'s copy both name `arch_discovery` / `arch_import` explicitly. They match
-  by `task.source` string, so they keep working across the plugin boundary, but the two
-  literals must stay in sync with each other and with the plugin's registrations.
 - **Deep imports, no `exports` map.** A plugin reaching past this contract into a private
   internal is unsupported and may break without notice. If the surface needs to grow, add
   the export here and to `plugin-api.test.js` in the same change.

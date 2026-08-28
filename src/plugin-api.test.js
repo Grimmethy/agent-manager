@@ -15,6 +15,7 @@ const CONTRACT = {
   './task-source-registry.js': { functions: ['registerTaskSource', 'updateTaskSource', 'getRegisteredSource', 'getRegisteredSources', 'clearRegistry'] },
   './config.js': { functions: ['getConfig', 'resolveGraphPath'] },
   './task-sources.js': { functions: ['nextCandidateFulfillmentTask', 'taskIdExistsInQueue', 'taskPriority', 'windowFetchedFileContent'] },
+  './sdk/candidate-fulfillment.js': { functions: ['nextCandidateFulfillmentTask', 'windowFetchedFileContent', 'applyArchDiscoveryCandidates', 'parseArchDiscoveryCandidates', 'nextAvailableCandidateId', 'isEffectivelyEmptyResponse'] },
   './candidate-docs.js': { functions: ['applyArchDiscoveryCandidates', 'parseArchDiscoveryCandidates', 'nextAvailableCandidateId', 'isEffectivelyEmptyResponse'] },
   './apply-group-a.js': { functions: ['applyVerdictOnly'] },
   './prompts.js': {
@@ -28,10 +29,7 @@ const CONTRACT = {
     other: { groupBJsonInstructions: 'string', candidateSplitInstructions: 'string' },
   },
   './atomic-write.js': { functions: ['writeAtomicSync', 'writeJsonAtomicSync'] },
-  './maintenance/observability-scan.js': { functions: ['scanProject', 'findSilentCatchBlocks', 'findUnguardedLoops', 'findOtelNamingViolations', 'hasOtelDependency', 'findMissingReservedAttributes'] },
-  './maintenance/performance-scan.js': { functions: ['scanProject', 'findLoopBodyIssues', 'findJsonDeepCloneAntipattern'] },
-  './maintenance/function-length-scan.js': { functions: ['scanProject', 'findLongFunctions', 'maxFunctionLines'] },
-  './maintenance/scan-utils.js': { functions: ['listSourceFiles', 'isLikelyMinified', 'lineOfIndex', 'extractBraceBody'] },
+  './deterministic-recheck-registry.js': { functions: ['registerDeterministicRecheck', 'getDeterministicRecheck', 'getRecheckSources', 'clearDeterministicRecheckRegistry'] },
   './model-profile-registry.js': { functions: ['clearModelProfileRegistry'] },
 };
 
@@ -60,15 +58,10 @@ test('plugin API: candidate-docs.js exports are the same objects apply-group-a.j
   }
 });
 
-test('plugin API: DIRECT_TO_MAIN literals in task-sources.js and apply-task.js agree', () => {
+test('plugin API: apply-task.js reads directToMain off the registry, not a source-name literal (ADR-0022 Stage G)', () => {
   const fs = require('fs');
   const path = require('path');
-  const grab = (file) => {
-    const m = fs.readFileSync(path.join(__dirname, file), 'utf8').match(/DIRECT_TO_MAIN_SOURCES\s*=\s*new Set\(\[([^\]]+)\]\)/);
-    return m ? new Set(m[1].match(/'([^']+)'/g).map((s) => s.slice(1, -1))) : null;
-  };
-  const a = grab('task-sources.js');
-  const b = grab('apply-task.js');
-  assert.ok(a && b, 'both files must still declare a DIRECT_TO_MAIN_SOURCES literal');
-  assert.deepEqual([...a].sort(), [...b].sort(), 'task-sources.js and apply-task.js DIRECT_TO_MAIN_SOURCES must match (see docs/PLUGIN_API.md "Known warts")');
+  const applySrc = fs.readFileSync(path.join(__dirname, 'apply-task.js'), 'utf8');
+  assert.doesNotMatch(applySrc, /DIRECT_TO_MAIN_SOURCES\s*=\s*new Set/, 'the source-name literal must be gone');
+  assert.match(applySrc, /registered\.directToMain === true/, 'must gate on the registry field');
 });

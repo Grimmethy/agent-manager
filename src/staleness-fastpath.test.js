@@ -4,6 +4,13 @@
 // incident this fixes: a staleness_audit task for a scanner-originated finding burned all
 // 3 infra-requeue rounds on real local-model timeouts and permanently blocked, needing a
 // human to manually re-derive an answer a regex could give with certainty).
+//
+// ADR-0022 Stage B: the rule->detector wiring moved out of staleness-fastpath.js into
+// deterministic-recheck-registry.js; agent-manager-hygiene registers the real
+// observability_review / performance_review rechecks (and its own test suite exercises
+// them end to end against fixture repos). These tests register FIXTURE rules and cover
+// what stays in core: the registry lookup, per-file vs repo-wide dispatch, the repoRoot
+// path-safety check, file IO / ENOENT handling, and the report-text templates.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -11,8 +18,39 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { deterministicRecheck } = require('./staleness-fastpath.js');
+const {
+  registerDeterministicRecheck,
+  clearDeterministicRecheckRegistry,
+} = require('./deterministic-recheck-registry.js');
+
+// A per-file fixture rule: "fires" once per line containing TODO. A repo-wide fixture
+// rule: "fires" once if the repo has no MARKER file. Both return scanProject's
+// { file, line, detail } finding shape.
+function registerFixtureRules() {
+  clearDeterministicRecheckRegistry();
+  registerDeterministicRecheck('observability_review', {
+    perFileRules: {
+      'todo-marker': (text, relPath) => text.split('\n').flatMap((ln, i) => (
+        ln.includes('TODO') ? [{ file: relPath, line: i + 1, detail: `TODO at line ${i + 1}` }] : []
+      )),
+    },
+    repoWideRules: {
+      'needs-marker-file': (repoRoot) => (
+        fs.existsSync(path.join(repoRoot, 'MARKER'))
+          ? []
+          : [{ file: '<repo>', line: 0, detail: 'MARKER file absent' }]
+      ),
+    },
+  });
+  registerDeterministicRecheck('performance_review', {
+    perFileRules: {
+      'slow-marker': (text, relPath) => (text.includes('SLOW') ? [{ file: relPath, line: 1, detail: 'SLOW' }] : []),
+    },
+  });
+}
 
 function makeFixtureRepo() {
+  registerFixtureRules();
   return fs.mkdtempSync(path.join(os.tmpdir(), 'staleness-fastpath-test-'));
 }
 
@@ -21,28 +59,27 @@ function stalenessTask(overrides) {
     id: 'staleness-audit-x-1',
     source: 'staleness_audit',
     promptContext: {
-      originalTaskId: 'observability-x-silent-catch-block-worker-js-3',
+      originalTaskId: 'observability-x-todo-marker-worker-js-3',
       originalSource: 'observability_review',
-      originalRule: 'silent-catch-block',
+      originalRule: 'todo-marker',
       originalFile: 'worker.js',
       ...overrides,
     },
   };
 }
 
-test('deterministicRecheck returns null when originalSource is unsupported (e.g. adhoc)', () => {
+test('deterministicRecheck returns null when originalSource has no registered recheck (e.g. adhoc)', () => {
   const dir = makeFixtureRepo();
-  const task = stalenessTask({ originalSource: 'adhoc' });
-  assert.equal(deterministicRecheck(task, dir), null);
+  assert.equal(deterministicRecheck(stalenessTask({ originalSource: 'adhoc' }), dir), null);
 });
 
-test('deterministicRecheck returns null when originalRule is not in RULE_DETECTORS or REPO_WIDE_RULE_DETECTORS', () => {
+test('deterministicRecheck returns null when originalRule is in neither perFileRules nor repoWideRules', () => {
   const dir = makeFixtureRepo();
-  const task = stalenessTask({ originalRule: 'some-rule-that-does-not-exist' });
-  assert.equal(deterministicRecheck(task, dir), null);
+  assert.equal(deterministicRecheck(stalenessTask({ originalRule: 'some-rule-that-does-not-exist' }), dir), null);
 });
 
 test('deterministicRecheck returns null when repoRoot/originalFile/originalRule/originalSource are missing', () => {
+  makeFixtureRepo();
   assert.equal(deterministicRecheck(stalenessTask(), null), null);
   assert.equal(deterministicRecheck(stalenessTask({ originalFile: null }), '/tmp'), null);
   assert.equal(deterministicRecheck({ source: 'staleness_audit', promptContext: {} }, '/tmp'), null);
@@ -50,8 +87,7 @@ test('deterministicRecheck returns null when repoRoot/originalFile/originalRule/
 
 test('deterministicRecheck recommends archive when the file no longer exists', () => {
   const dir = makeFixtureRepo();
-  const task = stalenessTask();
-  const verdict = deterministicRecheck(task, dir); // worker.js was never written
+  const verdict = deterministicRecheck(stalenessTask(), dir); // worker.js was never written
   assert.ok(verdict);
   assert.equal(verdict.recommendation, 'archive');
   assert.equal(verdict.hits.length, 0);
@@ -61,9 +97,8 @@ test('deterministicRecheck recommends archive when the file no longer exists', (
 
 test('deterministicRecheck recommends archive when the flagged rule no longer fires anywhere in the file', () => {
   const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch (e) {\n  logger.error(e);\n}\n');
-  const task = stalenessTask();
-  const verdict = deterministicRecheck(task, dir);
+  fs.writeFileSync(path.join(dir, 'worker.js'), 'const x = 1;\nreturn x;\n');
+  const verdict = deterministicRecheck(stalenessTask(), dir);
   assert.ok(verdict);
   assert.equal(verdict.recommendation, 'archive');
   assert.equal(verdict.hits.length, 0);
@@ -72,86 +107,76 @@ test('deterministicRecheck recommends archive when the flagged rule no longer fi
 
 test('deterministicRecheck recommends investigate when the flagged rule still fires', () => {
   const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
-  const task = stalenessTask();
-  const verdict = deterministicRecheck(task, dir);
+  fs.writeFileSync(path.join(dir, 'worker.js'), 'const x = 1; // TODO drop this\n');
+  const verdict = deterministicRecheck(stalenessTask(), dir);
   assert.ok(verdict);
   assert.equal(verdict.recommendation, 'investigate');
   assert.equal(verdict.hits.length, 1);
   assert.equal(verdict.hits[0].file, 'worker.js');
+  assert.equal(verdict.hits[0].query, 'deterministic-rescan');
   assert.match(verdict.reportText, /RECOMMENDATION: worth a fresh investigation/);
 });
 
-test('deterministicRecheck still finds a still-live rule even when its line number has drifted', () => {
+test('deterministicRecheck reports a still-live rule regardless of which line it now sits on', () => {
   const dir = makeFixtureRepo();
-  // The original finding was filed against an earlier version of this file where the
-  // catch sat near the top; unrelated lines were added above it since -- this must not
-  // be read as "resolved" just because the line moved.
   const padding = Array.from({ length: 30 }, (_, i) => `const unrelated${i} = ${i};`).join('\n');
-  fs.writeFileSync(path.join(dir, 'worker.js'), `${padding}\ntry {\n  risky();\n} catch {}\n`);
-  const task = stalenessTask();
-  const verdict = deterministicRecheck(task, dir);
+  fs.writeFileSync(path.join(dir, 'worker.js'), `${padding}\nx(); // TODO still here\n`);
+  const verdict = deterministicRecheck(stalenessTask(), dir);
   assert.equal(verdict.recommendation, 'investigate');
+  assert.match(verdict.reportText, /at line 31/);
 });
 
 test('deterministicRecheck refuses to read outside repoRoot', () => {
   const dir = makeFixtureRepo();
-  const task = stalenessTask({ originalFile: '../../../../etc/passwd' });
-  assert.equal(deterministicRecheck(task, dir), null);
+  assert.equal(deterministicRecheck(stalenessTask({ originalFile: '../../../../etc/passwd' }), dir), null);
 });
 
-test('deterministicRecheck works for performance_review rules too (sequential-await-in-loop)', () => {
+test('deterministicRecheck dispatches per-source: a performance_review rule uses that source\'s config', () => {
   const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'worker.js'), 'for (const x of xs) {\n  await fetch(x);\n}\n');
-  const task = stalenessTask({
-    originalTaskId: 'performance-x-sequential-await-in-loop-worker-js-1',
+  fs.writeFileSync(path.join(dir, 'worker.js'), 'doSLOWthing();\n');
+  const verdict = deterministicRecheck(stalenessTask({
     originalSource: 'performance_review',
-    originalRule: 'sequential-await-in-loop',
-  });
-  const verdict = deterministicRecheck(task, dir);
+    originalRule: 'slow-marker',
+  }), dir);
   assert.equal(verdict.recommendation, 'investigate');
   assert.equal(verdict.hits.length, 1);
 });
 
-// missing-reserved-attribute is REPO-WIDE (no single file/line -- a project either has
-// service.name/error.type somewhere in its source or it doesn't), so it needs its own
-// coverage separate from the per-file RULE_DETECTORS tests above -- originalFile is null
-// on a real task for this rule, matching observability-scan.js's own finding shape.
-function missingReservedAttributeTask(overrides) {
+test('deterministicRecheck returns null for a rule registered under a DIFFERENT source', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'worker.js'), 'x(); // TODO\n');
+  // todo-marker lives under observability_review, not performance_review.
+  assert.equal(deterministicRecheck(stalenessTask({ originalSource: 'performance_review' }), dir), null);
+});
+
+// Repo-wide rules: originalFile is null, the detector takes repoRoot.
+function repoWideTask(overrides) {
   return {
-    id: 'staleness-audit-mra-1',
+    id: 'staleness-audit-rw-1',
     source: 'staleness_audit',
     promptContext: {
-      originalTaskId: 'observability-x-missing-reserved-attribute-repo-0',
+      originalTaskId: 'observability-x-needs-marker-file-repo-0',
       originalSource: 'observability_review',
-      originalRule: 'missing-reserved-attribute',
+      originalRule: 'needs-marker-file',
       originalFile: null,
       ...overrides,
     },
   };
 }
 
-test('deterministicRecheck (missing-reserved-attribute) recommends archive when the project has no OpenTelemetry dependency at all', () => {
+test('deterministicRecheck (repo-wide) recommends archive when the repo-wide rule no longer fires', () => {
   const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: {} }));
-  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
+  fs.writeFileSync(path.join(dir, 'MARKER'), '');
+  const verdict = deterministicRecheck(repoWideTask(), dir);
   assert.equal(verdict.recommendation, 'archive');
+  assert.match(verdict.reportText, /repo-wide check/);
   assert.match(verdict.reportText, /RECOMMENDATION: archive/);
 });
 
-test('deterministicRecheck (missing-reserved-attribute) recommends archive once both reserved attributes are present in source', () => {
-  const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: { '@opentelemetry/api': '^1.0.0' } }));
-  fs.writeFileSync(path.join(dir, 'tracing.js'), "resource.setAttribute('service.name', 'x');\nspan.setAttribute('error.type', e.name);\n");
-  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
-  assert.equal(verdict.recommendation, 'archive');
-});
-
-test('deterministicRecheck (missing-reserved-attribute) recommends investigate when a reserved attribute is still genuinely missing', () => {
-  const dir = makeFixtureRepo();
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: { '@opentelemetry/api': '^1.0.0' } }));
-  fs.writeFileSync(path.join(dir, 'tracing.js'), "resource.setAttribute('service.name', 'x');\n"); // error.type still missing
-  const verdict = deterministicRecheck(missingReservedAttributeTask(), dir);
+test('deterministicRecheck (repo-wide) recommends investigate when the repo-wide rule still fires', () => {
+  const dir = makeFixtureRepo(); // no MARKER file
+  const verdict = deterministicRecheck(repoWideTask(), dir);
   assert.equal(verdict.recommendation, 'investigate');
   assert.ok(verdict.hits.length > 0);
+  assert.match(verdict.reportText, /worth a fresh investigation/);
 });

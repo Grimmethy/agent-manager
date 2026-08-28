@@ -90,7 +90,6 @@ function resolveSourceName(task) {
   if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
   if (task.domain === 'secondbrain') return 'secondbrain';
   if (sourceAliases[task.source]) return sourceAliases[task.source];
-  if (task.source === 'deadcode_triage') return 'unused_export'; // legacy fallback -- the hygiene plugin also registers this via registerSourceAlias()
   return task.source;
 }
 

@@ -47,6 +47,9 @@ for (const name of ['observability_review', 'performance_review', 'arch_discover
     registerTaskSource(name, {
       priority: 80,
       next: () => null,
+      directToMain: true, // these candidate-generator sources commit straight to main -- the real
+      // agent-manager-hygiene registrations set this; mirror it so the direct-to-main tests below
+      // exercise the same path production does (ADR-0022 Stage G dropped the DIRECT_TO_MAIN_SOURCES literal).
       apply: ({ implementResponse, task }) => applyArchDiscoveryCandidates({
         implementResponse,
         candidatesPath: path.join(PIPELINE_DIR, `${name.toUpperCase()}_CANDIDATES.md`),
@@ -61,6 +64,7 @@ if (!getRegisteredSource('arch_import')) {
   registerTaskSource('arch_import', {
     priority: 81,
     next: () => null,
+    directToMain: true, // see the loop above
     apply: ({ implementResponse, task }) => {
       const { itemId } = task.promptContext; // throws if promptContext is missing
       return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: path.join(PIPELINE_DIR, `ARCH_IMPORT_${itemId || 'x'}.md`) });
