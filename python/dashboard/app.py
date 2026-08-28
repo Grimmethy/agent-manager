@@ -2522,6 +2522,71 @@ def api_adhoc_tasks():
     return jsonify({"tasks": tasks})
 
 
+# --- Live task-source topology -----------------------------------------------------------
+# `node src/task-sources.js --dump-topology` reads the REAL registry (this repo's built-ins
+# PLUS any AGENT_MANAGER_REGISTER_PATH plugin sources -- agent-manager-hygiene owns
+# observability/performance/function-length/arch/unused-export), so the Job List catalog,
+# default priorities, worker types and candidate-doc paths below no longer drift the way a
+# hand-maintained TASK_SOURCE_CATALOG did. Cached briefly (several endpoints hit it per
+# page load); on any failure we fall back to a committed snapshot so a transient node/env
+# hiccup blanks nothing -- never to a hand-typed list.
+_TOPOLOGY_FALLBACK_PATH = Path(__file__).resolve().parent / "task_source_topology_fallback.json"
+_topology_cache: dict = {"at": 0.0, "value": None}
+_TOPOLOGY_TTL_SECONDS = 5.0
+
+
+def _load_topology_fallback() -> list[dict]:
+    try:
+        return json.loads(_TOPOLOGY_FALLBACK_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def load_topology() -> list[dict]:
+    """List of per-source dicts from `--dump-topology` (name, slug, priority, reasoningTier,
+    workerType, candidateFulfillment, candidatesPath, candidateDocTitle, ...). Falls back to
+    the committed snapshot on any error."""
+    now = time.monotonic()
+    if _topology_cache["value"] is not None and now - _topology_cache["at"] < _TOPOLOGY_TTL_SECONDS:
+        return _topology_cache["value"]
+    value = None
+    try:
+        child_env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+        result = subprocess.run(
+            ["node", str(SRC_DIR / "task-sources.js"), "--dump-topology"],
+            capture_output=True, text=True, timeout=15, cwd=str(SRC_DIR), env=child_env,
+        )
+        if result.returncode == 0:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, list) and parsed:
+                value = parsed
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        value = None
+    if value is None:
+        value = _load_topology_fallback()
+    _topology_cache["at"] = now
+    _topology_cache["value"] = value
+    return value
+
+
+def topology_by_name() -> dict:
+    return {s["name"]: s for s in load_topology()}
+
+
+def task_source_catalog() -> list[str]:
+    """Every registered source name, in registry (priority) order. Replaces the old
+    hand-maintained TASK_SOURCE_CATALOG list."""
+    return [s["name"] for s in load_topology()]
+
+
+def task_source_default_priorities() -> dict:
+    return {s["name"]: s.get("priority") for s in load_topology()}
+
+
+def task_source_default_worker_types() -> dict:
+    return {s["name"]: s.get("workerType", "ornith") for s in load_topology()}
+
+
 def arch_candidates_path() -> Path | None:
     """Mirrors src/config.js's archReviewCandidatesPath resolution (env override, else
     <repoRoot>/Docs/ARCH_REVIEW_CANDIDATES.md) -- the dashboard reads the same doc the
@@ -2573,28 +2638,39 @@ def performance_fix_candidates_path() -> Path | None:
 # nextCandidateFulfillmentTask, src/task-sources.js, consumes one Strong entry from at a
 # time); every other source's backlog (an inbox folder size, a flags file, external
 # scanner output) isn't covered here and the column just shows nothing for those rows.
-# Maps source name -> (doc-path getter, task-id prefix nextCandidateFulfillmentTask
-# stamps -- `sourceName.replace(/_/g,'-') + '-' + candidateId.toLowerCase()`).
-CANDIDATE_BACKLOG_SOURCES = {
-    "arch_review": (arch_candidates_path, "arch-review"),
-    "arch_import_review": (arch_import_candidates_path, "arch-import-review"),
-    "observability_fix": (observability_fix_candidates_path, "observability-fix"),
-    "performance_fix": (performance_fix_candidates_path, "performance-fix"),
-}
+# The set of such sources, and each one's candidate-doc path, now comes from
+# load_topology() (candidateFulfillment + candidatesPath) -- so a plugin fulfillment source
+# (observability_fix / performance_fix / function_length_fix / arch_import_review) gets an
+# Available count with no per-source Python mirror to keep in sync. The task-id prefix
+# nextCandidateFulfillmentTask stamps is `slug + '-ac-' + candidateId.toLowerCase()`.
+def candidate_backlog_sources() -> dict:
+    """name -> (candidate-doc Path, task-id prefix) for every registered
+    candidate-fulfillment source that has a resolvable doc path."""
+    repo_root = get_active_repo_root()
+    out = {}
+    for s in load_topology():
+        raw = s.get("candidatesPath")
+        if not s.get("candidateFulfillment") or not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute() and repo_root:
+            p = Path(repo_root) / raw
+        out[s["name"]] = (p, s["slug"])
+    return out
 
 
 def available_candidate_counts() -> dict:
-    """One count per CANDIDATE_BACKLOG_SOURCES entry: Strong-rated candidates in that
+    """One count per candidate_backlog_sources() entry: Strong-rated candidates in that
     source's doc that don't already have a fulfillment task somewhere in the queue (any
     state -- a done/archived one has already been fulfilled, not "available" any more).
     A candidate doc only ever grows (nothing removes an entry once consumed, see
-    apply-group-a.js's applyArchDiscoveryCandidates), so counting doc entries alone would
+    candidate-docs.js's applyArchDiscoveryCandidates), so counting doc entries alone would
     overstate the real backlog more and more over time -- the queue lookup is what keeps
     this an honest "still waiting" number instead of a raw, ever-growing doc size."""
-    counts = {name: None for name in CANDIDATE_BACKLOG_SOURCES}
+    backlog = candidate_backlog_sources()
+    counts = {name: None for name in backlog}
     task_states = _task_state_index(queue_dir())
-    for name, (path_fn, id_prefix) in CANDIDATE_BACKLOG_SOURCES.items():
-        doc_path = path_fn()
+    for name, (doc_path, id_prefix) in backlog.items():
         if not doc_path or not doc_path.is_file():
             continue
         try:
@@ -4866,17 +4942,9 @@ def api_pipeline_status():
 
 # Kept in sync by hand with src/task-sources.js's registerTaskSource() calls, same
 # "Python duplicates Node's knowledge" convention already used for SECOND_BRAIN_DIR above.
-# This is the canonical name list both the Job List tab's isActive checkboxes and
-# /api/pipeline/start's task-domain healing draw from -- there is no mode bundling these
-# into fixed sets anymore (removed 2026-07-23 at Grimmethy's request: job-type activity is
-# a top-level, cross-project setting, the same "sits above any single active project"
-# reasoning as AGENT_MANAGER_BRAIN_DUMP_PATH).
-TASK_SOURCE_CATALOG = [
-    "adhoc", "research_task", "trouble_log", "secondbrain", "brain_dump_sort", "path_prefetch_resolve",
-    "arch_review", "arch_import_review", "arch_discovery", "arch_import", "observability_review",
-    "performance_review",
-    "deep_dive", "project_search", "unused_export", "pipeline_self_audit", "staleness_audit", "observability_fix", "performance_fix",
-]
+# The canonical source-name list (Job List isActive checkboxes, /api/pipeline/start's
+# task-domain healing) now comes from task_source_catalog() -> load_topology(), so it can
+# never drift from the real registry (built-ins + AGENT_MANAGER_REGISTER_PATH plugins).
 
 # Exempt from any allowlist restriction regardless of stored state -- task-sources.js's
 # getNextTask() hardcodes this same exemption ('adhoc': fixed contract per README,
@@ -4896,22 +4964,11 @@ def read_active_job_types() -> set:
     raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_TASK_SOURCES", "")
     listed = {s.strip() for s in raw.split(",") if s.strip()}
     if not listed:
-        return set(TASK_SOURCE_CATALOG)
+        return set(task_source_catalog())
     return listed | ALWAYS_ACTIVE_SOURCES
 
-# Mirrors the priority values templates/index.html's JOB_TYPES constant documents (which
-# itself mirrors src/task-sources.js's registerTaskSource() calls) -- the default a
-# source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no override for it.
-TASK_SOURCE_DEFAULT_PRIORITIES = {
-    "adhoc": 10, "research_task": 10, "trouble_log": 20, "secondbrain": 40, "brain_dump_sort": 42,
-    "path_prefetch_resolve": 45,
-    "arch_review": 70, "arch_import_review": 71, "observability_fix": 72, "performance_fix": 73,
-    "pipeline_self_audit": 65,
-    "arch_discovery": 80, "observability_review": 80,
-    "performance_review": 80,
-    "arch_import": 81, "deep_dive": 82, "project_search": 85, "unused_export": 90,
-    "staleness_audit": 91,
-}
+# The default priority a source falls back to when AGENT_MANAGER_TASK_PRIORITIES has no
+# override -- straight from the registry now (task_source_default_priorities()).
 
 
 def read_task_priorities() -> dict:
@@ -4930,7 +4987,7 @@ def read_task_priorities() -> dict:
             overrides[name] = int(num.strip())
         except ValueError:
             continue
-    return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_PRIORITIES.items()}
+    return {name: overrides.get(name, default) for name, default in task_source_default_priorities().items()}
 
 
 VALID_WORKER_TYPES = ("ornith", "reasoning")
@@ -4940,9 +4997,8 @@ VALID_WORKER_TYPES = ("ornith", "reasoning")
 # to 'low' (Ornith). The default a source falls back to when AGENT_MANAGER_TASK_TIERS has no
 # override for it -- same "Python duplicates Node's knowledge" convention as
 # TASK_SOURCE_DEFAULT_PRIORITIES above.
-TASK_SOURCE_DEFAULT_WORKER_TYPES = {
-    name: ("reasoning" if name in ("adhoc", "research_task") else "ornith") for name in TASK_SOURCE_CATALOG
-}
+# task_source_default_worker_types() -> load_topology(): each source's registered
+# reasoningTier mapped to its worker lane (low->ornith, high->reasoning).
 
 
 def read_worker_types() -> dict:
@@ -4964,7 +5020,7 @@ def read_worker_types() -> dict:
         tier = tier.strip()
         if tier in tier_to_worker_type:
             overrides[name] = tier_to_worker_type[tier]
-    return {name: overrides.get(name, default) for name, default in TASK_SOURCE_DEFAULT_WORKER_TYPES.items()}
+    return {name: overrides.get(name, default) for name, default in task_source_default_worker_types().items()}
 
 
 VALID_APPROVAL_MODES = ("auto", "prompt", "approve")
@@ -4996,7 +5052,7 @@ def read_approval_modes() -> dict:
         if mode in VALID_APPROVAL_MODES:
             overrides[name] = mode
     default = _default_approval_mode()
-    return {name: overrides.get(name, default) for name in TASK_SOURCE_CATALOG}
+    return {name: overrides.get(name, default) for name in task_source_catalog()}
 
 
 # workDirKind/successCheck values that satisfy review-runner.ps1's unconditional
@@ -5047,6 +5103,44 @@ _DOMAIN_DEFAULTS_TO_ENSURE = {
 # future call site ever passes a hand-built task_sources list that forgot one, since the
 # failure mode ("Unknown task domain") is silent and easy to miss (as just proven).
 _ALWAYS_ENSURE_DOMAINS = ["brain_dump_sort", "adhoc", "path_prefetch_resolve"]
+
+# Human-readable domain label per domain KEY, for the Job List "Domain" column. The
+# "default" key shows "(project default)" -- it's whatever the active project's
+# defaultDomain resolves to, not a literal.
+SOURCE_DOMAIN_LABELS = {"default": "(project default)"}
+
+# One-line description per source name, for the Job List row. UI copy, not registry data --
+# kept here (server-side, one place) rather than in a client-side JOB_TYPES const that
+# drifted from the real registry. /api/job-types serves it; a source with no entry just
+# renders a blank description cell.
+SOURCE_DESCRIPTIONS = {
+    "adhoc": "Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.",
+    "research_task": "A captured Brain Dump entry brain_dump_sort classified as requiresResearch (queue/research/*.json), drafted by research-agentic-draft.js's WebSearch/WebFetch-backed agentic call. Always high-reasoning-tier. Same \"drop everything\" priority as adhoc.",
+    "trouble_log": "Entries in the project's trouble-log doc flagged ready-for-agent (\U0001f916 marker).",
+    "secondbrain": "Oldest unprocessed note in a SecondBrain-style Inbox/ folder.",
+    "brain_dump_sort": "Sorts a captured Brain Dump entry into a second-brain destination and marks it filed. Always active -- see the Brain Dump tab.",
+    "path_prefetch_resolve": "LLM-assisted fallback for a queue/needs-clarification/ held task path-prefetch's deterministic keyword match could not resolve -- suggests file path(s) + rationale for a human to accept or override, never auto-resolves. Always active.",
+    "arch_review": "Strong-rated architecture candidates awaiting a fulfillment task. (agent-manager-hygiene plugin.)",
+    "arch_import_review": "Strong-rated architecture-IMPORT candidates (from arch_import) awaiting a fulfillment task. (agent-manager-hygiene plugin.)",
+    "arch_discovery": "Generates new architecture candidates for one graphify community at a time. (agent-manager-hygiene plugin.)",
+    "arch_import": "Promotes a reviewed deep_dive Use/Adapt finding into an agent-manager-grounded architecture-import candidate (ADR-0020). (agent-manager-hygiene plugin.)",
+    "observability_review": "Triages a deterministically-flagged observability-hygiene issue (silent catch, unguarded loop, OTel naming) in the active project as genuine or false-positive; a genuine verdict writes a candidate for observability_fix. (agent-manager-hygiene plugin.)",
+    "observability_fix": "Consumes a Strong observability_review candidate into a real code fix, against OBSERVABILITY_FIX_CANDIDATES.md. (agent-manager-hygiene plugin.)",
+    "performance_review": "Triages a deterministically-flagged performance issue (sync I/O in a loop, sequential await, JSON deep-clone) in the active project; a genuine verdict writes a candidate for performance_fix. (agent-manager-hygiene plugin.)",
+    "performance_fix": "Consumes a Strong performance_review candidate into a real code fix, against PERFORMANCE_FIX_CANDIDATES.md. (agent-manager-hygiene plugin.)",
+    "function_length_review": "Triages a deterministically-flagged over-long function in the active project as a genuine maintainability problem or false-positive; a genuine verdict writes a decomposition candidate for function_length_fix. (agent-manager-hygiene plugin.)",
+    "function_length_fix": "Consumes a Strong function_length_review candidate into a real decomposition diff, against FUNCTION_LENGTH_CANDIDATES.md. (agent-manager-hygiene plugin.)",
+    "deep_dive": "Reviews one import-graph community at a time from a project_search Strong lead's cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019). See the Scouted Repos tab.",
+    "project_search": "Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment.",
+    "unused_export": "Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive. (agent-manager-hygiene plugin.)",
+    "pipeline_self_audit": "Deterministically scans queue/blocked/ for a cluster of tasks failing the same way; files an adhoc task asking a Claude agentic pass to find and fix the root cause. Always requires human confirmation.",
+    "pipeline_health_audit": "Periodic deterministic check of the pipeline's own health signals; files an advisory when something looks wrong.",
+    "ui_visibility_audit": "Checks that pipeline state a human needs is actually surfaced in the dashboard; files an advisory for a gap.",
+    "staleness_audit": "Deterministically scans queue/blocked/ and queue/needs-clarification/ for an old or repeatedly-rejected task; files an advisory asking whether the original concern still holds. Never applies anything.",
+    "product_spec": "Drafts or updates a greenfield product's spec doc.",
+    "backlog_decomposition": "Breaks a product-spec backlog item into AC-NNN candidates in BACKLOG_CANDIDATES.md.",
+    "backlog_fulfillment": "Consumes a Strong BACKLOG_CANDIDATES.md entry into a real diff -- same fulfillment logic as arch_review.",
+}
 
 
 def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
@@ -5233,16 +5327,18 @@ def api_job_types():
             "name": name,
             "active": name in active,
             "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
-            "priority": priorities.get(name, TASK_SOURCE_DEFAULT_PRIORITIES.get(name)),
+            "priority": priorities.get(name),
             "approvalMode": approval_modes.get(name),
-            "workerType": worker_types.get(name, TASK_SOURCE_DEFAULT_WORKER_TYPES.get(name)),
+            "workerType": worker_types.get(name),
             "timesPerformed": counters.get(name, 0),
             # None (-> null) for a source with no enumerable backlog doc -- see
             # available_candidate_counts()'s own comment; the frontend renders that as a
             # blank cell rather than a misleading 0.
             "available": available_counts.get(name),
+            "domain": SOURCE_DOMAIN_LABELS.get(_SOURCE_TO_DOMAIN_KEY.get(name, name), _SOURCE_TO_DOMAIN_KEY.get(name, name)),
+            "description": SOURCE_DESCRIPTIONS.get(name, ""),
         }
-        for name in TASK_SOURCE_CATALOG
+        for name in task_source_catalog()
     ])
 
 
@@ -5271,7 +5367,7 @@ def api_job_types_toggle():
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
     active = bool(body.get("active"))
-    if name not in TASK_SOURCE_CATALOG:
+    if name not in task_source_catalog():
         abort(400, description=f"unknown job type '{name}'")
     if name in ALWAYS_ACTIVE_SOURCES:
         abort(400, description=f"'{name}' is always active and cannot be toggled off")
@@ -5286,7 +5382,7 @@ def api_job_types_toggle():
     # an explicit list naming all of TASK_SOURCE_CATALOG means exactly the same thing as
     # no list at all, and staying in that tidy round-trip avoids the allowlist silently
     # drifting out of sync if TASK_SOURCE_CATALOG ever gains a new entry later.
-    if current == set(TASK_SOURCE_CATALOG):
+    if current == set(task_source_catalog()):
         new_value = ""
     else:
         new_value = ",".join(sorted(current - ALWAYS_ACTIVE_SOURCES))
@@ -5313,7 +5409,7 @@ def api_job_types_priority():
     takes effect on the very next tick with no pipeline restart needed."""
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
-    if name not in TASK_SOURCE_CATALOG:
+    if name not in task_source_catalog():
         abort(400, description=f"unknown job type '{name}'")
     try:
         priority = int(body.get("priority"))
@@ -5325,7 +5421,7 @@ def api_job_types_priority():
 
     # Collapse back to "no overrides" (empty string) when every source ends up at its own
     # default -- same tidy-round-trip reasoning as api_job_types_toggle()'s allowlist collapse.
-    non_default = {n: p for n, p in priorities.items() if p != TASK_SOURCE_DEFAULT_PRIORITIES.get(n)}
+    non_default = {n: p for n, p in priorities.items() if p != task_source_default_priorities().get(n)}
     new_value = ",".join(f"{n}:{p}" for n, p in sorted(non_default.items()))
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_PRIORITIES", new_value)
 
@@ -5342,7 +5438,7 @@ def api_job_types_approval_mode():
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
     mode = (body.get("mode") or "").strip()
-    if name not in TASK_SOURCE_CATALOG:
+    if name not in task_source_catalog():
         abort(400, description=f"unknown job type '{name}'")
     if mode not in VALID_APPROVAL_MODES:
         abort(400, description=f"mode must be one of {VALID_APPROVAL_MODES}")
@@ -5373,7 +5469,7 @@ def api_job_types_worker_type():
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
     worker_type = (body.get("workerType") or "").strip()
-    if name not in TASK_SOURCE_CATALOG:
+    if name not in task_source_catalog():
         abort(400, description=f"unknown job type '{name}'")
     if worker_type not in VALID_WORKER_TYPES:
         abort(400, description=f"workerType must be one of {VALID_WORKER_TYPES}")
@@ -5385,7 +5481,7 @@ def api_job_types_worker_type():
     # default -- same tidy-round-trip reasoning as the priority/approval-mode collapses above.
     worker_type_to_tier = {"ornith": "low", "reasoning": "high"}
     non_default = {
-        n: worker_type_to_tier[wt] for n, wt in worker_types.items() if wt != TASK_SOURCE_DEFAULT_WORKER_TYPES.get(n)
+        n: worker_type_to_tier[wt] for n, wt in worker_types.items() if wt != task_source_default_worker_types().get(n)
     }
     new_value = ",".join(f"{n}:{t}" for n, t in sorted(non_default.items()))
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_TIERS", new_value)

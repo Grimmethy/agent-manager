@@ -74,9 +74,14 @@ convention the underlying model client already used. Set these before launching 
 }
 ```
 
-## Built-in task sources
+## Task sources
 
-Nineteen, at priorities 10/20/40/42/45/65/70/71/72/73/80/81/82/85/90 (30/50/60 left open for yours):
+The rows below are every registered source — this package's own built-ins **plus** whatever
+an `AGENT_MANAGER_REGISTER_PATH` plugin adds. The programming-hygiene family
+(`observability_*`, `performance_*`, `function_length_*`, `arch_*`, `unused_export`) is
+provided by the separate **agent-manager-hygiene** plugin, not this repo. `npm run
+drift-scan` checks this table against `node src/task-sources.js --dump-topology` (the live
+registry), so it stays honest across the plugin boundary. Priorities 30/50/60 are left open.
 
 | Source | Priority | Reads |
 |---|---|---|
@@ -97,7 +102,15 @@ Nineteen, at priorities 10/20/40/42/45/65/70/71/72/73/80/81/82/85/90 (30/50/60 l
 | `arch_import` | 81 | `AGENT_MANAGER_IMPORT_COVERAGE_PATH` + deep_dive's analysis docs (ADR-0020) — promotes a reviewed `deep_dive` Use/Adapt finding into a real, agent-manager-grounded import candidate |
 | `deep_dive` | 82 | Reviews one import-graph community at a time from a `project_search` Strong lead's cloned repo, rating each finding Use/Adapt/Ignore (ADR-0019) |
 | `project_search` | 85 | Proposes external open-source leads relevant to the project. Discovery-only, no auto-fulfillment (ADR-0018) |
-| `unused_export` | 90 | `queue/dead-code-flags.json` (produce this with your own scanner) |
+| `unused_export` | 90 | `queue/dead-code-flags.json` (agent-manager-hygiene plugin) |
+| `function_length_review` | 80 | runs `function-length-scan.js` against the ACTIVE project; a genuine verdict writes a candidate to `AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH` for `function_length_fix` (agent-manager-hygiene plugin) |
+| `function_length_fix` | 72 | `AGENT_MANAGER_FUNCTION_LENGTH_CANDIDATES_PATH` — same fulfillment logic as `arch_review` (agent-manager-hygiene plugin) |
+| `product_spec` | 15 | greenfield product spec doc — drafts/updates `AGENT_MANAGER_PRODUCT_SPEC_PATH` |
+| `backlog_decomposition` | 17 | breaks a product-spec backlog item into AC-NNN entries in `AGENT_MANAGER_BACKLOG_CANDIDATES_PATH` |
+| `backlog_fulfillment` | 16 | `AGENT_MANAGER_BACKLOG_CANDIDATES_PATH`, entries rated Strong — same fulfillment logic as `arch_review` |
+| `pipeline_health_audit` | 90 | periodic deterministic check of the pipeline's own health signals; files an advisory |
+| `ui_visibility_audit` | 63 | checks pipeline state a human needs is surfaced in the dashboard; files an advisory for a gap |
+| `staleness_audit` | 91 | `queue/blocked/*.json` + `queue/needs-clarification/*.json` — flags an old or repeatedly-rejected task for a human to re-check; never applies anything |
 
 ## Building the codebase graph (`arch_discovery`'s input)
 

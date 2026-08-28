@@ -191,3 +191,47 @@ test('checkPair is not confused by an unrelated top-level array sharing the end 
   assert.deepEqual(result.missingFromStatic, []);
   assert.deepEqual(result.staleInStatic, []);
 });
+
+// sourceCommand mode (2026-08-27, Phase 3): the source list comes from a JSON-emitting
+// command (`node task-sources.js --dump-topology`) instead of a regex over a file, so a
+// pair can be checked against the REAL registry -- built-ins plus AGENT_MANAGER_REGISTER_PATH
+// plugin sources -- not just what one file's registerTaskSource() calls reveal.
+function commandPair(overrides = {}) {
+  return {
+    label: 'test command pair',
+    staticFile: 'README.md',
+    staticStartMarker: '| Source |',
+    staticEndMarker: '## Next section',
+    staticValueRegex: /^\|\s*`([^`]+)`\s*\|/gm,
+    sourceCommand: ['emit-topology.js'],
+    sourceJsonNameKey: 'name',
+    ...overrides,
+  };
+}
+
+test('checkPair sourceCommand mode: clean when the table matches the command JSON', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'emit-topology.js', 'console.log(JSON.stringify([{name:"alpha"},{name:"beta"}]));\n');
+  writeFixture(repoRoot, 'README.md', '| Source |\n|---|\n| `alpha` | x |\n| `beta` | y |\n## Next section\n');
+  const result = checkPair(repoRoot, commandPair());
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.missingFromStatic, []);
+  assert.deepEqual(result.staleInStatic, []);
+});
+
+test('checkPair sourceCommand mode: flags a source the command reports but the table omits', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'emit-topology.js', 'console.log(JSON.stringify([{name:"alpha"},{name:"beta"},{name:"gamma"}]));\n');
+  writeFixture(repoRoot, 'README.md', '| Source |\n|---|\n| `alpha` | x |\n| `beta` | y |\n## Next section\n');
+  const result = checkPair(repoRoot, commandPair());
+  assert.deepEqual(result.missingFromStatic, ['gamma']);
+  assert.deepEqual(result.staleInStatic, []);
+});
+
+test('checkPair sourceCommand mode: errors clearly when the command does not emit JSON', () => {
+  const repoRoot = makeTempRepo();
+  writeFixture(repoRoot, 'emit-topology.js', 'console.log("not json at all");\n');
+  writeFixture(repoRoot, 'README.md', '| Source |\n|---|\n| `alpha` | x |\n## Next section\n');
+  const result = checkPair(repoRoot, commandPair());
+  assert.match(result.error, /did not return JSON/);
+});

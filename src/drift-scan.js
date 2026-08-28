@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 
 function extractAll(text, regex) {
@@ -55,50 +56,65 @@ function sliceBetween(text, startMarker, endMarker) {
 // registered exactly once by construction -- registerTaskSource() itself would be the
 // one throwing on an actual duplicate key), so it's the join key that can't silently
 // paper over a second source sharing an existing one's priority.
+// The Job List tab's own JOB_TYPES const was removed 2026-08-27 (Phase 3): it's served
+// from /api/job-types now, which is load_topology()-driven, so there's no static list left
+// to drift there.
+//
+// sourceCommand: `node task-sources.js --dump-topology` is the authoritative source list --
+// it reads the REAL registry, this repo's built-ins PLUS any AGENT_MANAGER_REGISTER_PATH
+// plugin sources (agent-manager-hygiene). Regexing `registerTaskSource('...')` in
+// task-sources.js alone would (since Phase 1-2) wrongly flag every moved plugin source as
+// "stale" in README, since they're registered from the plugin, not this file.
 const PAIRS = [
   {
-    label: 'Dashboard Job List tab vs task-sources.js registry',
-    staticFile: 'python/dashboard/templates/index.html',
-    staticStartMarker: 'const JOB_TYPES = [',
-    staticEndMarker: '];',
-    staticValueRegex: /source:\s*'([^']+)'/g,
-    sourceFile: 'src/task-sources.js',
-    sourceValueRegex: /registerTaskSource\('([^']+)'/g,
-  },
-  {
-    // Found the same day as the Job List bug, same root cause: README.md's own
-    // "Built-in task sources" table is hand-maintained prose, not generated, and had
-    // silently rotted to "Six" sources when nine were actually registered (missing
-    // arch_import, deep_dive, and project_search entirely).
-    label: 'README.md Built-in task sources table vs task-sources.js registry',
+    label: 'README.md Built-in task sources table vs the live registry',
     staticFile: 'README.md',
     staticStartMarker: '| Source | Priority | Reads |',
     staticEndMarker: '## Building the codebase graph',
     // Anchored to the START of the row (^, multiline) so this only ever matches the
-    // Source column -- an unanchored version also matched a Reads-column cell that
-    // happens to be nothing but a single backtick-wrapped path (confirmed live: matched
-    // `SECOND_BRAIN_DIR/Inbox/*.md` as if it were a registered source name).
+    // Source column.
     staticValueRegex: /^\|\s*`([^`]+)`\s*\|/gm,
-    sourceFile: 'src/task-sources.js',
-    sourceValueRegex: /registerTaskSource\('([^']+)'/g,
+    sourceCommand: ['src/task-sources.js', '--dump-topology'],
+    sourceJsonNameKey: 'name',
   },
 ];
 
+function sourceValuesFor(repoRoot, pair, base) {
+  if (pair.sourceCommand) {
+    let out;
+    try {
+      out = execFileSync('node', pair.sourceCommand, { cwd: repoRoot, encoding: 'utf8', timeout: 20000 });
+    } catch (e) {
+      return { error: `\`node ${pair.sourceCommand.join(' ')}\` failed: ${e.message}` };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(out);
+    } catch (e) {
+      return { error: `\`node ${pair.sourceCommand.join(' ')}\` did not return JSON: ${e.message}` };
+    }
+    if (!Array.isArray(parsed)) return { error: `\`node ${pair.sourceCommand.join(' ')}\` returned non-array JSON` };
+    return { values: new Set(parsed.map((s) => s[pair.sourceJsonNameKey]).filter(Boolean)) };
+  }
+  const sourcePath = path.join(repoRoot, pair.sourceFile);
+  let sourceText;
+  try {
+    sourceText = fs.readFileSync(sourcePath, 'utf8');
+  } catch (e) {
+    return { error: `could not read ${pair.sourceFile}: ${e.message}` };
+  }
+  return { values: extractAll(sourceText, pair.sourceValueRegex) };
+}
+
 function checkPair(repoRoot, pair) {
   const staticPath = path.join(repoRoot, pair.staticFile);
-  const sourcePath = path.join(repoRoot, pair.sourceFile);
-  const base = { label: pair.label, staticFile: pair.staticFile, sourceFile: pair.sourceFile };
+  const base = { label: pair.label, staticFile: pair.staticFile, sourceFile: pair.sourceFile || (pair.sourceCommand && `\`node ${pair.sourceCommand.join(' ')}\``) };
 
-  let staticText, sourceText;
+  let staticText;
   try {
     staticText = fs.readFileSync(staticPath, 'utf8');
   } catch (e) {
     return { ...base, error: `could not read ${pair.staticFile}: ${e.message}` };
-  }
-  try {
-    sourceText = fs.readFileSync(sourcePath, 'utf8');
-  } catch (e) {
-    return { ...base, error: `could not read ${pair.sourceFile}: ${e.message}` };
   }
 
   const staticBlock = sliceBetween(staticText, pair.staticStartMarker, pair.staticEndMarker);
@@ -107,13 +123,15 @@ function checkPair(repoRoot, pair) {
   }
 
   const staticValues = extractAll(staticBlock, pair.staticValueRegex);
-  const sourceValues = extractAll(sourceText, pair.sourceValueRegex);
+  const sourceResult = sourceValuesFor(repoRoot, pair, base);
+  if (sourceResult.error) return { ...base, error: sourceResult.error };
+  const sourceValues = sourceResult.values;
 
   if (staticValues.size === 0) {
     return { ...base, error: `matched the static block in ${pair.staticFile} but extracted zero values -- staticValueRegex may be stale` };
   }
   if (sourceValues.size === 0) {
-    return { ...base, error: `extracted zero values from ${pair.sourceFile} -- sourceValueRegex may be stale` };
+    return { ...base, error: `extracted zero source values -- sourceValueRegex/sourceCommand may be stale` };
   }
 
   const missingFromStatic = [...sourceValues].filter((v) => !staticValues.has(v)).sort();
