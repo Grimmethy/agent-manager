@@ -2311,27 +2311,15 @@ registerTaskSource('backlog_fulfillment', {
   candidateDocTitle: '# Backlog Candidates',
 });
 
-// function_length_review / function_length_fix (2026-08-23, Grimmethy: "Let's start with
-// the modular approach with the intent to further separate it into a fully separate npm
-// later") -- first member of the "maintenance" task-source family, kept in its own
-// src/maintenance/ directory with the narrowest possible dependency on this file (only
-// the already-public nextCandidateFulfillmentTask/taskIdExistsInQueue/taskPriority,
-// injected here rather than required by that module directly) -- see its own header for
-// the full design and the extraction this is meant to make cheap later.
-require('./maintenance/function-length-review.js').register({
-  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
-});
-
-// observability_review / observability_fix, performance_review / performance_fix
-// (2026-08-23, Grimmethy: "Move the observability/performance scanners into
-// src/maintenance/ next") -- moved out of this file the same way, same injected-
-// dependency shape as function_length_review just above.
-require('./maintenance/observability-review.js').register({
-  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
-});
-require('./maintenance/performance-review.js').register({
-  getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue, taskPriority,
-});
+// function_length_review/fix, observability_review/fix, performance_review/fix -- the
+// "maintenance" task-source family (2026-08-23, Grimmethy: "Let's start with the modular
+// approach with the intent to further separate it into a fully separate npm later"). That
+// extraction happened (2026-08-27): the review modules now live in the out-of-tree
+// agent-manager-hygiene plugin, which does its own register() wiring with the same
+// injected-deps bag (getConfig / nextCandidateFulfillmentTask / taskIdExistsInQueue /
+// taskPriority -- all still exported from this file). The pure detector files stay here
+// (src/maintenance/*-scan.js), because staleness-fastpath.js re-runs their rules for the
+// deterministic staleness recheck. Wire the plugin in via AGENT_MANAGER_REGISTER_PATH.
 
 // tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
 // this, getNextTask() always returns the FIRST source in priority order with eligible

@@ -42,6 +42,20 @@ process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 // real load order rather than a standalone fixture.
 require('./task-sources.js');
 
+// observability_review/performance_review moved to the out-of-tree agent-manager-hygiene
+// plugin (2026-08-27), so ./task-sources.js no longer registers them. The verdict-gate
+// regression tests below assert that reviewTask does not auto-reject a short false-positive
+// prose verdict from an advisoryProse source -- register a stub carrying that one flag so
+// isAdvisoryProseSource() still resolves them the way production (plugin loaded) does.
+{
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  for (const name of ['observability_review', 'performance_review']) {
+    if (!getRegisteredSource(name)) {
+      registerTaskSource(name, { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
+    }
+  }
+}
+
 const { reviewTask, buildVerdictPrompt } = require('./review-task.js');
 
 function baseTask(overrides = {}) {
