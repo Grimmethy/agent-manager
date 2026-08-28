@@ -1298,6 +1298,14 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt,
+  // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
+  // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
+  // Bodies stay here; archReview{Plan,Implement}Prompt also stay wired below for core
+  // backlog_fulfillment.
+  archReviewPlanPrompt, archReviewImplementPrompt,
+  archDiscoveryPlanPrompt, archDiscoveryImplementPrompt,
+  archImportPlanPrompt, archImportImplementPrompt,
+  unusedExportPlanPrompt, unusedExportImplementPrompt,
 };
 
 if (require.main === module) {
