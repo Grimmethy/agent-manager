@@ -1466,7 +1466,35 @@ function taskPriority(name, def) {
 // what local-draft.js's own resolveSourceName()==='adhoc' branch already hardcodes
 // regardless of this registration -- kept here so the two can't drift apart (Brain Dump
 // #77's generalized tier filter, replacing the earlier adhoc-hardcoded bash check).
-registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high' });
+// Review-gate guidance for these sources, read by review-task.js's buildVerdictPrompt off
+// the registry (source.reviewGuidance / source.reviewCompletenessQuestion) instead of an
+// if (task.source === ...) chain there -- ADR-0022: the source that defines the work also
+// defines how its draft is judged. A plain string, or a (task) => string for guidance that
+// depends on a task field. arch_discovery / arch_import set theirs in the hygiene plugin.
+const ADHOC_BLIND_PLAN_GUIDANCE = 'The PLAN section above was drafted BLIND, by an earlier and separate pass, before any real investigation happened -- true for EVERY adhoc task here, regardless of how it ultimately resolved (implemented, decomposed, or otherwise). It is exploratory scratch work, not the deliverable, and may itself be rough, incomplete, wrong, or even contain broken/truncated example code. NEVER reject over a problem in the PLAN itself (a syntax error in an illustrative snippet there, a design the real work ends up doing differently, a file or approach it guessed at that turned out wrong) -- judge ONLY the actual IMPLEMENT draft below, produced after real investigation.';
+const ADHOC_DIFF_GROUNDED_GUIDANCE = "This is an adhoc task: the IMPLEMENT draft comes from a real agentic pass that ran Read/Grep/Glob/Bash against the actual repo and produced the real `git diff` shown (see the DIFF section of the implement draft). Grounded investigation is frequently more accurate than the blind plan that preceded it -- do NOT reject the implement draft merely because it touches different files, a different number of files, or a narrower/broader scope than the plan named; that is the expected, normal outcome of the plan being wrong about something the real investigation then corrected, not a sign of an over-broad or off-task draft. Judge the diff against the TASK's actual request and the real repo state (fact-check/grounding above), not against the plan's stated scope. Reject only if the diff itself is wrong given the real repo state, contradicts the task's actual ask, or the draft's own RESOLUTION/summary text is inconsistent with what the diff actually does.";
+const ADHOC_DECOMPOSE_GUIDANCE = 'This is an adhoc task the drafter chose to DECOMPOSE rather than implement directly: it judged the task too large/broad to implement confidently in one pass and produced a JSON array of smaller sub-tasks instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual DECOMPOSITION in the IMPLEMENT draft below. Is it sound: do the sub-tasks, together, actually cover everything the original TASK asked for (no silently dropped requirement)? Is each sub-task concrete and independently implementable on its own (not still vague, not itself obviously too large)? Is the JSON well-formed with a real title and a self-contained rawText for each entry? Reject if a requirement was dropped, a sub-task is too vague/large to actually help, or the JSON itself is malformed -- never because of something in the PLAN, and never merely because no code was written.';
+const ADHOC_DECOMPOSE_COMPLETENESS_QUESTION = 'Does it contain a well-formed JSON array of sub-tasks, each with a real title and a self-contained rawText, that together cover the original task with nothing dropped?';
+const BRAIN_DUMP_SORT_REVIEW_GUIDANCE = 'This is a brain-dump CLASSIFICATION task, not a code-change task: the implement draft is a JSON metadata object (category/secondBrainPath/tags/actionable/rationale/belongsToProject) that files a note into a personal vault -- do not reject it for lacking implementation code or for being "just documentation," that was never the ask. secondBrainPath names the note file to create or append to; it commonly does NOT exist yet -- filing something brand new is the normal, most common, correct outcome, so a "missing-file" fact-check flag on secondBrainPath ALONE is expected and is NOT evidence of fabrication (unlike a missing-file flag on a claimed source-code reference elsewhere, which would be). Reject only if: the JSON itself is malformed or missing a required field, category is not one of task/reference/idea/journal/question, secondBrainPath is an obviously wrong or nonsensical destination given what the note is actually about, or belongsToProject names a project that plainly was not among the tracked projects listed in the PLAN above.';
+const BRAIN_DUMP_SORT_COMPLETENESS_QUESTION = 'Does it contain a complete, valid classification JSON (not a bare tool-call request, not meta-commentary, not a truncated/partial JSON fragment)?';
+const DEEP_DIVE_REVIEW_GUIDANCE = 'This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.';
+const PROJECT_SEARCH_REVIEW_GUIDANCE = 'This is a project-search task: the drafter was told it is correct to report zero findings when none of the real, harness-fetched GitHub/HuggingFace search results were genuinely useful -- do not reject a draft merely for reporting no findings. Only reject an empty result if the draft invents a project/URL not present in the actual search results given to it, or if the search results plainly did contain something usable that the draft ignored.';
+const STALENESS_AUDIT_REVIEW_GUIDANCE = 'This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," verify that call is actually earned by the real evidence shown above (the harness search genuinely supports the concern being resolved/ungrounded), not just asserted -- reject an under-supported "archive" the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without the real evidence above actually supporting that conclusion.';
+const STALENESS_AUDIT_COMPLETENESS_QUESTION = 'Does it contain a genuine three-part analysis (does the concern still hold, was the original fabrication finding genuine, and an explicit RECOMMENDATION), grounded in the real harness search results shown above rather than invented?';
+
+// The PLAN section of an adhoc task is drafted blind, before investigation -- this guarantee
+// (never reject over a problem in the PLAN itself) was previously hoisted, unconditionally,
+// above every adhoc carve-out in review-task.js; it now prefixes whichever resolution-specific
+// body applies so a new resolution type structurally cannot miss it.
+function adhocReviewGuidance(task) {
+  const body = task.adhocResolution === 'decompose' ? ADHOC_DECOMPOSE_GUIDANCE : ADHOC_DIFF_GROUNDED_GUIDANCE;
+  return `${ADHOC_BLIND_PLAN_GUIDANCE}\n${body}`;
+}
+function adhocReviewCompletenessQuestion(task) {
+  return task.adhocResolution === 'decompose' ? ADHOC_DECOMPOSE_COMPLETENESS_QUESTION : null;
+}
+
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
 // task" priority tier as adhoc, and reasoningTier: 'high' is UNCONDITIONAL (unlike
 // path_prefetch_resolve's two-tier design) -- the local model has no web tools at all, so there is
@@ -1509,7 +1537,7 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // profile existed, since local-draft.js's own call sites unconditionally requested
 // think:true and had no way to know this profile's model couldn't honor it).
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local' });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', reviewGuidance: BRAIN_DUMP_SORT_REVIEW_GUIDANCE, reviewCompletenessQuestion: BRAIN_DUMP_SORT_COMPLETENESS_QUESTION });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -1803,8 +1831,8 @@ function markStalenessAuditReported(task) {
 }
 
 
-registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true });
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
@@ -1832,7 +1860,7 @@ registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibilit
 // explicit RECOMMENDATION: archive, moving the ORIGINAL flagged task to
 // done/_archived_no_action/ automatically once the report has cleared review. See
 // staleness-auto-archive.js's own header for the full reasoning and safety scoping.
-registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true });
+registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true, reviewGuidance: STALENESS_AUDIT_REVIEW_GUIDANCE, reviewCompletenessQuestion: STALENESS_AUDIT_COMPLETENESS_QUESTION });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...
