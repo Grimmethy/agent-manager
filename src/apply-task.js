@@ -357,8 +357,13 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 
     // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) --
     // see DIRECT_TO_MAIN_SOURCES' own header comment for why. Everything else keeps the
-    // normal throwaway agent/<id> branch.
-    const commitsDirectlyToMain = DIRECT_TO_MAIN_SOURCES.has(task.source);
+    // normal throwaway agent/<id> branch. A source declares this via `directToMain: true`
+    // on its registration now (so an out-of-tree plugin's source can opt in without
+    // editing this file); DIRECT_TO_MAIN_SOURCES stays as a fallback for the built-ins
+    // until Stage G of the plugin extraction removes it.
+    const registered = getRegisteredSource(resolveSourceName(task));
+    const commitsDirectlyToMain = (registered && registered.directToMain === true)
+      || DIRECT_TO_MAIN_SOURCES.has(task.source);
     const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
     if (branchName) {
       // Defensive pre-cleanup (2026-08-25 -- same fix, same root cause, as adhoc-agentic-

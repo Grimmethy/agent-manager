@@ -237,6 +237,28 @@ test('arch_discovery: commits straight to main, no branch, pushes immediately ev
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
+test('a source with `directToMain: true` on its registration takes the direct-to-main path even without a DIRECT_TO_MAIN_SOURCES literal entry', () => {
+  const name = 'sa1_direct_probe';
+  if (!getRegisteredSource(name)) {
+    registerTaskSource(name, {
+      priority: 80,
+      next: () => null,
+      directToMain: true,
+      apply: ({ implementResponse, task }) => applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: path.join(PIPELINE_DIR, `${name.toUpperCase()}.md`),
+        snippet: task && task.promptContext && task.promptContext.snippet,
+      }),
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(archDiscoveryTask({ source: name, id: 'sa1-direct-1' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(result.branch, gitRunner.mainBranch);
+  assert.deepEqual(gitRunner.calls.map((c) => c.name), ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+});
+
 test('arch_discovery: still pushes even when skipPush is true -- an unpushed direct-to-main commit would be destroyed by the next resetToMain()', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, skipPush: true });
