@@ -29,10 +29,6 @@ const CONTRACT = {
   },
   './atomic-write.js': { functions: ['writeAtomicSync', 'writeJsonAtomicSync'] },
   './deterministic-recheck-registry.js': { functions: ['registerDeterministicRecheck', 'getDeterministicRecheck', 'getRecheckSources', 'clearDeterministicRecheckRegistry'] },
-  './maintenance/observability-scan.js': { functions: ['scanProject', 'findSilentCatchBlocks', 'findUnguardedLoops', 'findOtelNamingViolations', 'hasOtelDependency', 'findMissingReservedAttributes'] },
-  './maintenance/performance-scan.js': { functions: ['scanProject', 'findLoopBodyIssues', 'findJsonDeepCloneAntipattern'] },
-  './maintenance/function-length-scan.js': { functions: ['scanProject', 'findLongFunctions', 'maxFunctionLines'] },
-  './maintenance/scan-utils.js': { functions: ['listSourceFiles', 'isLikelyMinified', 'lineOfIndex', 'extractBraceBody'] },
   './model-profile-registry.js': { functions: ['clearModelProfileRegistry'] },
 };
 
