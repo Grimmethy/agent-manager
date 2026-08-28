@@ -44,7 +44,7 @@ const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { getRegisteredSource } = require('./task-source-registry.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
@@ -146,6 +146,25 @@ function decodeGroupBContent(implementResponse) {
   }
 }
 
+// review-task.js reads each source's own review-gate guidance off the registry
+// (source.reviewGuidance / source.reviewCompletenessQuestion, set in src/task-sources.js
+// or by an AGENT_MANAGER_REGISTER_PATH plugin) instead of an if (task.source === ...) chain.
+// A field may be a plain string or a (task) => string|null function (the adhoc source
+// branches on task.adhocResolution). resolveDynamicReviewField normalizes both to a
+// non-empty string or null.
+function resolveDynamicReviewField(field, task) {
+  const value = typeof field === 'function' ? field(task) : field;
+  return typeof value === 'string' && value ? value : null;
+}
+
+// arch_discovery / arch_import live in the agent-manager-hygiene plugin and set their own
+// reviewGuidance there. This fallback keeps core's review gate correct when that plugin
+// is not loaded; ADR-0022 Stage G removes it once the plugin field is the only source.
+const FALLBACK_REVIEW_GUIDANCE = {
+  arch_discovery: 'This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).',
+  arch_import: "This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.",
+};
+
 function buildVerdictPrompt(task, factCheck, groundingText) {
   const lines = [];
   lines.push('You are a review gate in an unattended pipeline. You are producing a VERDICT ONLY -- you have no ability to run commands, write files, or touch git. Do not attempt to.');
@@ -192,88 +211,29 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('');
   lines.push('Judge whether this draft is correct, narrowly scoped, and safe to apply as-is. Reject if it is fabricated, over-broad, or the fact-check flags a real problem.');
   lines.push('Also REJECT if the draft consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") standing in for the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine." IMPORTANT EXCEPTION: this rule is about hedging PROSE, not about a genuinely EMPTY response (zero characters, or effectively so) -- several task types below are explicitly instructed to output nothing when there is nothing real to report, and that is NOT the same failure as writing evasive text instead of answering. If the draft is truly empty, judge it ONLY by the source-specific rule below (if any); do not reject an empty draft under this rule merely for containing no implementation.');
-  // 2026-08-24: stated ONCE, unconditionally, for every adhoc (source==='manual') task
-  // regardless of which resolution branch fires below -- NOT duplicated inside each
-  // individual carve-out the way it used to be. Caught live: the decompose carve-out
-  // originally had its own copy of this exact instruction, added only after a real
-  // decomposition got wrongly rejected over a broken snippet in the (unrelated, blind)
-  // PLAN section; the plain manual/diff carve-out already had its own independent copy.
-  // Two copies of the same guarantee, easy to keep in sync by accident today -- but the
-  // NEXT new adhoc resolution type (or any future source-specific carve-out that forgets
-  // to repeat it) would silently reintroduce the identical bug, since nothing actually
-  // GUARANTEES this protection exists beyond each carve-out author remembering to restate
-  // it. Hoisted here so it structurally can't be missed again, and removed from both
-  // carve-outs below (each keeps only its own resolution-specific judging criteria).
-  if (task.source === 'manual') {
-    lines.push('The PLAN section above was drafted BLIND, by an earlier and separate pass, before any real investigation happened -- true for EVERY adhoc task here, regardless of how it ultimately resolved (implemented, decomposed, or otherwise). It is exploratory scratch work, not the deliverable, and may itself be rough, incomplete, wrong, or even contain broken/truncated example code. NEVER reject over a problem in the PLAN itself (a syntax error in an illustrative snippet there, a design the real work ends up doing differently, a file or approach it guessed at that turned out wrong) -- judge ONLY the actual IMPLEMENT draft below, produced after real investigation.');
-  }
+  // The PLAN section is drafted BLIND for every adhoc task, and each source's own
+  // judging carve-out, now live on the source's reviewGuidance (see resolveDynamicReviewField).
+  // candidateSplitProposals stays an explicit check here -- it is a task field, not a source.
+  const registeredSource = getRegisteredSource(resolveSourceName(task));
   if (task.candidateSplitProposals) {
     // 2026-08-26, root-caused live via arch-review-ac-4 -- see prompts.js's
     // candidateSplitInstructions and local-draft.js's parseCandidateSplit for the full
-    // incident/design. Same reasoning as the manual/decompose carve-out below: a split
-    // proposal deliberately has no diff, and the generic "does it contain real, complete
-    // code" completeness question would reject every correct split on sight for exactly
-    // that reason.
+    // incident/design. A split proposal deliberately has no diff, and the generic
+    // "does it contain real, complete code" completeness question would reject every
+    // correct split on sight for exactly that reason.
     lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. Is it sound: do the sub-candidates, together, actually cover the FULL original candidate scope (no silently dropped requirement)? Is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
-  } else if (task.source === 'arch_discovery') {
-    lines.push('This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).');
-  } else if (task.source === 'project_search') {
-    lines.push('This is a project-search task: the drafter was told it is correct to report zero findings when none of the real, harness-fetched GitHub/HuggingFace search results were genuinely useful -- do not reject a draft merely for reporting no findings. Only reject an empty result if the draft invents a project/URL not present in the actual search results given to it, or if the search results plainly did contain something usable that the draft ignored.');
-  } else if (task.source === 'deep_dive') {
-    lines.push('This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.');
-  } else if (task.source === 'arch_import') {
-    lines.push("This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.");
-  } else if (task.source === 'brain_dump_sort') {
-    lines.push('This is a brain-dump CLASSIFICATION task, not a code-change task: the implement draft is a JSON metadata object (category/secondBrainPath/tags/actionable/rationale/belongsToProject) that files a note into a personal vault -- do not reject it for lacking implementation code or for being "just documentation," that was never the ask. secondBrainPath names the note file to create or append to; it commonly does NOT exist yet -- filing something brand new is the normal, most common, correct outcome, so a "missing-file" fact-check flag on secondBrainPath ALONE is expected and is NOT evidence of fabrication (unlike a missing-file flag on a claimed source-code reference elsewhere, which would be). Reject only if: the JSON itself is malformed or missing a required field, category is not one of task/reference/idea/journal/question, secondBrainPath is an obviously wrong or nonsensical destination given what the note is actually about, or belongsToProject names a project that plainly was not among the tracked projects listed in the PLAN above.');
-  } else if (task.source === 'manual' && task.adhocResolution === 'decompose') {
-    // 2026-08-24: RESOLUTION: decompose is a legitimate third outcome (adhoc-agentic-
-    // draft.js), not a cop-out -- the drafter investigated for real, judged the task too
-    // large for one confident pass, and produced a JSON list of smaller sub-tasks instead
-    // of a diff. Without this carve-out the generic "does it contain real, complete code"
-    // completeness question and the manual-source carve-out just below it (which assumes
-    // every adhoc draft either has a diff or is wrong) would reject every correct
-    // decomposition on sight for containing no code -- the exact false-reject failure mode
-    // that motivated writing this carve-out in the first place. The "PLAN was drafted
-    // blind, don't judge it" instruction lives in the unconditional source==='manual'
-    // block above now, not repeated here -- see its own comment for why.
-    lines.push('This is an adhoc task the drafter chose to DECOMPOSE rather than implement directly: it judged the task too large/broad to implement confidently in one pass and produced a JSON array of smaller sub-tasks instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual DECOMPOSITION in the IMPLEMENT draft below. Is it sound: do the sub-tasks, together, actually cover everything the original TASK asked for (no silently dropped requirement)? Is each sub-task concrete and independently implementable on its own (not still vague, not itself obviously too large)? Is the JSON well-formed with a real title and a self-contained rawText for each entry? Reject if a requirement was dropped, a sub-task is too vague/large to actually help, or the JSON itself is malformed -- never because of something in the PLAN, and never merely because no code was written.');
-  } else if (task.source === 'manual') {
-    lines.push("This is an adhoc task: the IMPLEMENT draft comes from a real agentic pass that ran Read/Grep/Glob/Bash against the actual repo and produced the real `git diff` shown (see the DIFF section of the implement draft). Grounded investigation is frequently more accurate than the blind plan that preceded it -- do NOT reject the implement draft merely because it touches different files, a different number of files, or a narrower/broader scope than the plan named; that is the expected, normal outcome of the plan being wrong about something the real investigation then corrected, not a sign of an over-broad or off-task draft. Judge the diff against the TASK's actual request and the real repo state (fact-check/grounding above), not against the plan's stated scope. Reject only if the diff itself is wrong given the real repo state, contradicts the task's actual ask, or the draft's own RESOLUTION/summary text is inconsistent with what the diff actually does.");
-  } else if (task.source === 'staleness_audit') {
-    // Fix, 2026-08-22 (Grimmethy: caught this live -- a real staleness_audit report got
-    // rejected as "meta-commentary and hedging... rather than providing the requested
-    // implementation") -- staleness_audit's implement draft is DELIBERATELY an advisory
-    // prose report, never code (see stalenessAuditImplementPrompt, prompts.js: "Write a
-    // short advisory report... not a diff"). This is the ONE source whose entire
-    // contract is the exact language pattern the generic instruction above tells a
-    // reviewer to reject on sight ("here's what I found, you decide," hedged language
-    // about what's confirmed vs. unconfirmed) -- without this carve-out, EVERY correctly-
-    // written staleness_audit report is structurally guaranteed to be rejected by the
-    // generic hedging rule, regardless of how accurate its analysis actually is.
-    lines.push('This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," verify that call is actually earned by the real evidence shown above (the harness search genuinely supports the concern being resolved/ungrounded), not just asserted -- reject an under-supported "archive" the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without the real evidence above actually supporting that conclusion.');
+  } else {
+    const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task)
+      || FALLBACK_REVIEW_GUIDANCE[resolveSourceName(task)];
+    if (guidance) lines.push(guidance);
   }
   const completenessQuestion = task.candidateSplitProposals
-    // Same reasoning as the manual/decompose and brain_dump_sort carve-outs below --
     // "real, complete code" directly contradicts the split carve-out above, whose whole
     // point is that no code was written yet.
     ? 'Does it contain a well-formed JSON array of sub-candidates, each with a real title/problem/solution, that together cover the original candidate with nothing dropped?'
-    : task.source === 'brain_dump_sort'
-    // Deliberately NOT "does it contain real, complete code" -- confirmed live
-    // 2026-08-16: that phrasing, left unconditional, directly contradicted the
-    // brain_dump_sort carve-out above (a reviewer told two conflicting things in the
-    // same prompt, one of which it's more likely to weight since it comes last) and
-    // was one of two compounding causes behind every brain_dump_sort draft getting
-    // rejected regardless of how correct the classification actually was.
-    ? 'Does it contain a complete, valid classification JSON (not a bare tool-call request, not meta-commentary, not a truncated/partial JSON fragment)?'
-    : task.source === 'staleness_audit'
-      // Same reasoning as the brain_dump_sort carve-out just above -- "real, complete
-      // code" directly contradicts this source's own advisory-prose carve-out.
-      ? 'Does it contain a genuine three-part analysis (does the concern still hold, was the original fabrication finding genuine, and an explicit RECOMMENDATION), grounded in the real harness search results shown above rather than invented?'
-      : task.source === 'manual' && task.adhocResolution === 'decompose'
-        // Same reasoning again -- "real, complete code" directly contradicts the
-        // decompose carve-out above, whose whole point is that no code was written.
-        ? 'Does it contain a well-formed JSON array of sub-tasks, each with a real title and a self-contained rawText, that together cover the original task with nothing dropped?'
-        : 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
+    : resolveDynamicReviewField(
+        registeredSource && registeredSource.reviewCompletenessQuestion, task)
+      || 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
   lines.push(`Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? ${completenessQuestion} Does anything in it contradict the real grounding source or fact-check above?`);
   lines.push('Respond with EXACTLY one of these two forms, nothing else. BOTH require a concrete, specific reason -- cite an actual file name, field name, or line of the draft. A reason that just restates the verdict word ("looks correct", "seems fine", "meets requirements") is not acceptable and will be discarded as unreasoned.');
   lines.push('APPROVE: <one-sentence reason citing the specific requirement(s) you verified are met>');
