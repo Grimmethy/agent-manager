@@ -15,6 +15,7 @@ const CONTRACT = {
   './task-source-registry.js': { functions: ['registerTaskSource', 'updateTaskSource', 'getRegisteredSource', 'getRegisteredSources', 'clearRegistry'] },
   './config.js': { functions: ['getConfig', 'resolveGraphPath'] },
   './task-sources.js': { functions: ['nextCandidateFulfillmentTask', 'taskIdExistsInQueue', 'taskPriority', 'windowFetchedFileContent'] },
+  './sdk/candidate-fulfillment.js': { functions: ['nextCandidateFulfillmentTask', 'windowFetchedFileContent', 'applyArchDiscoveryCandidates', 'parseArchDiscoveryCandidates', 'nextAvailableCandidateId', 'isEffectivelyEmptyResponse'] },
   './candidate-docs.js': { functions: ['applyArchDiscoveryCandidates', 'parseArchDiscoveryCandidates', 'nextAvailableCandidateId', 'isEffectivelyEmptyResponse'] },
   './apply-group-a.js': { functions: ['applyVerdictOnly'] },
   './prompts.js': {
