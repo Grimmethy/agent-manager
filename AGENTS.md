@@ -110,9 +110,11 @@ points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
 - **`docs/PLUGIN_API.md` is the contract** for what a plugin may `require` from
   `agent-manager/src/*`. `src/plugin-api.test.js` fails in THIS repo's CI if one of those
   exports is removed — update both together.
-- The pure scanner rules (`src/maintenance/*-scan.js` + `scan-utils.js`) **stay here** —
-  `staleness-fastpath.js` re-runs them. Only the `*-review.js` wrappers moved. See
-  `src/maintenance/README.md`.
+- The deterministic scanner rules (`observability`/`performance`/`function-length` scans +
+  `scan-utils.js`) live in the **plugin** as of ADR-0022 Stage C. `staleness-fastpath.js`
+  re-runs a rule via the `registerDeterministicRecheck` seam
+  (`src/deterministic-recheck-registry.js`) — it holds no detector code and no source names.
+  Core imports nothing from a `src/maintenance/` directory; that directory is gone.
 - `arch-discovery-structcheck.js` and `arch-import-fetch.js` **stay here** (worker
   subprocess by hardcoded path; shared repo-search harness).
 - `python/build_graph.py` **stays here** — it produces `graph.json` / `community-coverage.json`
