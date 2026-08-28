@@ -16,6 +16,27 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// observability_review/observability_fix (and the performance/function-length trio) moved
+// to the out-of-tree agent-manager-hygiene plugin (2026-08-27), so requiring
+// ./task-sources.js no longer registers them. Several tests below assert CORE draft
+// behaviour (candidate-fulfillment retry, critique pass, tool-access gating, heartbeats)
+// using observability_fix/observability_review as the concrete example -- re-register a
+// matching stub with the same shape (advisoryProse for _review, candidateFulfillment for
+// _fix) and generic candidate-fulfillment prompt builders (the same archReview* pair
+// backlog_fulfillment reuses) so those assertions still exercise the real core path.
+function registerHygieneStubs() {
+  const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const { archReviewPlanPrompt, archReviewImplementPrompt } = require('./prompts.js');
+  if (!getRegisteredSource('observability_review')) {
+    registerTaskSource('observability_review', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
+    updateTaskSource('observability_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+  }
+  if (!getRegisteredSource('observability_fix')) {
+    registerTaskSource('observability_fix', { priority: 72, next: () => null, emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
+    updateTaskSource('observability_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+  }
+}
+
 function withFixtureRepo(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-draft-lock-test-'));
   process.env.AGENT_MANAGER_REPO_ROOT = dir;
@@ -36,6 +57,7 @@ function withFixtureRepo(fn) {
   // its updateTaskSource() calls never re-run, and every source ends up registered but
   // missing its prompt builder (buildPlanPrompt() then throws "no prompt template for
   // domain=...").
+  registerHygieneStubs();
   const { draftTask } = require('./local-draft.js');
   try {
     return fn(draftTask, dir);
