@@ -33,6 +33,28 @@ process.env.AGENT_MANAGER_REPO_ROOT = REPO_ROOT;
 
 const { applyTask, recordApplyOutcome } = require('./apply-task.js');
 
+// observability_review/performance_review moved to the out-of-tree agent-manager-hygiene
+// plugin (2026-08-27), so requiring ./apply-task.js (which requires ./task-sources.js) no
+// longer registers them. The two direct-to-main routing tests below assert core's
+// behaviour for a candidates-doc-appending source (one with its own registered `apply`,
+// whose name is in DIRECT_TO_MAIN_SOURCES) -- register a matching stub so usesGroupB()
+// still resolves them to the custom-apply path.
+const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+const { applyArchDiscoveryCandidates } = require('./candidate-docs.js');
+for (const name of ['observability_review', 'performance_review']) {
+  if (!getRegisteredSource(name)) {
+    registerTaskSource(name, {
+      priority: 80,
+      next: () => null,
+      apply: ({ implementResponse, task }) => applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: path.join(PIPELINE_DIR, `${name.toUpperCase()}_CANDIDATES.md`),
+        snippet: task && task.promptContext && task.promptContext.snippet,
+      }),
+    });
+  }
+}
+
 function baseTask(overrides = {}) {
   return {
     id: 'test-task-1',
