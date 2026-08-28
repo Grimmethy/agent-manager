@@ -46,7 +46,7 @@ convention the underlying model client already used. Set these before launching 
 |---|---|---|
 | `AGENT_MANAGER_REPO_ROOT` | **yes** | Absolute path to the repo this pipeline operates on. |
 | `AGENT_MANAGER_PIPELINE_DIR` | no (defaults to `REPO_ROOT`) | Where `queue/`, `instances/`, and your own local task-source/applier scripts live. |
-| `AGENT_MANAGER_REGISTER_PATH` | no | Path to a script the CLI entry points `require()` once, for its side effect of calling `registerTaskSource`/`updateTaskSource` for your project-specific sources. |
+| `AGENT_MANAGER_REGISTER_PATH` | no | Path (or comma-separated list) to a script the CLI entry points `require()` once, for its side effect of calling `registerTaskSource`/`updateTaskSource` for out-of-tree sources. The programming-hygiene sources ship as one such plugin (`agent-manager-hygiene`). See `docs/PLUGIN_API.md` for what a plugin may import from `agent-manager/src/*`. |
 | `SECOND_BRAIN_DIR` | no | A personal-notes vault, if you use the `secondbrain` built-in source. |
 | `AGENT_MANAGER_GREP_DIRS` | no (default `frontend/src,backend/src`) | Comma-separated dirs the `grep_codebase` tool is allowed to search. |
 | `AGENT_MANAGER_TROUBLE_LOG_PATH` | no (default `<repoRoot>/Docs/TROUBLE_LOG.md`) | Issue-tracker doc for the `trouble_log` source. |
@@ -272,6 +272,12 @@ If you don't register `buildImplementPrompt`, your source's implement pass emits
 generic Group B JSON change-object shape (`{mode: create|edit|delete, file, ...}`, or an
 array of them) and gets applied by `apply-group-b.js` automatically — the default path,
 and the one every built-in "real code change" source uses.
+
+`AGENT_MANAGER_REGISTER_PATH` accepts a comma-separated list, so several independently
+versioned plugins can load side by side. For a larger multi-source plugin (its own repo,
+tests, and a `register.js` that wires each module), see **agent-manager-hygiene** and
+`docs/PLUGIN_API.md` — the latter is the enforced contract (`src/plugin-api.test.js`) for
+which `agent-manager/src/*` exports a plugin may depend on.
 
 ## Launching
 

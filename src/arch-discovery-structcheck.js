@@ -8,6 +8,11 @@
 // Deterministic structural sanity check for arch_discovery's implement/revision output,
 // run by local-worker.ps1 right after critique/revision, before the task reaches review.
 //
+// STAYS IN agent-manager CORE even though arch_discovery itself moved to the
+// agent-manager-hygiene plugin (2026-08-27): the worker invokes this by hardcoded path as
+// a subprocess (scripts/local-worker.*), and it only depends on core's ./candidate-docs.js
+// (parseArchDiscoveryCandidates / isEffectivelyEmptyResponse). See docs/PLUGIN_API.md.
+//
 // Reproduced live 2026-07-21: local-worker.ps1's Critique pass correctly flagged a draft
 // as unverifiable, triggered a Revision pass -- and the REVISION pass itself then produced
 // fluent, on-topic English refusing to verify the draft ("I cannot verify this draft
