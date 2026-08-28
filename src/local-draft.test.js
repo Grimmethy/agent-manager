@@ -36,6 +36,23 @@ function registerHygieneStubs() {
   stub('observability_fix', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
   stub('arch_review', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath, candidateDocTitle: '# Architecture Review Candidates', reasoningTier: 'high' });
   stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }), harnessSearch: 'archImport', skipImplementWhenNoHarnessHits: true }, p.archImportPlanPrompt, p.archImportImplementPrompt);
+
+  // ADR-0022 Stage B/C: staleness-fastpath.js's deterministic recheck consults the
+  // deterministic-recheck-registry instead of a hardcoded rule map, and agent-manager-hygiene
+  // owns both the wiring and the real scanners now. The two staleness_audit fast-path tests
+  // below only need *a* detector that fires on their fixture content -- register a small
+  // "empty catch block" matcher under silent-catch-block so they still exercise the
+  // deterministic short-circuit without a dependency on the (moved-out) real scanner.
+  const { registerDeterministicRecheck, getDeterministicRecheck } = require('./deterministic-recheck-registry.js');
+  if (!getDeterministicRecheck('observability_review')) {
+    registerDeterministicRecheck('observability_review', {
+      perFileRules: {
+        'silent-catch-block': (text, relPath) => text.split('\n').flatMap((ln, i) => (
+          /catch\s*(\([^)]*\))?\s*\{\s*\}/.test(ln) ? [{ file: relPath, line: i + 1, detail: 'empty catch block' }] : []
+        )),
+      },
+    });
+  }
 }
 
 function withFixtureRepo(fn) {
@@ -46,6 +63,7 @@ function withFixtureRepo(fn) {
   delete process.env.AGENT_MANAGER_FORCE_PROVIDER;
   const { clearRegistry } = require('./task-source-registry.js');
   clearRegistry();
+  require('./deterministic-recheck-registry.js').clearDeterministicRecheckRegistry();
   const { clearModelProfileRegistry } = require('./model-profile-registry.js');
   clearModelProfileRegistry();
   delete require.cache[require.resolve('./task-sources.js')];

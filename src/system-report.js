@@ -80,29 +80,18 @@ function terminalTimestamp(task) {
 function classifyTask(task, queueState) {
   if (queueState === 'blocked' || queueState === 'archived') return 'junk';
 
-  // A task source declares how its completed tasks count toward this accounting via
-  // reportClass on its registration -- a plain bucket string, or a (task) => bucket|null
-  // for a source that decides from the draft text (observability/performance review split
-  // filtering vs. benefit on what the verdict actually said). ADR-0022 Stage A3: the
-  // hardcoded branches below are the fallback for sources that don't declare it, and for
-  // when a plugin that would isn't loaded; Stage G removes them.
+  // Each task source declares how its completed tasks count toward this accounting via
+  // reportClass on its registration -- a plain bucket string ('benefit' / 'filtering' /
+  // 'housekeeping'), or a (task) => bucket function for a source that decides from the
+  // draft text (observability/performance review split filtering vs. benefit on what the
+  // verdict actually said). A source with no reportClass -> 'unclear', reported as its own
+  // bucket rather than guessed into one. ADR-0022 Stage G removed the hardcoded per-source
+  // fallback chain this used to carry -- every source that had a branch now sets the field.
   const registered = getRegisteredSource(resolveSourceName(task));
   const declared = typeof registered?.reportClass === 'function'
     ? registered.reportClass(task)
     : registered?.reportClass;
-  if (declared) return declared;
-
-  const source = task.source;
-  if (source === 'observability_review' || source === 'performance_review') {
-    const text = (task.implementResponse || '').toLowerCase();
-    if (text.includes('false positive') || text.includes('false-positive')) return 'filtering';
-    if (text.includes('genuine')) return 'benefit';
-    return 'unclear';
-  }
-  if (source === 'manual' || task.domain === 'adhoc') return 'benefit';
-  if (['arch_import', 'arch_discovery', 'deep_dive', 'project_search'].includes(source)) return 'benefit';
-  if (['brain_dump_sort', 'path_prefetch_resolve'].includes(source)) return 'housekeeping';
-  return 'unclear';
+  return declared || 'unclear';
 }
 
 // Scans queue/done/ (including done/_archived_no_action/, which is where the minified-

@@ -32,45 +32,41 @@ function writeTask(dir, id, task) {
 
 test('classifyTask: blocked/archived tasks are always junk regardless of source', () => {
   assert.equal(classifyTask({ source: 'manual' }, 'blocked'), 'junk');
-  assert.equal(classifyTask({ source: 'arch_import' }, 'archived'), 'junk');
+  assert.equal(classifyTask({ source: 'backlog_fulfillment' }, 'archived'), 'junk');
 });
 
-test('classifyTask: observability/performance review verdicts split into filtering vs benefit', () => {
-  assert.equal(classifyTask({ source: 'observability_review', implementResponse: 'This is a false positive, no action needed.' }, 'done'), 'filtering');
-  assert.equal(classifyTask({ source: 'performance_review', implementResponse: 'Confirmed genuine issue, fixed.' }, 'done'), 'benefit');
-  assert.equal(classifyTask({ source: 'observability_review', implementResponse: 'unrelated text' }, 'done'), 'unclear');
-});
-
-test('classifyTask: manual/adhoc and arch_import/discovery/deep_dive/project_search are benefit', () => {
+test('classifyTask: core built-ins report the bucket their registration declares', () => {
+  // adhoc (manual resolves to it) -> benefit; deep_dive -> benefit;
+  // brain_dump_sort / path_prefetch_resolve -> housekeeping. All set in task-sources.js.
   assert.equal(classifyTask({ source: 'manual', domain: 'adhoc' }, 'done'), 'benefit');
-  assert.equal(classifyTask({ source: 'arch_discovery' }, 'done'), 'benefit');
   assert.equal(classifyTask({ source: 'deep_dive' }, 'done'), 'benefit');
-});
-
-test('classifyTask: brain_dump_sort/path_prefetch_resolve are housekeeping', () => {
   assert.equal(classifyTask({ source: 'brain_dump_sort' }, 'done'), 'housekeeping');
   assert.equal(classifyTask({ source: 'path_prefetch_resolve' }, 'done'), 'housekeeping');
 });
 
-// ADR-0022 Stage A3: classifyTask no longer hardcodes the source->bucket mapping; it reads
-// reportClass off the registry (string, or a (task) => bucket for the review split). Guard
-// the seam so a future refactor can't silently drop it.
+test('classifyTask: a source with no reportClass (or an unloaded plugin source) is "unclear"', () => {
+  // arch_discovery / observability_review live in agent-manager-hygiene, not loaded here.
+  assert.equal(classifyTask({ source: 'arch_discovery' }, 'done'), 'unclear');
+  assert.equal(classifyTask({ source: 'observability_review', implementResponse: 'genuine issue' }, 'done'), 'unclear');
+});
+
+// ADR-0022 Stage A3/G: classifyTask reads reportClass off the registry only -- no hardcoded
+// source->bucket mapping. Guard the seam so a future refactor can't silently drop it.
 test('classifyTask: reads reportClass off the registry -- string and (task) => bucket forms', () => {
   const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
-  if (!getRegisteredSource('sa3_probe_static')) {
-    registerTaskSource('sa3_probe_static', { priority: 50, next: () => null, reportClass: 'filtering' });
+  if (!getRegisteredSource('sg_probe_static')) {
+    registerTaskSource('sg_probe_static', { priority: 50, next: () => null, reportClass: 'filtering' });
   }
-  if (!getRegisteredSource('sa3_probe_dynamic')) {
-    registerTaskSource('sa3_probe_dynamic', {
+  if (!getRegisteredSource('sg_probe_dynamic')) {
+    registerTaskSource('sg_probe_dynamic', {
       priority: 50, next: () => null,
       reportClass: (t) => (t.implementResponse === 'good' ? 'benefit' : 'unclear'),
     });
   }
-  assert.equal(classifyTask({ source: 'sa3_probe_static' }, 'done'), 'filtering');
-  assert.equal(classifyTask({ source: 'sa3_probe_dynamic', implementResponse: 'good' }, 'done'), 'benefit');
-  assert.equal(classifyTask({ source: 'sa3_probe_dynamic', implementResponse: 'meh' }, 'done'), 'unclear');
-  // a registered source with no reportClass still falls through to the hardcoded fallback
-  assert.equal(classifyTask({ source: 'sa3_probe_static' }, 'blocked'), 'junk');
+  assert.equal(classifyTask({ source: 'sg_probe_static' }, 'done'), 'filtering');
+  assert.equal(classifyTask({ source: 'sg_probe_dynamic', implementResponse: 'good' }, 'done'), 'benefit');
+  assert.equal(classifyTask({ source: 'sg_probe_dynamic', implementResponse: 'meh' }, 'done'), 'unclear');
+  assert.equal(classifyTask({ source: 'sg_probe_static' }, 'blocked'), 'junk'); // blocked short-circuit wins
 });
 
 test('scanTaskActivity: only includes tasks whose terminal history timestamp falls in the window', () => {

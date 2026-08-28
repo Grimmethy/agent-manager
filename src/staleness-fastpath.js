@@ -8,19 +8,24 @@
 // timeouts (~225-240s every attempt, 14 attempts, ~2 hours) and permanently blocked,
 // needing a human to manually re-derive the one thing staleness_audit exists to answer:
 // "is the flagged code still there." That answer was a git-diff and a regex away the
-// whole time -- observability_review/performance_review's OWN scanners
-// (src/maintenance/*-scan.js) already express each rule as a pure, deterministic
-// (text, relPath) -> findings function. Re-running the SAME rule against the file's
-// CURRENT content answers "is this still true" with certainty, in milliseconds, with zero
-// chance of a model timeout ever blocking the audit.
+// whole time -- the scanner that raised the finding already expresses each rule as a
+// pure, deterministic (text, relPath) -> findings function. Re-running the SAME rule
+// against the file's CURRENT content answers "is this still true" with certainty, in
+// milliseconds, with zero chance of a model timeout ever blocking the audit.
 //
-// Scope: only observability_review/performance_review findings with a real
-// {rule, file} the ORIGINAL task's own promptContext named (stamped onto the
-// staleness_audit task at filing time -- see staleness-audit.js's buildStalenessAuditTask).
-// Anything else (adhoc, project_search, arch_review, function_length_review's non-
-// line-based shape, or a rule this file doesn't recognize) returns null -- the existing
-// harness-grounded local-model path (local-draft.js's own staleness_audit branch) is the
-// right tool for a claim a regex can't re-derive, unchanged.
+// ADR-0022 Stage B: which rules are re-runnable, and how, is no longer hardcoded here.
+// The source that owns a scanner registers its rechecks via
+// deterministic-recheck-registry.js's registerDeterministicRecheck() (agent-manager-hygiene
+// does this for observability_review / performance_review). This file stays a pure,
+// core-side consumer -- it holds the file IO, the repoRoot path-safety check, and the
+// report-text templates (all generic), and imports nothing from src/maintenance/. A source
+// with no registered recheck -> deterministicRecheck returns null -> the existing
+// harness-grounded local-model path (local-draft.js's own staleness_audit branch) runs,
+// unchanged, exactly as it did before this file existed.
+//
+// Scope: only a staleness_audit task whose ORIGINAL finding carried a real
+// {originalSource, originalRule[, originalFile]} in its promptContext (stamped at filing
+// time -- see staleness-audit.js's buildStalenessAuditTask). Anything else returns null.
 //
 // Deliberately conservative in the safe direction: "the rule still fires SOMEWHERE in the
 // file" (not an exact line match, which line-drift from unrelated edits would break)
@@ -32,67 +37,71 @@
 
 const fs = require('fs');
 const path = require('path');
+const { getDeterministicRecheck } = require('./deterministic-recheck-registry.js');
 
-function silentCatchBlocks(text, relPath) {
-  return require('./maintenance/observability-scan.js').findSilentCatchBlocks(text, relPath);
-}
-function unguardedLoops(text, relPath) {
-  return require('./maintenance/observability-scan.js').findUnguardedLoops(text, relPath);
-}
-function otelNaming(text, relPath) {
-  return require('./maintenance/observability-scan.js').findOtelNamingViolations(text, relPath);
-}
-function syncIoInLoop(text, relPath) {
-  return require('./maintenance/performance-scan.js').findLoopBodyIssues(text, relPath).filter((f) => f.rule === 'sync-io-in-loop');
-}
-function sequentialAwaitInLoop(text, relPath) {
-  return require('./maintenance/performance-scan.js').findLoopBodyIssues(text, relPath).filter((f) => f.rule === 'sequential-await-in-loop');
-}
-function jsonDeepClone(text, relPath) {
-  return require('./maintenance/performance-scan.js').findJsonDeepCloneAntipattern(text, relPath);
+function toHits(findings) {
+  return findings.map((f) => ({ file: f.file, line: f.line, query: 'deterministic-rescan', text: f.detail }));
 }
 
-// function_length_review's length-not-pattern shape is deliberately absent here -- a
-// single-file (text, relPath) recheck isn't the right shape for it; it falls back to the
-// LLM path same as any other unsupported rule.
-const RULE_DETECTORS = {
-  'silent-catch-block': silentCatchBlocks,
-  'unguarded-long-running-loop': unguardedLoops,
-  'otel-naming-convention': otelNaming,
-  'sync-io-in-loop': syncIoInLoop,
-  'sequential-await-in-loop': sequentialAwaitInLoop,
-  'json-deep-clone-antipattern': jsonDeepClone,
-};
-
-// 2026-08-24, Grimmethy: "Do 1 and 2" (extend the fastpath's rule coverage) -- the one
-// real gap left after the initial pass: missing-reserved-attribute is REPO-WIDE (a
-// project either has service.name/error.type somewhere in its source or it doesn't --
-// there's no single (file, line) to re-check), so it can't share RULE_DETECTORS' per-file
-// (text, relPath) -> findings shape. Re-derives the exact same scan scanProject()
-// (observability-scan.js) runs for this rule: same SCAN_EXTENSIONS list (duplicated
-// locally -- not exported, same small-duplication convention every other maintenance
-// module here already follows), same isLikelyMinified filter, same hasOtelDependency gate
-// (a project with no OTel SDK dependency was never really subject to this rule at all,
-// same as "resolved" -- there's nothing to still be missing).
-const REPO_WIDE_SCAN_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.go'];
-
-function missingReservedAttribute(repoRoot) {
-  const { hasOtelDependency, findMissingReservedAttributes } = require('./maintenance/observability-scan.js');
-  const { listSourceFiles, isLikelyMinified } = require('./maintenance/scan-utils.js');
-  if (!hasOtelDependency(repoRoot)) return [];
-  const files = listSourceFiles(repoRoot, REPO_WIDE_SCAN_EXTENSIONS).filter((file) => {
-    let text;
-    try { text = fs.readFileSync(file, 'utf8'); } catch { return false; }
-    return !isLikelyMinified(text);
-  });
-  return findMissingReservedAttributes(repoRoot, files);
+function repoWideArchive(originalRule) {
+  return {
+    recommendation: 'archive',
+    hits: [],
+    reportText: [
+      `1. The original concern no longer applies: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content finds nothing missing.`,
+      '2. N/A -- not a fabrication-repeat case.',
+      `3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" no longer fires anywhere in this repo.`,
+    ].join('\n'),
+  };
 }
 
-const REPO_WIDE_RULE_DETECTORS = {
-  'missing-reserved-attribute': missingReservedAttribute,
-};
+function repoWideInvestigate(originalRule, findings) {
+  return {
+    recommendation: 'investigate',
+    hits: toHits(findings),
+    reportText: [
+      `1. The original concern still holds: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content still finds it missing.`,
+      '2. N/A -- not a fabrication-repeat case.',
+      `3. RECOMMENDATION: worth a fresh investigation -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" still fires in this repo.`,
+    ].join('\n'),
+  };
+}
 
-const SUPPORTED_SOURCES = new Set(['observability_review', 'performance_review']);
+function fileGoneArchive() {
+  return {
+    recommendation: 'archive',
+    hits: [],
+    reportText: [
+      '1. The original concern no longer applies: the file it named no longer exists in this repo (deleted or moved since the finding was filed).',
+      '2. N/A -- not a fabrication-repeat case.',
+      '3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): the file no longer exists.',
+    ].join('\n'),
+  };
+}
+
+function perFileArchive(originalRule, originalFile) {
+  return {
+    recommendation: 'archive',
+    hits: [],
+    reportText: [
+      `1. The original concern no longer applies: re-running the original scanner rule ("${originalRule}") against ${originalFile}'s CURRENT content finds no match anywhere in the file -- the flagged pattern is provably gone, not just moved.`,
+      '2. N/A -- not a fabrication-repeat case.',
+      `3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" no longer fires anywhere in ${originalFile}.`,
+    ].join('\n'),
+  };
+}
+
+function perFileInvestigate(originalRule, originalFile, findings) {
+  return {
+    recommendation: 'investigate',
+    hits: toHits(findings),
+    reportText: [
+      `1. The original concern still holds: re-running the original scanner rule ("${originalRule}") against ${originalFile}'s CURRENT content still finds it, at line ${findings[0].line} (${findings.map((f) => f.line).join(', ')} total match(es)).`,
+      '2. N/A -- not a fabrication-repeat case.',
+      `3. RECOMMENDATION: worth a fresh investigation -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" still fires in ${originalFile}.`,
+    ].join('\n'),
+  };
+}
 
 // task = the staleness_audit task (NOT the original flagged task) -- reads the
 // originalSource/originalRule/originalFile fields buildStalenessAuditTask stamps onto
@@ -102,35 +111,18 @@ function deterministicRecheck(task, repoRoot) {
   const ctx = (task && task.promptContext) || {};
   const { originalSource, originalRule, originalFile } = ctx;
   if (!repoRoot || !originalSource || !originalRule) return null;
-  if (!SUPPORTED_SOURCES.has(originalSource)) return null;
 
-  const repoWideDetector = REPO_WIDE_RULE_DETECTORS[originalRule];
+  const config = getDeterministicRecheck(originalSource);
+  if (!config) return null;
+
+  const repoWideDetector = config.repoWideRules[originalRule];
   if (repoWideDetector) {
     const findings = repoWideDetector(repoRoot);
-    if (findings.length === 0) {
-      return {
-        recommendation: 'archive',
-        hits: [],
-        reportText: [
-          `1. The original concern no longer applies: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content finds nothing missing.`,
-          '2. N/A -- not a fabrication-repeat case.',
-          `3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" no longer fires anywhere in this repo.`,
-        ].join('\n'),
-      };
-    }
-    return {
-      recommendation: 'investigate',
-      hits: findings.map((f) => ({ file: f.file, line: f.line, query: 'deterministic-rescan', text: f.detail })),
-      reportText: [
-        `1. The original concern still holds: re-running the original scanner rule ("${originalRule}", a repo-wide check) against this repo's CURRENT content still finds it missing.`,
-        '2. N/A -- not a fabrication-repeat case.',
-        `3. RECOMMENDATION: worth a fresh investigation -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" still fires in this repo.`,
-      ].join('\n'),
-    };
+    return findings.length === 0 ? repoWideArchive(originalRule) : repoWideInvestigate(originalRule, findings);
   }
 
   if (!originalFile) return null;
-  const detector = RULE_DETECTORS[originalRule];
+  const detector = config.perFileRules[originalRule];
   if (!detector) return null;
 
   const absPath = path.resolve(repoRoot, originalFile);
@@ -143,43 +135,14 @@ function deterministicRecheck(task, repoRoot) {
   try {
     text = fs.readFileSync(absPath, 'utf8');
   } catch (e) {
-    if (e.code === 'ENOENT') {
-      return {
-        recommendation: 'archive',
-        hits: [],
-        reportText: [
-          '1. The original concern no longer applies: the file it named no longer exists in this repo (deleted or moved since the finding was filed).',
-          '2. N/A -- not a fabrication-repeat case.',
-          '3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): the file no longer exists.',
-        ].join('\n'),
-      };
-    }
+    if (e.code === 'ENOENT') return fileGoneArchive();
     return null; // any other read failure (permissions, etc.) -- not confident enough to auto-resolve, fall back to the LLM path
   }
 
   const findings = detector(text, originalFile);
-  if (findings.length === 0) {
-    return {
-      recommendation: 'archive',
-      hits: [],
-      reportText: [
-        `1. The original concern no longer applies: re-running the original scanner rule ("${originalRule}") against ${originalFile}'s CURRENT content finds no match anywhere in the file -- the flagged pattern is provably gone, not just moved.`,
-        '2. N/A -- not a fabrication-repeat case.',
-        `3. RECOMMENDATION: archive -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" no longer fires anywhere in ${originalFile}.`,
-      ].join('\n'),
-    };
-  }
-
-  const hits = findings.map((f) => ({ file: f.file, line: f.line, query: 'deterministic-rescan', text: f.detail }));
-  return {
-    recommendation: 'investigate',
-    hits,
-    reportText: [
-      `1. The original concern still holds: re-running the original scanner rule ("${originalRule}") against ${originalFile}'s CURRENT content still finds it, at line ${findings[0].line} (${findings.map((f) => f.line).join(', ')} total match(es)).`,
-      '2. N/A -- not a fabrication-repeat case.',
-      `3. RECOMMENDATION: worth a fresh investigation -- deterministic recheck (re-ran the original scanner rule directly, not a model judgment call): "${originalRule}" still fires in ${originalFile}.`,
-    ].join('\n'),
-  };
+  return findings.length === 0
+    ? perFileArchive(originalRule, originalFile)
+    : perFileInvestigate(originalRule, originalFile, findings);
 }
 
-module.exports = { deterministicRecheck, RULE_DETECTORS, REPO_WIDE_RULE_DETECTORS, SUPPORTED_SOURCES };
+module.exports = { deterministicRecheck };
