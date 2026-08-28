@@ -43,7 +43,7 @@ const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const { draftAdhocImplement, parseClarificationOptions } = require('./adhoc-agentic-draft.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
@@ -55,6 +55,16 @@ const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
+
+// Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
+// plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
+// buildPlanPrompt/buildImplementPrompt (prompts.js), which look the builder up by source
+// name on the registry -- without this, a plugin-source task (arch_review,
+// observability_fix, ...) hits genericFallbackPlanPrompt and dies with "no prompt template
+// for domain=default source=arch_review". Matches apply-task.js / get-grounding-source.js.
+// (Before the 2026-08-27 plugin split, requiring prompts.js -> task-sources.js registered
+// everything eagerly; it no longer covers plugin sources.)
+ensureRegistered();
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
