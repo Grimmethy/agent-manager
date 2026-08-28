@@ -2171,18 +2171,37 @@ if (require.main === module) {
       if (!map.has(fn)) map.set(fn, `g${nextGroupId++}`);
       return map.get(fn);
     };
-    const dump = sources.map((source) => ({
-      name: source.name,
-      priority: source.priority ?? null,
-      candidateFulfillment: !!source.candidateFulfillment,
-      emptyApproval: !!source.emptyApproval,
-      advisoryProse: !!source.advisoryProse,
-      hasCustomApply: typeof source.apply === 'function',
-      directToMain: DIRECT_TO_MAIN_SOURCES.has(source.name),
-      hasCandidatesPath: typeof source.candidatesPath === 'function',
-      planPromptGroup: groupIdFor(source.buildPlanPrompt, planGroupIds),
-      implementPromptGroup: groupIdFor(source.buildImplementPrompt, implementGroupIds),
-    }));
+    // reasoningTier/workerType: the static tier a source registers (model-provider.js's
+    // reasoningTierFor() default), and the worker lane name the dashboard shows for it.
+    // candidatesPath/candidateDocTitle: resolved doc for a candidate-fulfillment source
+    // (the lazy getter is called here so app.py's Job List "Available" column and
+    // CANDIDATE_BACKLOG_SOURCES no longer need their own hand-maintained path mirrors) --
+    // wrapped because the getter calls getConfig(), which can throw if repoRoot is unset.
+    const TIER_TO_WORKER = { low: 'ornith', high: 'reasoning' };
+    const dump = sources.map((source) => {
+      const reasoningTier = source.reasoningTier || 'low';
+      let candidatesPath = null;
+      if (typeof source.candidatesPath === 'function') {
+        try { candidatesPath = source.candidatesPath() || null; } catch { candidatesPath = null; }
+      }
+      return {
+        name: source.name,
+        slug: source.name.replace(/_/g, '-'),
+        priority: source.priority ?? null,
+        reasoningTier,
+        workerType: TIER_TO_WORKER[reasoningTier] || 'ornith',
+        candidateFulfillment: !!source.candidateFulfillment,
+        emptyApproval: !!source.emptyApproval,
+        advisoryProse: !!source.advisoryProse,
+        hasCustomApply: typeof source.apply === 'function',
+        directToMain: DIRECT_TO_MAIN_SOURCES.has(source.name),
+        hasCandidatesPath: typeof source.candidatesPath === 'function',
+        candidatesPath,
+        candidateDocTitle: source.candidateDocTitle ?? null,
+        planPromptGroup: groupIdFor(source.buildPlanPrompt, planGroupIds),
+        implementPromptGroup: groupIdFor(source.buildImplementPrompt, implementGroupIds),
+      };
+    });
     console.log(JSON.stringify(dump));
     return;
   }
