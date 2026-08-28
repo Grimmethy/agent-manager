@@ -227,9 +227,16 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       const { repoRoot, pipelineDir, defaultDomain, performanceCoveragePath } = getConfig();
       return nextPerformanceReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: performanceCoveragePath });
     },
-    apply: ({ implementResponse }) => {
+    apply: ({ implementResponse, task }) => {
       const { performanceFixCandidatesPath } = getConfig();
-      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: performanceFixCandidatesPath, docTitle: '# Performance Fix Candidates' });
+      // See apply-group-a.js's applyArchDiscoveryCandidates for why this real,
+      // review-time-fresh snippet is threaded through deterministically.
+      return applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: performanceFixCandidatesPath,
+        docTitle: '# Performance Fix Candidates',
+        snippet: task && task.promptContext && task.promptContext.snippet,
+      });
     },
     advisoryProse: true,
   });

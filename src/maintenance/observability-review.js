@@ -243,9 +243,18 @@ function register({ getConfig, nextCandidateFulfillmentTask, taskIdExistsInQueue
       const { repoRoot, pipelineDir, defaultDomain, observabilityCoveragePath } = getConfig();
       return nextObservabilityReviewTask({ repoRoot, pipelineDir, defaultDomain, taskIdExistsInQueue, coveragePath: observabilityCoveragePath });
     },
-    apply: ({ implementResponse }) => {
+    apply: ({ implementResponse, task }) => {
       const { observabilityFixCandidatesPath } = getConfig();
-      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: observabilityFixCandidatesPath, docTitle: '# Observability Fix Candidates' });
+      // task.promptContext.snippet is the real, review-time-fresh code text this
+      // finding is about (see nextObservabilityReviewTask below) -- passed through
+      // deterministically so it survives into the candidate doc as data, not just
+      // however faithfully the model's own prose happened to paraphrase it.
+      return applyArchDiscoveryCandidates({
+        implementResponse,
+        candidatesPath: observabilityFixCandidatesPath,
+        docTitle: '# Observability Fix Candidates',
+        snippet: task && task.promptContext && task.promptContext.snippet,
+      });
     },
     advisoryProse: true,
   });

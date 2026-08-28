@@ -211,6 +211,49 @@ test('performance_review genuine verdict -> apply writes a candidate -> performa
   assert.deepEqual(fixTask.promptContext.files, ['worker.js']);
 });
 
+// 2026-08-27, Grimmethy: "we should be looking for code content instead of the line
+// itself." The review task already carries the real code text it judged as
+// promptContext.snippet; apply must thread it through to applyArchDiscoveryCandidates so
+// it lands in the candidate doc as a deterministic Snippet: field (see apply-group-a.js),
+// giving windowFetchedFileContent a real anchor instead of the model's own prose.
+test('performance_review apply threads task.promptContext.snippet into the candidate doc as a Snippet: field', () => {
+  const dir = makePerformanceFixtureRepo();
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const candidatesPath = path.join(dir, 'PERFORMANCE_FIX_CANDIDATES.md');
+  process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH = candidatesPath;
+  const { clearRegistry, getRegisteredSource } = require('../task-source-registry.js');
+  clearRegistry();
+  const { clearModelProfileRegistry } = require('../model-profile-registry.js');
+  clearModelProfileRegistry();
+  delete require.cache[require.resolve('../task-sources.js')];
+  require('../task-sources.js');
+
+  const genuineImplementResponse = [
+    '### AC-001 · Sequential network calls in a hot loop',
+    'Strength: Strong',
+    'Files: worker.js',
+    '',
+    'Problem:',
+    'Each iteration awaits sequentially -- prose paraphrases the loop as `for (const x of items)`.',
+    '',
+    'Solution:',
+    'Batch with Promise.all.',
+    '',
+    'Benefits:',
+    'Faster.',
+  ].join('\n');
+
+  const performanceReview = getRegisteredSource('performance_review');
+  performanceReview.apply({
+    implementResponse: genuineImplementResponse,
+    task: { promptContext: { snippet: '  for (const item of items) {\n    await fetch(item.url);\n  }' } },
+  });
+
+  const text = fs.readFileSync(candidatesPath, 'utf8');
+  assert.match(text, /Snippet:\n```\n {2}for \(const item of items\) \{\n {4}await fetch\(item\.url\);\n {2}\}\n```/);
+});
+
 test('performance_review false-positive verdict -> apply is a clean no-op, no candidate written', () => {
   const dir = makePerformanceFixtureRepo();
   process.env.AGENT_MANAGER_REPO_ROOT = dir;
