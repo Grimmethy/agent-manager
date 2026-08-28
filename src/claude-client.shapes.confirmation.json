@@ -1,0 +1,16 @@
+{
+  "confirmed": true,
+  "file": "src/claude-client.js",
+  "confirmedAt": "2026-08-28",
+  "call": {
+    "signature": "async function call(opts, maxRetries = 2)",
+    "returnsSuccess": "{ ...result, degenerate: null, attempts: attempt + 1 }",
+    "returnsAllDegenerate": "{ response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 }",
+    "note": "Reuses local-client.js detectDegenerate(); retries up to maxRetries (default 2) on degenerate output."
+  },
+  "majorityVote": {
+    "signature": "async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs })",
+    "returns": "{ verdict, confident, votes, realVoteCount, requestedVotes }",
+    "note": "Mirrors local-client.js majorityVote exactly (same signature, same tally logic). Duplicated rather than imported. model/effort/timeoutMs added for profile support."
+  }
+}
