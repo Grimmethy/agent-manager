@@ -19,7 +19,7 @@ const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
-const { applyArchDiscoveryCandidates, applyArchImportCandidate, applyVerdictOnly } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -798,96 +798,9 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
   return null;
 }
 
-// --- Source: arch_discovery — generates new candidates for one graphify community at a time (priority 80) --
-//
-// Deliberately placed AFTER arch_review (the consumer): new candidates are only generated
-// once there's nothing left to consume, so this never piles up junk faster than arch_review
-// can drain it. The model has no filesystem access, so every real file this needs is read
-// here and embedded verbatim into promptContext.
-// Was 60000, same bug and same fix as DEEP_DIVE_CONTEXT_BUDGET_CHARS below (see its
-// comment) -- nearly double local-client.js's num_ctx=8192 default, which arch_discovery's
-// plan call never overrides. Hadn't yet triggered a live degenerate-empty failure the way
-// deep_dive's did, but the same overflow risk existed regardless.
-const ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS = 24000;
-
-function nextArchDiscoveryTask() {
-  const { repoRoot, communityCoveragePath, graphPath, archReviewCandidatesPath, defaultDomain } = getConfig();
-  const coverageText = readIfExists(communityCoveragePath);
-  if (!coverageText) return null;
-
-  let coverage;
-  try {
-    coverage = JSON.parse(coverageText);
-  } catch {
-    return null;
-  }
-  if (!coverage || !Array.isArray(coverage.communities) || coverage.communities.length === 0) return null;
-
-  // Oldest lastReviewedAt first; null (never reviewed) sorts before any real timestamp.
-  const sorted = [...coverage.communities].sort((a, b) => {
-    const at = a.lastReviewedAt ? Date.parse(a.lastReviewedAt) : -Infinity;
-    const bt = b.lastReviewedAt ? Date.parse(b.lastReviewedAt) : -Infinity;
-    return at - bt;
-  });
-  const chosen = sorted.find((c) => !taskIdExistsInQueue('arch-discovery-community-' + c.id));
-  if (!chosen) return null; // every community already has an in-flight or terminal task
-
-  const graphText = readIfExists(graphPath);
-  if (!graphText) return null;
-
-  let graph;
-  try {
-    graph = JSON.parse(graphText);
-  } catch {
-    return null;
-  }
-  if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.links)) return null;
-
-  const memberNodes = graph.nodes.filter((n) => n.community === chosen.id);
-  if (memberNodes.length === 0) return null;
-
-  // Degree = how many times a node's id appears as EITHER end of ANY link in the whole
-  // graph, not just links within this community — a file's real architectural weight
-  // includes its cross-community connections.
-  const degreeByNodeId = {};
-  for (const link of graph.links) {
-    degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
-    degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
-  }
-
-  const degreeByFile = {};
-  for (const node of memberNodes) {
-    if (!node.source_file) continue;
-    degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-  }
-  const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
-
-  const files = [];
-  let budgetUsed = 0;
-  for (const [sourceFile, degree] of rankedFiles) {
-    const content = readIfExists(path.join(repoRoot, sourceFile));
-    if (content == null) continue; // skip unreadable/missing files, never throw
-    if (budgetUsed + content.length > ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS) break;
-    files.push({ path: sourceFile, degree, content });
-    budgetUsed += content.length;
-  }
-
-  const candidatesTail = readIfExists(archReviewCandidatesPath);
-  const existingCandidatesTail = candidatesTail ? candidatesTail.slice(-4000) : '';
-
-  return {
-    id: 'arch-discovery-community-' + chosen.id,
-    domain: defaultDomain,
-    source: 'arch_discovery',
-    title: 'Architecture discovery: ' + chosen.name,
-    promptContext: {
-      communityId: chosen.id,
-      communityName: chosen.name,
-      files,
-      existingCandidatesTail,
-    },
-  };
-}
+// arch_discovery / arch_review / arch_import / arch_import_review moved to the
+// agent-manager-hygiene plugin (2026-08-27). unused_export too. Wired via
+// AGENT_MANAGER_REGISTER_PATH.
 
 // --- Source: project_search — proposes external open-source leads for the active project
 // (priority 85, between arch_discovery's 80 and unused_export's 90) ----------------------
@@ -1175,47 +1088,6 @@ function nextDeepDiveTask() {
       files,
     },
   };
-}
-
-// --- Source: queue/dead-code-flags.json, absolute lowest priority (priority 90) ---------
-//
-// A separate scanner script flags exported symbols with low real call-site counts (call
-// sites are attached so the downstream judgment is "genuine dead code vs. false positive,"
-// not a bare tool verdict). Lower priority than even the architecture backlog: this is
-// pure speculative cleanup.
-function nextUnusedExportTask() {
-  const { pipelineDir, defaultDomain } = getConfig();
-  const flagsPath = path.join(pipelineDir, 'queue', 'dead-code-flags.json');
-  let entries;
-  try {
-    const raw = readIfExists(flagsPath);
-    if (!raw) return null;
-    entries = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-
-  entries.sort((a, b) => new Date(a.scannedAt) - new Date(b.scannedAt));
-
-  for (const entry of entries) {
-    const taskId = `deadcode-${slugifyForId(entry.symbol)}-${slugifyForId(entry.definedIn)}`;
-    if (taskIdExistsInQueue(taskId)) continue;
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'deadcode_triage',
-      title: `Triage dead-code candidate: ${entry.symbol} (defined in ${entry.definedIn}) — ${entry.callSites.length} call site(s) found`,
-      promptContext: {
-        symbol: entry.symbol,
-        definedIn: entry.definedIn,
-        callSites: entry.callSites,
-        note: 'Judge genuine-dead vs false-positive (barrel/re-export, factory pattern, etc.). Use a majority-vote judgment, not a single verdict.',
-      },
-    };
-  }
-
-  return null;
 }
 
 // --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
@@ -1650,203 +1522,9 @@ registerTaskSource('path_prefetch_resolve', {
   priority: taskPriority('path_prefetch_resolve', 45),
   next: nextPathPrefetchResolveTask,
 });
-// candidatesPath/candidateDocTitle (2026-08-26): where a `{"mode": "split"}` implement
-// response (see prompts.js's candidateSplitInstructions -- "how do we make that split
-// happen the moment it realizes the scope is too large" -- root-caused live via
-// arch-review-ac-4) gets its sub-candidates written back to, via
-// applyArchDiscoveryCandidates (apply-group-a.js), the same appender arch_discovery's own
-// apply already uses. A lazy getter, not a plain value, since getConfig() isn't callable
-// at module-load time.
-// reasoningTier: 'high' (2026-08-26, Grimmethy: "default to qwen reasoning to high...
-// across the board" -- root-caused live via arch-review-ac-5, whose local (low-tier)
-// implement pass produced 0 chars on its 3rd and final attempt, exhausting retries with
-// nothing usable). This moves arch_review onto the worker-reasoning lane instead of
-// worker-1's -- NOT a route to Claude: refresh_active_model()'s own budget/pause check
-// (local-worker.sh) already forces that lane back to local Ollama whenever Claude is
-// rate-limited or manually paused (which it currently is, deliberately, per that same
-// conversation), so this stays qwen-only as long as that pause holds.
-registerTaskSource('arch_review', {
-  priority: taskPriority('arch_review', 70),
-  next: () => nextCandidateFulfillmentTask(getConfig().archReviewCandidatesPath, 'arch_review'),
-  emptyApproval: true, candidateFulfillment: true,
-  candidatesPath: () => getConfig().archReviewCandidatesPath,
-  candidateDocTitle: '# Architecture Review Candidates',
-  reasoningTier: 'high',
-});
-// arch_import_review (ADR-0020): the OTHER consumer of nextCandidateFulfillmentTask,
-// against arch_import's own candidates doc instead of arch_discovery's. Priority 71 --
-// immediately after arch_review (70), before arch_discovery (80) -- every stage's own
-// consumer outranks its own generator, and outranks the stage that feeds it; see
-// docs/arch-import-pipeline.md for the full priority-ladder reasoning.
-registerTaskSource('arch_import_review', {
-  priority: taskPriority('arch_import_review', 71),
-  next: () => nextCandidateFulfillmentTask(getConfig().archImportCandidatesPath, 'arch_import_review'),
-  emptyApproval: true, candidateFulfillment: true,
-  candidatesPath: () => getConfig().archImportCandidatesPath,
-  candidateDocTitle: '# Architecture Import Candidates',
-  reasoningTier: 'high', // same reasoning as arch_review's own registration just above.
-});
-// apply (not just priority/next): arch_discovery's implement pass deliberately outputs raw
-// markdown candidate write-ups (see prompts.js's archDiscoveryImplementPrompt), not Group B
-// JSON -- without this, apply-task.js's writeArtifact() falls through to the generic Group
-// B JSON parser and every approved arch_discovery task fails apply 100% of the time (found
-// live 2026-07-21, see apply-group-a.js's applyArchDiscoveryCandidates for the full story).
-registerTaskSource('arch_discovery', {
-  priority: taskPriority('arch_discovery', 80),
-  next: nextArchDiscoveryTask,
-  apply: ({ implementResponse }) => {
-    const { archReviewCandidatesPath } = getConfig();
-    return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: archReviewCandidatesPath });
-  },
-  emptyApproval: true,
-});
-
 // observability_review/observability_fix, performance_review/performance_fix -- moved
 // to src/maintenance/observability-review.js and src/maintenance/performance-review.js
 // (2026-08-23), registered near the bottom of this file alongside function_length_review.
-
-// --- Source: arch_import -- promotes a deep_dive Use/Adapt finding into a real,
-// agent-manager-grounded architecture candidate (priority 81, ADR-0020,
-// docs/arch-import-pipeline.md). Deliberately placed AFTER arch_import_review (71, its
-// own consumer) and BEFORE deep_dive (82, its own generator) -- same "drain before
-// generate, outrank your own generator" principle every stage in this ladder follows.
-//
-// Scans every UsefulProjectIndex/analysis/<project>.md for **ID:**-tagged items (stamped
-// by applyDeepDiveFindings at write time) not yet a key in import-coverage.json, adds
-// them with promotedAt: null, then picks the oldest not-yet-promoted Use/Adapt item not
-// already in-flight. Ignore-rated items are never import candidates -- deep_dive's own
-// "honest nothing found" outcome has nothing to promote. Items with no **ID:** at all
-// (written before that stamping existed) are deliberately never considered -- same
-// "pre-existing entries are ambiguous, not retroactively fixed" precedent
-// docs/deep-dive-pipeline.md already sets for community-name matching.
-const ARCH_IMPORT_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-
-function nextArchImportTask() {
-  const { repoRoot, deepDiveAnalysisDir, deepDiveCoveragePath, importCoveragePath, defaultDomain } = getConfig();
-  // Same convention nextDeepDiveTask()/nextProjectSearchTask() already use.
-  const projectTag = path.basename(repoRoot);
-
-  let entries;
-  try {
-    entries = fs.readdirSync(deepDiveAnalysisDir, { withFileTypes: true });
-  } catch {
-    return null; // no analysis dir yet -- nothing to promote
-  }
-
-  // Scoping fix (2026-07-27, see writeTask()'s comment for the incident): an analysis doc
-  // (one per onboarded external project, e.g. "autogen-microsoft.md") only contributes
-  // candidates when deep-dive-coverage.json says that external project was onboarded FOR
-  // this consumer project. Without this, arch_import offered ANY Use/Adapt-rated item from
-  // ANY analysis doc as a candidate against whichever repoRoot happened to be active --
-  // this is what generated ~48 unrelated import candidates against a throwaway test repo.
-  // A doc with no recorded relevantToProject at all predates this fix and is excluded, same
-  // fail-closed reasoning as nextDeepDiveTask()'s candidate filter.
-  let deepDiveCoverage;
-  try {
-    deepDiveCoverage = JSON.parse(readIfExists(deepDiveCoveragePath) || '{"projects":{}}');
-  } catch {
-    deepDiveCoverage = { projects: {} };
-  }
-  const relevantSlugs = new Set(
-    Object.entries(deepDiveCoverage.projects || {})
-      .filter(([, proj]) => proj.relevantToProject === projectTag)
-      .map(([slug]) => slug),
-  );
-
-  let coverage;
-  try {
-    coverage = JSON.parse(readIfExists(importCoveragePath) || '{"items":{}}');
-  } catch {
-    coverage = { items: {} };
-  }
-  if (!coverage.items) coverage.items = {};
-
-  let coverageChanged = false;
-  const candidates = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-    const projectSlug = entry.name.replace(/\.md$/, '');
-    if (!relevantSlugs.has(projectSlug)) continue;
-    const text = readIfExists(path.join(deepDiveAnalysisDir, entry.name));
-    if (!text) continue;
-
-    // Split on H2 ("## ") item headings -- drop index 0, which is the "# <project> —
-    // Deep Dive" H1 header line applyDeepDiveFindings writes on first create, not a real
-    // item block.
-    const blocks = text.split(/(?=^## )/m).slice(1);
-    for (const block of blocks) {
-      const idMatch = block.match(/^\*\*ID:\*\*\s*(\S+)/m);
-      if (!idMatch) continue;
-      const itemId = idMatch[1];
-
-      if (!(itemId in coverage.items)) {
-        coverage.items[itemId] = { promotedAt: null, candidateId: null, projectSlug };
-        coverageChanged = true;
-      }
-      const itemCoverage = coverage.items[itemId];
-      if (itemCoverage.promotedAt) continue; // a REAL candidate was produced -- genuinely done
-      // A skipped (zero-harness-grounding, or the local model declined) attempt is retryable, not
-      // terminal -- agent-manager's own codebase keeps growing, so a query with zero hits
-      // today can find a real match later. Confirmed live 2026-07-26: the old unconditional
-      // promotedAt stamp had permanently blocked 134/134 real attempts, none of which ever
-      // produced an actual candidate. ARCH_IMPORT_RETRY_COOLDOWN_MS below just stops the
-      // SAME just-attempted item from being re-picked every single tick forever while
-      // nothing about the codebase has changed yet.
-      if (itemCoverage.lastAttemptedAt && Date.now() - Date.parse(itemCoverage.lastAttemptedAt) < ARCH_IMPORT_RETRY_COOLDOWN_MS) continue;
-
-      const ratingMatch = block.match(/^\*\*Rating:\*\*\s*(\S+)/m);
-      const rating = ratingMatch ? ratingMatch[1] : '';
-      if (rating !== 'Use' && rating !== 'Adapt') continue;
-
-      const titleMatch = block.match(/^##\s*(.+)$/m);
-      const filesMatch = block.match(/^\*\*Files:\*\*\s*(.+)$/m);
-      const rationaleAnchor = filesMatch ? filesMatch[0] : idMatch[0];
-      const rationale = block.slice(block.indexOf(rationaleAnchor) + rationaleAnchor.length).trim();
-
-      candidates.push({
-        itemId,
-        projectSlug,
-        title: titleMatch ? titleMatch[1].trim() : itemId,
-        rating,
-        files: filesMatch ? filesMatch[1].trim() : '',
-        rationale,
-      });
-    }
-  }
-
-  if (coverageChanged) {
-    fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
-    fs.writeFileSync(importCoveragePath, JSON.stringify(coverage, null, 2));
-  }
-
-  // No timestamp is stamped on an item itself (only on promotion), and itemId's numeric
-  // suffix is only meaningfully ordered WITHIN one project (each has its own independent
-  // counter) -- sorting by itemId string is just for a stable, reproducible pick across
-  // repeated calls, not a claim of real chronological ordering across projects.
-  candidates.sort((a, b) => a.itemId.localeCompare(b.itemId));
-
-  for (const c of candidates) {
-    const taskId = 'arch-import-' + c.itemId;
-    if (taskIdExistsInQueue(taskId)) continue;
-
-    return {
-      id: taskId,
-      domain: defaultDomain,
-      source: 'arch_import',
-      title: `Arch import: ${c.title} (from ${c.projectSlug})`,
-      promptContext: {
-        itemId: c.itemId,
-        sourceProject: c.projectSlug,
-        itemTitle: c.title,
-        rating: c.rating,
-        itemFiles: c.files,
-        itemRationale: c.rationale,
-      },
-    };
-  }
-
-  return null;
-}
 
 // pipeline_self_audit (2026-08-19: "How can we turn this into a self improving
 // process?"): see pipeline-self-audit.js's own header for the full design. Deterministic
@@ -2124,24 +1802,9 @@ function markStalenessAuditReported(task) {
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
 
-registerTaskSource('arch_import', {
-  priority: taskPriority('arch_import', 81),
-  next: nextArchImportTask,
-  apply: ({ implementResponse, task }) => {
-    const { archImportCandidatesPath, importCoveragePath } = getConfig();
-    return applyArchImportCandidate({ implementResponse, candidatesPath: archImportCandidatesPath, importCoveragePath, task });
-  },
-  emptyApproval: true,
-});
 
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true });
 registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true });
-// apply: applyVerdictOnly -- fix, 2026-07-26, same reasoning as observability_review's own
-// (see unusedExportImplementPrompt's header comment, prompts.js). Never actually confirmed
-// live (dead-code-flags.json has never existed in this pipeline's real history), but the
-// registration gap was identical, so fixed for consistency ahead of the scanner ever
-// actually running.
-registerTaskSource('unused_export', { priority: taskPriority('unused_export', 90), next: nextUnusedExportTask, apply: applyVerdictOnly });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
@@ -2395,8 +2058,8 @@ function writeTask(task) {
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
   nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
-  nextCandidateFulfillmentTask, windowFetchedFileContent, nextArchDiscoveryTask, nextUnusedExportTask, nextProjectSearchTask,
-  nextArchImportTask, nextDeepDiveTask, nextBrainDumpSortTask,
+  nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
+  nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
   isTaskReady, pendingReadinessMap,
