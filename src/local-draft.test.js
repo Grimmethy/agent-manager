@@ -16,25 +16,26 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-// observability_review/observability_fix (and the performance/function-length trio) moved
-// to the out-of-tree agent-manager-hygiene plugin (2026-08-27), so requiring
+// The hygiene sources -- observability/performance/function-length _review + _fix
+// (2026-08-27) and arch_review/arch_import/arch_discovery/unused_export (2026-08-27,
+// Phase 2) -- moved to the out-of-tree agent-manager-hygiene plugin, so requiring
 // ./task-sources.js no longer registers them. Several tests below assert CORE draft
-// behaviour (candidate-fulfillment retry, critique pass, tool-access gating, heartbeats)
-// using observability_fix/observability_review as the concrete example -- re-register a
-// matching stub with the same shape (advisoryProse for _review, candidateFulfillment for
-// _fix) and generic candidate-fulfillment prompt builders (the same archReview* pair
-// backlog_fulfillment reuses) so those assertions still exercise the real core path.
+// behaviour (candidate-fulfillment retry, critique pass, split-response handling,
+// tool-access gating, heartbeats, the arch_import zero-query skip) using those sources as
+// the concrete example -- re-register a matching-shape stub so the assertions still
+// exercise the real core path. Prompt builders are the real ones prompts.js still exports.
 function registerHygieneStubs() {
   const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
-  const { archReviewPlanPrompt, archReviewImplementPrompt } = require('./prompts.js');
-  if (!getRegisteredSource('observability_review')) {
-    registerTaskSource('observability_review', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
-    updateTaskSource('observability_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
-  }
-  if (!getRegisteredSource('observability_fix')) {
-    registerTaskSource('observability_fix', { priority: 72, next: () => null, emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
-    updateTaskSource('observability_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
-  }
+  const p = require('./prompts.js');
+  const stub = (name, cfg, plan = p.archReviewPlanPrompt, impl = p.archReviewImplementPrompt) => {
+    if (getRegisteredSource(name)) return;
+    registerTaskSource(name, { priority: 80, next: () => null, ...cfg });
+    updateTaskSource(name, { buildPlanPrompt: plan, buildImplementPrompt: impl });
+  };
+  stub('observability_review', { apply: () => ({ skipped: true }), advisoryProse: true });
+  stub('observability_fix', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
+  stub('arch_review', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath, candidateDocTitle: '# Architecture Review Candidates', reasoningTier: 'high' });
+  stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }) }, p.archImportPlanPrompt, p.archImportImplementPrompt);
 }
 
 function withFixtureRepo(fn) {

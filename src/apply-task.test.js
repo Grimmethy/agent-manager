@@ -33,15 +33,16 @@ process.env.AGENT_MANAGER_REPO_ROOT = REPO_ROOT;
 
 const { applyTask, recordApplyOutcome } = require('./apply-task.js');
 
-// observability_review/performance_review moved to the out-of-tree agent-manager-hygiene
-// plugin (2026-08-27), so requiring ./apply-task.js (which requires ./task-sources.js) no
-// longer registers them. The two direct-to-main routing tests below assert core's
-// behaviour for a candidates-doc-appending source (one with its own registered `apply`,
-// whose name is in DIRECT_TO_MAIN_SOURCES) -- register a matching stub so usesGroupB()
-// still resolves them to the custom-apply path.
+// observability_review/performance_review (2026-08-27) and arch_discovery/arch_import/
+// arch_review (2026-08-27, Phase 2) moved to the out-of-tree agent-manager-hygiene plugin,
+// so requiring ./apply-task.js (which requires ./task-sources.js) no longer registers them.
+// The routing/apply tests below assert CORE behaviour (direct-to-main for a
+// candidates-doc-appending source, the candidateSplitProposals write-back path, a thrown
+// apply error triggering a second resetToMain) -- register matching-shape stubs so
+// usesGroupB() and applyCandidateSplit() still resolve them the way production does.
 const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
 const { applyArchDiscoveryCandidates } = require('./candidate-docs.js');
-for (const name of ['observability_review', 'performance_review']) {
+for (const name of ['observability_review', 'performance_review', 'arch_discovery']) {
   if (!getRegisteredSource(name)) {
     registerTaskSource(name, {
       priority: 80,
@@ -53,6 +54,30 @@ for (const name of ['observability_review', 'performance_review']) {
       }),
     });
   }
+}
+// arch_import's real apply destructures task.promptContext up front -- a task with none
+// throws a TypeError, which is exactly what the "thrown write error" test exercises.
+if (!getRegisteredSource('arch_import')) {
+  registerTaskSource('arch_import', {
+    priority: 81,
+    next: () => null,
+    apply: ({ implementResponse, task }) => {
+      const { itemId } = task.promptContext; // throws if promptContext is missing
+      return applyArchDiscoveryCandidates({ implementResponse, candidatesPath: path.join(PIPELINE_DIR, `ARCH_IMPORT_${itemId || 'x'}.md`) });
+    },
+  });
+}
+// arch_review -- NOT direct-to-main; the candidateSplitProposals test needs its
+// candidatesPath()/candidateDocTitle so applyCandidateSplit() can write the sub-candidates.
+if (!getRegisteredSource('arch_review')) {
+  registerTaskSource('arch_review', {
+    priority: 70,
+    next: () => null,
+    emptyApproval: true,
+    candidateFulfillment: true,
+    candidatesPath: () => path.join(REPO_ROOT, 'Docs', 'ARCH_REVIEW_CANDIDATES.md'),
+    candidateDocTitle: '# Architecture Review Candidates',
+  });
 }
 
 function baseTask(overrides = {}) {

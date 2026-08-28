@@ -1147,17 +1147,12 @@ function genericFallbackImplementPrompt(task, planText) {
 // ---- Wire this package's 6 built-in sources' prompt builders into the registry ----
 
 updateTaskSource('trouble_log', { buildPlanPrompt: troubleLogPlanPrompt, buildImplementPrompt: troubleLogImplementPrompt });
-updateTaskSource('arch_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
-// arch_import_review (ADR-0020): a real code-change fulfillment task, structurally
-// identical to arch_review's (same promptContext shape from nextCandidateFulfillmentTask
-// -- candidateId/title/body/files) -- reuses the exact same builders rather than a
-// duplicate copy that would just drift, same reasoning as
-// nextCandidateFulfillmentTask() itself being parameterized instead of copy-pasted.
-updateTaskSource('arch_import_review', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+// arch_review / arch_import_review / arch_discovery / arch_import / unused_export prompt
+// wiring moved to the agent-manager-hygiene plugin (2026-08-27); their builder bodies stay
+// exported from this file. backlog_fulfillment still reuses archReview* below.
 // observability_fix/performance_fix -- moved to src/maintenance/observability-review.js
 // and src/maintenance/performance-review.js (2026-08-23), each with its own small
 // plan/implement prompt pair now instead of reaching for archReviewPlanPrompt here.
-updateTaskSource('arch_discovery', { buildPlanPrompt: archDiscoveryPlanPrompt, buildImplementPrompt: archDiscoveryImplementPrompt });
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
 updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolvePlanPrompt, buildImplementPrompt: pathPrefetchResolveImplementPrompt });
@@ -1180,12 +1175,10 @@ updateTaskSource('adhoc', { buildPlanPrompt: adhocPlanPrompt, buildImplementProm
 // (see local-draft.js's own domain==='research' branch), same as adhoc's agentic bypass
 // just above. Only the mandatory plan stage needs a real template here.
 updateTaskSource('research_task', { buildPlanPrompt: researchPlanPrompt });
-updateTaskSource('unused_export', { buildPlanPrompt: unusedExportPlanPrompt, buildImplementPrompt: unusedExportImplementPrompt });
 // observability_review/performance_review -- moved to src/maintenance/ (2026-08-23),
 // each with its own plan/implement prompt pair now instead of living here.
 updateTaskSource('project_search', { buildPlanPrompt: projectSearchPlanPrompt, buildImplementPrompt: projectSearchImplementPrompt });
 updateTaskSource('deep_dive', { buildPlanPrompt: deepDivePlanPrompt, buildImplementPrompt: deepDiveImplementPrompt });
-updateTaskSource('arch_import', { buildPlanPrompt: archImportPlanPrompt, buildImplementPrompt: archImportImplementPrompt });
 updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlanPrompt, buildImplementPrompt: pipelineSelfAuditImplementPrompt });
 updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAuditPlanPrompt, buildImplementPrompt: pipelineHealthAuditImplementPrompt });
 updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
