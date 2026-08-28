@@ -5174,11 +5174,17 @@ def api_pipeline_map():
     come straight from the real queue/ directories, correlated by each task's own recorded
     `source` field -- never estimated, never cached across requests."""
     script_path = SRC_DIR / "task-sources.js"
+    # Same env the pipeline loops themselves get (agent-manager.env on top of os.environ):
+    # --dump-topology needs AGENT_MANAGER_REPO_ROOT to run at all, and
+    # AGENT_MANAGER_REGISTER_PATH so out-of-tree plugin sources (agent-manager-hygiene:
+    # observability/performance/function-length/arch/unused-export) show up in the map,
+    # not just this repo's built-ins. Also picks up any UI-set priority/allowlist overrides.
+    child_env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
     try:
         result = subprocess.run(
             ["node", str(script_path), "--dump-topology"],
             capture_output=True, text=True, timeout=15,
-            cwd=str(SRC_DIR),
+            cwd=str(SRC_DIR), env=child_env,
         )
     except subprocess.TimeoutExpired:
         return jsonify({"available": False, "reason": "task-sources.js --dump-topology timed out"}), 504
