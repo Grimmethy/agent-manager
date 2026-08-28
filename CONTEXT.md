@@ -5,7 +5,7 @@ A queue-based system that delegates scoped implementation tasks to a local Ornit
 ## Language
 
 **Task Source**:
-A priority-ranked generator, registered via `registerTaskSource`, that produces tasks for the queue (e.g. `arch_review`, `arch_discovery`, `adhoc`). The priority ladder between task sources determines claim order.
+A priority-ranked generator, registered via `registerTaskSource`, that produces tasks for the queue (e.g. `adhoc`, `deep_dive`, `backlog_fulfillment`). The priority ladder between task sources determines claim order. Sources come from this repo's `src/task-sources.js` **and** from any out-of-tree plugin loaded via `AGENT_MANAGER_REGISTER_PATH` — the programming-hygiene sources (`observability_*`, `performance_*`, `function_length_*`, `arch_*`, `unused_export`) live in the **agent-manager-hygiene** plugin, not here. See `docs/PLUGIN_API.md`.
 _Avoid_: source (ambiguous with the `source` field below — always say "task source" for the generator)
 
 **Source** (task field):

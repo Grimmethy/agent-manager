@@ -98,3 +98,30 @@ of the three match. A candidate doc entry that describes its target in prose wit
 `Snippet:` field and without ever quoting the actual symbol/snippet degrades to the old
 blind-truncation behavior for a large file -- when hand-writing or editing a candidates doc
 entry, include a `Snippet:` fenced block (or at least quote the real identifier).
+
+## Task sources: built-ins here, hygiene sources in a separate plugin
+
+The `observability_*`, `performance_*`, `function_length_*`, `arch_*` and `unused_export`
+task sources moved (2026-08-27) into the out-of-tree **agent-manager-hygiene** plugin,
+loaded via `AGENT_MANAGER_REGISTER_PATH` (comma-separated for more than one plugin;
+`src/config.js` `ensureRegistered()` `require()`s each once). The live `agent-manager.env`
+points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
+
+- **`docs/PLUGIN_API.md` is the contract** for what a plugin may `require` from
+  `agent-manager/src/*`. `src/plugin-api.test.js` fails in THIS repo's CI if one of those
+  exports is removed — update both together.
+- The pure scanner rules (`src/maintenance/*-scan.js` + `scan-utils.js`) **stay here** —
+  `staleness-fastpath.js` re-runs them. Only the `*-review.js` wrappers moved. See
+  `src/maintenance/README.md`.
+- `arch-discovery-structcheck.js` and `arch-import-fetch.js` **stay here** (worker
+  subprocess by hardcoded path; shared repo-search harness).
+- `python/build_graph.py` **stays here** — it produces `graph.json` / `community-coverage.json`
+  that the plugin's `arch_discovery` reads read-only. Keep the output shapes stable.
+- The dashboard's Job List / Pipeline Map and `npm run drift-scan` are registry-driven
+  (`node src/task-sources.js --dump-topology`), so plugin sources show up automatically and
+  drift-scan stays clean across the boundary. When editing a plugin source, run
+  `drift-scan` with `AGENT_MANAGER_REGISTER_PATH` set (the watchdog does).
+- **Editing a plugin source:** clone/worktree `agent-manager-hygiene` separately (same
+  "never edit the live checkout" rule as this repo — `apply-task.js`'s `resetToMain()` and
+  the plugin's own `node_modules/agent-manager` symlink both point at the live tree). Its
+  `npm test` runs against that symlink.
