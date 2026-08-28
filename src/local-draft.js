@@ -95,6 +95,55 @@ function isAdvisoryProseSource(source) {
   return !!(entry && entry.advisoryProse);
 }
 
+// Between plan and implement, several task sources need the QUERY: lines their plan pass
+// proposed actually run against a real search harness, with the hits handed to the
+// implement pass as grounding (rather than leaving the local model to invent file paths or
+// projects -- see this file's header). `harnessSearch` on the source's registration says
+// which harness: 'archImport' greps agent-manager's own repo (archImportFetch ->
+// promptContext.harnessHits/harnessFiles); 'projectSearch' hits the GitHub/HF search APIs
+// (-> promptContext.searchResults). ADR-0022 Stage A4 -- one generic step here replaces six
+// near-identical `if (task.source === ...)` branches.
+function parseHarnessQueries(planResponse) {
+  return [...(planResponse || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+}
+
+async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch }) {
+  const queries = parseHarnessQueries(task.planResponse);
+  if (kind === 'projectSearch') {
+    let searchResults = [];
+    if (queries.length > 0) {
+      try {
+        searchResults = await projectSearchFetch(queries);
+      } catch (e) {
+        // Non-fatal -- implement proceeds with no results (its own prompt handles an empty
+        // list: "(no results -- the searches returned nothing usable)").
+      }
+    }
+    task.promptContext.searchResults = searchResults;
+    appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${searchResults.length} result(s)`);
+    return;
+  }
+  // 'archImport' -- also pipeline_self_audit / pipeline_health_audit / ui_visibility_audit /
+  // staleness_audit: literally the same archImportFetch of agent-manager's own repo, the
+  // only difference being what promptContext text the implement prompt renders around the
+  // hits (which lives in the prompt, not this step).
+  let harnessHits = [];
+  let harnessFiles = [];
+  if (queries.length > 0) {
+    try {
+      const result = archImportFetch(queries);
+      harnessHits = result.hits || [];
+      harnessFiles = result.files || [];
+    } catch (e) {
+      // Non-fatal -- implement proceeds with no hits (its own prompt handles an empty list).
+    }
+  }
+  task.promptContext.harnessHits = harnessHits;
+  task.promptContext.harnessFiles = harnessFiles;
+  appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+}
+
+
 // 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
 // given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
 // a plausible-but-fabricated `find` string that matched nothing in the real file --
@@ -364,152 +413,15 @@ async function draftTask(task, {
       task.planResponse = planResult.response;
       appendHistoryEvent(task, 'plan-done', `${planResult.attempts} attempt(s), ${task.planResponse.length} chars`);
 
-      // project_search's plan pass proposes search queries only (the local model has no network
-      // access); the HARNESS runs them here, between plan and implement, and hands real
-      // results to the implement pass -- see ADR-0018 / docs/project-search-pipeline.md.
-      // Without this, task.promptContext.searchResults stays undefined and the local model invents
-      // projects from training data instead of reporting on real search results, despite
-      // being explicitly told not to (confirmed live 2026-08-14, see this file's header).
-      if (task.source === 'project_search') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let searchResults = [];
-        if (queries.length > 0) {
-          try {
-            searchResults = await projectSearchFetch(queries);
-          } catch (e) {
-            // Non-fatal -- implement proceeds with no results (its own prompt already
-            // handles an empty results list: "(no results -- the searches returned nothing
-            // usable)"), same as local-worker.ps1's own try/catch around this call.
-          }
-        }
-        task.promptContext.searchResults = searchResults;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${searchResults.length} result(s)`);
-      }
-
-      // arch_import's plan pass proposes search terms for agent-manager's OWN repo (same
-      // two-call shape as project_search above, grep instead of an HTTP API -- see
-      // arch-import-fetch.js and archImportImplementPrompt in prompts.js), but this branch
-      // was never ported here (see this file's header: arch_import's extra pass was
-      // "deliberately NOT ported ... since neither domain is wired up outside the Windows
-      // path yet"), even though task-sources.js keeps generating real arch_import tasks
-      // that flow through this same generic pending/ pipeline regardless. Without it,
-      // task.promptContext.harnessHits/harnessFiles stayed permanently undefined, so
-      // archImportImplementPrompt's hits.length>0 branch was unreachable for every single
-      // arch_import task -- confirmed live 2026-08-16: 44 of the arch_import tasks in
-      // queue/blocked/, every one of them with harnessHits.length===0, either correctly
-      // (but uselessly) reporting "nothing found" or -- far more often -- fabricating
-      // plausible-looking file paths/imports the fact-check then caught as non-existent,
-      // because implement was never given any real grounding to work from.
-      if (task.source === 'arch_import') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let harnessHits = [];
-        let harnessFiles = [];
-        if (queries.length > 0) {
-          try {
-            const result = archImportFetch(queries);
-            harnessHits = result.hits || [];
-            harnessFiles = result.files || [];
-          } catch (e) {
-            // Non-fatal -- implement proceeds with no hits (its own prompt already handles
-            // an empty hits list: "(no matches -- the searches found nothing ...)"), same
-            // try/catch treatment project_search's branch above gives its own fetch call.
-          }
-        }
-        task.promptContext.harnessHits = harnessHits;
-        task.promptContext.harnessFiles = harnessFiles;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
-      }
-
-      // pipeline_self_audit (2026-08-20, moved off Claude -- see pipeline-self-audit.js's
-      // own header): exact same two-call shape as arch_import immediately above, and
-      // literally the SAME archImportFetch -- both search agent-manager's own repo, the
-      // only difference is what's IN promptContext (a failure-pattern's evidence vs. an
-      // external finding's rationale), which lives entirely in the prompt text, not this
-      // harness step.
-      if (task.source === 'pipeline_self_audit') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let harnessHits = [];
-        let harnessFiles = [];
-        if (queries.length > 0) {
-          try {
-            const result = archImportFetch(queries);
-            harnessHits = result.hits || [];
-            harnessFiles = result.files || [];
-          } catch (e) {
-            // Non-fatal -- same try/catch treatment arch_import's own branch above gives.
-          }
-        }
-        task.promptContext.harnessHits = harnessHits;
-        task.promptContext.harnessFiles = harnessFiles;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
-      }
-
-      // pipeline_health_audit (2026-08-24, see pipeline-health-audit.js's own header):
-      // exact same two-call harness-search shape as pipeline_self_audit right above --
-      // the evidence here comes from a live-system check (process/queue/log inspection)
-      // instead of a blocked-task cluster, but the "propose search terms, ground the fix
-      // in real matched file content" mechanism is identical.
-      if (task.source === 'pipeline_health_audit') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let harnessHits = [];
-        let harnessFiles = [];
-        if (queries.length > 0) {
-          try {
-            const result = archImportFetch(queries);
-            harnessHits = result.hits || [];
-            harnessFiles = result.files || [];
-          } catch (e) {
-            // Non-fatal -- same try/catch treatment pipeline_self_audit's own branch above gives.
-          }
-        }
-        task.promptContext.harnessHits = harnessHits;
-        task.promptContext.harnessFiles = harnessFiles;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
-      }
-
-      // ui_visibility_audit (2026-08-24, see ui-visibility-audit.js's own header): same
-      // two-call harness-search shape as pipeline_health_audit right above -- the
-      // evidence here is a route with no reference in any scanned frontend source file,
-      // needing the same "ground the verdict in real matched file content" treatment.
-      if (task.source === 'ui_visibility_audit') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let harnessHits = [];
-        let harnessFiles = [];
-        if (queries.length > 0) {
-          try {
-            const result = archImportFetch(queries);
-            harnessHits = result.hits || [];
-            harnessFiles = result.files || [];
-          } catch (e) {
-            // Non-fatal -- same try/catch treatment pipeline_health_audit's own branch above gives.
-          }
-        }
-        task.promptContext.harnessHits = harnessHits;
-        task.promptContext.harnessFiles = harnessFiles;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
-      }
-
-      // staleness_audit (2026-08-22, see staleness-audit.js's own header): same
-      // harness-grounded two-call shape as pipeline_self_audit/arch_import right above --
-      // the premise recheck this source exists for genuinely needs to see CURRENT real
-      // repo content, not just the frozen evidence embedded in promptContext at filing
-      // time, exactly the same reasoning pipeline_self_audit's own branch documents.
-      if (task.source === 'staleness_audit') {
-        const queries = [...task.planResponse.matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-        let harnessHits = [];
-        let harnessFiles = [];
-        if (queries.length > 0) {
-          try {
-            const result = archImportFetch(queries);
-            harnessHits = result.hits || [];
-            harnessFiles = result.files || [];
-          } catch (e) {
-            // Non-fatal -- same try/catch treatment pipeline_self_audit's own branch above gives.
-          }
-        }
-        task.promptContext.harnessHits = harnessHits;
-        task.promptContext.harnessFiles = harnessFiles;
-        appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
+      // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a
+      // real search harness and hand the hits to implement. Which harness (if any) is
+      // declared per source via `harnessSearch` on its registration -- see runHarnessSearch
+      // above. Replaces the per-source branches this used to be (project_search,
+      // arch_import, pipeline_self_audit, pipeline_health_audit, ui_visibility_audit,
+      // staleness_audit).
+      const harnessKind = getRegisteredSource(resolveSourceName(task))?.harnessSearch;
+      if (harnessKind) {
+        await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch });
       }
 
       // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" --
@@ -682,10 +594,12 @@ async function draftTask(task, {
       // and a full review cycle on a draft that was doomed from the moment harness search
       // came back empty. Skipping the implement call entirely on a genuine zero-hit
       // search removes the temptation altogether -- deterministic, not a prompt tweak the
-      // model can still ignore. arch_import is in EMPTY_APPROVAL_SOURCES (review-task.js),
-      // so this empty implementResponse auto-approves with zero further local-model spend, the
+      // model can still ignore. The source opts in via `skipImplementWhenNoHarnessHits` on
+      // its registration (ADR-0022 Stage A4) and is also an emptyApproval source, so this
+      // empty implementResponse auto-approves with zero further local-model spend -- the
       // exact outcome a compliant model would have produced anyway.
-      if (task.source === 'arch_import' && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
+      const skipImplementOnNoHits = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoHarnessHits;
+      if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
         task.implementResponse = '';
         appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
         task.status = 'needs-review';

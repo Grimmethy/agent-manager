@@ -1833,26 +1833,26 @@ function markStalenessAuditReported(task) {
 
 
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit' });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit' });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
 // right above. apply-task.js's own explicit `task.source === 'pipeline_self_audit'`
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
-registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true });
+registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // Priority 90, just under staleness_audit(91) -- an operational incident (today's real
 // example: every draft of one task type silently failing outright) can be actively
 // costing real throughput/compute for as long as it goes unnoticed, closer in urgency to
 // staleness_audit's "is this still worth chasing" recheck than pipeline_self_audit's
 // slower blocked-task-cluster pattern.
-registerTaskSource('pipeline_health_audit', { priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true });
+registerTaskSource('pipeline_health_audit', { priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // Priority 63, just under staleness_audit's own recheck neighborhood but well above the
 // large background-generation sources (arch_import/arch_discovery etc, 79-83) -- a
 // missing-UI finding is a real gap worth surfacing promptly, but (unlike
 // pipeline_health_audit) it's never actively costing throughput or compute the way a
 // live operational incident is, so it doesn't need to outrank those.
-registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibility_audit', 63), next: nextUiVisibilityAuditTask, emptyApproval: true });
+registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibility_audit', 63), next: nextUiVisibilityAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
 // part of that step") -- this source's implement pass writes an advisory report, never a
 // diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
@@ -1861,7 +1861,7 @@ registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibilit
 // explicit RECOMMENDATION: archive, moving the ORIGINAL flagged task to
 // done/_archived_no_action/ automatically once the report has cleared review. See
 // staleness-auto-archive.js's own header for the full reasoning and safety scoping.
-registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true, reviewGuidance: STALENESS_AUDIT_REVIEW_GUIDANCE, reviewCompletenessQuestion: STALENESS_AUDIT_COMPLETENESS_QUESTION });
+registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true, reviewGuidance: STALENESS_AUDIT_REVIEW_GUIDANCE, reviewCompletenessQuestion: STALENESS_AUDIT_COMPLETENESS_QUESTION, harnessSearch: 'archImport' });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...
