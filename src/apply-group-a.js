@@ -215,48 +215,9 @@ const {
   applyArchDiscoveryCandidates,
 } = require('./candidate-docs.js');
 
-// arch_import's apply step (ADR-0020): wraps applyArchDiscoveryCandidates (same
-// markdown-candidate append it already does for arch_discovery, since the format is
-// byte-compatible modulo the Source: line) with the one extra thing arch_import needs
-// that arch_discovery doesn't -- stamping import-coverage.json's item entry as promoted,
-// same "mark the source state so it's never re-offered" convention
-// applyDeepDiveFindings already uses for deep-dive-coverage.json.
-function applyArchImportCandidate({ implementResponse, candidatesPath, importCoveragePath, task }) {
-  const { itemId, sourceProject } = task.promptContext;
-
-  const result = applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle: '# Architecture Import Candidates' });
-
-  let coverage;
-  try {
-    coverage = JSON.parse(fs.existsSync(importCoveragePath) ? fs.readFileSync(importCoveragePath, 'utf8') : '{"items":{}}');
-  } catch {
-    coverage = { items: {} };
-  }
-  if (!coverage.items) coverage.items = {};
-  const nowIso = new Date().toISOString();
-  coverage.items[itemId] = {
-    // Was unconditional (promotedAt stamped even when result.skipped) -- confirmed live
-    // 2026-07-26: 134/134 "promoted" items had candidateId:null, ARCH_IMPORT_CANDIDATES.md
-    // never even existed, and nextArchImportTask()'s `if (promotedAt) continue` treated
-    // every one as permanently done. A zero-harness-grounding skip (the documented COMMON
-    // case, see local-worker.ps1's $skipImplement comment -- 10/14 in the original sample)
-    // is NOT the same as "genuinely evaluated, doesn't fit" -- agent-manager's own codebase
-    // keeps growing, so a query with zero hits today can have a real hit next week. Only a
-    // REAL candidate (result.skipped === false) is a terminal outcome now; a skip just
-    // records lastAttemptedAt so nextArchImportTask() can retry it later instead of never.
-    promotedAt: result.skipped ? (coverage.items[itemId]?.promotedAt ?? null) : nowIso,
-    candidateId: result.skipped ? (coverage.items[itemId]?.candidateId ?? null) : result.candidateIds[0],
-    lastAttemptedAt: nowIso,
-    projectSlug: sourceProject,
-  };
-  fs.mkdirSync(path.dirname(importCoveragePath), { recursive: true });
-  writeJsonAtomicSync(importCoveragePath, coverage);
-
-  // Same shape applyArchDiscoveryCandidates already returns ({skipped,reason} or
-  // {file,candidateCount,candidateIds}) -- apply-task.js's generic writeArtifact() flow
-  // already knows how to handle both, no extra wrapping needed here.
-  return result;
-}
+// applyArchImportCandidate moved to the agent-manager-hygiene plugin (src/arch.js,
+// 2026-08-27) -- only arch_import ever used it. applyArchDiscoveryCandidates (re-exported
+// above) stays: core backlog_decomposition still appends AC-NNN candidates with it.
 
 // Parses brain_dump_sort's implement-pass output -- a single JSON object, not markdown
 // (see prompts.js's brainDumpSortImplementPrompt for the exact schema this must match).
@@ -813,7 +774,6 @@ module.exports = {
   parseDeepDiveItems,
   applyArchDiscoveryCandidates,
   parseArchDiscoveryCandidates,
-  applyArchImportCandidate,
   isEffectivelyEmptyResponse,
   applyBrainDumpSort,
   applyVerdictOnly,
