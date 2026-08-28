@@ -14,7 +14,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveSourceName } = require('./task-source-registry.js');
+const { resolveSourceName, registerSourceAlias, clearRegistry } = require('./task-source-registry.js');
 
 test('resolveSourceName resolves domain:"adhoc" tasks to "adhoc" regardless of source', () => {
   assert.equal(resolveSourceName({ domain: 'adhoc', source: 'anything' }), 'adhoc');
@@ -41,4 +41,18 @@ test('resolveSourceName resolves source:"deadcode_triage" tasks to "unused_expor
 test('resolveSourceName falls back to task.source unchanged for everything else', () => {
   assert.equal(resolveSourceName({ domain: 'default', source: 'project_search' }), 'project_search');
   assert.equal(resolveSourceName({ domain: 'default', source: 'brain_dump_sort' }), 'brain_dump_sort');
+});
+
+test('registerSourceAlias: a plugin can declare its own source-field quirk without editing this file', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ source: 'my_weird_label' }), 'my_weird_label', 'no alias yet -> unchanged');
+  registerSourceAlias('my_weird_label', 'my_real_source');
+  assert.equal(resolveSourceName({ source: 'my_weird_label' }), 'my_real_source');
+  clearRegistry();
+  assert.equal(resolveSourceName({ source: 'my_weird_label' }), 'my_weird_label', 'clearRegistry() also clears aliases');
+});
+
+test('deadcode_triage still resolves via the legacy hardcoded fallback even without an alias registered', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'unused_export');
 });

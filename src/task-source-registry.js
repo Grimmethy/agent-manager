@@ -4,6 +4,15 @@
 const registry = {};
 
 /**
+ * task.source string -> registry name, for sources whose generated tasks carry a `source`
+ * field that differs from the name they registered under (e.g. unused_export stamps
+ * source: 'deadcode_triage'). A plugin declares its own quirk via registerSourceAlias()
+ * instead of this file needing to know every consumer's naming; resolveSourceName() below
+ * still has hardcoded fallbacks for this package's own built-in quirks + a legacy one.
+ */
+const sourceAliases = {};
+
+/**
  * Register a task source.
  * @param {string} name - Unique identifier for the source.
  * @param {object} config - Configuration to store (no validation).
@@ -38,10 +47,23 @@ function getRegisteredSource(name) {
 }
 
 /**
- * Clear all registered sources. Useful for testing.
+ * Declare that tasks carrying `task.source === fromField` belong to the registry entry
+ * `toName`. Called by a plugin's registration file (e.g.
+ * registerSourceAlias('deadcode_triage', 'unused_export')) so resolveSourceName() doesn't
+ * need a hardcoded `if` for every out-of-tree source's naming quirk.
+ * @param {string} fromField - the value a generated task stamps on its `source` field
+ * @param {string} toName - the registry key that source registered under
+ */
+function registerSourceAlias(fromField, toName) {
+  sourceAliases[fromField] = toName;
+}
+
+/**
+ * Clear all registered sources (and source aliases). Useful for testing.
  */
 function clearRegistry() {
   Object.keys(registry).forEach(key => delete registry[key]);
+  Object.keys(sourceAliases).forEach(key => delete sourceAliases[key]);
 }
 
 /**
@@ -67,7 +89,8 @@ function clearRegistry() {
 function resolveSourceName(task) {
   if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
   if (task.domain === 'secondbrain') return 'secondbrain';
-  if (task.source === 'deadcode_triage') return 'unused_export';
+  if (sourceAliases[task.source]) return sourceAliases[task.source];
+  if (task.source === 'deadcode_triage') return 'unused_export'; // legacy fallback -- the hygiene plugin also registers this via registerSourceAlias()
   return task.source;
 }
 
@@ -86,4 +109,4 @@ function updateTaskSource(name, partialConfig) {
   Object.assign(registry[name], partialConfig);
 }
 
-module.exports = { registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName };
+module.exports = { registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
