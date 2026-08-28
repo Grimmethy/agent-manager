@@ -36,6 +36,19 @@ function registerHygieneStubs() {
   stub('observability_fix', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
   stub('arch_review', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath, candidateDocTitle: '# Architecture Review Candidates', reasoningTier: 'high' });
   stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }), harnessSearch: 'archImport', skipImplementWhenNoHarnessHits: true }, p.archImportPlanPrompt, p.archImportImplementPrompt);
+
+  // ADR-0022 Stage B: staleness-fastpath.js's deterministic recheck now consults the
+  // deterministic-recheck-registry instead of a hardcoded rule map, and agent-manager-hygiene
+  // owns the real observability_review / performance_review wiring. The two staleness_audit
+  // fast-path tests below use silent-catch-block as their example -- register that one rule
+  // with its real core-side detector so they still exercise the deterministic short-circuit.
+  const { registerDeterministicRecheck, getDeterministicRecheck } = require('./deterministic-recheck-registry.js');
+  if (!getDeterministicRecheck('observability_review')) {
+    const obsScan = require('./maintenance/observability-scan.js');
+    registerDeterministicRecheck('observability_review', {
+      perFileRules: { 'silent-catch-block': (t, rel) => obsScan.findSilentCatchBlocks(t, rel) },
+    });
+  }
 }
 
 function withFixtureRepo(fn) {
@@ -46,6 +59,7 @@ function withFixtureRepo(fn) {
   delete process.env.AGENT_MANAGER_FORCE_PROVIDER;
   const { clearRegistry } = require('./task-source-registry.js');
   clearRegistry();
+  require('./deterministic-recheck-registry.js').clearDeterministicRecheckRegistry();
   const { clearModelProfileRegistry } = require('./model-profile-registry.js');
   clearModelProfileRegistry();
   delete require.cache[require.resolve('./task-sources.js')];
