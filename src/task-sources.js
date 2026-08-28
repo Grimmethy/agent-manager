@@ -2420,6 +2420,10 @@ module.exports = {
   nextProductSpecTask,
   nextBacklogDecompositionTask,
   existingQueuedTaskTitles,
+  // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene): its register.js
+  // passes taskPriority through as an injected dep so plugin sources honor
+  // AGENT_MANAGER_TASK_PRIORITIES overrides exactly like the built-ins do.
+  taskPriority,
 };
 
 // CLI entry point: `node task-sources.js` -- writes one new pending task if one is found
