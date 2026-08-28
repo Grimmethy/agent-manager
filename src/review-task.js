@@ -37,7 +37,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { checkDraft } = require('./fact-checker.js');
 const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
@@ -45,6 +45,16 @@ const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-clie
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
+
+// Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
+// plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
+// unused-export). review-task.js reads each source's advisoryProse/emptyApproval/
+// candidateFulfillment flags off the registry -- without this, a plugin source's task is
+// treated as unregistered and its short prose verdict gets wrongly auto-rejected. Matches
+// apply-task.js / get-grounding-source.js, which already call this at load. (Before the
+// 2026-08-27 plugin split, requiring prompts.js -> task-sources.js registered everything
+// eagerly; it no longer covers plugin sources.)
+ensureRegistered();
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
