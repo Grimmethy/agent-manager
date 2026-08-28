@@ -157,14 +157,6 @@ function resolveDynamicReviewField(field, task) {
   return typeof value === 'string' && value ? value : null;
 }
 
-// arch_discovery / arch_import live in the agent-manager-hygiene plugin and set their own
-// reviewGuidance there. This fallback keeps core's review gate correct when that plugin
-// is not loaded; ADR-0022 Stage G removes it once the plugin field is the only source.
-const FALLBACK_REVIEW_GUIDANCE = {
-  arch_discovery: 'This is an architecture-discovery task: finding ZERO real issues in the given files is a valid, EXPECTED, and often correct outcome -- do not reject a draft merely for concluding there is nothing worth flagging. Only reject an empty result if the draft itself looks like it never actually engaged with the given file content (e.g. generic boilerplate with no reference to anything specific in the files).',
-  arch_import: "This is an architecture-import task (an idea from an external project, being checked against agent-manager's own code): the drafter was told to output nothing if the harness search found no real agent-manager files this idea concretely applies to -- do not reject an empty result on that basis alone. Reject only if the draft names a file the harness search results do NOT show, or proposes something contradicted by the real file content given.",
-};
-
 function buildVerdictPrompt(task, factCheck, groundingText) {
   const lines = [];
   lines.push('You are a review gate in an unattended pipeline. You are producing a VERDICT ONLY -- you have no ability to run commands, write files, or touch git. Do not attempt to.');
@@ -223,8 +215,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     // correct split on sight for exactly that reason.
     lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. Is it sound: do the sub-candidates, together, actually cover the FULL original candidate scope (no silently dropped requirement)? Is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
   } else {
-    const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task)
-      || FALLBACK_REVIEW_GUIDANCE[resolveSourceName(task)];
+    const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
   }
   const completenessQuestion = task.candidateSplitProposals

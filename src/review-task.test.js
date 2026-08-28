@@ -144,14 +144,16 @@ test('buildVerdictPrompt surfaces reviewGuidance / reviewCompletenessQuestion fr
   assert.doesNotMatch(prompt, /does it contain real, complete code/i);
 });
 
-// arch_discovery / arch_import register their reviewGuidance in the agent-manager-hygiene
-// plugin, which isn't loaded in this suite. review-task.js keeps a FALLBACK_REVIEW_GUIDANCE
-// map so core's gate stays correct standalone (removed in Stage G).
-test('buildVerdictPrompt falls back to the built-in arch guidance when the hygiene plugin is not loaded', () => {
+// ADR-0022 Stage G: review-task.js no longer names any plugin source. arch_discovery /
+// arch_import get their reviewGuidance from the agent-manager-hygiene plugin; with the
+// plugin unloaded (as in this suite) buildVerdictPrompt just emits no source-specific
+// carve-out for them -- the generic framing still applies.
+test('buildVerdictPrompt emits no arch-specific carve-out when the hygiene plugin is not loaded (no core fallback)', () => {
   const { getRegisteredSource } = require('./task-source-registry.js');
   assert.equal(getRegisteredSource('arch_discovery'), undefined, 'precondition: plugin not loaded here');
   const prompt = buildVerdictPrompt(baseTask({ domain: 'default', source: 'arch_discovery' }), { flags: [] }, '');
-  assert.match(prompt, /architecture-discovery task: finding ZERO real issues/);
+  assert.doesNotMatch(prompt, /architecture-discovery task: finding ZERO real issues/);
+  assert.match(prompt, /does it contain real, complete code/i, 'generic completeness framing still present');
 });
 
 // Regression, 2026-08-22: caught live -- a real staleness_audit advisory report

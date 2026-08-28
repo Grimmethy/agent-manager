@@ -110,6 +110,11 @@ points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
 - **`docs/PLUGIN_API.md` is the contract** for what a plugin may `require` from
   `agent-manager/src/*`. `src/plugin-api.test.js` fails in THIS repo's CI if one of those
   exports is removed — update both together.
+- **No core `src/*.js` file names a plugin task source.** Per-source behaviour is read off
+  the registration (`directToMain`, `reviewGuidance`, `reportClass`, `harnessSearch`, …) or
+  a dedicated registry (`deterministic-recheck-registry.js`). `src/no-plugin-source-names.test.js`
+  enforces it; `arch-discovery-structcheck.js` is the one allowlisted exception (see PLUGIN_API.md).
+  The candidate-fulfillment SDK is `src/sdk/candidate-fulfillment.js` (ADR-0022 Stage D).
 - The deterministic scanner rules (`observability`/`performance`/`function-length` scans +
   `scan-utils.js`) live in the **plugin** as of ADR-0022 Stage C. `staleness-fastpath.js`
   re-runs a rule via the `registerDeterministicRecheck` seam
