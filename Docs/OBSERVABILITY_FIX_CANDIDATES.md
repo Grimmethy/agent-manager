@@ -472,3 +472,29 @@ Replace the comment-only catch body with a single console.warn (or the project l
 
 Benefits:
 Makes the previously silent failure greppable in logs with a stable [local-draft] prefix, preserves existing control flow and downstream behavior exactly, and introduces no new dependencies or refactoring.
+
+### AC-33 · Add structured warn log to the silent secondary-push catch block
+Strength: Strong
+Files: src/apply-task.js
+
+Problem:
+The catch block in the secondary-push path (the best-effort push that is NOT the primary task-completion push) swallows every error silently. Its body is effectively empty apart from a comment (per the plan: `/* Non-fatal -- see comment above. */`), so when the push fails there is zero observability signal—no log line, no metric, nothing to grep or alert on. The block sits immediately before `return { succeeded: true, pushed: true }` in the secondary-push path, meaning the caller sees a successful result even though the push never landed. The exact catch-block text, the branch-name variable in scope, and the project's logging convention (no logger import is visible in the file's import block; the file uses only `fs`, `path`, and project-internal modules) must be confirmed against the full file before the edit is written.
+
+Solution:
+Inside that single catch block, replace the bare comment with a structured warn-level log call. Because no third-party logger (pino, winston, etc.) is imported in the visible portion of the file and the plan explicitly forbids introducing a new dependency, use `console.warn` with a JSON-serialisable object as the second argument so the output is greppable and parseable. The object must carry these discrete fields (not a single interpolated string): `event: 'apply_task.secondary_push_failure'`, `branch: <the branch variable already in scope at the catch site>`, `error_message: (e && e.message) ? e.message : String(e)`, `error_name: (e && e.name) ? e.name : 'Unknown'`. Do not add a manual timestamp—`console.warn` output is typically timestamped by the log shipper. Leave the `return { succeeded: true, pushed: true }` statement unchanged so behaviour is identical; the only addition is the observability signal.
+
+Benefits:
+Every secondary-push failure now produces a single, greppable, structured log line containing the branch name and the error's identity, enabling operators to (a) confirm the failure actually happened, (b) identify which branch was affected, and (c) distinguish error types (network timeout vs. auth rejection vs. malformed ref) without adding any new dependency or changing runtime behaviour.
+
+### AC-34 · Add a metrics counter for secondary-push failures (defer if no metrics framework exists)
+Strength: Strong
+Files: src/apply-task.js
+
+Problem:
+Even with the log line from the first candidate, there is no quantitative, time-series signal for how often the secondary push fails. Without a counter, operators cannot build a dashboard, set an alert threshold, or track whether the failure rate is trending up or down. The plan marks this step as 'optional but recommended' and explicitly says to skip it if no metrics library (Prometheus client, OpenTelemetry, custom counter module) is already integrated, and to note the deferral in the PR description rather than introducing a new dependency.
+
+Solution:
+Search `package.json` and `src/` for an existing metrics library (`prom-client`, `@opentelemetry/api`, a custom `counter`/`metric` module). If one is found: at module scope in `src/apply-task.js` (alongside any other metric definitions), register a counter named `apply_task_secondary_push_failure` (or the project's dot-separated convention) with a `branch` label. Inside the catch block, after the log call from the first candidate, increment that counter with the same `branch` value. If no metrics library is present in the project: do NOT add one as part of this fix. The log line from the first candidate is sufficient for the immediate observability gap. Note in the PR description: 'Metric counter deferred until a metrics framework is adopted; the structured log line provides the greppable signal in the interim.'
+
+Benefits:
+When a metrics framework is (or already is) in use, the counter provides a ready-made time-series metric for dashboards and alerting, with per-branch granularity. When it is not, the deferral note keeps the PR scope tight and avoids a dependency addition that would need separate review and operational ownership—while the log line still closes the zero-signal gap.
