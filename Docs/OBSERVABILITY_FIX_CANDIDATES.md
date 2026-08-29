@@ -454,19 +454,6 @@ Inside that single catch block, replace the bare comment with a structured warn-
 Benefits:
 Every secondary-push failure now produces a single, greppable, structured log line containing the branch name and the error's identity, enabling operators to (a) confirm the failure actually happened, (b) identify which branch was affected, and (c) distinguish error types (network timeout vs. auth rejection vs. malformed ref) without adding any new dependency or changing runtime behaviour.
 
-### AC-34 · Add a metrics counter for secondary-push failures (defer if no metrics framework exists)
-Strength: Strong
-Files: src/apply-task.js
-
-Problem:
-Even with the log line from the first candidate, there is no quantitative, time-series signal for how often the secondary push fails. Without a counter, operators cannot build a dashboard, set an alert threshold, or track whether the failure rate is trending up or down. The plan marks this step as 'optional but recommended' and explicitly says to skip it if no metrics library (Prometheus client, OpenTelemetry, custom counter module) is already integrated, and to note the deferral in the PR description rather than introducing a new dependency.
-
-Solution:
-Search `package.json` and `src/` for an existing metrics library (`prom-client`, `@opentelemetry/api`, a custom `counter`/`metric` module). If one is found: at module scope in `src/apply-task.js` (alongside any other metric definitions), register a counter named `apply_task_secondary_push_failure` (or the project's dot-separated convention) with a `branch` label. Inside the catch block, after the log call from the first candidate, increment that counter with the same `branch` value. If no metrics library is present in the project: do NOT add one as part of this fix. The log line from the first candidate is sufficient for the immediate observability gap. Note in the PR description: 'Metric counter deferred until a metrics framework is adopted; the structured log line provides the greppable signal in the interim.'
-
-Benefits:
-When a metrics framework is (or already is) in use, the counter provides a ready-made time-series metric for dashboards and alerting, with per-branch granularity. When it is not, the deferral note keeps the PR scope tight and avoids a dependency addition that would need separate review and operational ownership—while the log line still closes the zero-signal gap.
-
 ### AC-35 · AC-32: Add console.warn log line to the projectSearchFetch catch block in src/local-draft.js
 Strength: Strong
 Files: src/local-draft.js
@@ -479,16 +466,3 @@ Open src/local-draft.js and locate the catch clause whose surrounding context re
 
 Benefits:
 A single warning-level log line makes the previously silent fetch failure visible in stdout/stderr logs, enabling operators to correlate a degraded project_search draft (empty searchResults) with the underlying network/API error. The [local-draft] prefix keeps it greppable alongside other local-draft.js log lines. No new dependency, no control-flow change, searchResults still retains its pre-catch value of [].
-
-### AC-36 · AC-32 (contingent): Add metrics counter increment alongside the log line if a counter helper is already in scope
-Strength: Strong
-Files: src/local-draft.js
-
-Problem:
-The plan's step 3 calls for a metrics counter increment only if a counter helper (e.g. metrics.increment, a stats client, etc.) is already imported or in-scope in src/local-draft.js. The visible import block (lines 1–50) includes recordCall from model-stats-client.js and appendHistoryEvent from task-history.js, but no generic metrics.increment or counter helper. If no such helper exists, this step is a no-op. If one does exist (perhaps imported in the truncated portion), a one-line counter increment should follow the log line to give observability dashboards a numeric signal of fetch-failure frequency.
-
-Solution:
-Search the full file (including the truncated portion) for an existing metrics/counter helper import or in-scope binding (e.g. metrics.increment, stats.bump, a counter object). If found, insert one line immediately after the console.warn line added by the first candidate, using that helper with a key consistent with the file's existing naming convention (e.g. local_draft_search_fetch_fail). If no such helper is confirmed, omit this line entirely — do not introduce a new import or dependency. This candidate is entirely conditional and may resolve to a no-op.
-
-Benefits:
-If a counter helper already exists, a one-line increment gives dashboards and alerting a numeric rate of search-fetch failures without adding any new dependency. If it does not exist, the candidate is safely skipped with zero surface area added, preserving the narrow scope of the fix.
