@@ -47,6 +47,7 @@ test('starved + a yieldable app IS running: stops it via TheAgent\'s own /stop e
     fetchJsonFn: async (url, options) => {
       calls.push({ url, method: options && options.method });
       if (url.endsWith('/free')) return { ok: false }; // no standalone ComfyUI in this scenario
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [] } }; // no Ollama model resident
       if (url.endsWith('/api/automation/apps')) {
         return { ok: true, body: { apps: [{ id: 'comfyui', running: true }, { id: 'n8n', running: false }] } };
       }
@@ -69,6 +70,7 @@ test('starved but no allowlisted app is running: reports starved with an explana
     readFreeVram: () => 1500,
     fetchJsonFn: async (url) => {
       if (url.endsWith('/free')) return { ok: false };
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [] } };
       if (url.endsWith('/api/automation/apps')) return { ok: true, body: { apps: [{ id: 'comfyui', running: false }] } };
       throw new Error(`unexpected url in test: ${url}`);
     },
@@ -86,6 +88,7 @@ test('only stops apps in the yieldAppIds allowlist, even if TheAgent reports oth
     readFreeVram: () => 1500,
     fetchJsonFn: async (url) => {
       if (url.endsWith('/free')) return { ok: false };
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [] } };
       if (url.endsWith('/api/automation/apps')) {
         return { ok: true, body: { apps: [{ id: 'comfyui', running: true }, { id: 'some-other-app', running: true }] } };
       }
@@ -130,6 +133,7 @@ test('starved: /free is tried but does not free enough -> still falls through to
     fetchJsonFn: async (url) => {
       calls.push(url);
       if (url.endsWith('/free')) return { ok: true };
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [] } };
       if (url.endsWith('/api/automation/apps')) return { ok: true, body: { apps: [{ id: 'n8n', running: true }] } };
       if (url.endsWith('/api/automation/apps/n8n/stop')) return { ok: true };
       throw new Error(`unexpected url: ${url}`);
@@ -151,4 +155,51 @@ test('starved: no standalone ComfyUI (/free unreachable) and TheAgent unreachabl
   assert.equal(result.starved, true);
   assert.deepEqual(result.freed, []);
   assert.deepEqual(result.yielded, []);
+});
+
+test('below the target but Ollama has a model resident -> not starved (expected occupancy), no TheAgent call', async () => {
+  const calls = [];
+  const result = await ensureGpuHeadroom({
+    minFreeMb: 18000,
+    readFreeVram: () => 7000, // model is loaded, so free is well under target -- normal
+    fetchJsonFn: async (url) => {
+      calls.push(url);
+      if (url.endsWith('/free')) return { ok: false }; // no standalone ComfyUI
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [{ name: 'qwen3.8:27b-q4_K_M', size_vram: 16 * 1024 * 1024 * 1024 }] } };
+      throw new Error(`must not reach TheAgent when the shortfall is Ollama's own model: ${url}`);
+    },
+  });
+  assert.equal(result.starved, false);
+  assert.match(result.note, /Ollama's own resident model/);
+  assert.match(result.note, /16384MB/);
+  assert.equal(calls.filter((c) => c.includes('/api/automation/apps')).length, 0);
+});
+
+test('below the target, freed ComfyUI, and Ollama model also resident -> not starved, note mentions both', async () => {
+  const result = await ensureGpuHeadroom({
+    minFreeMb: 18000,
+    readFreeVram: () => 9000,
+    fetchJsonFn: async (url) => {
+      if (url.endsWith('/free')) return { ok: true }; // standalone ComfyUI unloaded
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [{ size_vram: 15 * 1024 * 1024 * 1024 }] } };
+      throw new Error(`unexpected: ${url}`);
+    },
+  });
+  assert.equal(result.starved, false);
+  assert.deepEqual(result.freed, ['comfyui']);
+  assert.match(result.note, /freed comfyui/);
+});
+
+test('a tiny /api/ps size_vram (rounding artefact) is not treated as a resident model', async () => {
+  const result = await ensureGpuHeadroom({
+    minFreeMb: 4096,
+    readFreeVram: () => 1500,
+    fetchJsonFn: async (url) => {
+      if (url.endsWith('/free')) return { ok: false };
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [{ size_vram: 4 * 1024 * 1024 }] } }; // 4MB
+      if (url.endsWith('/api/automation/apps')) return { ok: true, body: { apps: [] } };
+      throw new Error(`unexpected: ${url}`);
+    },
+  });
+  assert.equal(result.starved, true); // 4MB isn't "the model is resident"
 });
