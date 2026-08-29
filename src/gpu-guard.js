@@ -13,11 +13,15 @@
 //
 // Deliberately does NOT kill arbitrary GPU processes -- that's real user work this
 // pipeline has no way to tell apart from an idle leftover. It only touches apps this
-// pipeline can identify AND has a real, sanctioned control surface for: TheAgent's own
-// automation-apps API (server/automationApps.js, see docs there), which already tracks
-// n8n/ComfyUI as managed jobs with a proper start/stop lifecycle -- calling its /stop
-// endpoint is the same action a human clicking "Stop" in TheAgent's own UI would take,
-// not a raw `kill` on a process this pipeline doesn't own.
+// pipeline can identify AND has a real, sanctioned control surface for:
+//   1. ComfyUI's own POST /free -- unloads models + frees VRAM without stopping the
+//      server (it reloads on the next prompt). Same as its "Unload Models" button.
+//      This is the usual case now that PromptForge and manual launches run ComfyUI
+//      standalone, where TheAgent's app registry never saw it.
+//   2. TheAgent's automation-apps API (server/automationApps.js, see docs there), which
+//      tracks n8n/ComfyUI as managed jobs with a proper start/stop lifecycle -- calling
+//      its /stop is the same action a human clicking "Stop" in TheAgent's UI would take.
+// Neither is a raw `kill` on a process this pipeline doesn't own.
 //
 // CLI: node gpu-guard.js   -- best-effort, always exits 0; callers (local-worker.sh,
 // review-runner.sh) run this once per tick and never let its outcome block the tick
@@ -28,6 +32,13 @@ const { execFileSync } = require('child_process');
 
 const MIN_FREE_VRAM_MB = Number(process.env.AGENT_MANAGER_MIN_FREE_VRAM_MB) || 4096;
 const THEAGENT_URL = process.env.AGENT_MANAGER_THEAGENT_URL || 'http://localhost:4519';
+// ComfyUI exposes its own POST /free -- it unloads models and frees VRAM without
+// stopping the server (it reloads on the next prompt). That's the usual contention
+// case: ComfyUI started standalone (PromptForge, a manual launch) that TheAgent's
+// app registry never saw, so the TheAgent /stop path below finds nothing to stop.
+// Hitting /free is the same action as ComfyUI's own "Unload Models" button, not a
+// raw kill -- so it fits this guard's "sanctioned control surface only" charter.
+const COMFY_URL = process.env.AGENT_MANAGER_COMFY_URL || process.env.COMFY_URL || 'http://127.0.0.1:8188';
 // Apps this pipeline is allowed to ask TheAgent to stop when the GPU is starved --
 // an explicit allowlist, not "every app TheAgent knows about", so a future addition to
 // TheAgent's own APPS registry doesn't silently become something this pipeline can stop
@@ -76,19 +87,38 @@ async function fetchJson(url, options = {}, timeoutMs = 5000) {
 async function ensureGpuHeadroom({
   minFreeMb = MIN_FREE_VRAM_MB,
   theAgentUrl = THEAGENT_URL,
+  comfyUrl = COMFY_URL,
   yieldAppIds = YIELD_APP_IDS,
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
 } = {}) {
   const freeMb = readFreeVram();
-  if (freeMb === null) return { checked: false, freeMb: null, minFreeMb, starved: false, yielded: [], note: 'nvidia-smi unavailable' };
-  if (freeMb >= minFreeMb) return { checked: true, freeMb, minFreeMb, starved: false, yielded: [], note: '' };
+  if (freeMb === null) return { checked: false, freeMb: null, minFreeMb, starved: false, yielded: [], freed: [], note: 'nvidia-smi unavailable' };
+  if (freeMb >= minFreeMb) return { checked: true, freeMb, minFreeMb, starved: false, yielded: [], freed: [], note: '' };
 
-  // Starved: find which allowlisted apps TheAgent reports as actually running, and ask
-  // it to stop each -- through its own tracked job lifecycle, not a raw kill.
+  // Starved. First the control surface that needs nothing else running: ask ComfyUI
+  // to unload its models via its own POST /free. This covers a standalone ComfyUI
+  // (the common case) and is a no-op 200 if it is already unloaded.
+  const freed = [];
+  const freeRes = await fetchJsonFn(
+    `${comfyUrl}/free`,
+    { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ unload_models: true, free_memory: true }) },
+    10000,
+  );
+  if (freeRes && freeRes.ok) {
+    freed.push('comfyui');
+    const afterMb = readFreeVram();
+    if (afterMb !== null && afterMb >= minFreeMb) {
+      return { checked: true, freeMb: afterMb, minFreeMb, starved: false, yielded: [], freed, note: `GPU was starved (${freeMb}MB free) -- ComfyUI /free recovered it to ${afterMb}MB` };
+    }
+  }
+
+  // Still starved (or no standalone ComfyUI): find which allowlisted apps TheAgent
+  // reports as actually running and ask it to stop each -- through its own tracked
+  // job lifecycle, not a raw kill.
   const statusResult = await fetchJsonFn(`${theAgentUrl}/api/automation/apps`);
   if (!statusResult.ok || !statusResult.body || !Array.isArray(statusResult.body.apps)) {
-    return { checked: true, freeMb, minFreeMb, starved: true, yielded: [], note: `GPU starved (${freeMb}MB free) but could not reach TheAgent at ${theAgentUrl} to check for yieldable apps` };
+    return { checked: true, freeMb, minFreeMb, starved: true, yielded: [], freed, note: `GPU starved (${freeMb}MB free)${freed.length ? ', ComfyUI /free did not free enough' : ''} -- could not reach TheAgent at ${theAgentUrl} to check for yieldable apps` };
   }
 
   const runningYieldable = statusResult.body.apps.filter((a) => yieldAppIds.includes(a.id) && a.running);
@@ -98,15 +128,17 @@ async function ensureGpuHeadroom({
     if (stopResult.ok) yielded.push(app.id);
   }
 
+  const acted = [...freed.map((f) => `${f} (/free)`), ...yielded];
   return {
     checked: true,
     freeMb,
     minFreeMb,
     starved: true,
     yielded,
-    note: runningYieldable.length === 0
-      ? `GPU starved (${freeMb}MB free, need ${minFreeMb}MB) but no allowlisted app (${yieldAppIds.join(', ')}) is currently running -- contention is from something this pipeline has no control surface for`
-      : `GPU starved (${freeMb}MB free, need ${minFreeMb}MB) -- asked TheAgent to stop: ${yielded.join(', ') || '(all stop attempts failed)'}`,
+    freed,
+    note: acted.length === 0
+      ? `GPU starved (${freeMb}MB free, need ${minFreeMb}MB) but no allowlisted app (${yieldAppIds.join(', ')}) is running or reachable -- contention is from something this pipeline has no control surface for`
+      : `GPU starved (${freeMb}MB free, need ${minFreeMb}MB) -- acted on: ${acted.join(', ')}`,
   };
 }
 
@@ -114,7 +146,7 @@ module.exports = { ensureGpuHeadroom, readFreeVramMb };
 
 if (require.main === module) {
   ensureGpuHeadroom().then((result) => {
-    if (result.starved) {
+    if (result.starved || (result.freed && result.freed.length) || (result.yielded && result.yielded.length)) {
       console.error(`[gpu-guard] ${result.note}`);
     } else if (result.checked) {
       console.error(`[gpu-guard] ${result.freeMb}MB free (>= ${result.minFreeMb}MB min) -- ok`);
