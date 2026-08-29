@@ -293,9 +293,21 @@ let registered = false;
 function ensureRegistered() {
   if (registered) return;
   registered = true;
-  const { registerPath } = getConfig();
-  if (!registerPath) return;
-  for (const p of registerPath.split(',').map((s) => s.trim()).filter(Boolean)) {
+
+  // Preferred source of truth: the plugin manifest (plugins.json beside agent-manager.env),
+  // which the dashboard's Plugins tab writes. Only enabled entries load. If there is no
+  // manifest at all, fall back to splitting AGENT_MANAGER_REGISTER_PATH exactly as before
+  // (an existing but empty manifest means "no plugins" and is honoured, no fallback).
+  const { readPluginsManifest, enabledRegisterPaths } = require('./plugins-manifest.js');
+  const manifest = readPluginsManifest();
+  let paths;
+  if (manifest !== null) {
+    paths = enabledRegisterPaths(manifest);
+  } else {
+    const { registerPath } = getConfig();
+    paths = registerPath ? registerPath.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  }
+  for (const p of paths) {
     require(p);
   }
 }

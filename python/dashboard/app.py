@@ -189,6 +189,10 @@ QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clari
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_FILE_PATH = PACKAGE_ROOT / "agent-manager.env"
 SRC_DIR = PACKAGE_ROOT / "src"
+# Which AGENT_MANAGER_REGISTER_PATH plugins are installed / enabled. Read by src/config.js's
+# ensureRegistered() (JS side: src/plugins-manifest.js) and by the Plugins tab here. Lives
+# beside agent-manager.env; seeded from AGENT_MANAGER_REGISTER_PATH on first read.
+PLUGINS_MANIFEST_PATH = PACKAGE_ROOT / "plugins.json"
 
 # Project tab's "previously loaded projects" dropdown/search-list. Separate from
 # agent-manager.env (which only ever holds the CURRENT project) -- this is a small,
@@ -5487,6 +5491,113 @@ def api_job_types_worker_type():
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_TIERS", new_value)
 
     return jsonify({"name": name, "workerType": worker_type})
+
+
+# --- Plugins tab ------------------------------------------------------------------------
+# Enable/disable the AGENT_MANAGER_REGISTER_PATH plugins the manager is working on, and
+# register a new one by path. Persists to plugins.json (PLUGINS_MANIFEST_PATH); src/
+# config.js's ensureRegistered() loads only the enabled entries. Since every loop entry
+# point re-runs ensureRegistered() in a fresh process per tick, a change takes effect on
+# the next task -- the pipeline is still restarted on a change (like the Job List toggles)
+# so an in-flight draft for a now-disabled source can't hit "no prompt template".
+
+def _plugin_name_from_path(register_path: str) -> str:
+    """A readable default name: the plugin repo's own directory name (…/agent-manager-hygiene/
+    register.js -> "agent-manager-hygiene"), falling back to the file's parent basename."""
+    p = Path(register_path)
+    parent = p.parent
+    return parent.name or p.stem or register_path
+
+
+def _seed_plugins_manifest() -> list:
+    """First-read migration: build the manifest from AGENT_MANAGER_REGISTER_PATH (the old
+    single source of truth) so an existing install keeps exactly what it had, now toggleable."""
+    raw = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_REGISTER_PATH", "")
+    entries = []
+    seen = set()
+    for path_str in [s.strip() for s in raw.split(",") if s.strip()]:
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+        entries.append({
+            "name": _plugin_name_from_path(path_str),
+            "registerPath": path_str,
+            "enabled": True,
+            "description": "",
+        })
+    _write_plugins_manifest(entries)
+    return entries
+
+
+def _read_plugins_manifest() -> list:
+    if not PLUGINS_MANIFEST_PATH.is_file():
+        return _seed_plugins_manifest()
+    try:
+        parsed = json.loads(PLUGINS_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _write_plugins_manifest(entries: list) -> None:
+    PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+@app.route("/api/plugins")
+def api_plugins():
+    return jsonify({
+        "plugins": _read_plugins_manifest(),
+        "manifestPath": str(PLUGINS_MANIFEST_PATH),
+    })
+
+
+@app.route("/api/plugins/toggle", methods=["POST"])
+def api_plugins_toggle():
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    enabled = bool(body.get("enabled"))
+    manifest = _read_plugins_manifest()
+    match = next((p for p in manifest if p.get("name") == name), None)
+    if match is None:
+        abort(404, description=f"no plugin named '{name}'")
+    match["enabled"] = enabled
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({"name": name, "enabled": enabled, "restarted": restarted})
+
+
+@app.route("/api/plugins/add", methods=["POST"])
+def api_plugins_add():
+    body = request.get_json(silent=True) or {}
+    register_path = (body.get("registerPath") or "").strip()
+    name = (body.get("name") or "").strip() or _plugin_name_from_path(register_path)
+    description = (body.get("description") or "").strip()
+
+    if not register_path:
+        abort(400, description="registerPath is required")
+    p = Path(register_path)
+    if not p.is_absolute():
+        abort(400, description="registerPath must be an absolute path")
+    if not p.is_file() or p.suffix != ".js":
+        abort(400, description=f"registerPath must point at an existing .js file (got {register_path})")
+
+    manifest = _read_plugins_manifest()
+    if any(pl.get("name") == name for pl in manifest):
+        abort(409, description=f"a plugin named '{name}' is already registered")
+    if any(pl.get("registerPath") == register_path for pl in manifest):
+        abort(409, description="that registerPath is already registered")
+
+    entry = {"name": name, "registerPath": register_path, "enabled": True, "description": description}
+    manifest.append(entry)
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({"plugin": entry, "restarted": restarted})
 
 
 def _stop_pipeline(force: bool = False) -> list:
