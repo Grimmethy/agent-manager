@@ -36,6 +36,10 @@ function registerHygieneStubs() {
   stub('observability_fix', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().observabilityFixCandidatesPath, candidateDocTitle: '# Observability Fix Candidates' });
   stub('arch_review', { emptyApproval: true, candidateFulfillment: true, candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath, candidateDocTitle: '# Architecture Review Candidates', reasoningTier: 'high' });
   stub('arch_import', { emptyApproval: true, apply: () => ({ skipped: true }), harnessSearch: 'archImport', skipImplementWhenNoHarnessHits: true }, p.archImportPlanPrompt, p.archImportImplementPrompt);
+  // arch_discovery -- a GENERATOR: emptyApproval but NOT candidateFulfillment (it has no
+  // specific candidate to implement -- "found nothing" is a valid outcome). Used by the
+  // empty-plan tests below.
+  stub('arch_discovery', { emptyApproval: true, apply: () => ({ skipped: true }) }, p.archDiscoveryPlanPrompt, p.archDiscoveryImplementPrompt);
 
   // ADR-0022 Stage B/C: staleness-fastpath.js's deterministic recheck consults the
   // deterministic-recheck-registry instead of a hardcoded rule map, and agent-manager-hygiene
@@ -944,5 +948,61 @@ test('draftTask writes no queued/working heartbeat at all when AGENT_MANAGER_INS
     await draftTask(task, { localCall, withLockFn: async (instancesDir2, fn) => fn() });
 
     assert.equal(fs.existsSync(path.join(dir, 'instances', 'undefined.json')), false, 'must not write a heartbeat keyed on a missing instance id');
+  });
+});
+
+// --- arch_discovery / arch_import empty-plan handling ---------------------------
+// 2026-08-29, root-caused live: arch-discovery-community-11 (src/gpu-guard.js + its test,
+// a clean well-documented utility with no real architectural friction) blocked TWICE on
+// "Plan pass degenerate: empty". arch_discovery is a GENERATOR registered emptyApproval:
+// true -- its own plan prompt explicitly invites "found nothing" as the right answer, and
+// an empty implement already auto-approves. But the plan call never passed allowEmpty, so
+// a terse honest "nothing here" plan blocked instead of flowing to that path. community-10
+// (same no-friction outcome) only passed because its model happened to write a 646-char
+// paragraph first.
+
+test('arch_discovery: the plan call is made with allowEmpty:true, so an empty "nothing found" plan does not block', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'util.js'), '// a small clean utility\nmodule.exports.noop = () => {};\n');
+    const task = {
+      id: 'arch-discovery-empty-plan-1', domain: 'default', source: 'arch_discovery', title: 'test',
+      promptContext: {
+        communityId: 99, communityName: 'src',
+        files: [{ path: 'util.js', degree: 1, content: '// a small clean utility\n' }],
+        existingCandidatesTail: '(none yet)',
+      },
+    };
+    const planOpts = [];
+    const localCall = async (opts) => {
+      planOpts.push(opts);
+      return { response: '', degenerate: null, attempts: 1 }; // model looked, found nothing, said nothing
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+
+    assert.equal(planOpts[0].allowEmpty, true, 'arch_discovery plan call must allow an empty result');
+    assert.notEqual(result.blocked, true, 'an empty arch_discovery plan is "nothing found", not a failure');
+    assert.equal(task.planResponse, '');
+    assert.equal((task.history || []).some((h) => (h.detail || '').includes('Plan pass degenerate')), false);
+  });
+});
+
+test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be empty -- an empty plan still blocks', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-empty-plan-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'a real queued change', body: 'Problem/Solution/Benefits', files: ['src/x.js'], fetchedFiles: [] },
+    };
+    const planOpts = [];
+    const localCall = async (opts) => {
+      planOpts.push(opts);
+      return { response: '', degenerate: 'empty', attempts: 3 };
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+
+    assert.notEqual(planOpts[0].allowEmpty, true, 'arch_review has a specific candidate to implement -- an empty plan there is a real model failure');
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /Plan pass degenerate: empty/);
   });
 });

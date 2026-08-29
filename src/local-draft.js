@@ -400,7 +400,20 @@ async function draftTask(task, {
       // task.domain === 'research' -- every other source's plan pass is unaffected, kept as
       // a plain no-tool completion exactly as before.
       const researchPlanTools = task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
-      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, ...researchPlanTools }), 'plan');
+      // arch_discovery / arch_import are GENERATORS registered emptyApproval:true -- their
+      // own plan prompt explicitly invites "found nothing" as the correct answer, and an
+      // empty implement already auto-approves as "no candidates -- nothing to apply". An
+      // empty PLAN is just the terser form of that same conclusion. Confirmed live:
+      // arch-discovery-community-11 (src/gpu-guard.js + its test, a clean well-documented
+      // utility with no real architectural friction) blocked TWICE on "Plan pass
+      // degenerate: empty", while community-10 -- same no-friction outcome -- only passed
+      // because its model happened to write a 646-char "nothing found" paragraph before
+      // the (also-empty) implement pass carried it to the auto-approve path. Without this,
+      // every clean community is a coin-flip between those two fates. Candidate-
+      // FULFILLMENT sources (arch_review, observability_fix, ...) are excluded: they have a
+      // specific candidate to implement, so an empty plan there is a genuine model failure.
+      const allowEmptyPlan = isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source);
+      planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
       if (planResult.degenerate) {
         const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
         appendHistoryEvent(task, 'blocked', blockedReason);
