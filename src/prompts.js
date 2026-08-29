@@ -86,6 +86,8 @@ const candidateSplitInstructions = [
   ']}',
   '',
   'Requirements: at least 2 sub-candidates; together they must cover the FULL original scope with nothing dropped; each must be independently small enough to land as its own single JSON file-change object later, on its own; write each one as a real, self-contained Problem/Solution/Benefits write-up (a future drafting pass will only ever see the sub-candidate\'s own text, not this one). Do NOT use this escape hatch for anything that genuinely fits in the file-change JSON below -- splitting a change that didn\'t need it just adds review overhead for no reason.',
+  '',
+  'EVERY sub-candidate must be a concrete code change. NEVER emit a sub-candidate whose job is to read, inspect, confirm, document, or analyze the code first -- the full file content is already above, and the pass that implements each sub-candidate gets it too. "Understand / document the current structure", "identify the exact text", "record the current behaviour" and the like are NOT valid sub-candidates and will be rejected. If you cannot yet name the exact functions, lines, or identifiers a sub-candidate would touch, the split is not ready: output the single-diff file-change JSON below instead of a split.',
 ].join('\n');
 
 // ---- Per-source plan-prompt builders ----
