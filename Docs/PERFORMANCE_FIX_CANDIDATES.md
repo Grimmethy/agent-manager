@@ -21,45 +21,22 @@ Action: **No code change.** The implementation in `src/task-sources.js` remains 
 Benefits of inaction:
 The codebase avoids unnecessary API-surface changes, preserves the simple synchronous contract of the map builder, and keeps the function easy to reason about and test without async fixtures. The cold-path, bounded nature of the operation means there is no measurable p99 or event-loop-stall impact to mitigate.
 
-### AC-2 · Parallelise independent LLM votes in majorityVote
+### AC-2 · Parallelise the independent LLM votes in majorityVote
 Strength: Strong
-Files: src/claude-client.js
+Files: src/claude-client.js, src/local-client.js
 
 Problem:
-At line 190 the `majorityVote` helper loops `n` times (default 3, caller-supplied up to 7+) and `await`s a separate `call({ prompt, think: false, temperature }, 1)` round-trip on each iteration before moving to the next. Every call is an independent network request to the LLM API with identical inputs; no iteration's prompt, temperature, or classification depends on a prior iteration's output. The sequential `await` therefore serialises `n` independent I/O operations, inflating wall-clock time to roughly `n × single-call-latency` (typically 3–20 s for the default `n = 3`) when the work could complete in approximately one round-trip.
+`majorityVote` runs its `n` votes (default 3, callers pass up to 7+) in a sequential `for` loop that `await`s a full `call(...)` round-trip per iteration before starting the next. Every vote uses an identical prompt/temperature and no vote depends on a prior one, so wall-clock time is roughly `n x single-call-latency` where it could be ~`1 x` -- and this is on the review hot path (review-task.js's only route to a verdict). There are TWO copies to fix: `src/claude-client.js` (Claude backend) and `src/local-client.js` (Ollama backend); claude-client.js's own header says the two are deliberate mirrors, so both must change together or they drift.
 
 Solution:
-Replace the sequential `for`-loop that awaits each `call()` before starting the next with a single `Promise.all` that fires all `n` calls concurrently, then classify the collected results in a second pass. Concretely, in `src/claude-client.js` around line 190, change the body from:
-
-```js
-const votes = [];
-for (let i = 0; i < n; i++) {
-  const result = await call({ prompt, think: false, temperature }, 1);
-  if (result.degenerate) continue;
-  votes.push(classify(result.response));
-}
-```
-
-to:
-
-```js
-const results = await Promise.all(
-  Array.from({ length: n }, () => call({ prompt, think: false, temperature }, 1))
-);
-const votes = [];
-for (const result of results) {
-  if (result.degenerate) continue;
-  votes.push(classify(result.response));
-}
-```
-
-The downstream majority/minAgreeing logic is unchanged. If the upstream gateway enforces a per-key concurrency cap, wrap the array in a bounded-concurrency helper (e.g. `pLimit(2)(fn)`) around the `Promise.all` mapping; that is a deployment-tuning knob, not a reason to keep the calls serial.
+In each file's `majorityVote`, replace the sequential `for (let i = 0; i < n; i++) { const result = await call(...); ... }` with `const results = await Promise.all(Array.from({ length: n }, () => call(<the exact args that file already passes>, 1)));` followed by the file's existing per-result handling (degenerate/verdict filter, `votes.push(...)`) in a plain loop over `results`. Read the real current loop body first -- the exact `call(...)` argument list and the push shape differ between the two files and from any snippet in this doc. Preserve error semantics exactly: a rejection in any one call already aborts the whole vote, and `Promise.all` keeps that. Do not change the signature, the tally / minAgreeing logic, or the return value.
 
 Benefits:
-Wall-clock latency for the `majorityVote` call drops from `n × single-call-latency` to approximately `1 × single-call-latency` (plus negligible scheduling overhead), a 2–6× reduction depending on `n`. The fix is local to one function, introduces no new dependencies, preserves the existing `degenerate`-skip and majority-vote semantics, and removes the only artificial serialisation in the voting path.
+`majorityVote` latency drops from `n x t` to ~`t` (2-6x on the review path depending on `n`), the dominant per-task cost. Local to one function in each of two files; no call-site or interface changes, no new dependency.
 
 ### AC-3 · Confirm exact shape of majorityVote and call in src/claude-client.js
-Strength: Strong
+Strength: **Rejected -- research step, not implementable**
+Rejected note: Its own Solution says "read the file, record the loop shape, do NOT modify any code". The fix it was meant to precede is AC-2.
 Files: src/claude-client.js
 
 Problem:
@@ -72,7 +49,8 @@ Benefits:
 Guarantees the subsequent edit's find string is an exact character-for-character match against the real file, eliminating the risk of a failed or mis-applied replacement. Surfaces any UNKNOWN the plan flagged so the edit can be adapted (e.g. adding a null-guard on call's result, or restructuring if classify is async). Prevents silently changing semantics (e.g. partial-vote collection on failure) that the plan explicitly chose to preserve.
 
 ### AC-4 · Replace sequential for-loop in majorityVote with Promise.all parallel dispatch
-Strength: Strong
+Strength: **Rejected -- duplicate of AC-2**
+Rejected note: Same "Promise.all the n independent votes in majorityVote" change, re-drafted under a new number.
 Files: src/claude-client.js
 
 Problem:

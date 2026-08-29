@@ -79,7 +79,8 @@ Benefits:
 Static analysis can now see all imports; library consumers no longer risk accidental side effects from a stray CLI invocation, and CLI users get an explicit contract around where configuration comes from. The separation also makes unit testing the pure utilities straightforward without mocking filesystem writes or config resolution.
 
 ### AC-7 · `resolveGraphPath` performs eager filesystem I/O inside `getConfig()` with no repoRoot-keyed memoization
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/config.js, src/apply-task.js, src/task-sources.js, src/local-worker.ps1
 
 Problem:
@@ -133,7 +134,8 @@ Benefits:
 Adding a new direct-write domain (e.g. a new apply-group-a.js export) only touches applyViaDirectWrite and the import line, not the git path. The marker/INDEX/coverage bookkeeping can be refactored or tested in isolation. The two extraction functions (this one and applyViaGit from AC-4a) together reduce the dispatcher to a ~10-line routing function, making the file's top-level control flow trivially auditable. Each sub-function can be exported for targeted unit tests without exercising the other path.
 
 ### AC-11 · Async-ify resolveGraphPath with repoRoot-keyed memoization in config.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/config.js
 
 Problem:
@@ -146,7 +148,8 @@ Benefits:
 Eliminates redundant synchronous readdir/stat walks on every getConfig() call in long-lived worker processes; frees the event loop during the (now async) filesystem I/O; gives downstream code (e.g. a task-completion handler that writes a new graph.json) a deterministic one-line call to force a re-scan on the next getConfig() invocation; the env-var override path remains zero-cost and synchronous.
 
 ### AC-12 · Adopt async getConfig() in apply-task.js and task-sources.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/apply-task.js,src/task-sources.js
 
 Problem:
@@ -159,7 +162,8 @@ Benefits:
 Completes the breaking-change migration so no caller silently receives a Promise where it expects a plain object; the cascading async in task-sources.js is contained to that one file's internal call graph (all nextTask functions are already called from a single async worker loop, so the propagation is mechanical); apply-task.js's CLI entry point already runs in an async context (it's a top-level script), so adding await is straightforward; no PowerShell-side change is needed, keeping the worker's invocation contract unchanged.
 
 ### AC-13 · Async-ify resolveGraphPath and getConfig in src/config.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/config.js
 
 Problem:
@@ -172,7 +176,8 @@ Benefits:
 Non-blocking filesystem I/O in the daemon and server processes; no behavioral change to the resolution logic or the returned config object; paves the way for callers to do useful work while the stat/readdir round-trip is in flight.
 
 ### AC-14 · Propagate await getConfig() through taskIdExistsInQueue (task-sources.js) and all getConfig() call sites in apply-task.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/apply-task.js, src/task-sources.js
 
 Problem:
@@ -237,7 +242,8 @@ Benefits:
 The prompt shape for each provider is a single contiguous block that can be read, copied, and tested in isolation; the 8192-token budget for Ornith is no longer silently consumed by a Claude-only preamble; adding a new provider means adding one more preamble branch at the top of the function rather than threading a conditional through every string-concatenation line.
 
 ### AC-19 · Make taskIdExistsInQueue async and propagate await to all its callers in task-sources.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/task-sources.js
 
 Problem:
@@ -250,7 +256,8 @@ Benefits:
 Restores correct synchronous-looking dedup semantics: taskIdExistsInQueue returns a real boolean again (via await), callers correctly skip already-queued tasks, and the 10 built-in sources plus the title-scanning helper all work with the new async getConfig() contract without TypeError or silent truthiness bugs.
 
 ### AC-20 · Add await to every getConfig() call site in apply-task.js and make enclosing functions async
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/apply-task.js
 
 Problem:
@@ -263,7 +270,8 @@ Benefits:
 The apply pipeline correctly resolves the config object before using pipelineDir, git branch names, and artifact paths. All downstream logic (writeArtifact, group-A/group-B dispatch, git runner, history append) receives a real string path instead of undefined, eliminating the class of failures where apply silently writes to the wrong location or crashes with a TypeError on the first path.join call.
 
 ### AC-21 · Async-ify resolveGraphPath and getConfig in src/config.js
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: src/config.js
 
 Problem:
@@ -276,7 +284,8 @@ Benefits:
 Eliminates event-loop blocking during config and graph-path resolution, allowing the drafting daemon and dashboard server to handle concurrent I/O without stalling. The resolution algorithm, its three-tier priority order, and the shape of the returned config object are all preserved, so no consumer logic changes beyond adding `await`.
 
 ### AC-22 · Update all callers of getConfig and resolveGraphPath to await the now-async functions
-Strength: Strong
+Strength: **Rejected -- async-getConfig refactor, superseded**
+Rejected note: config.js's resolveGraphPath already has repoRoot-keyed memoization (graphPathCache); the only residual is a handful of first-call sync stat() calls at startup -- a bounded cold-path one-shot, the same shape PERFORMANCE_FIX_CANDIDATES.md AC-1 was rejected as a False Positive. Async-ifying getConfig() is a viral await-propagation change across dozens of sync call sites for negligible gain. AC-7/11/12/13/14/19/20/21/22 are all fragments of that one over-decomposed refactor.
 Files: (to be enumerated: every file that imports src/config.js and calls getConfig or resolveGraphPath -- known consumers include the drafting daemon and the dashboard server; exact file paths must be discovered via repository search)
 
 Problem:
