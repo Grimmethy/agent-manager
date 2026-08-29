@@ -282,6 +282,7 @@ const TABS = [
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
+  { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
@@ -3524,6 +3525,20 @@ async function renderTokenfoldTab() {
     ${modelRows ? `<table><thead><tr><th>Model</th><th>Requests</th><th>Tokens saved</th><th>Avg %</th></tr></thead><tbody>${modelRows}</tbody></table>` : '<div class="empty">No model calls have gone through the proxy yet -- numbers appear as soon as the pipeline makes its first call.</div>'}`;
 }
 
+// PromptForge tab: PromptForge is a separate local web app (its own repo + Flask
+// server, default http://localhost:7430; set PROMPTFORGE_URL to override). This tab
+// just embeds it in an iframe -- no proxy, no shared state. The app itself talks to
+// ComfyUI on :8188. See SecondBrain/Projects/promptforge-ecosystem.md.
+async function renderPromptForgeTab() {
+  const main = document.getElementById('main');
+  let url = 'http://' + location.hostname + ':7430/';
+  try {
+    const cfg = await fetchJson('/api/promptforge/config');
+    if (cfg && cfg.url) url = cfg.url.replace('localhost', location.hostname);
+  } catch (e) { /* fall back to the default host:7430 */ }
+  main.innerHTML = `<iframe class="viz" src="${escapeAttr(url)}" style="width:100%;height:calc(100vh - 120px);border:2px solid var(--border);border-radius:8px"></iframe>`;
+}
+
 // --- Hardware tab --------------------------------------------------------------------
 // Read-only view of hardware_stats.py's background sampler (a daemon thread app.py
 // starts on boot, 10s interval / 24h retention -- see start_sampler() there) via
@@ -3647,6 +3662,7 @@ async function renderMain() {
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
     else if (activeTab === 'tokenfold') await renderTokenfoldTab();
+    else if (activeTab === 'promptforge') await renderPromptForgeTab();
     else if (activeTab === 'adhoc') await renderAdhocTasksTab();
     else await renderQueueTab(activeTab);
   } catch (e) {

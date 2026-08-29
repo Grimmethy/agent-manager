@@ -980,6 +980,14 @@ def api_tokenfold_stats():
         return jsonify({"available": False, "port": port})
 
 
+@app.route("/api/promptforge/config")
+def api_promptforge_config():
+    # PromptForge is a separate local app (its own Flask server). The dashboard just
+    # tells the browser where to point the embedded iframe -- PROMPTFORGE_URL, else the
+    # convention :7430. No proxy: the iframe loads that origin directly.
+    return jsonify({"url": os.environ.get("PROMPTFORGE_URL", "http://localhost:7430")})
+
+
 def _hardware_history_averages(history: list) -> dict:
     """Current-vs-average is computed here rather than in hardware_stats.py -- that
     module only knows about individual samples, "average over the retention window" is
