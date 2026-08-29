@@ -41,8 +41,13 @@ for (const entryPoint of ['./local-draft.js', './review-task.js', './apply-task.
   test(`${entryPoint} calls ensureRegistered() at module load (picks up AGENT_MANAGER_REGISTER_PATH plugins)`, () => {
     const prevRegister = process.env.AGENT_MANAGER_REGISTER_PATH;
     const prevRepoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+    const prevManifest = process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
     process.env.AGENT_MANAGER_REGISTER_PATH = writePluginFixture();
     process.env.AGENT_MANAGER_REPO_ROOT = process.cwd();
+    // Force the env-var path: point the plugin manifest at a guaranteed-missing file so
+    // ensureRegistered() falls back to AGENT_MANAGER_REGISTER_PATH regardless of whether a
+    // real plugins.json happens to sit at the repo root of the checkout the test runs in.
+    process.env.AGENT_MANAGER_PLUGINS_MANIFEST = path.join(os.tmpdir(), 'no-such-plugins-manifest-' + Date.now() + '.json');
     try {
       const { clearRegistry, getRegisteredSource } = freshRequire('./task-source-registry.js');
       clearRegistry();
@@ -56,7 +61,9 @@ for (const entryPoint of ['./local-draft.js', './review-task.js', './apply-task.
     } finally {
       if (prevRegister === undefined) delete process.env.AGENT_MANAGER_REGISTER_PATH; else process.env.AGENT_MANAGER_REGISTER_PATH = prevRegister;
       if (prevRepoRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRepoRoot;
+      if (prevManifest === undefined) delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST; else process.env.AGENT_MANAGER_PLUGINS_MANIFEST = prevManifest;
       delete require.cache[require.resolve('./config.js')];
+      delete require.cache[require.resolve('./plugins-manifest.js')];
     }
   });
 }
