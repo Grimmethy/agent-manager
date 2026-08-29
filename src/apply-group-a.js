@@ -368,18 +368,30 @@ function appendMarkdownLineAtomic(fullPath, line) {
   writeAtomicSync(fullPath, contents);
 }
 
-function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
-  const { brainDumpEntryId, rawText } = task.promptContext;
-
+// Loads the brain-dump JSON store from disk, returning a normalized { entries: Array } object.
+// A missing file or corrupt JSON both yield an empty store rather than throwing.
+function loadBrainDump(filePath) {
   let data;
   try {
-    data = JSON.parse(fs.existsSync(brainDumpPath) ? fs.readFileSync(brainDumpPath, 'utf8') : '{"entries":[]}');
+    data = JSON.parse(fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '{"entries":[]}');
   } catch {
     data = { entries: [] };
   }
   if (!Array.isArray(data.entries)) data.entries = [];
+  return data;
+}
 
-  const entry = data.entries.find((e) => e && e.id === brainDumpEntryId);
+// Finds a single entry by id in a brain-dump store's entries array, or null if absent.
+function findEntry(data, entryId) {
+  return data.entries.find((e) => e && e.id === entryId) || null;
+}
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+
+  const data = loadBrainDump(brainDumpPath);
+
+  const entry = findEntry(data, brainDumpEntryId);
   if (!entry) {
     return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
   }
