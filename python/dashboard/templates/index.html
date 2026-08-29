@@ -3529,6 +3529,11 @@ async function renderTokenfoldTab() {
 // server, default http://localhost:7430; set PROMPTFORGE_URL to override). This tab
 // just embeds it in an iframe -- no proxy, no shared state. The app itself talks to
 // ComfyUI on :8188. See SecondBrain/Projects/promptforge-ecosystem.md.
+//
+// IDEMPOTENT: this must NOT rebuild the iframe when it's already mounted -- doing so
+// reloads PromptForge and wipes whatever the user is typing/dragging. The generic 5s
+// refresh() also skips this tab (same opt-out as Project / Brain Dump), so the iframe
+// is built exactly once per visit.
 async function renderPromptForgeTab() {
   const main = document.getElementById('main');
   let url = 'http://' + location.hostname + ':7430/';
@@ -3536,7 +3541,12 @@ async function renderPromptForgeTab() {
     const cfg = await fetchJson('/api/promptforge/config');
     if (cfg && cfg.url) url = cfg.url.replace('localhost', location.hostname);
   } catch (e) { /* fall back to the default host:7430 */ }
-  main.innerHTML = `<iframe class="viz" src="${escapeAttr(url)}" style="width:100%;height:calc(100vh - 120px);border:2px solid var(--border);border-radius:8px"></iframe>`;
+  const existing = main.querySelector('iframe.promptforge-frame');
+  if (existing) {
+    if (existing.getAttribute('src') !== url) existing.setAttribute('src', url);
+    return;
+  }
+  main.innerHTML = `<iframe class="viz promptforge-frame" src="${escapeAttr(url)}" style="width:100%;height:calc(100vh - 120px);border:2px solid var(--border);border-radius:8px"></iframe>`;
 }
 
 // --- Hardware tab --------------------------------------------------------------------
@@ -3681,7 +3691,10 @@ async function refresh() {
   // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
   // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
   // this generic 5s cycle -- only the nav badge counts above still update while open.
-  if (activeTab !== 'project' && activeTab !== 'brain-dump') renderMain();
+  // promptforge is an embedded iframe -- re-running renderMain() every 5s would
+  // rebuild it and reload the app out from under the user's inputs, same reason
+  // project / brain-dump opt out here.
+  if (activeTab !== 'project' && activeTab !== 'brain-dump' && activeTab !== 'promptforge') renderMain();
 }
 
 // --- Project tab --------------------------------------------------------------------
