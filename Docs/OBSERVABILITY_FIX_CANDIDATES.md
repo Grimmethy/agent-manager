@@ -321,3 +321,29 @@ Inside that single catch block, replace the bare comment with a structured warn-
 
 Benefits:
 Every secondary-push failure now produces a single, greppable, structured log line containing the branch name and the error's identity, enabling operators to (a) confirm the failure actually happened, (b) identify which branch was affected, and (c) distinguish error types (network timeout vs. auth rejection vs. malformed ref) without adding any new dependency or changing runtime behaviour.
+
+### AC-37 · Add console.warn diagnostic to brain-dump-sort catch block
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+The brain-dump sort task-shaping function (the one that reads brainDumpPath, iterates entries, selects a `chosen` entry, and builds a task descriptor) has a `} catch (err) { return null; }` block that silently swallows any error (malformed entry, missing field, unexpected shape) and drops the entry with zero diagnostic output. Because the same `} catch (err) { return null; }` pattern appears in at least two other functions in this file (nextAdhocTask, nextResearchTask), a bare text match on that three-line block is non-unique and will either fail to apply or corrupt the wrong function. The fix must anchor on unique surrounding context specific to the brain-dump sort function.
+
+Solution:
+Locate the brain-dump sort function by its section header comment (`// --- Source: brain_dump_sort`) and its unique logic (iterating brain-dump entries, calling `listSecondBrainTopLevel`, selecting a `chosen` entry, building a task descriptor referencing `chosen.rawText` and a `slice` call). Within that function's try/catch, replace the single `return null;` in the catch body with two statements: (1) `console.warn('[brain-dump-sort] skipped entry (id=' + (chosen && chosen.id != null ? chosen.id : 'unknown') + '): ' + err.message);` and (2) `return null;`. Use a find pattern that includes at least the last 2–3 lines of the try block (the task-descriptor construction referencing `chosen.rawText` / `slice`) immediately followed by the `} catch (err) {` line to guarantee uniqueness against the identical catch blocks in nextAdhocTask and nextResearchTask. Do NOT use the bare three-line `} catch (err) {\n    return null;\n  }` as the find anchor.
+
+Benefits:
+Operators get a single-line diagnostic in stdout/stderr identifying which brain-dump entry was dropped and why, turning a silent data-loss path into a debuggable one. The edit is scoped to exactly one catch block, leaving all other functions byte-identical. No new dependencies, no API changes, no behavioural change on the happy path.
+
+### AC-38 · Add explanatory comment above the brain-dump-sort catch block
+Strength: Strong
+Files: src/task-sources.js
+
+Problem:
+After the diagnostic is added (sub-candidate 1), the catch block still lacks context for future readers: it is not obvious why the function returns null on error rather than rethrowing, or that the entry will be retried on the next tick because it was never marked as processed. A brief comment prevents a future developer from 'fixing' the catch by removing the `return null` or replacing it with a throw, which would crash the worker loop.
+
+Solution:
+Immediately above the `} catch (err) {` line in the brain-dump sort function (the same function identified by its `chosen.rawText` / `slice` try-block logic), insert a one-line comment: `// Non-fatal: skip this entry this tick; it stays unprocessed and will be retried next tick.` Place it between the last line of the try block and the `} catch (err) {` line. Use the same unique multi-line find anchor (last try-block lines + catch opening) to ensure the edit lands in the correct function and not in nextAdhocTask or nextResearchTask.
+
+Benefits:
+Documents the intentional retry-by-silence design decision inline, reducing the chance of a well-meaning refactor breaking the worker loop. Pairs with the diagnostic from sub-candidate 1 to give both runtime visibility (console.warn) and static context (comment) for the same code path.
