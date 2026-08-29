@@ -23,6 +23,11 @@
 //      its /stop is the same action a human clicking "Stop" in TheAgent's UI would take.
 // Neither is a raw `kill` on a process this pipeline doesn't own.
 //
+// It also treats Ollama's own resident model (GET /api/ps -> size_vram) as *expected*
+// occupancy: once the local model is loaded there is always less than minFreeMb free,
+// and that's the pipeline running, not starvation -- so that state reports "ok", not a
+// per-tick "still starved" line.
+//
 // CLI: node gpu-guard.js   -- best-effort, always exits 0; callers (local-worker.sh,
 // review-runner.sh) run this once per tick and never let its outcome block the tick
 // itself, same "network/external state is unreliable, log and move on" treatment
@@ -39,6 +44,15 @@ const THEAGENT_URL = process.env.AGENT_MANAGER_THEAGENT_URL || 'http://localhost
 // Hitting /free is the same action as ComfyUI's own "Unload Models" button, not a
 // raw kill -- so it fits this guard's "sanctioned control surface only" charter.
 const COMFY_URL = process.env.AGENT_MANAGER_COMFY_URL || process.env.COMFY_URL || 'http://127.0.0.1:8188';
+// Ollama's own resident model is *expected* GPU occupancy, not contention -- once the
+// local model is loaded there will always be less than minFreeMb free, and that's the
+// pipeline working, not a problem. Ask Ollama what it has resident (GET /api/ps ->
+// models[].size_vram) so the guard can tell "the model is loaded and running" apart
+// from "something foreign is sitting on the card".
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
+// Below this, a /api/ps entry is a rounding artefact / tiny embed model, not "the model
+// is resident" -- a real LLM is multiple GB.
+const OLLAMA_RESIDENT_MIN_MB = 1024;
 // Apps this pipeline is allowed to ask TheAgent to stop when the GPU is starved --
 // an explicit allowlist, not "every app TheAgent knows about", so a future addition to
 // TheAgent's own APPS registry doesn't silently become something this pipeline can stop
@@ -66,6 +80,15 @@ function readFreeVramMb() {
   }
 }
 
+// MB of VRAM Ollama reports as resident (sum of loaded models' size_vram), or null if
+// Ollama can't be reached / says nothing is loaded.
+async function readOllamaVramMb(fetchJsonFn, ollamaUrl = OLLAMA_URL) {
+  const res = await fetchJsonFn(`${ollamaUrl}/api/ps`, {}, 5000);
+  if (!res || !res.ok || !res.body || !Array.isArray(res.body.models)) return null;
+  const bytes = res.body.models.reduce((sum, m) => sum + (Number(m.size_vram) || 0), 0);
+  return Math.round(bytes / (1024 * 1024));
+}
+
 async function fetchJson(url, options = {}, timeoutMs = 5000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -88,6 +111,7 @@ async function ensureGpuHeadroom({
   minFreeMb = MIN_FREE_VRAM_MB,
   theAgentUrl = THEAGENT_URL,
   comfyUrl = COMFY_URL,
+  ollamaUrl = OLLAMA_URL,
   yieldAppIds = YIELD_APP_IDS,
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
@@ -105,12 +129,30 @@ async function ensureGpuHeadroom({
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ unload_models: true, free_memory: true }) },
     10000,
   );
+  let freeAfterMb = freeMb;
   if (freeRes && freeRes.ok) {
     freed.push('comfyui');
     const afterMb = readFreeVram();
+    if (afterMb !== null) freeAfterMb = afterMb;
     if (afterMb !== null && afterMb >= minFreeMb) {
       return { checked: true, freeMb: afterMb, minFreeMb, starved: false, yielded: [], freed, note: `GPU was starved (${freeMb}MB free) -- ComfyUI /free recovered it to ${afterMb}MB` };
     }
+  }
+
+  // Still below the target. If Ollama already has a model resident, that IS the
+  // shortfall -- the local model is loaded and running, which is the goal, not
+  // contention. Only escalate when the held VRAM isn't Ollama's own model.
+  const ollamaMb = await readOllamaVramMb(fetchJsonFn, ollamaUrl);
+  if (ollamaMb !== null && ollamaMb >= OLLAMA_RESIDENT_MIN_MB) {
+    return {
+      checked: true,
+      freeMb: freeAfterMb,
+      minFreeMb,
+      starved: false,
+      yielded: [],
+      freed,
+      note: `${freeAfterMb}MB free is under the ${minFreeMb}MB target, but ${ollamaMb}MB is Ollama's own resident model -- expected${freed.length ? `; freed ${freed.join(', ')}` : ''}`,
+    };
   }
 
   // Still starved (or no standalone ComfyUI): find which allowlisted apps TheAgent
@@ -146,7 +188,7 @@ module.exports = { ensureGpuHeadroom, readFreeVramMb };
 
 if (require.main === module) {
   ensureGpuHeadroom().then((result) => {
-    if (result.starved || (result.freed && result.freed.length) || (result.yielded && result.yielded.length)) {
+    if (result.note) {
       console.error(`[gpu-guard] ${result.note}`);
     } else if (result.checked) {
       console.error(`[gpu-guard] ${result.freeMb}MB free (>= ${result.minFreeMb}MB min) -- ok`);
