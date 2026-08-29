@@ -1,5 +1,7 @@
 # Observability Fix Candidates
 
+<!-- Cleanup 2026-08-28 (ADR-0022 fallout): removed AC-14/AC-15 (observability-scan.js) and AC-23 (unused-export-scan.js) -- those files moved to the agent-manager-hygiene plugin and are no longer in this repo. Collapsed the src/local-draft.js harness-search cluster (AC-16/19/31/32/35) into AC-16, the src/apply-group-a.js domains cluster (AC-5/29/30) into AC-29, and the src/apply-task.js secondary-push pair (AC-7/33) into AC-33. AC-25/AC-34/AC-36 retired separately. Existing AC numbers are preserved so in-flight task-id dedup still works. -->
+
 ### AC-1 · Silent cache-write failure in budget-monitor health check
 Strength: Strong
 Files: budget-monitor.js
@@ -52,19 +54,6 @@ Introduce a module-level `parseFailures` counter that is incremented inside the 
 Benefits:
 Once the counter and rate-limited log are in place, a total data-source failure becomes diagnosable within seconds: the warning line appears in logs, the metric spikes on any dashboard, and an on-call engineer can immediately distinguish "upstream broke" from "no traffic." The rate-limiting keeps log volume bounded even under a sustained flood of malformed lines, and the counter gives a precise number for post-incident review. No runtime behavior changes for well-formed lines, so the fix is non-breaking and safe to ship behind a feature flag if desired.
 
-### AC-5 · Silent domain-file load failure hides guardrail loss
-Strength: Strong
-Files: src/apply-group-a.js
-
-Problem:
-The IIFE that loads `matchedProject.domainsPath` catches every exception—`ENOENT`, `EACCES`, `SyntaxError` from a corrupt JSON file, or any other runtime error—and returns an empty array with no log line, no metric emission, and no rethrow. Downstream code that uses `validDomains` as a whitelist either fail-closes (blocking all applies with an opaque "domain not allowed" message) or fail-opens (treating `length === 0` as "no restriction"), and in neither case does the operator learn that the domains file was unreadable or malformed. The root cause is invisible in every log stream, dashboard, and alert channel.
-
-Solution:
-Replace the bare `catch { return []; }` with a `catch (err)` that (a) logs a structured warning including the resolved `domainsPath`, the error `code`/`name`, and the error message (e.g. `logger.warn('domains-file-unreadable', { path: matchedProject.domainsPath, code: err.code, message: err.message })`), (b) increments a dedicated counter metric such as `agent_manager_domains_load_errors_total` tagged with the project name, and (c) rethrows the error so the caller's existing error-handling path surfaces the failure to the operator immediately rather than silently degrading to an empty whitelist. If the project's design intentionally tolerates a missing domains file (e.g. "no file means allow-all"), that intent should be made explicit by catching only `ENOENT` and logging an info-level note, while letting `EACCES` and `SyntaxError` propagate.
-
-Benefits:
-Operators see an immediate, greppable log line and a rising metric the moment the domains file becomes unreadable or corrupt, turning a silent security-guarantee loss into a one-line alert. Fail-closed vs. fail-open ambiguity is resolved because the error now reaches the caller's error path, where the documented behavior (block all applies) applies and is visible in the apply result. Post-incident triage drops from "why did this apply get rejected?" to a single `grep` on the structured log, and the metric provides a leading indicator that a config file drifted or a permissions change broke the guardrail before any user-facing failure occurs.
-
 ### AC-6 · Silent catch in apply-group-b hides parse failures from operators
 Strength: Strong
 Files: src/apply-group-b.js
@@ -77,19 +66,6 @@ Inside the `catch` block, emit a single `warn`-level structured log (using the p
 
 Benefits:
 An operator facing a batch that "succeeded with zero applied items" can now `grep` the warn log for the group identifier and immediately see whether the failure was a uniform schema drift (every item shows the same prose preview) or a sporadic parser crash (a `TypeError` with a null-preview). The structured fields (group id, item key, error name) make the signal machine-parseable for alerting dashboards without changing any runtime control flow or the function's return contract.
-
-### AC-7 · Silent catch swallows secondary-push failure with zero observability signal
-Strength: Strong
-Files: src/apply-task.js
-
-Problem:
-The catch block for the best-effort secondary push (likely a remote update or post-push housekeeping step) captures the exception `e` and discards it entirely — no log line, no metric increment, no structured trace. The function then falls through to `return { succeeded: true, pushed: true }`, so from the operator's perspective the task completed normally. If this path begins failing persistently (expired token, renamed remote, revoked permission), the degradation is structurally invisible: no log to grep, no counter to alert on, no span to trace. The only surviving artifact is a comment pointing to an "above" rationale that may be refactored away, leaving the code with zero self-documenting signal about why the error is tolerable or what went wrong.
-
-Solution:
-Replace the bare `catch (e) { /* Non-fatal -- see comment above. */ }` with a structured warning log that records the branch name and the exception message, plus an optional metric counter (e.g. `apply_task.secondary_push_failure`) for sustained-failure alerting. Keep the control flow identical — the function still returns `{ succeeded: true, … }` — so no caller logic changes. Document the non-fatal intent directly in the catch block's comment rather than relying on a pointer to an external comment, so the rationale survives refactors and is visible to anyone reading only the error-handling path.
-
-Benefits:
-Operators gain a greppable, structured log line the moment the secondary push fails, turning a silent degradation into a one-line diagnostic (network timeout vs. auth rejection vs. missing ref). A metric counter enables a threshold alert that fires after N consecutive failures, surfacing the issue within minutes rather than days. The in-code comment makes the non-fatal contract self-documenting, removing the fragile dependency on an "above" comment that a future refactor could delete. No behavioral change to callers; the fix is purely additive observability.
 
 ### AC-8 · Add diagnostic log to silent catch in structcheck coverage reader
 Strength: Strong
@@ -181,44 +157,18 @@ Replace the bare `catch` with a code-checked branch: if `err.code === 'ENOENT'` 
 Benefits:
 A permission fault, transient I/O error, or disk-full condition now propagates to the caller instead of masquerading as an empty lock set, eliminating the silent double-dispatch path. The single `console.error` line gives operators an immediate, greppable signal in logs that the lock directory is unreadable, turning an invisible corruption risk into a visible, actionable alert. The "no directory yet" fast path is preserved exactly as before.
 
-### AC-14 · Silent read-failure swallow in observability scan loop
-Strength: Strong
-Files: src/observability-scan.js
-
-Problem:
-The `for` loop that iterates over candidate files wraps `fs.readFileSync` in a bare `catch { continue; }`. Every read failure—ENOENT from a race, EACCES, a stale symlink, a path that was never valid—falls into that single catch and is discarded. No `skipped` array, no `process.emitWarning`, no stderr write, no flag on the return value. The caller receives a `found` set that is indistinguishable from a complete scan, so a gate that checks "no reserved attributes present → proceed" can pass on a result that silently omitted half the files it was supposed to read.
-
-Solution:
-Accumulate failures in a `skipped` array inside the catch (`skipped.push({ file, err: err.code ?? err.message })`), then return `{ found: [...found], skipped }` (or, for a void/CLI entry point, write a one-line stderr summary `scan: skipped N file(s)` and exit 0). The `continue` is preserved so one bad file still does not abort the bulk scan; the only change is that the caller now has a concrete, inspectable list of which files were missed and the errno or message that caused the miss.
-
-Benefits:
-The scan output becomes self-describing: an operator or CI gate can distinguish "zero reserved attributes found across all 12 files" from "zero found across 7 of 12 files; 5 unreadable." This closes the observability gap in the observability tool itself, makes the gate decision auditable, and costs zero on the happy path (empty `skipped` array, no extra I/O).
-
-### AC-15 · Silent catch swallows scan failure in observability module
-Strength: Strong
-Files: src/observability-scan.js
-
-Problem:
-The `catch { return []; }` block at line 48 of `src/observability-scan.js` discards the error object entirely—no `console.error`, no logger call, no `process.emitWarning`, no rethrow, no metric increment. A network timeout, a 500 from the upstream API, or a permission error all collapse into the same `[]` that a legitimate zero-event scan would produce. Downstream consumers (dashboards, alerting rules, on-call runbooks) interpret `[]` as "zero anomalies detected" and conclude the system is healthy, when in fact the scan itself never completed. In an observability module specifically, this is the highest-impact form of silent failure: the tool whose job is to surface problems is itself hiding its own problems.
-
-Solution:
-Replace the bare `catch { return []; }` with a handler that (1) logs the failure at minimum `warn` level including the function name, `err.message`, and `err.stack` so the original call site is preserved in the log, (2) optionally increments a counter metric (`observability_scan_errors`) so a metrics pipeline can alert on repeated scan failures, and (3) still returns `[]` to preserve the existing return-type contract for callers that branch on array length. Example: `catch (err) { console.error('[observability-scan] scan failed:', err.message, err.stack); return []; }`. No signature change, no new dependency, no caller migration required.
-
-Benefits:
-An on-call engineer investigating an incident will see a timestamped log line with the full stack trace instead of a silent `0 anomalies` reading. A metrics alert can fire when `observability_scan_errors` exceeds a threshold, decoupling detection from human log-scraping. The original error context (which upstream endpoint, which timeout, which permission) is preserved in the log rather than lost in a discarded binding, making root-cause analysis a grep instead of a guess.
-
-### AC-16 · Silent search-fetch failure is unobservable
+### AC-16 · Silent search-fetch failure in runHarnessSearch is unobservable (both catch blocks)
 Strength: Strong
 Files: src/local-draft.js
 
 Problem:
-The `catch` block around `projectSearchFetch` contains only a comment. When the fetch fails (auth rotation, backend 500, transient DNS), `searchResults` stays empty and the downstream prompt renders "(no results …)" with no log line, counter, or structured event. In a fan-out agent pipeline the operator has zero signal that search is degraded until end-user answer quality drops.
+`runHarnessSearch()` in src/local-draft.js has two adjacent try/catch blocks that both swallow the fetch error entirely -- the body is a comment only, no log line. The first (the `projectSearch` branch) wraps `await projectSearchFetch(queries)`; the second (the `archImport` branch, shared by pipeline_self_audit / pipeline_health_audit / ui_visibility_audit / staleness_audit) wraps `archImportFetch(queries)`. On a thrown error (auth rotation, backend 500, transient DNS, a grep-tool bug) the results/hits list stays empty and the subsequent `appendHistoryEvent(...)` records "0 result(s)" / "0 hit(s)" -- indistinguishable from a genuinely empty search. Supersedes the earlier AC-19 / AC-31 / AC-32 / AC-35, which each covered one catch or were a research step, before the ADR-0022 refactor consolidated the six per-source harness branches into this one helper.
 
 Solution:
-Replace the comment-only catch body with a single `console.warn` (or the project's existing logger, e.g. `logger.warn`) that includes the error message: `console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e)`. Control flow is unchanged—`searchResults` remains `[]` and execution falls through. If a metrics sink (Prometheus, Datadog, etc.) is already wired, increment a `search_fetch_errors` counter in the same block.
+In each of the two catch blocks (keep the existing `catch (e)` binding), immediately after the existing comment, add one `console.warn` line naming the fetch and carrying the error message -- e.g. `console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results:', e?.message ?? e);` and, in the archImport branch, `console.warn('[local-draft] archImportFetch failed, proceeding with no hits:', e?.message ?? e);`. Do not add return/throw/await or any control-flow statement -- the empty-result fallthrough is intentional. Do not introduce a logger dependency (the file imports only fs, path, and project-internal modules).
 
 Benefits:
-Every silent degradation becomes a greppable, alertable log line. On-call can correlate a spike in `projectSearchFetch failed` warnings with the underlying cause (auth, DNS, 500) within seconds instead of waiting for user complaints. The fix is additive; no behavioral or API change, so regression risk is nil.
+A thrown fetch error becomes a greppable `[local-draft] ...Fetch failed` warning an operator can correlate with the underlying cause, instead of looking identical to an empty result. Additive only -- no behaviour or API change.
 
 ### AC-17 · Empty catch on coverage write swallows fs.writeFileSync failure with no observability
 Strength: Strong
@@ -245,31 +195,6 @@ Replace the bare `summary.errors++` with a structured log line that captures `fi
 
 Benefits:
 Operators can immediately identify which task and which file path failed, the OS-level error code (ENOSPC vs EACCES vs EBUSY), and the human-readable message, enabling correct triage (free disk space, fix permissions, or investigate duplicate-task risk) instead of guessing from an opaque counter. The aggregate `summary.errors` counter is preserved for existing dashboards and alerting thresholds.
-
-### AC-19 · Log non-fatal archImportFetch failure in catch block
-Strength: Strong
-Files: src/local-draft.js
-
-Problem:
-At `src/local-draft.js:157` the `catch` block for `archImportFetch` swallows the exception entirely—no `console.*` call, no metric, no rethrow. A throw here signals a network timeout, auth expiry, 500, or parse error, yet the pipeline proceeds with an empty hits list and leaves zero log line in the entire run. In a batch/agent context that is the only observable trace of *why* the search step contributed nothing, and the existing comment documents the intent to proceed without hits but provides no diagnostic signal.
-
-Solution:
-Insert a single `console.debug` line as the first statement inside the existing `catch (e)` block at line 157, before the implicit fall-through to the empty-hits path. The exact change:
-
-```js
-// src/local-draft.js:157  (the catch block)
-} catch (e) {
-  console.debug(`[local-draft] archImportFetch non-fatal failure: ${e?.message ?? e}`);
-  // Non-fatal -- implement proceeds with no hits (its own prompt already handles
-  // an empty hits list: "(no matches -- the searches found nothing ...)"), same
-  // try/catch treatment project_search's branch above gives its own fetch call.
-}
-```
-
-`console.debug` (not `warn`) keeps stdout clean in normal operation; surface it via `NODE_DEBUG` or a log-level flag when diagnosing. `e?.message ?? e` handles both `Error` instances and non-Error throws. No rethrow, no metric—preserves the existing "proceed with empty hits" contract and the `project_search` parity the comment references.
-
-Benefits:
-Once fixed, any operator or agent diagnosing a run where the search step returned nothing can enable debug logging and immediately see the concrete failure reason (timeout, 401, 500, JSON parse error) instead of staring at a silent empty result. The one-line addition changes no runtime behaviour, adds no new dependency, and satisfies the scanner's "no log/rethrow/metric" condition by providing the minimal observable trace the finding requires.
 
 ### AC-20 · Silent catch on grounding-source retrieval
 Strength: Strong
@@ -309,24 +234,6 @@ Add a single `console.warn` (or `log.debug` if the project uses a structured log
 
 Benefits:
 The all-files-fail scenario becomes diagnosable at the console/log level without altering control flow. An operator can immediately distinguish a permissions or path error from a genuinely empty directory. The single-line addition keeps the best-effort enumeration contract intact while closing the silent-failure observability gap.
-
-### AC-23 · Silent catch in unused-export-scan hides scan failure from CI
-Strength: Strong
-Files: src/unused-export-scan.js
-
-Problem:
-The `catch` block in the unused-export scan function swallows every error (syntax error in a target file, permission denied, circular-import crash in the AST walker) and returns `[]` with no diagnostic output. The return type stays `string[]` so no caller breaks, but the failure is indistinguishable from a legitimate "zero unused exports" result. In a CI gate this means a broken import or unreadable file produces a green build with no signal that the scan never actually ran.
-
-Solution:
-Two edits inside the existing catch block:
-
-1. Change the optional catch binding `catch {` to `catch (err) {` so the thrown value is available.
-2. Before the `return []`, write a single diagnostic line to `process.stderr`: `` `[unused-export-scan] scan failed: ${err?.message ?? err}\n` ``.
-
-Do not rethrow (callers expect an array), do not change the return shape, do not add a dependency on a logger. One stderr line is sufficient for a dev-tool utility and is visible in any CI log without altering the public API contract.
-
-Benefits:
-A real scan failure becomes visible in CI logs and local terminal output, eliminating the silent false-clean where broken code passes because the scanner never completed. The return type and caller expectations are unchanged, so no downstream type errors or semantic shifts are introduced. The one-line stderr write has zero runtime cost on the success path and no new dependencies.
 
 ### AC-24 · Uptime-log readdir catch swallows all errors and returns undefined
 Strength: Strong
@@ -389,57 +296,18 @@ Replace the empty catch body with a `console.error` call that includes the task 
 Benefits:
 Every failed enqueue now emits a single log line containing the task id and the OS error, giving operators a grep-able trace. The rethrow (or falsy return) lets the caller's retry loop or abort path engage, so a transient ENOSPC is retried rather than lost. The queue invariant—"every task that entered `writeTask` either exists in `queue/pending/` or the failure is recorded"—is restored, closing the silent-loss gap in the deployment pipeline.
 
-### AC-29 · Add structured warn log and error counter to the domains-file load-failure catch in src/apply-group-a.js
+### AC-29 · Silent domains-file load failure in src/apply-group-a.js
 Strength: Strong
 Files: src/apply-group-a.js
 
 Problem:
-The IIFE in src/apply-group-a.js that reads matchedProject.domainsPath currently ends with a bare `catch { return []; }` that swallows every exception (ENOENT, EACCES, JSON parse errors, network hiccups on a remote path, etc.) with zero observability. No log line is emitted, no metric is incremented, and no signal reaches the operator or any dashboard. A guardrail file that fails to load is indistinguishable from a project that simply has no domain restrictions, which is exactly the silent guardrail-loss scenario AC-5 calls out.
+The IIFE in src/apply-group-a.js that reads matchedProject.domainsPath ends with a bare `catch { return []; }` that swallows every exception (ENOENT, EACCES, JSON parse errors, a bad path) with zero observability. A guardrail file that fails to load is then indistinguishable from a project that legitimately has no domain restrictions -- a silent guardrail loss on a per-apply hot path. Supersedes the earlier AC-5 and AC-30, which described the same catch.
 
 Solution:
-In that IIFE's catch clause (the one wrapping the read/parse of matchedProject.domainsPath), change the parameterless `catch {` to `catch (err) {`. Inside the new body, before any return or throw, (1) call the project's logger at warn level with a stable event name such as `domains-file-unreadable` and a structured payload containing the resolved matchedProject.domainsPath value, err.code, err.name, and err.message (adapt field names to the project's logger API—confirm whether it is key-value or object-keyed); (2) increment a dedicated counter metric (e.g. `agent_manager_domains_load_errors_total`) with a single label for the project identifier (matchedProject.name or equivalent—confirm the exact field from the matchedProject shape). Do not log the full stack trace at warn level to avoid bloat on a per-apply hot path. Do not add labels beyond the project name to keep cardinality bounded. Leave the try block, the path expression, and the success-path return value untouched.
+Change the parameterless `catch {` on that IIFE to `catch (err) {`. Before the `return []`, add one `console.warn` naming the event and carrying the resolved domainsPath plus `err.code` / `err.message` -- e.g. `console.warn('[apply-group-a] domains-file unreadable, proceeding with no domain restrictions:', { code: err.code, message: err.message });`. Keep the `return []` fallthrough and the try body unchanged. Do not add a metrics counter or a logger dependency -- agent-manager has neither; a warn line is the whole ask.
 
 Benefits:
-Every non-successful domains-file load now produces a structured, greppable log line and a countable metric. Operators can correlate a sudden spike in `agent_manager_domains_load_errors_total` with a deploy or infrastructure change. The warn-level log gives enough context (path, OS error code, message) to diagnose without dumping full stacks on a hot path. The metric enables alerting and SLO tracking on guardrail-file availability.
-
-### AC-30 · Replace the silent empty-array return with explicit failure propagation (rethrow or ENOENT-scoped allow-all) in the same catch
-Strength: Strong
-Files: src/apply-group-a.js
-
-Problem:
-After the bare `catch { return []; }` in the domains-file IIFE, the caller receives an empty array and proceeds as if the project has no domain restrictions (allow-all). This is correct only if a missing file is an intentional 'no restriction' signal. For every other failure mode—permission denied, corrupt JSON, network timeout on a remote path, a typo in the path—the empty array silently disables the guardrail while the apply step reports success. The operator never sees the failure in the apply result, in CI logs, or in any upstream alerting channel.
-
-Solution:
-In the same catch body (after the log and metric added by the first sub-candidate), inspect err.code. If err.code === 'ENOENT' (or 'MODULE_NOT_FOUND' if the loader is a module-system read), treat it as the intentional 'no domain restriction' case: log at info level with event name `domains-file-absent-allow-all`, do NOT increment the error counter (undo the increment if the first sub-candidate already ran, or guard the increment in the first sub-candidate with `err.code !== 'ENOENT'`), and return [] as before. For all other error codes (EACCES, EISDIR, parse errors, etc.), rethrow the original error object (`throw err`) so the caller's existing error-handling path fires, the apply result reflects the failure, and upstream alerting is triggered. Do not wrap in a new Error unless the project convention requires a specific error class; if it does, set `cause: err` to preserve the original stack. Confirm the caller's error-handling contract (try/catch, .catch(), or thrown-error) before finalizing the rethrow shape.
-
-Benefits:
-Non-ENOENT failures (permissions, corruption, network) become visible in the apply result and any upstream alerting, closing the silent guardrail-loss gap. A genuinely absent file can still be treated as 'no restriction' if that is the product intent, without conflating it with a real I/O or parse failure. The rethrow preserves the original stack trace for debugging. Operators can distinguish 'project has no domains file' (info log) from 'project's domains file is broken' (warn log + error in apply result) at a glance.
-
-### AC-31 · Identify the exact catch-block text around the projectSearchFetch call in src/local-draft.js
-Strength: Strong
-Files: src/local-draft.js
-
-Problem:
-The plan targets a catch block in draftTask() that wraps the projectSearchFetch call and currently contains only a comment. The provided file excerpt is truncated at both ends and the draftTask() body (where the try/catch lives) is not visible, so the exact comment text, surrounding lines, and whether a project logger or metrics sink is imported cannot be confirmed. Forcing a find/replace against guessed text risks a non-applying diff or an edit to the wrong catch block.
-
-Solution:
-Open src/local-draft.js in full, locate the single try/catch (or try/finally + nested catch) that wraps the projectSearchFetch(...) call inside draftTask(). Record the exact catch-line and its body (the comment-only line) verbatim. Also confirm whether any logger (winston, pino, pino-logger, etc.) or metrics helper (promClient, counter.add, metrics.inc) is imported at the top of the file. Report the exact 3–6 line snippet (the catch { … } block plus one line of context above and below) so the next pass can produce a character-exact find string.
-
-Benefits:
-Guarantees the subsequent edit's find string is grounded in real file content, eliminates the risk of a non-applying or mis-targeted diff, and resolves the plan's Step-2 (logger) and Step-3 (metrics) unknowns before any code is written.
-
-### AC-32 · Add a warning-level log line to the identified catch block in src/local-draft.js
-Strength: Strong
-Files: src/local-draft.js
-
-Problem:
-Once the exact catch-block text is confirmed (see sibling candidate), the block still swallows the projectSearchFetch failure silently—only a comment sits in the catch body, so operators have no signal that the search fetch failed and the draft proceeded with empty results.
-
-Solution:
-Replace the comment-only catch body with a single console.warn (or the project logger's .warn, if one is confirmed imported) call: console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results:', err && err.message || err); Preserve any existing rationale comment above the log line. Do NOT add return, throw, break, or any control-flow statement—execution must fall through so searchResults retains its [] value. If a metrics counter is confirmed in the file, add one counter-increment line after the log; otherwise omit it. Run the project's lint and any local-draft tests afterward.
-
-Benefits:
-Makes the previously silent failure greppable in logs with a stable [local-draft] prefix, preserves existing control flow and downstream behavior exactly, and introduces no new dependencies or refactoring.
+Every non-successful domains-file load produces a structured, greppable warning with enough context (OS error code, message) to diagnose, without changing behaviour or adding a dependency.
 
 ### AC-33 · Add structured warn log to the silent secondary-push catch block
 Strength: Strong
@@ -453,16 +321,3 @@ Inside that single catch block, replace the bare comment with a structured warn-
 
 Benefits:
 Every secondary-push failure now produces a single, greppable, structured log line containing the branch name and the error's identity, enabling operators to (a) confirm the failure actually happened, (b) identify which branch was affected, and (c) distinguish error types (network timeout vs. auth rejection vs. malformed ref) without adding any new dependency or changing runtime behaviour.
-
-### AC-35 · AC-32: Add console.warn log line to the projectSearchFetch catch block in src/local-draft.js
-Strength: Strong
-Files: src/local-draft.js
-
-Problem:
-The catch block that handles a runSearches (project-search-fetch.js) failure in src/local-draft.js currently has a comment-only body with no executable statement. When the fetch fails, the failure is silently swallowed with no log output, making it invisible in production/CI logs. The target catch block sits in the truncated portion of the file (beyond the visible findUnverifiedEdit function), so the exact existing comment text, the catch-parameter name, and whether a project-level logger import exists at the top of the file are all unconfirmed from the visible content. A safe edit requires first opening the file and reading the exact catch-clause text verbatim.
-
-Solution:
-Open src/local-draft.js and locate the catch clause whose surrounding context references runSearches / project-search-fetch. Record the exact catch-parameter name and the exact existing comment text. Confirm no project logger (logger/log import) is present in the visible import block (lines 1–50 show only fs, path, and domain-specific requires — no generic logger). Insert one line immediately after the existing comment: console.warn('[local-draft] projectSearchFetch failed, proceeding with empty results', <catchParam>); Do not add return, throw, break, continue, await, or any control-flow statement. Do not modify any line outside this catch body. Do not introduce a new import.
-
-Benefits:
-A single warning-level log line makes the previously silent fetch failure visible in stdout/stderr logs, enabling operators to correlate a degraded project_search draft (empty searchResults) with the underlying network/API error. The [local-draft] prefix keeps it greppable alongside other local-draft.js log lines. No new dependency, no control-flow change, searchResults still retains its pre-catch value of [].
