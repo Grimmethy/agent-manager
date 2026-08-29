@@ -322,3 +322,29 @@ Solution:
 
 Benefits:
 Eliminates a second, possibly-divergent copy of the degenerate/retry logic; the no-tools path now inherits the already-audited behaviour from local-client.js automatically; smaller surface area in local-tool-client.js (fewer lines to review, test, and keep in sync); satisfies the plan's A5 requirement of zero observable behavioural change.
+
+### AC-25 · Extract local/Ollama provider call path into _call_local
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+
+Problem:
+The _generate function in discuss_sessions.py inlines the entire local (Ollama) provider path directly in its body: building the harness-mediated grep search proposal, expanding query terms via _expand_grep_terms, fetching context via grep_fetch_client under _maybe_locked, and calling ollama_client.generate(). This logic is entangled with the Claude provider's branch and with _generate's own dispatch/stats-recording responsibilities, making the function long and harder to read or modify safely.
+
+Solution:
+Add a new function _call_local(session, prompt, transcript) placed directly above _generate in discuss_sessions.py. Move the local-provider branch's body out of _generate into this function verbatim -- the harness query-proposal call, QUERY_LINE_RE parsing, _expand_grep_terms usage, MAX_HARNESS_QUERIES/MAX_HARNESS_CONTEXT_CHARS limits, the _maybe_locked-guarded grep_fetch_client call, and the ollama_client.generate() call -- with no behavioral changes, only adjusting indentation and turning locals referenced from the branch into the function's parameters/return value. The function should return whatever _generate needs afterward (e.g. response text and model id) so the caller can still do its existing post-processing. Leave the module-level constants (QUERY_LINE_RE, MAX_HARNESS_QUERIES, MAX_HARNESS_CONTEXT_CHARS) untouched at module scope; _call_local simply references them.
+
+Benefits:
+Isolates the local-provider's harness-context-building and generation logic into its own testable, independently readable unit, and is a prerequisite step toward turning _generate into a short provider-dispatch function without changing any runtime behavior.
+
+### AC-26 · Extract Claude provider call path into _call_claude and rewrite _generate as a dispatcher
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+
+Problem:
+The _generate function also inlines the entire Claude-provider path (the claude_client CLI invocation using CLAUDE_DISCUSS_ALLOWED_TOOLS and CLAUDE_DISCUSS_MAX_TURNS) alongside the local-provider path, plus shared pre/post logic and stats recording, all in one function. Once the local path is pulled into _call_local, _generate still contains the Claude branch's full body and a manual if/else on session["provider"] mixed with unrelated setup and stats-recording code.
+
+Solution:
+Add a new function _call_claude(session, prompt, transcript) placed directly above _generate (next to _call_local), and move the Claude-provider branch's body into it verbatim -- the claude_client CLI invocation using CLAUDE_DISCUSS_ALLOWED_TOOLS and CLAUDE_DISCUSS_MAX_TURNS, cwd handling, and any Claude-specific error handling -- with no behavioral changes, returning the same shape _call_local returns (e.g. response text and model id) so both can be consumed identically. Then rewrite _generate itself: keep any shared prompt/transcript setup that runs before the provider branch, replace the inlined if/else provider logic with a short dispatch that calls _call_local(...) or _call_claude(...) based on session["provider"], and perform the existing stats/latency/model-id recording once against the adapter's return value before returning as before. Leave CLAUDE_DISCUSS_ALLOWED_TOOLS and CLAUDE_DISCUSS_MAX_TURNS at module scope, referenced only from _call_claude.
+
+Benefits:
+Completes the split of per-provider logic out of _generate, leaving _generate as a short, easy-to-follow dispatcher with a single unified stats-recording path, while both adapters remain plain functions in the same file with no behavioral change and no new module/class introduced.
