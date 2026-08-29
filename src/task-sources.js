@@ -936,191 +936,241 @@ function nextBrainDumpSortTask() {
 // within a few cycles, not months.
 const PERIODIC_REATTEMPT_INTERVAL_MS = 14 * 24 * 60 * 60 * 1000;
 
-function nextPathPrefetchResolveTask() {
-  const { pipelineDir, graphPath } = getConfig();
-  const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
-  let files;
+// Held-task queue scan: the .json files in queue/needs-clarification/, oldest-first
+// (mtime) -- same convention nextAdhocTask() already uses for its own queue/adhoc/ scan;
+// readdirSync's own order is unspecified, and a held task deserves the same FIFO
+// treatment as everything else this pipeline processes, not whatever arbitrary order the
+// filesystem happens to return. Returns null (not []) when the directory itself is
+// unreadable/absent -- the caller reads that as "no held tasks at all, nothing to do".
+function listHeldTasksFifo(heldDir) {
   try {
-    // Oldest-first (mtime), same convention nextAdhocTask() already uses for its own
-    // queue/adhoc/ scan -- readdirSync's own order is unspecified, and a held task
-    // deserves the same FIFO treatment as everything else this pipeline processes, not
-    // whatever arbitrary order the filesystem happens to return.
-    files = fs.readdirSync(heldDir)
+    return fs.readdirSync(heldDir)
       .filter((f) => f.endsWith('.json'))
       .map((f) => ({ f, mtime: fs.statSync(path.join(heldDir, f)).mtimeMs }))
       .sort((a, b) => a.mtime - b.mtime)
       .map((entry) => entry.f);
   } catch {
-    return null; // no held tasks at all -- nothing to do
+    return null;
+  }
+}
+
+// Which automatic retry tier (if any) a held task is currently eligible for. Returns null
+// to mean "skip this held task this tick"; otherwise { isHighReasoningRetry,
+// isPeriodicReattempt } -- both false being an ordinary first / low-reasoning attempt.
+//
+// Does NOT gate on `needsClarification.suggested` -- a non-confident (or
+// confident-but-empty-paths) suggestion still sets `suggested`, and that's exactly the
+// case this retry targets (a CONFIDENT non-empty suggestion already auto-resolved the
+// task straight into queue/adhoc/ in applyPathPrefetchResolve(), removing it from this
+// directory entirely, so it can never reach this loop at all). Eligibility is driven
+// entirely by the two attempted-flags instead. Confirmed live 2026-08-17: an earlier
+// version of this gate skipped on bare `suggested` truthiness, which silently skipped
+// every one of the 22 real stuck held tasks in this project's own
+// queue/needs-clarification/ (all of which already carry a non-confident `suggested` from
+// their first attempt) -- nextPathPrefetchResolveTask() returned null for all of them
+// instead of offering the intended retry.
+// Brain Dump #77: two automatic attempts per held task, not one -- a low-reasoning
+// (local model) attempt first, same as always, then ONE automatic high-reasoning (Claude)
+// retry if that first attempt didn't land a confident suggestion. Only once both flags
+// are set does this fall back to requiring a human (Discuss, which resets both -- see
+// app.py's discuss-end handler).
+// Brain Dump (2026-08-18, "build a system" for needs-clarification): a THIRD tier beyond
+// the two automatic attempts above -- once both are spent, periodically retry the same
+// safe, human-gated suggestion step anyway, on an interval, rather than requiring a human
+// to remember to open Discuss forever. The codebase keeps growing; a keyword with no
+// match today may have a real one in a few weeks, and this is the exact same
+// non-auto-applying suggest-only step every other tier already uses -- this only changes
+// HOW OFTEN a person has to notice and act, never what happens automatically. Re-fires
+// every PERIODIC_REATTEMPT_INTERVAL_MS indefinitely (not a third one-shot) so an old held
+// task can't just age out of ever being retried.
+function classifyReattemptTier(needsClarification, createdAt) {
+  if (!needsClarification.suggestionAttempted) {
+    return { isHighReasoningRetry: false, isPeriodicReattempt: false };
+  }
+  if (!needsClarification.highReasoningAttempted) {
+    return { isHighReasoningRetry: true, isPeriodicReattempt: false };
+  }
+  const anchorAt = needsClarification.lastPeriodicReattemptAt || createdAt;
+  const anchorMs = anchorAt ? Date.parse(anchorAt) : NaN;
+  // No anchor at all (missing/unparseable createdAt) is treated as "not due yet", not
+  // "due now" -- conservative on purpose, same direction every other unknown gets treated
+  // in this pipeline (an unknown budget/staleness signal is never silently read as "safe
+  // to proceed"). Every real held task has a real createdAt in practice; this only
+  // matters for the theoretical case where it doesn't.
+  if (Number.isNaN(anchorMs) || Date.now() - anchorMs < PERIODIC_REATTEMPT_INTERVAL_MS) return null;
+  return { isHighReasoningRetry: false, isPeriodicReattempt: true };
+}
+
+// The resolve task's own id (and the pieces that feed it). Suffixed with the attempt
+// number, not just heldId alone -- taskIdExistsInQueue() checks queue/done/ too, so a
+// bare `path-prefetch-resolve-${heldId}` id would collide with the FIRST attempt's
+// now-done/ file forever, permanently blocking a legitimate second attempt after Discuss
+// resets suggestionAttempted to false. Confirmed live 2026-08-16: two held tasks came
+// back from Discuss with suggestionAttempted:false as designed, but this loop still
+// silently skipped both of them every tick because their first attempt's id already
+// existed in done/. app.py's discuss-end handler bumps needsClarification.attempt
+// alongside the reset; default to 1 for a held task that predates this field
+// (first-ever attempt).
+// The high-reasoning retry and periodic reattempts each get their own distinct id suffix,
+// independent of `attempt` (which only tracks human/Discuss-driven retries) -- so none of
+// the three ever collides with either other's id in queue/done/. The periodic round
+// number comes from the held task itself (bumped by applyPathPrefetchResolve on each
+// periodic run), so every cycle gets a fresh id.
+function deriveResolveIdentity(held, fileName, { isHighReasoningRetry, isPeriodicReattempt }) {
+  const heldId = held.id || fileName.replace(/\.json$/, '');
+  const attempt = held.needsClarification.attempt || 1;
+  const periodicRound = (held.needsClarification.periodicReattemptCount || 0) + 1;
+  const resolveId = isPeriodicReattempt
+    ? `path-prefetch-resolve-${heldId}-periodic${periodicRound}`
+    : isHighReasoningRetry
+      ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
+      : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
+  return { heldId, periodicRound, resolveId };
+}
+
+// Self-heal a deadlock confirmed live 2026-08-17: a resolve task that gets rejected by
+// REVIEW never reaches applyPathPrefetchResolve() at all, so the held task's own
+// suggestionAttempted/highReasoningAttempted flag never gets stamped -- but if
+// review-rejection retries (reject-retry-check.js's own generic 2-attempt cap, unrelated
+// to this tier system) are exhausted first, the resolveId now permanently "exists" in
+// queue/blocked/, so this loop refuses to ever regenerate it, while the held task's own
+// flags still say "eligible", forever. Two real held tasks hit this exact deadlock (both
+// attempt1-highreasoning resolve tasks exhausted at review), silently starving
+// worker-reasoning of the only work it had left. If the existing resolveId reached a
+// TERMINAL state (blocked/ or done/) without ever calling applyPathPrefetchResolve(),
+// stamp the flag here instead of leaving it to that function alone, so this held task
+// stops being offered (matches the "spent" outcome review-rejection-exhaustion already
+// represents) and a human can pick it up via Discuss like any other exhausted case.
+function selfHealResolveDeadlock({
+  pipelineDir, heldDir, fileName, held, resolveId,
+  isHighReasoningRetry, isPeriodicReattempt, periodicRound,
+}) {
+  const resolveTerminalPath = ['blocked', 'done']
+    .map((state) => path.join(pipelineDir, 'queue', state, `${resolveId}.json`))
+    .find((p) => fs.existsSync(p));
+  if (!resolveTerminalPath) return;
+
+  const heldPath = path.join(heldDir, fileName);
+  // Same deadlock class, applied to the periodic tier: a rejected periodic resolve task
+  // must still advance lastPeriodicReattemptAt/periodicReattemptCount, or this exact
+  // resolveId (round N) "exists" in queue/blocked/ forever and the interval check in
+  // classifyReattemptTier() never gets a fresh anchor to count forward from -- an
+  // indefinite stall identical to the pre-existing high-reasoning deadlock this block
+  // already self-heals, just for a different tier.
+  if (isPeriodicReattempt) {
+    held.needsClarification.lastPeriodicReattemptAt = new Date().toISOString();
+    held.needsClarification.periodicReattemptCount = periodicRound;
+    try {
+      fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
+    } catch {
+      // Non-fatal -- worst case this self-heal is retried next tick.
+    }
+    return;
   }
 
-  for (const f of files) {
+  const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
+  if (!held.needsClarification[flagKey]) {
+    held.needsClarification[flagKey] = true;
+    try {
+      fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
+    } catch {
+      // Non-fatal -- worst case this self-heal is retried next tick.
+    }
+  }
+}
+
+// The candidate file universe the LLM fallback reasons over -- the exact same real files
+// path-prefetch.js's own deterministic pass already searched, not a separate signal that
+// could disagree with what "matched" would even mean. Uses getConfig().graphPath
+// (config.js's resolveGraphPath()) rather than re-deriving the old hardcoded
+// graphify-out/graph.json default here -- confirmed live 2026-08-16: this function had
+// its OWN independent copy of that stale default, so it never actually benefited from the
+// resolveGraphPath() fix even after that fix shipped, and silently returned null (graph
+// "not found") for every real held task.
+function loadGraphFileList(graphPath) {
+  try {
+    const graph = JSON.parse(readIfExists(graphPath) || '{}');
+    return [...new Set((graph.nodes || []).map((n) => n.source_file).filter(Boolean))];
+  } catch {
+    return [];
+  }
+}
+
+function buildResolveTask({
+  resolveId, held, heldId,
+  isHighReasoningRetry, isPeriodicReattempt, periodicRound, fileList,
+}) {
+  return {
+    id: resolveId,
+    domain: 'path_prefetch_resolve',
+    source: 'path_prefetch_resolve',
+    // Per-instance override (see model-provider.js's reasoningTierFor()) -- only the
+    // retry attempt sets this; the first attempt stays on path_prefetch_resolve's
+    // ordinary low-reasoning default (no static reasoningTier registered for that source).
+    ...(isHighReasoningRetry ? { reasoningTier: 'high' } : {}),
+    title: isPeriodicReattempt
+      ? `Periodic re-check (round ${periodicRound}): suggest file path(s) for held task: ${(held.title || heldId).slice(0, 60)}`
+      : `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
+    promptContext: {
+      heldTaskId: heldId,
+      rawText: (held.promptContext && held.promptContext.rawText) || held.title || '',
+      taskTitle: held.title || '',
+      reason: held.needsClarification.reason,
+      candidates: held.needsClarification.candidates || null,
+      // Budget cap matching path-prefetch.js's own MAX_PREFETCHED_PATHS reasoning --
+      // this is meant to give the model a real candidate list, not the whole repo's
+      // worth of paths crammed into one prompt.
+      fileList: fileList.slice(0, 400),
+      // Read by applyPathPrefetchResolve() to know which flag/counter to advance on
+      // completion -- see its own comment for why this can't just reuse
+      // suggestionAttempted/highReasoningAttempted (both are already true by the time
+      // this tier fires).
+      periodicReattempt: isPeriodicReattempt,
+    },
+  };
+}
+
+// Hybrid path-prefetch fallback: offers the oldest still-unresolved held task in
+// queue/needs-clarification/ a safe, suggest-only path-resolution retry. A short
+// orchestrator over five single-purpose helpers -- FIFO scan, retry-tier classification,
+// resolve-id derivation, deadlock self-heal, and task construction (see each above).
+function nextPathPrefetchResolveTask() {
+  const { pipelineDir, graphPath } = getConfig();
+  const heldDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+
+  const files = listHeldTasksFifo(heldDir);
+  if (files === null) return null; // no held tasks at all -- nothing to do
+
+  for (const fileName of files) {
     let held;
     try {
-      held = JSON.parse(fs.readFileSync(path.join(heldDir, f), 'utf8'));
+      held = JSON.parse(fs.readFileSync(path.join(heldDir, fileName), 'utf8'));
     } catch {
       continue; // unreadable/mid-write -- skip this tick, same non-fatal-skip convention as everywhere else in this file
     }
     if (!held || !held.needsClarification) continue;
-    // NOTE: does NOT skip on `held.needsClarification.suggested` alone -- a non-confident
-    // (or confident-but-empty-paths) suggestion still sets `suggested`, and that's exactly
-    // the case this retry targets (a CONFIDENT non-empty suggestion already auto-resolved
-    // the task straight into queue/adhoc/ in applyPathPrefetchResolve(), removing it from
-    // this directory entirely, so it can never reach this loop at all). Eligibility is
-    // driven entirely by the two attempted-flags below instead. Confirmed live 2026-08-17:
-    // an earlier version of this gate skipped on bare `suggested` truthiness, which
-    // silently skipped every one of the 22 real stuck held tasks in this project's own
-    // queue/needs-clarification/ (all of which already carry a non-confident `suggested`
-    // from their first attempt) -- nextPathPrefetchResolveTask() returned null for all of
-    // them instead of offering the intended retry.
-    // Brain Dump #77: two automatic attempts per held task, not one -- a low-reasoning
-    // (local model) attempt first, same as always, then ONE automatic high-reasoning (Claude)
-    // retry if that first attempt didn't land a confident suggestion. Only once both flags
-    // are set does this fall back to requiring a human (Discuss, which resets both --
-    // see app.py's discuss-end handler).
-    // Brain Dump (2026-08-18, "build a system" for needs-clarification): a THIRD tier
-    // beyond the two automatic attempts above -- once both are spent, periodically retry
-    // the same safe, human-gated suggestion step anyway, on an interval, rather than
-    // requiring a human to remember to open Discuss forever. The codebase keeps growing;
-    // a keyword with no match today may have a real one in a few weeks, and this is the
-    // exact same non-auto-applying suggest-only step every other tier already uses --
-    // this only changes HOW OFTEN a person has to notice and act, never what happens
-    // automatically. Re-fires every PERIODIC_REATTEMPT_INTERVAL_MS indefinitely (not a
-    // third one-shot) so an old held task can't just age out of ever being retried.
-    let isHighReasoningRetry = false;
-    let isPeriodicReattempt = false;
-    if (held.needsClarification.suggestionAttempted) {
-      if (held.needsClarification.highReasoningAttempted) {
-        const anchorAt = held.needsClarification.lastPeriodicReattemptAt || held.createdAt;
-        const anchorMs = anchorAt ? Date.parse(anchorAt) : NaN;
-        // No anchor at all (missing/unparseable createdAt) is treated as "not due yet",
-        // not "due now" -- conservative on purpose, same direction every other unknown
-        // gets treated in this pipeline (an unknown budget/staleness signal is never
-        // silently read as "safe to proceed"). Every real held task has a real createdAt
-        // in practice; this only matters for the theoretical case where it doesn't.
-        if (Number.isNaN(anchorMs) || Date.now() - anchorMs < PERIODIC_REATTEMPT_INTERVAL_MS) continue;
-        isPeriodicReattempt = true;
-      } else {
-        isHighReasoningRetry = true;
-      }
-    }
 
-    const heldId = held.id || f.replace(/\.json$/, '');
-    // Suffixed with the attempt number, not just heldId alone -- taskIdExistsInQueue()
-    // checks queue/done/ too, so a bare `path-prefetch-resolve-${heldId}` id would
-    // collide with the FIRST attempt's now-done/ file forever, permanently blocking a
-    // legitimate second attempt after Discuss resets suggestionAttempted to false.
-    // Confirmed live 2026-08-16: two held tasks came back from Discuss with
-    // suggestionAttempted:false as designed, but this loop still silently skipped both of
-    // them every tick because their first attempt's id already existed in done/. app.py's
-    // discuss-end handler bumps needsClarification.attempt alongside the reset; default to
-    // 1 for a held task that predates this field (first-ever attempt).
-    const attempt = held.needsClarification.attempt || 1;
-    // The high-reasoning retry and periodic reattempts each get their own distinct id
-    // suffix, independent of `attempt` (which only tracks human/Discuss-driven retries)
-    // -- so none of the three ever collides with either other's id in queue/done/. The
-    // periodic round number comes from the held task itself (bumped by
-    // applyPathPrefetchResolve on each periodic run), so every cycle gets a fresh id.
-    const periodicRound = (held.needsClarification.periodicReattemptCount || 0) + 1;
-    const resolveId = isPeriodicReattempt
-      ? `path-prefetch-resolve-${heldId}-periodic${periodicRound}`
-      : isHighReasoningRetry
-        ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
-        : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
+    const tier = classifyReattemptTier(held.needsClarification, held.createdAt);
+    if (tier === null) continue; // both automatic tiers spent, periodic interval not yet elapsed
+    const { isHighReasoningRetry, isPeriodicReattempt } = tier;
+
+    const { heldId, periodicRound, resolveId } = deriveResolveIdentity(held, fileName, tier);
+
     if (taskIdExistsInQueue(resolveId)) {
-      // Self-heal a deadlock confirmed live 2026-08-17: a resolve task that gets rejected
-      // by REVIEW never reaches applyPathPrefetchResolve() at all, so the held task's own
-      // suggestionAttempted/highReasoningAttempted flag never gets stamped -- but if
-      // review-rejection retries (reject-retry-check.js's own generic 2-attempt cap,
-      // unrelated to this tier system) are exhausted first, the resolveId now permanently
-      // "exists" in queue/blocked/, so this loop refuses to ever regenerate it, while the
-      // held task's own flags still say "eligible", forever. Two real held tasks hit this
-      // exact deadlock (both attempt1-highreasoning resolve tasks exhausted at review),
-      // silently starving worker-reasoning of the only work it had left. If the existing
-      // resolveId reached a TERMINAL state (blocked/ or done/) without ever calling
-      // applyPathPrefetchResolve(), stamp the flag here instead of leaving it to that
-      // function alone, so this held task stops being offered (matches the "spent" outcome
-      // review-rejection-exhaustion already represents) and a human can pick it up via
-      // Discuss like any other exhausted case.
-      const heldPath = path.join(heldDir, f);
-      const resolveTerminalPath = ['blocked', 'done']
-        .map((state) => path.join(pipelineDir, 'queue', state, `${resolveId}.json`))
-        .find((p) => fs.existsSync(p));
-      if (resolveTerminalPath) {
-        // Same deadlock class, applied to the periodic tier: a rejected periodic resolve
-        // task must still advance lastPeriodicReattemptAt/periodicReattemptCount, or this
-        // exact resolveId (round N) "exists" in queue/blocked/ forever and the interval
-        // check above never gets a fresh anchor to count forward from -- an indefinite
-        // stall identical to the pre-existing high-reasoning deadlock this block already
-        // self-heals, just for a different tier.
-        if (isPeriodicReattempt) {
-          held.needsClarification.lastPeriodicReattemptAt = new Date().toISOString();
-          held.needsClarification.periodicReattemptCount = periodicRound;
-          try {
-            fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
-          } catch {
-            // Non-fatal -- worst case this self-heal is retried next tick.
-          }
-        } else {
-          const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
-          if (!held.needsClarification[flagKey]) {
-            held.needsClarification[flagKey] = true;
-            try {
-              fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
-            } catch {
-              // Non-fatal -- worst case this self-heal is retried next tick.
-            }
-          }
-        }
-      }
+      selfHealResolveDeadlock({
+        pipelineDir, heldDir, fileName, held, resolveId,
+        isHighReasoningRetry, isPeriodicReattempt, periodicRound,
+      });
       continue;
     }
 
-    // Same candidate universe path-prefetch.js's own deterministic pass already
-    // searched -- the LLM fallback reasons over the exact same real files, not a
-    // separate signal that could disagree with what "matched" would even mean. Uses
-    // getConfig().graphPath (config.js's resolveGraphPath()) rather than re-deriving the
-    // old hardcoded graphify-out/graph.json default here -- confirmed live 2026-08-16:
-    // this function had its OWN independent copy of that stale default, so it never
-    // actually benefited from the resolveGraphPath() fix even after that fix shipped,
-    // and silently returned null (graph "not found") for every real held task.
-    let fileList;
-    try {
-      const graph = JSON.parse(readIfExists(graphPath) || '{}');
-      fileList = [...new Set((graph.nodes || []).map((n) => n.source_file).filter(Boolean))];
-    } catch {
-      fileList = [];
-    }
+    const fileList = loadGraphFileList(graphPath);
     if (fileList.length === 0) continue; // greenfield project -- nothing for the LLM to match against either; leave held as-is
 
-    return {
-      id: resolveId,
-      domain: 'path_prefetch_resolve',
-      source: 'path_prefetch_resolve',
-      // Per-instance override (see model-provider.js's reasoningTierFor()) -- only the
-      // retry attempt sets this; the first attempt stays on path_prefetch_resolve's
-      // ordinary low-reasoning default (no static reasoningTier registered for that source).
-      ...(isHighReasoningRetry ? { reasoningTier: 'high' } : {}),
-      title: isPeriodicReattempt
-        ? `Periodic re-check (round ${periodicRound}): suggest file path(s) for held task: ${(held.title || heldId).slice(0, 60)}`
-        : `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
-      promptContext: {
-        heldTaskId: heldId,
-        rawText: (held.promptContext && held.promptContext.rawText) || held.title || '',
-        taskTitle: held.title || '',
-        reason: held.needsClarification.reason,
-        candidates: held.needsClarification.candidates || null,
-        // Budget cap matching path-prefetch.js's own MAX_PREFETCHED_PATHS reasoning --
-        // this is meant to give the model a real candidate list, not the whole repo's
-        // worth of paths crammed into one prompt.
-        fileList: fileList.slice(0, 400),
-        // Read by applyPathPrefetchResolve() to know which flag/counter to advance on
-        // completion -- see its own comment for why this can't just reuse
-        // suggestionAttempted/highReasoningAttempted (both are already true by the time
-        // this tier fires).
-        periodicReattempt: isPeriodicReattempt,
-      },
-    };
+    return buildResolveTask({
+      resolveId, held, heldId,
+      isHighReasoningRetry, isPeriodicReattempt, periodicRound, fileList,
+    });
   }
   return null;
 }
