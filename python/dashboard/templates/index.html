@@ -276,6 +276,7 @@ const TABS = [
   { key: 'hardware', label: 'Hardware', description: 'Live CPU/RAM/disk/GPU utilization, VRAM used vs total, and CPU/GPU temperature vs their 24h rolling average, with a temperature history graph.' },
   { key: 'models', label: 'Models', description: 'Configure which models are used for each pipeline stage, review implement-pass quality and usage stats, and run reasoning benchmarks.' },
   { key: 'joblist', label: 'Job List', description: 'Turn individual job types on or off for the pipeline, independent of which project is currently targeted -- plus live per-stage counts and behavior flags for every registered source, read straight off the source registry and the queue so they can never drift out of sync.' },
+  { key: 'plugins', label: '🧩 Plugins', description: 'Enable or disable the AGENT_MANAGER_REGISTER_PATH plugins the manager works on, and register a new one by its register.js path. Changes take effect on the next task (the pipeline is restarted if running).' },
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
   { key: 'discovery', label: 'Discovery', description: 'Watch the architecture-discovery job work through the project\'s code communities, and read the candidate write-ups it has produced.' },
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
@@ -530,7 +531,7 @@ function renderTabButton(tab, indent) {
     };
     return btn;
   }
-  const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
+  const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
   btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
@@ -2997,6 +2998,96 @@ async function renderJobListTab() {
   });
 }
 
+// Plugins tab -- enable/disable AGENT_MANAGER_REGISTER_PATH plugins (src/config.js's
+// ensureRegistered() loads only the enabled ones from plugins.json) and register a new one
+// by path. Same "edit persists to a config file the running pipeline re-reads per tick"
+// shape as the Job List toggles.
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const plugins = data.plugins || [];
+  const rows = plugins.map((p) => {
+    const enabled = p.enabled !== false;
+    return `
+      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
+          <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
+        </label>
+        <div style="flex:1; min-width:0;">
+          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:6px;">disabled</span>'}</div>
+          ${p.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(p.description)}</div>` : ''}
+          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:11px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    <div class="meta" style="margin-bottom:14px;">
+      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
+      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
+    </div>
+    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
+
+    <h3 style="margin-top:22px;">Add a plugin</h3>
+    <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
+      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
+      <div id="plugin-add-msg" class="meta"></div>
+    </div>`;
+
+  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const r = await fetch('/api/plugins/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not update plugin: ' + e.message);
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+      }
+    };
+  });
+
+  const addBtn = main.querySelector('#plugin-add-btn');
+  addBtn.onclick = async () => {
+    const msg = main.querySelector('#plugin-add-msg');
+    const registerPath = main.querySelector('#plugin-add-path').value.trim();
+    const name = main.querySelector('#plugin-add-name').value.trim();
+    const description = main.querySelector('#plugin-add-desc').value.trim();
+    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
+    addBtn.disabled = true;
+    msg.textContent = 'Adding...';
+    try {
+      const r = await fetch('/api/plugins/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerPath, name, description }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.description || r.status);
+      await renderPluginsTab();
+    } catch (e) {
+      msg.textContent = 'Could not add plugin: ' + e.message;
+      addBtn.disabled = false;
+    }
+  };
+}
+
 // Pipeline-map helpers, shared by the Job List tab above (2026-08-26, Grimmethy: "I want a
 // live pipeline map for architecture review... right now I don't have any way of
 // visualizing the process" -- then, after seeing it as its own tab: "it really should just
@@ -3550,6 +3641,7 @@ async function renderMain() {
     else if (activeTab === 'hardware') await renderHardwareTab();
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
+    else if (activeTab === 'plugins') await renderPluginsTab();
     else if (activeTab === 'deepdive') await renderDeepDiveTab();
     else if (activeTab === 'discovery') await renderDiscoveryTab();
     else if (activeTab === 'branches') await renderBranchesTab();

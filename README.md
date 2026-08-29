@@ -279,6 +279,13 @@ tests, and a `register.js` that wires each module), see **agent-manager-hygiene*
 `docs/PLUGIN_API.md` — the latter is the enforced contract (`src/plugin-api.test.js`) for
 which `agent-manager/src/*` exports a plugin may depend on.
 
+The **Plugins tab** in the dashboard manages this list: it writes `plugins.json` (beside
+`agent-manager.env`), and `ensureRegistered()` loads only the entries marked `enabled`.
+Toggle a plugin off to stop the manager working on its task sources; "Add plugin" registers
+a new one by its `register.js` path. If `plugins.json` doesn't exist, the manifest is
+seeded from `AGENT_MANAGER_REGISTER_PATH` on first read, and that env var stays the
+fallback when there's no manifest at all.
+
 ## Launching
 
 **Windows (recommended): no config file needed.** `pip install -r python/requirements.txt`,

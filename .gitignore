@@ -1,6 +1,7 @@
 node_modules/
 *.log
 agent-manager.env
+plugins.json
 *.bak
 .venv
 .venv-broken-*/
