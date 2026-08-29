@@ -229,7 +229,8 @@ Benefits:
 Each provider's call path is independently readable and testable; a future third provider adds one more adapter without touching the other two; _generate shrinks to a ~5-line dispatch that is trivially reviewable; the stats-recording convention (latency + model identifier) is written once at the dispatch level rather than duplicated in each branch.
 
 ### AC-18 · Provider-aware prompt building in _chat_prompt_for_turn
-Strength: Strong
+Strength: **Rejected -- describes a refactor already done; the waste it targets is fictional**
+Rejected note: _chat_prompt_for_turn (discuss_sessions.py:224) is already a 12-line function that branches on provider at the top and delegates to the shared _build_chat_prompt skeleton. The Claude branch never calls _local_harness_context, so there is no Claude turn "silently consuming Ornith's num_ctx on a preamble it ignores" -- that waste does not exist. The proposed "shared skeleton + provider-specific preamble slot" split is (a) already in place at the _chat_prompt_for_turn level and (b) impossible as written without editing _build_chat_prompt (which injects harness context *inside* the body via `elif harness_context:`), which this candidate's own scope guard forbids. Across three attempts the drafter either guessed wrong (rejected for contradicting the real code) or correctly refused; task archived. Also surfaced a grounding gap worth noting separately: discuss_sessions.py (27KB) was truncated to MAX_FETCHED_FILE_CHARS (8KB) and the fetch window missed the target function entirely, so no drafter saw the code it was told to restructure. Investigated 2026-08-29.
 Files: python/dashboard/discuss_sessions.py
 
 Problem:
