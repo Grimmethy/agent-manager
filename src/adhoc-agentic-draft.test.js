@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { draftAdhocImplement, parseSubTaskProposals, parseClarificationOptions, buildSandboxOpts } = require('./adhoc-agentic-draft.js');
+const { draftAdhocImplement, parseSubTaskProposals, parseClarificationOptions, buildSandboxOpts, buildAgenticPrompt } = require('./adhoc-agentic-draft.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -424,4 +424,28 @@ test('draftAdhocImplement does NOT retry when the response is degenerate rather 
 
   assert.equal(result.blocked, true);
   assert.equal(calls, 1, 'a genuinely degenerate (not turn-exhausted) response must not trigger the turn-budget retry');
+});
+
+// --- no-changes-needed coverage framing + prior-rejection feedback (2026-08-30) --------
+test('buildAgenticPrompt demands per-object coverage before no-changes-needed and warns extend != done', () => {
+  const p = buildAgenticPrompt({ title: 'NSFW images should be tagged', promptContext: { rawText: 'NSFW images should be tagged as such. When NSFW checkbox is not selected, hide NSFW tagged images.' } });
+  assert.match(p, /enumerate every concrete object the request names/i);
+  assert.match(p, /EXTEND/);
+  assert.match(p, /MENTIONS the same topic is NOT proof/i);
+  assert.match(p, /Already covered:/);
+});
+
+test('buildAgenticPrompt renders a PRIOR REVIEW REJECTIONS block when priorRejectionFeedback is present', () => {
+  const p = buildAgenticPrompt({
+    title: 't', promptContext: { rawText: 'do the thing' },
+    priorRejectionFeedback: ['the cited app.py implementation is fabricated', 'only covers prompt data, not images'],
+  });
+  assert.match(p, /PRIOR REVIEW REJECTIONS/);
+  assert.match(p, /1\. the cited app\.py implementation is fabricated/);
+  assert.match(p, /2\. only covers prompt data, not images/);
+});
+
+test('buildAgenticPrompt omits the PRIOR REVIEW REJECTIONS block on a first attempt', () => {
+  const p = buildAgenticPrompt({ title: 't', promptContext: { rawText: 'x' } });
+  assert.doesNotMatch(p, /PRIOR REVIEW REJECTIONS/);
 });

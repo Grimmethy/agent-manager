@@ -175,3 +175,11 @@ test('applied:false immediately, with zero runPlan calls, when the task requires
   });
   delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
 });
+
+test('buildLocalAgenticPrompt carries the extend-vs-done coverage framing', () => {
+  const { buildLocalAgenticPrompt } = require('./local-agentic-draft.js');
+  const p = buildLocalAgenticPrompt({ title: 't', promptContext: { rawText: 'X should also hide tagged images' } });
+  assert.match(p, /EXTEND/);
+  assert.match(p, /Enumerate every concrete object the request names/i);
+  assert.match(p, /Already covered:/);
+});

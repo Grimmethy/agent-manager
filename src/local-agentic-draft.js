@@ -87,6 +87,8 @@ function buildLocalAgenticPrompt(task) {
     '',
     'You have real, read-only tools: grep_codebase (search for a term), read_file (read a real file), list_directory (list a real directory). Use them across as many turns as you need -- read a file, then based on what you saw, read a DIFFERENT file if that is what you need next. You do NOT have write/edit/bash tools -- you cannot directly change anything, only investigate.',
     '',
+    'Before you could conclude "already resolved": a feature that MENTIONS the same topic is not proof this request is done. If the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element), the base feature existing is not enough -- the SPECIFIC delta must be present. A feature with the same NAME may act on a DIFFERENT object than the one this request names. Enumerate every concrete object the request names and confirm current code covers EACH before saying no-changes-needed.',
+    '',
     'Once you have investigated enough to decide, your FINAL response (no more tool calls) must start with exactly ONE of these three lines:',
     'RESOLUTION: implemented',
     'RESOLUTION: no-changes-needed',
@@ -98,7 +100,7 @@ function buildLocalAgenticPrompt(task) {
     '  {"mode": "delete", "file": "relative/path.js"}',
     'The "find" value MUST be an exact substring you actually saw via read_file -- copy it character for character, never paraphrase it, or the edit will fail to apply. Stay inside exactly the files and scope the task asked for.',
     '',
-    'If RESOLUTION: no-changes-needed -- the concern is already resolved, or nothing real needs to change. Follow with a short (2-4 sentence) explanation of what you found.',
+    'If RESOLUTION: no-changes-needed -- the concern is already resolved, or nothing real needs to change. Follow with a short explanation, then an "Already covered:" block: one line per concrete object the request names, as `<object> -- <path>:<symbol>`. If you cannot name a real file:symbol for every object the request names, it is NOT no-changes-needed.',
     '',
     'If RESOLUTION: needs-capability-i-dont-have -- this genuinely needs something you cannot do read-only (running a test suite, a multi-step refactor too large/risky to get right blind, a product/design decision only a human should make). Follow with a short explanation. This is a legitimate, honest answer -- do not force a change you are not confident in.',
   ].join('\n');

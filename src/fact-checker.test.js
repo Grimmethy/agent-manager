@@ -480,3 +480,54 @@ test('checkGroundedValues does not flag a URL that exists literally elsewhere in
   const flags = checkGroundedValues(draftText, sourceText, dir);
   assert.deepEqual(flags, []);
 });
+
+// --- resolvedVia / imprecise-file-path (2026-08-30): a real file cited with a missing or
+// wrong directory prefix is a citation nit, not fabrication. -----------------------------
+const { resolveAgainstRepoDetailed } = require('./fact-checker.js');
+
+test('resolveAgainstRepoDetailed reports how a path resolved (exact / prefix / basename)', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-via-'));
+  fs.mkdirSync(path.join(repoRoot, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'server', 'app.py'), '# app');
+  fs.writeFileSync(path.join(repoRoot, 'top.js'), '// top');
+
+  assert.equal(resolveAgainstRepoDetailed(repoRoot, 'top.js').resolvedVia, 'exact');
+  assert.equal(resolveAgainstRepoDetailed(repoRoot, 'server/app.py').resolvedVia, 'exact');
+  assert.equal(resolveAgainstRepoDetailed(repoRoot, 'app.py', ['server']).resolvedVia, 'prefix');
+  assert.equal(resolveAgainstRepoDetailed(repoRoot, 'app.py', []).resolvedVia, 'basename'); // single basename match
+  assert.equal(resolveAgainstRepoDetailed(repoRoot, 'nope.py', ['server']).resolvedPath, null);
+});
+
+test('resolveAgainstRepoDetailed disambiguates >1 basename match by preferring one under an extraRoot', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-ambig-'));
+  fs.mkdirSync(path.join(repoRoot, 'server', 'core'), { recursive: true });
+  fs.mkdirSync(path.join(repoRoot, 'thirdparty'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'server', 'core', 'app.py'), '# real');
+  fs.writeFileSync(path.join(repoRoot, 'thirdparty', 'app.py'), '# stray copy');
+
+  // Neither tier-1 nor tier-2 (<root>/server/app.py, <root>/web/app.py) hits; the bare
+  // basename walk finds 2 -> was null before; now prefers the one under an extraRoot.
+  const r = resolveAgainstRepoDetailed(repoRoot, 'app.py', ['server', 'web']);
+  assert.equal(r.resolvedPath, path.join(repoRoot, 'server', 'core', 'app.py'));
+  assert.equal(r.resolvedVia, 'basename');
+});
+
+test('checkDraft: a real file cited with a wrong prefix -> imprecise-file-path flag, NOT missing-file', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-imprecise-'));
+  fs.mkdirSync(path.join(repoRoot, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'server', 'app.py'), '# app');
+
+  const draft = "The NSFW gating is already wired through app.py's /api/nsfw endpoint.";
+  const fc = checkDraft(draft, repoRoot, undefined, ['server']);
+  assert.equal(fc.flags.some((f) => f.type === 'missing-file'), false, 'no fabrication flag for a real file');
+  const imp = fc.flags.find((f) => f.type === 'imprecise-file-path');
+  assert.ok(imp, 'an informational imprecise-file-path flag is emitted');
+  assert.match(imp.detail, /app\.py -> server\/app\.py/);
+  assert.equal(fc.fileChecks.find((f) => f.claimedPath === 'app.py').resolvedVia, 'prefix');
+});
+
+test('checkDraft: a genuinely absent file is still flagged missing-file', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-absent-'));
+  const fc = checkDraft('See totally-made-up.py for the implementation.', repoRoot, undefined, ['server']);
+  assert.ok(fc.flags.some((f) => f.type === 'missing-file' && f.detail === 'totally-made-up.py'));
+});
