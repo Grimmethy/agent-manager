@@ -3846,6 +3846,16 @@ async function refreshPipelineStatus() {
         <span class="badge ok">RUNNING</span>
       </div>
     `;
+  } else if (status.stoppable) {
+    // Daemons are alive but _pipeline_running() isn't confirming (e.g. a worker blocked
+    // on the model lock, a stale/missing heartbeat). The Stop control below still shows,
+    // gated on stoppable -- so this state is always recoverable from the dashboard.
+    panel.innerHTML = `
+      <div class="row">
+        <span>Pipeline daemons are running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong>, but the health check isn't confirming (a worker may be blocked on the model lock). Use Stop / Force Stop to clear them.</span>
+        <span class="badge idle">DAEMONS DETECTED</span>
+      </div>
+    `;
   } else {
     stopRequested = false; // confirmed not running -- next click on the toggle starts fresh, not a stray "force stop"
     if (status.activeRepoRoot) {
@@ -3870,8 +3880,12 @@ async function refreshPipelineStatus() {
     startBtn.id = 'start-pipeline-btn';
     document.querySelector('.path-row').appendChild(startBtn);
   }
-  if (status.running) {
-    pipelineStarting = false; // confirmed running -- past the starting gap this flag exists to bridge
+  if (status.running || status.stoppable) {
+    // Gated on stoppable, not just running: if daemon processes exist, the Stop control
+    // must be reachable no matter what the health check says (2026-08-30 incident -- a
+    // blocked worker read as "not running" and the button was stuck on "Start Pipeline"
+    // with no way to stop the real, live pipeline).
+    pipelineStarting = false; // daemons exist -- past the starting gap this flag exists to bridge
     startBtn.className = 'danger';
     startBtn.disabled = false;
     startBtn.textContent = stopRequested ? 'Force Stop Pipeline' : 'Stop Pipeline';
