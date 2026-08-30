@@ -260,11 +260,205 @@ function runGit(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
 }
 
+// Creates the isolated scratch worktree for one adhoc draft: fetch the base branch,
+// force-clear any stale leftover from a prior interrupted attempt at this SAME task.id,
+// then `git worktree add` fresh. Returns { ok: true } or { ok: false, reason } -- never
+// throws for the expected git failures.
+//
+// Defensive pre-cleanup (2026-08-25, root-caused live: this exact task looping forever
+// on "a branch named '...' already exists") -- worktreeDir/branchName are BOTH
+// deterministic, derived only from task.id, and the real cleanup (cleanupAdhocWorktree)
+// only runs in the finally guarding the actual agentic call. A process killed between
+// here and there (a kill -9, dead-process-check.js's own zombie-restart, an OOM, a host
+// reboot) strands the branch with no path back: `git worktree add -b` always tries to
+// CREATE the branch, so every future retry for the SAME task.id fails at this exact step,
+// forever, before ever reaching the finally cleanup. Since both names are unique to this
+// one task, anything found here can only be OUR OWN stale leftover -- never another task's
+// or lane's real work -- so force-clearing before creating fresh is always safe.
+//
+// Confirmed live (2026-08-25, same task, second requeue): `git worktree remove --force`
+// alone isn't enough -- it only un-registers a directory git STILL considers a real
+// worktree. The exact interruption this exists for (a kill -9 mid-`worktree add`) can
+// leave a full checkout on disk at worktreeDir WITHOUT completing registration in the main
+// repo's .git/worktrees/ metadata, in which case `worktree remove` correctly no-ops ("is
+// not a working tree") and leaves the directory behind -- `worktree add` then refuses to
+// reuse that path ("already exists"). fs.rmSync as an unconditional fallback closes it:
+// whether or not git still recognizes the directory as a worktree, nothing should be left
+// there before the fresh `worktree add`.
+function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchName) {
+  try {
+    runGit(['fetch', 'origin', mainBranch], resolvedRepoRoot);
+  } catch (e) {
+    return { ok: false, reason: `could not fetch origin/${mainBranch} before starting adhoc worktree: ${e.message}` };
+  }
+
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* no stale worktree registered */ }
+  try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { /* nothing left to remove */ }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* no stale branch */ }
+
+  try {
+    runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], resolvedRepoRoot);
+  } catch (e) {
+    return { ok: false, reason: `could not create adhoc scratch worktree: ${e.message}` };
+  }
+  return { ok: true };
+}
+
+// Best-effort teardown regardless of outcome -- a worker SIGKILL'd mid-call (dead-
+// process-check.js's zombie-restart) skips this entirely, stranding an isolated scratch
+// worktree in os.tmpdir(); harmless (never touches the real repo), just needs occasional
+// manual/cron cleanup -- not a correctness or safety issue.
+function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+}
+
+// The real agentic Claude Code CLI call, with the ONE bounded turn-budget retry
+// (2026-08-23, Grimmethy: "Claude agentic adhoc drafts that exhaust their turn budget get
+// blindly retried at the same budget, wasting real spend"). stop_reason:'tool_use' with
+// no RESOLUTION line is the CLI's own signal that it was still mid-investigation/edit when
+// the budget ran out -- NOT a degenerate response (claude-client.js's call() already
+// retries those) and not an unfixable task, just under-budgeted for THIS attempt. Retried
+// once in the SAME worktree (partial edits carry over) at a bumped budget; a task that
+// exhausts twice is a genuine scope problem a bigger number won't fix, so this never
+// becomes an unbounded doubling loop. Mutates task (abCallId, draftModel,
+// sandboxUnavailable). Returns { result, totalCostUsd, retriedForTurnBudget, attemptTurns }.
+async function runAgenticAttempts(task, { claudeCall, recordModelCall, prompt, worktreeDir, sandbox }) {
+  let totalCostUsd = 0;
+  let attemptTurns = ADHOC_MAX_TURNS;
+  let retriedForTurnBudget = false;
+  let result;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    result = await claudeCall({
+      prompt,
+      cwd: worktreeDir,
+      allowedTools: 'Read,Grep,Glob,Edit,Write,Bash',
+      maxTurns: attemptTurns,
+      permissionMode: 'dontAsk',
+      timeoutMs: ADHOC_TIMEOUT_MS,
+      ...(sandbox ? { sandbox } : {}),
+    });
+    totalCostUsd += result.costUsd || 0;
+    // sandboxUnavailable (2026-08-24): fails OPEN (the call above still ran, unsandboxed)
+    // but flagged loudly on the task itself, not just a console.error a human might never
+    // see -- see sandbox.js's own header on why this hardening layer must never become a
+    // new single point of failure that blocks real work.
+    if (result.sandboxUnavailable) task.sandboxUnavailable = true;
+
+    task.abCallId = recordModelCall({
+      taskId: task.id,
+      model: DRAFT_MODEL_LABEL,
+      startedAt,
+      latencyMs: Date.now() - startMs,
+      result,
+    });
+    task.draftModel = DRAFT_MODEL_LABEL;
+
+    const ranOutOfTurns = result.stopReason === 'tool_use' && !RESOLUTION_RE.test(result.response || '');
+    if (!ranOutOfTurns || attempt === 1) break;
+    retriedForTurnBudget = true;
+    attemptTurns = Math.round(ADHOC_MAX_TURNS * 1.5);
+  }
+
+  return { result, totalCostUsd, retriedForTurnBudget, attemptTurns };
+}
+
+// Turns the finished agentic result into a draftTask-style outcome: degenerate -> blocked;
+// no RESOLUTION line -> blocked; RESOLUTION: decompose -> parse sub-tasks (>=2) or blocked;
+// RESOLUTION: needs-human-decision -> needsClarification; implemented / no-changes-needed
+// -> stage everything and capture the real diff. Mutates task (adhocResolution,
+// subTaskProposals, rawDiff, implementResponse).
+function interpretAgenticResult(task, { result, totalCostUsd, retriedForTurnBudget, attemptTurns, worktreeDir }) {
+  if (result.degenerate) {
+    return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass degenerate: ${result.degenerate} (total_cost_usd=${totalCostUsd.toFixed(4)}${retriedForTurnBudget ? ', retried once at a larger turn budget' : ''})` };
+  }
+
+  const summary = result.response || '';
+  const resolutionMatch = summary.match(RESOLUTION_RE);
+  const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
+
+  if (!resolution) {
+    // Claude didn't follow the required sentinel format -- treat as a degenerate
+    // response rather than silently guessing which outcome was intended (same "fail
+    // loud, don't guess" reasoning as this pipeline's other deterministic gates).
+    const budgetNote = retriedForTurnBudget
+      ? ` (ran out of turns twice in a row -- retried once already at ${attemptTurns}, a larger budget alone will not fix this; total_cost_usd=${totalCostUsd.toFixed(4)})`
+      : ` (total_cost_usd=${totalCostUsd.toFixed(4)})`;
+    return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}` };
+  }
+
+  if (resolution === 'decompose') {
+    // No diff capture here -- Claude was told not to make code changes for this
+    // resolution, and even if it looked at files first that's read-only investigation,
+    // nothing to stage. applyAdhocDiff.js queues subTaskProposals as fresh adhoc tasks
+    // at apply time; this function's only job is producing a valid proposal list.
+    const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
+    const subTasks = parseSubTaskProposals(afterResolution);
+    if (!subTasks || subTasks.length < 2) {
+      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks (total_cost_usd=${totalCostUsd.toFixed(4)})` };
+    }
+    task.adhocResolution = resolution;
+    task.subTaskProposals = subTasks;
+    task.rawDiff = '';
+    task.implementResponse = summary;
+    return { succeeded: true, blocked: false };
+  }
+
+  if (resolution === 'needs-human-decision') {
+    // 2026-08-24, Grimmethy: "We're here to create permanent systemic fixes... Why is
+    // it declining to do the work?" -- root-caused live: adhoc-agentic-draft.js's own
+    // prompt already told the model to explain itself and not guess at a real product/
+    // design decision, but the only resolutions available were implemented/no-changes-
+    // needed/decompose -- none of which honestly means "I have real open questions for
+    // a human." The model was forced into no-changes-needed, which reads as a flat
+    // refusal and gets rejected every time, regardless of how sound its reasoning was.
+    // No diff, no sub-task list -- this goes straight to a human (see local-draft.js's
+    // own handling of needsClarification, which routes this to queue/needs-
+    // clarification/ instead of the normal review flow) rather than being judged by an
+    // automatic reviewer that has no way to verify a genuinely open question.
+    task.adhocResolution = resolution;
+    task.rawDiff = '';
+    task.implementResponse = summary;
+    return { succeeded: true, blocked: false, needsClarification: true };
+  }
+
+  let rawDiff = '';
+  try {
+    // `git diff` alone only ever shows already-TRACKED files' changes -- a brand new
+    // file Claude created via Write never appears in it at all until staged. `add -A`
+    // first (stages new/modified/deleted alike), then `diff --cached`, so a new file
+    // is captured exactly the same way a modified one already was.
+    runGit(['add', '-A'], worktreeDir);
+    rawDiff = runGit(['diff', '--cached'], worktreeDir);
+  } catch (e) {
+    return { succeeded: false, reason: `could not capture git diff from adhoc worktree: ${e.message}` };
+  }
+
+  // A mismatch between what Claude claimed (resolution) and what actually happened
+  // (rawDiff) is handled entirely by apply-adhoc-diff.js downstream just by checking
+  // rawDiff's own content -- deliberately no special-casing here: a real diff always
+  // goes through normal human-gated review+apply regardless of what `resolution` said,
+  // and an empty diff always skips apply regardless of what `resolution` said. Kept as
+  // its own field purely so a human reviewing the task can see Claude's own claim.
+  task.adhocResolution = resolution;
+  task.rawDiff = rawDiff.trim();
+  task.implementResponse = task.rawDiff
+    ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
+    : summary;
+
+  return { succeeded: true, blocked: false };
+}
+
 /**
  * Drafts task.implementResponse/task.rawDiff for an adhoc-domain task via a real agentic
  * Claude Code CLI call against an isolated git worktree -- see this file's own header.
  * Mutates `task` in place (implementResponse, rawDiff, adhocResolution) on success. Never
- * touches the shared apply-target working tree.
+ * touches the shared apply-target working tree. A thin orchestrator over
+ * prepareAdhocWorktree -> runAgenticAttempts -> interpretAgenticResult, with
+ * cleanupAdhocWorktree in the finally.
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, reason?: string}>}
  */
 async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recordModelCall = defaultRecordModelCall, repoRoot } = {}) {
@@ -273,190 +467,19 @@ async function draftAdhocImplement(task, { claudeCall = defaultClaudeCall, recor
   const worktreeDir = path.join(os.tmpdir(), `agent-manager-adhoc-worktree-${task.id}`);
   const branchName = `throwaway/adhoc-${task.id}`;
 
-  try {
-    runGit(['fetch', 'origin', mainBranch], resolvedRepoRoot);
-  } catch (e) {
-    return { succeeded: false, reason: `could not fetch origin/${mainBranch} before starting adhoc worktree: ${e.message}` };
-  }
-
-  // Defensive pre-cleanup (2026-08-25, root-caused live: this exact task looping forever
-  // on "a branch named '...' already exists") -- worktreeDir/branchName are BOTH
-  // deterministic, derived only from task.id, and the real cleanup below only runs inside
-  // the finally block guarding the SECOND try (the actual agentic call). A process killed
-  // between here and there (a kill -9, dead-process-check.js's own zombie-restart, an OOM,
-  // a host reboot -- this file's own finally comment already documented the risk, just
-  // never closed the loop) strands the branch with no path back: `git worktree add -b`
-  // always tries to CREATE the branch, so every future retry for the SAME task.id fails at
-  // this exact step, forever, before ever reaching the finally cleanup at all. Since both
-  // names are unique to this one task, anything found here can only be OUR OWN stale
-  // leftover from a prior interrupted attempt at this same task -- never another task's or
-  // another lane's real work -- so force-clearing it before creating fresh is always safe.
-  //
-  // Confirmed live (2026-08-25, same task, second requeue): `git worktree remove --force`
-  // alone isn't enough -- it only un-registers a directory git STILL considers a real
-  // worktree. The exact interruption this whole block exists for (a kill -9 mid-`worktree
-  // add`) can leave a full, real checkout populated on disk at worktreeDir WITHOUT ever
-  // completing registration in the main repo's own .git/worktrees/ metadata, in which case
-  // `worktree remove` correctly no-ops ("is not a working tree") and leaves the directory
-  // behind -- `worktree add` then refuses to reuse that same path on the next attempt
-  // ("already exists"), a second dead end this task hit immediately after the first one
-  // was fixed. fs.rmSync as an unconditional fallback closes it for real: whether or not
-  // git still recognizes the directory as a worktree, nothing should be left there before
-  // the fresh `worktree add` below.
-  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* no stale worktree registered */ }
-  try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { /* nothing left to remove */ }
-  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* no stale branch */ }
-
-  try {
-    runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], resolvedRepoRoot);
-  } catch (e) {
-    return { succeeded: false, reason: `could not create adhoc scratch worktree: ${e.message}` };
-  }
+  const prep = prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchName);
+  if (!prep.ok) return { succeeded: false, reason: prep.reason };
 
   const sandbox = SANDBOX_ENABLED ? buildSandboxOpts(resolvedRepoRoot, worktreeDir) : null;
 
   try {
     const prompt = buildAgenticPrompt(task);
-    let totalCostUsd = 0;
-    let attemptTurns = ADHOC_MAX_TURNS;
-    let retriedForTurnBudget = false;
-    let result;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const startedAt = new Date().toISOString();
-      const startMs = Date.now();
-      result = await claudeCall({
-        prompt,
-        cwd: worktreeDir,
-        allowedTools: 'Read,Grep,Glob,Edit,Write,Bash',
-        maxTurns: attemptTurns,
-        permissionMode: 'dontAsk',
-        timeoutMs: ADHOC_TIMEOUT_MS,
-        ...(sandbox ? { sandbox } : {}),
-      });
-      totalCostUsd += result.costUsd || 0;
-      // sandboxUnavailable (2026-08-24): fails OPEN (the call above still ran, unsandboxed)
-      // but flagged loudly on the task itself, not just a console.error a human might never
-      // see -- see sandbox.js's own header on why this hardening layer must never become a
-      // new single point of failure that blocks real work.
-      if (result.sandboxUnavailable) task.sandboxUnavailable = true;
-
-      task.abCallId = recordModelCall({
-        taskId: task.id,
-        model: DRAFT_MODEL_LABEL,
-        startedAt,
-        latencyMs: Date.now() - startMs,
-        result,
-      });
-      task.draftModel = DRAFT_MODEL_LABEL;
-
-      // 2026-08-23, Grimmethy: "Fix: Claude agentic adhoc drafts that exhaust their turn
-      // budget get blindly retried at the same budget, wasting real spend" -- caught
-      // live: a task's OWN outer retry (reject-retry-check.js requeuing a blocked task)
-      // just re-ran this exact function from scratch at the exact same ADHOC_MAX_TURNS,
-      // burning a full ~31-turn session again with no reason to expect a different
-      // outcome. stop_reason:'tool_use' with no RESOLUTION line is Claude Code CLI's own
-      // signal that it was still mid-investigation/edit when the turn budget ran out --
-      // NOT a degenerate/malformed response (claude-client.js's call() already retries
-      // those on its own) and not a case where the task is unfixable, just under-budgeted
-      // for THIS attempt. Retried here, inside the SAME worktree (any partial edits
-      // Claude already made carry over rather than being thrown away) with a bumped
-      // budget, but only ONCE -- a task that exhausts twice in a row is a genuine size/
-      // scope problem a bigger number won't fix, and this must never become an unbounded
-      // doubling loop.
-      const ranOutOfTurns = result.stopReason === 'tool_use' && !RESOLUTION_RE.test(result.response || '');
-      if (!ranOutOfTurns || attempt === 1) break;
-      retriedForTurnBudget = true;
-      attemptTurns = Math.round(ADHOC_MAX_TURNS * 1.5);
-    }
-
-    if (result.degenerate) {
-      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass degenerate: ${result.degenerate} (total_cost_usd=${totalCostUsd.toFixed(4)}${retriedForTurnBudget ? ', retried once at a larger turn budget' : ''})` };
-    }
-
-    const summary = result.response || '';
-    const resolutionMatch = summary.match(RESOLUTION_RE);
-    const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
-
-    if (!resolution) {
-      // Claude didn't follow the required sentinel format -- treat as a degenerate
-      // response rather than silently guessing which outcome was intended (same "fail
-      // loud, don't guess" reasoning as this pipeline's other deterministic gates).
-      const budgetNote = retriedForTurnBudget
-        ? ` (ran out of turns twice in a row -- retried once already at ${attemptTurns}, a larger budget alone will not fix this; total_cost_usd=${totalCostUsd.toFixed(4)})`
-        : ` (total_cost_usd=${totalCostUsd.toFixed(4)})`;
-      return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}` };
-    }
-
-    if (resolution === 'decompose') {
-      // No diff capture here -- Claude was told not to make code changes for this
-      // resolution, and even if it looked at files first that's read-only investigation,
-      // nothing to stage. applyAdhocDiff.js queues subTaskProposals as fresh adhoc tasks
-      // at apply time; this function's only job is producing a valid proposal list.
-      const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
-      const subTasks = parseSubTaskProposals(afterResolution);
-      if (!subTasks || subTasks.length < 2) {
-        return { succeeded: true, blocked: true, blockedReason: `Adhoc agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks (total_cost_usd=${totalCostUsd.toFixed(4)})` };
-      }
-      task.adhocResolution = resolution;
-      task.subTaskProposals = subTasks;
-      task.rawDiff = '';
-      task.implementResponse = summary;
-      return { succeeded: true, blocked: false };
-    }
-
-    if (resolution === 'needs-human-decision') {
-      // 2026-08-24, Grimmethy: "We're here to create permanent systemic fixes... Why is
-      // it declining to do the work?" -- root-caused live: adhoc-agentic-draft.js's own
-      // prompt already told the model to explain itself and not guess at a real product/
-      // design decision, but the only resolutions available were implemented/no-changes-
-      // needed/decompose -- none of which honestly means "I have real open questions for
-      // a human." The model was forced into no-changes-needed, which reads as a flat
-      // refusal and gets rejected every time, regardless of how sound its reasoning was.
-      // No diff, no sub-task list -- this goes straight to a human (see local-draft.js's
-      // own handling of needsClarification, which routes this to queue/needs-
-      // clarification/ instead of the normal review flow) rather than being judged by an
-      // automatic reviewer that has no way to verify a genuinely open question.
-      task.adhocResolution = resolution;
-      task.rawDiff = '';
-      task.implementResponse = summary;
-      return { succeeded: true, blocked: false, needsClarification: true };
-    }
-
-    let rawDiff = '';
-    try {
-      // `git diff` alone only ever shows already-TRACKED files' changes -- a brand new
-      // file Claude created via Write never appears in it at all until staged. `add -A`
-      // first (stages new/modified/deleted alike), then `diff --cached`, so a new file
-      // is captured exactly the same way a modified one already was.
-      runGit(['add', '-A'], worktreeDir);
-      rawDiff = runGit(['diff', '--cached'], worktreeDir);
-    } catch (e) {
-      return { succeeded: false, reason: `could not capture git diff from adhoc worktree: ${e.message}` };
-    }
-
-    // A mismatch between what Claude claimed (resolution) and what actually happened
-    // (rawDiff) is handled entirely by apply-adhoc-diff.js downstream just by checking
-    // rawDiff's own content -- deliberately no special-casing here: a real diff always
-    // goes through normal human-gated review+apply regardless of what `resolution` said,
-    // and an empty diff always skips apply regardless of what `resolution` said. Kept as
-    // its own field purely so a human reviewing the task can see Claude's own claim.
-    task.adhocResolution = resolution;
-    task.rawDiff = rawDiff.trim();
-    task.implementResponse = task.rawDiff
-      ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
-      : summary;
-
-    return { succeeded: true, blocked: false };
+    const attempts = await runAgenticAttempts(task, { claudeCall, recordModelCall, prompt, worktreeDir, sandbox });
+    return interpretAgenticResult(task, { ...attempts, worktreeDir });
   } catch (e) {
     return { succeeded: false, reason: e.message };
   } finally {
-    // Best-effort cleanup regardless of outcome -- a worker SIGKILL'd mid-call (dead-
-    // process-check.js's zombie-restart) skips this finally entirely, stranding an
-    // isolated scratch worktree in os.tmpdir(); harmless (never touches the real repo),
-    // just needs occasional manual/cron cleanup -- not a correctness or safety issue.
-    try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* best-effort */ }
-    try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+    cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName);
   }
 }
 
