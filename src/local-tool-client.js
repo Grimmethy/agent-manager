@@ -403,6 +403,130 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   return { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined };
 }
 
+// 2026-08-26 (Chat panel 502, Grimmethy): a real Ollama /api/chat call can
+// intermittently come back "Ollama HTTP 500: {"error":"no user query found in
+// messages"}". CORRECTED root cause (an earlier version of this comment wrongly
+// blamed the vendored TokenFold proxy -- ruled out live: OLLAMA_URL is unset for this
+// caller, so TokenFold was never actually in the request path): confirmed via
+// `journalctl -u ollama` this is Ollama's OWN renderer failing --
+// `source=routes.go:2702 msg="chat prompt error" error="no user query found in
+// messages"` -- and confirmed live a SECOND time that it is NOT a live-inference race:
+// the failing calls returned in <100ms, far too fast to have reached the model at all,
+// and retrying the IDENTICAL messages array failed 3/3 times, deterministically, every
+// time. Matches a documented Ollama renderer bug (github.com/ollama/ollama#17647): a
+// tool-call-only assistant turn (empty content, just tool_calls) leaves the rendered
+// `<think>` block unclosed, and that corruption is baked into the STORED history from
+// then on -- every later request that replays it trips the same "no user query" check,
+// no matter how many times it's retried unchanged. A plain retry (still done first,
+// CHAT_FLAKE_MAX_ATTEMPTS times, in case it's a genuine one-off) can never fix this
+// specific shape of failure; only dropping the poisoned turn and making the model
+// regenerate it (a fresh sample can easily come out with content this time, or a
+// properly-closed think block) can.
+const CHAT_FLAKE_MAX_ATTEMPTS = 3;
+// Bounded separately from CHAT_FLAKE_MAX_ATTEMPTS -- each rollback re-asks the model to
+// redo a whole prior turn (a real generation, not a cheap resend), so this stays small.
+const MAX_ROLLBACK_ATTEMPTS = 2;
+
+// Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
+// no multi-turn loop. local-client.js's own call() doesn't self-lock, so it's wrapped
+// externally here, the same discipline local-draft.js's maybeLocked() applies for its
+// own plan pass.
+async function runWithoutToolsFallback(prompt, pipelineDir) {
+  const { call } = require('./local-client.js');
+  const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }), MODEL);
+  return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
+}
+
+// Runs one /api/chat turn with the two-layer recovery this call path needs for Ollama's
+// "no user query found in messages" renderer bug (see CHAT_FLAKE_MAX_ATTEMPTS' comment):
+// retry the identical call CHAT_FLAKE_MAX_ATTEMPTS times first, then -- since that error
+// is baked into stored history and a plain retry can never clear it -- roll the
+// conversation back to the START of the prior turn (up to MAX_ROLLBACK_ATTEMPTS times) so
+// the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
+// turnStartLengths / turnStartLogLengths in place on each rollback. Returns
+// { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths }) {
+  let rollbackAttempts = 0;
+  for (;;) {
+    let message;
+    let attemptErr = null;
+    for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
+      try {
+        message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+        attemptErr = null;
+        break;
+      } catch (e) {
+        if (!/no user query found in messages/i.test(e.message)) throw e;
+        attemptErr = e;
+      }
+    }
+    if (!attemptErr) return { message };
+    if (rollbackAttempts < MAX_ROLLBACK_ATTEMPTS && turnStartLengths.length >= 2) {
+      const priorStart = turnStartLengths[turnStartLengths.length - 2];
+      const priorLogStart = turnStartLogLengths[turnStartLengths.length - 2];
+      messages.length = priorStart;
+      toolCallLog.length = priorLogStart;
+      turnStartLengths.pop();
+      turnStartLogLengths.pop();
+      // NOT decrementing turnsUsed in the caller for this: a rollback still consumes a
+      // real outer-loop iteration slot (the `for` loop's own `turn` counter doesn't
+      // rewind), so turnsUsed must keep tracking that real count. 2026-08-26 bug, caught
+      // live: decrementing it meant a request that repeatedly flaked-rolled-back-
+      // succeeded could exhaust the entire maxTurns budget while turnsUsed stayed
+      // artificially low -- chat_sessions.py's `turnsUsed >= CHAT_LOCAL_MAX_TURNS` check
+      // never fired, so a maxTurns-exhausted call returned a silent BLANK reply instead
+      // of the "ran out of its turn budget" explainer.
+      rollbackAttempts += 1;
+      continue;
+    }
+    return { flakeErr: attemptErr };
+  }
+}
+
+// Both recovery layers in chatTurnWithFlakeRecovery are spent, but the model already said
+// something real on an earlier turn (already streamed to the browser via onChunk).
+// Throwing would silently discard all of that (confirmed live: a whole streamed AC-3
+// investigation vanished and the Chat panel quietly rolled back to its pre-message
+// state). Append a NEW note explaining the drop -- it needs its own onChunk call since
+// the model never said it -- and return the same graceful-degrade shape as the
+// maxTurns-reached return.
+function flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk) {
+  const note = '\n\n*(Lost the connection to the local model mid-investigation -- '
+    + "Ollama's own renderer hit a known intermittent fault. The above is what it "
+    + 'had said so far; ask again to let it continue.)*';
+  if (onChunk) onChunk(note);
+  return {
+    response: (lastMessage.content || '') + note,
+    toolCallLog, turnsUsed: Math.max(turnsUsed - 1, 0), toolsDisabled: false,
+  };
+}
+
+// Runs every tool call the model made this turn: appends the assistant turn, then one
+// tool-result message (and one toolCallLog entry) per call. A malformed/unknown/throwing
+// tool call degrades to an error STRING result the model can see and correct on its next
+// turn -- never a thrown exception that would kill the whole loop (see this file's header:
+// one bad tool call should never crash the entire draft attempt).
+function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
+  messages.push(assistantMessage);
+  for (const toolCall of toolCalls) {
+    const name = toolCall.function && toolCall.function.name;
+    const args = (toolCall.function && toolCall.function.arguments) || {};
+    const handler = toolHandlers[name];
+    let result;
+    if (!handler) {
+      result = { error: `unknown tool: ${name}` };
+    } else {
+      try {
+        result = handler(args);
+      } catch (e) {
+        result = { error: `tool ${name} failed: ${e.message}` };
+      }
+    }
+    toolCallLog.push({ tool: name, args, result });
+    messages.push({ role: 'tool', content: JSON.stringify(result) });
+  }
+}
+
 async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk }) {
   const { pipelineDir } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
@@ -410,11 +534,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const killSwitchPath = path.join(pipelineDir, 'queue',
     allowWrite ? '.chat-write-tools-disabled' : '.arch-discovery-tools-disabled');
   if (fs.existsSync(killSwitchPath)) {
-    const { call } = require('./local-client.js');
-    // local-client.js's own call() doesn't self-lock -- local-draft.js's maybeLocked()
-    // wraps it externally for its own plan pass, same discipline applied here.
-    const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }), MODEL);
-    return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
+    return runWithoutToolsFallback(prompt, pipelineDir);
   }
 
   const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
@@ -425,8 +545,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // work earlier tonight was built to fix, just reintroduced through a different call
   // path. Same instancesDir derivation and withLock() usage local-draft.js's own
   // maybeLocked() already establishes -- held ONLY around each individual /api/chat call
-  // below, not the whole multi-turn loop (tool execution between turns doesn't touch the
-  // GPU and shouldn't block other lanes while it runs).
+  // (in chatTurnWithFlakeRecovery), not the whole multi-turn loop (tool execution between
+  // turns doesn't touch the GPU and shouldn't block other lanes while it runs).
   const instancesDir = path.join(pipelineDir, 'instances');
 
   // Same TokenFold session/scope headers local-client.js sends on /api/generate.
@@ -451,29 +571,6 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   let turnsUsed = 0;
   let lastMessage = null;
 
-  // 2026-08-26 (Chat panel 502, Grimmethy): a real Ollama /api/chat call can
-  // intermittently come back "Ollama HTTP 500: {"error":"no user query found in
-  // messages"}". CORRECTED root cause (an earlier version of this comment wrongly
-  // blamed the vendored TokenFold proxy -- ruled out live: OLLAMA_URL is unset for this
-  // caller, so TokenFold was never actually in the request path): confirmed via
-  // `journalctl -u ollama` this is Ollama's OWN renderer failing --
-  // `source=routes.go:2702 msg="chat prompt error" error="no user query found in
-  // messages"` -- and confirmed live a SECOND time that it is NOT a live-inference race:
-  // the failing calls returned in <100ms, far too fast to have reached the model at all,
-  // and retrying the IDENTICAL messages array failed 3/3 times, deterministically, every
-  // time. Matches a documented Ollama renderer bug (github.com/ollama/ollama#17647): a
-  // tool-call-only assistant turn (empty content, just tool_calls) leaves the rendered
-  // `<think>` block unclosed, and that corruption is baked into the STORED history from
-  // then on -- every later request that replays it trips the same "no user query" check,
-  // no matter how many times it's retried unchanged. A plain retry (still done first,
-  // CHAT_FLAKE_MAX_ATTEMPTS times, in case it's a genuine one-off) can never fix this
-  // specific shape of failure; only dropping the poisoned turn and making the model
-  // regenerate it (a fresh sample can easily come out with content this time, or a
-  // properly-closed think block) can.
-  const CHAT_FLAKE_MAX_ATTEMPTS = 3;
-  // Bounded separately from CHAT_FLAKE_MAX_ATTEMPTS -- each rollback re-asks the model to
-  // redo a whole prior turn (a real generation, not a cheap resend), so this stays small.
-  const MAX_ROLLBACK_ATTEMPTS = 2;
   // messages.length / toolCallLog.length as of the START of each turn, in order -- lets a
   // later turn's unrecoverable flake roll back exactly the PRIOR turn's own additions
   // (the ones most likely to be the corrupting tool-call-only turn) rather than just the
@@ -487,99 +584,24 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
 
-    let message;
-    let flakeErr = null;
-    let rollbackAttempts = 0;
-    for (;;) {
-      let attemptErr = null;
-      for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
-        try {
-          message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
-          attemptErr = null;
-          break;
-        } catch (e) {
-          if (!/no user query found in messages/i.test(e.message)) throw e;
-          attemptErr = e;
-        }
-      }
-      if (!attemptErr) break;
-      if (rollbackAttempts < MAX_ROLLBACK_ATTEMPTS && turnStartLengths.length >= 2) {
-        const priorStart = turnStartLengths[turnStartLengths.length - 2];
-        const priorLogStart = turnStartLogLengths[turnStartLengths.length - 2];
-        messages.length = priorStart;
-        toolCallLog.length = priorLogStart;
-        turnStartLengths.pop();
-        turnStartLogLengths.pop();
-        // NOT decrementing turnsUsed here: a rollback still consumes a real outer-loop
-        // iteration slot (the `for` loop's own `turn` counter doesn't rewind), so
-        // turnsUsed must keep tracking that real count. 2026-08-26 bug, caught live:
-        // decrementing it here meant a request that repeatedly flaked-rolled-back-
-        // succeeded could exhaust the entire maxTurns budget while turnsUsed stayed
-        // artificially low -- chat_sessions.py's `turnsUsed >= CHAT_LOCAL_MAX_TURNS`
-        // check never fired, so a maxTurns-exhausted call returned a silent BLANK reply
-        // instead of the "ran out of its turn budget" explainer.
-        rollbackAttempts += 1;
-        continue;
-      }
-      flakeErr = attemptErr;
-      break;
-    }
+    const { message, flakeErr } = await chatTurnWithFlakeRecovery({
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
     if (flakeErr) {
-      // Rollback exhausted too (or there was no prior turn to roll back -- this failed
-      // on the very first turn of the conversation, which is a genuinely different,
-      // unexplained case). A LATER turn (turn > 0) means the model already said
-      // something real on earlier turns -- onChunk already streamed it to the browser.
-      // Throwing here would silently discard all of that (confirmed live: a whole
-      // streamed AC-3 investigation vanished and the Chat panel quietly rolled back to
-      // its pre-message state) for a failure that has nothing to do with what was
-      // already said. Same graceful-degrade shape as the maxTurns-reached return below.
-      if (lastMessage) {
-        // The already-streamed content (if any) already reached onChunk on earlier
-        // turns -- this note is NEW text the model never said, so it needs its own
-        // onChunk call to actually reach the browser (the CLI's own "emittedAny"
-        // fallback only fires when NOTHING streamed yet, which isn't this case).
-        const note = '\n\n*(Lost the connection to the local model mid-investigation -- '
-          + "Ollama's own renderer hit a known intermittent fault. The above is what it "
-          + 'had said so far; ask again to let it continue.)*';
-        if (onChunk) onChunk(note);
-        return {
-          response: (lastMessage.content || '') + note,
-          toolCallLog, turnsUsed: Math.max(turnsUsed - 1, 0), toolsDisabled: false,
-        };
-      }
+      // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
+      // failure is a genuinely different, unexplained case). Graceful-degrade if the
+      // model already produced real content on an earlier turn; otherwise rethrow.
+      if (lastMessage) return flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk);
       throw flakeErr;
     }
 
     lastMessage = message;
     const toolCalls = message.tool_calls || [];
-
     if (toolCalls.length === 0) {
       return { response: message.content || '', toolCallLog, turnsUsed, toolsDisabled: false };
     }
-
-    messages.push(message);
-    for (const toolCall of toolCalls) {
-      const name = toolCall.function && toolCall.function.name;
-      const args = (toolCall.function && toolCall.function.arguments) || {};
-      const handler = toolHandlers[name];
-      // A malformed/unknown tool call (bad name, missing/wrong-typed args, an escaping
-      // path) must degrade gracefully -- a clear error STRING back to the model as the
-      // tool result, so it can see it made a mistake and try again, not a thrown
-      // exception that kills the whole loop (see this file's own header: one bad tool
-      // call from the model should never crash the entire draft attempt).
-      let result;
-      if (!handler) {
-        result = { error: `unknown tool: ${name}` };
-      } else {
-        try {
-          result = handler(args);
-        } catch (e) {
-          result = { error: `tool ${name} failed: ${e.message}` };
-        }
-      }
-      toolCallLog.push({ tool: name, args, result });
-      messages.push({ role: 'tool', content: JSON.stringify(result) });
-    }
+    executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
   }
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
