@@ -380,3 +380,60 @@ test('module exports the same shape as local-client.js so it is a drop-in swap a
     assert.equal(typeof claudeClient[key], 'function', `missing or non-function export: ${key}`);
   }
 });
+
+// 2026-08-29 (performance_fix AC-4): majorityVote() had drifted out of parity with
+// local-client.js's -- no per-vote try/catch, no voteErrors, no early-exit. These pin the
+// restored behavior (and why the loop stays sequential rather than Promise.all).
+test('majorityVote() early-exits as soon as a verdict reaches minAgreeing -- does not pay for every vote', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let callCount = 0;
+    await withMockedClient(
+      () => { callCount += 1; return JSON.stringify({ result: 'APPROVE: fine' }); },
+      async ({ majorityVote }) => {
+        const classify = (t) => (t.includes('APPROVE') ? 'approve' : null);
+        const r = await majorityVote({ prompt: 'x', classify, n: 5, minAgreeing: 2 });
+        assert.equal(r.verdict, 'approve');
+        assert.equal(r.confident, true);
+      },
+    );
+    assert.equal(callCount, 2, 'stopped after 2 agreeing votes even though n=5');
+  });
+});
+
+test('majorityVote() records a hard-failed vote in voteErrors and keeps going with the rest', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let callCount = 0;
+    await withMockedClient(
+      () => {
+        callCount += 1;
+        if (callCount === 1) throw new Error('claude CLI exited 1: network unreachable');
+        return JSON.stringify({ result: 'APPROVE: fine' });
+      },
+      async ({ majorityVote }) => {
+        const classify = (t) => (t.includes('APPROVE') ? 'approve' : null);
+        const r = await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 });
+        assert.equal(r.verdict, 'approve', 'the two surviving votes still form a majority');
+        assert.equal(r.confident, true);
+        assert.equal(r.realVoteCount, 2);
+        assert.equal(r.voteErrors.length, 1);
+        assert.match(r.voteErrors[0], /network unreachable/);
+      },
+    );
+    assert.equal(callCount, 3, '1 failed + 2 that reached minAgreeing');
+  });
+});
+
+test('majorityVote() rethrows only when EVERY vote hard-fails (a real infra failure, not "inconclusive")', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    await withMockedClient(
+      () => { throw new Error('claude CLI exited 1: service unavailable'); },
+      async ({ majorityVote }) => {
+        const classify = () => 'approve';
+        await assert.rejects(
+          majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 }),
+          /service unavailable/,
+        );
+      },
+    );
+  });
+});

@@ -22,7 +22,8 @@ Benefits of inaction:
 The codebase avoids unnecessary API-surface changes, preserves the simple synchronous contract of the map builder, and keeps the function easy to reason about and test without async fixtures. The cold-path, bounded nature of the operation means there is no measurable p99 or event-loop-stall impact to mitigate.
 
 ### AC-2 · Parallelise the independent LLM votes in majorityVote
-Strength: Strong
+Strength: **Rejected -- would regress error resilience and cost; the real gap it sat next to is closed**
+Rejected note: AC-2's Solution says to `Promise.all` both copies and "preserve error semantics exactly: a rejection in any one call already aborts the whole vote". That is only true of the DRIFTED src/claude-client.js copy. src/local-client.js's majorityVote was deliberately fixed on 2026-08-23 to do the opposite -- per-vote try/catch + voteErrors, because "59 of the last 62 real review attempts failed this way, each discarding whatever votes DID land". `Promise.all` there is a straight regression. Both copies also early-exit once minAgreeing is reached (2026-08-23), which parallel dispatch discards -- a whole real Claude call / GPU generation in the common 2-of-3 case. Review is a background pipeline stage, not human-blocking, so wall-clock is the cheap axis here. The actual defect nearby -- src/claude-client.js's copy having drifted out of parity (no try/catch, no voteErrors despite review-task.js reading it, no early-exit) -- was fixed instead (2026-08-29; see git log for src/claude-client.js majorityVote). src/local-client.js already had all three and is unchanged.
 Files: src/claude-client.js, src/local-client.js
 
 Problem:
