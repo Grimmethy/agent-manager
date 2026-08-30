@@ -179,6 +179,16 @@ function parseClarificationOptions(text) {
 // instead of always crediting the local model (this path never calls the local model at all).
 const DRAFT_MODEL_LABEL = `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
 
+function priorRejectionBlockLocal(task) {
+  const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+  if (feedback.length === 0) return '';
+  return [
+    `PRIOR REVIEW REJECTIONS -- this task has been attempted ${feedback.length} time(s) and rejected each time. Address each one; do NOT just restate the same conclusion:`,
+    ...feedback.map((r, i) => `  ${i + 1}. ${r}`),
+    '',
+  ].join('\n');
+}
+
 function buildAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   return [
@@ -190,10 +200,20 @@ function buildAgenticPrompt(task) {
     '',
     ctx.rawText || '',
     '',
-    'First, investigate whether this is ALREADY resolved: check git log (e.g. `git log ' +
-    '--oneline --all | grep ...`) and the current code for evidence the described ' +
-    'problem or idea was already addressed by an earlier commit. If it clearly already ' +
-    'is, make no code changes -- explain why in your final summary instead.',
+    priorRejectionBlockLocal(task),
+    'First, investigate whether this specific request is ALREADY satisfied by the CURRENT ' +
+    'code -- check `git log` and read the real files. Be careful: a commit or feature ' +
+    'that MENTIONS the same topic is NOT proof this request is done. Two things especially: ' +
+    '(a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", ' +
+    'a reference to an existing UI element/endpoint), the base feature already existing is ' +
+    'NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with ' +
+    'the same NAME may act on a DIFFERENT object than the one this request names (e.g. an ' +
+    '"NSFW toggle" that gates prompt DATA vs. this request about gallery IMAGES). ' +
+    'Before you conclude RESOLUTION: no-changes-needed you MUST enumerate every concrete ' +
+    'object the request names -- each UI element, endpoint, data field, file, and observable ' +
+    'behavior -- and, for EACH one, point at the specific CURRENT file:symbol that already ' +
+    'implements it. If any one of them is not covered by current code, this is NOT ' +
+    'no-changes-needed -- implement the missing part (or decompose/ask, per below).',
     '',
     'If it is NOT already resolved and is a concrete, scoped, real change you can make ' +
     'confidently: implement it. Read whatever real files you need first -- do not guess ' +
@@ -223,9 +243,14 @@ function buildAgenticPrompt(task) {
     'RESOLUTION: decompose',
     'RESOLUTION: needs-human-decision',
     '',
-    'If RESOLUTION: implemented or no-changes-needed -- follow with a short (2-4 sentence) ' +
-    'plain-English summary of what you did, or why nothing was needed -- this is what a ' +
-    'human reads to decide whether to apply your change.',
+    'If RESOLUTION: implemented -- follow with a short (2-4 sentence) plain-English summary ' +
+    'of what you did -- this is what a human reads to decide whether to apply your change.',
+    '',
+    'If RESOLUTION: no-changes-needed -- follow with a short summary of why nothing was ' +
+    'needed, and then an "Already covered:" block: one line per concrete object the ' +
+    'request names, in the form `<object> -- <path>:<symbol>` (add `(<short commit hash>)` ' +
+    'when a specific commit is what implemented it). If you cannot fill in a real ' +
+    'file:symbol for every object the request names, it is NOT no-changes-needed.',
     '',
     'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, ' +
     'in exactly this shape (a title and a full, self-contained description for each ' +

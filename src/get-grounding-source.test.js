@@ -346,3 +346,50 @@ test('a fetchedFiles entry with no content (a create-target that does not exist 
     });
   });
 });
+
+// --- REQUEST OBJECTS grep block for a no-changes-needed adhoc task (2026-08-30) --------
+const { extractRequestObjectTokens } = require('./get-grounding-source.js');
+
+test('extractRequestObjectTokens pulls nouns/identifiers/paths from free request text, drops stopwords', () => {
+  const toks = extractRequestObjectTokens('NSFW images should be tagged as such. When NSFW checkbox is not selected, hide NSFW tagged images. See /api/gallery-meta.');
+  assert.ok(toks.includes('images'));
+  assert.ok(toks.includes('NSFW'));
+  assert.ok(toks.some((t) => t.startsWith('/api/gallery')));
+  assert.ok(!toks.includes('should') && !toks.includes('when') && !toks.includes('checkbox'));
+});
+
+test('a no-changes-needed adhoc task gets a "REQUEST OBJECTS -- current repo state" block grepped live', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-objgrep-'));
+  fs.mkdirSync(path.join(repoRoot, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'server', 'app.py'),
+    'def gallery():\n    return list_gallery_pngs()\n\n# nsfw toggle gates prompt data only\n');
+  // "images" appears nowhere -> should render as "(no match ...)".
+
+  const task = {
+    id: 'adhoc-nc-1', domain: 'adhoc', source: 'manual', adhocResolution: 'no-changes-needed',
+    implementResponse: 'Already implemented via the nsfw toggle.\n\nAlready covered:\nnsfw -- server/app.py',
+    promptContext: { rawText: 'NSFW images should be tagged as such. When NSFW checkbox is not selected, hide NSFW tagged images.' },
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot, AGENT_MANAGER_GREP_DIRS: 'server' },
+  });
+
+  assert.match(stdout, /REQUEST OBJECTS -- current repo state/);
+  assert.match(stdout, /"nsfw":[^\n]*server\/app\.py:\d+/i);
+  assert.match(stdout, /"images": \(no match/);
+});
+
+test('the REQUEST OBJECTS block is NOT added for an ordinary implemented adhoc task', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-noobjgrep-'));
+  const task = { id: 'a', domain: 'adhoc', source: 'manual', adhocResolution: 'implemented', implementResponse: 'did it', promptContext: { rawText: 'hide images' } };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+  });
+  assert.doesNotMatch(stdout, /REQUEST OBJECTS/);
+});

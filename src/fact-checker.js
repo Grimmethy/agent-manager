@@ -71,9 +71,11 @@ const WALK_SKIP_DIRS = new Set(['node_modules', '.git', '.claude', 'queue', 'ins
 // used as a last-resort fallback (see resolveAgainstRepo below) -- deep_dive tasks review
 // a CLONED external repo with an arbitrary, unknowable-in-advance layout, so no fixed
 // extraRoots list can generalize the way it can for this package's own repo. Stops at
-// maxResults finds; resolveAgainstRepo treats anything other than exactly one match as
-// unresolved (0 = genuinely doesn't exist; >1 = ambiguous, don't guess which one).
-function findByBasename(root, basename, maxResults = 2) {
+// maxResults finds. resolveAgainstRepo trusts exactly one match outright; with several it
+// first tries to disambiguate by preferring one under a configured code dir (extraRoots)
+// before giving up -- so a bare `app.py` still resolves to `server/app.py` in a repo that
+// also has, say, a vendored `app.py` somewhere.
+function findByBasename(root, basename, maxResults = 10) {
   const found = [];
   function walk(dir) {
     if (found.length >= maxResults) return;
@@ -114,25 +116,44 @@ function findByBasename(root, basename, maxResults = 2) {
 // directories deep (desktop/src/components/ExecutionReport/SummaryCard.tsx). No fixed
 // extraRoots list can be known in advance for an arbitrary external repo's layout, so this
 // tier searches for it instead -- but only trusts a single, unambiguous match.
-function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
+// Returns { resolvedPath, resolvedVia } where resolvedVia is:
+//   'exact'    -- the claimed path exists verbatim under repoRoot
+//   'prefix'   -- it exists once an extraRoot (a configured code dir) is prepended
+//   'basename' -- only the filename matched, found by walking the tree (single match, or
+//                 a single match under an extraRoot when the bare walk was ambiguous)
+// A non-'exact' hit is still a REAL file -- just cited with an imprecise path. Callers use
+// resolvedVia to treat that as a citation nit, not fabrication.
+function resolveAgainstRepoDetailed(repoRoot, candidatePath, extraRoots = []) {
   const normalized = candidatePath.replace(/\\/g, '/').replace(/^\.?\//, '');
-  const tryRoots = [repoRoot, ...extraRoots.map((r) => path.join(repoRoot, r))];
-  for (const root of tryRoots) {
-    const full = path.join(root, normalized);
-    if (fs.existsSync(full)) return full;
+
+  const exact = path.join(repoRoot, normalized);
+  if (fs.existsSync(exact)) return { resolvedPath: exact, resolvedVia: 'exact' };
+
+  for (const r of extraRoots) {
+    const full = path.join(repoRoot, r, normalized);
+    if (fs.existsSync(full)) return { resolvedPath: full, resolvedVia: 'prefix' };
   }
 
   const basename = path.basename(normalized);
   const matches = findByBasename(repoRoot, basename);
-  if (matches.length === 1) return matches[0];
+  if (matches.length === 1) return { resolvedPath: matches[0], resolvedVia: 'basename' };
+  if (matches.length > 1 && extraRoots.length) {
+    const rootsAbs = extraRoots.map((r) => path.join(repoRoot, r) + path.sep);
+    const preferred = matches.filter((m) => rootsAbs.some((ra) => m.startsWith(ra)));
+    if (preferred.length === 1) return { resolvedPath: preferred[0], resolvedVia: 'basename' };
+  }
 
-  return null;
+  return { resolvedPath: null, resolvedVia: null };
+}
+
+function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
+  return resolveAgainstRepoDetailed(repoRoot, candidatePath, extraRoots).resolvedPath;
 }
 
 function checkFilePaths(text, repoRoot, extraRoots = []) {
   return extractFilePaths(text).map((claimedPath) => {
-    const resolved = resolveAgainstRepo(repoRoot, claimedPath, extraRoots);
-    return { claimedPath, exists: !!resolved, resolvedPath: resolved };
+    const { resolvedPath, resolvedVia } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+    return { claimedPath, exists: !!resolvedPath, resolvedPath, resolvedVia };
   });
 }
 
@@ -455,7 +476,15 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
     // fabrication -- see extractCreateModeTargets' own header for the live incident this
     // fixes. Still recorded in fileChecks (now flagged isCreateTarget) for transparency;
     // only the flag derived from it is suppressed.
-    if (!f.exists && !f.isCreateTarget) flags.push({ type: 'missing-file', detail: f.claimedPath });
+    if (!f.exists && !f.isCreateTarget) {
+      flags.push({ type: 'missing-file', detail: f.claimedPath });
+    } else if (f.exists && f.resolvedVia && f.resolvedVia !== 'exact') {
+      // The file IS real -- it was just cited with a missing/wrong directory prefix
+      // (e.g. `app.py` for `server/app.py`). Informational only: this flag type is NOT a
+      // reject driver (review-task.js), and buildVerdictPrompt tells the reviewer so.
+      const rel = path.relative(repoRoot, f.resolvedPath).replace(/\\/g, '/');
+      flags.push({ type: 'imprecise-file-path', detail: `${f.claimedPath} -> ${rel}` });
+    }
   }
   for (const r of relationshipChecks) {
     if (r.checked && !r.found) {
@@ -491,6 +520,7 @@ module.exports = {
   extractClaimedRelationships,
   extractClaimedCommits,
   resolveAgainstRepo,
+  resolveAgainstRepoDetailed,
   findByBasename,
 };
 
