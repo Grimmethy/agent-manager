@@ -397,3 +397,51 @@ Extract the online-gated onboarding phase into a private helper, e.g. `onboardPe
 
 Benefits:
 Each extracted piece becomes independently unit-testable: the onboarding helper can be tested with a mocked network layer and a stubbed `onboardDeepDiveProject` without exercising the selection path, and the selection logic can be tested with a pre-populated `coverage` object and no network at all. Code review diffs are scoped to one concern at a time, reducing the chance that a change to clone-retry semantics silently affects candidate ordering or vice versa. The main function shrinks to roughly 60–70 lines of single-purpose selection logic, bringing it back under the project's length budget and making the "return a task descriptor" contract visible at a glance.
+
+### AC-9 · Extract markdown section parser and candidate selection from nextCandidateFulfillmentTask
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+Snippet:
+```
+// (see this whole session's running theme of exactly that happening elsewhere).
+function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+  // lazy (see module header) -- task-sources.js is fully loaded by the time any
+  // next() poll calls this.
+  const { taskIdExistsInQueue } = require('../task-sources.js');
+  const { defaultDomain } = getConfig();
+  const text = readIfExists(candidatesPath);
+  if (!text) return null;
+
+  const sections = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const start = text.indexOf('### ', pos);
+    if (start === -1) break;
+
+    const nextH2 = text.indexOf('\n## ', start + 3);
+    const nextH3 = text.indexOf('\n### ', start + 3);
+    let end;
+    if (nextH2 !== -1 && nextH3 !== -1) {
+      end = Math.min(nextH2, nextH3);
+    } else if (nextH2 !== -1) {
+      end = nextH2;
+    } else if (nextH3 !== -1) {
+      end = nextH3;
+    } else {
+      end = -1;
+    }
+
+    const sectionText = end === -1 ? text.slice(start) : text.slice(start, end);
+    sections.push(sectionText);
+    pos = end === -1 ? text.length : end + 1;
+  }
+```
+
+Problem:
+`nextCandidateFulfillmentTask` spans 140 lines and interleaves three independently-testable responsibilities: a file-existence guard (`readIfExists(candidatesPath)` with an early `return null`), a self-contained markdown `###`-section parser (a `while (pos < text.length)` loop that tracks `nextH2`, `nextH3`, and section boundaries to push `sectionText` entries), and the downstream candidate-selection logic that filters sections by `sourceName`/`defaultDomain`, checks `taskIdExistsInQueue`, and assembles the final task object. Because the parser's four-way boundary logic (both H2 and H3 present, only one, neither, end-of-text sentinel) is entangled with the selection loop, a change to header-matching rules forces a reviewer to re-read the entire 140-line body, and unit-testing malformed markdown (missing H2, nested H3, empty trailing section) requires invoking a function whose primary contract is "return the next fulfillable task or null."
+
+Solution:
+Extract two pure helpers from the body of `nextCandidateFulfillmentTask`. First, `parseCandidateSections(markdownText)` — a standalone function that takes the raw file text and returns an array of `{ heading, body }` objects by walking the `###`/`##` boundary logic; it has no dependency on `sourceName`, `defaultDomain`, or the task queue. Second, `selectNextCandidate(sections, { sourceName, defaultDomain, queue })` — a function that receives the parsed sections plus the selection context and returns the next eligible task object or `null`, encapsulating the `taskIdExistsInQueue` check and domain filtering. The original `nextCandidateFulfillmentTask` then shrinks to a thin orchestrator: read the file, call `parseCandidateSections`, call `selectNextCandidate`, and return the result. Both helpers are pure (or near-pure) and can be exported for direct unit testing.
+
+Benefits:
+Each extracted helper can be tested in isolation with focused fixtures — the parser against a battery of malformed-markdown strings, the selector against various queue states and domain mismatches — without mocking the filesystem or constructing a full task-queue harness. Code review diffs become scoped: a change to header-matching rules touches only `parseCandidateSections`, while a change to queue-priority logic touches only `selectNextCandidate`. The orchestrator function drops to roughly 10–15 lines, making its control flow (read → parse → select → return) immediately legible at a glance.
