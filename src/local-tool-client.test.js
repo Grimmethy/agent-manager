@@ -220,3 +220,97 @@ test('withApplyLock genuinely blocks a concurrent real bash flock attempt on the
     assert.match(sawHeld, /BLOCKED/, 'a concurrent flock attempt must fail while withApplyLock holds it');
   });
 });
+
+// --- runPlanWithTools() multi-turn loop -------------------------------------------------
+// The loop itself had no direct coverage while it lived inline in a 183-line function;
+// added alongside its 2026-08-29 decomposition into chatTurnWithFlakeRecovery /
+// executeToolCalls / flakeDegradeResult / runWithoutToolsFallback. Ollama's /api/chat is
+// stubbed at the ollama-http.js boundary; the single-flight lock is a no-op here.
+function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallResponse = 'fallback reply' } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-tool-client-loop-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  if (killSwitch) {
+    fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'queue', killSwitch), '');
+  }
+  const queue = scriptedTurns.slice();
+  const stub = (relId, exportsObj) => {
+    const resolved = require.resolve(relId);
+    require.cache[resolved] = { id: resolved, filename: resolved, loaded: true, exports: exportsObj };
+  };
+  for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
+    delete require.cache[require.resolve(relId)];
+  }
+  stub('./ollama-http.js', {
+    postJson: async () => ({ message: queue.length ? queue.shift() : {} }),
+    postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
+  });
+  stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
+  stub('./local-client.js', { call: async () => ({ response: localCallResponse }) });
+  try {
+    const mod = require('./local-tool-client.js');
+    return fn(mod, dir);
+  } finally {
+    for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
+      delete require.cache[require.resolve(relId)];
+    }
+  }
+}
+
+test('runPlanWithTools returns the model reply immediately when the first turn has no tool calls', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi' });
+    assert.equal(result.response, 'here is the answer');
+    assert.equal(result.turnsUsed, 1);
+    assert.equal(result.toolsDisabled, false);
+    assert.deepEqual(result.toolCallLog, []);
+  });
+});
+
+test('runPlanWithTools executes a tool call, feeds the result back, and returns the next-turn reply', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+    { role: 'assistant', content: 'done exploring' },
+  ], async (mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const result = await mod.runPlanWithTools({ prompt: 'look around' });
+    assert.equal(result.response, 'done exploring');
+    assert.equal(result.turnsUsed, 2);
+    assert.equal(result.toolCallLog.length, 1);
+    assert.equal(result.toolCallLog[0].tool, 'list_directory');
+    assert.ok(Array.isArray(result.toolCallLog[0].result.entries), 'the real list_directory handler ran');
+    assert.ok(result.toolCallLog[0].result.entries.some((e) => e.name === 'a.txt'));
+  });
+});
+
+test('runPlanWithTools reports an unknown tool as an error string result and keeps going', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: '', tool_calls: [{ function: { name: 'nonexistent_tool', arguments: {} } }] },
+    { role: 'assistant', content: 'recovered' },
+  ], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go' });
+    assert.equal(result.response, 'recovered');
+    assert.deepEqual(result.toolCallLog[0].result, { error: 'unknown tool: nonexistent_tool' });
+  });
+});
+
+test('runPlanWithTools force-stops at maxTurns when the model never stops calling tools', async () => {
+  const toolTurn = { role: 'assistant', content: 'still working', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  await withMockedChat([toolTurn, toolTurn, toolTurn, toolTurn], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2 });
+    assert.equal(result.turnsUsed, 2);
+    assert.equal(result.response, 'still working', 'returns the last turn\'s content on a forced stop');
+    assert.equal(result.toolCallLog.length, 2);
+  });
+});
+
+test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the kill switch file is present', async () => {
+  await withMockedChat([], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi' });
+    assert.equal(result.toolsDisabled, true);
+    assert.equal(result.turnsUsed, 0);
+    assert.equal(result.response, 'fallback reply');
+    assert.deepEqual(result.toolCallLog, []);
+  }, { killSwitch: '.arch-discovery-tools-disabled' });
+});
