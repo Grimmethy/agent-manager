@@ -13,7 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
@@ -1617,11 +1617,46 @@ registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit'
 // Shape deliberately mirrors nextAdhocTask() immediately above: a human (or a future
 // backlog-decomposition source) drops a request file into queue/product-spec-requests/,
 // this claims the oldest unclaimed one, oldest-first, same "skip an in-queue id and keep
-// looking" rule every other inbox-style source here already uses. Unlike adhoc, this
-// always runs domain:defaultDomain (local model, 'low' tier, same as pipeline_self_audit) --
-// there is no code-repo tool access to justify Claude's agentic path here, only reading the
-// current spec doc and the request text, both handed to the model directly as context, no
-// harness search needed (the "grounding" IS the doc itself, already in hand).
+// looking" rule every other inbox-style source here already uses.
+//
+// TWO modes, resolved here at task-creation time so the pipeline never does an initial
+// failing run (2026-08-30):
+//   - GREENFIELD (the request file's `mode` is "greenfield", OR auto-detected: repoRoot
+//     is not a git repo with real source yet): domain:defaultDomain (local model, 'low'
+//     tier). The current spec doc + request text ARE the grounding, both handed to the
+//     model directly -- there is no code to read, the spec INVENTS its entities. Uses
+//     prompts.js's productSpecPlanPrompt / productSpecImplementPrompt via the normal
+//     runPlanPass -> runImplementPass path.
+//   - BROWNFIELD (`mode` is "brownfield", OR auto-detected: repoRoot is a git repo with
+//     >=1 commit AND >=1 tracked source-extension file): the request describes structure
+//     that already exists in code. Sets promptContext.specMode='brownfield' and a
+//     per-task reasoningTier:'high'; local-draft.js routes it to draftProductSpecBranch
+//     -> product-spec-agentic-draft.js, a read-only Read/Grep/Glob agentic Claude pass
+//     against a throwaway clone. The blind local plan is skipped -- it has no code access
+//     and empty-blocks on a real codebase (the exact failure this mode fixes).
+const SPEC_SOURCE_EXTS = new Set([
+  '.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java', '.rb', '.php',
+  '.c', '.cc', '.cpp', '.h', '.cs', '.kt', '.swift', '.scala', '.ex', '.exs',
+]);
+
+// Robust binary: brownfield iff repoRoot is a git repo with at least one commit AND at
+// least one tracked file with a source-code extension. Any error (not a git repo, no
+// commits, git missing, timeout) -> 'greenfield', which is the pre-2026-08-30 behaviour
+// and never regresses a working greenfield project.
+function detectSpecMode(repoRoot) {
+  const gitOpts = { cwd: repoRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] };
+  try {
+    const commits = parseInt(execFileSync('git', ['rev-list', '--count', 'HEAD'], gitOpts).trim(), 10);
+    if (!Number.isFinite(commits) || commits < 1) return 'greenfield';
+    const tracked = execFileSync('git', ['ls-files'], gitOpts).split('\n');
+    for (const rel of tracked) {
+      if (rel && SPEC_SOURCE_EXTS.has(path.extname(rel).toLowerCase())) return 'brownfield';
+    }
+    return 'greenfield';
+  } catch {
+    return 'greenfield';
+  }
+}
 function nextProductSpecTask() {
   const { pipelineDir, repoRoot, productSpecPath, defaultDomain } = getConfig();
   const requestsDir = path.join(pipelineDir, 'queue', 'product-spec-requests');
@@ -1659,17 +1694,28 @@ function nextProductSpecTask() {
     // the implement prompt is told explicitly that it's creating the doc, not editing it.
     const currentSpec = readIfExists(productSpecPath) || '';
 
+    // Explicit `mode` in the request file wins; otherwise auto-detect. See this source's
+    // header for the two modes.
+    const explicitMode = parsed.mode === 'brownfield' || parsed.mode === 'greenfield' ? parsed.mode : null;
+    const specMode = explicitMode || detectSpecMode(repoRoot);
+
     return {
       id,
       domain: defaultDomain,
       source: 'product_spec',
       title: parsed.title || `Product spec: ${parsed.id.trim()}`,
+      // Per-task tier so a brownfield task claims on the Claude lane (its agentic pass is
+      // a hardcoded Claude call regardless, but lane/claim accounting must agree).
+      // reasoningTierFor() checks task.reasoningTier first (model-provider.js). Greenfield
+      // leaves it unset -> resolves 'low' -> unchanged local path.
+      ...(specMode === 'brownfield' ? { reasoningTier: 'high' } : {}),
       promptContext: {
         requestId: parsed.id.trim(),
         requestText: parsed.requestText,
         currentSpec,
         specExists: currentSpec.trim().length > 0,
         specRelPath,
+        specMode,
       },
     };
   }
