@@ -62,7 +62,32 @@ function stampDeepDiveExhausted(task, deepDiveCoveragePath) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, recordModelOutcome = defaultRecordModelOutcome }) {
+function isAdhocTask(task) {
+  return task.domain === 'adhoc' || task.source === 'manual';
+}
+
+// The pre-filled question a human sees when an adhoc rejection has burned all its blind
+// redrafts. The commonest cause (confirmed live: the NSFW-images task) is the handler
+// deciding a request to EXTEND an existing feature is already done -- so the question
+// steers the human straight at that.
+function buildExhaustedAdhocQuestion(task) {
+  const reasons = (Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [])
+    .concat(task.blockedReason ? [String(task.blockedReason)] : [])
+    .filter(Boolean);
+  const verdictNote = task.adhocResolution === 'no-changes-needed'
+    ? 'The automated handler concluded this needs NO changes (RESOLUTION: no-changes-needed), but review rejected that every time:'
+    : `The automated handler could not get this past review after ${MAX_LOCAL_REJECT_RETRIES + 1} attempts:`;
+  return [
+    verdictNote,
+    ...reasons.map((r, i) => `  ${i + 1}. ${r}`),
+    '',
+    'If this is a request to EXTEND an existing feature (a "should also", a "when X, also Y", '
+      + 'or it names a different object than a similarly-named feature already covers), say '
+      + 'exactly what should change and which file(s). If it is genuinely already done, use Archive.',
+  ].join('\n');
+}
+
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
   let names = [];
   try {
@@ -87,6 +112,23 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
 
       const retryCount = Number(task.localRejectCount) || 0;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
+        // An exhausted ADHOC rejection is very often a real disagreement about scope
+        // ("is this already done, or a request to extend it?") that no amount of blind
+        // redraft will resolve -- send it to a human instead of leaving it to rot in
+        // blocked/ forever. (Non-adhoc keeps the original "stamp once, stay in blocked"
+        // behaviour.)
+        if (isAdhocTask(task) && needsClarificationDir) {
+          const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+          if (alreadyEscalated) { summary.exhausted++; continue; }
+          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedAdhocQuestion(task) };
+          appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
+          appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
         // Already stamped on a prior tick -- an exhausted task stays in blocked/
         // permanently (nothing here ever moves or deletes it), so without this guard this
         // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
@@ -114,8 +156,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath, record
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
 
-      const newPath = path.join(pendingDir, name);
-      fs.mkdirSync(pendingDir, { recursive: true });
+      // nextAdhocTask() only scans queue/adhoc/ -- an adhoc task requeued to pending/ is
+      // only picked up by a general worker, never re-drafted through draftAdhocBranch's
+      // tiers. Match python/dashboard/app.py's own adhoc-requeue destination.
+      const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+      const newPath = path.join(destDir, name);
+      fs.mkdirSync(destDir, { recursive: true });
       fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
       fs.unlinkSync(filePath);
       summary.requeued++;
@@ -133,8 +179,10 @@ function main() {
   const queueDir = path.join(pipelineDir, 'queue');
   const blockedDir = path.join(queueDir, 'blocked');
   const pendingDir = path.join(queueDir, 'pending');
+  const adhocDir = path.join(queueDir, 'adhoc');
+  const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = rejectRetryCheck({ blockedDir, pendingDir, deepDiveCoveragePath });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath });
   process.stdout.write(JSON.stringify(summary));
 }
 

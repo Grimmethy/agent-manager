@@ -1782,3 +1782,24 @@ test('product_spec: no mode + a git repo with NO commits -> greenfield', () => {
   const { nextProductSpecTask } = freshTaskSources(dir);
   assert.equal(nextProductSpecTask().promptContext.specMode, 'greenfield');
 });
+
+// --- adhoc no-changes-needed review guidance (2026-08-30) -----------------------------
+test('adhoc reviewGuidance/reviewCompletenessQuestion have a dedicated no-changes-needed (coverage-check) branch', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adhoc-nc-guidance-'));
+  freshTaskSources(dir);
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  const adhoc = getRegisteredSource('adhoc');
+
+  const nc = adhoc.reviewGuidance({ adhocResolution: 'no-changes-needed' });
+  assert.match(nc, /COVERAGE check/);
+  assert.match(nc, /EXTENSION/);
+  assert.match(nc, /RELATED-BUT-DIFFERENT surface/);
+
+  const ncq = adhoc.reviewCompletenessQuestion({ adhocResolution: 'no-changes-needed' });
+  assert.match(ncq, /EVERY concrete object/);
+
+  // other resolutions are unchanged
+  assert.match(adhoc.reviewGuidance({ adhocResolution: 'implemented' }), /real `git diff` shown/);
+  assert.equal(adhoc.reviewCompletenessQuestion({ adhocResolution: 'implemented' }), null);
+  assert.match(adhoc.reviewGuidance({ adhocResolution: 'decompose' }), /DECOMPOSE/);
+});
