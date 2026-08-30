@@ -1986,6 +1986,40 @@ def _files_touched_for(task: dict) -> list[str]:
     return out
 
 
+# The promptContext keys that carry a task's actual INPUT -- what the drafting model was
+# asked to act on. Different sources stash it under different names, and only `rawText`
+# was ever surfaced in the task-detail modal, so e.g. product_spec's whole request brief
+# (promptContext.requestText, ~2KB) rendered nowhere and a blocked product_spec task gave
+# "no indication of what actually happened" (2026-08-30). (label, candidate keys) -- first
+# non-empty key per label wins; several labels can show at once (a scanner finding's
+# `detail` + its `snippet`, say).
+_TASK_INPUT_FIELDS = [
+    ("Request", ("requestText", "rawText", "taskText", "reason")),
+    ("Finding", ("detail",)),
+    ("Code snippet", ("snippet",)),
+    ("Candidate", ("body",)),
+    ("Open questions", ("openQuestions",)),
+]
+
+
+def _task_input_summary(task: dict) -> list[dict]:
+    pc = task.get("promptContext") or {}
+    title = (task.get("title") or "").strip()
+    out: list[dict] = []
+    for label, keys in _TASK_INPUT_FIELDS:
+        for k in keys:
+            v = pc.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != title:
+                out.append({"label": label, "text": v})
+                break
+    if task.get("source") == "product_spec":
+        rel = pc.get("specRelPath")
+        if rel:
+            note = "updating the existing spec" if pc.get("specExists") else "new file"
+            out.append({"label": "Output", "text": f"{rel} ({note})"})
+    return out
+
+
 @app.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     qdir = queue_dir()
@@ -1998,7 +2032,7 @@ def api_task_detail(state, task_id):
             for candidate in drafting_root.rglob(f"{task_id}.json"):
                 data = read_json_safe(candidate)
                 if data:
-                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
+                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
         abort(404)
 
     if state not in QUEUE_STATES:
@@ -2007,7 +2041,7 @@ def api_task_detail(state, task_id):
     data = read_json_safe(f)
     if not data:
         abort(404)
-    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
+    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
 
 
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
@@ -2410,12 +2444,12 @@ def api_task_anywhere(task_id):
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
+                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
 
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data)})
+            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
 
     abort(404, description=f"task {task_id} not found in any queue state")
 

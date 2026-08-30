@@ -2170,14 +2170,15 @@ function renderTaskDetailModal(task) {
     const hLabel = cs.hypotheticalCostUsd != null ? ` · ${fmtUsd(cs.hypotheticalCostUsd)} est. if every call had used the API` : '';
     html += `<div class="field-label">Estimated API Cost</div><div>${realLabel}${hLabel}</div>`;
   }
-  // task.title is truncated to 120 chars at creation time (see app.py's brain-dump
-  // ingestion) -- the full original text lives in promptContext.rawText and was never
-  // surfaced anywhere in this modal, leaving anyone deciding a needs-clarification task
-  // (or any other) with only a truncated title to go on. Only shown when it actually adds
-  // information over the title (it may just equal the title for non-brain-dump sources).
-  const rawText = task.promptContext && task.promptContext.rawText;
-  if (rawText && rawText !== task.title) {
-    html += `<div class="field-label">Full Text</div><pre>${escapeHtml(rawText)}</pre>`;
+  // Request / Input (2026-08-30, Grimmethy: "I get no indication of what actually
+  // happened") -- the task's actual INPUT (what the model was asked to act on). Different
+  // sources stash it under different promptContext keys; app.py's _task_input_summary
+  // normalises them into a [{label, text}] list so a blocked product_spec task shows its
+  // ~2KB request brief (promptContext.requestText) instead of just a truncated title.
+  if (task._requestInput && task._requestInput.length) {
+    for (const item of task._requestInput) {
+      html += `<div class="field-label">${escapeHtml(item.label)}</div><pre>${escapeHtml(item.text)}</pre>`;
+    }
   }
   html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
   if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
@@ -2224,8 +2225,15 @@ function renderTaskDetailModal(task) {
         + `</div>`;
     }).join('') + `</div>`;
   }
+  // A "degenerate: empty" block means the model returned nothing for that pass -- the
+  // field is absent, not present-and-empty, so without this the modal just omits the
+  // section and the timeline is the only hint anything ran. Say it explicitly.
+  const emptyPlan = !task.planResponse && /plan pass degenerate/i.test(task.blockedReason || '');
+  const emptyImpl = !task.implementResponse && /implement pass degenerate/i.test(task.blockedReason || '');
   if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
+  else if (emptyPlan) html += `<div class="field-label">Plan</div><pre class="meta">(the plan pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   if (task.implementResponse) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+  else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   content.innerHTML = html;
   backdrop.classList.add('open');
   if (task.needsClarification) wireClarificationPicker(task.id);

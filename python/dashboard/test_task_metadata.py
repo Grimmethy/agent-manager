@@ -87,5 +87,50 @@ class FilesTouchedForTest(unittest.TestCase):
         self.assertEqual(app._files_touched_for({}), [])
 
 
+class TaskInputSummaryTest(unittest.TestCase):
+    def test_product_spec_surfaces_requestText_and_the_output_target(self):
+        task = {
+            "source": "product_spec",
+            "title": "Seed the PromptForge product spec",
+            "promptContext": {
+                "requestText": "PromptForge is a local single-user web app ... write the FIRST product spec ...",
+                "specRelPath": "Docs/PRODUCT_SPEC.md",
+                "specExists": False,
+            },
+        }
+        out = app._task_input_summary(task)
+        self.assertEqual(out[0]["label"], "Request")
+        self.assertIn("local single-user web app", out[0]["text"])
+        self.assertEqual(out[-1], {"label": "Output", "text": "Docs/PRODUCT_SPEC.md (new file)"})
+
+    def test_product_spec_output_note_reflects_an_existing_spec(self):
+        task = {"source": "product_spec", "promptContext": {"specRelPath": "S.md", "specExists": True}}
+        self.assertEqual(app._task_input_summary(task)[-1]["text"], "S.md (updating the existing spec)")
+
+    def test_scanner_finding_surfaces_detail_and_snippet(self):
+        task = {
+            "source": "function_length_review",
+            "title": "Function-length triage: server/app.py:349 — promptforge",
+            "promptContext": {
+                "detail": 'function "resolve_job" is 103 lines long (threshold 100)',
+                "snippet": "def resolve_job(spec):\n    ...",
+            },
+        }
+        labels = [i["label"] for i in app._task_input_summary(task)]
+        self.assertEqual(labels, ["Finding", "Code snippet"])
+
+    def test_falls_back_to_rawText_and_skips_a_value_equal_to_the_title(self):
+        # brain-dump style: rawText carries the real request
+        task = {"title": "short title", "promptContext": {"rawText": "the full, longer request body"}}
+        self.assertEqual(app._task_input_summary(task), [{"label": "Request", "text": "the full, longer request body"}])
+        # rawText that just duplicates the title adds nothing -> omitted
+        task2 = {"title": "same", "promptContext": {"rawText": "same"}}
+        self.assertEqual(app._task_input_summary(task2), [])
+
+    def test_no_promptContext_returns_empty_list_not_error(self):
+        self.assertEqual(app._task_input_summary({}), [])
+        self.assertEqual(app._task_input_summary({"promptContext": None}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
