@@ -224,21 +224,63 @@ async function call(opts, maxRetries = 2) {
   return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
 }
 
-// Mirrors local-client.js's majorityVote() exactly (same signature, same tally logic)
-// so review-task.js's localMajorityVote injection point works unchanged with this
-// module swapped in -- duplicated rather than imported since local-client.js's version
-// calls its own local `call` directly with no injection seam of its own. Still true as
-// of 2026-08-24 (model-profile-registry.js) -- not consolidated, deliberately deferred,
-// see that file's own header. model/effort/timeoutMs added here for profile support --
-// no numCtx/numPredict equivalent exists on this module's own callOnce() (a Claude Code
-// CLI call, not a raw Ollama /api/generate), so those two are local-client.js-only.
+// Mirrors local-client.js's majorityVote() exactly (same signature, same tally logic,
+// same per-vote resilience + early-exit + voteErrors) so review-task.js's
+// localMajorityVote injection point works unchanged with this module swapped in --
+// duplicated rather than imported since local-client.js's version calls its own local
+// `call` directly with no injection seam of its own. model/effort/timeoutMs replace
+// local-client.js's source/numCtx/numPredict (a Claude Code CLI call, not a raw Ollama
+// /api/generate), the only intentional divergence.
+//
+// 2026-08-29 (performance_fix AC-4 -- "parallelize the sequential vote loop"): kept
+// SEQUENTIAL on purpose. Parallel dispatch (Promise.all/allSettled over n calls) would
+// (a) discard the early-exit below -- which saves a whole real Claude call, i.e. real
+// subscription tokens, in the common minAgreeing-reached-early case -- and (b) with
+// Promise.all, reintroduce the exact "one failed vote aborts them all" bug the
+// try/catch below exists to prevent. The candidate's own "n x latency" framing assumes
+// all n calls always run, which the early-exit makes false; and review here is a
+// background pipeline stage, not human-blocking, so wall-clock is the cheap axis. The
+// real gap AC-4 sat next to -- this copy having drifted out of parity (no try/catch, no
+// voteErrors despite review-task.js reading it, no early-exit) -- is closed instead.
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs }) {
   const votes = [];
+  const voteErrors = [];
   for (let i = 0; i < n; i++) {
-    const result = await call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1);
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1);
+    } catch (e) {
+      // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
+      // retry above) -- must not abort the other n-1 votes, which may well succeed under
+      // exactly the same slow-but-not-dead conditions. See local-client.js's own
+      // 2026-08-23 note: 59 of the last 62 real review attempts failed this way, each
+      // discarding whatever votes DID land because the first failure killed the whole
+      // majorityVote() call outright.
+      voteErrors.push(e.message);
+      continue;
+    }
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response });
+
+    // Early-exit once any verdict has mathematically already secured minAgreeing votes
+    // -- no remaining vote can change the outcome (a verdict's count only ever goes UP as
+    // more votes come in, so "already >= minAgreeing" is a permanent fact once observed).
+    // 2026-08-23, Grimmethy: "Are there opportunities to make the actual review more
+    // efficient?" -- the common 2-of-3-agree case was still always paying for a full 3rd
+    // real generation call whose result could never change the verdict.
+    const earlyCounts = {};
+    for (const v of votes) earlyCounts[v.verdict] = (earlyCounts[v.verdict] || 0) + 1;
+    if (Object.values(earlyCounts).some((c) => c >= minAgreeing)) break;
+  }
+
+  // Only when EVERY vote hard-failed (zero real responses of any kind, not even a
+  // degenerate one) is this a genuine infra failure rather than a legitimate "no
+  // consensus reached" outcome -- rethrow so the caller's existing infra-requeue
+  // detection still catches it, instead of silently reporting a false "inconclusive"
+  // verdict for what was actually zero real votes cast.
+  if (voteErrors.length === n) {
+    throw new Error(voteErrors[voteErrors.length - 1]);
   }
 
   const tally = {};
@@ -259,6 +301,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     votes,
     realVoteCount: votes.length,
     requestedVotes: n,
+    voteErrors,
   };
 }
 
