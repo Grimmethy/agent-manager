@@ -181,6 +181,13 @@ function getConfig() {
   // generic, task-sources.js) can consume it for free with zero new consumption code.
   const backlogCandidatesPath = process.env.AGENT_MANAGER_BACKLOG_CANDIDATES_PATH
     || path.join(repoRoot, 'Docs', 'BACKLOG_CANDIDATES.md');
+  // product_spec BROWNFIELD outline doc (2026-08-30): a brownfield spec request is
+  // decomposed into ordered `### AC-NNN` section candidates here (product_spec_outline),
+  // then drafted one section at a time on the LOCAL model (product_spec_section, a
+  // candidate-fulfillment consumer of this exact doc). Same AC-NNN format and repoRoot/Docs
+  // home as backlogCandidatesPath, for the same "reuse the generic writer/consumer" reason.
+  const productSpecOutlineCandidatesPath = process.env.AGENT_MANAGER_PRODUCT_SPEC_OUTLINE_CANDIDATES_PATH
+    || path.join(repoRoot, 'Docs', 'PRODUCT_SPEC_OUTLINE.md');
 
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
   // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
@@ -282,6 +289,7 @@ function getConfig() {
     performanceCoveragePath,
     productSpecPath,
     backlogCandidatesPath,
+    productSpecOutlineCandidatesPath,
     brainDumpPath,
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,

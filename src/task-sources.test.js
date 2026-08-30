@@ -1729,31 +1729,39 @@ function gitInitWithFiles(dir, files) {
   execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
 }
 
-test('product_spec: explicit mode:"brownfield" wins even with zero source files, and sets reasoningTier:high', () => {
+test('product_spec: explicit mode:"brownfield" routes to the OUTLINE lane (product_spec_outline), not the greenfield lane, and carries no reasoningTier', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
   writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec', mode: 'brownfield' });
-  const { nextProductSpecTask } = freshTaskSources(dir);
-  const task = nextProductSpecTask();
+  const { nextProductSpecTask, nextProductSpecOutlineTask } = freshTaskSources(dir);
+
+  assert.equal(nextProductSpecTask(), null, 'greenfield lane must not claim a brownfield request');
+
+  const task = nextProductSpecOutlineTask();
+  assert.equal(task.source, 'product_spec_outline');
+  assert.equal(task.id, 'product-spec-outline-bootstrap-1');
   assert.equal(task.promptContext.specMode, 'brownfield');
-  assert.equal(task.reasoningTier, 'high');
+  assert.equal(task.reasoningTier, undefined, 'the redesigned brownfield lane runs on the local model -- no high tier');
 });
 
-test('product_spec: explicit mode:"greenfield" wins even with many source files, and leaves reasoningTier unset', () => {
+test('product_spec: explicit mode:"greenfield" wins even with many source files, stays on the greenfield lane, reasoningTier unset', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
   gitInitWithFiles(dir, { 'a.py': '1', 'b.py': '2', 'c.js': '3' });
   writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec', mode: 'greenfield' });
-  const { nextProductSpecTask } = freshTaskSources(dir);
+  const { nextProductSpecTask, nextProductSpecOutlineTask } = freshTaskSources(dir);
   const task = nextProductSpecTask();
+  assert.equal(task.source, 'product_spec');
   assert.equal(task.promptContext.specMode, 'greenfield');
   assert.equal(task.reasoningTier, undefined);
+  assert.equal(nextProductSpecOutlineTask(), null, 'outline lane must not claim a greenfield request');
 });
 
-test('product_spec: no mode + a git repo with a committed source file -> auto brownfield', () => {
+test('product_spec: no mode + a git repo with a committed source file -> auto brownfield -> outline lane', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
   gitInitWithFiles(dir, { 'server/app.py': 'print(1)\n', 'README.md': '# x\n' });
   writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec' });
-  const { nextProductSpecTask } = freshTaskSources(dir);
-  assert.equal(nextProductSpecTask().promptContext.specMode, 'brownfield');
+  const { nextProductSpecTask, nextProductSpecOutlineTask } = freshTaskSources(dir);
+  assert.equal(nextProductSpecTask(), null);
+  assert.equal(nextProductSpecOutlineTask().promptContext.specMode, 'brownfield');
 });
 
 test('product_spec: no mode + a git repo with only a README -> auto greenfield', () => {
@@ -1802,4 +1810,35 @@ test('adhoc reviewGuidance/reviewCompletenessQuestion have a dedicated no-change
   assert.match(adhoc.reviewGuidance({ adhocResolution: 'implemented' }), /real `git diff` shown/);
   assert.equal(adhoc.reviewCompletenessQuestion({ adhocResolution: 'implemented' }), null);
   assert.match(adhoc.reviewGuidance({ adhocResolution: 'decompose' }), /DECOMPOSE/);
+});
+
+test('product_spec_section: consumes the outline doc top-to-bottom, one Strong AC at a time, with the spec doc path and fetched code attached', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-section-test-'));
+  fs.mkdirSync(path.join(dir, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'server', 'app.py'), 'def generate():\n    return 1\n');
+  fs.mkdirSync(path.join(dir, 'Docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'Docs', 'PRODUCT_SPEC_OUTLINE.md'), [
+    '# Product Spec Outline',
+    '',
+    '### AC-1 · Data Model',
+    'Strength: Strong',
+    'Files: server/app.py',
+    '',
+    'Problem:',
+    'The entities the generate endpoint operates on.',
+    'Solution:',
+    'Document the fields and their types from server/app.py.',
+    'Benefits:',
+    'A later build task can rely on the shape.',
+    '',
+  ].join('\n'));
+
+  const { nextProductSpecSectionTask } = freshTaskSources(dir);
+  const task = nextProductSpecSectionTask();
+  assert.equal(task.source, 'product_spec_section');
+  assert.equal(task.id, 'product-spec-section-ac-1');
+  assert.equal(task.promptContext.candidateId, 'AC-1');
+  assert.equal(task.promptContext.title, 'Data Model');
+  assert.equal(task.promptContext.specRelPath, path.join('Docs', 'PRODUCT_SPEC.md'));
+  assert.ok(task.promptContext.fetchedFiles.some((f) => f.path === 'server/app.py' && f.content.includes('def generate')));
 });
