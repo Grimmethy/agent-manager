@@ -43,6 +43,72 @@ ensureRegistered();
 // mention many paths can't blow up the review prompt's size.
 const LIVE_FETCH_MAX_FILES = 5;
 const LIVE_FETCH_MAX_CHARS_PER_FILE = 4000;
+
+// For an adhoc task resolved `no-changes-needed`, the reviewer's job is a coverage check:
+// is every concrete thing the request names actually present in the current code? Pull the
+// candidate "objects" out of the raw request text and grep each against the real repo NOW,
+// so the vote sees "what the repo actually has for `gallery` / `image` / `nsfw`" rather
+// than only whatever the drafter's own summary chose to cite. Deterministic, bounded.
+const REQUEST_OBJECT_STOPWORDS = new Set([
+  'should', 'shall', 'when', 'with', 'that', 'this', 'from', 'have', 'into', 'their', 'them',
+  'then', 'they', 'will', 'would', 'could', 'being', 'such', 'also', 'only', 'each', 'both',
+  'some', 'more', 'most', 'other', 'while', 'where', 'what', 'your', 'about', 'after', 'before',
+  'tagged', 'selected', 'checkbox', 'check', 'these', 'those', 'here', 'there', 'been', 'does',
+  'hide', 'show', 'make', 'like', 'need', 'want', 'note', 'used', 'uses', 'able', 'must',
+]);
+const MAX_REQUEST_OBJECT_TOKENS = 8;
+const MAX_HITS_PER_OBJECT = 4;
+
+function extractRequestObjectTokens(rawText) {
+  const text = String(rawText || '');
+  const tokens = new Set();
+  for (const m of text.matchAll(/\/[A-Za-z][\w/-]{2,}/g)) tokens.add(m[0]);                 // /api/... paths
+  for (const m of text.matchAll(/["'`]([^"'`]{3,40})["'`]/g)) tokens.add(m[1].trim());       // "quoted phrases"
+  for (const m of text.matchAll(/\b[A-Za-z_][A-Za-z0-9]*(?:[_][A-Za-z0-9]+|[A-Z][a-z0-9]+)+\b/g)) tokens.add(m[0]); // camelCase / snake_case
+  for (const m of text.matchAll(/\b[A-Za-z]{4,}\b/g)) {                                      // plain content words
+    if (!REQUEST_OBJECT_STOPWORDS.has(m[0].toLowerCase())) tokens.add(m[0]);
+  }
+  return [...tokens].slice(0, MAX_REQUEST_OBJECT_TOKENS);
+}
+
+function buildRequestObjectGrounding(rawText) {
+  const tokens = extractRequestObjectTokens(rawText);
+  if (tokens.length === 0) return '';
+  // grepCodebase (via fetchForQueries) matches a single-word query case-SENSITIVELY, so a
+  // request that writes "NSFW" would never find `nsfw` in code. Search each token plus its
+  // lower/upper-cased forms and fold the hits back onto the original token -- the same
+  // case-normalization discuss_sessions.py's _expand_grep_terms does on the Python side.
+  const variantToTok = new Map();
+  const queries = [];
+  for (const tok of tokens) {
+    for (const v of new Set([tok, tok.toLowerCase(), tok.toUpperCase()])) {
+      if (!variantToTok.has(v)) { variantToTok.set(v, tok); queries.push(v); }
+    }
+  }
+  let hits = [];
+  try {
+    hits = require('./arch-import-fetch.js').fetchForQueries(queries).hits || [];
+  } catch (e) {
+    return '';
+  }
+  const byTok = new Map(tokens.map((t) => [t, []]));
+  for (const h of hits) {
+    const tok = variantToTok.get(h.query);
+    if (tok && byTok.has(tok)) byTok.get(tok).push(h);
+  }
+  const lines = [
+    '=== REQUEST OBJECTS -- current repo state (each noun/identifier from the request text, ' +
+    'grepped against the real repo NOW; "(no match ...)" means the request names something ' +
+    'the current code has no trace of -- a strong signal the request is NOT already done) ===',
+  ];
+  for (const tok of tokens) {
+    const tokHits = (byTok.get(tok) || []).slice(0, MAX_HITS_PER_OBJECT);
+    lines.push(tokHits.length
+      ? `- "${tok}": ${tokHits.map((h) => `${h.file}:${h.line}`).join(', ')}`
+      : `- "${tok}": (no match in the searched code dirs)`);
+  }
+  return lines.join('\n');
+}
 // 2026-08-24 regression, caught investigating a real blocked task: the draft correctly
 // cited `python/dashboard/templates/index.html:882-895` as proof a feature already
 // existed -- .html was never in this extension list, so the ONE file that actually
@@ -301,10 +367,18 @@ function main() {
     }
   }
 
+  // A `no-changes-needed` adhoc draft claims "already implemented" -- give the reviewer the
+  // current repo state for every object the ORIGINAL request names, not just the files the
+  // draft's own summary happened to cite. See buildRequestObjectGrounding above.
+  if (task.domain === 'adhoc' && task.adhocResolution === 'no-changes-needed' && repoRoot && pc && pc.rawText) {
+    const objGrounding = buildRequestObjectGrounding(pc.rawText);
+    if (objGrounding) parts.push(objGrounding);
+  }
+
   process.stdout.write(parts.join('\n\n'));
 }
 
-module.exports = { extractLiveRepoGrounding, refreshFetchedFileContent, main };
+module.exports = { extractLiveRepoGrounding, refreshFetchedFileContent, extractRequestObjectTokens, buildRequestObjectGrounding, main };
 
 if (require.main === module) {
   main();

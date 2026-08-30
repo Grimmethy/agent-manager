@@ -199,6 +199,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push('');
   }
   lines.push('The fact-check above is deterministic and authoritative for file existence -- it already checked the real filesystem. A claimed path listed with "exists": true is CONFIRMED real; do not express doubt about it or re-litigate whether it exists. A path listed with "exists": false AND "isCreateTarget": true is this draft\'s own mode:"create" target -- it not existing yet is the normal, EXPECTED case for a create (that is the entire point of creating it), and is NOT evidence of fabrication; do not reject a draft for this. Only "exists": false WITHOUT isCreateTarget is evidence toward fabrication.');
+  lines.push('An "imprecise-file-path" flag (or a fileChecks entry with "exists": true and "resolvedVia" other than "exact") means the draft named a REAL file but with a missing or wrong directory prefix (e.g. "app.py" for "server/app.py"). The file exists -- this is a citation-style nit, NOT fabrication. Do NOT reject a draft for an imprecise path that resolves to a real file.');
   lines.push('A "fabricated-commit-reference" flag means the draft cited a specific commit hash (e.g. "already resolved in commit abc1234") that this pipeline confirmed via real `git cat-file` does NOT exist anywhere in this repo\'s history -- this is deterministic and authoritative the same way a missing-file flag is: strong, concrete evidence the draft invented a resolution instead of doing (or honestly reporting it could not do) the real work asked for. commitChecks with "exists": null means the hash could not be checked (no git access) -- treat that as unconfirmed, not as fabrication.');
   lines.push('');
   lines.push('Judge whether this draft is correct, narrowly scoped, and safe to apply as-is. Reject if it is fabricated, over-broad, or the fact-check flags a real problem.');
@@ -332,8 +333,18 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
     try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
   }
 
-  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined);
-  const factCheckVerdict = factCheck.flags && factCheck.flags.length > 0 ? 'flagged' : 'pass';
+  // Feed the consumer's configured code dirs (AGENT_MANAGER_GREP_DIRS) as extraRoots so
+  // resolveAgainstRepo can turn a bare `app.py` into `server/app.py` instead of reporting
+  // it "missing" -> "fabricated". Only meaningful when the fact-check runs against
+  // agent-manager's OWN repoRoot (the default); for a deep_dive external clone or the
+  // second-brain vault, these dirs don't apply and simply won't match -- harmless.
+  const factCheckExtraRoots = (repoRootForCheck === workDir)
+    ? (() => { try { return getConfig().grepAllowedDirs; } catch { return []; } })()
+    : [];
+  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots);
+  // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
+  // it must not by itself flip the verdict label to "flagged".
+  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';
 
   // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
   // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
