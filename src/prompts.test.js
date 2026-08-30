@@ -346,3 +346,20 @@ test('buildPlanPrompt for research_task explicitly forbids stating an unverified
   const prompt = buildPlanPrompt(researchTask());
   assert.match(prompt, /do not state a specific identifier, registry number, date, name, or URL as a known fact unless you actually found it via a real search\/fetch/i);
 });
+
+test('stalenessAuditImplementPrompt: recommending archive requires a cited commit OR full per-object coverage, and says stuck != resolved', () => {
+  const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const p = require('./prompts.js');
+  const task = {
+    domain: 'default', source: 'staleness_audit', title: 't',
+    promptContext: {
+      originalTaskId: 'orig-x', reasons: ['fabrication-repeat', 'retries-exhausted'],
+      evidenceText: 'Original task text: hide NSFW tagged images', harnessHits: [], harnessFiles: [],
+    },
+  };
+  const prompt = p.buildImplementPrompt(task, 'QUERY: nsfw');
+  assert.match(prompt, /name the specific commit/i);
+  assert.match(prompt, /EVERY concrete thing the original task names/i);
+  assert.match(prompt, /repeated fabrication or exhausted retries means the PIPELINE could not build it -- that alone is never grounds to archive/);
+  assert.match(prompt, /similar NAME that acts on a DIFFERENT object/);
+});

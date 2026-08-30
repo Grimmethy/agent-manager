@@ -816,7 +816,12 @@ function stalenessAuditImplementPrompt(task, planText) {
     '2. If the original task was flagged for repeated fabrication, does the evidence above suggest its claims were genuinely ungrounded, or does it hold up after all?',
     '3. An explicit RECOMMENDATION: either "archive" (the concern is resolved or was never grounded) or "worth a fresh investigation" (the concern still looks real and unaddressed) -- with one sentence of reasoning.',
     '',
-    'Your RECOMMENDATION here has a real, automatic effect once this report passes review: "archive" moves the ORIGINAL flagged task out of the active queue for good; "worth a fresh investigation" takes no action at all and leaves it exactly as it is. This is no longer a human double-checking your read before anything happens -- get it right the first time. Recommend "archive" ONLY when the evidence above genuinely, concretely supports it (the file/behavior it named plainly no longer applies, or the fabricated claims are clearly confirmed baseless) -- if the evidence is thin, ambiguous, or the searches found nothing useful either way, say so plainly and recommend "worth a fresh investigation" instead. When genuinely uncertain, the safe default is "worth a fresh investigation," never "archive."',
+    'Your RECOMMENDATION here has a real, automatic effect once this report passes review: "archive" moves the ORIGINAL flagged task out of the active queue for good; "worth a fresh investigation" takes no action at all and leaves it exactly as it is. This is no longer a human double-checking your read before anything happens -- get it right the first time.',
+    '',
+    'To recommend "archive" you MUST show one of these, concretely, from the evidence above -- NOT a vague "this is probably handled somewhere":',
+    '  (a) name the specific commit (a real hash) that implemented what the original task asked for -- it will be fact-checked; or',
+    '  (b) show the CURRENT code covers EVERY concrete thing the original task names -- each UI element, endpoint, data field, file, observable behavior -- each with a real file:symbol. A feature with a similar NAME that acts on a DIFFERENT object (e.g. a toggle that gates data vs. a request about images) is NOT resolution, and neither is "loosely-related code exists."',
+    'A task flagged for repeated fabrication or exhausted retries means the PIPELINE could not build it -- that alone is never grounds to archive; it is only "already resolved" if (a) or (b) genuinely holds. If the evidence is thin or ambiguous, or the searches found nothing that pins this down, recommend "worth a fresh investigation." When uncertain, the safe default is "worth a fresh investigation," never "archive."',
   ].join('\n');
 }
 
