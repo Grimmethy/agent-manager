@@ -11,6 +11,7 @@
 // buildImplementPrompt. require('./task-sources.js') below is loaded purely for its side
 // effect of populating the registry with this package's 10 built-in sources.
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
+const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
 require('./task-sources.js');
 
 function truncate(str, max) {
@@ -889,8 +890,9 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
 // header for the full motivation): the request text and the current spec doc ARE the
 // grounding, both handed over directly -- there is no code to read because the project
 // doesn't exist yet, the spec INVENTS its entities. (The BROWNFIELD path -- an existing
-// codebase -- skips these two prompts entirely for buildProductSpecAgenticPrompt below,
-// which reads the real code.) The one thing this prompt insists on that a plain "write me
+// codebase -- skips these two prompts entirely; it goes through the local decompose ->
+// fulfill lane, productSpecOutline*Prompt / productSpecSection*Prompt below.) The one
+// thing this prompt insists on that a plain "write me
 // a doc" prompt wouldn't: flag a real conflict with an EXISTING decision explicitly
 // rather than silently overwriting it. A spec is the one artifact every later feature
 // task gets grounded against -- a silently-resolved contradiction here is far more
@@ -942,66 +944,151 @@ function productSpecImplementPrompt(task, planText) {
   ].join('\n');
 }
 
-// product_spec BROWNFIELD path (2026-08-30): the target project already has a real
-// codebase, cloned read-only for this pass. Unlike the greenfield prompts above, the
-// grounding is the CODE, not the request author's prose -- the model reads real files
-// with Read/Grep/Glob and writes the spec as markdown ending with a SPEC: sentinel.
-// draftProductSpecImplement (product-spec-agentic-draft.js) then deterministically wraps
-// that markdown into a Group-B create/edit JSON -- the model is never asked to reproduce
-// a giant JSON string, which is this pipeline's most repeated failure mode.
-function buildProductSpecAgenticPrompt(task, repoClone) {
+// product_spec BROWNFIELD path (2026-08-30 redesign): the target project already has a
+// real codebase, so the request describes structure that already exists -- too big for one
+// blind local pass. It runs on the LOCAL model in two stages, each grounded by
+// harness-mediated grep (the plan pass proposes `QUERY:` terms, the harness greps the
+// repo, the implement pass gets real file content). No subscription agent.
+//
+// Stage 1 (product_spec_outline): decompose the request into ordered `### AC-NNN` section
+// candidates -- the SAME format backlog_decomposition uses, so the generic AC-NNN writer
+// and consumer apply unchanged.
+function productSpecOutlinePlanPrompt(task) {
   const ctx = task.promptContext || {};
-  const lines = [
-    'You are writing (or maintaining) the product specification document for a WORKING '
-      + 'software project. The real code has been cloned read-only for you at: '
-      + `${repoClone.dir}. You have Read/Grep/Glob tool access to that exact directory -- `
-      + 'use it. Everything you state about how the system actually works MUST come from a '
-      + 'file you opened yourself, cited by real relative path (e.g. server/app.py) and, '
-      + 'where relevant, the real route/function/symbol -- never from a guess or from a '
-      + "README's prose description of what the code probably does. There is no "
-      + 'Write/Edit/Bash access here -- this is read-only investigation.',
+  return [
+    'You are scoping the SECTIONS of a product specification document for a project that ALREADY has a working codebase. The spec must describe how the system really works, grounded in the real code -- it does not invent anything.',
     '',
-    `Title: ${task.title || ''}`,
-    '',
-    'THE REQUEST (this is the SCOPE -- cover ONLY what it concerns; do not spec the whole '
-      + 'app unless the request explicitly asks for that):',
+    'THE REQUEST (this is the whole scope -- cover only what it concerns, do not spec the entire app):',
     ctx.requestText || '',
     '',
-  ];
-  if (ctx.specExists) {
-    lines.push(
-      'CURRENT SPEC (already exists -- treat everything in it as settled unless this '
-        + 'request changes it; if the real code contradicts a decision recorded here, note '
-        + 'the conflict explicitly rather than silently overwriting it):',
-      '```',
-      ctx.currentSpec,
-      '```',
-      '',
-    );
-  } else {
-    lines.push(
-      'No spec exists yet -- write the FIRST version, scoped to the request above, with '
-        + 'clear `##` section headings a later request can anchor an edit against (e.g. '
-        + '`## Entities`, `## API`, `## Decisions`).',
-      '',
-    );
-  }
-  lines.push(
-    `The spec document's path is ${ctx.specRelPath} (context only -- you output markdown, `
-      + 'not a file operation).',
+    ctx.specExists
+      ? 'A spec doc already exists; treat what is in it as settled unless this request changes it.'
+      : 'No spec doc exists yet -- this request bootstraps it.',
     '',
-    'When you are completely done, end your FINAL message with exactly one of these two '
-      + 'lines (nothing after it on that line):',
-    'SPEC: written',
-    'SPEC: insufficient-context',
+    'First, propose 1 to 3 SHORT search terms (identifiers, file names, or a few-word phrase) that will find the code this request is about.',
     '',
-    'If "written", everything BEFORE that line is the spec document itself -- start it '
-      + 'with a `#` heading, no preamble like "Here is the spec". Do NOT output JSON, a '
-      + 'diff, or code fences wrapping the whole document -- just the markdown body then '
-      + 'the sentinel line. If "insufficient-context", briefly explain what you could not '
-      + 'determine from the code instead of guessing at it.',
-  );
-  return lines.join('\n');
+    'Output the queries EXACTLY in this format, one per line, nothing else on those lines:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+    '',
+    'Then, below the queries, write a numbered PLAN (no doc prose yet) of the sections the spec needs for this request, IN DOC ORDER: data model / entities first, then the operations and rules on that data, then anything built on those (APIs, CLI, UI, integrations). Each section must be ONE focused slice of the request -- small enough for a single later drafting pass -- and must correspond to real code. Do not pad the list with sections the request does not call for.',
+  ].join('\n');
+}
+
+function productSpecOutlineImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this repo)';
+  const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+  return [
+    'Earlier you proposed search terms and an ordered section plan for this product-spec request:',
+    '',
+    planText,
+    '',
+    `THE REQUEST: ${ctx.requestText || ''}`,
+    '',
+    'The harness ran your searches against THIS repo\'s real, current content. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'Now write ONE candidate per section from your plan, IN PLAN ORDER (whatever comes first is drafted first -- the order is the doc order and is not cosmetic). Ground every section in a real file shown above; name real paths, never a guessed or invented one. If the searches found nothing that lets you scope a real section, output the empty string and nothing else.',
+    '',
+    'Each candidate MUST use exactly this format (it is parsed downstream and must match):',
+    '',
+    '### AC-NNN · Section Title',
+    'Strength: Strong',
+    'Files: comma, separated, REAL paths from the matches above (leave blank only if this section genuinely names no existing file)',
+    '',
+    'Problem:',
+    'Which part of the request this section documents, and why it belongs at this position in the doc (what it depends on).',
+    '',
+    'Solution:',
+    'What the section\'s prose must state about how the system actually works -- specific and grounded in the real files above, enough that a later pass can write the section without re-reading everything.',
+    '',
+    'Benefits:',
+    'What a reader or a downstream build task can rely on once this section exists.',
+    '',
+    '"Section Title" becomes a `## ` heading in the final doc: one short line of plain text, no "<", ">", or "-->". (Strength may instead be "Worth exploring" or "Speculative" if you are unsure a section is correctly scoped.) Number your candidates AC-001, AC-002, ...; the real numbering is assigned when they are written to the doc.',
+  ].join('\n');
+}
+
+// Stage 2 (product_spec_section): a candidate-fulfillment consumer -- draft ONE section at
+// a time and deliver it as a Group-B `edit` that fills that section's placeholder block in
+// Docs/PRODUCT_SPEC.md. The `find` anchor is pendingBlock() verbatim, so the model only
+// has to copy a 4-line block and supply prose -- never echo the whole document.
+function productSpecSectionPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  const fetched = ctx.fetchedFiles || [];
+  return [
+    'You are drafting ONE section of a product specification document for a project with a working codebase. Everything the section states about how the system behaves must come from real code, not memory or guesswork.',
+    '',
+    'THE SECTION BRIEF (from the spec outline -- this is the whole scope of this task):',
+    '',
+    ctx.body || '',
+    '',
+    fetched.length > 0 ? 'Code the outline already attached for this section:' : 'The outline attached no code for this section.',
+    fetched.length > 0 ? formatFileContents(fetched) : '',
+    '',
+    'Propose 1 to 3 more SHORT search terms for anything the brief points at that the code above does not already show.',
+    '',
+    'Output the queries EXACTLY in this format, one per line, nothing else on those lines:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+    '',
+    'Then, below the queries, write a short numbered PLAN for the section\'s prose: the specific things it will state and the real file(s) each is grounded in. No prose yet.',
+  ].join('\n');
+}
+
+function productSpecSectionImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const fetched = ctx.fetchedFiles || [];
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no additional matches)';
+  const grounding = [
+    fetched.length > 0 ? formatFileContents(fetched) : '',
+    files.length > 0 ? formatFileContents(files) : '',
+  ].filter(Boolean).join('\n\n') || '(no file content available)';
+  const find = pendingBlock(ctx.candidateId, ctx.title);
+  const replaceShape = filledBlock(ctx.candidateId, ctx.title, '<your section prose here>');
+  return [
+    'Earlier you proposed search terms and a plan for this one spec section:',
+    '',
+    planText,
+    '',
+    'THE SECTION BRIEF:',
+    '',
+    ctx.body || '',
+    '',
+    'Additional harness matches for your follow-up searches:',
+    '',
+    hitsText,
+    '',
+    'Real file content available to ground this section:',
+    '',
+    grounding,
+    '',
+    'Write the section prose now. Every statement about how the system works MUST come from the code shown above, cited by its real relative path where it matters -- no preamble, no invented files or symbols. If the code shown genuinely does not let you write this section, output the empty string and nothing else.',
+    '',
+    `Deliver it as ONE Group-B "edit" against the spec doc "${ctx.specRelPath}". The "find" value must be EXACTLY this block (the section's current placeholder in the doc), copied character for character:`,
+    '',
+    find,
+    '',
+    'The "replace" value is that SAME block with your prose swapped in for the "_(pending)_" line -- keep both `<!-- section:... -->` marker lines and the `## ` heading line byte-for-byte unchanged:',
+    '',
+    replaceShape,
+    '',
+    groupBJsonInstructions,
+  ].join('\n');
 }
 
 // backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
@@ -1250,6 +1337,8 @@ updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAudit
 updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
+updateTaskSource('product_spec_outline', { buildPlanPrompt: productSpecOutlinePlanPrompt, buildImplementPrompt: productSpecOutlineImplementPrompt });
+updateTaskSource('product_spec_section', { buildPlanPrompt: productSpecSectionPlanPrompt, buildImplementPrompt: productSpecSectionImplementPrompt });
 updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositionPlanPrompt, buildImplementPrompt: backlogDecompositionImplementPrompt });
 // backlog_fulfillment reuses arch_review's own prompt builders verbatim -- turning one
 // AC-NNN candidate (candidateId/title/files/body) into a real diff is the same job
@@ -1365,7 +1454,8 @@ module.exports = {
   archDiscoveryPlanPrompt, archDiscoveryImplementPrompt,
   archImportPlanPrompt, archImportImplementPrompt,
   unusedExportPlanPrompt, unusedExportImplementPrompt,
-  buildProductSpecAgenticPrompt,
+  productSpecOutlinePlanPrompt, productSpecOutlineImplementPrompt,
+  productSpecSectionPlanPrompt, productSpecSectionImplementPrompt,
 };
 
 if (require.main === module) {
