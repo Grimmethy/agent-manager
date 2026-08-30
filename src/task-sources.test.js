@@ -1705,3 +1705,80 @@ test('nextUiVisibilityAuditTask returns null and does not throw when app.py does
   const { nextUiVisibilityAuditTask } = freshTaskSources(dir);
   assert.equal(nextUiVisibilityAuditTask(), null);
 });
+
+// --- product_spec mode selection (2026-08-30: greenfield vs brownfield) ----------------
+
+const { execFileSync } = require('child_process');
+
+function writeSpecRequest(dir, body) {
+  const rdir = path.join(dir, 'queue', 'product-spec-requests');
+  fs.mkdirSync(rdir, { recursive: true });
+  fs.writeFileSync(path.join(rdir, `${body.id}.json`), JSON.stringify(body));
+}
+
+function gitInitWithFiles(dir, files) {
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@t'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: dir });
+  for (const [rel, content] of Object.entries(files)) {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  }
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+}
+
+test('product_spec: explicit mode:"brownfield" wins even with zero source files, and sets reasoningTier:high', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec', mode: 'brownfield' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.equal(task.promptContext.specMode, 'brownfield');
+  assert.equal(task.reasoningTier, 'high');
+});
+
+test('product_spec: explicit mode:"greenfield" wins even with many source files, and leaves reasoningTier unset', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  gitInitWithFiles(dir, { 'a.py': '1', 'b.py': '2', 'c.js': '3' });
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec', mode: 'greenfield' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.equal(task.promptContext.specMode, 'greenfield');
+  assert.equal(task.reasoningTier, undefined);
+});
+
+test('product_spec: no mode + a git repo with a committed source file -> auto brownfield', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  gitInitWithFiles(dir, { 'server/app.py': 'print(1)\n', 'README.md': '# x\n' });
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  assert.equal(nextProductSpecTask().promptContext.specMode, 'brownfield');
+});
+
+test('product_spec: no mode + a git repo with only a README -> auto greenfield', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  gitInitWithFiles(dir, { 'README.md': '# concept\n', 'notes.txt': 'ideas\n' });
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  const task = nextProductSpecTask();
+  assert.equal(task.promptContext.specMode, 'greenfield');
+  assert.equal(task.reasoningTier, undefined);
+});
+
+test('product_spec: no mode + repoRoot is not a git repo -> greenfield, no throw', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  fs.writeFileSync(path.join(dir, 'x.py'), '1'); // present but untracked / no git
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  assert.equal(nextProductSpecTask().promptContext.specMode, 'greenfield');
+});
+
+test('product_spec: no mode + a git repo with NO commits -> greenfield', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-mode-test-'));
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'a.py'), '1'); // staged-able but never committed
+  writeSpecRequest(dir, { id: 'bootstrap-1', requestText: 'seed the spec' });
+  const { nextProductSpecTask } = freshTaskSources(dir);
+  assert.equal(nextProductSpecTask().promptContext.specMode, 'greenfield');
+});
