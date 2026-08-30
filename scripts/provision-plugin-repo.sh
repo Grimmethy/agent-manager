@@ -108,12 +108,21 @@ EOF
 if [[ -n "$SEED_REQUEST_FILE" ]]; then
   if [[ -f "$SEED_REQUEST_FILE" ]]; then
     cp "$SEED_REQUEST_FILE" "$PIPELINE_DIR/queue/product-spec-requests/bootstrap-1.json"
-    echo "[provision] seeded product-spec-request from $SEED_REQUEST_FILE"
+    # This script scaffolds a brand-new repo -- greenfield by definition. Stamp
+    # "mode":"greenfield" unless the seed file already set a mode, so product_spec's
+    # file-count auto-detect can't misclassify a large scaffold as brownfield.
+    node -e '
+      const fs = require("fs"), p = process.argv[1];
+      const d = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (d.mode !== "greenfield" && d.mode !== "brownfield") { d.mode = "greenfield"; fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+    ' "$PIPELINE_DIR/queue/product-spec-requests/bootstrap-1.json"
+    echo "[provision] seeded product-spec-request (mode=greenfield) from $SEED_REQUEST_FILE"
   else
     echo "[provision] WARNING: seed request file not found: $SEED_REQUEST_FILE -- skipping (repo/pipeline still provisioned)" >&2
   fi
 else
   echo "[provision] no seed request given -- file one in $PIPELINE_DIR/queue/product-spec-requests/ before running product_spec"
+  echo "[provision]   (a scaffold like this is greenfield -- include \"mode\": \"greenfield\" in that request file)"
 fi
 
 bash "$SCRIPT_DIR/register-project.sh" "$NAME" "$REPO_DIR" "$PIPELINE_DIR"
