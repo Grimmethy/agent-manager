@@ -88,10 +88,10 @@ test('archiveOriginalTask returns null and does not clobber an already-archived 
   assert.equal(stillThere.preExisting, true);
 });
 
-test('applyStalenessAuditVerdict archives the original task when the report recommends archive', () => {
+test('applyStalenessAuditVerdict archives the original task on archive + a resolution signal (possibly-resolved flag)', () => {
   const dir = makeFixtureDir();
   writeOriginalTask(dir, 'blocked', 'orig-4');
-  const task = { id: 'staleness-audit-orig-4-1', promptContext: { originalTaskId: 'orig-4' } };
+  const task = { id: 'staleness-audit-orig-4-1', promptContext: { originalTaskId: 'orig-4', reasons: ['possibly-resolved'] } };
 
   const result = applyStalenessAuditVerdict({
     implementResponse: '1. Resolved.\n2. N/A.\n3. RECOMMENDATION: archive -- the file no longer has this issue.',
@@ -101,6 +101,7 @@ test('applyStalenessAuditVerdict archives the original task when the report reco
   assert.equal(result.skipped, true);
   assert.match(result.reason, /auto-archived original task "orig-4"/);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-4.json')), false);
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-4.json')));
 });
 
 test('applyStalenessAuditVerdict takes NO action when the report recommends a fresh investigation', () => {
@@ -138,4 +139,75 @@ test('applyStalenessAuditVerdict degrades gracefully (does not throw) if origina
     assert.equal(result.skipped, true);
     assert.match(result.reason, /no longer in blocked\/needs-clarification/);
   });
+});
+
+// --- verifiable-resolution-signal gate (2026-08-30) ----------------------------------
+const { holdForHumanReview, hasResolutionSignal } = require('./staleness-auto-archive.js');
+const { execFileSync } = require('child_process');
+
+test('archive + NO signal (fabrication-repeat / retries-exhausted only) -> original routed to needs-clarification, not archived', () => {
+  const dir = makeFixtureDir();
+  writeOriginalTask(dir, 'blocked', 'orig-nc', { history: [{ stage: 'blocked', at: 'x' }] });
+  const task = { id: 'sa-nc-1', promptContext: { originalTaskId: 'orig-nc', reasons: ['fabrication-repeat', 'retries-exhausted'] } };
+
+  const result = applyStalenessAuditVerdict({
+    implementResponse: '1. No.\n3. RECOMMENDATION: archive -- directory-level exclusion handles it.',
+    pipelineDir: dir, task,
+  });
+
+  assert.match(result.reason, /routed "orig-nc" to needs-clarification/);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-nc.json')), false, 'gone from blocked/');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-nc.json')), false, 'NOT archived');
+  const nc = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'needs-clarification', 'orig-nc.json'), 'utf8'));
+  assert.equal(nc.needsClarification.reason, 'design-decision');
+  assert.match(nc.needsClarification.openQuestions, /already resolved/);
+  assert.match(nc.needsClarification.openQuestions, /no verifiable evidence/);
+  assert.equal(nc.status, 'needs-clarification');
+  assert.ok(nc.history.some((h) => h.stage === 'needs-clarification'));
+});
+
+test('archive + a cited commit that actually exists -> archived', () => {
+  const dir = makeFixtureDir();
+  // a real git repo so checkCommitClaims can resolve the hash
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@t'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'x');
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'did the thing'], { cwd: dir });
+  const realHash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  writeOriginalTask(dir, 'blocked', 'orig-commit');
+
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  try {
+    const result = applyStalenessAuditVerdict({
+      implementResponse: `1. Yes, resolved.\n3. RECOMMENDATION: archive -- implemented in commit ${realHash}.`,
+      pipelineDir: dir, task: { id: 'sa-c-1', promptContext: { originalTaskId: 'orig-commit', reasons: ['stale-age'] } },
+    });
+    assert.match(result.reason, /auto-archived original task "orig-commit"/);
+    assert.ok(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-commit.json')));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+  }
+});
+
+test('hasResolutionSignal: possibly-resolved flag OR an existing cited commit; nothing else', () => {
+  assert.equal(hasResolutionSignal({ promptContext: { reasons: ['possibly-resolved'] } }, 'no commit here'), true);
+  assert.equal(hasResolutionSignal({ promptContext: { reasons: ['fabrication-repeat', 'retries-exhausted'] } }, 'RECOMMENDATION: archive'), false);
+  assert.equal(hasResolutionSignal({ promptContext: {} }, 'commit deadbeefdeadbeef did it'), false); // hash not real in this repo
+});
+
+test('holdForHumanReview: original already in needs-clarification/ -> advisory note appended, file not re-moved, existing needsClarification untouched', () => {
+  const dir = makeFixtureDir();
+  const ncDir = path.join(dir, 'queue', 'needs-clarification');
+  fs.mkdirSync(ncDir, { recursive: true });
+  const existing = { id: 'orig-already-nc', needsClarification: { reason: 'design-decision', openQuestions: 'ORIGINAL question -- keep me' }, history: [] };
+  fs.writeFileSync(path.join(ncDir, 'orig-already-nc.json'), JSON.stringify(existing));
+
+  const held = holdForHumanReview(dir, 'orig-already-nc', 'sa-x', 'RECOMMENDATION: archive -- probably fine');
+  assert.equal(held, 'orig-already-nc');
+  const after = JSON.parse(fs.readFileSync(path.join(ncDir, 'orig-already-nc.json'), 'utf8'));
+  assert.equal(after.needsClarification.openQuestions, 'ORIGINAL question -- keep me', 'existing question not clobbered');
+  assert.ok(after.history.some((h) => h.stage === 'advisory'));
 });
