@@ -250,8 +250,7 @@ test('an adhoc task where harness-search declines but local-agentic applies -- n
 // other budget gate by design), so they're the two call sites this pause has to check
 // directly rather than relying on the plan-call routing alone.
 test('an adhoc task declines the Claude fallback (never calls it) when Claude use is manually paused, after both local tiers decline', async () => {
-  await withFixtureRepo(async (draftTask, dir) => {
-    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+  await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-test-paused', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
     const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
@@ -261,6 +260,7 @@ test('an adhoc task declines the Claude fallback (never calls it) when Claude us
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn: async (dir2, fn) => fn(), draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+      isClaudePausedFn: () => true,
     });
 
     assert.equal(result.succeeded, false);
@@ -269,8 +269,7 @@ test('an adhoc task declines the Claude fallback (never calls it) when Claude us
 });
 
 test('a research task declines the Claude implement call (never calls it) when Claude use is manually paused', async () => {
-  await withFixtureRepo(async (draftTask, dir) => {
-    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+  await withFixtureRepo(async (draftTask) => {
     const task = {
       id: 'research-test-paused', domain: 'research', source: 'research_task', title: 'test',
       promptContext: { rawText: 'investigate something', tags: [] },
@@ -279,7 +278,7 @@ test('a research task declines the Claude implement call (never calls it) when C
     const localCall = async () => ({ response: 'plan text (paused, no tool access needed for this test)', degenerate: null, attempts: 1 });
     const draftResearchImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
 
-    const result = await draftTask(task, { localCall, withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn });
+    const result = await draftTask(task, { localCall, withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn, isClaudePausedFn: () => true });
 
     assert.equal(result.succeeded, false);
     assert.match(result.reason, /manually paused/);
@@ -1064,14 +1063,13 @@ test('brownfield product_spec: an implement-fn infra failure propagates as {succ
 });
 
 test('brownfield product_spec: declines the agentic call when Claude use is manually paused', async () => {
-  await withFixtureRepo(async (draftTask, dir) => {
-    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+  await withFixtureRepo(async (draftTask) => {
     const draftProductSpecImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
     const task = {
       id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
       promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield' },
     };
-    const result = await draftTask(task, { localCall: fakeLocalCall('x'), withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+    const result = await draftTask(task, { localCall: fakeLocalCall('x'), withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn, isClaudePausedFn: () => true });
     assert.equal(result.succeeded, false);
     assert.match(result.reason, /manually paused/);
   });

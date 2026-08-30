@@ -367,6 +367,7 @@ function runStalenessFastpath(task) {
 async function draftAdhocBranch(task, {
   maybeLocked, recordModelCall,
   draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+  isClaudePausedFn = isClaudePaused,
 }) {
   // Tiered escalation (2026-08-22, Grimmethy: "expand the tooling capabilities so
   // that the local reasoning model can handle the work... I'd like to see the
@@ -412,7 +413,7 @@ async function draftAdhocBranch(task, {
   // INFRA_FAILURE_PATTERN ("service unavailable") so a paused task gets the same
   // bounded-requeue-then-hold treatment a real transient outage already gets,
   // rather than inventing a third failure-handling path for one more reason string.
-  if (isClaudePaused(getConfig().pipelineDir)) {
+  if (isClaudePausedFn()) {
     return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
   }
   const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
@@ -460,11 +461,11 @@ async function draftAdhocBranch(task, {
 // would add nothing (there's no repo state to reason about, and "revision" of a research
 // write-up the model already finished is redundant with the normal review-task.js pass
 // this still flows into afterward).
-async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn }) {
+async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn = isClaudePaused }) {
   // Same manual pause kill switch as the adhoc branch -- research's own implement call is
   // ALSO an unconditional real Claude call with no local fallback path, so it needs the
   // same explicit check.
-  if (isClaudePaused(getConfig().pipelineDir)) {
+  if (isClaudePausedFn()) {
     return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
   }
   const researchResult = await draftResearchImplementFn(task, { recordModelCall });
@@ -487,8 +488,8 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
 // draftTask BEFORE runPlanPass (unlike adhoc/research, which route after) -- the blind
 // local plan pass has no code access and its `degenerate: empty` outcome hard-blocks the
 // task before any agentic pass could run, which is the exact failure this mode fixes.
-async function draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn }) {
-  if (isClaudePaused(getConfig().pipelineDir)) {
+async function draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn, isClaudePausedFn = isClaudePaused }) {
+  if (isClaudePausedFn()) {
     return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
   }
   const specResult = await draftProductSpecImplementFn(task, { recordModelCall });
@@ -948,6 +949,7 @@ async function draftTask(task, {
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
   draftResearchImplementFn = draftResearchImplement,
   draftProductSpecImplementFn = draftProductSpecImplement, withLockFn = defaultWithLock,
+  isClaudePausedFn = isClaudePaused,
 } = {}) {
   const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked } =
     resolveDraftContext(task, { localCall, withLockFn });
@@ -972,7 +974,7 @@ async function draftTask(task, {
     if (task.source === 'product_spec' && task.promptContext && task.promptContext.specMode === 'brownfield') {
       task.planResponse = 'Brownfield product_spec: the spec is written by a read-only, code-grounded agentic pass (Read/Grep/Glob against a throwaway clone of the real repo). The blind local plan pass is skipped by design -- it has no code access and empty-blocks on a real codebase.';
       appendHistoryEvent(task, 'plan-done', 'skipped (brownfield agentic path)');
-      return await draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn });
+      return await draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn, isClaudePausedFn });
     }
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
@@ -1013,6 +1015,7 @@ async function draftTask(task, {
         return await draftAdhocBranch(task, {
           maybeLocked, recordModelCall,
           draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+          isClaudePausedFn,
         });
       }
 
@@ -1020,7 +1023,7 @@ async function draftTask(task, {
       // draftResearchBranch(). Same "the agentic pass already produced the final artifact,
       // skip the local plan/critique/revision loop" reasoning as the adhoc branch.
       if (task.domain === 'research') {
-        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn });
+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn });
       }
 
       const implementOutcome = await runImplementPass(task, {
