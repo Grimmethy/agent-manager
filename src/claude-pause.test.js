@@ -9,56 +9,61 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { isClaudePaused } = require('./claude-pause.js');
+const { isClaudePaused, settingsPathFor } = require('./claude-pause.js');
 
-function withTempPipelineDir(settings, fn) {
+// isClaudePaused takes an explicit settings-file path as a test seam; production callers
+// pass nothing and get settingsPathFor() (the package root -- see the module header).
+function withTempSettingsFile(settings, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-pause-test-'));
+  const file = path.join(dir, 'dashboard-settings.json');
   if (settings !== undefined) {
-    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify(settings));
+    fs.writeFileSync(file, typeof settings === 'string' ? settings : JSON.stringify(settings));
   }
   try {
-    return fn(dir);
+    return fn(file);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
+test('settingsPathFor resolves to <packageRoot>/dashboard-settings.json (beside src/, matching app.py + agent-manager-common.sh)', () => {
+  const p = settingsPathFor();
+  assert.equal(path.basename(p), 'dashboard-settings.json');
+  assert.equal(path.dirname(p), path.resolve(__dirname, '..'));
+});
+
 test('isClaudePaused returns true when dashboard-settings.json has claudePaused: true', () => {
-  withTempPipelineDir({ claudePaused: true }, (dir) => {
-    assert.equal(isClaudePaused(dir), true);
+  withTempSettingsFile({ claudePaused: true }, (file) => {
+    assert.equal(isClaudePaused(file), true);
   });
 });
 
 test('isClaudePaused returns false when claudePaused is false', () => {
-  withTempPipelineDir({ claudePaused: false }, (dir) => {
-    assert.equal(isClaudePaused(dir), false);
+  withTempSettingsFile({ claudePaused: false }, (file) => {
+    assert.equal(isClaudePaused(file), false);
   });
 });
 
 test('isClaudePaused returns false when claudePaused is absent entirely', () => {
-  withTempPipelineDir({ claudeDefaultModel: 'sonnet' }, (dir) => {
-    assert.equal(isClaudePaused(dir), false);
+  withTempSettingsFile({ claudeDefaultModel: 'sonnet' }, (file) => {
+    assert.equal(isClaudePaused(file), false);
   });
 });
 
 test('isClaudePaused fails open (false) when dashboard-settings.json does not exist', () => {
-  withTempPipelineDir(undefined, (dir) => {
-    assert.equal(isClaudePaused(dir), false);
+  withTempSettingsFile(undefined, (file) => {
+    assert.equal(isClaudePaused(file), false);
   });
 });
 
 test('isClaudePaused fails open (false) on malformed JSON rather than throwing', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-pause-test-'));
-  fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), '{not valid json');
-  try {
-    assert.equal(isClaudePaused(dir), false);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  withTempSettingsFile('{not valid json', (file) => {
+    assert.equal(isClaudePaused(file), false);
+  });
 });
 
 test('isClaudePaused treats a truthy-but-non-boolean value as NOT paused (strict === true check)', () => {
-  withTempPipelineDir({ claudePaused: 'true' }, (dir) => {
-    assert.equal(isClaudePaused(dir), false);
+  withTempSettingsFile({ claudePaused: 'true' }, (file) => {
+    assert.equal(isClaudePaused(file), false);
   });
 });
