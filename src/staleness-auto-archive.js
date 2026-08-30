@@ -25,6 +25,30 @@
 
 const fs = require('fs');
 const path = require('path');
+const { appendHistoryEvent } = require('./task-history.js');
+const { checkCommitClaims } = require('./fact-checker.js');
+
+// staleness_audit exists to sweep brain-dump tasks whose concern the human ALREADY
+// resolved by hand, outside the pipeline, and never came back to archive. Auto-archiving
+// one of those is the whole point. What it must NOT do (confirmed live 2026-08-30, the
+// NSFW-images task): archive a task that was flagged `fabrication-repeat` /
+// `retries-exhausted` -- i.e. the pipeline TRIED and FAILED to build it -- on the strength
+// of a report that guesses it's "already covered" by loosely-related code, with no commit
+// that actually did it. "stuck" is not "stale". So auto-archive now requires a real
+// resolution signal; without one, the original task is routed to needs-clarification for
+// the human to decide, not silently dropped in the outbox.
+function hasResolutionSignal(task, reportText) {
+  // 1. The deterministic "real commits landed since this task was filed, touching files it
+  //    names" check -- staleness-audit.js's findFilesTouchedSince, recorded in reasons.
+  const reasons = (task && task.promptContext && task.promptContext.reasons) || [];
+  if (reasons.includes('possibly-resolved')) return true;
+  // 2. The report cites a commit hash that git confirms is a real object in this repo.
+  let repoRoot;
+  try { ({ repoRoot } = require('./config.js').getConfig()); } catch { return false; }
+  try {
+    return checkCommitClaims(reportText || '', repoRoot).some((c) => c.exists === true);
+  } catch { return false; }
+}
 
 // Same three-part structure stalenessAuditImplementPrompt (prompts.js) asks the model
 // for -- looks for a RECOMMENDATION line and reads the words immediately after it, up to
@@ -82,13 +106,64 @@ function archiveOriginalTask(pipelineDir, originalTaskId, stalenessAuditTaskId, 
   return null;
 }
 
+// The no-verifiable-signal path: instead of archiving, put the ORIGINAL task in front of a
+// human. If it's still in blocked/, move it to needs-clarification/ with a pre-filled
+// question; if it's already in needs-clarification/, just leave an advisory note (don't
+// re-move, don't clobber an existing needsClarification). Returns the original id on a
+// successful hold, null if the task is genuinely gone.
+function holdForHumanReview(pipelineDir, originalTaskId, stalenessAuditTaskId, reportText) {
+  if (!originalTaskId) return null;
+  const queueDir = path.join(pipelineDir, 'queue');
+  const excerpt = (reportText || '').slice(0, 500);
+
+  const ncPath = path.join(queueDir, 'needs-clarification', `${originalTaskId}.json`);
+  try {
+    const data = JSON.parse(fs.readFileSync(ncPath, 'utf8'));
+    appendHistoryEvent(data, 'advisory', `staleness_audit ${stalenessAuditTaskId} recommended archive, but with no verifiable resolution signal -- left here for you: ${excerpt.slice(0, 200)}`);
+    fs.writeFileSync(ncPath, JSON.stringify(data, null, 2));
+    return originalTaskId;
+  } catch { /* not in needs-clarification/ -- try blocked/ */ }
+
+  const blockedPath = path.join(queueDir, 'blocked', `${originalTaskId}.json`);
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(blockedPath, 'utf8'));
+  } catch {
+    return null; // genuinely gone (already archived / requeued by other means)
+  }
+
+  appendHistoryEvent(data, 'needs-clarification', `staleness_audit ${stalenessAuditTaskId} recommended archive without verifiable evidence -- escalated for a human decision`);
+  if (!data.needsClarification) {
+    data.needsClarification = {
+      reason: 'design-decision',
+      openQuestions: [
+        `An automated staleness audit (${stalenessAuditTaskId}) assessed this stuck task as likely already resolved:`,
+        '',
+        excerpt,
+        '',
+        'But it produced no verifiable evidence -- no commit that implemented it, and it did not show the current code covers every part of the request. If you already handled this outside the pipeline, use Archive. If it is still open, say what should change.',
+      ].join('\n'),
+    };
+  }
+  data.status = 'needs-clarification';
+
+  const destDir = path.join(queueDir, 'needs-clarification');
+  fs.mkdirSync(destDir, { recursive: true });
+  const destPath = path.join(destDir, `${originalTaskId}.json`);
+  if (fs.existsSync(destPath)) return null; // already there -- don't clobber
+  fs.writeFileSync(destPath, JSON.stringify(data, null, 2));
+  fs.unlinkSync(blockedPath);
+  return originalTaskId;
+}
+
 /**
  * Registered as staleness_audit's `apply` (task-sources.js) in place of the generic
  * applyVerdictOnly every other verdict-only source uses -- same {skipped, reason} return
  * shape apply-task.js's writeArtifact() already expects (this source never produces a
  * diff, so it always "skips" its OWN branch/commit step regardless of what happens here),
- * with a real side effect layered on top: an explicit archive recommendation moves the
- * ORIGINAL flagged task out of the live queue.
+ * with a real side effect layered on top: an explicit archive recommendation either moves
+ * the ORIGINAL flagged task out of the live queue (when there's a verifiable resolution
+ * signal) or escalates it to needs-clarification for a human (when there isn't).
  */
 function applyStalenessAuditVerdict({ implementResponse, pipelineDir, task }) {
   const text = (implementResponse || '').trim();
@@ -100,6 +175,22 @@ function applyStalenessAuditVerdict({ implementResponse, pipelineDir, task }) {
   }
 
   const originalTaskId = task && task.promptContext && task.promptContext.originalTaskId;
+
+  if (!hasResolutionSignal(task, text)) {
+    let heldId = null;
+    try {
+      heldId = holdForHumanReview(pipelineDir, originalTaskId, task && task.id, text);
+    } catch (e) {
+      return { skipped: true, reason: `recommended archive without a verifiable signal; the hold-for-human attempt failed: ${e.message}` };
+    }
+    return {
+      skipped: true,
+      reason: heldId
+        ? `recommended archive without a verifiable resolution signal (no possibly-resolved flag, no cited commit that exists) -- routed "${heldId}" to needs-clarification for a human instead of archiving`
+        : `recommended archive without a verifiable resolution signal, but original task "${originalTaskId}" was no longer in blocked/needs-clarification`,
+    };
+  }
+
   let archivedId = null;
   try {
     archivedId = archiveOriginalTask(pipelineDir, originalTaskId, task && task.id, text);
@@ -115,4 +206,4 @@ function applyStalenessAuditVerdict({ implementResponse, pipelineDir, task }) {
   return { skipped: true, reason };
 }
 
-module.exports = { applyStalenessAuditVerdict, parseStalenessRecommendation, archiveOriginalTask };
+module.exports = { applyStalenessAuditVerdict, parseStalenessRecommendation, archiveOriginalTask, holdForHumanReview, hasResolutionSignal };
