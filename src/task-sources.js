@@ -21,6 +21,7 @@ const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
+const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -1635,11 +1636,17 @@ registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit'
 //     runPlanPass -> runImplementPass path.
 //   - BROWNFIELD (`mode` is "brownfield", OR auto-detected: repoRoot is a git repo with
 //     >=1 commit AND >=1 tracked source-extension file): the request describes structure
-//     that already exists in code. Sets promptContext.specMode='brownfield' and a
-//     per-task reasoningTier:'high'; local-draft.js routes it to draftProductSpecBranch
-//     -> product-spec-agentic-draft.js, a read-only Read/Grep/Glob agentic Claude pass
-//     against a throwaway clone. The blind local plan is skipped -- it has no code access
-//     and empty-blocks on a real codebase (the exact failure this mode fixes).
+//     that already exists in code and is too big for one blind local pass (which
+//     empty-blocks on a real codebase). nextProductSpecOutlineTask -- NOT
+//     nextProductSpecTask -- claims it and emits a `product_spec_outline` task: the LOCAL
+//     model, grounded by harness grep (harnessSearch:'archImport' -- propose QUERY: terms,
+//     the harness greps the repo), decomposes the request into ordered `### AC-NNN`
+//     section candidates in Docs/PRODUCT_SPEC_OUTLINE.md (reusing backlog_decomposition's
+//     AC-NNN format + generic writer), and its apply also seeds Docs/PRODUCT_SPEC.md as an
+//     ordered marker skeleton (product-spec-assembly.js). `product_spec_section` then
+//     consumes that outline one AC at a time (nextCandidateFulfillmentTask), each section
+//     drafted locally into its own skeleton block. No subscription agent anywhere -- see
+//     the 2026-08-30 redesign (the earlier read-only Claude agentic pass was removed).
 const SPEC_SOURCE_EXTS = new Set([
   '.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java', '.rb', '.php',
   '.c', '.cc', '.cpp', '.h', '.cs', '.kt', '.swift', '.scala', '.ex', '.exs',
@@ -1663,8 +1670,13 @@ function detectSpecMode(repoRoot) {
     return 'greenfield';
   }
 }
-function nextProductSpecTask() {
-  const { pipelineDir, repoRoot, productSpecPath, defaultDomain } = getConfig();
+// Shared request-file reader for BOTH product_spec lanes. Scans
+// queue/product-spec-requests/*.json oldest-first and returns the first request whose
+// resolved specMode matches `laneMode` and whose lane-specific task id
+// (`${idPrefix}-${requestId}`) is not already in the queue. promptContext is identical for
+// both lanes; the caller wraps it in the lane's own task shape.
+function readNextProductSpecRequest(laneMode, idPrefix) {
+  const { pipelineDir, repoRoot, productSpecPath } = getConfig();
   const requestsDir = path.join(pipelineDir, 'queue', 'product-spec-requests');
   const specRelPath = path.relative(repoRoot, productSpecPath);
 
@@ -1692,31 +1704,25 @@ function nextProductSpecTask() {
     }
     if (!parsed || typeof parsed.id !== 'string' || !parsed.id.trim() || typeof parsed.requestText !== 'string' || !parsed.requestText.trim()) continue;
 
-    const id = `product-spec-${parsed.id.trim()}`;
-    if (taskIdExistsInQueue(id)) continue;
-
-    // A missing spec doc is the legitimate bootstrap case (this is the FIRST request ever
-    // filed for this project), not an error -- currentSpec is just the empty string and
-    // the implement prompt is told explicitly that it's creating the doc, not editing it.
-    const currentSpec = readIfExists(productSpecPath) || '';
-
     // Explicit `mode` in the request file wins; otherwise auto-detect. See this source's
     // header for the two modes.
     const explicitMode = parsed.mode === 'brownfield' || parsed.mode === 'greenfield' ? parsed.mode : null;
     const specMode = explicitMode || detectSpecMode(repoRoot);
+    if (specMode !== laneMode) continue;
+
+    const requestId = parsed.id.trim();
+    if (taskIdExistsInQueue(`${idPrefix}-${requestId}`)) continue;
+
+    // A missing spec doc is the legitimate bootstrap case (this is the FIRST request ever
+    // filed for this project), not an error -- currentSpec is just the empty string and
+    // the prompts are told explicitly that they are creating the doc, not editing it.
+    const currentSpec = readIfExists(productSpecPath) || '';
 
     return {
-      id,
-      domain: defaultDomain,
-      source: 'product_spec',
-      title: parsed.title || `Product spec: ${parsed.id.trim()}`,
-      // Per-task tier so a brownfield task claims on the Claude lane (its agentic pass is
-      // a hardcoded Claude call regardless, but lane/claim accounting must agree).
-      // reasoningTierFor() checks task.reasoningTier first (model-provider.js). Greenfield
-      // leaves it unset -> resolves 'low' -> unchanged local path.
-      ...(specMode === 'brownfield' ? { reasoningTier: 'high' } : {}),
+      requestId,
+      title: parsed.title,
       promptContext: {
-        requestId: parsed.id.trim(),
+        requestId,
         requestText: parsed.requestText,
         currentSpec,
         specExists: currentSpec.trim().length > 0,
@@ -1728,7 +1734,75 @@ function nextProductSpecTask() {
 
   return null;
 }
+
+// GREENFIELD lane: no real code to read yet -- the request text + current spec ARE the
+// grounding. Unchanged local runPlanPass -> runImplementPass path (no reasoningTier, no
+// special routing).
+function nextProductSpecTask() {
+  const r = readNextProductSpecRequest('greenfield', 'product-spec');
+  if (!r) return null;
+  return {
+    id: `product-spec-${r.requestId}`,
+    domain: getConfig().defaultDomain,
+    source: 'product_spec',
+    title: r.title || `Product spec: ${r.requestId}`,
+    promptContext: r.promptContext,
+  };
+}
 registerTaskSource('product_spec', { priority: taskPriority('product_spec', 15), next: nextProductSpecTask });
+
+// BROWNFIELD lane, step 1 -- decompose the request into ordered `### AC-NNN` section
+// candidates on the LOCAL model, grounded by harness grep. Mirrors backlog_decomposition
+// (same AC-NNN format, same generic writer). applyProductSpecOutline additionally seeds
+// Docs/PRODUCT_SPEC.md as an ordered marker skeleton so step 2 fills sections
+// independently. Branch + human merge is the "approve this decomposition" gate -- no
+// product_spec_section task can start until the outline doc is on repoRoot.
+function nextProductSpecOutlineTask() {
+  const r = readNextProductSpecRequest('brownfield', 'product-spec-outline');
+  if (!r) return null;
+  return {
+    id: `product-spec-outline-${r.requestId}`,
+    domain: getConfig().defaultDomain,
+    source: 'product_spec_outline',
+    title: r.title ? `Outline product spec: ${r.title}` : `Outline product spec into sections: ${r.requestId}`,
+    promptContext: r.promptContext,
+  };
+}
+registerTaskSource('product_spec_outline', {
+  priority: taskPriority('product_spec_outline', 14),
+  next: nextProductSpecOutlineTask,
+  apply: ({ implementResponse }) => {
+    const { productSpecOutlineCandidatesPath, productSpecPath } = getConfig();
+    return applyProductSpecOutline({ implementResponse, candidatesPath: productSpecOutlineCandidatesPath, specPath: productSpecPath });
+  },
+  emptyApproval: true,          // "no sections needed for this request" is a valid, auto-approved outcome
+  harnessSearch: 'archImport',  // plan pass proposes QUERY: terms; the harness greps the repo
+});
+
+// BROWNFIELD lane, step 2 -- draft each section, one AC-NNN at a time, in outline order. A
+// candidate-fulfillment consumer of Docs/PRODUCT_SPEC_OUTLINE.md; each task's implement
+// pass emits ONE Group-B `edit` replacing that section's `_(pending)_` marker block in
+// Docs/PRODUCT_SPEC.md (product-spec-assembly.js / productSpecSectionImplementPrompt).
+// Sections touch disjoint byte ranges so their branches merge cleanly regardless of order.
+// NO emptyApproval -- a section it cannot draft should retry/escalate, not auto-close (the
+// same reason arch_review drops emptyApproval on its fulfillment half). It ALSO gets its
+// own harness grep pass on top of the files the outline already named (fetchedFiles).
+function nextProductSpecSectionTask() {
+  const { productSpecOutlineCandidatesPath, productSpecPath, repoRoot } = getConfig();
+  const task = nextCandidateFulfillmentTask(productSpecOutlineCandidatesPath, 'product_spec_section');
+  // nextCandidateFulfillmentTask is generic and doesn't know the spec doc path the edit
+  // must target -- add it here so productSpecSectionImplementPrompt can name `file`.
+  if (task) task.promptContext.specRelPath = path.relative(repoRoot, productSpecPath);
+  return task;
+}
+registerTaskSource('product_spec_section', {
+  priority: taskPriority('product_spec_section', 13),   // consumer outranks its generator
+  next: nextProductSpecSectionTask,
+  candidateFulfillment: true,
+  candidatesPath: () => getConfig().productSpecOutlineCandidatesPath,
+  candidateDocTitle: OUTLINE_DOC_TITLE,
+  harnessSearch: 'archImport',
+});
 
 // --- Source: backlog_decomposition (2026-08-20, Grimmethy: "Build the backlog-
 // decomposition source") -- the other half of the gap identified when this all started:
@@ -1891,6 +1965,8 @@ module.exports = {
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
   nextProductSpecTask,
+  nextProductSpecOutlineTask,
+  nextProductSpecSectionTask,
   nextBacklogDecompositionTask,
   existingQueuedTaskTitles,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene): its register.js

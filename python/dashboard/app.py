@@ -2024,6 +2024,12 @@ def _task_input_summary(task: dict) -> list[dict]:
         if rel:
             note = "updating the existing spec" if pc.get("specExists") else "new file"
             out.append({"label": "Output", "text": f"{rel} ({note})"})
+    elif task.get("source") == "product_spec_outline":
+        out.append({"label": "Output", "text": "PRODUCT_SPEC_OUTLINE.md (AC-NNN section candidates) + a marker skeleton for the spec doc"})
+    elif task.get("source") == "product_spec_section":
+        rel = pc.get("specRelPath")
+        if rel:
+            out.append({"label": "Output", "text": f"{rel} (fills one section's placeholder block)"})
     return out
 
 
@@ -5216,6 +5222,8 @@ _SOURCE_TO_DOMAIN_KEY = {
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
     "path_prefetch_resolve": "path_prefetch_resolve", "pipeline_self_audit": "adhoc",
     "staleness_audit": "default",
+    "product_spec": "default", "product_spec_outline": "default", "product_spec_section": "default",
+    "backlog_decomposition": "default", "backlog_fulfillment": "default",
 }
 
 _DOMAIN_DEFAULTS_TO_ENSURE = {
@@ -5268,7 +5276,9 @@ SOURCE_DESCRIPTIONS = {
     "pipeline_health_audit": "Periodic deterministic check of the pipeline's own health signals; files an advisory when something looks wrong.",
     "ui_visibility_audit": "Checks that pipeline state a human needs is actually surfaced in the dashboard; files an advisory for a gap.",
     "staleness_audit": "Deterministically scans queue/blocked/ and queue/needs-clarification/ for an old or repeatedly-rejected task; files an advisory asking whether the original concern still holds. Never applies anything.",
-    "product_spec": "Drafts or updates a greenfield product's spec doc.",
+    "product_spec": "GREENFIELD lane: drafts or updates a concept-only product's spec doc blind on the local model (request text + current spec are the only grounding). A brownfield request goes to product_spec_outline instead.",
+    "product_spec_outline": "BROWNFIELD lane, step 1: decomposes a product-spec request against a real codebase into ordered AC-NNN section candidates in PRODUCT_SPEC_OUTLINE.md, on the local model, grounded by harness grep. Its apply also seeds PRODUCT_SPEC.md as a marker skeleton.",
+    "product_spec_section": "BROWNFIELD lane, step 2: drafts one PRODUCT_SPEC_OUTLINE.md section at a time (candidate-fulfillment) into its placeholder block in PRODUCT_SPEC.md, on the local model, grounded by that section's files plus its own harness grep.",
     "backlog_decomposition": "Breaks a product-spec backlog item into AC-NNN candidates in BACKLOG_CANDIDATES.md.",
     "backlog_fulfillment": "Consumes a Strong BACKLOG_CANDIDATES.md entry into a real diff -- same fulfillment logic as arch_review.",
 }

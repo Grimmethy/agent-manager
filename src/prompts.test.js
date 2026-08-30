@@ -177,6 +177,58 @@ test('buildImplementPrompt for backlog_decomposition emits the same AC-NNN candi
   assert.match(prompt, /whatever comes first in your output gets built first/);
 });
 
+// product_spec brownfield lane (2026-08-30 redesign): product_spec_outline decomposes a
+// brownfield request into ordered AC-NNN section candidates on the local model, grounded
+// by harness grep; product_spec_section drafts each section as a Group-B edit against a
+// marker block in PRODUCT_SPEC.md.
+function productSpecOutlineTask() {
+  return {
+    domain: 'default', source: 'product_spec_outline', title: 'seed',
+    promptContext: {
+      requestText: 'document the generate endpoint',
+      currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield',
+      harnessHits: [{ file: 'server/app.py', line: 3, query: 'generate', text: 'def generate():' }],
+      harnessFiles: [{ path: 'server/app.py', content: 'def generate():\n    return 1\n' }],
+    },
+  };
+}
+
+test('buildPlanPrompt for product_spec_outline asks for QUERY: terms and an ordered, code-grounded section plan', () => {
+  const prompt = buildPlanPrompt(productSpecOutlineTask());
+  assert.match(prompt, /scoping the SECTIONS/);
+  assert.match(prompt, /QUERY: <search terms>/);
+  assert.match(prompt, /IN DOC ORDER/);
+  assert.match(prompt, /grounded in the real code/);
+});
+
+test('buildImplementPrompt for product_spec_outline renders the harness hits/files and demands the AC-NNN section format', () => {
+  const prompt = buildImplementPrompt(productSpecOutlineTask(), 'PLAN:\n1. Data model\n2. API');
+  assert.match(prompt, /server\/app\.py:3/);            // hit rendered
+  assert.match(prompt, /def generate\(\):/);            // file content rendered
+  assert.match(prompt, /### AC-NNN · Section Title/);
+  assert.match(prompt, /Strength: Strong/);
+  assert.match(prompt, /Problem:[\s\S]*Solution:[\s\S]*Benefits:/);
+  assert.match(prompt, /IN PLAN ORDER/);
+});
+
+test('buildImplementPrompt for product_spec_section instructs a Group-B edit whose find is pendingBlock() verbatim', () => {
+  const { pendingBlock } = require('./product-spec-assembly.js');
+  const task = {
+    domain: 'default', source: 'product_spec_section', title: 'AC-2 · Generate API',
+    promptContext: {
+      candidateId: 'AC-2', title: 'Generate API', files: ['server/app.py'],
+      fetchedFiles: [{ path: 'server/app.py', content: 'def generate():\n    return 1\n' }],
+      body: '### AC-2 · Generate API\nStrength: Strong\nFiles: server/app.py\n\nProblem:\np\nSolution:\ns\nBenefits:\nb',
+      specRelPath: 'Docs/PRODUCT_SPEC.md',
+    },
+  };
+  const prompt = buildImplementPrompt(task, 'PLAN:\n1. state the route');
+  assert.ok(prompt.includes(pendingBlock('AC-2', 'Generate API')), 'the exact find anchor must appear verbatim in the prompt');
+  assert.match(prompt, /Group-B "edit" against the spec doc "Docs\/PRODUCT_SPEC\.md"/);
+  assert.match(prompt, /def generate\(\):/);          // fetched code rendered
+  assert.match(prompt, /copied character for character/);
+});
+
 // backlog_fulfillment reuses arch_review's own prompt builders verbatim -- these tests
 // just confirm the registration actually wires that reuse up, not the prompt content
 // itself (already covered by arch_review's own behavior).
