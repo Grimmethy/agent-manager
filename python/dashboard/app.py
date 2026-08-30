@@ -4426,23 +4426,95 @@ def api_project_positions():
     return jsonify({"saved": True})
 
 
+# Daemon-script command-line fragments scripts/launch.sh starts and scripts/stop.sh
+# stops -- the same set stop.sh's own stray-sweep matches (minus the dashboard, which is
+# always running and is not "the pipeline"). Used for a real process check so this file
+# never again has to trust a heartbeat timestamp alone to decide whether a stop is
+# possible. Matched with `pgrep -f` against the script path fragment, so it works whether
+# the pipeline dir is the real path or a symlink to it.
+_PIPELINE_DAEMON_PGREP_RE = r"agent-manager/scripts/(launch|local-worker|review-runner|queue-watcher)\.sh|agent-manager/scripts/\.\./src/(local-draft|apply-task)\.js"
+
+
+def _pid_alive(pid) -> bool:
+    """True if `pid` names a live process (whether or not this user can signal it)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _pipeline_daemon_pids() -> list:
+    """PIDs of live pipeline daemon processes right now, by real process scan -- the
+    ground truth a stop actually acts on, independent of any heartbeat file. Empty when
+    `pgrep` is unavailable or finds nothing; callers treat "empty" as "nothing to stop"
+    only in combination with the heartbeat check, never on its own."""
+    try:
+        res = subprocess.run(
+            ["pgrep", "-f", _PIPELINE_DAEMON_PGREP_RE],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(p) for p in res.stdout.split() if p.strip().isdigit()]
+
+
+def _pipeline_stoppable() -> bool:
+    """Is there anything a stop would actually kill? Deliberately looser than
+    _pipeline_running(): a live daemon process counts even if every heartbeat file is
+    missing or stale. This is what gates the dashboard's Stop control, so a wrong
+    _pipeline_running() (a blocked-on-lock worker reading as dead, a deleted heartbeat, a
+    future timestamp-parsing regression like the 2026-07-22 one) can never again strand a
+    real running pipeline with no way to stop it from the UI."""
+    if _pipeline_running():
+        return True
+    if _pipeline_daemon_pids():
+        return True
+    inst_dir = instances_dir()
+    if inst_dir and inst_dir.is_dir():
+        for name in ("worker-1", "worker-reasoning", "review-runner", "queue-watchdog"):
+            data = read_json_safe(inst_dir / f"{name}.json")
+            if data and data.get("pid") and _pid_alive(data["pid"]):
+                return True
+    return False
+
+
 def _pipeline_running() -> bool:
-    """A pipeline counts as running if worker-1's own heartbeat is fresh -- the other 3
+    """A pipeline counts as running if worker-1's own heartbeat is fresh -- the other
     loops matter too, but the worker is the one that actually produces work, and checking
-    just one avoids this being wrong the moment any ONE of the other 3 is mid-restart."""
+    just one avoids this being wrong the moment any ONE of the others is mid-restart.
+
+    Fallbacks (2026-08-30, after a live incident where worker-1 sat status:'queued'
+    blocked on the model lock for >OTHER_STALE_SECONDS behind a wedged local-agentic
+    pass -- its heartbeat legitimately stops updating while blocked, so the fresh-
+    heartbeat check alone read the whole running pipeline as stopped and the dashboard
+    hid its own Stop button): if the heartbeat is stale/missing, fall back to whether the
+    recorded worker/reviewer PID is still a live process, and finally to a real daemon
+    process scan. A blocked worker is still a running pipeline."""
     inst_dir = instances_dir()
     if not inst_dir or not inst_dir.is_dir():
-        return False
+        return bool(_pipeline_daemon_pids())
+
     worker_hb = inst_dir / "worker-1.json"
     data = read_json_safe(worker_hb)
-    if not data or not data.get("lastHeartbeat"):
-        return False
-    last_hb = parse_hb_timestamp(data["lastHeartbeat"])
-    if not last_hb:
-        return False
-    age = (datetime.now(timezone.utc) - last_hb).total_seconds()
-    threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
-    return age <= threshold
+    if data and data.get("lastHeartbeat"):
+        last_hb = parse_hb_timestamp(data["lastHeartbeat"])
+        if last_hb:
+            age = (datetime.now(timezone.utc) - last_hb).total_seconds()
+            threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
+            if age <= threshold:
+                return True
+
+    # Stale or unparseable heartbeat -- believe a live process over a stale timestamp.
+    for name in ("worker-1", "worker-reasoning", "review-runner"):
+        d = read_json_safe(inst_dir / f"{name}.json")
+        if d and d.get("pid") and _pid_alive(d["pid"]):
+            return True
+    return bool(_pipeline_daemon_pids())
 
 
 # --- Unmerged branches (the "sandbox" visibility gap) -----------------------------------
@@ -4941,9 +5013,15 @@ def api_git_merge_branch(branch):
 @app.route("/api/pipeline/status")
 def api_pipeline_status():
     env = read_env_file(ENV_FILE_PATH)
+    running = _pipeline_running()
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
-        "running": _pipeline_running(),
+        "running": running,
+        # "stoppable" is looser than "running": true whenever a real daemon process
+        # exists, even if every heartbeat says otherwise. The frontend gates its Stop
+        # control on (running || stoppable) so a wrong "running" can never hide the only
+        # way to stop a live pipeline from the UI (2026-08-30 incident).
+        "stoppable": True if running else _pipeline_stoppable(),
         # Which job types actually run is no longer a bundled "mode" -- see /api/job-types.
         # includeApply/skipPush are the two run-specific safety toggles that used to be
         # implied by mode; they're per-repoRoot and persisted the same way REPO_ROOT is.
