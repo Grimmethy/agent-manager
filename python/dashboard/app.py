@@ -670,40 +670,47 @@ def write_env_value(env_path: Path, key: str, value: str):
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def get_active_repo_root() -> str | None:
-    """Env vars (set by launch.bat, or by whatever launched this process) win first --
-    that's still how the 4 pipeline loops themselves get configured. Falling back to
-    reading agent-manager.env directly means the dashboard also works when started with
-    NO env vars pre-set at all (e.g. launch.bat now starts it unconditionally, project
-    or not) and still remembers whatever project was last started via the Project tab."""
-    v = os.environ.get("AGENT_MANAGER_REPO_ROOT")
+def _active_project_setting(key: str) -> str | None:
+    """Which project the dashboard is showing, and where its queue/state lives. The
+    agent-manager.env FILE wins over os.environ for these -- inverted from the usual
+    "env overrides file" precedence (2026-08-30, live incident: the dashboard silently
+    served the wrong project's queue after a hot-reload).
+
+    Rationale: the ONLY way the dashboard switches project is Project tab -> _start_pipeline(),
+    which always writes the new value to agent-manager.env. os.environ, by contrast, goes
+    STALE: Werkzeug's reloader re-execs this process on every .py change from the reloader
+    SUPERVISOR's launch-time environment, discarding the os.environ mutation _start_pipeline
+    made in the (now-dead) child -- so after any hot-reload the env var holds whatever
+    project the dashboard was FIRST launched against, while the file holds the truth. The
+    4 pipeline loop scripts are unaffected: they `source` agent-manager.env directly and
+    never call this. os.environ stays as the fallback for a dashboard started before
+    anything was written to the file."""
+    v = read_env_file(ENV_FILE_PATH).get(key)
     if v:
         return v
-    return read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_REPO_ROOT")
+    return os.environ.get(key)
+
+
+def get_active_repo_root() -> str | None:
+    return _active_project_setting("AGENT_MANAGER_REPO_ROOT")
 
 
 def get_active_grep_dirs() -> str | None:
-    """Same env-then-file resolution as get_active_repo_root(), for the one other setting
-    Ornith's harness-mediated retrieval needs (discuss_sessions.py's
+    """The one other setting Ornith's harness-mediated retrieval needs (discuss_sessions.py's
     _local_harness_context) -- grep-codebase-tool.js/arch-import-fetch.js's own repoRoot-
     relative search scope. Unset means grep_fetch_client falls back to the same
     'frontend/src,backend/src' default src/config.js's getConfig() already uses for every
-    other AGENT_MANAGER_GREP_DIRS consumer."""
-    v = os.environ.get("AGENT_MANAGER_GREP_DIRS")
-    if v:
-        return v
-    return read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_GREP_DIRS")
+    other AGENT_MANAGER_GREP_DIRS consumer. Same file-first resolution as
+    get_active_repo_root() -- see _active_project_setting()."""
+    return _active_project_setting("AGENT_MANAGER_GREP_DIRS")
 
 
 def get_pipeline_dir() -> Path | None:
-    pipeline_dir = os.environ.get("AGENT_MANAGER_PIPELINE_DIR")
+    pipeline_dir = _active_project_setting("AGENT_MANAGER_PIPELINE_DIR")
     if pipeline_dir:
         return Path(pipeline_dir)
     repo_root = get_active_repo_root()
-    if not repo_root:
-        return None
-    pipeline_dir = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_PIPELINE_DIR") or repo_root
-    return Path(pipeline_dir)
+    return Path(repo_root) if repo_root else None
 
 
 def queue_dir() -> Path | None:
