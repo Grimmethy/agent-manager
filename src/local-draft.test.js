@@ -1006,3 +1006,91 @@ test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be em
     assert.match(result.blockedReason, /Plan pass degenerate: empty/);
   });
 });
+
+// --- product_spec brownfield routing (2026-08-30) -------------------------------------
+// Brownfield product_spec skips the blind local plan pass entirely and routes to the
+// code-grounded agentic branch BEFORE runPlanPass. Greenfield is byte-for-byte unchanged.
+
+test('brownfield product_spec: draftTask routes to the injected implement fn, skips the plan pass, lands needs-review', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let localCalled = false;
+    const localCall = async () => { localCalled = true; return { response: 'should not run', degenerate: null, attempts: 1 }; };
+    let implFnGotTask = null;
+    const draftProductSpecImplementFn = async (t) => {
+      implFnGotTask = t;
+      t.implementResponse = JSON.stringify({ mode: 'create', file: 'Docs/PRODUCT_SPEC.md', content: '# Spec\n\nbody' });
+      return { succeeded: true, blocked: false };
+    };
+    const task = {
+      id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed the spec', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield' },
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(localCalled, false, 'the blind local plan pass must be skipped for brownfield');
+    assert.equal(task.status, 'needs-review');
+    assert.match(task.planResponse, /Brownfield product_spec/);
+    assert.ok(implFnGotTask === task);
+  });
+});
+
+test('brownfield product_spec: an implement-fn block propagates as a blocked draftTask result', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const draftProductSpecImplementFn = async () => ({ succeeded: true, blocked: true, blockedReason: 'Product spec insufficient-context: could not find the API layer' });
+    const task = {
+      id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield' },
+    };
+    const result = await draftTask(task, { localCall: fakeLocalCall('x'), withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /insufficient-context/);
+  });
+});
+
+test('brownfield product_spec: an implement-fn infra failure propagates as {succeeded:false}', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const draftProductSpecImplementFn = async () => ({ succeeded: false, reason: 'could not clone repo (service unavailable) -- will retry.' });
+    const task = {
+      id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield' },
+    };
+    const result = await draftTask(task, { localCall: fakeLocalCall('x'), withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+    assert.equal(result.succeeded, false);
+    assert.match(result.reason, /service unavailable/);
+  });
+});
+
+test('brownfield product_spec: declines the agentic call when Claude use is manually paused', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.writeFileSync(path.join(dir, 'dashboard-settings.json'), JSON.stringify({ claudePaused: true }));
+    const draftProductSpecImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
+    const task = {
+      id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'brownfield' },
+    };
+    const result = await draftTask(task, { localCall: fakeLocalCall('x'), withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+    assert.equal(result.succeeded, false);
+    assert.match(result.reason, /manually paused/);
+  });
+});
+
+test('greenfield product_spec: unchanged -- runs the normal local plan+implement path, never the agentic fn', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const draftProductSpecImplementFn = async () => { throw new Error('greenfield must never call the brownfield agentic fn'); };
+    let sawPlanPrompt = false;
+    const localCall = async (opts) => {
+      if ((opts.prompt || '').includes('product specification document')) sawPlanPrompt = true;
+      return { response: '{"mode":"create","file":"Docs/PRODUCT_SPEC.md","content":"# Spec"}', degenerate: null, attempts: 1 };
+    };
+    const task = {
+      id: 'product-spec-bootstrap-1', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed the spec', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'greenfield' },
+    };
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), draftProductSpecImplementFn });
+    assert.equal(result.succeeded, true);
+    assert.equal(sawPlanPrompt, true, 'greenfield must still run the local plan pass');
+  });
+});

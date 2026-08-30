@@ -885,15 +885,17 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
   ].join('\n');
 }
 
-// product_spec (2026-08-20, see task-sources.js's nextProductSpecTask header for the full
-// motivation): no harness search, unlike pipeline_self_audit/arch_import right above --
-// the request text and the current spec doc ARE the grounding, both handed over directly.
-// The one thing this prompt insists on that a plain "write me a doc" prompt wouldn't:
-// flag a real conflict with an EXISTING decision explicitly rather than silently
-// overwriting it. A spec is the one artifact every later feature task gets grounded
-// against -- a silently-resolved contradiction here is far more expensive than the same
-// mistake in one throwaway code diff, since it propagates into everything built on top of
-// it before anyone notices.
+// product_spec GREENFIELD path (2026-08-20, see task-sources.js's nextProductSpecTask
+// header for the full motivation): the request text and the current spec doc ARE the
+// grounding, both handed over directly -- there is no code to read because the project
+// doesn't exist yet, the spec INVENTS its entities. (The BROWNFIELD path -- an existing
+// codebase -- skips these two prompts entirely for buildProductSpecAgenticPrompt below,
+// which reads the real code.) The one thing this prompt insists on that a plain "write me
+// a doc" prompt wouldn't: flag a real conflict with an EXISTING decision explicitly
+// rather than silently overwriting it. A spec is the one artifact every later feature
+// task gets grounded against -- a silently-resolved contradiction here is far more
+// expensive than the same mistake in one throwaway code diff, since it propagates into
+// everything built on top of it before anyone notices.
 function productSpecPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -938,6 +940,68 @@ function productSpecImplementPrompt(task, planText) {
     '',
     groupBJsonInstructions,
   ].join('\n');
+}
+
+// product_spec BROWNFIELD path (2026-08-30): the target project already has a real
+// codebase, cloned read-only for this pass. Unlike the greenfield prompts above, the
+// grounding is the CODE, not the request author's prose -- the model reads real files
+// with Read/Grep/Glob and writes the spec as markdown ending with a SPEC: sentinel.
+// draftProductSpecImplement (product-spec-agentic-draft.js) then deterministically wraps
+// that markdown into a Group-B create/edit JSON -- the model is never asked to reproduce
+// a giant JSON string, which is this pipeline's most repeated failure mode.
+function buildProductSpecAgenticPrompt(task, repoClone) {
+  const ctx = task.promptContext || {};
+  const lines = [
+    'You are writing (or maintaining) the product specification document for a WORKING '
+      + 'software project. The real code has been cloned read-only for you at: '
+      + `${repoClone.dir}. You have Read/Grep/Glob tool access to that exact directory -- `
+      + 'use it. Everything you state about how the system actually works MUST come from a '
+      + 'file you opened yourself, cited by real relative path (e.g. server/app.py) and, '
+      + 'where relevant, the real route/function/symbol -- never from a guess or from a '
+      + "README's prose description of what the code probably does. There is no "
+      + 'Write/Edit/Bash access here -- this is read-only investigation.',
+    '',
+    `Title: ${task.title || ''}`,
+    '',
+    'THE REQUEST (this is the SCOPE -- cover ONLY what it concerns; do not spec the whole '
+      + 'app unless the request explicitly asks for that):',
+    ctx.requestText || '',
+    '',
+  ];
+  if (ctx.specExists) {
+    lines.push(
+      'CURRENT SPEC (already exists -- treat everything in it as settled unless this '
+        + 'request changes it; if the real code contradicts a decision recorded here, note '
+        + 'the conflict explicitly rather than silently overwriting it):',
+      '```',
+      ctx.currentSpec,
+      '```',
+      '',
+    );
+  } else {
+    lines.push(
+      'No spec exists yet -- write the FIRST version, scoped to the request above, with '
+        + 'clear `##` section headings a later request can anchor an edit against (e.g. '
+        + '`## Entities`, `## API`, `## Decisions`).',
+      '',
+    );
+  }
+  lines.push(
+    `The spec document's path is ${ctx.specRelPath} (context only -- you output markdown, `
+      + 'not a file operation).',
+    '',
+    'When you are completely done, end your FINAL message with exactly one of these two '
+      + 'lines (nothing after it on that line):',
+    'SPEC: written',
+    'SPEC: insufficient-context',
+    '',
+    'If "written", everything BEFORE that line is the spec document itself -- start it '
+      + 'with a `#` heading, no preamble like "Here is the spec". Do NOT output JSON, a '
+      + 'diff, or code fences wrapping the whole document -- just the markdown body then '
+      + 'the sentinel line. If "insufficient-context", briefly explain what you could not '
+      + 'determine from the code instead of guessing at it.',
+  );
+  return lines.join('\n');
 }
 
 // backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
@@ -1301,6 +1365,7 @@ module.exports = {
   archDiscoveryPlanPrompt, archDiscoveryImplementPrompt,
   archImportPlanPrompt, archImportImplementPrompt,
   unusedExportPlanPrompt, unusedExportImplementPrompt,
+  buildProductSpecAgenticPrompt,
 };
 
 if (require.main === module) {

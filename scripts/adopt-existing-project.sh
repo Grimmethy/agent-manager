@@ -53,6 +53,11 @@ git clone -q "$CLONE_URL" "$REPO_DIR"
 
 echo "[adopt] setting up dedicated pipeline dir $PIPELINE_DIR"
 mkdir -p "$PIPELINE_DIR/queue/product-spec-requests"
+# An adopted repo already has a real codebase -- when you file the first product_spec
+# request in queue/product-spec-requests/, include "mode": "brownfield" so it drafts the
+# spec from the actual code (a read-only agentic pass) instead of the blind local model,
+# which empty-blocks on a real codebase. (product_spec also auto-detects this, but the
+# explicit field is the intended signal.)
 cat > "$PIPELINE_DIR/task-domains.json" <<JSONEOF
 {
   "default": {

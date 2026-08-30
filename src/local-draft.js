@@ -49,6 +49,7 @@ const { draftAdhocImplement, parseClarificationOptions } = require('./adhoc-agen
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
 const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
+const { draftProductSpecImplement } = require('./product-spec-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
@@ -475,6 +476,30 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
     return { succeeded: true, blocked: true, blockedReason: researchResult.blockedReason };
   }
   appendHistoryEvent(task, 'implement-done', `agentic research, ${(task.implementResponse || '').length} chars`);
+  task.status = 'needs-review';
+  appendHistoryEvent(task, 'needs-review');
+  return { succeeded: true, blocked: false };
+}
+
+// BROWNFIELD product_spec: the target project already has a real codebase. Draft the spec
+// from a read-only, code-grounded agentic Claude pass (Read/Grep/Glob against a throwaway
+// clone) rather than the blind local model. Same shape as draftResearchBranch. Routed from
+// draftTask BEFORE runPlanPass (unlike adhoc/research, which route after) -- the blind
+// local plan pass has no code access and its `degenerate: empty` outcome hard-blocks the
+// task before any agentic pass could run, which is the exact failure this mode fixes.
+async function draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn }) {
+  if (isClaudePaused(getConfig().pipelineDir)) {
+    return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
+  }
+  const specResult = await draftProductSpecImplementFn(task, { recordModelCall });
+  if (!specResult.succeeded) {
+    return { succeeded: false, reason: specResult.reason };
+  }
+  if (specResult.blocked) {
+    appendHistoryEvent(task, 'blocked', specResult.blockedReason);
+    return { succeeded: true, blocked: true, blockedReason: specResult.blockedReason };
+  }
+  appendHistoryEvent(task, 'implement-done', `agentic product spec, ${(task.implementResponse || '').length} chars`);
   task.status = 'needs-review';
   appendHistoryEvent(task, 'needs-review');
   return { succeeded: true, blocked: false };
@@ -921,7 +946,8 @@ async function draftTask(task, {
   draftAdhocImplementFn = draftAdhocImplement,
   draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
-  draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
+  draftResearchImplementFn = draftResearchImplement,
+  draftProductSpecImplementFn = draftProductSpecImplement, withLockFn = defaultWithLock,
 } = {}) {
   const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked } =
     resolveDraftContext(task, { localCall, withLockFn });
@@ -936,6 +962,17 @@ async function draftTask(task, {
       // else: not a rule this file knows how to re-run deterministically (adhoc,
       // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
       // existing harness-grounded local-model path below, completely unchanged.
+    }
+
+    // BROWNFIELD product_spec: skip the blind local plan pass entirely (it has no code
+    // access and empty-blocks on a real codebase -- the exact failure this mode fixes)
+    // and route straight to the code-grounded agentic pass. Routed here, before
+    // runPlanPass, unlike adhoc/research which route after -- see draftProductSpecBranch.
+    // Greenfield product_spec has specMode !== 'brownfield' and takes the unchanged path.
+    if (task.source === 'product_spec' && task.promptContext && task.promptContext.specMode === 'brownfield') {
+      task.planResponse = 'Brownfield product_spec: the spec is written by a read-only, code-grounded agentic pass (Read/Grep/Glob against a throwaway clone of the real repo). The blind local plan pass is skipped by design -- it has no code access and empty-blocks on a real codebase.';
+      appendHistoryEvent(task, 'plan-done', 'skipped (brownfield agentic path)');
+      return await draftProductSpecBranch(task, { recordModelCall, draftProductSpecImplementFn });
     }
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
