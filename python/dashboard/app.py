@@ -996,6 +996,21 @@ def api_promptforge_config():
     return jsonify({"url": os.environ.get("PROMPTFORGE_URL", "http://localhost:7430")})
 
 
+@app.route("/api/adforge/config")
+def api_adforge_config():
+    # AdForge is a separate local app (its own Flask server), same as PromptForge above.
+    # Just tells the browser where to point the embedded iframe -- ADFORGE_URL, else the
+    # convention :7431. No proxy.
+    return jsonify({"url": os.environ.get("ADFORGE_URL", "http://localhost:7431")})
+
+
+@app.route("/api/scriptforge/config")
+def api_scriptforge_config():
+    # ScriptForge is a separate local app (phase 1 of the AdForge pipeline), same shape
+    # as the two above -- SCRIPTFORGE_URL, else the convention :7432.
+    return jsonify({"url": os.environ.get("SCRIPTFORGE_URL", "http://localhost:7432")})
+
+
 def _hardware_history_averages(history: list) -> dict:
     """Current-vs-average is computed here rather than in hardware_stats.py -- that
     module only knows about individual samples, "average over the retention window" is
