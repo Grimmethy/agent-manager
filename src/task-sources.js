@@ -1242,11 +1242,17 @@ function adhocReviewCompletenessQuestion(task) {
   return null;
 }
 
+// reasoningTier: 'high' puts adhoc on the worker-reasoning lane, which runs its own
+// tiered LOCAL agentic draft ladder (harness-search -> read-only agentic -> write agentic
+// in an isolated worktree -- see local-draft.js's draftAdhocBranch). 2026-09-01: no
+// longer a Claude route.
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'benefit' });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
-// task" priority tier as adhoc, and reasoningTier: 'high' is UNCONDITIONAL (unlike
-// path_prefetch_resolve's two-tier design) -- the local model has no web tools at all, so there is
-// no meaningful low-tier attempt to make. No `apply` registered here -- its target
+// task" priority tier as adhoc. reasoningTier: 'high' keeps it on the worker-reasoning
+// lane, but research is the ONE draft path with no local implementation -- WebSearch/
+// WebFetch are Claude-only. It runs only when a deployment opts research_task into
+// AGENT_MANAGER_CLAUDE_SOURCES (with a token, unpaused); otherwise it blocks cleanly
+// (local-draft.js's researchClaudeStatus). No `apply` registered here -- its target
 // (SecondBrain) is outside repoRoot and has nothing to do with the tracked code repo's
 // git state, the same "non-git write target" shape as secondbrain/brain_dump_sort/
 // project_search/path_prefetch_resolve above, all of which applyTask() intercepts

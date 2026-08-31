@@ -102,17 +102,21 @@ function spyLock() {
   return { calls, withLockFn };
 }
 
-// Both new local tiers (adhoc-harness-draft.js, local-agentic-draft.js -- 2026-08-22, see
-// local-draft.js's own dispatch comment) are injectable the same way draftAdhocImplementFn
-// already was; every test below that isn't specifically exercising them declines
-// immediately so the pre-existing Claude-fallback behavior these tests were written
-// against is unchanged.
+// The three LOCAL adhoc tiers (harness-search, read-only agentic, write agentic -- see
+// local-draft.js's dispatch comment) are all injectable. `declineLocalTiers()` makes the
+// first two decline and the write tier block-for-human, matching the real "no local tier
+// could do this" outcome for tests not specifically exercising a tier. (2026-09-01: there
+// is no Claude tier any more.)
 function declineLocalTiers() {
   const decline = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
-  return { draftAdhocViaHarnessSearchFn: decline, draftAdhocViaLocalAgenticFn: decline };
+  return {
+    draftAdhocViaHarnessSearchFn: decline,
+    draftAdhocViaLocalAgenticFn: decline,
+    draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'all local adhoc tiers declined (test stub)' }),
+  };
 }
 
-test('an adhoc task with NO local-model override never locks at all (plan and implement both resolve to Claude)', async () => {
+test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls claude-client', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();
     const task = { id: 'adhoc-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
@@ -120,14 +124,17 @@ test('an adhoc task with NO local-model override never locks at all (plan and im
     await draftTask(task, {
       localCall: fakeLocalCall('no real match -- nothing plausible'),
       withLockFn,
-      ...declineLocalTiers(),
-      draftAdhocImplementFn: async (t) => {
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        t.adhocResolution = 'no-changes-needed';
         t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
         return { succeeded: true, blocked: false };
       },
     });
 
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end'], 'the two declined local tiers each lock around their own attempt; no override active -> Claude fallback needs no lock of its own');
+    // plan + harness + read-only agentic + write agentic = 4 lock cycles, all local.
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end', 'start', 'end']);
   });
 });
 
@@ -141,7 +148,7 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-test-needs-decision', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'build something with real open questions' } };
 
-    const draftAdhocImplementFn = async (t) => {
+    const draftAdhocViaLocalAgenticWriteFn = async (t) => {
       t.adhocResolution = 'needs-human-decision';
       t.implementResponse = 'Which charting library should this use?';
       return { succeeded: true, blocked: false, needsClarification: true };
@@ -151,8 +158,9 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
     const result = await draftTask(task, {
       localCall: fakeLocalCall('no real match -- nothing plausible'),
       withLockFn,
-      ...declineLocalTiers(),
-      draftAdhocImplementFn,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.succeeded, true);
@@ -163,18 +171,15 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
   });
 });
 
-test('an adhoc task with a local-model override (the real bug scenario) locks around the plan call but NOT the real Claude implement call', async () => {
+test('adhoc: every tier lock-cycle is fully closed before the next tier runs (no nesting)', async () => {
   await withFixtureRepo(async (draftTask) => {
-    process.env.AGENT_MANAGER_FORCE_PROVIDER = 'local'; // the dashboard workerModelOverrides scenario that caused the original bug
     const { calls, withLockFn } = spyLock();
     const task = { id: 'adhoc-test-2', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+    let callsAtWriteTier = null;
 
-    const draftAdhocImplementFn = async (t) => {
-      // The real Claude call happening HERE must NOT be wrapped in a lock -- the plan
-      // call's and both declined local tiers' own lock cycles must already be fully
-      // closed before this runs (plan locks too here since FORCE_PROVIDER=local makes
-      // resolvedCallIsLocal true for the plan pass specifically).
-      assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end'], 'plan + both declined local tiers\' locks must already be released before the real Claude implement call starts');
+    const draftAdhocViaLocalAgenticWriteFn = async (t) => {
+      callsAtWriteTier = calls.slice();
+      t.adhocResolution = 'no-changes-needed';
       t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
       return { succeeded: true, blocked: false };
     };
@@ -182,12 +187,20 @@ test('an adhoc task with a local-model override (the real bug scenario) locks ar
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn,
-      ...declineLocalTiers(),
-      draftAdhocImplementFn,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.succeeded, true);
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end'], 'one lock cycle for the plan call plus one per declined local tier');
+    assert.equal(calls.length % 2, 0, 'all lock cycles closed by the end');
+    assert.ok(calls.length >= 8, 'plan + harness + read-only + write agentic each locked');
+    // The write tier runs inside its OWN (single) lock -- every earlier tier's lock is
+    // already released, so exactly one `start` is unmatched at that point.
+    const starts = callsAtWriteTier.filter((c) => c === 'start').length;
+    const ends = callsAtWriteTier.filter((c) => c === 'end').length;
+    assert.equal(starts - ends, 1);
+    assert.equal(callsAtWriteTier[callsAtWriteTier.length - 1], 'start');
   });
 });
 
@@ -204,17 +217,19 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
       return { applied: true, succeeded: true };
     };
     const draftAdhocViaLocalAgenticFn = async () => { throw new Error('must not be called when harness-search already applied'); };
-    const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when harness-search already applied'); };
+    const draftAdhocViaLocalAgenticWriteFn = async () => { throw new Error('must not reach the write tier when harness-search already applied'); };
 
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
-      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, false);
     assert.equal(task.status, 'needs-review');
-    assert.deepEqual(calls, ['start', 'end'], 'exactly one lock cycle -- the applied harness-search tier');
+    // plan pass (now local for adhoc) + the applied harness-search tier = 2 lock cycles;
+    // the read-only and write tiers are never reached.
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end']);
   });
 });
 
@@ -235,7 +250,7 @@ test('a successful draft appends draft-done immediately before needs-review, aft
       withLockFn: async (d, fn) => fn(),
       draftAdhocViaHarnessSearchFn,
       draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
-      draftAdhocImplementFn: async () => { throw new Error('unused'); },
+      draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
     });
     const stages = (task.history || []).map((e) => e.stage);
     const dd = stages.indexOf('draft-done');
@@ -261,7 +276,7 @@ test('draftDoneDetail summarises whatever the branch stamped, and is undefined w
   assert.equal(draftDoneDetail({ draftModel: 'qwen' }), 'qwen');
 });
 
-test('an adhoc task where harness-search declines but local-agentic applies -- never reaches Claude', async () => {
+test('an adhoc task where harness-search declines but local-agentic (read-only) applies -- never reaches the write tier', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
     const task = { id: 'adhoc-test-4', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
@@ -274,11 +289,11 @@ test('an adhoc task where harness-search declines but local-agentic applies -- n
       t.draftModel = 'test-local-model';
       return { applied: true, succeeded: true };
     };
-    const draftAdhocImplementFn = async () => { throw new Error('must not fall through to Claude when local-agentic already applied'); };
+    const draftAdhocViaLocalAgenticWriteFn = async () => { throw new Error('must not reach the write tier when the read-only tier already applied'); };
 
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
-      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.succeeded, true);
@@ -286,67 +301,103 @@ test('an adhoc task where harness-search declines but local-agentic applies -- n
   });
 });
 
-// Manual "pause Claude" kill switch, 2026-08-25 (Grimmethy: "I need a way to pause the
-// claude use... preserve the tokens since I know I'm very likely to hit my weekly
-// limit") -- see claude-pause.js's own header. adhoc's real Claude implement call and
-// research's own implement call are both unconditional (no local fallback, bypass every
-// other budget gate by design), so they're the two call sites this pause has to check
-// directly rather than relying on the plan-call routing alone.
-test('an adhoc task declines the Claude fallback (never calls it) when Claude use is manually paused, after both local tiers decline', async () => {
+// 2026-09-01: adhoc has no Claude tier. When every local tier (harness-search, read-only
+// agentic, write agentic) declines/can't do it, the task BLOCKS for a human -- it never
+// reaches out to claude-client, and Claude's paused state is irrelevant.
+test('an adhoc task blocks for a human (no Claude) when all three local tiers decline', async () => {
   await withFixtureRepo(async (draftTask) => {
-    const task = { id: 'adhoc-test-paused', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-
-    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
-    const draftAdhocViaLocalAgenticFn = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
-    const draftAdhocImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
+    const task = { id: 'adhoc-test-all-decline', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
-      withLockFn: async (dir2, fn) => fn(), draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
-      isClaudePausedFn: () => true,
+      withLockFn: async (dir2, fn) => fn(),
+      ...declineLocalTiers(),
     });
 
-    assert.equal(result.succeeded, false);
-    assert.match(result.reason, /manually paused/);
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /local adhoc tiers declined/);
+    assert.equal(task.status, undefined, 'not routed into needs-review');
   });
 });
 
-test('a research task declines the Claude implement call (never calls it) when Claude use is manually paused', async () => {
+// 2026-09-01: research_task has no local implementation (WebSearch/WebFetch are Claude-
+// only). With no AGENT_MANAGER_CLAUDE_SOURCES it blocks CLEANLY, before the plan pass,
+// with a legible reason -- it does NOT wedge or call Claude.
+test('a research task blocks cleanly with a "needs Claude" reason when not opted into AGENT_MANAGER_CLAUDE_SOURCES', async () => {
   await withFixtureRepo(async (draftTask) => {
+    delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;
     const task = {
-      id: 'research-test-paused', domain: 'research', source: 'research_task', title: 'test',
+      id: 'research-test-noclaude', domain: 'research', source: 'research_task', title: 'test',
       promptContext: { rawText: 'investigate something', tags: [] },
     };
 
-    const localCall = async () => ({ response: 'plan text (paused, no tool access needed for this test)', degenerate: null, attempts: 1 });
-    const draftResearchImplementFn = async () => { throw new Error('must not call Claude while manually paused'); };
+    let planCalled = false;
+    const localCall = async () => { planCalled = true; return { response: 'plan', degenerate: null, attempts: 1 }; };
+    const draftResearchImplementFn = async () => { throw new Error('must not call Claude'); };
 
-    const result = await draftTask(task, { localCall, withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn, isClaudePausedFn: () => true });
+    const result = await draftTask(task, { localCall, withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn });
 
-    assert.equal(result.succeeded, false);
-    assert.match(result.reason, /manually paused/);
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /Claude Code CLI \(WebSearch\/WebFetch\)/);
+    assert.equal(planCalled, false, 'blocked before the plan pass even ran');
   });
 });
 
-test('an adhoc task falls through to Claude normally when Claude use is NOT paused', async () => {
+// research still works when explicitly opted in + a token is set + not paused.
+test('a research task runs its Claude implement pass when research_task IS in AGENT_MANAGER_CLAUDE_SOURCES (token set, not paused)', async () => {
   await withFixtureRepo(async (draftTask) => {
-    const task = { id: 'adhoc-test-not-paused', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-
-    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
-    const draftAdhocViaLocalAgenticFn = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';
+    const task = {
+      id: 'research-test-optedin', domain: 'research', source: 'research_task', title: 'test',
+      promptContext: { rawText: 'investigate something', tags: [] },
+    };
     let claudeCalled = false;
-    const draftAdhocImplementFn = async (t) => {
+    const draftResearchImplementFn = async (t) => {
       claudeCalled = true;
-      t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+      t.implementResponse = 'research write-up';
+      return { succeeded: true, blocked: false };
+    };
+    try {
+      await draftTask(task, {
+        localCall: async () => ({ response: 'plan', degenerate: null, attempts: 1 }),
+        withLockFn: async (dir2, fn) => fn(), draftResearchImplementFn, isClaudePausedFn: () => false,
+      });
+      assert.equal(claudeCalled, true);
+    } finally {
+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+  });
+});
+
+test('an adhoc task reaches the local write-agentic tier when harness + read-only both decline', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-test-write-tier', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    let writeTierCalled = false;
+    const draftAdhocViaLocalAgenticWriteFn = async (t) => {
+      writeTierCalled = true;
+      t.adhocResolution = 'implemented';
+      t.rawDiff = 'diff --git a/x b/x';
+      t.implementResponse = 'RESOLUTION: implemented\n\ndid the thing';
       return { succeeded: true, blocked: false };
     };
 
-    await draftTask(task, {
+    const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
-      withLockFn: async (dir2, fn) => fn(), draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
+      withLockFn: async (dir2, fn) => fn(),
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn,
     });
 
-    assert.equal(claudeCalled, true, 'must still reach Claude normally when not paused');
+    assert.equal(writeTierCalled, true);
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.status, 'needs-review');
   });
 });
 
@@ -892,8 +943,10 @@ test('draftTask still runs the critique+revision pass for a non-advisoryProse so
 // covers the wiring half: local-draft.js must actually pass allowedTools/maxTurns
 // through to the plan call for domain==='research', and must NOT do so for any other
 // domain (a plain no-tool completion is correct everywhere else).
-test('draftTask grants the plan call real WebSearch/WebFetch tool access for a research-domain task', async () => {
+test('draftTask grants the plan call real WebSearch/WebFetch tool access for a research-domain task (opted into Claude)', async () => {
   await withFixtureRepo(async (draftTask) => {
+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';
     const task = {
       id: 'research-test-1', domain: 'research', source: 'research_task', title: 'test',
       promptContext: { rawText: 'investigate something', tags: [] },
@@ -910,10 +963,14 @@ test('draftTask grants the plan call real WebSearch/WebFetch tool access for a r
       return { succeeded: true, blocked: false };
     };
 
-    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn(), draftResearchImplementFn });
-
-    assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
-    assert.equal(capturedOpts.maxTurns, 8);
+    try {
+      await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn(), draftResearchImplementFn, isClaudePausedFn: () => false });
+      assert.equal(capturedOpts.allowedTools, 'WebSearch,WebFetch');
+      assert.equal(capturedOpts.maxTurns, 8);
+    } finally {
+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
   });
 });
 

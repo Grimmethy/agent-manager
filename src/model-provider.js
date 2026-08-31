@@ -15,6 +15,11 @@
 // (and, for review-task.js, vote) using Claude instead of the local model. Empty/unset
 // means every source stays on the local model -- i.e. this integration is fully opt-in per
 // source, never a silent default switch.
+//
+// 2026-09-01: the reasoning *tier* ('high') no longer routes to Claude. It only selects
+// the worker-reasoning lane + bigger local budgets. Claude is reached solely through
+// AGENT_MANAGER_CLAUDE_SOURCES / AGENT_MANAGER_FORCE_PROVIDER / a backend:'claude'
+// modelProfile. See providerFor().
 
 const local = require('./local-client.js');
 const claude = require('./claude-client.js');
@@ -49,11 +54,10 @@ function normalizeTask(sourceOrTask) {
 //      over #1's one-off automatic escalation, which only applies to the specific task
 //      that already failed once).
 //   3. the task's registered source's own static `reasoningTier` (e.g. adhoc, registered
-//      'high' in task-sources.js -- though adhoc's actual draft call is hardcoded to
-//      Claude via local-draft.js's own resolveSourceName()==='adhoc' branch regardless;
-//      this registration exists so the worker-lane filter agrees with that by
-//      construction rather than by two people remembering to update two places).
-//   4. AGENT_MANAGER_CLAUDE_SOURCES (pre-existing opt-in env var, kept for compatibility).
+//      'high' in task-sources.js so the worker-reasoning lane -- which runs its own local
+//      write-agentic draft tier -- claims it instead of worker-1).
+//   4. AGENT_MANAGER_CLAUDE_SOURCES -- see providerFor(); the ONLY thing here that still
+//      forces a Claude backend, and only for the sources explicitly listed.
 //   5. default: 'low'.
 function reasoningTierFor(task) {
   const t = normalizeTask(task);
@@ -120,12 +124,20 @@ function resolveModelProfile(sourceOrTask) {
   return getModelProfile(profileName) || null;
 }
 
+// 2026-09-01 (Grimmethy: "Those reasoning workers are supposed to go through qwen. Claude
+// needs to be removed as a dependency from that system."): the reasoning *tier* no longer
+// implies a provider. 'high' still exists -- it puts the task on the worker-reasoning lane
+// with bigger local turn/context budgets -- but drafting runs on the local model unless a
+// deployment explicitly opts a source back onto Claude via AGENT_MANAGER_CLAUDE_SOURCES
+// (or AGENT_MANAGER_FORCE_PROVIDER=claude / a backend:'claude' modelProfile). Nothing in
+// the pipeline requires Claude any more; adhoc drafts via a local write-agentic tier and
+// research_task blocks cleanly when Claude isn't configured.
 function providerFor(sourceOrTask) {
   const forced = forcedProvider();
   if (forced) return forced;
   const profile = resolveModelProfile(sourceOrTask);
   if (profile) return profile.backend === 'claude' ? claude : local;
-  return reasoningTierFor(sourceOrTask) === 'high' ? claude : local;
+  return CLAUDE_SOURCES.has(normalizeTask(sourceOrTask).source) ? claude : local;
 }
 
 // Display/stats label for whichever backend providerFor(source) actually picked --
@@ -148,8 +160,9 @@ function labelFor(sourceOrTask) {
       ? `claude:${profile.model || process.env.CLAUDE_MODEL || 'sonnet'}`
       : (profile.model || process.env.LOCAL_MODEL);
   }
-  if (reasoningTierFor(sourceOrTask) !== 'high') return process.env.LOCAL_MODEL;
-  return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
+  // Mirrors providerFor(): 'high' no longer means Claude; only an explicit opt-in does.
+  if (CLAUDE_SOURCES.has(normalizeTask(sourceOrTask).source)) return `claude:${process.env.CLAUDE_MODEL || 'sonnet'}`;
+  return process.env.LOCAL_MODEL;
 }
 
 module.exports = { providerFor, labelFor, reasoningTierFor, resolveModelProfile };

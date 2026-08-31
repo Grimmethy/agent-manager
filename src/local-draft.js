@@ -45,9 +45,10 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
-const { draftAdhocImplement, parseClarificationOptions } = require('./adhoc-agentic-draft.js');
+const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
 const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
+const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
@@ -68,6 +69,28 @@ ensureRegistered();
 
 function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+}
+
+// research_task drafting is the one path with no local equivalent -- WebSearch/WebFetch
+// exist only in the Claude Code CLI (2026-09-01: everything else in the reasoning path
+// now runs on the local model). So research runs ONLY when a deployment has explicitly
+// opted it onto Claude (AGENT_MANAGER_CLAUDE_SOURCES) AND a token is set AND Claude isn't
+// paused; otherwise the task blocks cleanly with a legible reason instead of wedging.
+// Returns { ok: true } or { ok: false, reason }.
+function researchClaudeStatus(task, isClaudePausedFn) {
+  const src = resolveSourceName(task) || task.source || 'research_task';
+  const optedIn = (process.env.AGENT_MANAGER_CLAUDE_SOURCES || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  if (!optedIn.includes(src)) {
+    return { ok: false, reason: `research_task drafting needs the Claude Code CLI (WebSearch/WebFetch) -- there is no local web-research capability. Add "${src}" to AGENT_MANAGER_CLAUDE_SOURCES (and set CLAUDE_CODE_OAUTH_TOKEN) to enable it.` };
+  }
+  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return { ok: false, reason: 'research_task drafting needs Claude (WebSearch/WebFetch) but CLAUDE_CODE_OAUTH_TOKEN is not set.' };
+  }
+  if (isClaudePausedFn()) {
+    return { ok: false, reason: 'research_task drafting needs Claude (WebSearch/WebFetch) but Claude is manually paused from the Workers tab.' };
+  }
+  return { ok: true };
 }
 
 // A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft
@@ -287,14 +310,13 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // it. A real flock acquire/release is single-digit milliseconds (confirmed live) --
   // cheap enough that tests just inject withLockFn as a lightweight in-memory spy instead
   // (see local-draft.test.js), and production behavior stays exactly what labelFor(task)
-  // says regardless of how a test wires the rest of this function. Only ACTUALLY matters
-  // for adhoc/research tasks, whose real IMPLEMENT call bypasses resolvedLocalCall
-  // entirely for a Claude call that never touches the local GPU
-  // (draftAdhocImplementFn/draftResearchImplementFn below) -- for every other task, plan
-  // and implement always resolve to the SAME backend, so locking around each call
-  // individually (rather than one lock spanning the whole function) costs a few extra
-  // real flock round-trips in exchange for never holding the lock across a Claude call by
-  // construction, not by remembering to release early in exactly the right place.
+  // says regardless of how a test wires the rest of this function. For adhoc, the IMPLEMENT
+  // path is a tiered ladder (draftAdhocBranch) whose tiers manage their own locks; for
+  // research (when opted into Claude), the implement call is a Claude call that never
+  // touches the local GPU. For every other task, plan and implement resolve to the SAME
+  // backend, so locking around each call individually (rather than one lock spanning the
+  // whole function) costs a few extra flock round-trips in exchange for never holding the
+  // lock across an off-GPU call by construction.
   // labelFor(task) can genuinely return undefined now (LOCAL_MODEL has no hardcoded
   // fallback string as of the earlier fix today -- see local-client.js's own comment) --
   // treat that the same safe-default way as everywhere else in this codebase treats an
@@ -390,20 +412,19 @@ function runStalenessFastpath(task) {
 // path here returns a final draftTask result directly instead.
 async function draftAdhocBranch(task, {
   maybeLocked, recordModelCall,
-  draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
-  isClaudePausedFn = isClaudePaused,
+  draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
 }) {
-  // Tiered escalation (2026-08-22, Grimmethy: "expand the tooling capabilities so
-  // that the local reasoning model can handle the work... I'd like to see the
-  // automated work being handled entirely locally" -- see adhoc-harness-draft.js's
-  // and local-agentic-draft.js's own headers for the full design): harness-search
-  // (cheap, single-shot, proven) tried first; local-agentic (multi-turn, opt-in,
-  // newest/least-proven) tried next; only if BOTH decline does this fall through to
-  // the existing real Claude agentic path below, exactly as it always has. Both
-  // local tiers always run the local model (never gated on resolvedCallIsLocal --
-  // adhoc is registered high-tier so that would always read false here), so both
-  // are unconditionally lock-wrapped, same reasoning the abLocalCall branch above
-  // already documents for the same "always local regardless of resolvedCallIsLocal" case.
+  // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
+  // through qwen. Claude needs to be removed as a dependency from that system"). Every
+  // tier runs the local model against an isolated worktree:
+  //   1. harness-search  -- cheap, single-shot, grep-grounded blind diff (proven).
+  //   2. local-agentic   -- multi-turn, READ-ONLY tools, emits a Group-B diff (opt-in).
+  //   3. local-agentic-WRITE -- multi-turn with real edit/write/run_bash in a worktree
+  //      (default-on; this is what the deleted Claude adhoc-agentic-draft.js used to do).
+  // Tiers 1-2 return {applied, succeeded, reason?}: applied -> done; declined -> next
+  // tier. Tier 3 returns a terminal draftTask-shaped verdict (implemented / blocked /
+  // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
+  // fallback. All tiers are unconditionally lock-wrapped (always local).
   const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
   if (!harnessResult.applied && harnessResult.succeeded === false) {
     return { succeeded: false, reason: harnessResult.reason };
@@ -424,22 +445,10 @@ async function draftAdhocBranch(task, {
     return { succeeded: true, blocked: false };
   }
 
-  // Manual pause kill switch (2026-08-25, Grimmethy: "I need a way to pause the
-  // claude use... preserve the tokens since I know I'm very likely to hit my
-  // weekly limit" -- see claude-pause.js's own header). This real Claude call is
-  // the biggest single token spend in this whole pipeline (a full multi-turn
-  // agentic Read/Grep/Glob/Edit/Write/Bash session) and, unlike the plan pass,
-  // NEVER goes through resolvedLocalCall/providerFor() -- it's unconditional by
-  // design (see this branch's own header above), so it's the one call site the
-  // budget-aware override/IS_CLAUDE_LANE gate genuinely cannot protect on their
-  // own; checked here explicitly instead. Phrased to match local-worker.sh's own
-  // INFRA_FAILURE_PATTERN ("service unavailable") so a paused task gets the same
-  // bounded-requeue-then-hold treatment a real transient outage already gets,
-  // rather than inventing a third failure-handling path for one more reason string.
-  if (isClaudePausedFn()) {
-    return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
-  }
-  const agenticResult = await draftAdhocImplementFn(task, { recordModelCall });
+  // Tier 3: local write-agentic. Returns the same verdict shape the Claude tier did
+  // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
+  // genuine infra error (retry), everything else is terminal.
+  const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
   if (!agenticResult.succeeded) {
     return { succeeded: false, reason: agenticResult.reason };
   }
@@ -484,11 +493,14 @@ async function draftAdhocBranch(task, {
 // write-up the model already finished is redundant with the normal review-task.js pass
 // this still flows into afterward).
 async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn = isClaudePaused }) {
-  // Same manual pause kill switch as the adhoc branch -- research's own implement call is
-  // ALSO an unconditional real Claude call with no local fallback path, so it needs the
-  // same explicit check.
-  if (isClaudePausedFn()) {
-    return { succeeded: false, reason: 'Claude use is manually paused (service unavailable by manual pause) -- preserving subscription tokens; will retry once unpaused from the Workers tab.' };
+  // research_task has no local implementation -- WebSearch/WebFetch are Claude-only. It
+  // runs only when explicitly opted onto Claude AND a token is set AND Claude isn't
+  // paused; otherwise it blocks cleanly for a human (draftTask hoists the same check
+  // ahead of the plan pass, this is defence-in-depth).
+  const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);
+  if (!claudeStatus.ok) {
+    appendHistoryEvent(task, 'blocked', claudeStatus.reason);
+    return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
   }
   const researchResult = await draftResearchImplementFn(task, { recordModelCall });
   if (!researchResult.succeeded) {
@@ -940,9 +952,9 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
  */
 async function draftTask(task, {
   localCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
-  draftAdhocImplementFn = draftAdhocImplement,
   draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
+  draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
   draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
   isClaudePausedFn = isClaudePaused,
 } = {}) {
@@ -982,6 +994,17 @@ async function draftTask(task, {
         task.planResponse = 'Pre-drafted task: the exact implementResponse below was specified directly by the caller, not produced by a plan+implement pass.';
       }
     } else {
+      // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research
+      // can't run on Claude (not opted in / no token / paused) block BEFORE the plan
+      // pass rather than run a webless plan that produces nothing usable.
+      if (task.domain === 'research') {
+        const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);
+        if (!claudeStatus.ok) {
+          appendHistoryEvent(task, 'blocked', claudeStatus.reason);
+          return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
+        }
+      }
+
       const planOutcome = await runPlanPass(task, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch,
       });
@@ -992,14 +1015,14 @@ async function draftTask(task, {
       const literalEditResult = tryDeterministicLiteralEdit(task);
       if (literalEditResult) return literalEditResult;
 
-      // adhoc-shaped tasks implement via a real agentic Claude Code CLI call (with a
-      // local-model tier tried first) instead of the blind JSON-diff pass below -- see
-      // draftAdhocBranch(). Every path there returns a final draftTask result.
+      // adhoc-shaped tasks implement via a tiered LOCAL agentic ladder (harness-search ->
+      // read-only agentic -> write agentic in an isolated worktree) instead of the blind
+      // JSON-diff pass below -- see draftAdhocBranch(). Every path there returns a final
+      // draftTask result; nothing here calls Claude.
       if (resolveSourceName(task) === 'adhoc') {
         return await draftAdhocBranch(task, {
           maybeLocked, recordModelCall,
-          draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocImplementFn,
-          isClaudePausedFn,
+          draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
         });
       }
 
