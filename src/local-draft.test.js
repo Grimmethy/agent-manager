@@ -218,6 +218,49 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
   });
 });
 
+// draft-done (2026-08-31, brain dump #6): the draft phase now bookends itself with an
+// explicit 'draft-done' history checkpoint before the terminal 'needs-review', so the
+// dashboard's Pipeline History shows drafting finishing -- not just the next state opening.
+test('a successful draft appends draft-done immediately before needs-review, after implement-done', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-dd-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+    const draftAdhocViaHarnessSearchFn = async (t) => {
+      t.implementResponse = 'x';
+      t.adhocResolution = 'implemented';
+      t.draftModel = 'test-local-model';
+      return { applied: true, succeeded: true };
+    };
+    await draftTask(task, {
+      localCall: fakeLocalCall('confident match: none'),
+      withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn,
+      draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
+      draftAdhocImplementFn: async () => { throw new Error('unused'); },
+    });
+    const stages = (task.history || []).map((e) => e.stage);
+    const dd = stages.indexOf('draft-done');
+    const nr = stages.indexOf('needs-review');
+    assert.ok(dd !== -1, 'a draft-done event was appended');
+    assert.equal(nr, dd + 1, 'draft-done sits immediately before needs-review');
+    assert.ok(stages.indexOf('implement-done') !== -1 && stages.indexOf('implement-done') < dd, 'implement-done still precedes draft-done');
+    const ev = task.history[dd];
+    assert.ok(!Number.isNaN(Date.parse(ev.at)), 'draft-done.at is an ISO timestamp');
+    assert.match(ev.detail, /resolution=implemented/);
+    assert.match(ev.detail, /test-local-model/);
+  });
+});
+
+test('draftDoneDetail summarises whatever the branch stamped, and is undefined when there is nothing', () => {
+  const { draftDoneDetail } = require('./local-draft.js');
+  assert.equal(draftDoneDetail({}), undefined);
+  assert.equal(draftDoneDetail({ adhocResolution: 'no-changes-needed' }), 'resolution=no-changes-needed');
+  assert.equal(
+    draftDoneDetail({ adhocResolution: 'implemented', localRejectCount: 2, draftModelDisplay: 'claude:sonnet' }),
+    'resolution=implemented, retry 2, claude:sonnet',
+  );
+  assert.equal(draftDoneDetail({ draftModel: 'qwen' }), 'qwen');
+});
+
 test('an adhoc task where harness-search declines but local-agentic applies -- never reaches Claude', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
