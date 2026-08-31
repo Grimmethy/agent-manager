@@ -6,28 +6,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17; generalized from
-# adhoc-only to a reasoning-tier concept for Brain Dump #77, 2026-08-17): any instance
-# named worker-reasoning* claims ONLY pending tasks whose reasoning tier (model-provider.js's
-# reasoningTierFor() -- the same function local-draft.js/review-task.js already call to
-# pick a backend) resolves to 'high', and every OTHER worker-* instance skips them
-# instead, leaving them for this lane. Originally this was hardcoded to "adhoc-shaped"
-# tasks specifically (the ones whose implement pass is a real agentic Claude Code CLI
-# call, adhoc-agentic-draft.js); it's now the general tier concept because a second kind
-# of high-reasoning-only task exists (Brain Dump #77's automatic high-reasoning retry for
-# a needs-clarification task whose first, low-reasoning attempt didn't resolve
-# confidently) -- adhoc itself still resolves to 'high' via its own static registration in
-# task-sources.js, so behavior for adhoc tasks is unchanged. Pure naming convention, no
-# new env var/config -- restartTargetFor() (dead-process-check.js) already matches any
-# instanceId.startsWith('worker-') generically via this same script, so a worker-reasoning
-# instance is auto-restart-eligible for free. Motivation: Claude is cloud-based, no GPU
-# contention with Ornith, but a single shared worker-1 claiming BOTH kinds serially means
-# a multi-minute high-reasoning call blocks Ornith's own (otherwise much faster) throughput
-# behind it for that whole time.
+# Parallel high-reasoning LOCAL lane (Brain Dump #67 follow-up, 2026-08-17; reasoning-tier
+# concept for Brain Dump #77; de-Claude'd 2026-09-01): any instance named worker-reasoning*
+# claims ONLY pending tasks whose reasoning tier (model-provider.js's reasoningTierFor())
+# resolves to 'high' -- adhoc (its tiered LOCAL agentic drafts), research_task, and the
+# Brain Dump #77 high-reasoning retry -- and every OTHER worker-* instance skips them,
+# leaving them for this lane. Motivation: a long multi-turn qwen draft would otherwise
+# block worker-1's much faster brain-dump-sort/etc. throughput behind it. Both lanes run
+# the local model and serialise on the GPU single-flight lock. This lane no longer routes
+# to Claude by default -- that only happens for a deployment with AGENT_MANAGER_CLAUDE_SOURCES
+# set (see refresh_active_model / model-provider.js). Pure naming convention; restartTargetFor()
+# (dead-process-check.js) already matches any instanceId.startsWith('worker-').
 case "$INSTANCE_ID" in
-  worker-reasoning*) IS_CLAUDE_LANE=true ;;
-  *) IS_CLAUDE_LANE=false ;;
+  worker-reasoning*) IS_REASONING_LANE=true ;;
+  *) IS_REASONING_LANE=false ;;
 esac
+# Whether Claude is in play at all for this deployment (opt-in only). Gates the
+# budget/pause checks and the Claude-vs-local routing below -- with it unset, the
+# reasoning lane is just a second local lane.
+CLAUDE_OPT_IN=false
+[[ -n "${AGENT_MANAGER_CLAUDE_SOURCES:-}" ]] && CLAUDE_OPT_IN=true
 
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
@@ -56,7 +54,7 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
-  if "$IS_CLAUDE_LANE"; then
+  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN"; then
     # Budget-aware (2026-08-25, Grimmethy: "The override exists because when we don't
     # have claude tokens available at the time, the worker and reasoning need to share a
     # lane rather than working in parallel" -- confirmed live this was NOT what the code
@@ -110,8 +108,16 @@ refresh_active_model() {
         ;;
     esac
   else
+    # Local-only lane (worker-1, or the reasoning lane when Claude isn't opted in). A
+    # per-instance dropdown override may be a bare model name or (reasoning lane) an
+    # "ollama:"/"claude:"-prefixed value; a "claude:" pick on a lane that no longer does
+    # Claude is ignored.
     unset AGENT_MANAGER_FORCE_PROVIDER
-    [[ -n "$override" ]] && LOCAL_MODEL="$override"
+    case "$override" in
+      claude:*) : ;;
+      ollama:*) LOCAL_MODEL="${override#ollama:}" ;;
+      ?*) LOCAL_MODEL="$override" ;;
+    esac
     export LOCAL_MODEL
     HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
   fi
@@ -187,25 +193,18 @@ process_drafting_file() {
   # heartbeat needs to surface, not the override that only ever governed the cheaper plan
   # pass. Recomputed fresh (not derived from draft_label) so it can never silently drift
   # from what draftAdhocImplement/draftResearchImplement will actually do.
-  # 2026-08-25: alwaysClaude used to be unconditional for adhoc/research -- correct
-  # before the manual pause existed (that call really did always reach Claude), but
-  # confirmed live to actively mislead once it didn't: a paused adhoc task correctly
-  # declined its Claude implement call (see local-draft.js's own pause check) and fell
-  # back to local, yet this heartbeat kept showing "claude:sonnet" as if it were still
-  # spending tokens -- exactly the "is Claude actually being avoided" question a human
-  # checking this pause feature would be trying to answer from this display. Checks the
-  # same isClaudePaused() gate local-draft.js's own implement-call check already uses.
+  # 2026-09-01: the old adhoc/research "alwaysClaude" special-case is gone -- adhoc drafts
+  # locally now, and research only reaches Claude when it's in AGENT_MANAGER_CLAUDE_SOURCES,
+  # which labelFor() already reflects. So labelFor(t) alone is both the lock-decision label
+  # AND the honest display value.
   draft_display_model="$(node -e '
     try {
       require(process.argv[1]);
-      const { resolveSourceName } = require(process.argv[2]);
-      const { labelFor } = require(process.argv[3]);
-      const { isClaudePaused } = require(process.argv[5]);
-      const t = JSON.parse(require("fs").readFileSync(process.argv[4], "utf8"));
-      const alwaysClaude = (resolveSourceName(t) === "adhoc" || t.domain === "research") && !isClaudePaused(process.argv[6]);
-      console.log(alwaysClaude ? `claude:${process.env.CLAUDE_MODEL || "sonnet"}` : labelFor(t));
+      const { labelFor } = require(process.argv[2]);
+      const t = JSON.parse(require("fs").readFileSync(process.argv[3], "utf8"));
+      console.log(labelFor(t));
     } catch (e) { /* leave stdout empty -- the bash fallback just below covers this */ }
-  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" "${PACKAGE_SRC_DIR}/claude-pause.js" "${PACKAGE_SRC_DIR}/.." 2>/dev/null)"
+  ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" "$wpath" 2>/dev/null)"
   [[ -n "$draft_display_model" ]] || draft_display_model="$HEARTBEAT_MODEL"
 
   # No bash-level single-flight lock around this call anymore (2026-08-22, Grimmethy:
@@ -475,7 +474,7 @@ while :; do                                                                     
 
   # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy -- see its own
   # comment) -- only the Claude lane needs this: worker-reasoning* instances are the only
-  # ones whose claimed/resumed tasks ever route to claude-client.js (the IS_CLAUDE_LANE
+  # ones whose claimed/resumed tasks ever route to claude-client.js (the IS_REASONING_LANE
   # claim filter above already restricts this lane to high-reasoning-tier tasks, and
   # model-provider.js's providerFor() maps ONLY high-tier tasks to Claude). A low-tier
   # Ornith worker checking this too would wrongly stall local Ornith work every time
@@ -496,7 +495,9 @@ while :; do                                                                     
   # AGENT_MANAGER_FORCE_PROVIDER is already "local", there is real local work this tick
   # CAN still do -- only skip the tick when Claude is unhealthy/paused AND there is no
   # local fallback in play at all (no override configured for this instance).
-  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
+  # Only when this deployment actually opted a source onto Claude (AGENT_MANAGER_CLAUDE_SOURCES);
+  # with it unset the reasoning lane is pure-local and has no Claude budget to check.
+  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
     budget_reason="$(check_budget_healthy)"
     budget_rc=$?
     if [[ $budget_rc -ne 0 ]]; then
@@ -507,17 +508,12 @@ while :; do                                                                     
     fi
   fi
 
-  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap --
-  # see its own header comment) -- only relevant when THIS tick's real work would call a
-  # LOCAL model: always true for the non-reasoning lane (plain Ornith), and true for the
-  # reasoning lane only when the dashboard override forced it onto a local model too
-  # (AGENT_MANAGER_FORCE_PROVIDER=local, set by refresh_active_model above). A Claude-lane
-  # tick calling real Claude never touches Ollama's resident slot, so it's exempt --
-  # exactly like the budget gate above, this only matters once local-in-reasoning is
-  # actually in use, and is a no-op (state file absent, or target already resident) in the
-  # default all-Claude-reasoning config.
+  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap) --
+  # only relevant when THIS tick's real work calls a LOCAL model. That's now every lane by
+  # default; the sole exception is a Claude-opted-in reasoning tick that's actually going
+  # to Claude (CLAUDE_OPT_IN, budget healthy so FORCE_PROVIDER isn't 'local').
   active_locally="true"
-  if "$IS_CLAUDE_LANE" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
+  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
     active_locally="false"
   fi
   if [[ "$active_locally" == "true" ]]; then
@@ -531,7 +527,7 @@ while :; do                                                                     
       continue
     fi
     target_tier="low"
-    "$IS_CLAUDE_LANE" && target_tier="high"
+    "$IS_REASONING_LANE" && target_tier="high"
     yield_verdict="$(should_yield_for_model_swap "$LOCAL_MODEL" "$target_tier")"
     if [[ "$yield_verdict" == "yield" ]]; then
       printf '[worker-%s] yielding this tick -- resident model still has pending work in the other tier (see should_yield_for_model_swap).\n' "$INSTANCE_ID" >&2
@@ -576,7 +572,7 @@ while :; do                                                                     
   # skip past a mismatched-tier candidate instead of stopping there, so each lane's own
   # generation call always reaches its own tier's real work if any exists, independent of
   # what the other tier's backlog looks like.
-  node "${PACKAGE_SRC_DIR}/task-sources.js" --tier="$( "$IS_CLAUDE_LANE" && echo high || echo low )" >>"$LOG_FILE" 2>&1 || true
+  node "${PACKAGE_SRC_DIR}/task-sources.js" --tier="$( "$IS_REASONING_LANE" && echo high || echo low )" >>"$LOG_FILE" 2>&1 || true
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
@@ -682,7 +678,7 @@ while :; do                                                                     
         fi
       fi
 
-      # Parallel Claude worker lane filter (see IS_CLAUDE_LANE's own comment above) --
+      # Parallel Claude worker lane filter (see IS_REASONING_LANE's own comment above) --
       # reasoningTierFor() is the SAME function local-draft.js/review-task.js already call
       # to pick a backend, so this lane split can never disagree with what actually happens
       # once a task is claimed. The Claude lane claims ONLY high-reasoning-tier tasks;
@@ -698,7 +694,7 @@ while :; do                                                                     
         # alone here (mirroring the old resolveSourceName one-liner, which has no such
         # dependency) reported adhoc as 'low' every time.
         resolved_tier="$(echo "$parsed_payload" | node -e 'try{require(process.argv[1]);const {reasoningTierFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(reasoningTierFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
-        if "$IS_CLAUDE_LANE"; then
+        if "$IS_REASONING_LANE"; then
           if [[ "$resolved_tier" != "high" ]]; then
             claim_succeeded=false
           fi

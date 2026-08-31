@@ -1,0 +1,157 @@
+'use strict';
+
+// Adhoc draft tier 3, LOCAL (2026-09-01, Grimmethy: "Those reasoning workers are supposed
+// to go through qwen. Claude needs to be removed as a dependency from that system."). The
+// local-model replacement for the deleted Claude adhoc-agentic-draft.js: a real multi-turn
+// investigate -> edit -> verify loop via local-tool-client.js's runPlanWithTools() with
+// its WRITE tool set (write_file / edit_file / run_bash, bwrap-sandboxed), pointed at an
+// ISOLATED git worktree so nothing touches the real apply-target tree -- only the
+// resulting `git diff` survives, captured the same way the Claude tier did.
+//
+// This is now the primary adhoc implement path, not an experiment: default-ON, gated only
+// by AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false and the shared queue/.chat-write-tools-disabled
+// kill switch. It runs AFTER the cheaper local tiers (adhoc-harness-draft.js tier 1,
+// local-agentic-draft.js tier 2 read-only); if it also declines, the task blocks for a
+// human -- there is no Claude fallback.
+//
+// Known limits vs. the old Claude tier (accepted trade-offs): runPlanWithTools's per-turn
+// 240s ceiling and 30s-per-command run_bash timeout (so the prompt asks for TARGETED
+// checks -- py_compile on changed files, one test module -- not a full suite), a smaller
+// turn budget, and the local model being materially less reliable at agentic tool use
+// (docs/pipeline-incident-2026-07-19.md). Mitigations: the isolated worktree (a bad edit
+// can't corrupt the real tree), human-gated review still decides whether the diff applies,
+// and dead-process-check.js's zombie-restart threshold bounds a stuck run.
+
+const path = require('path');
+const fs = require('fs');
+const { getConfig } = require('./config.js');
+const { runPlanWithTools } = require('./local-tool-client.js');
+const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
+const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
+
+const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 20;
+
+function isEnabled() {
+  return process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE !== 'false';
+}
+
+// Same shared kill switch runPlanWithTools({allowWrite}) checks (queue/.chat-write-tools-
+// disabled). Checked here too so a disabled tier returns a clean decline instead of
+// letting runPlanWithTools silently drop to its no-tools fallback (a plain completion,
+// useless for a draft).
+function writeToolsDisabled() {
+  try {
+    const { pipelineDir } = getConfig();
+    return fs.existsSync(path.join(pipelineDir, 'queue', '.chat-write-tools-disabled'));
+  } catch {
+    return false;
+  }
+}
+
+function localDraftModelLabel() {
+  return process.env.LOCAL_MODEL;
+}
+
+function buildWriteAgenticPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
+    '',
+    `Title: ${task.title || ''}`,
+    '',
+    ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
+    '',
+    priorRejectionBlock(task),
+    'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or decompose/ask, per below).',
+    '',
+    'If it is NOT already resolved and is a concrete, scoped change you can make confidently: implement it with edit_file / write_file. Read whatever real files you need first -- do not guess at code you have not looked at. Run a targeted check (py_compile / one test module) for what you changed before finishing, and fix any failure your own change introduced.',
+    '',
+    'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task.',
+    '',
+    'If implementing genuinely requires a PRODUCT/DESIGN DECISION only a human should make (which library/approach when none exists yet, what data to keep and for how long, which of several reasonable designs) -- NOT the same as too large, NOT the same as already resolved -- do not guess and do not falsely claim nothing needs to change. Stop and state the real open question(s).',
+    '',
+    'When you are completely done, end your FINAL message with exactly one of these four lines (nothing after it on that line):',
+    'RESOLUTION: implemented',
+    'RESOLUTION: no-changes-needed',
+    'RESOLUTION: decompose',
+    'RESOLUTION: needs-human-decision',
+    '',
+    'If RESOLUTION: implemented -- follow with a short (2-4 sentence) plain-English summary of what you did.',
+    '',
+    'If RESOLUTION: no-changes-needed -- follow with a short summary, then an "Already covered:" block: one line per concrete object the request names, as `<object> -- <path>:<symbol>`. If you cannot fill in a real file:symbol for every object, it is NOT no-changes-needed.',
+    '',
+    'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, in exactly this shape (a full, self-contained description for each -- someone implementing just that one piece must not need the original task):',
+    '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
+    'Then a short (1-3 sentence) explanation of why you split it this way.',
+    '',
+    'If RESOLUTION: needs-human-decision -- follow it with the specific open question(s), plainly stated, and enough real context for a human to answer without re-investigating. Then, if the answer space is a small number of genuinely distinct choices, ALSO give 2-4 options in exactly this format:',
+    'OPTIONS:',
+    '1. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
+    '2. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
+    '(a free-text "Other" answer is always available separately -- do not add an "other" option yourself. If the answer space is open-ended, omit OPTIONS entirely.)',
+  ].join('\n');
+}
+
+/**
+ * Adhoc tier-3, local. Same return contract as the (deleted) Claude draftAdhocImplement:
+ * { succeeded, blocked?, blockedReason?, needsClarification? } plus a `reason` on a
+ * "declined, try the next path" outcome. draftAdhocBranch calls this where the Claude
+ * call used to be; a non-succeeded/declined result there means "block for human".
+ *
+ * @param {object} task
+ * @param {object} [deps]
+ * @param {function} [deps.runPlan] - defaults to local-tool-client.js runPlanWithTools.
+ * @param {function} [deps.runInWorktree] - full override of the worktree run (tests).
+ * @param {function} [deps.recordModelCall]
+ */
+async function draftAdhocViaLocalAgenticWrite(task, {
+  runPlan = runPlanWithTools,
+  runInWorktree,
+  recordModelCall = defaultRecordModelCall,
+} = {}) {
+  // A deliberately-disabled tier is a clean block for a human, not an infra failure to
+  // retry -- return the {succeeded:true, blocked:true} shape so draftAdhocBranch routes
+  // the task to queue/blocked/ with a legible reason.
+  if (!isEnabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+  if (writeToolsDisabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (queue/.chat-write-tools-disabled kill switch) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+
+  const prompt = buildWriteAgenticPrompt(task);
+  const started = Date.now();
+
+  const doRun = runInWorktree || (async (worktreeDir) => {
+    const result = await runPlan({
+      prompt,
+      maxTurns: LOCAL_AGENTIC_WRITE_MAX_TURNS,
+      source: task.source,
+      allowWrite: true,
+      primaryRoot: worktreeDir,
+    });
+    modelStatsSafe(recordModelCall, {
+      taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
+      startedAt: new Date(started).toISOString(), latencyMs: Date.now() - started,
+      result, source: task.source,
+    });
+    return result;
+  });
+
+  try {
+    return await runAgenticDraftInWorktree(task, {
+      runInWorktree: doRun,
+      modelLabel: localDraftModelLabel(),
+    });
+  } catch (e) {
+    return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
+  }
+}
+
+function modelStatsSafe(fn, args) {
+  try { fn(args); } catch { /* telemetry must never break a draft */ }
+}
+
+module.exports = {
+  draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
+};
