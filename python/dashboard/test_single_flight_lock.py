@@ -5,10 +5,12 @@ matching python/test_build_graph.py's own zero-dependency stdlib-unittest conven
 
 Run: .venv/bin/python -m unittest python.dashboard.test_single_flight_lock -v
 """
+import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -91,6 +93,34 @@ class AcquireReleaseTest(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertIn("GOT_IT", freed.stdout)
+
+    def test_acquire_is_bounded_and_times_out_when_another_process_holds_the_lock(self):
+        # 2026-08-31 parity with single-flight-lock.js / agent-manager-common.sh: acquire()
+        # used to be an unbounded fcntl.flock(LOCK_EX), so a stuck holder hung the caller
+        # forever. It now honours SINGLE_FLIGHT_LOCK_TIMEOUT_SECS and raises TimeoutError
+        # with "timed out" in the message.
+        d = Path(tempfile.mkdtemp())
+        lockfile = d / single_flight_lock.LOCK_NAME
+        holder = subprocess.Popen(["bash", "-c", f'exec 200>"{lockfile}"; flock 200; sleep 30'])
+        try:
+            time.sleep(0.3)  # let the holder actually acquire
+            prev = os.environ.get("SINGLE_FLIGHT_LOCK_TIMEOUT_SECS")
+            os.environ["SINGLE_FLIGHT_LOCK_TIMEOUT_SECS"] = "1"
+            try:
+                start = time.monotonic()
+                with self.assertRaises(TimeoutError) as ctx:
+                    single_flight_lock.acquire(d)
+                elapsed = time.monotonic() - start
+                self.assertIn("timed out", str(ctx.exception))
+                self.assertLess(elapsed, 5, "must give up near the 1s deadline, not hang")
+            finally:
+                if prev is None:
+                    os.environ.pop("SINGLE_FLIGHT_LOCK_TIMEOUT_SECS", None)
+                else:
+                    os.environ["SINGLE_FLIGHT_LOCK_TIMEOUT_SECS"] = prev
+        finally:
+            holder.kill()
+            holder.wait()
 
     def test_priority_marker_present_only_while_genuinely_blocked_waiting(self):
         d = Path(tempfile.mkdtemp())
