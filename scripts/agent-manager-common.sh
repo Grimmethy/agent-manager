@@ -282,37 +282,108 @@ acquire_single_flight_lock() {
   # that identity is the entire mechanism; a bash `sed` step that drifted from the JS
   # regex even slightly would silently recreate this exact bug.
   local key="${1:-}"
-  local lockfile
+  local lockfile queue_dir
   if [[ -n "$key" ]]; then
     local safe_key
     safe_key="$(printf '%s' "$key" | sed -E 's/[^A-Za-z0-9._-]+/_/g')"
     lockfile="${INSTANCES_DIR}/.pipeline-single-flight.${safe_key}.lock"
+    queue_dir="${INSTANCES_DIR}/.pipeline-single-flight-queue.${safe_key}"
   else
     lockfile="${INSTANCES_DIR}/.pipeline-single-flight.lock"
+    queue_dir="${INSTANCES_DIR}/.pipeline-single-flight-queue"
   fi
   local priority_dir="${INSTANCES_DIR}/.discuss-waiting"
+  local timeout_secs="${SINGLE_FLIGHT_LOCK_TIMEOUT_SECS:-600}"
+
+  # Discuss-priority backoff (unchanged): a user-interactive waiter (Python drops a
+  # marker in .discuss-waiting/) gets a short head start to enter the FIFO queue below
+  # before this lane does.
   local waited=0
   while [[ -n "$(ls -A "$priority_dir" 2>/dev/null)" && "$waited" -lt "${DISCUSS_PRIORITY_MAX_WAIT_SEC:-8}" ]]; do
     sleep 1
     waited=$((waited + 1))
   done
+
+  # FIFO ticket queue (2026-08-31): flock(2) has no ordering guarantee, so under
+  # sustained contention a third consumer starves -- confirmed live over the entire life
+  # of the project, and root-caused on task bra-1788142124203 where a worker lane lost
+  # the acquire race for 600s straight, every attempt, against worker-1 + this reviewer.
+  # single-flight-lock.js's acquire() (the worker lanes) now enqueues a timestamped
+  # ticket and only attempts the real flock once it holds the OLDEST live ticket; this
+  # function does the identical thing so the reviewer takes its fair turn in the SAME
+  # queue instead of cutting the worker line. Ticket name = <20-digit ms>.<pid>.<8 hex>,
+  # byte-identical to the JS scheme (String(Date.now()).padStart(20,'0') + '.' + pid +
+  # '.' + 8 random hex) so a JS-written and a bash-written ticket sort against each other
+  # correctly -- that identity is the entire mechanism, same as the lockfile name.
+  # The final flock(2) is still the real mutual-exclusion primitive; the queue only
+  # decides who attempts it next.
+  mkdir -p "$queue_dir"
+  local ticket_name ticket
+  ticket_name="$(printf '%020d.%d.%04x%04x' "$(date +%s%3N)" "$$" "$RANDOM" "$RANDOM")"
+  ticket="${queue_dir}/${ticket_name}"
+  : > "$ticket"
+
+  local overall_deadline=$(( $(date +%s) + timeout_secs ))
+  local stale_secs=$(( timeout_secs * 2 ))
+  local acquired=1  # 0 == success, bash-style
+
+  # Open the real lockfile fd once; only flock it once we reach the head of the queue.
   eval "exec ${SINGLE_FLIGHT_LOCK_FD}>\"\$lockfile\""
-  # Bounded wait (2026-08-27, root-caused live): this used to be a plain blocking
-  # `flock "$SINGLE_FLIGHT_LOCK_FD"` with no timeout, by deliberate original design ("no
-  # timeout, no -n, matching the bash version exactly" -- see single-flight-lock.js's own
-  # comment on the same choice). Confirmed live via `lslocks`: the kernel reported this
-  # exact lockfile held by a PID that no longer existed (`kill -0` on it: "No such
-  # process") -- some prior holder died in a way that left the flock() unreleased, and
-  # three real waiters (reviewer, worker-1, worker-reasoning) sat blocked on it for 20+
-  # minutes with zero recovery path, stalling the entire pipeline (not just one lane) and
-  # producing the multi-hour queue/review backlog this was root-caused from. `-w` bounds
-  # the wait; a real, non-stale holder legitimately finishing its call well within this
-  # window is completely unaffected (this only ever fires on the failure path). On
-  # timeout, returns non-zero instead of hanging forever -- the caller must check this
-  # and treat it as an infra-shaped failure (same "requeue a bounded number of times,
-  # then give up loudly" contract every other infra failure in this pipeline already
-  # gets), not silently retry the exact same blocking call.
-  flock -w "${SINGLE_FLIGHT_LOCK_TIMEOUT_SECS:-600}" "$SINGLE_FLIGHT_LOCK_FD"
+
+  while :; do
+    (( $(date +%s) >= overall_deadline )) && break
+
+    # Sweep stale tickets: owning pid gone, or file older than 2x the timeout (a hard-
+    # killed process that never cleaned up -- same failure the -w bound was added for).
+    local now_s f base fpid mtime
+    now_s="$(date +%s)"
+    for f in "$queue_dir"/*; do
+      [[ -e "$f" ]] || continue
+      base="$(basename "$f")"
+      [[ "$base" =~ ^[0-9]{20}\.([0-9]+)\. ]] || continue
+      fpid="${BASH_REMATCH[1]}"
+      if ! kill -0 "$fpid" 2>/dev/null; then
+        rm -f "$f" 2>/dev/null
+        continue
+      fi
+      mtime="$(stat -c %Y "$f" 2>/dev/null || echo "$now_s")"
+      (( now_s - mtime > stale_secs )) && rm -f "$f" 2>/dev/null
+    done
+
+    # Am I at the head of the line?
+    local head
+    head="$(ls "$queue_dir" 2>/dev/null | grep -E '^[0-9]{20}\.' | LC_ALL=C sort | head -n1)"
+    if [[ -n "$head" && "$head" != "$ticket_name" ]]; then
+      sleep 0.5
+      continue
+    fi
+
+    # At the head -- attempt the real flock. Cap each attempt so a non-participating
+    # holder mid-call can't consume the whole remaining deadline in one blocking wait.
+    local remaining=$(( overall_deadline - $(date +%s) ))
+    (( remaining < 1 )) && remaining=1
+    local attempt=30
+    (( remaining < attempt )) && attempt="$remaining"
+    if flock -w "$attempt" "$SINGLE_FLIGHT_LOCK_FD"; then
+      acquired=0
+      break
+    fi
+    # Holder outlasted this attempt window -- re-check the queue and retry.
+  done
+
+  rm -f "$ticket" 2>/dev/null
+
+  if (( acquired != 0 )); then
+    # Never got it. Close the fd we opened and report an infra-shaped failure -- the
+    # caller (review-runner.sh) checks the return code and synthesizes a "timed out"
+    # review_result that INFRA_FAILURE_PATTERN matches, so the task gets bounded requeue
+    # rounds rather than a silent permanent hang (the 2026-08-27 incident this bound was
+    # first added for).
+    eval "exec ${SINGLE_FLIGHT_LOCK_FD}>&-" 2>/dev/null || true
+    printf '[single-flight] lock acquisition timed out after %ss waiting for lock '\''%s'\'' (never reached the head of the FIFO queue)\n' "$timeout_secs" "${key:-(default)}" >&2
+    return 1
+  fi
+  return 0
 }
 
 release_single_flight_lock() {
