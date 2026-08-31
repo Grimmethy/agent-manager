@@ -249,7 +249,7 @@
   <main id="main"><div class="empty">Loading...</div></main>
   <aside id="chat-panel">
     <div class="chat-header">
-      <h2>Chat</h2>
+      <h2 id="chat-title" title="Rooted at the agent-manager repo, with read/write access to every registered plugin and project repo.">System Chat</h2>
       <span id="chat-provider-container"></span>
       <button type="button" class="secondary" id="chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
       <button type="button" class="secondary" id="chat-new-btn" title="Start a fresh conversation">New</button>
@@ -263,7 +263,7 @@
     </div>
   </aside>
 </div>
-<button type="button" id="chat-toggle-tab" title="Show/hide the Chat panel">Chat</button>
+<button type="button" id="chat-toggle-tab" title="Show/hide the System Chat panel">Chat</button>
 
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" id="modal-content"></div>
@@ -1095,6 +1095,10 @@ function chatWireProviderToggle() {
 }
 
 function chatRender() {
+  const titleEl = document.getElementById('chat-title');
+  if (titleEl && chatSession && Array.isArray(chatSession.roots) && chatSession.roots.length) {
+    titleEl.title = 'Accessible repos (roots[0] is primary):\n' + chatSession.roots.join('\n');
+  }
   const container = document.getElementById('chat-provider-container');
   if (container && !document.getElementById('chat-provider')) {
     container.innerHTML = renderProviderToggle('chat-provider');

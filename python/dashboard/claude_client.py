@@ -36,7 +36,7 @@ class ClaudeClientError(RuntimeError):
 def generate(prompt: str, model: str = None, effort: str = None, think: bool = False,
              temperature: float = None, num_predict: int = None,
              cwd: str = None, allowed_tools: str = None, max_turns: int = None,
-             resume: str = None) -> dict:
+             resume: str = None, add_dirs: list = None) -> dict:
     """Same return shape as ollama_client.generate(): {"response": str, "thinking": str}.
     `think`/`temperature`/`num_predict` are accepted but ignored -- they're Ollama sampling
     knobs with no Claude Code CLI equivalent; kept in the signature only so callers built
@@ -54,7 +54,12 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     `sessionId` (returned below), threaded through to claude-client.js's `--resume` flag
     so the CLI's own session storage carries real conversation state forward -- the
     caller doesn't need to rebuild a transcript from scratch each turn the way
-    Discuss/Grill already do for lack of this."""
+    Discuss/Grill already do for lack of this.
+
+    `add_dirs` (2026-08-31, system-wide Chat panel) is a list of extra directories the
+    `claude` CLI may Read/Grep/Glob/Edit/Write in on top of `cwd` -- one `--add-dir` flag
+    each. The Chat panel roots `cwd` at the agent-manager repo and passes every registered
+    plugin/project repo here so one conversation spans the whole system."""
     request = {"prompt": prompt}
     if model:
         request["model"] = model
@@ -68,6 +73,8 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
         request["maxTurns"] = max_turns
     if resume:
         request["resume"] = resume
+    if add_dirs:
+        request["addDirs"] = list(add_dirs)
 
     tmp_path = Path(tempfile.gettempdir()) / f"claude-client-req-{uuid.uuid4().hex}.json"
     try:
