@@ -40,6 +40,18 @@ function extractFilePaths(text) {
 // fabrication" in the first place). Best-effort JSON parse; any failure (malformed JSON,
 // not Group B shaped at all -- e.g. a brain_dump_sort/research prose draft) just means no
 // targets get excluded, the exact same behavior as before this fix existed.
+//
+// 2026-08-31: `secondBrainPath` joins `mode:"create"` as a recognised write-target key.
+// A brain_dump_sort / secondbrain draft is a single JSON object whose `secondBrainPath`
+// names the note's DESTINATION in the vault -- created if new (the common case: filing
+// something brand new), appended if it already exists. Either way it is the thing being
+// WRITTEN, never a claim that a repo file already exists, so it is exactly the same
+// "not fabrication evidence" category as a Group B create target. review-task.js already
+// re-roots the check at the vault and carves this out in the reviewer PROMPT wording, but
+// the deterministic `missing-file` flag was still being generated and handed to the
+// reviewer model as JSON evidence -- confirmed live via the done-task backlog: 7 of 8
+// brain_dump_sort tasks were rejected on the first review pass for exactly this, each
+// costing an extra draft+review cycle.
 function extractCreateModeTargets(text) {
   let parsed;
   try {
@@ -51,8 +63,12 @@ function extractCreateModeTargets(text) {
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const targets = new Set();
   for (const item of items) {
-    if (item && item.mode === 'create' && typeof item.file === 'string' && item.file.trim()) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.mode === 'create' && typeof item.file === 'string' && item.file.trim()) {
       targets.add(item.file.trim());
+    }
+    if (typeof item.secondBrainPath === 'string' && item.secondBrainPath.trim()) {
+      targets.add(item.secondBrainPath.trim());
     }
   }
   return targets;
