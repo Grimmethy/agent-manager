@@ -68,6 +68,13 @@ while :; do                                                                     
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
+  # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
+  # the GPU for an image generation this tick; yield exactly like the model-swap guard.
+  if comfyui_lease_held; then
+    printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
   record_active_model "$INSTANCE_ID" "${LOCAL_MODEL:-}" "low"
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too

@@ -23,6 +23,17 @@ LOG_DIR="${STATE_DIR}/logs"
 PID_DIR="${STATE_DIR}/pids"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
+# Starting the pipeline by hand is an explicit "GPU work now" signal -- it stomps any
+# ComfyUI GPU lease PromptForge left behind (see comfyui_lease_held in
+# agent-manager-common.sh). An in-flight generation loses this round (gpu-guard.js will
+# /free its models on the next tick, the job errors cleanly); the next generation
+# re-acquires the lease and the pipeline yields again. Last explicit action wins.
+COMFY_LEASE_PATH="${AGENT_MANAGER_COMFY_LEASE_PATH:-${STATE_DIR}/comfyui-lease.json}"
+if [[ -f "$COMFY_LEASE_PATH" ]]; then
+  rm -f "$COMFY_LEASE_PATH" \
+    && echo "[launch] cleared ComfyUI GPU lease ($COMFY_LEASE_PATH) -- explicit pipeline start takes the GPU"
+fi
+
 AGENT_MANAGER_DASHBOARD_PORT="${AGENT_MANAGER_DASHBOARD_PORT:-7420}"
 
 # orc-common.sh and downstream scripts hard-requires MODEL_URL, HOME_LOGS already exported.

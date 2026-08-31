@@ -5894,6 +5894,21 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     domains_path_for_registry = child_env.get("AGENT_MANAGER_DOMAINS_PATH") or str(Path(pipeline_dir_for_registry) / "task-domains.json")
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
 
+    # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
+    # PromptForge left behind so the local-model daemons don't yield their ticks to a
+    # generation that isn't the priority anymore (see comfyui_lease_held in
+    # agent-manager-common.sh). scripts/launch.sh does the same on the Linux path; this
+    # also covers the Windows .ps1 path below.
+    _comfy_lease = Path(
+        os.environ.get("AGENT_MANAGER_COMFY_LEASE_PATH")
+        or (Path(os.environ.get("HOME") or "~").expanduser()
+            / ".local/state/agent-manager/comfyui-lease.json")
+    )
+    try:
+        _comfy_lease.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     if os.name != "nt":
         import platform, subprocess as sp, shlex
         LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
