@@ -147,6 +147,17 @@
   .task-history-row { font-size: 12px; padding: 3px 0; }
   .task-history-stage { font-family: monospace; font-weight: 600; }
   .task-history-row .meta { display: inline; }
+  /* Draft Attempts: one <details> per draftTask() run (draft-attempt-record.js). */
+  .draft-attempt { border: 2px solid var(--border); border-radius: 6px; margin-top: 6px; padding: 0 10px; }
+  .draft-attempt > summary { cursor: pointer; padding: 8px 0; font-size: 12px; font-weight: 600; list-style-position: inside; }
+  .draft-attempt[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+  .draft-attempt .da-body { padding-bottom: 10px; }
+  .da-outcome-blocked, .da-outcome-error { color: var(--bad); }
+  .da-outcome-succeeded { color: var(--good, #4caf50); }
+  .da-tier { font-size: 12px; padding: 4px 0; border-top: 1px dashed var(--border); margin-top: 6px; }
+  .da-tier-name { font-family: monospace; font-weight: 600; }
+  .da-tools { font-size: 11px; color: var(--muted); font-family: monospace; }
+  .draft-attempt pre { max-height: 260px; }
   /* Base state (Ornith) also gets its own look, not just the Claude state -- previously
      only .provider-toggle-claude had a distinct color, so the default Ornith state was
      visually identical to a plain .secondary button (Discuss/Edit/Delete), which is how
@@ -2141,6 +2152,95 @@ async function renderAdhocTasksTab() {
   });
 }
 
+// Renders task.draftAttempts[] (src/draft-attempt-record.js) as one <details> per
+// draftTask() run: plan text (or degenerate reason), each implement tier's
+// resolution/decline reason + response + captured worktree diff + a summary of its tool
+// activity, and the terminal outcome. Older records past the keep-window arrive already
+// collapsed to a slim shape (no bodies) -- rendered as a one-line summary. Newest first.
+function renderDraftAttempts(task) {
+  const attempts = Array.isArray(task.draftAttempts) ? task.draftAttempts : [];
+  if (!attempts.length) return '';
+
+  const tierBlock = (t) => {
+    const verdict = t.resolution
+      ? `resolution=${t.resolution}`
+      : (t.applied === true ? 'applied' : t.applied === false ? 'declined' : (t.blocked ? 'blocked' : '?'));
+    let h = `<div class="da-tier"><span class="da-tier-name">${escapeHtml(t.tier)}</span> `
+      + `<span class="meta">${escapeHtml(verdict)}`
+      + (t.turnsUsed != null ? ` · ${t.turnsUsed} turn(s)` : '')
+      + `</span>`;
+    if (t.reason) h += `<div class="meta">${escapeHtml(t.reason)}</div>`;
+    if (t.toolCalls) {
+      const tc = t.toolCalls;
+      const byTool = Object.entries(tc.byTool || {}).map(([k, v]) => `${k}×${v}`).join(', ');
+      h += `<div class="da-tools">${tc.total} tool call(s)${byTool ? ` — ${escapeHtml(byTool)}` : ''}`
+        + `${tc.errors ? ` · ${tc.errors} error(s)` : ''}${tc.listTruncated ? ' · list truncated' : ''}</div>`;
+    }
+    if (t.response) {
+      h += `<div class="meta">response${t.responseChars ? ` (${t.responseChars} chars)` : ''}:</div>`
+        + `<pre>${escapeHtml(t.response)}</pre>`;
+    }
+    if (t.rawDiff) {
+      h += `<div class="meta">captured worktree diff${t.rawDiffChars ? ` (${t.rawDiffChars} chars)` : ''}:</div>`
+        + `<pre>${escapeHtml(t.rawDiff)}</pre>`;
+    }
+    return h + `</div>`;
+  };
+
+  const one = (a) => {
+    const when = a.at ? new Date(a.at).toLocaleString() : '';
+    const outcome = a.outcome || '?';
+    const summary = `<summary>#${a.attemptNo} · <span class="da-outcome-${escapeHtml(outcome)}">${escapeHtml(outcome)}</span>`
+      + `${a.blockedReason ? ` — ${escapeHtml(String(a.blockedReason).slice(0, 120))}` : ''}`
+      + ` <span class="meta">${escapeHtml(when)}</span></summary>`;
+
+    if (a.collapsed) {
+      const tiers = (a.tiers || []).map((t) => `${t.tier}=${t.resolution || (t.applied ? 'applied' : 'declined')}`).join(' → ');
+      return `<details class="draft-attempt">${summary}<div class="da-body meta">`
+        + `plan ${a.planChars || 0} chars${a.planDegenerate ? ` (degenerate: ${escapeHtml(a.planDegenerate)})` : ''}`
+        + `${tiers ? ` · tiers: ${escapeHtml(tiers)}` : ''}`
+        + ` <em>(older attempt — full detail collapsed)</em></div></details>`;
+    }
+
+    let body = `<div class="da-body">`;
+    if (a.source || a.localRejectCount) {
+      body += `<div class="meta">source=${escapeHtml(a.source || '?')}`
+        + `${a.localRejectCount ? ` · localRejectCount=${a.localRejectCount}` : ''}`
+        + `${a.adhocResolution ? ` · adhocResolution=${escapeHtml(a.adhocResolution)}` : ''}</div>`;
+    }
+    if (a.plan) {
+      if (a.plan.degenerate) {
+        body += `<div class="field-label">Plan</div><pre class="meta">(degenerate: ${escapeHtml(a.plan.degenerate)})</pre>`;
+      } else {
+        body += `<div class="field-label">Plan${a.plan.chars ? ` (${a.plan.chars} chars` : ''}`
+          + `${a.plan.attempts != null ? `, ${a.plan.attempts} attempt(s)` : ''}${a.plan.chars ? ')' : ''}</div>`
+          + `<pre>${escapeHtml(a.plan.text || '')}</pre>`;
+      }
+    }
+    if (a.implement) {
+      const im = a.implement;
+      body += `<div class="field-label">Implement</div>`;
+      if (im.degenerate) body += `<pre class="meta">(degenerate: ${escapeHtml(im.degenerate)})</pre>`;
+      else {
+        if (im.note) body += `<div class="meta">${escapeHtml(im.note)}</div>`;
+        if (im.text) body += `<pre>${escapeHtml(im.text)}</pre>`;
+        else if (!im.note) body += `<pre class="meta">(empty)</pre>`;
+      }
+    }
+    if (a.critique) {
+      body += `<div class="meta">critique: ${escapeHtml(a.critique.outcome || '?')}${a.critique.revised ? ', revised' : ''}</div>`;
+    }
+    if (a.tiers && a.tiers.length) {
+      body += `<div class="field-label">Implement Tiers</div>${a.tiers.map(tierBlock).join('')}`;
+    }
+    if (a.reason) body += `<div class="field-label">Error</div><div class="meta da-outcome-error">${escapeHtml(a.reason)}</div>`;
+    return `<details class="draft-attempt">${summary}${body}</div></details>`;
+  };
+
+  const rows = attempts.slice().reverse().map(one).join('');
+  return `<div class="field-label">Draft Attempts (${attempts.length})</div>${rows}`;
+}
+
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
@@ -2242,6 +2342,12 @@ function renderTaskDetailModal(task) {
         + `</div>`;
     }).join('') + `</div>`;
   }
+  // Draft Attempts: one collapsible record per draftTask() run (draft-attempt-record.js).
+  // task.planResponse / task.implementResponse below only ever show the LAST run; this is
+  // the per-attempt history -- every earlier plan, every tier's decline reason + response,
+  // every tier-3 worktree diff -- so following up on a task that failed N times no longer
+  // means re-investigating from scratch.
+  html += renderDraftAttempts(task);
   // A "degenerate: empty" block means the model returned nothing for that pass -- the
   // field is absent, not present-and-empty, so without this the modal just omits the
   // section and the timeline is the only hint anything ran. Say it explicitly.
