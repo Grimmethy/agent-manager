@@ -203,3 +203,73 @@ test('a tiny /api/ps size_vram (rounding artefact) is not treated as a resident 
   });
   assert.equal(result.starved, true); // 4MB isn't "the model is resident"
 });
+
+// --- ComfyUI GPU lease (2026-08-30) -------------------------------------------------
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { comfyuiLeaseHeld } = require('./gpu-guard.js');
+
+function withLeaseFile(contents, fn) {
+  const p = path.join(os.tmpdir(), `comfyui-lease-test-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(p, JSON.stringify(contents));
+  try { return fn(p); } finally { try { fs.unlinkSync(p); } catch (e) {} }
+}
+
+test('lease held (fresh): ensureGpuHeadroom does nothing -- no VRAM read, no /free', async () => {
+  let touched = false;
+  const result = await ensureGpuHeadroom({
+    leaseHeld: () => true,
+    readFreeVram: () => { touched = true; return 100; },
+    fetchJsonFn: async () => { touched = true; return { ok: true }; },
+  });
+  assert.equal(touched, false, 'must not probe VRAM or hit ComfyUI while the lease is held');
+  assert.equal(result.starved, false);
+  assert.deepEqual(result.freed, []);
+  assert.deepEqual(result.yielded, []);
+  assert.match(result.note, /comfyui-lease held/);
+});
+
+test('lease absent: the normal /free reclaim path still runs', async () => {
+  const calls = [];
+  await ensureGpuHeadroom({
+    leaseHeld: () => false,
+    minFreeMb: 4096,
+    readFreeVram: () => 1500,
+    fetchJsonFn: async (url) => {
+      calls.push(url);
+      if (url.endsWith('/free')) return { ok: true };
+      if (url.endsWith('/api/ps')) return { ok: true, body: { models: [] } };
+      if (url.endsWith('/api/automation/apps')) return { ok: true, body: { apps: [] } };
+      throw new Error(`unexpected: ${url}`);
+    },
+  });
+  assert.ok(calls.some((u) => u.endsWith('/free')), 'the reclaim /free call must still happen with no lease');
+});
+
+test('comfyuiLeaseHeld: fresh refreshedAt + acquiredAt -> true', () => {
+  const now = new Date().toISOString();
+  withLeaseFile({ holder: 'promptforge', acquiredAt: now, refreshedAt: now }, (p) => {
+    assert.equal(comfyuiLeaseHeld(p), true);
+  });
+});
+
+test('comfyuiLeaseHeld: refreshedAt older than TTL -> false (stale)', () => {
+  const old = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  withLeaseFile({ holder: 'promptforge', acquiredAt: old, refreshedAt: old }, (p) => {
+    assert.equal(comfyuiLeaseHeld(p), false);
+  });
+});
+
+test('comfyuiLeaseHeld: acquiredAt past MAX_S even with a fresh refreshedAt -> false (anti-starvation ceiling)', () => {
+  const acquired = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 min ago, past 900s
+  const refreshed = new Date().toISOString();
+  withLeaseFile({ holder: 'promptforge', acquiredAt: acquired, refreshedAt: refreshed }, (p) => {
+    assert.equal(comfyuiLeaseHeld(p), false);
+  });
+});
+
+test('comfyuiLeaseHeld: missing file -> false (fails open)', () => {
+  assert.equal(comfyuiLeaseHeld(path.join(os.tmpdir(), 'definitely-not-a-lease-file-xyz.json')), false);
+});
