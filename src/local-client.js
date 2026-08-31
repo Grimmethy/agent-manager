@@ -47,6 +47,11 @@ const MODEL = process.env.LOCAL_MODEL;
 // 2026-08-24 (Grimmethy: "Ornith is no longer the default model... reference local
 // instead") -- LOCAL_KEEP_ALIVE is the current name; ORNITH_KEEP_ALIVE still read as a
 // fallback so an existing deployment's env doesn't silently stop working after this rename.
+// 2026-08-31: exported so local-tool-client.js's /api/chat calls (the agentic tool loop --
+// Chat panel + every local agentic draft tier) send the SAME keep_alive. Until then that
+// path sent none at all and inherited Ollama's 5-minute default, so a single agentic turn
+// that outran 5 min (model reasoning + a 240s run_bash + the GPU lock held elsewhere in
+// between) paid a full cold reload (~114s observed) on the next turn.
 const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
 
 function detectDegenerate(text, { allowEmpty = false } = {}) {
@@ -332,7 +337,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, KEEP_ALIVE };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

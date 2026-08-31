@@ -16,6 +16,7 @@ const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { withLock } = require('./single-flight-lock.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
 // capabilities so that the local reasoning model can handle the work... I'd like to see
@@ -457,10 +458,16 @@ function buildWriteToolHandlers(allowedRoots) {
 // per-call is what causes an expensive reload-triggered hang, not the fix for one).
 // Reusing the existing pinned constant instead of picking a new number keeps every local-
 // provider caller on the one value this pipeline has already vetted.
+// 2026-08-31: same story for keep_alive. This path sent none, so between agentic turns the
+// model unloaded on Ollama's 5-minute default and the next turn ate a cold reload (~114s
+// observed on the 27B during the first live run of the #36 write-agentic adhoc tier, whose
+// turns routinely outlast 5 min: model reasoning + a 240s run_bash + worker-1 holding the
+// GPU lock in between). local-client.js's KEEP_ALIVE (LOCAL_KEEP_ALIVE || ORNITH_KEEP_ALIVE
+// || '30m') is exported now and reused here so both call paths agree.
 async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL, messages, tools, stream: false, options: { num_ctx: PINNED_NUM_CTX },
+      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
     return res.message || {};
   }
@@ -468,7 +475,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   let toolCalls = null;
   let streamError = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
-    model: MODEL, messages, tools, options: { num_ctx: PINNED_NUM_CTX },
+    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
     if (obj.error || obj.done_reason === 'error') {
       streamError = obj.error || obj.done_reason || 'unknown stream error';
