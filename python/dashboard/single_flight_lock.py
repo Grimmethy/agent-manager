@@ -49,12 +49,27 @@ which a single `with` block can't do. held() stays the right shape for every OTH
 life fits inside one function call.
 """
 import fcntl
+import os
+import time
 import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
 LOCK_NAME = ".pipeline-single-flight.lock"
 PRIORITY_WAIT_DIR_NAME = ".discuss-waiting"
+
+
+def _timeout_secs() -> float:
+    """Bounded-wait parity with single-flight-lock.js / agent-manager-common.sh
+    (2026-08-31). Both of those bound acquire() with `flock -w $SINGLE_FLIGHT_LOCK_TIMEOUT_SECS`
+    (default 600) -- this twin was still an *unbounded* fcntl.flock(LOCK_EX), so a stuck
+    holder (a dead PID that left the flock unreleased -- the exact 2026-08-27 incident
+    the other two twins were bounded for) would hang a dashboard request forever. Same
+    env var, same default."""
+    try:
+        return float(os.environ.get("SINGLE_FLIGHT_LOCK_TIMEOUT_SECS") or 600)
+    except (TypeError, ValueError):
+        return 600.0
 
 
 def _lock_name(key: str | None) -> str:
@@ -72,13 +87,15 @@ def _lock_name(key: str | None) -> str:
 
 
 def acquire(instances_dir: Path, key: str | None = None):
-    """Blocking, exclusive acquire -- no timeout, matching single-flight-lock.js's own
-    acquire() exactly (a caller that wants a bounded wait should wrap this itself). Drops
-    a per-waiter priority marker (see this module's own header) for the duration of the
-    wait, clearing it the instant the lock is actually held. Returns the open file object
-    -- it MUST stay open for as long as the lock should be held (the flock is owned by
-    the open file description, not the process) and MUST be passed to release() when
-    done, or the lock leaks for the life of the process."""
+    """Blocking, exclusive acquire, bounded by SINGLE_FLIGHT_LOCK_TIMEOUT_SECS (default
+    600) -- parity with single-flight-lock.js / agent-manager-common.sh's `flock -w`.
+    Drops a per-waiter priority marker (see this module's own header) for the duration of
+    the wait, clearing it the instant the lock is actually held. Returns the open file
+    object -- it MUST stay open for as long as the lock should be held (the flock is owned
+    by the open file description, not the process) and MUST be passed to release() when
+    done, or the lock leaks for the life of the process. Raises TimeoutError (message
+    contains "timed out", matching the JS twin's INFRA_FAILURE_PATTERN-shaped string) if
+    the wait deadline elapses."""
     instances_dir.mkdir(parents=True, exist_ok=True)
     wait_dir = instances_dir / PRIORITY_WAIT_DIR_NAME
     wait_dir.mkdir(exist_ok=True)
@@ -87,8 +104,20 @@ def acquire(instances_dir: Path, key: str | None = None):
     try:
         lock_path = instances_dir / _lock_name(key)
         fh = open(lock_path, "w")
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        return fh
+        timeout = _timeout_secs()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh
+            except OSError:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise TimeoutError(
+                        f"single-flight lock acquisition timed out after {timeout:.0f}s "
+                        f"waiting for lock '{key or '(default)'}'"
+                    )
+                time.sleep(0.25)
     finally:
         # Acquired (or the open/flock call itself raised) -- either way no longer
         # "waiting". Not everyone's marker: another concurrent waiter may still be queued
