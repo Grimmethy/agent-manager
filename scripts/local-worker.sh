@@ -255,7 +255,11 @@ process_drafting_file() {
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
-    printf '[worker-%s] ready for review: %s\n' "$INSTANCE_ID" "$task_id"
+    # >&2 so a completed draft lands in the same operator log (local-worker-<lane>.log) as
+    # every failure/block branch above -- matches review-runner.sh's "reviewing X" and
+    # apply-task.sh's "applying X..." lines. The task JSON already carries a 'draft-done'
+    # history event (src/local-draft.js concludeDraft()).
+    printf '[worker-%s] draft complete, ready for review: %s\n' "$INSTANCE_ID" "$task_id" >&2
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
