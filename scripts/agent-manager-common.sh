@@ -81,6 +81,42 @@ get_claude_paused() {
   ' "$settings_path"
 }
 
+# ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
+# set up the comfui if it's down" + "make sure the eviction only happens if there isn't
+# enough space to run both" + "It needs to go both ways"). PromptForge writes this file
+# ONLY when starting ComfyUI would collide with the resident local model on a single GPU;
+# while it's held (fresh), the local-model lanes here yield their tick and gpu-guard.js
+# leaves ComfyUI alone. Absent / stale / stomped -> this echoes nothing and the pipeline
+# behaves exactly as before (multi-GPU and plenty-of-headroom are the common case).
+#
+# Held = file exists AND refreshedAt within AGENT_MANAGER_COMFY_LEASE_TTL_S (90) AND
+# acquiredAt within AGENT_MANAGER_COMFY_LEASE_MAX_S (900). The MAX_S ceiling means a
+# stuck/runaway generation can never starve this pipeline indefinitely. Fails open --
+# any parse error / missing file -> not held.
+#
+# comfyui_lease_held -> exit 0 if held, 1 otherwise.
+comfyui_lease_held() {
+  local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
+  [[ -f "$lease_path" ]] || return 1
+  local ttl="${AGENT_MANAGER_COMFY_LEASE_TTL_S:-90}"
+  local max_s="${AGENT_MANAGER_COMFY_LEASE_MAX_S:-900}"
+  local verdict
+  verdict="$(node -e '
+    try {
+      const fs = require("fs");
+      const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const ttl = Number(process.argv[2]) * 1000;
+      const maxS = Number(process.argv[3]) * 1000;
+      const now = Date.now();
+      const refreshed = Date.parse(d.refreshedAt);
+      const acquired = Date.parse(d.acquiredAt);
+      if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) process.exit(0);
+      if (now - refreshed <= ttl && now - acquired <= maxS) process.stdout.write("held");
+    } catch (e) {}
+  ' "$lease_path" "$ttl" "$max_s")"
+  [[ "$verdict" == "held" ]]
+}
+
 # Single-flight / model-swap-thrashing guard (2026-08-18, Grimmethy: "make sure that all
 # the tasks that the currently loaded model has available to them is completed before
 # switching to the next model"; widened 2026-08-19, Grimmethy: "it's still running two
