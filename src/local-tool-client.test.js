@@ -242,15 +242,16 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
   for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
     delete require.cache[require.resolve(relId)];
   }
+  const sentBodies = [];
   stub('./ollama-http.js', {
-    postJson: async () => ({ message: queue.length ? queue.shift() : {} }),
+    postJson: async (_url, body) => { sentBodies.push(body); return { message: queue.length ? queue.shift() : {} }; },
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: localCallResponse }) });
+  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '30m' });
   try {
     const mod = require('./local-tool-client.js');
-    return fn(mod, dir);
+    return fn(mod, dir, { sentBodies });
   } finally {
     for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
       delete require.cache[require.resolve(relId)];
@@ -265,6 +266,20 @@ test('runPlanWithTools returns the model reply immediately when the first turn h
     assert.equal(result.turnsUsed, 1);
     assert.equal(result.toolsDisabled, false);
     assert.deepEqual(result.toolCallLog, []);
+  });
+});
+
+test('every /api/chat turn carries keep_alive (the exported local-client KEEP_ALIVE) so the model does not unload between agentic turns', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+    { role: 'assistant', content: 'done' },
+  ], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go' });
+    assert.ok(sentBodies.length >= 2, 'both turns hit /api/chat');
+    for (const body of sentBodies) {
+      assert.equal(body.keep_alive, '30m', 'keep_alive is sent on every turn, not just the first');
+      assert.equal(body.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX);
+    }
   });
 });
 
