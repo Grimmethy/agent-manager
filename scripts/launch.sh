@@ -132,18 +132,14 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   start_bg "worker-1" "${PID_DIR}/worker-1.pid" "${LOG_DIR}/worker-1.log" \
     bash "${SCRIPT_DIR}/local-worker.sh" worker-1
 
-  # Parallel Claude worker lane (Brain Dump #67 follow-up, 2026-08-17) -- claims ONLY
-  # adhoc-shaped tasks (see local-worker.sh's own IS_CLAUDE_LANE comment), running
-  # independently of worker-1 so a multi-minute agentic Claude call never blocks Ornith's
-  # own throughput. Conditioned on CLAUDE_CODE_OAUTH_TOKEN the same way the apply loop
-  # below is conditioned on AGENT_MANAGER_INCLUDE_APPLY -- a deployment with no Claude
-  # subscription configured shouldn't spin up a lane that can only fail every tick.
-  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    start_bg "worker-reasoning" "${PID_DIR}/worker-reasoning.pid" "${LOG_DIR}/worker-reasoning.log" \
-      bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning
-  else
-    printf '[launch] CLAUDE_CODE_OAUTH_TOKEN is not set -- skipping the parallel Claude worker lane (adhoc tasks still get processed by worker-1, just serially).\n'
-  fi
+  # Parallel high-reasoning LOCAL lane (Brain Dump #67 follow-up, 2026-08-17; de-Claude'd
+  # 2026-09-01): claims ONLY reasoningTier:'high' tasks (adhoc's tiered local agentic
+  # drafts -- see local-worker.sh's IS_REASONING_LANE comment) so a long multi-turn qwen
+  # draft doesn't block worker-1's fast brain-dump-sort/etc. throughput. Both lanes run
+  # the local model and serialise on the GPU single-flight lock. Always started -- it no
+  # longer depends on a Claude subscription.
+  start_bg "worker-reasoning" "${PID_DIR}/worker-reasoning.pid" "${LOG_DIR}/worker-reasoning.log" \
+    bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning
 
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
     bash "${SCRIPT_DIR}/review-runner.sh" reviewer

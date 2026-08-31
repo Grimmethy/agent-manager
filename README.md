@@ -86,12 +86,12 @@ registry), so it stays honest across the plugin boundary. Priorities 30/50/60 ar
 | Source | Priority | Reads |
 |---|---|---|
 | `adhoc` | 10 | `queue/adhoc/*.json` (submit via `queue-adhoc-task.js`) |
-| `research_task` | 10 | `queue/research/*.json` -- notes `brain_dump_sort` classified as `requiresResearch`; drafted by `research-agentic-draft.js`'s WebSearch/WebFetch-backed agentic call. Always high-reasoning-tier (Claude) |
+| `research_task` | 10 | `queue/research/*.json` -- notes `brain_dump_sort` classified as `requiresResearch`; drafted by `research-agentic-draft.js`'s WebSearch/WebFetch-backed agentic call -- Claude-only (no local web tools). Runs only when `research_task` is in `AGENT_MANAGER_CLAUDE_SOURCES` with a token set; otherwise blocks cleanly |
 | `trouble_log` | 20 | `AGENT_MANAGER_TROUBLE_LOG_PATH`, entries flagged 🤖 |
 | `secondbrain` | 40 | `SECOND_BRAIN_DIR/Inbox/*.md` |
 | `brain_dump_sort` | 42 | `AGENT_MANAGER_BRAIN_DUMP_PATH`, entries with `status: 'captured'` -- always active regardless of any task-source allowlist, sits above any single project |
 | `path_prefetch_resolve` | 45 | `queue/needs-clarification/*.json` -- LLM-assisted fallback suggesting file path(s) + rationale for a held task path-prefetch's deterministic keyword match couldn't resolve on its own; never auto-resolves. Always active |
-| `pipeline_self_audit` | 65 | `queue/blocked/*.json` -- deterministically scans for a cluster of >=5 tasks failing the same way (`pipeline-self-audit.js`), files a real `adhoc`-shaped task asking a Claude agentic pass to find and fix the pipeline-code root cause. Tracks reported clusters in `AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH` so a signature is only reported once. Always requires human confirmation before applying, same as any other real adhoc diff |
+| `pipeline_self_audit` | 65 | `queue/blocked/*.json` -- deterministically scans for a cluster of >=5 tasks failing the same way (`pipeline-self-audit.js`), files a real `adhoc`-shaped task asking the local write-agentic pass to find and fix the pipeline-code root cause. Tracks reported clusters in `AGENT_MANAGER_SELF_AUDIT_COVERAGE_PATH` so a signature is only reported once. Always requires human confirmation before applying, same as any other real adhoc diff |
 | `arch_review` | 70 | `AGENT_MANAGER_ARCH_CANDIDATES_PATH`, entries rated Strong |
 | `arch_import_review` | 71 | `AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH` (ADR-0020) — same fulfillment logic as `arch_review`, against `arch_import`'s own candidates doc |
 | `observability_fix` | 72 | `AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH` — same fulfillment logic as `arch_review`, consuming a Strong `observability_review` candidate into a real fix |

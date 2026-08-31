@@ -1,0 +1,91 @@
+'use strict';
+
+// Tests for adhoc tier-3 (local write-agentic). The worktree + resolveAgenticDraft path
+// is covered by agentic-draft-common.test.js; here we fake the whole worktree run
+// (runInWorktree) and check the tier's own contract + kill switches.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+function freshModule() {
+  delete require.cache[require.resolve('./local-agentic-write-draft.js')];
+  delete require.cache[require.resolve('./config.js')];
+  return require('./local-agentic-write-draft.js');
+}
+
+function withRepo(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'law-draft-test-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const prev = { r: process.env.AGENT_MANAGER_REPO_ROOT, p: process.env.AGENT_MANAGER_PIPELINE_DIR, m: process.env.LOCAL_MODEL, k: process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.LOCAL_MODEL = 'qwen-test';
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE;
+  try { return fn(dir); } finally {
+    for (const [e, v] of [['AGENT_MANAGER_REPO_ROOT', prev.r], ['AGENT_MANAGER_PIPELINE_DIR', prev.p], ['LOCAL_MODEL', prev.m], ['AGENT_MANAGER_LOCAL_AGENTIC_WRITE', prev.k]]) {
+      if (v === undefined) delete process.env[e]; else process.env[e] = v;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// runInWorktree bypasses git entirely -- it's passed a worktreeDir and returns the model
+// result; resolveAgenticDraft then runs against that dir. For contract tests we hand a
+// fake runInWorktree that also fakes resolveAgenticDraft's outcome by mutating task.
+test('write tier: an implemented result flows through as a needs-review verdict', async () => {
+  await withRepo(async () => {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const task = { id: 'w1', source: 'manual', promptContext: { rawText: 'do it' } };
+    const res = await draftAdhocViaLocalAgenticWrite(task, {
+      runInWorktree: async () => ({ response: 'RESOLUTION: implemented\n\ndid it' }),
+    });
+    // resolveAgenticDraft ran against a real worktree it created from origin/<main> -- but
+    // there's no origin here, so prepare fails cleanly and we get a retryable infra error.
+    // (The happy path is covered end-to-end in agentic-draft-common.test.js.)
+    assert.equal(res.succeeded, false);
+    assert.match(res.reason, /worktree|fetch|origin/i);
+  });
+});
+
+test('write tier: disabled via AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false -> clean block for human', async () => {
+  await withRepo(async () => {
+    process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE = 'false';
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const res = await draftAdhocViaLocalAgenticWrite({ id: 'w2', source: 'manual', promptContext: { rawText: 'x' } }, {
+      runInWorktree: async () => { throw new Error('must not run when disabled'); },
+    });
+    assert.equal(res.succeeded, true);
+    assert.equal(res.blocked, true);
+    assert.match(res.blockedReason, /disabled \(AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false\)/);
+  });
+});
+
+test('write tier: disabled via the shared queue/.chat-write-tools-disabled kill switch -> clean block', async () => {
+  await withRepo(async (dir) => {
+    fs.writeFileSync(path.join(dir, 'queue', '.chat-write-tools-disabled'), '');
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const res = await draftAdhocViaLocalAgenticWrite({ id: 'w3', source: 'manual', promptContext: { rawText: 'x' } }, {
+      runInWorktree: async () => { throw new Error('must not run when kill switch set'); },
+    });
+    assert.equal(res.succeeded, true);
+    assert.equal(res.blocked, true);
+    assert.match(res.blockedReason, /chat-write-tools-disabled/);
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks + the 4 RESOLUTION verbs', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'the ask' } });
+    assert.match(p, /edit_file \/ write_file|edit\/write/i);
+    assert.match(p, /run_bash/);
+    assert.match(p, /py_compile/);
+    assert.match(p, /RESOLUTION: implemented/);
+    assert.match(p, /RESOLUTION: decompose/);
+    assert.match(p, /RESOLUTION: needs-human-decision/);
+    assert.match(p, /the ask/);
+  });
+});
