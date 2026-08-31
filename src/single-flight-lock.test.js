@@ -332,3 +332,92 @@ test('FIFO: a ticket owned by a dead pid is swept and does not wedge the queue',
   assert.deepEqual(fs.readdirSync(qdir).filter((n) => /^\d{20}\./.test(n)), [], 'the stale ticket was swept and our own ticket cleaned up');
   release(fd);
 });
+
+// ---------------------------------------------------------------------------
+// Cross-language FIFO: scripts/agent-manager-common.sh's acquire_single_flight_lock
+// (the reviewer lane) must enqueue in the SAME per-model queue dir with a
+// byte-compatible ticket name, so the reviewer takes its fair turn instead of
+// cutting the worker line. This is the "huge blocker for the entire life of the
+// project" fix -- the reviewer's raw flock(2) used to starve a worker lane for
+// the full 600s timeout, every attempt (task bra-1788142124203).
+// ---------------------------------------------------------------------------
+const REPO_ROOT = path.join(__dirname, '..');
+const COMMON_SH = path.join(REPO_ROOT, 'scripts', 'agent-manager-common.sh');
+
+test('bash acquire_single_flight_lock enqueues in the JS queue dir and is granted once JS releases', () => {
+  const dir = makeInstancesDir();
+  const fd = acquire(dir, 'k'); // JS holds it -- bash must queue behind us
+
+  const script = `
+    set -u
+    INSTANCES_DIR=${JSON.stringify(dir)}
+    SINGLE_FLIGHT_LOCK_TIMEOUT_SECS=10
+    source ${JSON.stringify(COMMON_SH)}
+    acquire_single_flight_lock k && { echo BASH_GOT_IT; release_single_flight_lock; }
+  `;
+  const child = require('child_process').spawn('bash', ['-c', script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+
+  const start = Date.now();
+  setTimeout(() => release(fd), 400);
+
+  return new Promise((resolve) => {
+    child.on('exit', (code) => {
+      const elapsed = Date.now() - start;
+      assert.equal(code, 0, 'bash acquire_single_flight_lock must succeed once JS releases');
+      assert.match(out, /BASH_GOT_IT/);
+      assert.ok(elapsed >= 300, `bash must have waited in the queue for the JS holder (~400ms), only waited ${elapsed}ms`);
+      // Its ticket must be cleaned up -- no wedged queue.
+      assert.deepEqual(
+        fs.readdirSync(queueDirPath(dir, 'k')).filter((n) => /^\d{20}\./.test(n)),
+        [],
+        'bash must remove its ticket from the shared queue dir on the way out',
+      );
+      resolve();
+    });
+  });
+});
+
+test('cross-language FIFO order: a bash waiter enqueued before a JS waiter is granted first', () => {
+  const dir = makeInstancesDir();
+  const outFile = path.join(dir, 'order.log');
+  fs.writeFileSync(outFile, '');
+  const sflPath = require.resolve('./single-flight-lock.js');
+
+  const gate = acquire(dir, 'k'); // both waiters must queue behind this
+
+  // bash waiter enqueues immediately.
+  const bashScript = `
+    set -u
+    INSTANCES_DIR=${JSON.stringify(dir)}
+    SINGLE_FLIGHT_LOCK_TIMEOUT_SECS=15
+    source ${JSON.stringify(COMMON_SH)}
+    acquire_single_flight_lock k && { printf BASH >> ${JSON.stringify(outFile)}; sleep 0.1; release_single_flight_lock; }
+  `;
+  const bashWaiter = require('child_process').spawn('bash', ['-c', bashScript], { stdio: ['ignore', 'ignore', 'inherit'] });
+
+  // JS waiter enqueues clearly later.
+  const jsWaiter = () => require('child_process').spawn('node', ['-e', `
+    const { acquire, release } = require(${JSON.stringify(sflPath)});
+    const fs = require('fs');
+    const fd = acquire(${JSON.stringify(dir)}, 'k');
+    fs.appendFileSync(${JSON.stringify(outFile)}, 'JS');
+    setTimeout(() => release(fd), 60);
+  `], { stdio: ['ignore', 'ignore', 'inherit'] });
+
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      const js = jsWaiter();
+      setTimeout(() => release(gate), 250); // release once both are queued
+      Promise.all([bashWaiter, js].map((c) => new Promise((r) => c.on('exit', r)))).then(() => {
+        assert.equal(
+          fs.readFileSync(outFile, 'utf8').trim(),
+          'BASHJS',
+          'the earlier-enqueued bash waiter must be granted before the later JS waiter',
+        );
+        resolve();
+      });
+    }, 300);
+  });
+});
