@@ -56,6 +56,7 @@ const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
+const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
@@ -761,7 +762,19 @@ function computeImplementBudget(task, implPrompt) {
   // supports up to 262144 (`ollama show ornith:35b`), so there's ample headroom;
   // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
   // output budget plus a fixed margin for the thinking trace.
-  const implNumCtx = Math.min(32768, Math.max(8192, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
+  //
+  // FLOOR at PINNED_NUM_CTX (2026-08-31): Ollama fully reloads the model on ANY num_ctx
+  // change (~55-100s for the 27B). This value used to vary per-prompt and usually landed
+  // on the 8192 floor -- so every draft flipped num_ctx away from the plan pass's and the
+  // Chat tool-loop's PINNED_NUM_CTX and paid a reload, WHILE HOLDING the single-flight GPU
+  // lock. Confirmed live as the cause of `flock -w 600` lock-acquisition timeouts under
+  // 3-way lane contention (worker-1 + worker-reasoning + reviewer), which requeued adhoc
+  // drafts indefinitely. Raising the floor to PINNED_NUM_CTX makes the normal case a
+  // single stable value shared with every other local-model call -> no reload. The
+  // computed need is almost always below the floor anyway; only the whole-document
+  // sources (product_spec family, implNumPredict up to 16000) still grow past it, and a
+  // one-time reload there beats a truncated spec.
+  const implNumCtx = Math.min(32768, Math.max(PINNED_NUM_CTX, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
   // Several sources' implement prompts explicitly tell the local model to output the empty
   // string when nothing genuinely applies (see prompts.js) -- an empty response from
   // them is a valid, intended answer, not a failed call, so the degenerate-output
@@ -1111,7 +1124,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail };
+module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget };
 
 if (require.main === module) {
   main();
