@@ -61,7 +61,7 @@ test('readFileTool returns a clear error string (not a throw) for a nonexistent 
 test('readFileTool refuses a path that escapes the repo root', () => {
   withFixtureRepo((mod) => {
     const result = mod.readFileTool({ path: '../../etc/passwd' });
-    assert.match(result.error, /escapes the repo root/);
+    assert.match(result.error, /not inside any accessible repo/);
   });
 });
 
@@ -91,7 +91,7 @@ test('listDirectoryTool defaults to the repo root when no path is given', () => 
 test('listDirectoryTool refuses a path that escapes the repo root', () => {
   withFixtureRepo((mod) => {
     const result = mod.listDirectoryTool({ path: '../' });
-    assert.match(result.error, /escapes the repo root/);
+    assert.match(result.error, /not inside any accessible repo/);
   });
 });
 
@@ -102,10 +102,10 @@ test('listDirectoryTool returns a clear error string (not a throw) for a nonexis
   });
 });
 
-test('TOOLS declares exactly grep_codebase, read_file, and list_directory -- no write/edit/bash tool', () => {
+test('TOOLS declares exactly the read-only tools (grep_codebase, read_file, list_directory, list_roots) -- no write/edit/bash tool', () => {
   withFixtureRepo((mod) => {
     const names = mod.TOOLS.map((t) => t.function.name).sort();
-    assert.deepEqual(names, ['grep_codebase', 'list_directory', 'read_file']);
+    assert.deepEqual(names, ['grep_codebase', 'list_directory', 'list_roots', 'read_file']);
   });
 });
 
@@ -133,7 +133,7 @@ test('writeFileTool overwrites an existing file', () => {
 test('writeFileTool refuses a path that escapes the repo root', () => {
   withFixtureRepo((mod) => {
     const result = mod.writeFileTool({ path: '../../etc/passwd', content: 'x' });
-    assert.match(result.error, /escapes the repo root/);
+    assert.match(result.error, /not inside any accessible repo/);
   });
 });
 
@@ -313,4 +313,80 @@ test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the k
     assert.equal(result.response, 'fallback reply');
     assert.deepEqual(result.toolCallLog, []);
   }, { killSwitch: '.arch-discovery-tools-disabled' });
+});
+
+// --- multi-root (2026-08-31, system-wide Chat panel) ---------------------------------
+
+test('resolveInsideRoots: a relative path resolves against the primary (first) root', () => {
+  withFixtureRepo((mod, dir) => {
+    const r = mod.resolveInsideRoots([dir, os.tmpdir()], 'src/x.js');
+    assert.equal(r.root, path.resolve(dir));
+    assert.equal(r.full, path.join(path.resolve(dir), 'src/x.js'));
+  });
+});
+
+test('resolveInsideRoots: an absolute path inside a non-primary root is accepted, tagged with that root', () => {
+  withFixtureRepo((mod) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-other-'));
+    const r = mod.resolveInsideRoots([os.homedir(), other], path.join(other, 'a/b.txt'));
+    assert.equal(r.root, path.resolve(other));
+  });
+});
+
+test('resolveInsideRoots: an absolute path outside every allowed root is rejected', () => {
+  withFixtureRepo((mod, dir) => {
+    assert.equal(mod.resolveInsideRoots([dir], '/etc/passwd'), null);
+  });
+});
+
+test('listRootsTool reports the primary first, each with a name and primary flag', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-other-'));
+    const out = mod.listRootsTool([dir, other]);
+    assert.equal(out.primary, dir);
+    assert.equal(out.roots[0].primary, true);
+    assert.equal(out.roots[1].primary, false);
+    assert.equal(out.roots[1].name, path.basename(other));
+  });
+});
+
+test('buildToolHandlers/read_file: relative path -> primary repo; absolute path -> a second root', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-other-'));
+    fs.writeFileSync(path.join(dir, 'here.txt'), 'PRIMARY\n');
+    fs.writeFileSync(path.join(other, 'there.txt'), 'SECONDARY\n');
+    const h = mod.buildToolHandlers([dir, other]);
+    assert.equal(h.read_file({ path: 'here.txt' }).content, 'PRIMARY\n');
+    assert.equal(h.read_file({ path: path.join(other, 'there.txt') }).content, 'SECONDARY\n');
+    assert.match(h.read_file({ path: '/etc/hostname' }).error, /not inside any accessible repo/);
+  });
+});
+
+test('buildWriteToolHandlers/write_file can write into a non-primary root (edit-any-root)', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-other-'));
+    const h = mod.buildWriteToolHandlers([dir, other]);
+    const res = h.write_file({ path: path.join(other, 'sub/new.txt'), content: 'x\n' });
+    assert.equal(res.written, true);
+    assert.equal(fs.readFileSync(path.join(other, 'sub/new.txt'), 'utf8'), 'x\n');
+  });
+});
+
+test('single-arg tool calls still work (roots default to the configured repoRoot)', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'solo.txt'), 'solo\n');
+    assert.equal(mod.readFileTool({ path: 'solo.txt' }).content, 'solo\n');
+    assert.match(mod.readFileTool({ path: '../../etc/passwd' }).error, /not inside any accessible repo/);
+  });
+});
+
+test('buildToolHandlers/grep_codebase rejects a `root` that is not one of the allowed roots', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-other-')));
+    const h = mod.buildToolHandlers([fs.realpathSync(dir), other]);
+    // allowed root -> ok (no throw, returns an array)
+    assert.ok(Array.isArray(h.grep_codebase({ query: 'x', dir: '.', root: other })));
+    // some other path -> refused
+    assert.match(h.grep_codebase({ query: 'x', dir: '.', root: os.homedir() }).error, /not an accessible repo/);
+  });
 });

@@ -75,3 +75,47 @@ test('grepCodebase caps at MAX_MATCHES', () => {
     assert.equal(hits.length, 20);
   });
 });
+
+// --- alternate `root` (2026-08-31, system-wide Chat panel) ----------------------------
+
+test('grepCodebase with an alternate `root` searches that repo and tags hits with it', () => {
+  const primary = makeFixtureRepo();
+  const other = makeFixtureRepo();
+  fs.writeFileSync(path.join(other, 'src', 'other.js'), 'const COMFY_LEASE_PATH = 1;\n');
+  withConfig(primary, 'src,python', () => {
+    const hits = grepCodebase({ query: 'COMFY_LEASE_PATH', dir: 'src', root: other });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'src/other.js');       // relative to `other`, not `primary`
+    assert.equal(hits[0].root, path.resolve(other));  // round-trip anchor
+  });
+});
+
+test('grepCodebase with an alternate `root` ignores the AGENT_MANAGER_GREP_DIRS allowlist', () => {
+  const primary = makeFixtureRepo();
+  const other = makeFixtureRepo();  // has python/app.py with "draft_task"
+  withConfig(primary, 'src', () => {  // "python" is NOT allowlisted
+    const hits = grepCodebase({ query: 'draft_task', dir: 'python', root: other });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'python/app.py');
+  });
+});
+
+test('grepCodebase with an alternate `root` and no dir walks the whole repo', () => {
+  const primary = makeFixtureRepo();
+  const other = makeFixtureRepo();
+  withConfig(primary, 'src', () => {
+    const hits = grepCodebase({ query: 'draftTask', dir: '.', root: other });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'src/worker.js');
+  });
+});
+
+test('grepCodebase without `root` is byte-identical to before (no root field, allowlist enforced)', () => {
+  const dir = makeFixtureRepo();
+  withConfig(dir, 'src,python', () => {
+    const hits = grepCodebase({ query: 'draftTask', dir: 'src' });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].root, undefined);
+    assert.deepEqual(grepCodebase({ query: 'draftTask', dir: 'nope' }), []);
+  });
+});

@@ -40,20 +40,51 @@ function resolveInsideRepo(repoRoot, relPath) {
   return full;
 }
 
+// Multi-root variant (2026-08-31, system-wide Chat panel): the chat assistant is rooted
+// at the agent-manager repo but can also reach every registered plugin/project repo. A
+// RELATIVE path resolves against allowedRoots[0] (the primary root); an ABSOLUTE path is
+// accepted only if it lands inside one of allowedRoots. Returns { full, root } or null.
+// For every non-chat caller allowedRoots is [repoRoot] and this behaves exactly like
+// resolveInsideRepo above.
+function resolveInsideRoots(allowedRoots, p) {
+  const roots = allowedRoots.map((r) => path.resolve(r));
+  if (p && path.isAbsolute(p)) {
+    const full = path.resolve(p);
+    const root = roots.find((r) => full === r || full.startsWith(r + path.sep));
+    return root ? { full, root } : null;
+  }
+  const root = roots[0];
+  const full = path.resolve(root, p || '');
+  if (full !== root && !full.startsWith(root + path.sep)) return null;
+  return { full, root };
+}
+
+// Each file tool below accepts either (allowedRootsArray, argsObj) -- the system-wide
+// Chat path, which threads its own root list -- or just (argsObj), in which case the
+// single configured repoRoot is the only allowed root. The second shape is what every
+// pre-2026-08-31 caller and the standalone unit tests use, unchanged.
+function rootsAndArgs(a, b) {
+  return Array.isArray(a)
+    ? { roots: a, args: b || {} }
+    : { roots: [getConfig().repoRoot], args: a || {} };
+}
+
 // Same cap/truncation-suffix convention as nextCandidateFulfillmentTask()'s own
 // MAX_FETCHED_FILE_CHARS -- one huge file must not blow the model's context or the /api/chat
 // response payload.
 const MAX_READ_FILE_CHARS = 8000;
 
-function readFileTool({ path: relPath }) {
-  const { repoRoot } = getConfig();
+function readFileTool(a, b) {
+  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
+  const relPath = args.path;
   if (typeof relPath !== 'string' || !relPath.trim()) {
     return { error: 'read_file requires a non-empty "path" argument' };
   }
-  const full = resolveInsideRepo(repoRoot, relPath);
-  if (!full) {
-    return { error: `path escapes the repo root, refusing to read: ${relPath}` };
+  const resolved = resolveInsideRoots(allowedRoots, relPath);
+  if (!resolved) {
+    return { error: `path is not inside any accessible repo, refusing to read: ${relPath}` };
   }
+  const { full } = resolved;
   let content;
   try {
     content = fs.readFileSync(full, 'utf8');
@@ -68,13 +99,15 @@ function readFileTool({ path: relPath }) {
   };
 }
 
-function listDirectoryTool({ path: relPath }) {
-  const { repoRoot } = getConfig();
+function listDirectoryTool(a, b) {
+  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
+  const relPath = args.path;
   const target = typeof relPath === 'string' && relPath.trim() ? relPath : '.';
-  const full = resolveInsideRepo(repoRoot, target);
-  if (!full) {
-    return { error: `path escapes the repo root, refusing to list: ${target}` };
+  const resolved = resolveInsideRoots(allowedRoots, target);
+  if (!resolved) {
+    return { error: `path is not inside any accessible repo, refusing to list: ${target}` };
   }
+  const { full } = resolved;
   let entries;
   try {
     entries = fs.readdirSync(full, { withFileTypes: true });
@@ -86,6 +119,18 @@ function listDirectoryTool({ path: relPath }) {
   return {
     path: target,
     entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+  };
+}
+
+// 2026-08-31 (system-wide Chat panel): the assistant is rooted at the agent-manager repo
+// but can also read/edit every registered plugin/project repo. list_roots tells it which
+// absolute paths those are so it can target a non-primary repo with an absolute path
+// argument (read_file/list_directory/write_file/edit_file) or grep_codebase's `root`.
+function listRootsTool(a) {
+  const roots = Array.isArray(a) ? a : [getConfig().repoRoot];
+  return {
+    primary: roots[0],
+    roots: roots.map((r, i) => ({ path: r, name: path.basename(r), primary: i === 0 })),
   };
 }
 
@@ -107,15 +152,17 @@ function listDirectoryTool({ path: relPath }) {
 //     chat_sessions.py)
 const CHAT_BASH_TIMEOUT_MS = 30_000;
 
-function writeFileTool({ path: relPath, content }) {
-  const { repoRoot } = getConfig();
+function writeFileTool(a, b) {
+  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
+  const { path: relPath, content } = args;
   if (typeof relPath !== 'string' || !relPath.trim()) {
     return { error: 'write_file requires a non-empty "path" argument' };
   }
-  const full = resolveInsideRepo(repoRoot, relPath);
-  if (!full) {
-    return { error: `path escapes the repo root, refusing to write: ${relPath}` };
+  const resolved = resolveInsideRoots(allowedRoots, relPath);
+  if (!resolved) {
+    return { error: `path is not inside any accessible repo, refusing to write: ${relPath}` };
   }
+  const { full } = resolved;
   try {
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, typeof content === 'string' ? content : '');
@@ -125,18 +172,20 @@ function writeFileTool({ path: relPath, content }) {
   return { path: relPath, written: true };
 }
 
-function editFileTool({ path: relPath, find, replace }) {
-  const { repoRoot } = getConfig();
+function editFileTool(a, b) {
+  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
+  const { path: relPath, find, replace } = args;
   if (typeof relPath !== 'string' || !relPath.trim()) {
     return { error: 'edit_file requires a non-empty "path" argument' };
   }
   if (typeof find !== 'string' || find === '') {
     return { error: 'edit_file requires a non-empty "find" argument' };
   }
-  const full = resolveInsideRepo(repoRoot, relPath);
-  if (!full) {
-    return { error: `path escapes the repo root, refusing to edit: ${relPath}` };
+  const resolved = resolveInsideRoots(allowedRoots, relPath);
+  if (!resolved) {
+    return { error: `path is not inside any accessible repo, refusing to edit: ${relPath}` };
   }
+  const { full } = resolved;
   let content;
   try {
     content = fs.readFileSync(full, 'utf8');
@@ -186,19 +235,21 @@ function withApplyLock(fn) {
   }
 }
 
-function runBashTool({ command }) {
-  const { repoRoot } = getConfig();
+function runBashTool(a, b) {
+  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
+  const { command } = args;
   if (typeof command !== 'string' || !command.trim()) {
     return { error: 'run_bash requires a non-empty "command" argument' };
   }
-  const realRepoRoot = fs.realpathSync(repoRoot);
+  const realRoots = allowedRoots.map((r) => fs.realpathSync(r));
   const wrapped = wrapWithSandbox('bash', ['-c', command], {
-    workDir: realRepoRoot,
+    workDir: realRoots[0],
     readOnlyBinds: ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
-    // The whole live repo, writable -- unlike adhoc-agentic-draft.js's throwaway
-    // worktree, Chat edits are meant to land directly on the real working tree (see
-    // this feature's own plan: "the same trust model as this session itself").
-    writableBinds: [realRepoRoot],
+    // Every accessible repo, writable -- unlike adhoc-agentic-draft.js's throwaway
+    // worktree, Chat edits are meant to land directly on the real working trees (see
+    // this feature's own plan: "the same trust model as this session itself"). For a
+    // non-chat caller allowedRoots is just [repoRoot], identical to before.
+    writableBinds: realRoots,
   });
   if (!wrapped.available) {
     // Fails CLOSED here, not open -- unlike the Claude adhoc path (a hardening layer on
@@ -228,11 +279,11 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'write_file',
-      description: 'Create a new file or overwrite an existing one with the given content, given a path relative to the repo root.',
+      description: 'Create a new file or overwrite an existing one with the given content. Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots).',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to the repo root.' },
+          path: { type: 'string', description: 'File path relative to the primary repo root, or an absolute path inside another accessible repo.' },
           content: { type: 'string', description: 'Full file content to write.' },
         },
         required: ['path', 'content'],
@@ -243,11 +294,11 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'edit_file',
-      description: 'Replace one exact, unique occurrence of "find" with "replace" in an existing file. Fails if "find" is not found verbatim or matches more than once -- include enough surrounding context to make it unique.',
+      description: 'Replace one exact, unique occurrence of "find" with "replace" in an existing file. Fails if "find" is not found verbatim or matches more than once -- include enough surrounding context to make it unique. Path is relative to the primary repo root, OR an absolute path inside any accessible repo.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to the repo root.' },
+          path: { type: 'string', description: 'File path relative to the primary repo root, or an absolute path inside another accessible repo.' },
           find: { type: 'string', description: 'Exact text to find, must match verbatim and uniquely.' },
           replace: { type: 'string', description: 'Text to replace it with.' },
         },
@@ -259,7 +310,7 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'run_bash',
-      description: 'Run a shell command in the repo root, inside a filesystem sandbox. Use for git operations, running tests, or anything read_file/write_file/edit_file cannot do directly.',
+      description: 'Run a shell command inside a filesystem sandbox. The working directory is the primary repo root; every accessible repo is mounted writable (use `git -C <abs path>` or `cd` for another repo). Use for git operations, running tests, or anything the file tools cannot do directly.',
       parameters: {
         type: 'object',
         properties: {
@@ -270,12 +321,6 @@ const WRITE_TOOLS = [
     },
   },
 ];
-
-const WRITE_TOOL_HANDLERS = {
-  write_file: (args) => writeFileTool({ path: args.path, content: args.content }),
-  edit_file: (args) => editFileTool({ path: args.path, find: args.find, replace: args.replace }),
-  run_bash: (args) => runBashTool({ command: args.command }),
-};
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // No hardcoded fallback tag -- see local-client.js's matching comment. An unset
@@ -300,12 +345,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'grep_codebase',
-      description: 'Search the codebase for a text/word match. Returns up to 20 matches with file path and line number.',
+      description: 'Search the codebase for a text/word match. Returns up to 20 matches with file path and line number. To search a repo other than the primary one, pass its absolute path (from list_roots) as "root".',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Plain substring/word to search for.' },
-          dir: { type: 'string', description: 'Which source root to search (one of the configured allowed dirs).' },
+          dir: { type: 'string', description: 'Which source subdirectory to search. For the primary repo, one of the configured allowed dirs; for another "root", any subdirectory, or "." / omitted to search the whole repo.' },
+          root: { type: 'string', description: 'Optional absolute path of another accessible repo to search instead of the primary one (see list_roots).' },
         },
         required: ['query', 'dir'],
       },
@@ -315,11 +361,11 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read the full content of a real file, given a path relative to the repo root. Content over ~8000 characters is truncated. Read-only -- cannot write or edit.',
+      description: 'Read the full content of a real file. Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots). Content over ~8000 characters is truncated.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to the repo root, e.g. "src/task-sources.js".' },
+          path: { type: 'string', description: 'File path relative to the primary repo root (e.g. "src/task-sources.js") or an absolute path inside another accessible repo.' },
         },
         required: ['path'],
       },
@@ -329,23 +375,59 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'list_directory',
-      description: 'List the files and subdirectories directly inside a given path (one level, not recursive), relative to the repo root.',
+      description: 'List the files and subdirectories directly inside a given path (one level, not recursive). Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots).',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Directory path relative to the repo root, e.g. "src". Omit or use "." for the repo root itself.' },
+          path: { type: 'string', description: 'Directory path relative to the primary repo root (e.g. "src"), or an absolute path inside another accessible repo. Omit or use "." for the primary repo root.' },
         },
         required: [],
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'list_roots',
+      description: 'List every repo you can access: the primary one (agent-manager, where relative paths resolve) and each additional plugin/project repo, with its absolute path. Use these paths to read/edit/grep a non-primary repo.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
 ];
 
-const TOOL_HANDLERS = {
-  grep_codebase: (args) => grepCodebase({ query: args.query, dir: args.dir }),
-  read_file: (args) => readFileTool({ path: args.path }),
-  list_directory: (args) => listDirectoryTool({ path: args.path }),
-};
+// Handler sets are built PER CALL as closures over that call's allowedRoots (the
+// system-wide Chat path threads a multi-repo list; every other caller gets
+// [getConfig().repoRoot], identical to the old static behaviour).
+function buildToolHandlers(allowedRoots) {
+  // A model-supplied `root` for grep_codebase must be one of THIS call's allowed roots --
+  // otherwise the tool would grep any path on disk. allowedRoots is already realpath'd
+  // (see runPlanWithTools), so compare on realpath.
+  const grepRoot = (raw) => {
+    if (!raw) return { ok: true, root: undefined };
+    let real;
+    try { real = fs.realpathSync(raw); } catch { real = null; }
+    if (!real || !allowedRoots.includes(real)) return { ok: false };
+    return { ok: true, root: real };
+  };
+  return {
+    grep_codebase: (args) => {
+      const r = grepRoot(args.root);
+      if (!r.ok) return { error: `root is not an accessible repo: ${args.root} (call list_roots)` };
+      return grepCodebase({ query: args.query, dir: args.dir, root: r.root });
+    },
+    read_file: (args) => readFileTool(allowedRoots, { path: args.path }),
+    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path }),
+    list_roots: () => listRootsTool(allowedRoots),
+  };
+}
+
+function buildWriteToolHandlers(allowedRoots) {
+  return {
+    write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content }),
+    edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace }),
+    run_bash: (args) => runBashTool(allowedRoots, { command: args.command }),
+  };
+}
 
 // One /api/chat turn, normalized to a plain {content, tool_calls} message object
 // regardless of whether it streamed or not -- keeps runPlanWithTools' own loop below
@@ -527,8 +609,8 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk }) {
-  const { pipelineDir } = getConfig();
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [] }) {
+  const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
   const killSwitchPath = path.join(pipelineDir, 'queue',
@@ -537,8 +619,24 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     return runWithoutToolsFallback(prompt, pipelineDir);
   }
 
+  // Multi-root (2026-08-31, system-wide Chat panel): the caller may thread its own
+  // primary root + a list of additional accessible repo roots. Every non-chat caller
+  // passes neither, so allowedRoots is just [repoRoot] and every tool behaves exactly
+  // as it did before. Deduped on realpath, primary first.
+  const rawRoots = [primaryRoot || repoRoot, ...(Array.isArray(extraRoots) ? extraRoots : [])];
+  const seen = new Set();
+  const allowedRoots = [];
+  for (const r of rawRoots) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
+  }
+  if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+
   const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
-  const toolHandlers = allowWrite ? { ...TOOL_HANDLERS, ...WRITE_TOOL_HANDLERS } : TOOL_HANDLERS;
+  const toolHandlers = allowWrite
+    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
+    : buildToolHandlers(allowedRoots);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
   // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
@@ -610,15 +708,21 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 }
 
 module.exports = {
-  runPlanWithTools, readFileTool, listDirectoryTool, resolveInsideRepo, TOOLS,
+  runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool,
+  resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
+  buildToolHandlers, buildWriteToolHandlers,
   withApplyLock, APPLY_LOCK_PATH,
 };
 
 // CLI: node local-tool-client.js <request.json>
-// request.json: { prompt, maxTurns, source?, allowWrite? }  (source: task type, keys the
-// per-task-type TokenFold dictionary -- same meaning as local-client.js's source.
-// allowWrite: Chat panel only, see WRITE_TOOLS' own header)
+// request.json: { prompt, maxTurns, source?, allowWrite?, primaryRoot?, extraRoots? }
+//   source: task type, keys the per-task-type TokenFold dictionary -- same meaning as
+//     local-client.js's source.
+//   allowWrite: Chat panel only, see WRITE_TOOLS' own header.
+//   primaryRoot / extraRoots (system-wide Chat panel, 2026-08-31): the repo the assistant
+//     is rooted at + additional accessible repo roots. Omitted by every other caller,
+//     which then operates on the single configured repoRoot exactly as before.
 // Writes the JSON result to stdout.
 if (require.main === module) {
   const requestPath = process.argv[2];
