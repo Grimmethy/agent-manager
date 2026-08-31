@@ -7,7 +7,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { appendHistoryEvent, COLLAPSIBLE_REPEAT_STAGES } = require('./task-history.js');
+const { appendHistoryEvent, setHistoryPersistHook, COLLAPSIBLE_REPEAT_STAGES } = require('./task-history.js');
+
+test.afterEach(() => setHistoryPersistHook(null)); // never leak a hook into another test
 
 test('appendHistoryEvent pushes a normal new entry for a non-collapsible stage', () => {
   const task = {};
@@ -71,4 +73,50 @@ test('appendHistoryEvent initializes task.history for a fresh task with no histo
   assert.equal(task.history.length, 1);
   assert.equal(entry.stage, 'created');
   assert.equal(entry.detail, undefined);
+});
+
+// --- history persist hook (2026-08-31): flush every checkpoint to disk as it happens, so
+// a long draft/review is observable while it runs instead of only after it finishes ---
+
+test('setHistoryPersistHook: the hook fires once per appended event, with the just-mutated task', () => {
+  const seen = [];
+  setHistoryPersistHook((t) => seen.push(t.history.length));
+  const task = {};
+  appendHistoryEvent(task, 'draft-started');
+  appendHistoryEvent(task, 'plan-done', '1 attempt(s)');
+  appendHistoryEvent(task, 'implement-done', '2 attempt(s)');
+  assert.deepEqual(seen, [1, 2, 3], 'hook sees history grow monotonically, one call per event');
+});
+
+test('setHistoryPersistHook: the hook also fires for a collapsed repeat entry', () => {
+  let calls = 0;
+  setHistoryPersistHook(() => { calls += 1; });
+  const task = {};
+  appendHistoryEvent(task, 'exhausted', 'x');
+  appendHistoryEvent(task, 'exhausted', 'x'); // collapses, but is still a checkpoint worth flushing
+  assert.equal(task.history.length, 1);
+  assert.equal(calls, 2);
+});
+
+test('setHistoryPersistHook(null) disables flushing', () => {
+  let calls = 0;
+  setHistoryPersistHook(() => { calls += 1; });
+  appendHistoryEvent({}, 'a');
+  setHistoryPersistHook(null);
+  appendHistoryEvent({}, 'b');
+  assert.equal(calls, 1, 'no further calls after the hook is cleared');
+});
+
+test('setHistoryPersistHook: a throwing hook is swallowed -- the event is still recorded and returned', () => {
+  setHistoryPersistHook(() => { throw new Error('disk full'); });
+  const task = {};
+  const entry = appendHistoryEvent(task, 'plan-done', 'ok');
+  assert.equal(task.history.length, 1, 'the event is recorded even though the flush threw');
+  assert.equal(entry.stage, 'plan-done');
+});
+
+test('setHistoryPersistHook: a non-function argument clears the hook rather than being called', () => {
+  setHistoryPersistHook(() => { throw new Error('should have been cleared'); });
+  setHistoryPersistHook('not a function');
+  assert.doesNotThrow(() => appendHistoryEvent({}, 'a'));
 });

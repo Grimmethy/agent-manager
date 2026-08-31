@@ -2229,7 +2229,9 @@ function renderTaskDetailModal(task) {
   // `status` (no `stage`, no `detail`) from before task-history.js existed -- render both
   // so a task whose life started before this feature shipped doesn't just show a gap.
   if (task.history && task.history.length) {
-    html += `<div class="field-label">Pipeline History</div><div class="task-history">`;
+    const liveBadge = TASK_DETAIL_LIVE_STATES.has(task._foundState || '')
+      ? ` <span class="meta" title="this task is mid-pass; new steps appear here automatically">● live</span>` : '';
+    html += `<div class="field-label">Pipeline History${liveBadge}</div><div class="task-history">`;
     html += task.history.map(h => {
       const label = h.stage || h.status || '?';
       const when = h.at ? new Date(h.at).toLocaleString() : '';
@@ -2252,6 +2254,42 @@ function renderTaskDetailModal(task) {
   content.innerHTML = html;
   backdrop.classList.add('open');
   if (task.needsClarification) wireClarificationPicker(task.id);
+  armTaskDetailAutoRefresh(task);
+}
+
+// While a task is mid-pass (drafting or review), the pipeline now flushes each new
+// Pipeline History checkpoint to the task file as it happens (task-history.js's persist
+// hook -- 2026-08-31, Grimmethy: "Anything that I can observe is good"). The modal is a
+// one-shot fetch, so poll while it's open and a live task is showing, re-rendering only
+// when something actually changed. task-anywhere follows the task across the
+// drafting->review->approved->done moves, so the modal keeps tracking it without a manual
+// reopen; a terminal state stops the poll.
+let taskDetailPoll = null;
+const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review']);
+function stopTaskDetailAutoRefresh() {
+  if (taskDetailPoll) { clearInterval(taskDetailPoll); taskDetailPoll = null; }
+}
+function armTaskDetailAutoRefresh(task) {
+  stopTaskDetailAutoRefresh();
+  const state = task._foundState || '';
+  if (!TASK_DETAIL_LIVE_STATES.has(state)) return;
+  const id = task.id;
+  let lastSig = `${state}:${(task.history || []).length}`;
+  taskDetailPoll = setInterval(async () => {
+    const backdrop = document.getElementById('modal-backdrop');
+    if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
+    let fresh;
+    try {
+      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}`);
+    } catch (e) {
+      return; // transient -- try again next tick
+    }
+    const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
+    if (sig !== lastSig) {
+      lastSig = sig;
+      renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
+    }
+  }, 4000);
 }
 
 // Path-prefetch's "needs clarification" resolution UI (context-aware-file-path-prefetch-
@@ -2553,6 +2591,9 @@ async function answerNeedsClarification(taskId, answer) {
 
 async function openDetail(state, id) {
   const task = await fetchJson(`/api/task/${state}/${encodeURIComponent(id)}`);
+  // /api/task/<state>/<id> doesn't stamp _foundState (only task-anywhere does); carry the
+  // state we already know so renderTaskDetailModal can decide whether to poll for updates.
+  if (!task._foundState) task._foundState = state;
   renderTaskDetailModal(task);
 }
 
@@ -2569,6 +2610,7 @@ async function openTaskAnywhere(taskId) {
 }
 
 function closeDetail() {
+  stopTaskDetailAutoRefresh();
   document.getElementById('modal-backdrop').classList.remove('open');
   deepDiveDetailCache = null; // force a fresh fetch next time any project's modal opens
 }

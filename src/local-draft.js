@@ -41,7 +41,7 @@ const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisio
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
-const { appendHistoryEvent } = require('./task-history.js');
+const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
@@ -68,7 +68,12 @@ const { writeHeartbeatFile } = require('./heartbeat.js');
 ensureRegistered();
 
 function writeTaskJson(taskPath, task) {
-  fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+  // Atomic write: the history persist hook (see main()) rewrites this file on every
+  // checkpoint while a draft is in flight, and the dashboard polls it concurrently -- a
+  // half-written file must never be observable. Same-dir tmp keeps the rename on one fs.
+  const tmp = `${taskPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
+  fs.renameSync(tmp, taskPath);
 }
 
 // research_task drafting is the one path with no local equivalent -- WebSearch/WebFetch
@@ -1065,6 +1070,15 @@ async function main() {
     process.stdout.write(JSON.stringify({ succeeded: false, reason: `Could not read/parse task JSON: ${e.message}` }));
     return;
   }
+
+  // Flush every Pipeline-History checkpoint to disk the moment it's recorded, so a long
+  // draft's progress (draft-started, plan-done, harness-search, implement-done, ...) shows
+  // up in the dashboard while the draft is still running -- and survives the worker being
+  // killed mid-draft (chat preempt, stop.sh) instead of vanishing with the process. The
+  // authoritative writeTaskJson below still runs on completion; these are additive.
+  setHistoryPersistHook(() => {
+    try { writeTaskJson(taskPath, task); } catch (_) { /* best-effort */ }
+  });
 
   const result = await draftTask(task);
   // Persist whatever pass results/status landed on the task, even when blocked -- so the
