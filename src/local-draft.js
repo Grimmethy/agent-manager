@@ -430,6 +430,15 @@ async function draftAdhocBranch(task, {
   // tier. Tier 3 returns a terminal draftTask-shaped verdict (implemented / blocked /
   // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
   // fallback. All tiers are unconditionally lock-wrapped (always local).
+  //
+  // Each tier is bracketed with an 'implement-started' checkpoint. The ladder emits no
+  // other history until a tier resolves, and tier 3 is a multi-turn agentic pass that
+  // routinely runs for many minutes -- so without these, a task killed mid-ladder (or one
+  // that keeps dying in tier 3) shows only '... -> plan-done' and the Pipeline History
+  // looks cut short. With main()'s persist hook each one lands on disk the moment it fires,
+  // so the log shows exactly how far the draft got. (2026-08-31, Grimmethy: "the task log
+  // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
   const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
   if (!harnessResult.applied && harnessResult.succeeded === false) {
     return { succeeded: false, reason: harnessResult.reason };
@@ -437,6 +446,7 @@ async function draftAdhocBranch(task, {
 
   let localTierApplied = harnessResult.applied;
   if (!localTierApplied) {
+    appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
     const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
     if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
       return { succeeded: false, reason: localAgenticResult.reason };
@@ -445,7 +455,8 @@ async function draftAdhocBranch(task, {
   }
 
   if (localTierApplied) {
-    appendHistoryEvent(task, 'implement-done', `local tier, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
+    const appliedTier = harnessResult.applied ? 'harness-search' : 'local-agentic (read-only)';
+    appendHistoryEvent(task, 'implement-done', `${appliedTier} tier applied, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
     concludeDraft(task);
     return { succeeded: true, blocked: false };
   }
@@ -453,6 +464,7 @@ async function draftAdhocBranch(task, {
   // Tier 3: local write-agentic. Returns the same verdict shape the Claude tier did
   // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
   // genuine infra error (retry), everything else is terminal.
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
   const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
   if (!agenticResult.succeeded) {
     return { succeeded: false, reason: agenticResult.reason };
@@ -507,6 +519,7 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
     appendHistoryEvent(task, 'blocked', claudeStatus.reason);
     return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
   }
+  appendHistoryEvent(task, 'implement-started', 'agentic research (WebSearch/WebFetch, multi-turn -- can take minutes)');
   const researchResult = await draftResearchImplementFn(task, { recordModelCall });
   if (!researchResult.succeeded) {
     return { succeeded: false, reason: researchResult.reason };
@@ -917,6 +930,11 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
   const budget = computeImplementBudget(task, implPrompt);
   const { hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
 
+  // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
+  // have. A single implement call can legitimately run close to its timeout; with the
+  // persist hook this makes a draft killed mid-call show 'implement-started' rather than
+  // ending at 'plan-done'.
+  appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
   const implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
 
   if (implResult.degenerate) {

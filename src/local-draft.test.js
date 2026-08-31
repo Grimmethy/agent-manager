@@ -352,6 +352,50 @@ test('an adhoc task blocks for a human (no Claude) when all three local tiers de
   });
 });
 
+// 2026-08-31 ("the task log gets cut short"): the adhoc tier ladder used to emit no
+// history between 'plan-done' and its terminal event, so a draft killed mid-ladder (or
+// looping in the multi-minute tier 3) showed only '...-> plan-done'. Each tier now emits
+// an 'implement-started' breadcrumb as it's entered.
+test('the adhoc tier ladder emits an implement-started checkpoint for each tier it enters', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-tier-crumbs', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    await draftTask(task, {
+      localCall: fakeLocalCall('confident match: none -- no real match'),
+      withLockFn: async (d, fn) => fn(),
+      ...declineLocalTiers(), // harness + read-only decline; write tier blocks for a human
+    });
+
+    const started = (task.history || []).filter((e) => e.stage === 'implement-started').map((e) => e.detail);
+    assert.equal(started.length, 3, 'one implement-started per tier (harness, read-only agentic, write agentic)');
+    assert.match(started[0], /tier 1\/3: harness-search/);
+    assert.match(started[1], /tier 2\/3: local-agentic/);
+    assert.match(started[2], /tier 3\/3: local-agentic-write/);
+
+    const stages = (task.history || []).map((e) => e.stage);
+    // the tier-3 breadcrumb lands BEFORE the terminal 'blocked' -- so a draft killed
+    // inside tier 3 still shows it got that far.
+    assert.ok(stages.lastIndexOf('implement-started') < stages.indexOf('blocked'));
+  });
+});
+
+test('a successful cheap-tier adhoc draft names which tier applied in implement-done', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-tier-named', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+    await draftTask(task, {
+      localCall: fakeLocalCall('confident match: none'),
+      withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn: async (t) => { t.implementResponse = 'x'; t.adhocResolution = 'implemented'; t.draftModel = 'test-local-model'; return { applied: true, succeeded: true }; },
+      draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
+      draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
+    });
+    const done = (task.history || []).find((e) => e.stage === 'implement-done');
+    assert.match(done.detail, /harness-search tier applied/);
+    // tier 2 was never entered, so only tier 1's implement-started exists
+    assert.equal((task.history || []).filter((e) => e.stage === 'implement-started').length, 1);
+  });
+});
+
 // 2026-09-01: research_task has no local implementation (WebSearch/WebFetch are Claude-
 // only). With no AGENT_MANAGER_CLAUDE_SOURCES it blocks CLEANLY, before the plan pass,
 // with a legible reason -- it does NOT wedge or call Claude.
