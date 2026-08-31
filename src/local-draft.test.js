@@ -265,6 +265,37 @@ test('a successful draft appends draft-done immediately before needs-review, aft
   });
 });
 
+test('a persist hook registered around a draft is flushed on every checkpoint, seeing history grow (not just once at the end)', async () => {
+  const { setHistoryPersistHook } = require('./task-history.js');
+  await withFixtureRepo(async (draftTask) => {
+    const snapshots = [];
+    // main() registers exactly this shape of hook (there it rewrites the task JSON).
+    setHistoryPersistHook((t) => snapshots.push((t.history || []).map((e) => e.stage)));
+    try {
+      const task = { id: 'adhoc-flush-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+      await draftTask(task, {
+        localCall: fakeLocalCall('confident match: none'),
+        withLockFn: async (d, fn) => fn(),
+        draftAdhocViaHarnessSearchFn: async (t) => {
+          t.implementResponse = 'x'; t.adhocResolution = 'implemented'; t.draftModel = 'test-local-model';
+          return { applied: true, succeeded: true };
+        },
+        draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
+        draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
+      });
+      assert.ok(snapshots.length >= 3, `hook fired for each checkpoint mid-draft, not once at the end (got ${snapshots.length})`);
+      assert.deepEqual(snapshots[0], ['draft-started'], 'first flush happens as soon as the draft starts, before any model work');
+      for (let i = 1; i < snapshots.length; i += 1) {
+        assert.ok(snapshots[i].length >= snapshots[i - 1].length, 'each flush sees history at least as long as the previous');
+      }
+      const last = snapshots[snapshots.length - 1];
+      assert.ok(last.includes('draft-done') && last.includes('needs-review'), 'the final flush carries the terminal checkpoints');
+    } finally {
+      setHistoryPersistHook(null);
+    }
+  });
+});
+
 test('draftDoneDetail summarises whatever the branch stamped, and is undefined when there is nothing', () => {
   const { draftDoneDetail } = require('./local-draft.js');
   assert.equal(draftDoneDetail({}), undefined);

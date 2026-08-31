@@ -43,7 +43,7 @@ const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
-const { appendHistoryEvent } = require('./task-history.js');
+const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
@@ -57,7 +57,13 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 ensureRegistered();
 
 function writeTaskJson(taskPath, task) {
-  fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+  // Atomic: the history persist hook (see main()) rewrites this file on every review
+  // checkpoint while votes are still being collected, and the dashboard polls it
+  // concurrently -- never leave a half-written file visible. Same-dir tmp so the rename
+  // stays on one filesystem.
+  const tmp = `${taskPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
+  fs.renameSync(tmp, taskPath);
 }
 
 function getDomainConfig(domainsPath, domain) {
@@ -545,6 +551,14 @@ async function main() {
     process.stdout.write(JSON.stringify({ succeeded: false, reason: `Could not read/parse task JSON: ${e.message}` }));
     return;
   }
+
+  // Flush every review checkpoint (review-started, per-vote, verdict) to disk as it's
+  // recorded, so the dashboard shows review progressing instead of a frozen file until
+  // the whole vote completes -- and so a reviewer killed mid-vote leaves a trace. The
+  // authoritative writeTaskJson below still runs on completion; these are additive.
+  setHistoryPersistHook(() => {
+    try { writeTaskJson(taskPath, task); } catch (_) { /* best-effort */ }
+  });
 
   const { repoRoot, pipelineDir, secondBrainDir, domainsPath, deepDiveCoveragePath } = getConfig();
   const instancesDir = path.join(pipelineDir, 'instances');

@@ -49,23 +49,44 @@
 // so collapsing changes nothing about what they see.
 const COLLAPSIBLE_REPEAT_STAGES = new Set(['exhausted']);
 
+// A long-running pass (a 20+ minute local agentic adhoc draft) mutates task.history in
+// memory the whole time it runs, but its caller only writes the task file back to disk
+// once, at the very end -- so the dashboard's per-task Pipeline History shows nothing new
+// for the entire draft, and if the worker is killed mid-draft (chat preempt, stop.sh) the
+// in-memory history is lost with the process. A process that wants every checkpoint
+// flushed as it happens registers a persistence hook here; appendHistoryEvent then calls
+// it (with the just-mutated task) after each entry. Opt-in per process: local-draft.js and
+// review-task.js register one that rewrites the task JSON; task-sources.js / apply-task.js /
+// reject-retry-check.js don't, and are unaffected. Best-effort -- a hook that throws is
+// swallowed so a transient write error never aborts the pass. (2026-08-31, Grimmethy:
+// "Anything that I can observe is good and will help me determine fixes faster.")
+let persistHook = null;
+function setHistoryPersistHook(fn) {
+  persistHook = typeof fn === 'function' ? fn : null;
+}
+
 function appendHistoryEvent(task, stage, detail) {
   const nowIso = new Date().toISOString();
   task.history = Array.isArray(task.history) ? task.history : [];
 
   const last = task.history[task.history.length - 1];
+  let entry;
   if (last && last.stage === stage && COLLAPSIBLE_REPEAT_STAGES.has(stage)) {
     if (!last.firstAt) last.firstAt = last.at;
     last.at = nowIso;
     last.count = (last.count || 1) + 1;
     if (detail !== undefined && detail !== null && detail !== '') last.detail = String(detail);
-    return last;
+    entry = last;
+  } else {
+    entry = { stage, at: nowIso };
+    if (detail !== undefined && detail !== null && detail !== '') entry.detail = String(detail);
+    task.history.push(entry);
   }
 
-  const entry = { stage, at: nowIso };
-  if (detail !== undefined && detail !== null && detail !== '') entry.detail = String(detail);
-  task.history.push(entry);
+  if (persistHook) {
+    try { persistHook(task); } catch (_) { /* best-effort: never abort a pass on a flush failure */ }
+  }
   return entry;
 }
 
-module.exports = { appendHistoryEvent, COLLAPSIBLE_REPEAT_STAGES };
+module.exports = { appendHistoryEvent, setHistoryPersistHook, COLLAPSIBLE_REPEAT_STAGES };
