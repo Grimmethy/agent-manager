@@ -284,6 +284,7 @@ const TABS = [
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
   { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
   { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
+  { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
@@ -3638,6 +3639,26 @@ async function renderAdForgeTab() {
   main.innerHTML = `<iframe class="viz adforge-frame" src="${escapeAttr(url)}" style="width:100%;height:calc(100vh - 120px);border:2px solid var(--border);border-radius:8px"></iframe>`;
 }
 
+// ScriptForge tab: same shape as PromptForge / AdForge above -- a separate local
+// web app (its own repo + Flask server, default http://localhost:7432; set
+// SCRIPTFORGE_URL to override), embedded in an iframe. Phase 1 of the AdForge
+// pipeline: brief -> treatment + shot list + PromptForge shot-specs + VO + music
+// brief, on the local model. IDEMPOTENT; the 5s refresh() skips this tab.
+async function renderScriptForgeTab() {
+  const main = document.getElementById('main');
+  let url = 'http://' + location.hostname + ':7432/';
+  try {
+    const cfg = await fetchJson('/api/scriptforge/config');
+    if (cfg && cfg.url) url = cfg.url.replace('localhost', location.hostname);
+  } catch (e) { /* fall back to the default host:7432 */ }
+  const existing = main.querySelector('iframe.scriptforge-frame');
+  if (existing) {
+    if (existing.getAttribute('src') !== url) existing.setAttribute('src', url);
+    return;
+  }
+  main.innerHTML = `<iframe class="viz scriptforge-frame" src="${escapeAttr(url)}" style="width:100%;height:calc(100vh - 120px);border:2px solid var(--border);border-radius:8px"></iframe>`;
+}
+
 // --- Hardware tab --------------------------------------------------------------------
 // Read-only view of hardware_stats.py's background sampler (a daemon thread app.py
 // starts on boot, 10s interval / 24h retention -- see start_sampler() there) via
@@ -3763,6 +3784,7 @@ async function renderMain() {
     else if (activeTab === 'tokenfold') await renderTokenfoldTab();
     else if (activeTab === 'promptforge') await renderPromptForgeTab();
     else if (activeTab === 'adforge') await renderAdForgeTab();
+    else if (activeTab === 'scriptforge') await renderScriptForgeTab();
     else if (activeTab === 'adhoc') await renderAdhocTasksTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
@@ -3781,10 +3803,10 @@ async function refresh() {
   // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
   // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
   // this generic 5s cycle -- only the nav badge counts above still update while open.
-  // promptforge / adforge are embedded iframes -- re-running renderMain() every 5s
-  // would rebuild them and reload the app out from under the user's inputs, same
-  // reason project / brain-dump opt out here.
-  if (activeTab !== 'project' && activeTab !== 'brain-dump' && activeTab !== 'promptforge' && activeTab !== 'adforge') renderMain();
+  // promptforge / adforge / scriptforge are embedded iframes -- re-running
+  // renderMain() every 5s would rebuild them and reload the app out from under the
+  // user's inputs, same reason project / brain-dump opt out here.
+  if (!['project', 'brain-dump', 'promptforge', 'adforge', 'scriptforge'].includes(activeTab)) renderMain();
 }
 
 // --- Project tab --------------------------------------------------------------------
