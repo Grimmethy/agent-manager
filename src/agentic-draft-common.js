@@ -144,40 +144,62 @@ async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repo
 // neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
 // diff. `retriedForTurnBudget` only tunes the "did not end with RESOLUTION" note.
 function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
+  const summary = (result && result.response) || '';
+  // draft-attempt-record.js: the caller records this tier's real output, tool activity,
+  // and -- on a NON-clean outcome (degenerate / no RESOLUTION line / bad decompose) where
+  // resolveAgenticDraft otherwise stages nothing -- whatever the model left in the
+  // worktree, so a 20-turn tier-3 run that ends up blocked is no longer a black box.
+  // All additive on the returned object; callers read succeeded/blocked/blockedReason/
+  // needsClarification exactly as before. bestEffortDiff is best-effort (the worktree is
+  // still alive here; cleanup runs in runAgenticDraftInWorktree's outer finally).
+  const meta = {
+    response: summary,
+    toolCallLog: (result && result.toolCallLog) || undefined,
+    turnsUsed: result && result.turnsUsed,
+  };
+  const bestEffortDiff = () => {
+    try {
+      runGit(['add', '-A'], worktreeDir);
+      return runGit(['diff', '--cached'], worktreeDir).trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   if (result && result.degenerate) {
-    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}` };
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`, ...meta, capturedDiff: bestEffortDiff() };
   }
 
-  const summary = (result && result.response) || '';
   const resolutionMatch = summary.match(RESOLUTION_RE);
   const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
   if (modelLabel) task.draftModel = modelLabel;
+  meta.resolution = resolution || undefined;
 
   if (!resolution) {
     const budgetNote = retriedForTurnBudget
       ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
       : '';
-    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}` };
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
   }
 
   if (resolution === 'decompose') {
     const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
     const subTasks = parseSubTaskProposals(afterResolution);
     if (!subTasks || subTasks.length < 2) {
-      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks' };
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks', ...meta, capturedDiff: bestEffortDiff() };
     }
     task.adhocResolution = resolution;
     task.subTaskProposals = subTasks;
     task.rawDiff = '';
     task.implementResponse = summary;
-    return { succeeded: true, blocked: false };
+    return { succeeded: true, blocked: false, ...meta };
   }
 
   if (resolution === 'needs-human-decision') {
     task.adhocResolution = resolution;
     task.rawDiff = '';
     task.implementResponse = summary;
-    return { succeeded: true, blocked: false, needsClarification: true };
+    return { succeeded: true, blocked: false, needsClarification: true, ...meta };
   }
 
   // implemented | no-changes-needed -- capture whatever actually landed in the worktree.
@@ -186,7 +208,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     runGit(['add', '-A'], worktreeDir);
     rawDiff = runGit(['diff', '--cached'], worktreeDir);
   } catch (e) {
-    return { succeeded: false, reason: `could not capture git diff from the worktree: ${e.message}` };
+    return { succeeded: false, reason: `could not capture git diff from the worktree: ${e.message}`, ...meta };
   }
 
   task.adhocResolution = resolution;
@@ -194,7 +216,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   task.implementResponse = task.rawDiff
     ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
     : summary;
-  return { succeeded: true, blocked: false };
+  return { succeeded: true, blocked: false, ...meta };
 }
 
 module.exports = {

@@ -149,18 +149,27 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   });
 
   const responseText = (result && result.response) || '';
+  // draft-attempt-record.js: the caller (draftAdhocBranch) records this tier's real
+  // output + tool activity even when it DECLINES -- previously response/toolCallLog were
+  // dropped as locals here, so a blocked task's investigation was a black box. Additive
+  // fields only; draftAdhocBranch reads .applied/.succeeded/.reason exactly as before.
+  const modelMeta = {
+    response: responseText,
+    toolCallLog: (result && result.toolCallLog) || undefined,
+    turnsUsed: result && result.turnsUsed,
+  };
   const resolutionMatch = responseText.match(RESOLUTION_RE);
   if (!resolutionMatch) {
     // Same "fail loud, don't guess" reasoning adhoc-agentic-draft.js's own missing-
     // RESOLUTION-line handling documents -- but here that's an EXPECTED, non-fatal
     // outcome (fall through to Claude), not a blocked task, since this tier is still an
     // opt-in experiment.
-    return { applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line' };
+    return { applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line', ...modelMeta };
   }
   const resolution = resolutionMatch[1].toLowerCase();
 
   if (resolution === 'needs-capability-i-dont-have') {
-    return { applied: false, succeeded: true, reason: 'local agentic investigation reported it needs a capability it does not have' };
+    return { applied: false, succeeded: true, reason: 'local agentic investigation reported it needs a capability it does not have', ...modelMeta };
   }
 
   if (resolution === 'no-changes-needed') {
@@ -168,7 +177,7 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
     task.rawDiff = '';
     task.implementResponse = responseText;
     task.draftModel = localDraftModelLabel();
-    return { applied: true, succeeded: true };
+    return { applied: true, succeeded: true, ...modelMeta };
   }
 
   // resolution === 'implemented' -- everything after the RESOLUTION line is expected to
@@ -182,18 +191,18 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
       repoRoot, pipelineDir, implementResponse: afterResolution, worktreeSuffix: `local-agentic-${task.id}`,
     });
   } catch (e) {
-    return { applied: false, succeeded: true, reason: `local agentic draft did not apply cleanly: ${e.message}` };
+    return { applied: false, succeeded: true, reason: `local agentic draft did not apply cleanly: ${e.message}`, ...modelMeta };
   }
 
   if (!rawDiff) {
-    return { applied: false, succeeded: true, reason: 'local agentic draft produced no net change' };
+    return { applied: false, succeeded: true, reason: 'local agentic draft produced no net change', ...modelMeta };
   }
 
   task.adhocResolution = 'implemented';
   task.rawDiff = rawDiff;
   task.implementResponse = `${responseText.slice(0, resolutionMatch.index).trim()}\n\nRESOLUTION: implemented\n\n=== DIFF ===\n${rawDiff}`.trim();
   task.draftModel = localDraftModelLabel();
-  return { applied: true, succeeded: true };
+  return { applied: true, succeeded: true, ...modelMeta };
 }
 
 module.exports = { draftAdhocViaLocalAgentic, isEnabled, buildLocalAgenticPrompt, LOCAL_AGENTIC_MAX_TURNS };

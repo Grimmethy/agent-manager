@@ -1275,3 +1275,116 @@ test('greenfield product_spec: unchanged -- runs the normal local plan+implement
     assert.equal(sawPlanPrompt, true, 'greenfield must still run the local plan pass');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Draft attempt records (src/draft-attempt-record.js): every draftTask() run
+// appends one entry to task.draftAttempts capturing that run's plan + each
+// implement tier's outcome/response, so a task that failed N times is no longer
+// a black box (the bra-1788142124203 incident -- 19 attempts, only the last
+// plan survived). See src/draft-attempt-record.test.js for the unit-level cap /
+// collapse / tool-summary coverage; these are the local-draft.js integration.
+// ---------------------------------------------------------------------------
+
+test('draft attempt record: a blocked adhoc run captures the plan text + every declining tier', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'da-adhoc-blocked', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+
+    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo' });
+    const draftAdhocViaLocalAgenticFn = async () => ({
+      applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line',
+      response: 'I looked at three files but could not decide', turnsUsed: 6,
+      toolCallLog: [{ tool: 'read_file', args: { path: 'x.js' }, result: { content: 'abc' } }],
+    });
+    const draftAdhocViaLocalAgenticWriteFn = async () => ({
+      succeeded: true, blocked: true, blockedReason: 'Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome',
+      response: 'ran out of turns', turnsUsed: 20, resolution: null,
+      capturedDiff: 'diff --git a/x.js b/x.js\n+partial edit',
+      toolCallLog: [{ tool: 'edit_file', args: { path: 'x.js', find: 'a', replace: 'b' }, result: { edited: true } }],
+    });
+
+    const result = await draftTask(task, {
+      localCall: fakeLocalCall('QUERY: something\n\nThe plan is to investigate the widget subsystem carefully.'),
+      withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+    });
+
+    assert.equal(result.blocked, true);
+    assert.equal(task.draftAttempts.length, 1);
+    const a = task.draftAttempts[0];
+    assert.equal(a.attemptNo, 1);
+    assert.equal(a.outcome, 'blocked');
+    assert.match(a.plan.text, /investigate the widget subsystem/);
+    assert.equal(a.tiers.length, 3);
+    assert.deepEqual(a.tiers.map((t) => t.tier), ['harness-search', 'local-agentic', 'local-agentic-write']);
+    assert.match(a.tiers[0].reason, /no real matches/);
+    assert.equal(a.tiers[1].response, 'I looked at three files but could not decide');
+    assert.equal(a.tiers[1].turnsUsed, 6);
+    assert.equal(a.tiers[1].toolCalls.total, 1);
+    assert.equal(a.tiers[2].turnsUsed, 20);
+    assert.match(a.tiers[2].rawDiff, /partial edit/);
+    // a 'draft-attempt' history event is emitted so the persist hook flushes it
+    assert.ok((task.history || []).some((e) => e.stage === 'draft-attempt'));
+  });
+});
+
+test('draft attempt record: requeued attempts accumulate -- every plan survives char-for-char', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'da-accumulate', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do it' } };
+    const plans = [
+      'First plan: short.',
+      'Second plan: this one is considerably more detailed and goes on about the subsystem at length.',
+      'Third plan: back to short.',
+    ];
+    for (let i = 0; i < plans.length; i++) {
+      task.localRejectCount = i;
+      await draftTask(task, {
+        localCall: fakeLocalCall(plans[i]),
+        withLockFn: async (d, fn) => fn(),
+        ...declineLocalTiers(),
+      });
+    }
+    assert.equal(task.draftAttempts.length, 3);
+    assert.deepEqual(task.draftAttempts.map((a) => a.attemptNo), [1, 2, 3]);
+    assert.deepEqual(task.draftAttempts.map((a) => a.plan.text), plans);
+    assert.deepEqual(task.draftAttempts.map((a) => a.localRejectCount), [0, 1, 2]);
+  });
+});
+
+test('draft attempt record: a plain successful non-adhoc draft records plan + implement + critique', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'da-standard-ok', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed the spec', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'greenfield' },
+    };
+    const result = await draftTask(task, {
+      localCall: async () => ({ response: '{"mode":"create","file":"Docs/PRODUCT_SPEC.md","content":"# Spec"}', degenerate: null, attempts: 1 }),
+      withLockFn: async (d, fn) => fn(),
+    });
+    assert.equal(result.succeeded, true);
+    assert.equal(task.draftAttempts.length, 1);
+    const a = task.draftAttempts[0];
+    assert.equal(a.outcome, 'succeeded');
+    assert.ok(a.plan.text.length > 0);
+    assert.ok(a.implement.text.length > 0);
+    assert.ok(a.critique);
+  });
+});
+
+test('draft attempt record: a degenerate plan pass records the reason instead of stale text, and still blocks', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'da-degen-plan', domain: 'default', source: 'product_spec', title: 'seed',
+      promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'greenfield' },
+    };
+    const result = await draftTask(task, {
+      localCall: async () => ({ response: '', degenerate: 'empty', attempts: 3 }),
+      withLockFn: async (d, fn) => fn(),
+    });
+    assert.equal(result.blocked, true);
+    const a = task.draftAttempts[0];
+    assert.equal(a.outcome, 'blocked');
+    assert.equal(a.plan.degenerate, 'empty');
+    assert.equal(a.plan.text, undefined);
+    assert.equal(a.plan.attempts, 3);
+  });
+});
