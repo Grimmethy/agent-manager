@@ -594,6 +594,9 @@ while :; do                                                                     
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
+      # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
+      # skipped drafting/) gets one now, set-once -- see the claim site's comment.
+      node -e 'try{const fs=require("fs"),p=process.argv[1],o=JSON.parse(fs.readFileSync(p,"utf8"));if(!o.claimedAt){o.claimedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(o,null,2));}}catch(e){}' "$wpath" 2>/dev/null || true
       process_drafting_file "$wpath"
       did_work=true
       # Intra-tick backoff gap fix (2026-08-25, proven live: an infra-shaped failure here
@@ -716,6 +719,11 @@ while :; do                                                                     
         new_wpath="${QUEUE_DIR}/drafting/${INSTANCE_ID}/${orig_name}"     # destination file path (same name but moved to drafting/ folder under this instance, matching task-sources.js's own "queue/drafting/<InstanceId>/<id>.json" convention -- was previously "$AGENT_MANAGER_REPO_ROOT/drafting/..." with no queue/ prefix at all, a path nothing else in the system reads from).
 
         mv -n "$wpath" "$new_wpath"                                                # atomic move: -n flag prevents overwriting target if exists already (same behavior as PowerShell's `Move-Item -NoClobber` for same intent — don't clobber whatever's at destination because could be stale file from previous crashed run which operator would want to investigate before losing).
+        # Stamp claimedAt (ISO) so the dashboard's chat-preempt age gate knows when THIS
+        # lane actually started working the task (heartbeat startedAt is daemon uptime;
+        # .model-locks startedAt is per model sub-call). Set-once: a resume keeps the
+        # original. Best-effort, never blocks the claim.
+        node -e 'try{const fs=require("fs"),p=process.argv[1],o=JSON.parse(fs.readFileSync(p,"utf8"));if(!o.claimedAt){o.claimedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(o,null,2));}}catch(e){}' "$new_wpath" 2>/dev/null || true
         printf '[worker-%s] claimed %s -> %s\n' "$INSTANCE_ID" "$wpath" "$new_wpath"     # log claim action with old+new paths — same information PowerShell's `$null = Write-Host "Claimed $src for $dest"` writes but using file redirection operator to send our printf output directly into stderr (which gets captured by launch.sh later via `nohup ... > /dev/null 2>&1 &` and tee'd into HOME_LOGS directory so user can review claim history later in log files even if their terminal is closed or busy).
 
         # Run the actual plan -> implement -> critique -> (revision) passes against Ornith,

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import string
@@ -3674,6 +3675,177 @@ def api_chat_new():
     return jsonify(session)
 
 
+# --- Chat "make GPU space" preemption (brain dump #5) ----------------------------------
+# The Chat panel is for live repo investigation and shares the one resident local model
+# with the pipeline's worker/reviewer lanes on the same single-flight lock. When they're
+# busy a chat turn can sit in `flock -w 600` for many minutes. Holding the lock (the
+# Reserve feature) doesn't interrupt an in-flight call -- only killing the in-flight
+# `local-draft.js` / `review-task.js` child frees the GPU now. On every local-provider
+# chat message we: kill worker-1's draft (always), and kill worker-reasoning's / the
+# reviewer's call only if it started < AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S ago
+# (spare long-running work). A killed worker task is `mv`'d drafting/ -> pending/ first so
+# no retry budget is burnt; the daemons treat the empty child result as a retryable
+# failed call (scripts/local-worker.sh:239-434) and recover on their own next tick.
+
+_PREEMPT_LANES_ALWAYS = ("worker-1",)
+_PREEMPT_LANES_AGE_GATED = ("worker-reasoning", "reviewer")
+# instances/<lane>.json currentPass values in which the heartbeat `pid` is the node
+# child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal.
+_PREEMPT_CHILD_PASSES = frozenset({
+    "plan", "implement", "implement-retry", "critique", "revise",
+    "harness-search", "local-agentic", "vote", "review",
+})
+_MODEL_INFLIGHT_STALE_S = 300  # mirrors src/model-inflight-lock.js STALE_MS
+
+
+def _chat_preempt_enabled() -> bool:
+    v = (os.environ.get("AGENT_MANAGER_CHAT_PREEMPT")
+         or read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT") or "true")
+    return str(v).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _chat_preempt_max_age_s() -> int:
+    v = (os.environ.get("AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S")
+         or read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S"))
+    try:
+        return max(0, int(str(v).strip()))
+    except (TypeError, ValueError):
+        return 180
+
+
+def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s):
+    """Pure. -> (action, reason). action in {"kill", "spare", "skip"}.
+    kill_pid: the resolved in-flight node child pid (or None). started_epoch: unix time
+    the call/task started (or None = age unknown)."""
+    if not kill_pid:
+        return ("skip", "no in-flight model call")
+    if lane in _PREEMPT_LANES_ALWAYS:
+        return ("kill", "always")
+    if started_epoch is None:
+        return ("spare", "age unknown")
+    age = now - started_epoch
+    if age < max_age_s:
+        return ("kill", f"{int(age)}s old (< {max_age_s}s)")
+    return ("spare", f"{int(age)}s old")
+
+
+def _read_fresh_model_locks(inst_dir: Path) -> dict:
+    """{instanceId: {pid, startedAt}} for every non-stale entry in instances/.model-locks/
+    -- mirrors src/model-inflight-lock.js readActiveLocks()."""
+    out = {}
+    d = inst_dir / ".model-locks"
+    try:
+        names = [f for f in os.listdir(d) if f.endswith(".json")]
+    except OSError:
+        return out
+    now = time.time()
+    for name in names:
+        fp = d / name
+        try:
+            if now - fp.stat().st_mtime > _MODEL_INFLIGHT_STALE_S:
+                continue
+            data = read_json_safe(fp)
+        except OSError:
+            continue
+        if data and data.get("instanceId") and data.get("pid"):
+            out[data["instanceId"]] = data
+    return out
+
+
+def _preempt_pipeline_for_chat() -> list:
+    """Kill in-flight worker/reviewer model calls to free the local model for a chat turn.
+    Best-effort: every failure is swallowed (gpu-guard's 'log and move on' rule). Returns
+    a summary list [{lane, action, taskId, ageSeconds}]."""
+    if os.name == "nt":
+        return []
+    inst_dir = instances_dir()
+    qdir = queue_dir()
+    if not inst_dir or not inst_dir.is_dir():
+        return []
+    pids_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/pids"
+    locks = _read_fresh_model_locks(inst_dir)
+    max_age = _chat_preempt_max_age_s()
+    now = time.time()
+    summary = []
+
+    for lane in (*_PREEMPT_LANES_ALWAYS, *_PREEMPT_LANES_AGE_GATED):
+        try:
+            hb = read_json_safe(inst_dir / f"{lane}.json") or {}
+            lock = locks.get(lane)
+
+            kill_pid = None
+            started_epoch = None
+            if lock:
+                try:
+                    kill_pid = int(lock.get("pid"))
+                except (TypeError, ValueError):
+                    kill_pid = None
+                sdt = parse_hb_timestamp(lock.get("startedAt"))
+                started_epoch = sdt.timestamp() if sdt else None
+            if kill_pid is None and hb.get("status") in ("working", "queued") \
+                    and hb.get("currentPass") in _PREEMPT_CHILD_PASSES and hb.get("pid"):
+                daemon_pid = None
+                try:
+                    daemon_pid = int((pids_dir / f"{lane}.pid").read_text().strip())
+                except (OSError, ValueError):
+                    pass
+                if daemon_pid is None or int(hb["pid"]) != daemon_pid:
+                    kill_pid = int(hb["pid"])
+
+            task_id = hb.get("currentTaskId")
+            # For an age-gated lane with no fresh model-lock, fall back to the task JSON's
+            # claimedAt, then its mtime (a conservative lower bound on task age).
+            if started_epoch is None and lane in _PREEMPT_LANES_AGE_GATED and task_id and qdir:
+                tf = qdir / "drafting" / lane / f"{task_id}.json"
+                try:
+                    tdata = read_json_safe(tf) or {}
+                    cdt = parse_hb_timestamp(tdata.get("claimedAt"))
+                    started_epoch = cdt.timestamp() if cdt else tf.stat().st_mtime
+                except OSError:
+                    pass
+
+            action, reason = _preempt_decision(lane, kill_pid, started_epoch, now, max_age)
+            age_s = int(now - started_epoch) if started_epoch else None
+
+            if action != "kill":
+                if kill_pid:
+                    summary.append({"lane": lane, "action": action, "taskId": task_id, "ageSeconds": age_s})
+                print(f"[chat-preempt] {lane}: {action} ({reason})", file=sys.stderr, flush=True)
+                continue
+
+            # Requeue the worker task before signalling (zero retry-budget cost); the
+            # reviewer keeps its task in queue/review/ and is re-reviewed next tick.
+            if lane != "reviewer" and task_id and qdir:
+                src = qdir / "drafting" / lane / f"{task_id}.json"
+                dst = qdir / "pending" / f"{task_id}.json"
+                try:
+                    if src.is_file() and not dst.exists():
+                        os.replace(src, dst)
+                except OSError:
+                    pass
+
+            try:
+                os.kill(kill_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            if lock:
+                for name in os.listdir(inst_dir / ".model-locks"):
+                    try:
+                        lp = inst_dir / ".model-locks" / name
+                        d = read_json_safe(lp) or {}
+                        if d.get("pid") == kill_pid:
+                            lp.unlink()
+                    except OSError:
+                        pass
+
+            summary.append({"lane": lane, "action": "killed", "taskId": task_id, "ageSeconds": age_s})
+            print(f"[chat-preempt] killed {lane} pid={kill_pid} task={task_id} ({reason}) -> requeued",
+                  file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001 -- best-effort, never block the chat turn
+            print(f"[chat-preempt] {lane}: skipped ({e})", file=sys.stderr, flush=True)
+    return summary
+
+
 @app.route("/api/chat/<session_id>/message", methods=["POST"])
 def api_chat_message(session_id):
     """The actual chat turn.
@@ -3717,11 +3889,24 @@ def api_chat_message(session_id):
     # streamed as SSE: one `data:` frame per {"type":"chunk"} as text arrives, then one
     # {"type":"final","session":{...}} carrying the same shape this route used to return
     # in one shot, so the frontend still ends up with the same authoritative session.
-    from chat_sessions import stream_message
+    from chat_sessions import stream_message, PROVIDER_LOCAL
     from claude_client import ClaudeClientError
     from local_tool_client import LocalToolClientError
 
+    # Make GPU space for a local-provider turn: kill worker-1's in-flight draft (always)
+    # and worker-reasoning's / the reviewer's (only if < ~3 min in). Synchronous, before
+    # the SSE generator / node child runs, so the tool loop's withLock() acquires at once.
+    # Claude-provider turns don't touch the local model -- skipped.
+    preempted = []
+    if existing.get("provider") == PROVIDER_LOCAL and _chat_preempt_enabled():
+        try:
+            preempted = _preempt_pipeline_for_chat()
+        except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
+            print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
+
     def generate():
+        if preempted:
+            yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
         try:
             for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
                 yield f"data: {json.dumps(event)}\n\n"
