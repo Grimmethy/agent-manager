@@ -1015,7 +1015,18 @@ async function chatSend() {
         const line = frame.split('\n').find((l) => l.startsWith('data: '));
         if (!line) continue;
         const evt = JSON.parse(line.slice(6));
-        if (evt.type === 'chunk') {
+        if (evt.type === 'preempt') {
+          // "make GPU space" summary (brain dump #5) -- a muted line prepended to this
+          // turn's reply so the user can see what the pipeline gave up for it.
+          const lanes = evt.lanes || [];
+          const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
+          const spared = lanes.filter((l) => l.action === 'spared')
+            .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
+          const bits = [];
+          if (killed.length) bits.push('freed ' + killed.join(', '));
+          if (spared.length) bits.push('spared ' + spared.join(', '));
+          if (bits.length) { assistantEntry.text = `_⚡ ${bits.join(' · ')}_\n\n`; chatRender(); }
+        } else if (evt.type === 'chunk') {
           assistantEntry.text += evt.text;
           chatRender();
         } else if (evt.type === 'final') {
