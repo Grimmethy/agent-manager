@@ -3619,15 +3619,45 @@ def _call_chat(fn, *args, **kwargs):
         abort(502, description=f"local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.")
 
 
+# 2026-08-31 (Grimmethy: "It should be rooted in agent manager always, and have access to
+# all active plugins"): the Chat panel is system-wide, not per-project. Its transcript
+# store is fixed at the agent-manager repo root, and its file tools span agent-manager
+# plus every registered plugin/project repo -- NOT whatever project the pipeline happens
+# to be pointed at.
+CHAT_STORAGE_DIR = PACKAGE_ROOT
+
+
+def _chat_roots() -> list:
+    """Ordered, deduped, existing-on-disk list of every repo the Chat panel can touch.
+    roots[0] is always the agent-manager repo (primary / cwd); the rest are each enabled
+    plugin's repo (dirname of its register.js) and each projects.json repoRoot. A fresh
+    clone with no plugins.json / projects.json just yields [agent-manager]."""
+    raw = [str(PACKAGE_ROOT)]
+    for e in _read_plugins_manifest():
+        rp = e.get("registerPath")
+        if rp and e.get("enabled") is not False:
+            raw.append(os.path.dirname(rp))
+    for e in read_project_registry():
+        if e.get("repoRoot"):
+            raw.append(e["repoRoot"])
+    seen, out = set(), []
+    for p in raw:
+        try:
+            real = os.path.realpath(p)
+        except OSError:
+            continue
+        if real not in seen and os.path.isdir(real):
+            seen.add(real)
+            out.append(real)
+    return out or [os.path.realpath(str(PACKAGE_ROOT))]
+
+
 @app.route("/api/chat/active", methods=["GET"])
 def api_chat_active():
-    """Loads (or creates, if none exists yet) the single ongoing conversation for the
-    active project -- called on dashboard load so the panel shows where you left off."""
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
+    """Loads (or creates, if none exists yet) the single ongoing system-wide
+    conversation -- called on dashboard load so the panel shows where you left off."""
     from chat_sessions import get_active_session, PROVIDER_LOCAL
-    session = _call_chat(get_active_session, pipeline_dir, get_active_repo_root(),
+    session = _call_chat(get_active_session, CHAT_STORAGE_DIR, _chat_roots(),
                            instances_dir(), provider=PROVIDER_LOCAL)
     return jsonify(session)
 
@@ -3637,12 +3667,9 @@ def api_chat_new():
     """Starts a fresh conversation, ending whatever's currently active. Body:
     {provider?, model?, effort?} -- same _discuss_provider_args fallback (local by
     default) every other Discuss-family start route already uses."""
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
     from chat_sessions import start_new_conversation
     provider, model, effort = _discuss_provider_args()
-    session = _call_chat(start_new_conversation, pipeline_dir, get_active_repo_root(),
+    session = _call_chat(start_new_conversation, CHAT_STORAGE_DIR, _chat_roots(),
                            instances_dir(), provider=provider, model=model, effort=effort)
     return jsonify(session)
 
@@ -3672,16 +3699,13 @@ def api_chat_message(session_id):
     NOT covered by this -- a known, real, narrower gap (git's own index.lock still turns
     a genuine collision into a clean failure to retry, not silent corruption) rather than
     a solved one; revisit if it causes a real incident."""
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
     if not message:
         abort(400, description="message is required")
 
     from chat_sessions import get_session
-    existing = get_session(pipeline_dir, session_id)
+    existing = get_session(CHAT_STORAGE_DIR, session_id)
     if not existing or existing.get("status") != "active":
         abort(404)
 
@@ -3699,7 +3723,7 @@ def api_chat_message(session_id):
 
     def generate():
         try:
-            for event in stream_message(pipeline_dir, session_id, message):
+            for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
                 yield f"data: {json.dumps(event)}\n\n"
         except ClaudeClientError as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
@@ -3730,13 +3754,10 @@ def api_chat_reserve(session_id):
     Body: {on: bool}. Only meaningful for the local provider (Claude has no shared-
     resource lock, per the earlier decision not to lock Claude calls against each
     other)."""
-    pipeline_dir = get_pipeline_dir()
-    if not pipeline_dir:
-        abort(500, description="no active project configured")
     from chat_sessions import get_session, set_reserved, PROVIDER_LOCAL
     import single_flight_lock
 
-    session = get_session(pipeline_dir, session_id)
+    session = get_session(CHAT_STORAGE_DIR, session_id)
     if not session:
         abort(404)
     if session.get("provider") != PROVIDER_LOCAL:
@@ -3759,7 +3780,7 @@ def api_chat_reserve(session_id):
             # Reserve the dict slot now (before the blocking acquire below) so a second,
             # concurrent toggle-on request for the SAME session can't also start
             # acquiring -- filled in with the real fh once acquire() returns.
-            _chat_reservations[session_id] = {"fh": None, "lastActivity": time.time(), "storageDir": pipeline_dir}
+            _chat_reservations[session_id] = {"fh": None, "lastActivity": time.time(), "storageDir": CHAT_STORAGE_DIR}
 
     if releasing_record is not None:
         single_flight_lock.release(releasing_record["fh"])
@@ -3772,9 +3793,9 @@ def api_chat_reserve(session_id):
         import ollama_client
         fh = single_flight_lock.acquire(inst_dir, ollama_client.MODEL)  # blocking -- may wait for a worker lane's current call on this same model
         with _chat_reservations_lock:
-            _chat_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": pipeline_dir}
+            _chat_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": CHAT_STORAGE_DIR}
 
-    session = set_reserved(pipeline_dir, session_id, want_on)
+    session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
     return jsonify(session)
 
 

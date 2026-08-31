@@ -84,7 +84,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -140,6 +140,15 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   // prior callOnce() (parsed.session_id, already returned below) is what a caller passes
   // back in here for its next message.
   if (resume) args.push('--resume', resume);
+
+  // addDirs (2026-08-31, system-wide Chat panel): extra directories the `claude` CLI is
+  // allowed to Read/Grep/Glob/Edit/Write in, on top of `cwd`. The dashboard's Chat panel
+  // roots `cwd` at the agent-manager repo and passes one entry per registered
+  // plugin/project repo, so a single conversation can span every codebase the system
+  // knows about. Omitted by every other caller -- unchanged single-`cwd` behaviour.
+  for (const d of Array.isArray(addDirs) ? addDirs : []) {
+    if (d) args.push('--add-dir', d);
+  }
 
   // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
   // this -- the one real Bash-capable, unattended tool-use path in this codebase (see
@@ -309,6 +318,7 @@ module.exports = { call, callOnce, majorityVote, detectDegenerate, assertSubscri
 
 // CLI: node claude-client.js <request.json>
 // request.json: { prompt, model, maxTurns, allowedTools, permissionMode, maxRetries,
+//                 cwd, resume, addDirs: [string, ...],
 //                 mode: "single" | "majority-vote", classifyMarkers: [string, ...] }
 // Writes the JSON result to stdout. Mirrors local-client.js's own CLI shape.
 if (require.main === module) {

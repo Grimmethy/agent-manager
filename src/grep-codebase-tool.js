@@ -36,11 +36,26 @@ function lineMatches(line, query) {
   return tokens.every((t) => lowerLine.includes(t));
 }
 
-function grepCodebase({ query, dir }) {
+// `root` (2026-08-31, system-wide Chat panel): an explicit absolute repo root to search
+// instead of config.js's single repoRoot. When a caller passes it AND it isn't the
+// configured repoRoot, the AGENT_MANAGER_GREP_DIRS allowlist is skipped -- that list is
+// this project's own source layout and means nothing for a sibling plugin/project repo
+// that has no per-repo grep-dirs config -- and an omitted / "." dir walks the whole root.
+// Every existing caller (arch-import-fetch.js, the pipeline's read-only tool loop) passes
+// no `root` and hits the unchanged path below.
+function grepCodebase({ query, dir, root }) {
   const { repoRoot, grepAllowedDirs } = getConfig();
-  if (!grepAllowedDirs.includes(dir) || !query) return [];
+  if (!query) return [];
 
-  const searchRoot = path.join(repoRoot, dir);
+  const altRoot = root && path.resolve(root) !== path.resolve(repoRoot) ? path.resolve(root) : null;
+  const base = altRoot || repoRoot;
+  let searchRoot;
+  if (altRoot) {
+    searchRoot = !dir || dir === '.' ? altRoot : path.join(altRoot, dir);
+  } else {
+    if (!grepAllowedDirs.includes(dir)) return [];
+    searchRoot = path.join(repoRoot, dir);
+  }
   const hits = [];
 
   function walk(current) {
@@ -69,9 +84,13 @@ function grepCodebase({ query, dir }) {
           if (hits.length >= MAX_MATCHES) return;
           if (lineMatches(lines[i], query)) {
             hits.push({
-              file: path.relative(repoRoot, fullPath).replace(/\\/g, '/'),
+              file: path.relative(base, fullPath).replace(/\\/g, '/'),
               line: i + 1,
               text: lines[i].trim(),
+              // Which root `file` is relative to -- lets a multi-root caller round-trip
+              // a hit into read_file with an absolute path. Only set for an alternate
+              // root so existing single-root callers see a byte-identical shape.
+              ...(altRoot ? { root: altRoot } : {}),
             });
           }
         }

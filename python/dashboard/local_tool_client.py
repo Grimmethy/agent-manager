@@ -37,18 +37,29 @@ class LocalToolClientError(RuntimeError):
 
 
 def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
-                         allow_write: bool = False) -> dict:
+                         allow_write: bool = False, primary_root: str = None,
+                         extra_roots: list = None) -> dict:
     """Returns local-tool-client.js's own result shape:
     {response, toolCallLog, turnsUsed, toolsDisabled}.
 
     allow_write=True (Chat panel only) opts into write_file/edit_file/run_bash on top
     of the always-available read-only tools -- see local-tool-client.js's own WRITE_TOOLS
-    header for why this is a deliberate, separate opt-in, not a default."""
+    header for why this is a deliberate, separate opt-in, not a default.
+
+    primary_root / extra_roots (2026-08-31, system-wide Chat panel): the repo the
+    assistant is rooted at, plus additional accessible repo roots. Passed via the request
+    JSON, NOT the child env -- AGENT_MANAGER_PIPELINE_DIR stays inherited so the node
+    child's GPU single-flight lock keeps coordinating with the running workers. Omitting
+    both keeps local-tool-client.js on the single configured repoRoot exactly as before."""
     request = {"prompt": prompt, "maxTurns": max_turns}
     if source:
         request["source"] = source
     if allow_write:
         request["allowWrite"] = True
+    if primary_root:
+        request["primaryRoot"] = primary_root
+    if extra_roots:
+        request["extraRoots"] = list(extra_roots)
 
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     try:
@@ -83,7 +94,8 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
 
 
 def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns: int = 5,
-                            source: str = None, allow_write: bool = False):
+                            source: str = None, allow_write: bool = False,
+                            primary_root: str = None, extra_roots: list = None):
     """Generator sibling of run_plan_with_tools for the Chat panel's live-streamed replies
     (2026-08-26, Grimmethy: "vastly improve the chat system... Open WebUI" investigation --
     Open WebUI streams tokens over Socket.IO/SSE as they generate instead of blocking for
@@ -103,6 +115,10 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
         request["source"] = source
     if allow_write:
         request["allowWrite"] = True
+    if primary_root:
+        request["primaryRoot"] = primary_root
+    if extra_roots:
+        request["extraRoots"] = list(extra_roots)
 
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     tmp_path.write_text(json.dumps(request), encoding="utf-8")
