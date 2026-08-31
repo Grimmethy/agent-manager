@@ -70,6 +70,32 @@ function writeTaskJson(taskPath, task) {
   fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
 }
 
+// A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft
+// branch already stamped on the task (adhoc resolution, retry count, model). Returns
+// undefined when there's nothing worth showing -- appendHistoryEvent then omits `detail`.
+function draftDoneDetail(task) {
+  const parts = [];
+  if (task.adhocResolution) parts.push(`resolution=${task.adhocResolution}`);
+  if (task.localRejectCount) parts.push(`retry ${task.localRejectCount}`);
+  const model = task.draftModelDisplay || task.draftModel;
+  if (model) parts.push(model);
+  return parts.join(', ') || undefined;
+}
+
+// The draft phase is complete and the task is heading to review. Emit an explicit
+// 'draft-done' checkpoint -- bookend to the 'draft-started' event above, and the same
+// -started/-done pairing plan/implement/critique/review already have -- BEFORE the
+// terminal 'needs-review' entry, so the per-task Pipeline History shows the draft phase
+// closing, not just the next state opening. (local-worker.ps1 records this seam as
+// Invoke-TaskDb 'draft-done'; the bash port never substituted a history event for it.)
+// Every draft-success return in draftTask/draftAdhocBranch/research/product_spec funnels
+// through here. Idempotent w.r.t. task.status.
+function concludeDraft(task) {
+  task.status = 'needs-review';
+  appendHistoryEvent(task, 'draft-done', draftDoneDetail(task));
+  appendHistoryEvent(task, 'needs-review');
+}
+
 // task-sources.js's nextCandidateFulfillmentTask() -- the shared candidate-consumer every
 // candidateFulfillment: true source uses, each fetching real file content (fetchedFiles)
 // for the exact files their own candidate names, so their implement pass always has real
@@ -344,8 +370,7 @@ function runStalenessFastpath(task) {
   appendHistoryEvent(task, 'implement-done', `deterministic recheck: ${verdict.recommendation}`);
   task.critiqueOutcome = 'no-issues';
   appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic report, nothing for a critique pass to add)');
-  task.status = 'needs-review';
-  appendHistoryEvent(task, 'needs-review');
+  concludeDraft(task);
   return { succeeded: true, blocked: false };
 }
 
@@ -395,8 +420,7 @@ async function draftAdhocBranch(task, {
 
   if (localTierApplied) {
     appendHistoryEvent(task, 'implement-done', `local tier, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
-    task.status = 'needs-review';
-    appendHistoryEvent(task, 'needs-review');
+    concludeDraft(task);
     return { succeeded: true, blocked: false };
   }
 
@@ -448,8 +472,7 @@ async function draftAdhocBranch(task, {
     return { succeeded: true, blocked: false, needsClarification: true };
   }
   appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
-  task.status = 'needs-review';
-  appendHistoryEvent(task, 'needs-review');
+  concludeDraft(task);
   return { succeeded: true, blocked: false };
 }
 
@@ -476,8 +499,7 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
     return { succeeded: true, blocked: true, blockedReason: researchResult.blockedReason };
   }
   appendHistoryEvent(task, 'implement-done', `agentic research, ${(task.implementResponse || '').length} chars`);
-  task.status = 'needs-review';
-  appendHistoryEvent(task, 'needs-review');
+  concludeDraft(task);
   return { succeeded: true, blocked: false };
 }
 
@@ -568,8 +590,7 @@ function tryDeterministicLiteralEdit(task) {
     replace: literalEditLiterals[0].content,
   });
   appendHistoryEvent(task, 'implement-done', 'deterministic find/replace (file, find, and the single fixedLiterals block were all fully specified in the task -- constructed directly instead of asking the model to reproduce content it was already handed verbatim)');
-  task.status = 'needs-review';
-  appendHistoryEvent(task, 'needs-review');
+  concludeDraft(task);
   return { succeeded: true, blocked: false };
 }
 
@@ -744,8 +765,7 @@ async function finalizeCandidateFulfillment(task, {
     }
     task.candidateSplitProposals = split.candidates;
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
-    task.status = 'needs-review';
-    appendHistoryEvent(task, 'needs-review');
+    concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
   }
   const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
@@ -872,8 +892,7 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
   if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
     task.implementResponse = '';
     appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
-    task.status = 'needs-review';
-    appendHistoryEvent(task, 'needs-review');
+    concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
   }
 
@@ -1001,8 +1020,7 @@ async function draftTask(task, {
       maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
     });
 
-    task.status = 'needs-review';
-    appendHistoryEvent(task, 'needs-review');
+    concludeDraft(task);
 
     return { succeeded: true, blocked: false };
   } catch (e) {
@@ -1038,7 +1056,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit };
+module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail };
 
 if (require.main === module) {
   main();

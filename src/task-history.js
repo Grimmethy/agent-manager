@@ -21,10 +21,10 @@
 // once you were looking at a single task file in isolation.
 //
 // Entry shape: { stage, at, detail?, firstAt?, count? }
-//   stage:  short machine-readable checkpoint name, e.g. 'created', 'claimed', 'plan-done',
-//           'implement-done', 'critique-done', 'revision-applied', 'needs-review',
-//           'review-voted', 'approved', 'blocked', 'requeued', 'exhausted', 'applied',
-//           'apply-failed'.
+//   stage:  short machine-readable checkpoint name, e.g. 'created', 'claimed',
+//           'draft-started', 'plan-done', 'implement-done', 'critique-done',
+//           'revision-applied', 'draft-done', 'needs-review', 'review-voted', 'approved',
+//           'blocked', 'requeued', 'exhausted', 'applied', 'apply-failed'.
 //   at:     ISO timestamp, always new Date().toISOString() at the moment the stage
 //           actually completed (not backfilled/estimated) -- for a collapsed repeat entry
 //           (see COLLAPSIBLE_REPEAT_STAGES below), the MOST RECENT occurrence's timestamp.
