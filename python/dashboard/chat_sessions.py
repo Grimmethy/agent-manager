@@ -3,6 +3,14 @@ right side of the app for a conversational AI, very similar to the claude termin
 been using externally. It should be able to access the project files and make edits to
 the system... the chat in the machine."
 
+2026-08-31 (Grimmethy: "It should be rooted in agent manager always, and have access to
+all active plugins"): the panel is no longer scoped to whichever project the pipeline is
+pointed at. It is one global, system-wide conversation ROOTED at the agent-manager repo,
+with real Read/Grep/Glob/Edit/Write/Bash access to agent-manager PLUS every registered
+plugin (plugins.json) and project (projects.json). `session["roots"]` carries that list,
+`roots[0]` (agent-manager) is the primary/`cwd`; app.py's `_chat_roots()` builds it and
+the storage dir is fixed at the agent-manager repo root, not the active pipelineDir.
+
 Deliberately NOT built on discuss_sessions.py's shape despite some surface similarity:
 Discuss is per-subject (a task/note/brain-dump entry), read-only, and rebuilds a fresh
 prompt+transcript every turn because neither provider has real session continuity wired
@@ -78,14 +86,19 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _new_session(repo_root: str, instances_dir, provider: str, model: str, effort: str) -> dict:
+def _new_session(roots: list, instances_dir, provider: str, model: str, effort: str) -> dict:
     session_id = f"chat-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    roots = [r for r in (roots or []) if r] or ["."]
     return {
         "id": session_id,
         "provider": provider,
         "model": model,
         "effort": effort,
-        "repoRoot": repo_root,
+        # roots[0] is the primary (agent-manager) repo -- Claude's cwd, and where a
+        # relative path resolves for the local provider. roots[1:] are the additional
+        # plugin/project repos, all read/write. See app.py:_chat_roots().
+        "roots": roots,
+        "repoRoot": roots[0],
         "instancesDir": str(instances_dir) if instances_dir else None,
         # Only meaningful for the Claude provider (claude_client.generate()'s own
         # `resume` param) -- the CLI's real session id, captured from the first reply and
@@ -105,7 +118,7 @@ def _new_session(repo_root: str, instances_dir, provider: str, model: str, effor
     }
 
 
-def get_active_session(storage_dir: Path, repo_root: str, instances_dir=None,
+def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
                         provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """The single ongoing conversation for this project (Brain Dump #153: "hideable panel
     on the right side of the app" -- global, not per-subject like Discuss). Creates one if
@@ -118,13 +131,13 @@ def get_active_session(storage_dir: Path, repo_root: str, instances_dir=None,
     if active:
         active.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
         return active[0]
-    session = _new_session(repo_root, instances_dir, provider, model, effort)
+    session = _new_session(roots, instances_dir, provider, model, effort)
     sessions[session["id"]] = session
     _write_sessions(storage_dir, sessions)
     return session
 
 
-def start_new_conversation(storage_dir: Path, repo_root: str, instances_dir=None,
+def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
                             provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """Ends whatever's currently active (if anything -- same shape as Discuss's own
     end_session, but here there's no subject-owning caller to fold a summary back into,
@@ -135,18 +148,36 @@ def start_new_conversation(storage_dir: Path, repo_root: str, instances_dir=None
         if s.get("status") == "active":
             s["status"] = "ended"
             s["endedAt"] = now
-    session = _new_session(repo_root, instances_dir, provider, model, effort)
+    session = _new_session(roots, instances_dir, provider, model, effort)
     sessions[session["id"]] = session
     _write_sessions(storage_dir, sessions)
     return session
 
 
+def _roots_blurb(session: dict) -> str:
+    roots = session.get("roots") or [session["repoRoot"]]
+    lines = [f"- {roots[0]}  (agent-manager -- primary; relative paths resolve here)"]
+    for r in roots[1:]:
+        lines.append(f"- {r}")
+    return "\n".join(lines)
+
+
 def _send_claude(session: dict, message: str) -> str:
     started = time.time()
+    roots = session.get("roots") or [session["repoRoot"]]
+    # First turn only: the CLI's --add-dir makes the extra repos reachable but doesn't
+    # announce them. Tell Claude they exist; on later turns --resume carries the context.
+    if not session.get("claudeSessionId") and len(roots) > 1:
+        message = (
+            "You are rooted at the agent-manager repo and also have full read/write access "
+            "to these additional repos:\n" + _roots_blurb(session)
+            + "\n\n---\n\n" + message
+        )
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
+        add_dirs=roots[1:],
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
@@ -156,15 +187,23 @@ def _send_claude(session: dict, message: str) -> str:
 
 
 _LOCAL_SYSTEM_PROMPT = (
-    "You are a coding assistant embedded in this project's own dashboard, with real "
-    "Read/Grep/Glob/Edit/Write/Bash access to the live repository via your tools -- "
-    "not a sandbox, not a draft that goes through review. A human is directly present "
-    "and watching, the same way they would be pairing with you in a terminal. Make "
-    "real changes when asked; explain what you did."
+    "You are a coding assistant embedded in the agent-manager system's own dashboard, "
+    "with real Read/Grep/Glob/Edit/Write/Bash access to live repositories via your tools "
+    "-- not a sandbox, not a draft that goes through review. A human is directly present "
+    "and watching, the same way they would be pairing with you in a terminal. Make real "
+    "changes when asked; explain what you did.\n\n"
+    "You are ROOTED at the agent-manager repo (relative paths resolve there) and also have "
+    "full read/write access to every registered plugin and project repo. Call list_roots "
+    "to see them; use an absolute path (or grep_codebase's `root` argument) to reach a "
+    "non-primary repo."
 )
 
 
-def _build_local_messages(transcript: list, message: str) -> list:
+def _local_system_prompt(session: dict) -> str:
+    return _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
+
+
+def _build_local_messages(session: dict, message: str) -> list:
     """2026-08-26 (Open WebUI investigation, Grimmethy): replaces the old approach of
     flattening the whole conversation into one giant string inside a single
     {role:'user'} message -- Ollama's /api/chat (like every real chat frontend, Open
@@ -173,8 +212,8 @@ def _build_local_messages(transcript: list, message: str) -> list:
     incidentally means only a session's very first-ever message is ever a length-1
     request now -- see local-tool-client.js's own comment on why that shape is the one
     that can hit TokenFold's flaky single-message cache path."""
-    messages = [{"role": "system", "content": _LOCAL_SYSTEM_PROMPT}]
-    for turn in transcript:
+    messages = [{"role": "system", "content": _local_system_prompt(session)}]
+    for turn in session["transcript"]:
         role = "assistant" if turn["role"] == "assistant" else "user"
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": message})
@@ -186,10 +225,12 @@ def _stream_local(session: dict, message: str):
     streaming, see this module's own recent header note) -- the caller accumulates them
     into the final transcript entry."""
     started = time.time()
-    messages = _build_local_messages(session["transcript"], message)
+    messages = _build_local_messages(session, message)
+    roots = session.get("roots") or [session["repoRoot"]]
     result = None
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
+        primary_root=roots[0], extra_roots=roots[1:],
     ):
         if event.get("type") == "chunk":
             yield event["text"]
