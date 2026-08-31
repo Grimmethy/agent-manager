@@ -517,6 +517,15 @@ while :; do                                                                     
     active_locally="false"
   fi
   if [[ "$active_locally" == "true" ]]; then
+    # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held -- see its header):
+    # PromptForge is holding the GPU for an image generation that wouldn't otherwise fit
+    # alongside the resident local model. Yield the tick exactly like the model-swap guard
+    # below; a Claude-lane real-Claude tick never reaches here so it's unaffected.
+    if comfyui_lease_held; then
+      printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+      sleep "${ORC_TICK_SECS:-30}"
+      continue
+    fi
     target_tier="low"
     "$IS_CLAUDE_LANE" && target_tier="high"
     yield_verdict="$(should_yield_for_model_swap "$LOCAL_MODEL" "$target_tier")"

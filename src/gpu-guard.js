@@ -34,6 +34,37 @@
 // project-search-fetch.js's own try/catch gives its own external call.
 
 const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// ComfyUI GPU lease (2026-08-30). PromptForge writes this file only when starting
+// ComfyUI would collide with the resident local model on a single GPU. While it's held
+// (fresh), this guard must NOT unload ComfyUI or Ollama -- PromptForge owns the card for
+// that generation, and local-worker.sh / review-runner.sh are yielding their ticks too.
+// Absent / expired / stomped -> returns false and the existing /free reclaim path runs
+// unchanged (that is the pipeline-reclaims-an-idle-ComfyUI direction, already working).
+const COMFY_LEASE_PATH = process.env.AGENT_MANAGER_COMFY_LEASE_PATH
+  || path.join(os.homedir(), '.local', 'state', 'agent-manager', 'comfyui-lease.json');
+const COMFY_LEASE_TTL_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_TTL_S) || 90;
+// Hard ceiling: a stuck/runaway generation can never keep the pipeline yielded past this,
+// no matter how fresh its refreshedAt looks.
+const COMFY_LEASE_MAX_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_MAX_S) || 900;
+
+function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
+  try {
+    const d = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+    const now = Date.now();
+    const refreshed = Date.parse(d.refreshedAt);
+    const acquired = Date.parse(d.acquiredAt);
+    if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) return false;
+    return (now - refreshed) <= COMFY_LEASE_TTL_S * 1000
+      && (now - acquired) <= COMFY_LEASE_MAX_S * 1000;
+  } catch (e) {
+    // No file / unreadable / malformed -- not held. Fail open.
+    return false;
+  }
+}
 
 const MIN_FREE_VRAM_MB = Number(process.env.AGENT_MANAGER_MIN_FREE_VRAM_MB) || 4096;
 const THEAGENT_URL = process.env.AGENT_MANAGER_THEAGENT_URL || 'http://localhost:4519';
@@ -115,7 +146,17 @@ async function ensureGpuHeadroom({
   yieldAppIds = YIELD_APP_IDS,
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
+  leaseHeld = comfyuiLeaseHeld,
 } = {}) {
+  // PromptForge holds the GPU for an image generation that wouldn't fit alongside the
+  // resident local model. Don't touch ComfyUI or Ollama this tick -- the local-model
+  // lanes are yielding too (see comfyui_lease_held in agent-manager-common.sh). An
+  // absent/expired/stomped lease -> leaseHeld() is false and the normal path below runs.
+  if (leaseHeld()) {
+    return { checked: true, freeMb: null, minFreeMb, starved: false, yielded: [], freed: [],
+             note: 'comfyui-lease held -- PromptForge owns the GPU; not touching ComfyUI or Ollama this tick' };
+  }
+
   const freeMb = readFreeVram();
   if (freeMb === null) return { checked: false, freeMb: null, minFreeMb, starved: false, yielded: [], freed: [], note: 'nvidia-smi unavailable' };
   if (freeMb >= minFreeMb) return { checked: true, freeMb, minFreeMb, starved: false, yielded: [], freed: [], note: '' };
@@ -184,7 +225,7 @@ async function ensureGpuHeadroom({
   };
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb };
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld };
 
 if (require.main === module) {
   ensureGpuHeadroom().then((result) => {
