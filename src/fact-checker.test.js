@@ -241,6 +241,51 @@ test('checkDraft still flags a genuinely fabricated path referenced by an edit/d
   assert.deepEqual(missing, ['src/does-not-exist.js']);
 });
 
+// --- 2026-08-31: brain_dump_sort / secondbrain drafts name a `secondBrainPath` note
+// destination. Filing a brand-new note (the path doesn't exist yet) is the normal case,
+// not fabrication -- but the deterministic missing-file flag was still generated and fed
+// to the reviewer as evidence. Done-task backlog: 7/8 brain_dump_sort tasks bounced at
+// review on exactly this. Treat secondBrainPath the same as a Group B create target. ---
+
+test('extractCreateModeTargets picks up a brain_dump_sort draft\'s secondBrainPath', () => {
+  const draft = JSON.stringify({
+    category: 'task',
+    secondBrainPath: 'projects/screaming_goat_advertisement_concept.md',
+    tags: ['advertising'],
+    actionable: true,
+  });
+  assert.deepEqual([...extractCreateModeTargets(draft)], ['projects/screaming_goat_advertisement_concept.md']);
+});
+
+test('checkDraft does not flag a not-yet-existing secondBrainPath as missing-file, and stamps isCreateTarget on it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const draft = JSON.stringify({
+    category: 'idea',
+    secondBrainPath: 'agent_manager/ideas/send_to_chat.md',
+    tags: ['agent-manager'],
+    rationale: 'Feature idea for the chat panel.',
+  });
+
+  const result = checkDraft(draft, dir);
+  assert.deepEqual(result.flags.filter((f) => f.type === 'missing-file'), [], 'no missing-file flag for the note destination');
+  const check = result.fileChecks.find((c) => c.claimedPath === 'agent_manager/ideas/send_to_chat.md');
+  assert.equal(check.exists, false);
+  assert.equal(check.isCreateTarget, true, 'the explanation travels with the raw fileChecks entry the reviewer model reads');
+});
+
+test('checkDraft still flags a genuinely fabricated repo path in a brain_dump_sort draft that also carries a secondBrainPath', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const draft = JSON.stringify({
+    category: 'task',
+    secondBrainPath: 'projects/new_note.md',
+    rationale: 'This relates to code in src/totally-made-up-module.js which handles it.',
+  });
+
+  const result = checkDraft(draft, dir);
+  const missing = result.flags.filter((f) => f.type === 'missing-file').map((f) => f.detail);
+  assert.deepEqual(missing, ['src/totally-made-up-module.js'], 'the note destination is exempt; a fabricated code path is still caught');
+});
+
 // Regression, 2026-08-23: caught live -- a draft was rejected TWICE by a human reviewer
 // for claiming "already resolved (commit 7261944)" with no diff or evidence, and that
 // hash does not exist anywhere in the repo. checkFilePaths already catches a fabricated
