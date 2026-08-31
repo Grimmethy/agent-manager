@@ -307,6 +307,38 @@ test('draftDoneDetail summarises whatever the branch stamped, and is undefined w
   assert.equal(draftDoneDetail({ draftModel: 'qwen' }), 'qwen');
 });
 
+// 2026-08-31: implNumCtx used to vary per-prompt (usually landing on an 8192 floor), so a
+// draft's implement pass flipped num_ctx away from the plan pass's PINNED_NUM_CTX and
+// Ollama fully reloaded the model (~55-100s) while holding the single-flight GPU lock ->
+// `flock -w 600` lock-acquisition timeouts under lane contention. The floor is now
+// PINNED_NUM_CTX so the normal case is one stable value shared with every other call.
+test('computeImplementBudget floors implNumCtx at PINNED_NUM_CTX for a normal-sized prompt (no per-draft model reload)', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const task = { source: 'manual', planResponse: 'x'.repeat(1500) };
+  const b = computeImplementBudget(task, 'a normal implement prompt '.repeat(120)); // ~3KB
+  assert.equal(b.implNumCtx, PINNED_NUM_CTX, 'a normal prompt gets exactly the pinned value, not the old 8192 floor');
+});
+
+test('computeImplementBudget still grows implNumCtx past the floor for a whole-document source, capped at 32768', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  // product_spec: implNumPredict ceiling 16000, and a large prompt -> genuine need above the floor
+  const task = { source: 'product_spec', planResponse: 'y'.repeat(9000) };
+  const big = computeImplementBudget(task, 'z'.repeat(80000));
+  assert.ok(big.implNumCtx > PINNED_NUM_CTX, 'a genuinely large document prompt is still allowed to exceed the floor');
+  assert.ok(big.implNumCtx <= 32768, 'still capped at 32768');
+});
+
+test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const task = { source: 'manual', planResponse: 'p', promptContext: { fixedLiterals: [{ content: 'tiny block' }] } };
+  const b = computeImplementBudget(task, 'short');
+  assert.equal(b.hasFixedLiterals, true);
+  assert.ok(b.implNumCtx >= PINNED_NUM_CTX);
+});
+
 test('an adhoc task where harness-search declines but local-agentic (read-only) applies -- never reaches the write tier', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
