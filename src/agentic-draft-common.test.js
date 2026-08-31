@@ -76,7 +76,9 @@ test('resolveAgenticDraft(implemented): stages + captures the worktree diff into
       result: { response: 'did stuff\n\nRESOLUTION: implemented\n\nsummary here' },
       worktreeDir: wt, modelLabel: 'qwen-test',
     });
-    assert.deepEqual(out, { succeeded: true, blocked: false });
+    assert.equal(out.succeeded, true);
+    assert.equal(out.blocked, false);
+    assert.equal(out.resolution, 'implemented'); // now surfaced for draft-attempt-record.js
     assert.equal(task.adhocResolution, 'implemented');
     assert.equal(task.draftModel, 'qwen-test');
     assert.match(task.rawDiff, /a\.txt/);
@@ -92,7 +94,8 @@ test('resolveAgenticDraft(decompose): sets subTaskProposals, no diff', () => {
       result: { response: 'RESOLUTION: decompose\n[{"title":"p1","rawText":"first"},{"title":"p2","rawText":"second"}]\nsplit because big' },
       worktreeDir: wt,
     });
-    assert.deepEqual(out, { succeeded: true, blocked: false });
+    assert.equal(out.succeeded, true);
+    assert.equal(out.blocked, false);
     assert.equal(task.subTaskProposals.length, 2);
     assert.equal(task.rawDiff, '');
   });
@@ -105,7 +108,9 @@ test('resolveAgenticDraft(needs-human-decision): needsClarification, no diff', (
       result: { response: 'RESOLUTION: needs-human-decision\nWhich DB?' },
       worktreeDir: wt,
     });
-    assert.deepEqual(out, { succeeded: true, blocked: false, needsClarification: true });
+    assert.equal(out.succeeded, true);
+    assert.equal(out.blocked, false);
+    assert.equal(out.needsClarification, true);
     assert.equal(task.adhocResolution, 'needs-human-decision');
   });
 });
