@@ -42,6 +42,9 @@ const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
+const {
+  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordTier, finalizeDraftAttempt,
+} = require('./draft-attempt-record.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
@@ -385,18 +388,21 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
 // critique-skip all constructed directly, task left at needs-review); returns null when
 // the original finding isn't from a deterministically re-runnable rule, so the caller
 // falls through to the normal harness-grounded local-model path unchanged.
-function runStalenessFastpath(task) {
+function runStalenessFastpath(task, attempt) {
   const { deterministicRecheck } = require('./staleness-fastpath.js');
   const verdict = deterministicRecheck(task, getConfig().repoRoot);
   if (!verdict) return null;
   task.planResponse = 'Deterministic recheck: the original finding came from a scanner rule this pipeline can re-run directly against the file\'s current content -- no search terms or model judgment needed.';
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
   appendHistoryEvent(task, 'plan-done', 'deterministic recheck, no model call');
   task.promptContext.harnessHits = verdict.hits;
   task.promptContext.harnessFiles = [];
   appendHistoryEvent(task, 'harness-search', `deterministic re-scan, ${verdict.hits.length} hit(s)`);
   task.implementResponse = verdict.reportText;
+  recordImplement(attempt, { text: task.implementResponse, note: `deterministic recheck: ${verdict.recommendation}` });
   appendHistoryEvent(task, 'implement-done', `deterministic recheck: ${verdict.recommendation}`);
   task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
   appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic report, nothing for a critique pass to add)');
   concludeDraft(task);
   return { succeeded: true, blocked: false };
@@ -417,7 +423,7 @@ function runStalenessFastpath(task) {
 // strict, line-based format; a freeform rewrite is not a safe way to edit one) -- every
 // path here returns a final draftTask result directly instead.
 async function draftAdhocBranch(task, {
-  maybeLocked, recordModelCall,
+  maybeLocked, recordModelCall, attempt,
   draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
 }) {
   // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
@@ -441,6 +447,11 @@ async function draftAdhocBranch(task, {
   // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
   appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
   const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
+  recordTier(attempt, {
+    tier: 'harness-search', applied: harnessResult.applied, reason: harnessResult.reason,
+    response: harnessResult.applied ? task.implementResponse : undefined,
+    rawDiff: harnessResult.applied ? task.rawDiff : undefined,
+  });
   if (!harnessResult.applied && harnessResult.succeeded === false) {
     return { succeeded: false, reason: harnessResult.reason };
   }
@@ -449,6 +460,11 @@ async function draftAdhocBranch(task, {
   if (!localTierApplied) {
     appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
     const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
+    recordTier(attempt, {
+      tier: 'local-agentic', applied: localAgenticResult.applied, reason: localAgenticResult.reason,
+      response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
+      toolCallLog: localAgenticResult.toolCallLog,
+    });
     if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
       return { succeeded: false, reason: localAgenticResult.reason };
     }
@@ -467,6 +483,16 @@ async function draftAdhocBranch(task, {
   // genuine infra error (retry), everything else is terminal.
   appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
   const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
+  recordTier(attempt, {
+    tier: 'local-agentic-write',
+    resolution: agenticResult.resolution || task.adhocResolution,
+    blocked: agenticResult.blocked,
+    reason: agenticResult.reason || agenticResult.blockedReason,
+    response: agenticResult.response,
+    rawDiff: agenticResult.capturedDiff || (agenticResult.blocked ? undefined : task.rawDiff),
+    turnsUsed: agenticResult.turnsUsed,
+    toolCallLog: agenticResult.toolCallLog,
+  });
   if (!agenticResult.succeeded) {
     return { succeeded: false, reason: agenticResult.reason };
   }
@@ -510,7 +536,7 @@ async function draftAdhocBranch(task, {
 // would add nothing (there's no repo state to reason about, and "revision" of a research
 // write-up the model already finished is redundant with the normal review-task.js pass
 // this still flows into afterward).
-async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn = isClaudePaused }) {
+async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn = isClaudePaused, attempt }) {
   // research_task has no local implementation -- WebSearch/WebFetch are Claude-only. It
   // runs only when explicitly opted onto Claude AND a token is set AND Claude isn't
   // paused; otherwise it blocks cleanly for a human (draftTask hoists the same check
@@ -526,9 +552,11 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
     return { succeeded: false, reason: researchResult.reason };
   }
   if (researchResult.blocked) {
+    recordTier(attempt, { tier: 'agentic-research', blocked: true, reason: researchResult.blockedReason });
     appendHistoryEvent(task, 'blocked', researchResult.blockedReason);
     return { succeeded: true, blocked: true, blockedReason: researchResult.blockedReason };
   }
+  recordTier(attempt, { tier: 'agentic-research', resolution: 'implemented', response: task.implementResponse });
   appendHistoryEvent(task, 'implement-done', `agentic research, ${(task.implementResponse || '').length} chars`);
   concludeDraft(task);
   return { succeeded: true, blocked: false };
@@ -540,7 +568,7 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
 // after emitting the 'blocked' event -- when the plan pass came back degenerate, else
 // { blocked: false }.
 async function runPlanPass(task, {
-  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch,
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
 }) {
   const planPrompt = buildPlanPrompt(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
@@ -573,10 +601,12 @@ async function runPlanPass(task, {
   const planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
+    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts });
     appendHistoryEvent(task, 'blocked', blockedReason);
     return { blocked: true, blockedReason };
   }
   task.planResponse = planResult.response;
+  recordPlan(attempt, { text: planResult.response, attempts: planResult.attempts });
   appendHistoryEvent(task, 'plan-done', `${planResult.attempts} attempt(s), ${task.planResponse.length} chars`);
 
   // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a
@@ -605,7 +635,7 @@ async function runPlanPass(task, {
 // adhoc-shaped task authored this way never even reaches the expensive Claude agentic
 // tiers for something that needed zero real reasoning. Returns the finished draftTask
 // result when it constructed the edit directly, else null.
-function tryDeterministicLiteralEdit(task) {
+function tryDeterministicLiteralEdit(task, attempt) {
   const literalEditLiterals = (task.promptContext && Array.isArray(task.promptContext.fixedLiterals))
     ? task.promptContext.fixedLiterals
     : [];
@@ -620,6 +650,7 @@ function tryDeterministicLiteralEdit(task) {
     find: task.promptContext.find,
     replace: literalEditLiterals[0].content,
   });
+  recordImplement(attempt, { text: task.implementResponse, note: 'deterministic find/replace (fully specified in the task)' });
   appendHistoryEvent(task, 'implement-done', 'deterministic find/replace (file, find, and the single fixedLiterals block were all fully specified in the task -- constructed directly instead of asking the model to reproduce content it was already handed verbatim)');
   concludeDraft(task);
   return { succeeded: true, blocked: false };
@@ -650,10 +681,11 @@ function tryDeterministicLiteralEdit(task) {
 // model choice or the judgment itself -- it only removes a self-review layer already
 // shown, on real data, to almost never do anything.
 async function runCritiqueAndRevision(task, {
-  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt,
 }) {
   if (isAdvisoryProseSource(resolveSourceName(task))) {
     task.critiqueOutcome = 'skipped-advisory-prose';
+    recordCritique(attempt, { outcome: task.critiqueOutcome });
     appendHistoryEvent(task, 'critique-done', task.critiqueOutcome);
     return;
   }
@@ -681,6 +713,7 @@ async function runCritiqueAndRevision(task, {
     // Revision came back degenerate: bounded to one attempt, leave original draft
     // intact rather than lose a working draft to a bad revision call.
   }
+  recordCritique(attempt, { outcome: task.critiqueOutcome, revised: !!task.revisionApplied });
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 }
 
@@ -799,14 +832,16 @@ function computeImplementBudget(task, implPrompt) {
 // falls through to critique.
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
-}, { implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement }) {
+}, { implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
   const split = parseCandidateSplit(task.implementResponse);
   if (split) {
     if (split.invalid) {
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `invalid candidate split: ${split.reason}` });
       appendHistoryEvent(task, 'blocked', split.reason);
       return { done: true, result: { succeeded: true, blocked: true, blockedReason: split.reason } };
     }
     task.candidateSplitProposals = split.candidates;
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `split into ${split.candidates.length} sub-candidate(s)` });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
     concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
@@ -818,8 +853,10 @@ async function finalizeCandidateFulfillment(task, {
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `retried once (find "${unverified.find.slice(0, 80)}" did not verify)` });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (retried once: find "${unverified.find.slice(0, 80)}" did not verify against real file content)`);
   } else {
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
   }
   return { done: false };
@@ -915,7 +952,7 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
 // draftModel, ...) and emits its own history events. Returns { done: true, result } when
 // a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
 // split), else { done: false } so draftTask continues to critique + revision.
-async function runImplementPass(task, ctx, { recordModelCall }) {
+async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
 
   // 2026-08-23, Grimmethy: "Investigate: arch_review/arch_import drafts hedge instead
@@ -934,6 +971,7 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
   const skipImplementOnNoHits = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoHarnessHits;
   if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
     task.implementResponse = '';
+    recordImplement(attempt, { note: 'deterministic empty (harness search found zero real matches)' });
     appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
     concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
@@ -952,6 +990,7 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
 
   if (implResult.degenerate) {
     const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
+    recordImplement(attempt, { degenerate: implResult.degenerate, attempts: implResult.attempts });
     appendHistoryEvent(task, 'blocked', blockedReason);
     return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
   }
@@ -967,9 +1006,10 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
   // third guess would likely fix either.
   if (isCandidateFulfillmentSource(task.source)) {
     return await finalizeCandidateFulfillment(task, ctx, {
-      implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement,
+      implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
     });
   }
+  recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
   appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
   return { done: false };
 }
@@ -986,7 +1026,21 @@ async function runImplementPass(task, ctx, { recordModelCall }) {
  *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, needsClarification?: boolean, reason?: string}>}
  */
-async function draftTask(task, {
+async function draftTask(task, deps = {}) {
+  // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
+  // threads `attempt` through every pass and records into it as output is produced;
+  // finalizeDraftAttempt stamps the terminal verdict, pushes it onto task.draftAttempts,
+  // and emits a 'draft-attempt' history event so main()'s persist hook flushes the record
+  // to disk -- including on the succeeded:false path, where main()'s own terminal
+  // writeTaskJson is skipped. Without this, a task that fails N times in a row keeps only
+  // the LAST attempt's planResponse (overwritten every run) and none of the tier detail.
+  const attempt = beginDraftAttempt(task);
+  const result = await runDraftPasses(task, attempt, deps);
+  finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+  return result;
+}
+
+async function runDraftPasses(task, attempt, {
   localCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
   draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
@@ -1002,7 +1056,7 @@ async function draftTask(task, {
 
     // Deterministic staleness-recheck short-circuit -- see runStalenessFastpath().
     if (task.source === 'staleness_audit') {
-      const fastpathResult = runStalenessFastpath(task);
+      const fastpathResult = runStalenessFastpath(task, attempt);
       if (fastpathResult) return fastpathResult;
       // else: not a rule this file knows how to re-run deterministically (adhoc,
       // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
@@ -1029,6 +1083,8 @@ async function draftTask(task, {
       if (!task.planResponse) {
         task.planResponse = 'Pre-drafted task: the exact implementResponse below was specified directly by the caller, not produced by a plan+implement pass.';
       }
+      recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+      recordImplement(attempt, { text: task.implementResponse, note: 'pre-drafted (caller-supplied implementResponse)' });
     } else {
       // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research
       // can't run on Claude (not opted in / no token / paused) block BEFORE the plan
@@ -1042,13 +1098,13 @@ async function draftTask(task, {
       }
 
       const planOutcome = await runPlanPass(task, {
-        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch,
+        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
       });
       if (planOutcome.blocked) {
         return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason };
       }
 
-      const literalEditResult = tryDeterministicLiteralEdit(task);
+      const literalEditResult = tryDeterministicLiteralEdit(task, attempt);
       if (literalEditResult) return literalEditResult;
 
       // adhoc-shaped tasks implement via a tiered LOCAL agentic ladder (harness-search ->
@@ -1057,7 +1113,7 @@ async function draftTask(task, {
       // draftTask result; nothing here calls Claude.
       if (resolveSourceName(task) === 'adhoc') {
         return await draftAdhocBranch(task, {
-          maybeLocked, recordModelCall,
+          maybeLocked, recordModelCall, attempt,
           draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
         });
       }
@@ -1066,17 +1122,17 @@ async function draftTask(task, {
       // draftResearchBranch(). Same "the agentic pass already produced the final artifact,
       // skip the local plan/critique/revision loop" reasoning as the adhoc branch.
       if (task.domain === 'research') {
-        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn });
+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });
       }
 
       const implementOutcome = await runImplementPass(task, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
-      }, { recordModelCall });
+      }, { recordModelCall, attempt });
       if (implementOutcome.done) return implementOutcome.result;
     }
 
     await runCritiqueAndRevision(task, {
-      maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+      maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt,
     });
 
     concludeDraft(task);
