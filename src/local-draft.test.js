@@ -400,9 +400,15 @@ test('computeImplementBudget gives pipeline_forensics a large implement budget d
   assert.ok(b.implNumPredict <= 16000, 'capped at the whole-document ceiling');
   assert.equal(b.allowEmptyImplement, false, 'an empty forensic report is a failure, not a valid answer');
 
-  // contrast: a normal source with the same tiny plan stays at the 2800 floor
+  // think is disabled for the forensic report -- the prompt's METHOD section already
+  // structures the reasoning into the output, and think:true otherwise spends the whole
+  // num_predict budget on a redundant reasoning trace and emits nothing (live 2026-09-01).
+  assert.equal(b.implNoThink, true);
+
+  // contrast: a normal source with the same tiny plan stays at the 2800 floor, think on
   const normal = computeImplementBudget({ source: 'manual', planResponse: 'QUERY: a\nQUERY: b' }, 'z'.repeat(20000));
   assert.equal(normal.implNumPredict, 2800);
+  assert.equal(normal.implNoThink, false);
 });
 
 test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
