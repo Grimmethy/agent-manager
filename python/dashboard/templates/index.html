@@ -4654,8 +4654,6 @@ function wireBrainDumpCardHandlers(el) {
   el.querySelectorAll('[data-discuss]').forEach((btn) => {
     btn.onclick = () => brainDumpDiscussStart(btn.dataset.discuss);
   });
-  el.querySelectorAll('[id^="bd-discuss-provider-"]').forEach((btn) => wireProviderToggle(btn.id));
-
   el.querySelectorAll('[data-discuss-send]').forEach((btn) => {
     const card = btn.closest('.bd-entry');
     const textarea = card ? card.querySelector('.grill-answer') : null;
@@ -4713,10 +4711,11 @@ function wireBrainDumpCardHandlers(el) {
 // perfectly healthy server -- confirmed live 2026-08-17). A toast surfaces the same
 // "your old discussion is still there" info without blocking anything.
 async function brainDumpDiscussStart(entryId) {
-  // Read the toggle BEFORE any re-render below -- refreshBrainDumpEntries() redraws
-  // this entry's card (including a freshly-defaulted-to-"local" toggle button), so
-  // capturing the chosen provider has to happen first or the choice is lost.
-  const providerBody = providerPayload('bd-discuss-provider-' + entryId);
+  // Brain Dump entries no longer carry a per-entry local/Subscription provider toggle
+  // (removed 2026 -- see the render/wiring sites below). The provider falls back to the
+  // same default the toggle itself defaulted to ("local"); the server's
+  // _discuss_provider_args() also defaults to "local" when no provider is supplied.
+  const providerBody = { provider: 'local' };
   try {
     const existing = await fetchJson('/api/brain-dump/' + encodeURIComponent(entryId) + '/discuss/latest');
     if (existing && existing.status === 'active') {
@@ -4911,7 +4910,6 @@ function renderBrainDumpCard(entry) {
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}" title="Queue this entry for drafting right away instead of waiting on the normal sort/priority order">Process now</button>
           <button class="secondary" data-discuss="${escapeAttr(entry.id)}" title="Start (or resume) an open-ended conversation to add context to this entry before it gets sorted">Discuss</button>
-          ${renderProviderToggle('bd-discuss-provider-' + escapeAttr(entry.id))}
           <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}" title="Copy this entry's raw text to the clipboard">Copy</button>
           <button class="secondary" data-edit="${escapeAttr(entry.id)}" title="Edit this entry's raw text">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}" title="Delete this brain dump entry">Delete</button>
