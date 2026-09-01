@@ -1230,6 +1230,7 @@ const STALENESS_AUDIT_COMPLETENESS_QUESTION = 'Does it contain a genuine three-p
 
 const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: the implement draft is DELIBERATELY an advisory prose report -- a RANKED root-cause analysis of why a class of pipeline tasks keeps failing -- not code or a diff. There is nothing to implement here. Judge it on: (1) does it rank concrete causes and, for each, state a real COUNTERFACTUAL ("if this alone were fixed, the failing case WOULD / WOULD NOT have shipped, because ...")? (2) does it actually CONTRAST the failing tasks with the named winner tasks in the evidence, rather than analysing the failures in isolation? (3) is every cited file a real src/ path from the harness hits or the tier->file map in the evidence -- not an invented module name? (4) is the RECOMMENDED FOLLOW-UP FIX a change to THIS PIPELINE, scoped and with an acceptance check, not a re-attempt of the failed task or a hand-built version of the feature it was trying to build? "NO CLEAR ROOT CAUSE" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a tier did something the draftAttempts/worklog show it did not), it proposes hand-building the failed feature instead of fixing the pipeline, or it asserts a root cause with no counterfactual and no contrast.';
 const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT CAUSE list with a counterfactual per cause, an explicit CONTRAST with the successful sibling tasks, and a RECOMMENDED FOLLOW-UP FIX (or a justified NO CLEAR ROOT CAUSE) -- all grounded in the real evidence and citing real src/ files?';
+const PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE = 'This task implements a human-CONFIRMED pipeline-fix candidate produced by a pipeline_forensics root-cause study (its full ranked report is in the candidate body). The change edits THIS pipeline\'s own src/. Judge it as a normal code change: does the diff actually do what the candidate\'s Solution describes, does it stay within the candidate\'s Files: line, and does it include (or make trivially checkable) the acceptance check the candidate named? Reject a diff that re-implements the ORIGINAL failed feature instead of fixing the pipeline mechanism, that is scoped far wider than the candidate, or that lands with no test/acceptance evidence for a behavioural change. An empty draft is NOT a valid "nothing to do" here -- it means the fix could not be produced.';
 
 // The PLAN section of an adhoc task is drafted blind, before investigation -- this guarantee
 // (never reject over a problem in the PLAN itself) was previously hoisted, unconditionally,
@@ -2038,6 +2039,25 @@ registerTaskSource('backlog_fulfillment', {
   emptyApproval: true, candidateFulfillment: true,
   candidatesPath: () => getConfig().backlogCandidatesPath,
   candidateDocTitle: '# Backlog Candidates',
+});
+
+// pipeline_forensics_fix (2026-09-01) -- consumes the AC-NNN candidates that
+// applyForensicsReport files into Docs/PIPELINE_FIX_CANDIDATES.md, one at a time, into a
+// real src/ diff on a pushed agent/<id> branch (generic Group B apply, like
+// backlog_fulfillment -- no custom `apply`). The candidate's Files: line is always this
+// pipeline's OWN src/..., so the study produces the fix PLAN and this produces the code;
+// neither ever hand-builds the feature the original failed task was chasing. NOT
+// emptyApproval: an empty fix draft means "couldn't produce the fix" -> reject -> retry ->
+// block for a human, not a silent auto-close (same reasoning as observability_fix).
+registerTaskSource('pipeline_forensics_fix', {
+  priority: taskPriority('pipeline_forensics_fix', 64),
+  next: () => nextCandidateFulfillmentTask(getConfig().pipelineFixCandidatesPath, 'pipeline_forensics_fix'),
+  candidateFulfillment: true,
+  candidatesPath: () => getConfig().pipelineFixCandidatesPath,
+  candidateDocTitle: '# Pipeline Fix Candidates',
+  harnessSearch: 'archImport',
+  reportClass: 'benefit',
+  reviewGuidance: PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE,
 });
 
 // function_length_review/fix, observability_review/fix, performance_review/fix -- the
