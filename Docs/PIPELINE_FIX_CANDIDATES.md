@@ -11,6 +11,7 @@ renumber existing blocks (in-flight task-id dedup depends on them).
 
 ### AC-1 · on-demand signature "manual::botched-decompose"
 Strength: Strong
+Signature: manual::botched-decompose
 Files: src/reject-retry-check.js, src/local-tool-client.js
 
 Problem: When the tier-3 agent in `src/local-agentic-write-draft.js` concludes that the requested feature does not exist in the codebase and explicitly asks for human input, the pipeline's block/retry logic in `src/reject-retry-check.js` records this as a generic "exhausted turn budget" block and consumes a retry slot. The shared turn-loop in `src/local-tool-client.js` enforces the hard ceiling without inspecting whether the agent's final message already contains a terminal escalation signal, so a valid "I need a human" conclusion is indistinguishable from "I ran out of time mid-exploration." The result is 2–3 wasted full pipeline runs (each with 3 tiers × 8–20 turns) before the `exhausted: 2/2 retries used` guard finally fires the needs-clarification escalation.
@@ -21,6 +22,7 @@ Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-sign
 
 ### AC-2 · on-demand signature "manual::empty-degenerate-draft"
 Strength: Strong
+Signature: manual::empty-degenerate-draft
 Files: src/local-agentic-write-draft.js, src/local-draft.js
 
 Model confidence: Worth exploring
@@ -32,6 +34,7 @@ Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-sign
 
 ### AC-3 · on-demand signature "manual::no-resolution-line"
 Strength: Strong
+Signature: manual::no-resolution-line
 Files: src/local-tool-client.js, src/local-agentic-write-draft.js
 
 Problem: The multi-turn tool loop in src/local-tool-client.js enforces a hard 20-turn ceiling, and the local-agentic-write tier (src/local-agentic-write-draft.js) inherits that ceiling. When a task's complexity (multi-file investigation + implementation + verification) exceeds what the assigned model can accomplish in 20 turns, the model is still mid-investigation when the budget expires, the final message lacks a RESOLUTION line, and src/reject-retry-check.js blocks the task. Both failing subjects hit this exact wall; both winners avoided it by completing in a single-shot call that never entered the multi-turn loop.

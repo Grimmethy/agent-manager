@@ -2078,7 +2078,19 @@ registerTaskSource('backlog_fulfillment', {
 // block for a human, not a silent auto-close (same reasoning as observability_fix).
 registerTaskSource('pipeline_forensics_fix', {
   priority: taskPriority('pipeline_forensics_fix', 43), // just below pipeline_forensics(44) -- see its comment
-  next: () => nextCandidateFulfillmentTask(getConfig().pipelineFixCandidatesPath, 'pipeline_forensics_fix'),
+  next: () => {
+    const task = nextCandidateFulfillmentTask(getConfig().pipelineFixCandidatesPath, 'pipeline_forensics_fix');
+    // Lift the failure signature out of the AC block so apply-task.js's auto-drain can
+    // requeue the exact tasks this study clustered once the fix lands (blocked-drain.js).
+    // Prefer the explicit `Signature:` line applyForensicsReport now writes; fall back to
+    // the `signature "…"` phrase in the title for candidates filed before that line existed.
+    if (task && task.promptContext) {
+      const body = task.promptContext.body || '';
+      const m = body.match(/^Signature:\s*(.+)$/m) || body.match(/signature\s+"([^"]+)"/i);
+      if (m) task.promptContext.signature = m[1].trim();
+    }
+    return task;
+  },
   candidateFulfillment: true,
   candidatesPath: () => getConfig().pipelineFixCandidatesPath,
   candidateDocTitle: '# Pipeline Fix Candidates',

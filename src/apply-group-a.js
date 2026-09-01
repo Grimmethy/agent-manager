@@ -657,7 +657,12 @@ function applyForensicsReport({ implementResponse, task }) {
     `Full ranked root-cause analysis: forensic task ${task.id}`,
   ].filter((l) => l !== null).join('\n');
 
-  const block = [`### AC-1 · ${title}`, `Strength: Strong`, files ? `Files: ${files}` : '', '', body]
+  // Signature: line -- the pipeline_forensics_fix consumer lifts this into
+  // promptContext.signature so apply-task.js's auto-drain can requeue the exact tasks this
+  // study clustered once the fix lands (blocked-drain.js). task.promptContext.signature is
+  // the same key signatureForClarificationTask derives for those tasks.
+  const sig = (task.promptContext && task.promptContext.signature) || '';
+  const block = [`### AC-1 · ${title}`, `Strength: Strong`, sig ? `Signature: ${sig}` : '', files ? `Files: ${files}` : '', '', body]
     .filter((l) => l !== null).join('\n');
 
   const res = applyArchDiscoveryCandidates({

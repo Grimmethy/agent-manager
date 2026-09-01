@@ -88,3 +88,51 @@ test('requeueBlockedTasksForSignature matches by re-derived signature, not a sto
   const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::refusal-no-changes-needed');
   assert.deepEqual(requeuedIds, ['manual-1']);
 });
+
+// --- pipeline_forensics_fix: sweep needs-clarification/ too, skip design-decision holds,
+//     and don't requeue the same task twice for the same signature (2026-09-01) ---
+
+function writeInState(dir, state, id, task) {
+  const d = path.join(dir, 'queue', state);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, `${id}.json`), JSON.stringify({ id, ...task }));
+}
+
+test('with dirs: [blocked, needs-clarification] it drains a matching task out of needs-clarification/ too', () => {
+  const dir = tempPipelineDir();
+  writeInState(dir, 'needs-clarification', 'adhoc-nc-1', {
+    source: 'manual', domain: 'adhoc', title: 'NC-1',
+    needsClarification: { reason: 'no anchor match' },
+    blockedReason: 'Plan pass degenerate: empty',
+  });
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::empty-degenerate-draft', { dirs: ['blocked', 'needs-clarification'] });
+  assert.deepEqual(requeuedIds, ['adhoc-nc-1']);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 'adhoc-nc-1.json')), false);
+  const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'adhoc-nc-1.json'), 'utf8'));
+  assert.match(pending.history[0].note, /auto-requeued from needs-clarification\//);
+  assert.deepEqual(pending.requeuedForSignatures, ['manual::empty-degenerate-draft']);
+});
+
+test('a design-decision hold is left alone -- no pipeline fix answers a "do you want this feature" question', () => {
+  const dir = tempPipelineDir();
+  writeInState(dir, 'needs-clarification', 'adhoc-dd-1', {
+    source: 'manual', domain: 'adhoc',
+    needsClarification: { reason: 'design-decision' },
+    blockedReason: 'Plan pass degenerate: empty',
+  });
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::empty-degenerate-draft', { dirs: ['blocked', 'needs-clarification'] });
+  assert.deepEqual(requeuedIds, []);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 'adhoc-dd-1.json')), true);
+});
+
+test('a task already auto-requeued for this signature is not requeued again', () => {
+  const dir = tempPipelineDir();
+  writeInState(dir, 'blocked', 'adhoc-again-1', {
+    source: 'manual', domain: 'adhoc',
+    blockedReason: 'Plan pass degenerate: empty',
+    requeuedForSignatures: ['manual::empty-degenerate-draft'],
+  });
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::empty-degenerate-draft', { dirs: ['blocked', 'needs-clarification'] });
+  assert.deepEqual(requeuedIds, []);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'adhoc-again-1.json')), true);
+});
