@@ -1572,7 +1572,8 @@ def api_benchmark_cases():
         return jsonify([])
     try:
         cases = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("case-list: subprocess output was not valid JSON (%s); returning empty list. Raw output (first 500 chars): %r", exc, result.stdout[:500])
         return jsonify([])
 
     stats = _compute_case_stats()
