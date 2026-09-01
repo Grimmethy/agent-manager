@@ -1582,3 +1582,26 @@ In each of the two `catch` blocks, emit a single `console.error` line that names
 
 Benefits:
 An operator running the auto-archive pipeline in a fresh environment (CI, a container with a missing config mount, a host without `git`) will see an immediate, greppable stderr line identifying the exact sub-step and the underlying error, turning a silent "archived 0" mystery into a one-line diagnosis. The once-per-invocation guard keeps the log signal-to-noise ratio acceptable in large batches while still surfacing the first failure. No behavioral change to the predicate's return value means no risk of altering archive decisions.
+
+### AC-92 · Broad catch in candidate-path search swallows non-ENOENT errors silently
+Strength: Strong
+Files: src/staleness-auto-archive.js
+Snippet:
+```
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(srcPath, 'utf8'));
+    } catch {
+      continue; // not here -- try the other dir, or it's genuinely already gone
+    }
+
+```
+
+Problem:
+The search loop's `catch { continue; }` clause is unqualified, so it silently absorbs every `Error` thrown while probing a candidate path — not just the intended `ENOENT` "file not here" case. A permission denial (`EACCES`/`EPERM`), a `JSON.parse` failure on a truncated or corrupt file, or any other unexpected I/O error is swallowed with no log line, no rethrow, and no signal to the caller. If every candidate path hits one of those non-ENOENT conditions, the function returns empty and the operator has zero evidence that anything went wrong, making the failure invisible in production logs.
+
+Solution:
+Inside the existing `catch (err)` block, branch on `err.code === 'ENOENT'`: for that case, keep the current silent `continue` (the file is simply not at this path — logging it would be noise). For every other error, emit a single `console.error` line that includes the candidate path being probed, `err.code`, and `err.message` (e.g. `console.error(\`[staleness-auto-archive] unexpected error probing ${candidatePath}: [${err.code}] ${err.message}\`)`), then `continue` so the loop still tries the remaining candidate paths. No new dependency, no metrics emission — just the project's existing `console.error` primitive with enough context to identify which path and which error class caused the problem.
+
+Benefits:
+An operator scanning `stderr` or the process log can now see, at the moment it happens, that a candidate path failed for a reason other than "not found," including the specific path and error code. This converts an otherwise invisible silent-empty-return into a one-line diagnostic that points directly at the root cause (permission issue, corrupt file, etc.) without adding noise for the common ENOENT case, and without introducing any new dependency or telemetry system the project does not have.
