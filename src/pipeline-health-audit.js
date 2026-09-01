@@ -126,7 +126,9 @@ function tailLogErrorSignatures(logDir, lines = 200) {
   let names;
   try {
     names = fs.readdirSync(logDir).filter((f) => f.endsWith('.log'));
-  } catch {
+  } catch (err) {
+    console.error(`tailLogErrorSignatures: failed to read logDir "${logDir}": ${err.message} (${err.code || 'unknown'})`);
+    findings.push(`logDir "${logDir}" unreadable: ${err.message} (${err.code || 'unknown'})`);
     return findings;
   }
   for (const name of names) {
