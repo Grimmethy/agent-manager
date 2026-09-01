@@ -270,7 +270,12 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
         yield {"type": "final", "session": session}
         return
 
-    session["transcript"].append({"role": "user", "text": message})
+    # 2026-09-01 (Grimmethy: "time stamps to the second programmed into each
+    # thought segment"): capture the turn's wall-clock time so the transcript
+    # render (grillRenderTranscript in index.html) can stamp each segment. Old
+    # persisted entries simply lack the key -- the renderer falls back to no
+    # stamp, so this is safe against existing sessions.
+    session["transcript"].append({"role": "user", "text": message, "timestamp": _now_iso()})
     # In-progress placeholder, rewritten and PERSISTED after every chunk (not just once
     # at the end) -- 2026-08-26, Grimmethy: "It thought a lot and then the chat record
     # just disappeared." Root-caused live: a 30+-minute real investigation was killed
@@ -280,7 +285,7 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     # whatever hadn't streamed yet. Any interruption now loses at most the last unwritten
     # chunk, regardless of cause (a reloader restart, a crash, a dropped connection) --
     # the whole point is not depending on reaching a specific line of code at the end.
-    session["transcript"].append({"role": "assistant", "text": ""})
+    session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso()})
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
 
@@ -323,7 +328,7 @@ def inject_user_message(storage_dir: Path, session_id: str, text: str):
     session = sessions.get(session_id)
     if not session or session.get("status") != "active":
         return None
-    session["transcript"].append({"role": "user", "text": text})
+    session["transcript"].append({"role": "user", "text": text, "timestamp": _now_iso()})
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     return session
