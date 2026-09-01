@@ -61,6 +61,10 @@ function signatureForClarificationTask(task) {
   const joined = haystacks.join(' ').toLowerCase();
   if (/decompose/.test(joined) && /(malformed|did not follow|json)/.test(joined)) return `${source}::botched-decompose`;
   if (/turn budget|made zero edits|without making any edits|out of turns/.test(joined)) return `${source}::turn-budget-exhausted`;
+  // "did not end with a RESOLUTION: line -- cannot determine outcome" -- the agentic pass
+  // ran but never emitted the sentinel. A distinct, common failure (3+ live in
+  // needs-clarification/ 2026-09-01) that none of the buckets above catch.
+  if (/did not end with a resolution|cannot determine outcome|no resolution.{0,3}line/.test(joined)) return `${source}::no-resolution-line`;
   if (task.turnBudgetExhausted === true) return `${source}::turn-budget-exhausted`;
   if (task.retryableDraftBlock === true) return `${source}::retryable-draft-block`;
 

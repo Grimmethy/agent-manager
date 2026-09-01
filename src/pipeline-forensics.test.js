@@ -49,6 +49,16 @@ test('signatureForClarificationTask: turn-budget flag on the task', () => {
   );
 });
 
+test('signatureForClarificationTask: "did not end with a RESOLUTION line" -> no-resolution-line bucket', () => {
+  const task = {
+    source: 'manual',
+    blockedReason: 'Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome',
+    needsClarification: { reason: 'design-decision' },
+    history: [{ stage: 'needs-clarification', detail: 'escalated to a human after exhausting redraft retries' }],
+  };
+  assert.equal(signatureForClarificationTask(task), 'manual::no-resolution-line');
+});
+
 test('signatureForClarificationTask: a genuinely unique clarification -> null', () => {
   const task = {
     source: 'adhoc',
