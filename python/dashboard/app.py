@@ -1981,6 +1981,23 @@ def _parse_json_maybe_fenced(text: str | None):
     return None
 
 
+def _work_log_for(task_id: str) -> dict | None:
+    """The per-task tool-call transcript (src/work-log.js writes queue/worklogs/<id>.json)
+    for a multi-turn agentic draft -- every file read, search run, command executed, and
+    edit made, so the result can be audited before it's approved/merged. None when there
+    is no worklog (non-agentic task, or already pruned after the task reached done/).
+    draftAttempts on the task itself only keeps a stripped summary (tool + arg keys); this
+    is the full detail, lazily loaded only when a task is opened."""
+    qdir = queue_dir()
+    if not qdir:
+        return None
+    p = qdir / "worklogs" / f"{task_id}.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _files_touched_for(task: dict) -> list[str]:
     raw_diff = task.get("rawDiff")
     if raw_diff:
@@ -2061,7 +2078,7 @@ def api_task_detail(state, task_id):
             for candidate in drafting_root.rglob(f"{task_id}.json"):
                 data = read_json_safe(candidate)
                 if data:
-                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
+                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
         abort(404)
 
     if state not in QUEUE_STATES:
@@ -2070,7 +2087,7 @@ def api_task_detail(state, task_id):
     data = read_json_safe(f)
     if not data:
         abort(404)
-    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
+    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
 
 
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
@@ -2473,12 +2490,12 @@ def api_task_anywhere(task_id):
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
+                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
 
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data)})
+            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
 
     abort(404, description=f"task {task_id} not found in any queue state")
 

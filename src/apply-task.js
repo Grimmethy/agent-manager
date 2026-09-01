@@ -519,10 +519,145 @@ function recordApplyOutcome(task, result) {
   return applyStage;
 }
 
+// Apply many directToMain (candidate-doc / *_review triage) tasks under ONE
+// fetch+reset+commit+push instead of one per task. These sources' apply is an additive
+// append to a Docs/*_CANDIDATES.md file that already passed review; committing+pushing each
+// one individually (forced, because an unpushed commit ahead of origin is destroyed by the
+// next apply's resetToMain -- see the commitsDirectlyToMain block in applyTask) turned a
+// 140-task backlog drain into 140 tiny commits pushed to master. Batching keeps the exact
+// same git effect (append + commit + push to main) but as a single commit.
+//
+// Returns { results: { <taskId>: { succeeded, doneMarker?, reason? } }, committed, pushed?, branch? }.
+// A task whose source is NOT directToMain is refused here (results[id].succeeded=false) --
+// the caller must send those through the per-task applyTask path.
+function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner = createRealGitRunner(repoRoot) } = {}) {
+  const results = {};
+  const eligible = [];
+  for (const task of tasks) {
+    const reg = getRegisteredSource(resolveSourceName(task));
+    if (reg && reg.directToMain === true) {
+      eligible.push(task);
+    } else {
+      results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
+    }
+  }
+  if (eligible.length === 0) return { results, committed: false };
+
+  gitRunner.fetchMain();
+  gitRunner.resetToMain();
+
+  const staged = [];
+  for (const task of eligible) {
+    try {
+      const artifact = writeArtifact(task, repoRoot, pipelineDir);
+      if (artifact && artifact.skipped) {
+        results[task.id] = { succeeded: true, doneMarker: artifact.reason };
+        closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+        continue;
+      }
+      const files = artifact.files || [artifact.file];
+      gitRunner.add(files);
+      staged.push({ task, files });
+    } catch (e) {
+      // This task's append threw. Its file may carry a partial trailing line -- cosmetic
+      // in an append-only markdown candidate doc and visible in review; not worth a
+      // resetToMain here (that would discard every sibling's already-good append too).
+      results[task.id] = { succeeded: false, reason: `writeArtifact failed: ${e.message}` };
+    }
+  }
+
+  if (staged.length === 0) return { results, committed: false };
+
+  const msgPath = path.join(require('os').tmpdir(), `apply-batch-msg-${process.pid}.txt`);
+  const commitMessage = [
+    `Triage batch: ${staged.length} candidate-doc update(s)`,
+    '',
+    ...staged.map((s) => `- ${s.task.title} (task ${s.task.id})`),
+    '',
+    coAuthorTrailer(staged[0].task),
+  ].join('\n');
+  fs.writeFileSync(msgPath, commitMessage);
+  try {
+    gitRunner.commit(msgPath);
+  } finally {
+    fs.unlinkSync(msgPath);
+  }
+
+  try {
+    gitRunner.pushMain();
+  } catch (pushErr) {
+    // Same rationale as applyTask's commitsDirectlyToMain push-failure handling: the
+    // commit is real, already-reviewed work; discarding it here recreates the data-loss
+    // this whole path exists to prevent. It stays local and rides out with the next push.
+    for (const s of staged) {
+      results[s.task.id] = { succeeded: false, reason: `triage batch push to main failed after commit (kept local, not rolled back): ${pushErr.message}` };
+    }
+    return { results, committed: true, pushed: false };
+  }
+
+  for (const s of staged) {
+    results[s.task.id] = { succeeded: true, doneMarker: `committed to ${gitRunner.mainBranch} in a ${staged.length}-task triage batch` };
+    closeOriginatingBrainDumpEntry(s.task, brainDumpPath, `Applied in a triage batch -- Task: ${s.task.id}`);
+  }
+  return { results, committed: true, pushed: true, branch: gitRunner.mainBranch };
+}
+
+// node apply-task.js --partition <file...>  -> { direct: [...], other: [...] }
+// Splits approved task files into the directToMain set (batchable by --batch) and the rest
+// (per-task applyTask). A file that can't be read/classified goes to `other` so the normal
+// path reports its failure properly.
+function mainPartition() {
+  const { repoRoot } = getConfig();
+  void repoRoot;
+  const direct = [];
+  const other = [];
+  for (const p of process.argv.slice(3)) {
+    try {
+      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const reg = getRegisteredSource(resolveSourceName(t));
+      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
+    } catch {
+      other.push(p);
+    }
+  }
+  process.stdout.write(JSON.stringify({ direct, other }));
+}
+
+// node apply-task.js --batch <file...>  -> { batch: true, results: [{ taskId, path, succeeded, doneMarker?, reason? }] }
+// Writes each task file back in place (recordApplyOutcome -> status/history) before the
+// caller moves it, exactly like the single-task path.
+function mainBatch() {
+  const { repoRoot, pipelineDir, secondBrainDir, brainDumpPath } = getConfig();
+  const paths = process.argv.slice(3);
+  const loaded = [];
+  const out = [];
+  for (const p of paths) {
+    try {
+      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+      loaded.push({ task: t, path: p });
+    } catch (e) {
+      out.push({ path: p, succeeded: false, reason: `Could not read/parse task JSON: ${e.message}` });
+    }
+  }
+
+  const { results } = applyDirectToMainBatch(loaded.map((l) => l.task), { repoRoot, pipelineDir, secondBrainDir, brainDumpPath });
+
+  for (const { task, path: p } of loaded) {
+    const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
+    recordApplyOutcome(task, r);
+    try { fs.writeFileSync(p, JSON.stringify(task, null, 2)); } catch { /* non-fatal, same as single path */ }
+    out.push({ taskId: task.id, path: p, succeeded: !!r.succeeded, doneMarker: r.doneMarker, reason: r.reason });
+  }
+  process.stdout.write(JSON.stringify({ batch: true, results: out }));
+}
+
 function main() {
+  if (process.argv[2] === '--partition') return mainPartition();
+  if (process.argv[2] === '--batch') return mainBatch();
+
   const taskPath = process.argv[2];
   if (!taskPath) {
-    process.stdout.write(JSON.stringify({ succeeded: false, reason: 'usage: node apply-task.js <task.json>' }));
+    process.stdout.write(JSON.stringify({ succeeded: false, reason: 'usage: node apply-task.js <task.json> | --partition <file...> | --batch <file...>' }));
     return;
   }
 
@@ -559,7 +694,7 @@ function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { applyTask, recordApplyOutcome };
+module.exports = { applyTask, recordApplyOutcome, applyDirectToMainBatch };
 
 if (require.main === module) {
   main();

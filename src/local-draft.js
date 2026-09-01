@@ -45,6 +45,7 @@ const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js
 const {
   beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordTier, finalizeDraftAttempt,
 } = require('./draft-attempt-record.js');
+const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
@@ -465,6 +466,7 @@ async function draftAdhocBranch(task, {
       response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
       toolCallLog: localAgenticResult.toolCallLog,
     });
+    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog });
     if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
       return { succeeded: false, reason: localAgenticResult.reason };
     }
@@ -493,6 +495,7 @@ async function draftAdhocBranch(task, {
     turnsUsed: agenticResult.turnsUsed,
     toolCallLog: agenticResult.toolCallLog,
   });
+  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog });
   if (!agenticResult.succeeded) {
     return { succeeded: false, reason: agenticResult.reason };
   }
@@ -1264,6 +1267,10 @@ async function main() {
     }
     writeTaskJson(taskPath, task);
   }
+  // Housekeeping: drop worklogs for tasks that have left the pre-merge queue (reached
+  // done/ or gone). Cheap, best-effort, and runs on every draft so queue/worklogs/ stays
+  // bounded even when the apply loop (the other prune caller) is disabled.
+  try { pruneWorkLogs(); } catch (_) { /* best-effort */ }
   process.stdout.write(JSON.stringify(result));
 }
 
