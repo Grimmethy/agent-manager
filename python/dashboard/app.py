@@ -99,6 +99,11 @@ def api_ping():
     return jsonify({"app": "agent-manager", "name": socket.gethostname(), "version": "1"})
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 _NEEDS_CLARIFICATION_REASON_TEXT = {
     "no-match": "No matching file found for this change.",
     "ambiguous": "Multiple candidate files found -- needs a human pick.",
@@ -178,8 +183,10 @@ def api_alerts():
             data = json.loads(p.read_text(encoding="utf-8"))
             generated_at = data.get("generatedAt")
             alerts.extend(data.get("alerts") or [])
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Alert feed read failed: %s (%s)", p, exc)
         except Exception:
-            pass  # unreadable feed file -- queue-derived alerts still go out
+            logger.exception("Alert feed read failed unexpectedly: %s", p)
 
     return jsonify({"generatedAt": generated_at, "alerts": alerts})
 
