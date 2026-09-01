@@ -29,7 +29,12 @@ const { runPlanWithTools } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
 
-const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 20;
+// 2026-08-31 (bra-1788142124203): raised 20 -> 35. A real tier-3 run hit the old 20-turn
+// cap having made 13 tool calls -- all read-only orientation, zero edits -- and blocked
+// before it could implement anything. 35 turns is ~9 min at the observed ~15s/turn,
+// comfortably inside dead-process-check.js's 1680s (28 min) zombie threshold. Env
+// override still wins.
+const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 35;
 
 function isEnabled() {
   return process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE !== 'false';
@@ -56,6 +61,7 @@ function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
+    'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Reserve run_bash for the final targeted check on files you actually changed; do not use it to grep, find, cat, or list the tree.',
     '',
     `Title: ${task.title || ''}`,
     '',
@@ -129,6 +135,9 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       source: task.source,
       allowWrite: true,
       primaryRoot: worktreeDir,
+      // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
+      // so resolveAgenticDraft has something to route on instead of a hard block.
+      forceSummaryOnCap: true,
     });
     modelStatsSafe(recordModelCall, {
       taskId: task.id, stage: 'implement', model: localDraftModelLabel(),

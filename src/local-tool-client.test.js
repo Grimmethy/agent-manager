@@ -317,6 +317,34 @@ test('runPlanWithTools force-stops at maxTurns when the model never stops callin
     assert.equal(result.turnsUsed, 2);
     assert.equal(result.response, 'still working', 'returns the last turn\'s content on a forced stop');
     assert.equal(result.toolCallLog.length, 2);
+    assert.equal(result.forcedSummary, undefined, 'no forced summary turn unless the caller opts in');
+  });
+});
+
+test('runPlanWithTools with forceSummaryOnCap spends one extra no-tools turn for a RESOLUTION when the cap is hit', async () => {
+  const toolTurn = { role: 'assistant', content: 'still working', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const summaryTurn = { role: 'assistant', content: 'out of time.\n\nRESOLUTION: needs-human-decision\nwhich approach?' };
+  await withMockedChat([toolTurn, toolTurn, summaryTurn], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2, forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.turnsUsed, 3, 'the forced summary turn counts');
+    assert.match(result.response, /RESOLUTION: needs-human-decision/);
+    // the extra turn asked the model to stop and offered no tools
+    const last = sentBodies[sentBodies.length - 1];
+    assert.deepEqual(last.tools, []);
+    assert.match(last.messages[last.messages.length - 1].content, /out of turns/i);
+  });
+});
+
+test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when the model finishes cleanly before the cap', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+    { role: 'assistant', content: 'RESOLUTION: implemented' },
+  ], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, forceSummaryOnCap: true });
+    assert.equal(result.response, 'RESOLUTION: implemented');
+    assert.equal(result.turnsUsed, 2);
+    assert.equal(result.forcedSummary, undefined);
   });
 });
 

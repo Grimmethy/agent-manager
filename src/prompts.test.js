@@ -363,3 +363,20 @@ test('stalenessAuditImplementPrompt: recommending archive requires a cited commi
   assert.match(prompt, /repeated fabrication or exhausted retries means the PIPELINE could not build it -- that alone is never grounds to archive/);
   assert.match(prompt, /similar NAME that acts on a DIFFERENT object/);
 });
+
+test('adhocPlanPrompt: no seed block when task has no _seedPlan', () => {
+  const { seedPlanBlock } = require('./prompts.js');
+  assert.deepEqual(seedPlanBlock({ promptContext: {} }), []);
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' } });
+  assert.doesNotMatch(prompt, /PRIOR attempt on this exact task/);
+});
+
+test('adhocPlanPrompt: a _seedPlan is embedded as a trailing "improve this" block, after the stable instructions', () => {
+  const seed = '1. step one\n2. step two\n3. step three';
+  const task = { domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' }, _seedPlan: seed };
+  const prompt = buildPlanPrompt(task);
+  assert.match(prompt, /PRIOR attempt on this exact task already produced this plan/);
+  assert.ok(prompt.includes(seed), 'the seed plan text is included verbatim');
+  assert.match(prompt, /do NOT start from scratch/);
+  assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('PRIOR attempt'), 'seed block trails the stable instruction text');
+});

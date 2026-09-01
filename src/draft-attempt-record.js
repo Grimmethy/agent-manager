@@ -37,7 +37,9 @@
 // ({ at, attemptNo, outcome, blockedReason?, planChars, tiers:[{tier,resolution|applied,
 // reason}], collapsed:true }) -- same "keep the signal, drop the bulk" idea as
 // task-history.js's COLLAPSIBLE_REPEAT_STAGES. A degenerate 257-char plan is tiny; a
-// 20-turn tool transcript is not.
+// 20-turn tool transcript is not. Collapse drops plan.text on purpose -- runPlanPass's
+// plan-reuse seed reads task.lastGoodPlan (a top-level field it maintains itself,
+// never collapsed) as its durable source, not these records.
 
 const PLAN_TEXT_CAP = 6000;
 const RESPONSE_TEXT_CAP = 4000;
@@ -99,7 +101,10 @@ function beginDraftAttempt(task) {
 }
 
 // The plan pass produced (or failed to produce) a plan. `info` is one of
-// { text, attempts } or { degenerate, attempts }.
+// { text, attempts } or { degenerate, attempts }, plus optional flags from runPlanPass's
+// substance gate: reRolled (a thin first roll was retried), seededFromPrior (the pass was
+// primed with, or fell back to, a plan a prior attempt produced), thin (recorded a
+// too-short plan on the no-seed block path).
 function recordPlan(attempt, info = {}) {
   if (!attempt) return;
   const plan = {};
@@ -112,6 +117,9 @@ function recordPlan(attempt, info = {}) {
     plan.text = cap(text, PLAN_TEXT_CAP);
   }
   if (info.attempts != null) plan.attempts = info.attempts;
+  if (info.reRolled) plan.reRolled = true;
+  if (info.seededFromPrior) plan.seededFromPrior = true;
+  if (info.thin) plan.thin = true;
   attempt.plan = plan;
 }
 
