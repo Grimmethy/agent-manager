@@ -1753,13 +1753,22 @@ registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_sel
 // pipeline_forensics (2026-09-01) -- the deep, report-producing sibling. advisoryProse:
 // its implement pass writes a ranked root-cause report, never a diff (see
 // pipelineForensicsImplementPrompt). reasoningTier:'low' -- runs on the local model like
-// every other reasoning worker; NOT added to AGENT_MANAGER_CLAUDE_SOURCES. Priority 66,
-// just above pipeline_self_audit: a full study is rarer and higher-value per run. apply
+// every other reasoning worker; NOT added to AGENT_MANAGER_CLAUDE_SOURCES. apply
 // (applyForensicsReport, apply-group-a.js): pass 1 holds the report at awaiting-confirm for
 // a human; pass 2 (after the dashboard stamps forensicsReportConfirmedAt) files the
 // RECOMMENDED FOLLOW-UP FIX as an AC-NNN candidate for pipeline_forensics_fix.
+//
+// Priority 44 -- deliberately ABOVE path_prefetch_resolve (45), which routinely re-attempts
+// the SAME needs-clarification holds a forensic study wants to analyse and would otherwise
+// win the generator's priority race indefinitely (2026-09-01, Grimmethy: "I'm not seeing
+// forensics being queued by the workers. The system is defaulting to observability
+// instead"). Unlike a backlog source, this one physically cannot flood the queue: a study
+// is either human-filed (queue/forensics-requests/) or coverage-gated (one per failure
+// signature forever, or a 21-day cooldown per low-value source), so ranking it high has no
+// crowd-out cost. pipeline_forensics_fix sits just below it so a confirmed fix lands
+// promptly too.
 registerTaskSource('pipeline_forensics', {
-  priority: taskPriority('pipeline_forensics', 66),
+  priority: taskPriority('pipeline_forensics', 44),
   next: nextPipelineForensicsTask,
   apply: applyForensicsReport,
   // pass 2 (post-confirm) appends the RECOMMENDED FOLLOW-UP FIX to
@@ -2068,7 +2077,7 @@ registerTaskSource('backlog_fulfillment', {
 // emptyApproval: an empty fix draft means "couldn't produce the fix" -> reject -> retry ->
 // block for a human, not a silent auto-close (same reasoning as observability_fix).
 registerTaskSource('pipeline_forensics_fix', {
-  priority: taskPriority('pipeline_forensics_fix', 64),
+  priority: taskPriority('pipeline_forensics_fix', 43), // just below pipeline_forensics(44) -- see its comment
   next: () => nextCandidateFulfillmentTask(getConfig().pipelineFixCandidatesPath, 'pipeline_forensics_fix'),
   candidateFulfillment: true,
   candidatesPath: () => getConfig().pipelineFixCandidatesPath,
