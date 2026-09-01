@@ -715,7 +715,9 @@ function schedulePath(instancesDir) {
 function loadSchedule(instancesDir) {
   try {
     return JSON.parse(fs.readFileSync(schedulePath(instancesDir), 'utf8'));
-  } catch {
+  } catch (err) {
+    if (err.code === 'ENOENT') return {};
+    console.warn(`[agent-manager] loadSchedule failed for instancesDir=${instancesDir}: ${err.message}`);
     return {};
   }
 }
