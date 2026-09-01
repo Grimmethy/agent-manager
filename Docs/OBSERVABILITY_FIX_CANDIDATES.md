@@ -1352,3 +1352,26 @@ Add a single `console.warn` line as the first statement inside the existing `cat
 
 Benefits:
 Operators now get a per-vote line in the log stream the moment a single vote hard-fails, showing which vote (index/total) and the underlying error message. In a total-outage scenario where all n votes fail, the log will contain n distinct lines with the same root-cause message, making the diagnosis immediate rather than requiring a code change and redeploy. The quorum semantics are unchanged: one vote failing still does not abort the others, and the caller's success/failure aggregation is untouched.
+
+### AC-82 · Silent catch in projectSearchFetch hides backend failures from operators
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+    let searchResults = [];
+    if (queries.length > 0) {
+      try {
+        searchResults = await projectSearchFetch(queries);
+      } catch (e) {
+        // Non-fatal -- implement proceeds with no results (its own prompt handles an empty
+        // list: "(no results -- the searches returned nothing usable)").
+```
+
+Problem:
+The `catch (e)` block around the `projectSearchFetch` call binds the error to `e` and then discards it entirely — no `console.warn`, no `process.stderr.write`, no rethrow. Because `searchResults` is pre-initialised to `[]` before the `try`, every failure mode (network timeout, 500 from the search backend, an auth-token expiry, a `TypeError` from a regression in the fetch helper) produces the exact same observable state: the downstream prompt receives an empty list and renders "(no results -- the searches returned nothing usable)". An operator investigating a "search never works" ticket has zero runtime trace to distinguish a legitimate zero-hit response from a persistent backend outage or a code regression; the only way to confirm the failure is to add logging after the fact.
+
+Solution:
+Add a single `console.warn` call inside the existing `catch` block that logs a greppable prefix, the function name, and the error message (falling back to the raw value if `e.message` is absent). The control flow is unchanged: `searchResults` remains `[]`, the agent proceeds, and nothing is rethrown. Concretely, the catch body becomes: `console.warn('[local-draft] projectSearchFetch failed, proceeding with no results:', e?.message ?? e);` followed by the existing comment. No new dependency, no metrics emission, no rethrow — only the one `console.warn` that the project's Node code already uses elsewhere.
+
+Benefits:
+Once the warning is in place, any backend outage, auth failure, or regression in `projectSearchFetch` produces a single greppable line (`[local-draft] projectSearchFetch failed`) in the operator's stdout/stderr stream, carrying the specific error message. This lets an on-call engineer immediately distinguish "the search API is down" from "the query legitimately returned zero hits" without attaching a debugger or adding temporary logging. The degrade-to-empty control flow and the agent's user-facing behaviour are completely unchanged, so no downstream prompt logic or test fixtures need modification.
