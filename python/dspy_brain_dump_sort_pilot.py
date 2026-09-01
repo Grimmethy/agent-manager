@@ -22,6 +22,7 @@ same as every other script in this package.
 """
 
 import json
+import logging
 import os
 import random
 import re
@@ -68,7 +69,8 @@ def load_real_examples(pipeline_dir: Path):
     for f in sorted(done_dir.glob("brain-dump-sort-*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            logging.warning("Skipping brain-dump-sort file %s: %s: %s", f, type(e).__name__, e)
             continue
         ctx = data.get("promptContext") or {}
         raw_text = ctx.get("rawText")
