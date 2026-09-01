@@ -1237,3 +1237,26 @@ Replace the bare `catch (e) { return false; }` with a `catch (e) { console.error
 
 Benefits:
 An operator who notices the agent is still running despite `claudePaused: true` in the settings file can now `grep` the process log for `claude-pause:` and immediately see the underlying exception (e.g. `Unexpected token } in JSON at position 42`) instead of having to manually `cat` the file and guess. The fix adds one line, introduces no new dependency, changes no public API, and keeps the function's return-type contract intact.
+
+### AC-77 · Swallowed readdirSync error hides fact-check batch failures
+Strength: Strong
+Files: src/fact-checker.js
+Snippet:
+```
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+```
+
+Problem:
+The `try/catch` wrapping `fs.readdirSync(dir, { withFileTypes: true })` catches every possible error class—`ENOENT`, `EACCES`, `EMFILE`, raw I/O faults—and responds with a bare `return;`, producing `undefined` indistinguishable from a legitimately empty directory. Because the project's only logging primitive is `console.error`/`console.warn` and neither is called here, a transient permission error or fd-exhaustion event leaves zero trace on stderr, in a log file, or in a crash dump. In a fact-checker pipeline the practical effect is that an entire batch of files silently goes unchecked, and the failure is only discovered later when a downstream assertion trips or a user reports a missing check.
+
+Solution:
+Narrow the catch so that only `err.code === 'ENOENT'` is treated as the benign "directory not yet created" case (a plain `return` with a brief comment is sufficient). For every other error code, emit a single `console.error` line that includes the `dir` path and `err.message` (e.g. `` `fact-checker: failed to read directory ${dir}: ${err.message}` ``) before returning. Do not rethrow—the caller has no meaningful recovery path for a directory-read failure and the function's contract is "process what is there, skip what is not." Do not add a metric, counter, or any telemetry primitive; the project has none and the instructions forbid fabricating one.
+
+Benefits:
+Once the fix lands, any non-`ENOENT` failure (mount hiccup, fd exhaustion, permission change) produces a single identifiable line on stderr that an operator or CI log scraper can grep for the directory path and error code, turning a silent batch-skip into a visible, debuggable event. The `ENOENT` path remains a clean no-op, so the common "directory created lazily" case does not generate noise. No new dependency, no new telemetry surface, and the change is a two-line edit inside an existing block.
