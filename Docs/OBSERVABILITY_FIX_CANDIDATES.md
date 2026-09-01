@@ -1559,3 +1559,26 @@ Inside the existing `catch (err)` block, emit a single `console.error` line that
 
 Benefits:
 Once the line is in place, any grep of the job's stderr for `checkCommitClaims failed` immediately surfaces how often and for which reports the predicate is silently no-oping. A systemic misconfiguration (wrong repo root, missing git binary) becomes visible on the first run rather than after days of "why is archiving behaving oddly." The operator can correlate the log timestamp with the report ID to confirm whether the failure is transient or persistent, and the safe `return false` still guarantees no incorrect archive decision is made.
+
+### AC-91 · Silent catch blocks in staleness predicate hide config and git failures
+Strength: Strong
+Files: src/staleness-auto-archive.js
+Snippet:
+```
+  try { ({ repoRoot } = require('./config.js').getConfig()); } catch { return false; }
+  try {
+    return checkCommitClaims(reportText || '', repoRoot).some((c) => c.exists === true);
+  } catch { return false; }
+}
+
+// Same three-part structure stalenessAuditImplementPrompt (prompts.js) asks the model
+```
+
+Problem:
+The staleness predicate in `src/staleness-auto-archive.js` contains two `catch { return false; }` blocks — one around `getConfig()` and one around the git/commit-claim check — that swallow the error entirely and return the fail-safe `false` with zero diagnostic output. Because the project has no metrics or structured-logging dependency, the only observable side-channel is the process's stderr stream, and neither catch writes to it. In a batch run of, say, 200 reports, a missing config file or an absent `git` binary causes every single report to be classified as "not stale," the pipeline logs "processed 200, archived 0," and an operator has no breadcrumb pointing at the root cause. The failure is functionally correct (fail-safe `false`) but operationally invisible.
+
+Solution:
+In each of the two `catch` blocks, emit a single `console.error` line that names the module, the specific sub-step that failed, and the error message, then continue with `return false`. Concretely: the first catch logs `[staleness-auto-archive] Failed to load config; skipping commit-claim check: <err.message>`; the second catch logs `[staleness-auto-archive] Commit-claim check failed for <reportId>: <err.message>`. To avoid flooding stderr in a large batch where the same config error repeats per-report, guard the config-load log with a module-level `let configWarned = false` flag so it prints at most once per process invocation. No new dependency, no metric, no rethrow — the return contract (`false`) is unchanged.
+
+Benefits:
+An operator running the auto-archive pipeline in a fresh environment (CI, a container with a missing config mount, a host without `git`) will see an immediate, greppable stderr line identifying the exact sub-step and the underlying error, turning a silent "archived 0" mystery into a one-line diagnosis. The once-per-invocation guard keeps the log signal-to-noise ratio acceptable in large batches while still surfacing the first failure. No behavioral change to the predicate's return value means no risk of altering archive decisions.
