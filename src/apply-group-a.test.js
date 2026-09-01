@@ -1012,11 +1012,13 @@ test('applyForensicsReport: NO CLEAR ROOT CAUSE -> clean skip, no file written',
   }
 });
 
-test('applyForensicsReport: confirmed pass files an AC candidate with the fix + full report', () => {
+test('applyForensicsReport: confirmed pass files a LEAN, consumable AC candidate (fix spec only, under the 4000-char guard)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
   const doc = path.join(dir, 'PIPELINE_FIX_CANDIDATES.md');
   const prev = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
   process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = doc;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
   for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
   try {
     const r = applyForensicsReport({ implementResponse: REPORT, task: { id: 't', title: 'Pipeline forensics: read_file paging', forensicsReportConfirmedAt: 'now' } });
@@ -1026,11 +1028,17 @@ test('applyForensicsReport: confirmed pass files an AC candidate with the fix + 
     assert.match(text, /### AC-1 · read_file paging/);
     assert.match(text, /Strength: Strong/);
     assert.match(text, /Files: src\/local-tool-client\.js/);
-    assert.match(text, /add offset\/limit params/);        // the Solution
-    assert.match(text, /--- full forensic report ---/);      // the ranked analysis is carried along
-    assert.match(text, /read_file cannot page a large file/);
+    assert.match(text, /add offset\/limit params/);        // the Solution is present
+    assert.match(text, /Full ranked root-cause analysis: forensic task t/);  // pointer, not the whole report
+    assert.doesNotMatch(text, /--- full forensic report ---/);
+    assert.doesNotMatch(text, /CONTRAST WITH SUCCESSFUL SIBLINGS/);
+    // nextCandidateFulfillmentTask (sdk/candidate-fulfillment.js) skips any section over
+    // MAX_ARCH_REVIEW_TASK_CHARS (4000) -- the old full-report body always tripped it.
+    const block = text.slice(text.indexOf('### AC-1'));
+    assert.ok(block.length < 4000, `AC block is ${block.length} chars, must clear the 4000-char consumer guard`);
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH; else process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
     for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
   }
 });
