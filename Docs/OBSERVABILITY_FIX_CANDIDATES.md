@@ -1053,3 +1053,26 @@ Add a module-level `logger = logging.getLogger(__name__)` (stdlib `logging`, alr
 
 Benefits:
 Once fixed, every failure path through `psutil.virtual_memory()` produces a single, greppable `WARNING` line in the application log that includes the exception class, message, and full traceback. An on-call engineer can immediately identify whether the cause is a missing `/proc/meminfo`, a `psutil.AccessDenied` after a kernel hardening change, a segfault in the C extension, or any other regression—and can correlate the timestamp with the dashboard's blank memory fields. The fix costs zero runtime overhead on the happy path (the `except` block is never entered), adds no new dependency, and preserves the existing `None`-return contract so no downstream code changes are required.
+
+### AC-69 · Add debug-level log to silent sensor-read exception handler
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+    except Exception:
+        return None
+
+
+def _cpu_temperature_celsius() -> float | None:
+    try:
+        sensors = psutil.sensors_temperatures()
+```
+
+Problem:
+The hardware-stats helper catches a bare `except Exception` and immediately returns `None` with no diagnostic output. Because the catch is not narrowed to the expected sensor-absence cases (`KeyError`, `OSError`), it also silently absorbs `AttributeError` from a psutil API rename, `PermissionError` on a hardened host where `/sys/class/thermal` is unreadable, or a genuine `TypeError` from a coding bug. In every one of those scenarios the dashboard permanently displays "N/A" for the thermal field and there is zero trace in any log, leaving an operator investigating "why did thermal alerts stop firing?" with nothing to grep for. The project already uses the stdlib `logging` module elsewhere, so the primitive to record the event exists but is simply not invoked on this path.
+
+Solution:
+Import `logging` at module level (or reuse an existing module-level `logger` if one is already present in the file) and, inside the `except Exception` block, emit `logger.debug("Hardware sensor read failed (non-fatal): %s", exc_info=True)` before returning `None`. Use `debug` rather than `warning` or `error` because on a healthy machine without a thermal sensor (VM, Windows, container) this path is the normal, expected outcome and should not pollute production logs; an operator who needs to diagnose a regression can raise the log level. The `exc_info=True` argument captures the full traceback so a systematic breakage (e.g., a psutil upgrade that renamed an internal attribute) is identifiable from the log alone without re-running the code. The return contract is unchanged—still `None`—so the dashboard rendering logic that maps `None` to "N/A" is untouched. No new dependency is introduced; the fix relies solely on the stdlib `logging` module that the project already uses.
+
+Benefits:
+Once the log line is in place, any operator or on-call engineer can raise the log level to DEBUG and immediately see the exact exception type, message, and full traceback for every sensor-read failure, distinguishing a benign "no sensor present" case from a genuine regression or permission issue. The `exc_info` traceback makes it possible to identify a psutil version incompatibility or a coding bug from the log alone, eliminating the need to reproduce the failure in a live environment. Because the severity is `debug`, healthy deployments see no change in log volume, and the fix introduces no new dependency, no new telemetry channel, and no change to the public return contract of the helper.
