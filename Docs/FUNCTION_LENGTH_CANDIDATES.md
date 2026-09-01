@@ -445,3 +445,51 @@ Extract two pure helpers from the body of `nextCandidateFulfillmentTask`. First,
 
 Benefits:
 Each extracted helper can be tested in isolation with focused fixtures — the parser against a battery of malformed-markdown strings, the selector against various queue states and domain mismatches — without mocking the filesystem or constructing a full task-queue harness. Code review diffs become scoped: a change to header-matching rules touches only `parseCandidateSections`, while a change to queue-priority logic touches only `selectNextCandidate`. The orchestrator function drops to roughly 10–15 lines, making its control flow (read → parse → select → return) immediately legible at a glance.
+
+### AC-10 · Decompose applyBrainDumpSort guard-and-classify monolith
+Strength: Strong
+Files: src/apply-group-a.js
+Snippet:
+```
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+
+  const data = loadBrainDump(brainDumpPath);
+
+  const entry = findEntry(data, brainDumpEntryId);
+  if (!entry) {
+    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+  }
+  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
+  // a text change) or otherwise changed since this task was drafted -- classifying stale
+  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
+  // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.status !== 'captured' || entry.rawText !== rawText) {
+    return { skipped: true, reason: 'brain-dump entry changed since this task was drafted -- not applying a stale classification' };
+  }
+
+  const result = parseBrainDumpSortResult(implementResponse);
+  if (!result) {
+    return { skipped: true, reason: 'implement pass did not return a valid classification -- entry left as captured for retry' };
+  }
+  if (!secondBrainDir) {
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir);
+  if (namingError) {
+    return { skipped: true, reason: `rejected secondBrainPath "${result.secondBrainPath}": ${namingError} -- entry left as captured for retry` };
+  }
+
+  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
+```
+
+Problem:
+applyBrainDumpSort packs at least five independent guard/validation checks (entry-existence, entry-staleness, parse-validity, config-presence, path-legality) into a single linear block, each carrying its own domain rationale — the staleness justification alone spans four lines of explanatory comment. A trailing note ("a note can be actionable WITHOUT being a code…") signals that the remaining roughly 170 lines layer on at least one more orthogonal rule (actionable-vs-code classification) before the mechanical write-and-flip tail. The result is a ~200-line function where a reviewer must hold all five preconditions in working memory to evaluate any single change, and where the classification rule is buried between unrelated validation steps, making it invisible to anyone scanning for "where do we decide what counts as actionable?"
+
+Solution:
+Extract three clearly-named helpers from the body of applyBrainDumpSort. First, validateBrainDumpEntry(entry, config) — a pure predicate that returns a discriminated result (ok / stale / unparseable / missing-config / illegal-path) so the five guards live in one place with a single return contract. Second, classifyNoteActionability(parsedEntry) — isolates the "actionable vs. code" domain rule (and any sub-rules the trailing comment foreshadows) into a function whose name states the decision it makes, independent of file I/O. Third, persistAndFlip(entry, classification) — the mechanical write-file-and-update-status tail. applyBrainDumpSort itself then shrinks to a short orchestration: call validate, call classify, call persist, and propagate the result. Each helper is small enough to unit-test in isolation with a handful of fixtures.
+
+Benefits:
+A reviewer changing the staleness window now reads a 15-line predicate instead of hunting through 200 lines for the one `if` that matters. The classification rule becomes independently testable: you can assert "this note is actionable" or "this note is code" without mocking file-system calls or config plumbing. Because each helper has a single responsibility and a named contract, the main function reads as a three-line narrative (validate → classify → persist), which makes the overall flow obvious in code review and gives future contributors a clear insertion point when a sixth guard or a second classification sub-rule appears.
