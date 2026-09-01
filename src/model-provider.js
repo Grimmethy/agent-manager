@@ -74,7 +74,8 @@ function reasoningTierFor(task) {
   let taskTierOverrides;
   try {
     ({ taskTierOverrides } = getConfig());
-  } catch {
+  } catch (err) {
+    console.warn(`[model-provider] Failed to load taskTierOverrides from config; falling back to defaults: ${err.message}`);
     taskTierOverrides = null;
   }
   if (taskTierOverrides && taskTierOverrides[sourceName]) return taskTierOverrides[sourceName];
