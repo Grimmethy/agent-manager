@@ -310,6 +310,25 @@ def get_session(storage_dir: Path, session_id: str):
     return _read_sessions(storage_dir).get(session_id)
 
 
+def inject_user_message(storage_dir: Path, session_id: str, text: str):
+    """Appends `text` as a user turn to an existing active session and persists it --
+    NO model call, NO assistant placeholder. Same {role, text} turn shape stream_message
+    uses when it records the user side of a turn, so the session's transcript is
+    indistinguishable from a normal chat that hasn't received its reply yet. Returns the
+    updated session dict, or None if the session doesn't exist / isn't active. This is
+    what app.py's POST /api/chat/inject endpoint calls so dashboard "Send to chat"
+    buttons (task detail, Brain Dump) can push a task log / brain-dump dump into the
+    conversation for follow-up without triggering a model turn."""
+    sessions = _read_sessions(storage_dir)
+    session = sessions.get(session_id)
+    if not session or session.get("status") != "active":
+        return None
+    session["transcript"].append({"role": "user", "text": text})
+    sessions[session_id] = session
+    _write_sessions(storage_dir, sessions)
+    return session
+
+
 def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     """Just the persisted flag -- app.py's reservation registry owns actually
     acquiring/releasing the lock and the idle-timeout watchdog; this only keeps the
