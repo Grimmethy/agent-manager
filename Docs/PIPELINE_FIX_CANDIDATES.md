@@ -42,3 +42,29 @@ Solution: In src/local-tool-client.js, inject a wrap-up system prompt at ~80% of
 Benefits: Adhoc tasks that need a verification command stop dead-ending at the 20-turn wall; the "did not end with a RESOLUTION line -> exhausted 2/2 retries -> needs-clarification" failure class is eliminated.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-signature-manual-no-resolution-line-1788259625401
+
+### AC-4 · Add WRAP_UP_THRESHOLD and wrap-up prompt injection to the multi-turn loop
+Strength: Strong
+Files: src/local-tool-client.js
+
+Problem:
+runPlanWithTools drives a multi-turn tool-calling loop with a fixed turn budget (ORIENT_TURN_LIMIT is exported and used by callers, and local-agentic-write-draft.js sets LOCAL_AGENTIC_WRITE_MAX_TURNS=35). When the model exhausts its budget still investigating, it never emits the RESOLUTION line that reject-retry-check.js requires, producing the manual::no-resolution-line signature. There is no mechanism inside the loop to tell the model to stop exploring and converge on a final answer before the budget runs out.
+
+Solution:
+(1) Add a WRAP_UP_THRESHOLD constant adjacent to the existing turn-budget constant inside local-tool-client.js, computed as Math.floor(turnBudget * 0.8). (2) Define a wrap-up prompt string that instructs the model to: stop opening new investigation threads, complete any in-progress edit, run the task's declared verification command if any, and emit a final line matching the exact RESOLUTION grammar reject-retry-check.js expects (RESOLUTION: implemented or RESOLUTION: needs-clarification). (3) Inside the multi-turn loop in runPlanWithTools, when the current turn index reaches WRAP_UP_THRESHOLD, append the wrap-up text to the system prompt for that turn and all remaining turns (do not replace the original system prompt). The injection point must respect whether the system prompt is rebuilt each turn or cached.
+
+Benefits:
+The model receives an explicit, timely signal to converge instead of silently hitting the turn cap mid-investigation. The RESOLUTION line is produced within the budget, so reject-retry-check.js passes and the task does not block for a human. The 80% threshold leaves ~20% of turns as a safety margin for the model to actually complete the wrap-up actions.
+
+### AC-5 · Add requiresVerification flag and route verification-required adhoc tasks to the single-shot path
+Strength: Strong
+Files: src/local-agentic-write-draft.js, src/local-tool-client.js
+
+Problem:
+Adhoc tasks that carry a declared verification command (e.g. py_compile, a specific test module) currently enter the same multi-turn qwen loop as all other tier-3 tasks. The local model tends to spend most of its budget on read-only orientation (grep, read_file, list_directory) and never reaches the verification step, so the RESOLUTION line is missing and the task fails. The single-shot /api/generate path in local-client.js (a plain prompt-in, text-out call with no tool loop) is better suited for a focused 'make the edit and run the check' task, but there is no routing condition that sends verification-required tasks there, and no guard preventing a retry from re-entering the single-shot path a second time.
+
+Solution:
+(1) In local-agentic-write-draft.js, where the task object is constructed before it is passed to runPlanWithTools, add a requiresVerification boolean field (true when the caller has declared a verification command). (2) In local-tool-client.js's dispatch/selection logic (the branch that currently sends the local-agentic-write tier into the multi-turn loop), add a condition: if the task is adhoc AND requiresVerification is true AND the task has not already been retried, route it to the existing single-shot call path (the /api/generate path in local-client.js) instead of entering the multi-turn loop. (3) Guard against double-routing: if the single-shot call also fails to produce a RESOLUTION line and reject-retry-check.js fires a retry, the retry must NOT re-enter the single-shot path a second time—fall through to the multi-turn loop or a clean decline instead.
+
+Benefits:
+Verification-required tasks get a focused single-shot attempt where the model can make the edit and run the check in one pass, rather than burning multi-turn budget on investigation. The retry guard prevents an infinite single-shot loop. The multi-turn path remains available for tasks that genuinely need iterative exploration, so no capability is lost.
