@@ -1525,10 +1525,12 @@ function nextPipelineForensicsTask() {
   let coverage;
   try { coverage = JSON.parse(readIfExists(forensicsCoveragePath) || '{}'); } catch { coverage = {}; }
 
-  const finish = (subject, { titleKey, triggerType, coverageKey, signatureFn }) => {
+  const finish = (subject, { titleKey, triggerType, coverageKey, signatureFn, minSubjects = 2 }) => {
     const bundle = buildForensicBundle({ pipelineDir, dbPath, subject, signatureFn });
-    if (bundle.stats.subjectCount < 2 && subject.kind !== 'task') return null; // nothing to contrast
-    if (bundle.stats.subjectCount < 1) return null;
+    // An explicit human request (on-demand) or a single named task runs with one subject;
+    // the auto cluster/low-value triggers want >= 2 so there is genuinely a pattern.
+    const floor = (subject.kind === 'task' || triggerType === 'on-demand') ? 1 : minSubjects;
+    if (bundle.stats.subjectCount < floor) return null;
     const id = `pipeline-forensics-${slugifyForId(String(titleKey)).slice(0, 80)}-${now}`;
     if (taskIdExistsInQueue(id)) return null;
     return {
@@ -1567,7 +1569,15 @@ function nextPipelineForensicsTask() {
         : { kind: 'source', key: req.source };
     const coverageKey = `request::${f.name}`;
     if (coverageEntryActiveLocal(coverage[coverageKey], now)) continue;
-    const task = finish(subject, { titleKey: `on-demand ${subject.kind} "${subject.key}"`, triggerType: 'on-demand', coverageKey });
+    // A signature request most often names a needs-clarification cluster signature, whose
+    // members signatureForTask() cannot re-derive (generic blockedReason). Use the
+    // clarification-aware signature for the subject match, same as the auto cluster path.
+    const task = finish(subject, {
+      titleKey: `on-demand ${subject.kind} "${subject.key}"`,
+      triggerType: 'on-demand',
+      coverageKey,
+      signatureFn: subject.kind === 'signature' ? pipelineForensics.signatureForClarificationTask : undefined,
+    });
     if (task) { task.promptContext._requestFile = f.full; return task; }
   }
 
