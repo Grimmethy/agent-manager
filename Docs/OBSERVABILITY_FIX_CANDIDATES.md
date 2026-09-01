@@ -1076,3 +1076,26 @@ Import `logging` at module level (or reuse an existing module-level `logger` if 
 
 Benefits:
 Once the log line is in place, any operator or on-call engineer can raise the log level to DEBUG and immediately see the exact exception type, message, and full traceback for every sensor-read failure, distinguishing a benign "no sensor present" case from a genuine regression or permission issue. The `exc_info` traceback makes it possible to identify a psutil version incompatibility or a coding bug from the log alone, eliminating the need to reproduce the failure in a live environment. Because the severity is `debug`, healthy deployments see no change in log volume, and the fix introduces no new dependency, no new telemetry channel, and no change to the public return contract of the helper.
+
+### AC-70 · Silent exception swallow in hardware-stats persistence
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+```
+
+Problem:
+The `except Exception: pass` block at line 220 catches every exception raised during the database write (commit, insert, or connection-level failure) and discards it with no log line, no stderr output, and no re-raise. Because the surrounding `finally: conn.close()` confirms a fresh connection is opened each cycle, the code path is expected to execute and succeed; a persistent failure (disk full, revoked credentials, schema drift after a migration, connection-pool exhaustion) would therefore cause every subsequent stats write to fail invisibly. The dashboard would silently show stale or missing hardware data, and an operator would have zero diagnostic signal—no log entry, no traceback, no metric—to distinguish a total outage of the stats pipeline from "no new data yet."
+
+Solution:
+Replace the bare `pass` with a `logger.warning(...)` call using the stdlib `logging` module (already imported or importable in this Python file), passing `exc_info=True` to capture the full exception type and traceback. The log message should identify the operation ("Failed to persist hardware stats") and the cycle context so the operator can correlate it with the periodic collector thread. Do not re-raise: the caller is a best-effort periodic collector that must not crash, so log-and-continue is the correct semantics. No new dependency is introduced; the fix uses only `logging.getLogger(__name__)` and the existing `exc_info` parameter.
+
+Benefits:
+Once fixed, any failure in the stats-write path produces a single WARNING-level log line containing the exception class, message, and full traceback, giving an operator immediate visibility into *what* failed (IntegrityError, OperationalError, disk I/O error) and *where* it originated. The periodic collector continues running, so a transient blip self-recovers on the next cycle, while a persistent fault is immediately visible in the log stream rather than silently accumulating as a growing data gap on the dashboard. No behavioral change is introduced for the success path, and no new dependency or metrics infrastructure is required.
