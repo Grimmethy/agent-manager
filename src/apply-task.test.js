@@ -491,6 +491,32 @@ test('applyDirectToMainBatch: a push failure marks every batched task failed, co
   assert.equal(gitRunner.calls.filter((c) => c.name === 'commit').length, 1);
 });
 
+test('applyDirectToMainBatch: a needsConfirmation result is surfaced (not staged, not committed, not a "failure")', () => {
+  // Regression: a directToMain source (pipeline_forensics) whose apply returns
+  // { succeeded:false, needsConfirmation:true } used to be indistinguishable from a real
+  // failure in the batch path -- apply-task.sh moved it to blocked/ instead of
+  // awaiting-confirm/, so the ranked root-cause report was invisible to the confirm gate.
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('batch_needs_confirm_src')) {
+    registerTaskSource('batch_needs_confirm_src', {
+      priority: 44, next: () => null, advisoryProse: true, directToMain: true,
+      apply: ({ task }) => task.confirmedAt
+        ? { succeeded: true, file: 'Docs/PIPELINE_FIX_CANDIDATES.md', doneMarker: 'filed AC-1' }
+        : { succeeded: false, needsConfirmation: true, reason: 'root-cause report held for a human read' },
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const held = baseTask({ id: 'batch-nc-1', source: 'batch_needs_confirm_src', implementResponse: 'RANKED REPORT' });
+  const ok = batchTriageTask('batch-ok-1');
+  const out = applyDirectToMainBatch([held, ok], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.results['batch-nc-1'].needsConfirmation, true);
+  assert.ok(!out.results['batch-nc-1'].succeeded, 'a hold is not a success (apply-task.sh checks needsConfirmation first)');
+  assert.equal(out.results['batch-ok-1'].succeeded, true, 'the sibling still applies in the same batch');
+  // recordApplyOutcome still routes the held one to awaiting-confirm/
+  assert.equal(recordApplyOutcome(held, out.results['batch-nc-1']), 'awaiting-confirm');
+});
+
 test('applyDirectToMainBatch: empty input does not touch git', () => {
   const gitRunner = createFakeGitRunner();
   const out = applyDirectToMainBatch([], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });

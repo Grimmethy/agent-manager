@@ -648,7 +648,7 @@ function mainPartition() {
   process.stdout.write(JSON.stringify({ direct, other }));
 }
 
-// node apply-task.js --batch <file...>  -> { batch: true, results: [{ taskId, path, succeeded, doneMarker?, reason? }] }
+// node apply-task.js --batch <file...>  -> { batch: true, results: [{ taskId, path, succeeded, needsConfirmation, doneMarker?, reason? }] }
 // Writes each task file back in place (recordApplyOutcome -> status/history) before the
 // caller moves it, exactly like the single-task path.
 function mainBatch() {
@@ -671,7 +671,7 @@ function mainBatch() {
     const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
     recordApplyOutcome(task, r);
     try { fs.writeFileSync(p, JSON.stringify(task, null, 2)); } catch { /* non-fatal, same as single path */ }
-    out.push({ taskId: task.id, path: p, succeeded: !!r.succeeded, doneMarker: r.doneMarker, reason: r.reason });
+    out.push({ taskId: task.id, path: p, succeeded: !!r.succeeded, needsConfirmation: !!r.needsConfirmation, doneMarker: r.doneMarker, reason: r.reason });
   }
   process.stdout.write(JSON.stringify({ batch: true, results: out }));
 }
