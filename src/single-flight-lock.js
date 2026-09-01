@@ -139,7 +139,11 @@ function someoneIsWaiting(instancesDir) {
   try {
     return fs.readdirSync(priorityWaitDirPath(instancesDir)).length > 0;
   } catch (e) {
-    return false; // directory doesn't exist yet -- nobody has ever waited.
+    if (e.code === 'ENOENT') {
+      return false; // directory doesn't exist yet -- nobody has ever waited.
+    }
+    console.error(`[single-flight-lock] someoneIsWaiting: unexpected error reading ${priorityWaitDirPath(instancesDir)}: code=${e.code} message=${e.message}`);
+    throw e;
   }
 }
 
