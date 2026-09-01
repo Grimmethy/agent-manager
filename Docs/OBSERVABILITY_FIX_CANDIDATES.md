@@ -1306,3 +1306,26 @@ Replace the bare `repoRoot = null` assignment in the catch block with a `console
 
 Benefits:
 Once the warning is in place, any unexpected `getConfig()` failure (corrupt file, missing dependency, permission error, internal regression) produces a single identifiable line in stderr that names the module, the failed call, and the error message, giving an operator or CI log scraper enough context to triage without attaching a debugger. The benign "config module intentionally absent" path still proceeds silently to `repoRoot = null` from the caller's perspective, so no behavioural contract changes. The redundant re-assignment is cleaned up, making the intent of the fallback explicit in the code rather than implied by a no-op write.
+
+### AC-80 · Silent catch in local-agentic-draft discards runPlan errors
+Strength: Strong
+Files: src/local-agentic-draft.js
+Snippet:
+```
+  // any result that actually came back (implemented, no-changes-needed, or declined for
+  // lack of a RESOLUTION line -- all three carry a real turnsUsed count worth keeping);
+  // a call that errored out entirely (the catch below) has no result to record.
+  const started = Date.now();
+  let result;
+  try {
+    result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source });
+```
+
+Problem:
+The `catch` block around the `runPlan` call (line 193) swallows the thrown error entirely—no `console.error`, no rethrow, no log line of any kind. The surrounding comment states the design intent ("a call that errored out entirely has no result to record"), which is a valid contract: the caller treats an absent `result` as "no draft produced." However, that same contract is indistinguishable from the legitimate "agent decided no changes were needed" path. A persistent failure in `runPlan`—a bad prompt template, a missing API key, a dependency regression—would cause every task in the pipeline to silently produce no draft, with zero observable signal in logs or stderr. An operator investigating "why are no drafts being generated?" would have no log entry to point them at the root cause.
+
+Solution:
+Inside the existing `catch (err)` block, add a single `console.error` call that includes the task identifier (`task.id ?? task.source`) and the error message (`err?.message ?? String(err)`), prefixed with a `[local-agentic-draft]` tag consistent with any other log lines in the file. Do not rethrow: the caller's contract is best-effort and already handles `result === undefined`. Do not add any metric, counter, or gauge—the project has no telemetry dependency. The fix is one line of logging; control flow is unchanged.
+
+Benefits:
+Once the error is logged, a persistent `runPlan` failure becomes immediately visible in stderr or whatever log collector the operator already uses. The task identifier in the log line lets an operator correlate the failure to a specific task and distinguish "agent declined" (no log, no error) from "agent crashed" (log line with error message). This converts a class of silent, undiagnosable pipeline stalls into a one-line grep-able event, while preserving the existing best-effort control flow that downstream code already depends on.
