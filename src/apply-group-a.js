@@ -603,6 +603,61 @@ function applyVerdictOnly({ implementResponse }) {
   return { skipped: true, reason };
 }
 
+// pipeline_forensics (2026-09-01): the implement pass wrote a RANKED root-cause report
+// (advisoryProse -- no diff). Two passes:
+//  1. First reach here (no task.forensicsReportConfirmedAt): NO CLEAR ROOT CAUSE -> clean
+//     skip; otherwise hold at queue/awaiting-confirm/ so a human reads the analysis before
+//     a pipeline-fix candidate is filed. `needsConfirmation` is the generic, non-source-
+//     name-gated hold apply-task.js already maps to awaiting-confirm/.
+//  2. Second reach (dashboard stamped forensicsReportConfirmedAt, task back in approved/):
+//     extract the RECOMMENDED FOLLOW-UP FIX block and append it -- with the full ranked
+//     report as context -- to Docs/PIPELINE_FIX_CANDIDATES.md as a `### AC-NNN` candidate,
+//     which the pipeline_forensics_fix source then turns into a real src/ diff.
+function applyForensicsReport({ implementResponse, task }) {
+  const { getConfig } = require('./config.js');
+  const text = (implementResponse || '').trim();
+
+  if (/^NO CLEAR ROOT CAUSE\b/m.test(text)) {
+    return { skipped: true, reason: 'forensic study found no clear root cause; nothing filed' };
+  }
+  if (!task || !task.forensicsReportConfirmedAt) {
+    return {
+      succeeded: false,
+      needsConfirmation: true,
+      reason: 'forensic root-cause report -- held in queue/awaiting-confirm/ for human review before a pipeline-fix candidate is filed',
+    };
+  }
+
+  const idx = text.search(/^RECOMMENDED FOLLOW-UP FIX\s*$/m);
+  if (idx === -1) {
+    return { skipped: true, reason: 'confirmed forensic report has no RECOMMENDED FOLLOW-UP FIX section; nothing to file' };
+  }
+  const section = text.slice(idx).replace(/^RECOMMENDED FOLLOW-UP FIX\s*$/m, '').trim();
+  const strength = (section.match(/^Strength:\s*(.+)$/m) || [])[1] || 'Worth exploring';
+  const files = (section.match(/^Files:\s*(.+)$/m) || [])[1] || '';
+  const title = String(task.title || 'pipeline fix').replace(/^Pipeline forensics:\s*/i, '').slice(0, 100);
+
+  // Body carries the full ranked report so the fix pass sees the whole analysis, not just
+  // the one-paragraph Solution.
+  const body = [
+    section.replace(/^Strength:.*$/m, '').replace(/^Files:.*$/m, '').trim(),
+    '',
+    '--- full forensic report ---',
+    text.slice(0, idx).trim(),
+  ].join('\n');
+
+  const block = [`### AC-1 · ${title}`, `Strength: ${strength}`, files ? `Files: ${files}` : '', '', body]
+    .filter((l) => l !== null).join('\n');
+
+  const res = applyArchDiscoveryCandidates({
+    implementResponse: block,
+    candidatesPath: getConfig().pipelineFixCandidatesPath,
+    docTitle: '# Pipeline Fix Candidates',
+  });
+  if (res.skipped) return res;
+  return { succeeded: true, doneMarker: `filed ${(res.candidateIds || []).join(', ')} to ${res.file}` };
+}
+
 // Parses path_prefetch_resolve's implement-pass output -- a single JSON object (see
 // prompts.js's pathPrefetchResolveImplementPrompt for the exact schema):
 //   { "paths": ["..."], "rationale": "...", "confident": true/false }
@@ -789,6 +844,7 @@ module.exports = {
   isEffectivelyEmptyResponse,
   applyBrainDumpSort,
   applyVerdictOnly,
+  applyForensicsReport,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
   applyPathPrefetchResolve,

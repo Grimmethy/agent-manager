@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -974,4 +974,62 @@ test('closeBrainDumpEntryResolved skips cleanly when brainDumpEntryId is missing
 
   const result = closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId: null, note: 'x' });
   assert.equal(result.skipped, true);
+});
+
+// --- applyForensicsReport (pipeline_forensics) -----------------------------------
+
+const REPORT = [
+  'ROOT CAUSE RANKING',
+  '1. read_file cannot page a large file -- Counterfactual: if fixed alone, WOULD have shipped, because the model then sees the pattern. Evidence: src/local-tool-client.js:78. Confidence: high.',
+  '',
+  'CONTRAST WITH SUCCESSFUL SIBLINGS',
+  'The winners edited a small greppable spot; the loser needed a 340-line span it could not read.',
+  '',
+  'RECOMMENDED FOLLOW-UP FIX',
+  'Strength: Strong',
+  'Files: src/local-tool-client.js',
+  'Problem: read_file has no line window.',
+  'Solution: add offset/limit params; acceptance check: a 4000-line file read returns a bounded window with nextOffset.',
+  'Benefits: net-new-code-in-a-large-file adhoc tasks stop dead-ending.',
+].join('\n');
+
+test('applyForensicsReport: first pass holds the report for human confirmation', () => {
+  const r = applyForensicsReport({ implementResponse: REPORT, task: { id: 't', title: 'Pipeline forensics: x' } });
+  assert.equal(r.succeeded, false);
+  assert.equal(r.needsConfirmation, true);
+});
+
+test('applyForensicsReport: NO CLEAR ROOT CAUSE -> clean skip, no file written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH;
+  process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = path.join(dir, 'PFC.md');
+  try {
+    const r = applyForensicsReport({ implementResponse: 'NO CLEAR ROOT CAUSE -- need the worklog for attempt 2', task: { id: 't', forensicsReportConfirmedAt: 'now' } });
+    assert.equal(r.skipped, true);
+    assert.equal(fs.existsSync(path.join(dir, 'PFC.md')), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH; else process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = prev;
+  }
+});
+
+test('applyForensicsReport: confirmed pass files an AC candidate with the fix + full report', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-group-a-test-'));
+  const doc = path.join(dir, 'PIPELINE_FIX_CANDIDATES.md');
+  const prev = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH;
+  process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = doc;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const r = applyForensicsReport({ implementResponse: REPORT, task: { id: 't', title: 'Pipeline forensics: read_file paging', forensicsReportConfirmedAt: 'now' } });
+    assert.equal(r.succeeded, true);
+    const text = fs.readFileSync(doc, 'utf8');
+    assert.match(text, /### AC-1 · read_file paging/);
+    assert.match(text, /Strength: Strong/);
+    assert.match(text, /Files: src\/local-tool-client\.js/);
+    assert.match(text, /add offset\/limit params/);        // the Solution
+    assert.match(text, /--- full forensic report ---/);      // the ranked analysis is carried along
+    assert.match(text, /read_file cannot page a large file/);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH; else process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH = prev;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
 });

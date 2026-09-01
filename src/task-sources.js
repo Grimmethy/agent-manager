@@ -20,7 +20,7 @@ const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
-const { applyArchDiscoveryCandidates } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyForensicsReport } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -1743,12 +1743,14 @@ registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_sel
 // its implement pass writes a ranked root-cause report, never a diff (see
 // pipelineForensicsImplementPrompt). reasoningTier:'low' -- runs on the local model like
 // every other reasoning worker; NOT added to AGENT_MANAGER_CLAUDE_SOURCES. Priority 66,
-// just above pipeline_self_audit: a full study is rarer and higher-value per run. `apply`
-// (applyForensicsReport) is attached in a follow-up PR -- until then it falls through to
-// applyVerdictOnly via advisoryProse.
+// just above pipeline_self_audit: a full study is rarer and higher-value per run. apply
+// (applyForensicsReport, apply-group-a.js): pass 1 holds the report at awaiting-confirm for
+// a human; pass 2 (after the dashboard stamps forensicsReportConfirmedAt) files the
+// RECOMMENDED FOLLOW-UP FIX as an AC-NNN candidate for pipeline_forensics_fix.
 registerTaskSource('pipeline_forensics', {
   priority: taskPriority('pipeline_forensics', 66),
   next: nextPipelineForensicsTask,
+  apply: applyForensicsReport,
   emptyApproval: true,
   advisoryProse: true,
   harnessSearch: 'archImport',

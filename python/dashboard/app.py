@@ -148,6 +148,8 @@ def api_alerts():
                     reason = (data.get("needsClarification") or {}).get("reason")
                     body = _NEEDS_CLARIFICATION_REASON_TEXT.get(
                         reason, "Needs clarification -- see dashboard for details.")
+                elif data.get("source") == "pipeline_forensics":
+                    body = "Forensic root-cause report ready -- review it, then Confirm to file a pipeline-fix candidate."
                 else:
                     body = "A delete-containing change is held for confirmation."
                 alerts.append({
@@ -2166,6 +2168,12 @@ def api_task_confirm_delete(task_id):
 
     now_iso = datetime.now(timezone.utc).isoformat()
     data["deleteConfirmedAt"] = now_iso
+    # pipeline_forensics (2026-09-01): its apply's first pass held the ranked root-cause
+    # report here for a human read. Confirming it stamps forensicsReportConfirmedAt so the
+    # re-run's second pass files the RECOMMENDED FOLLOW-UP FIX as a pipeline-fix candidate
+    # (see applyForensicsReport in src/apply-group-a.js).
+    if data.get("source") == "pipeline_forensics":
+        data["forensicsReportConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)
@@ -5474,6 +5482,7 @@ _SOURCE_TO_DOMAIN_KEY = {
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
     "path_prefetch_resolve": "path_prefetch_resolve", "pipeline_self_audit": "adhoc",
+    "pipeline_forensics": "default", "pipeline_forensics_fix": "default",
     "staleness_audit": "default",
     "product_spec": "default", "product_spec_outline": "default", "product_spec_section": "default",
     "backlog_decomposition": "default", "backlog_fulfillment": "default",
@@ -5527,6 +5536,8 @@ SOURCE_DESCRIPTIONS = {
     "unused_export": "Triages a flagged dead-code candidate (exported symbol with few call sites) as genuine-dead or false-positive. (agent-manager-hygiene plugin.)",
     "pipeline_self_audit": "Deterministically scans queue/blocked/ for a cluster of tasks failing the same way; files an adhoc task asking a Claude agentic pass to find and fix the root cause. Always requires human confirmation.",
     "pipeline_health_audit": "Periodic deterministic check of the pipeline's own health signals; files an advisory when something looks wrong.",
+    "pipeline_forensics": "Deep root-cause study of a class of pipeline tasks that keeps failing: assembles evidence (incl. a contrast set of tasks that succeeded), drafts a ranked root-cause report, holds it for human confirmation, then files a pipeline-fix candidate. Triggered by a needs-clarification cluster, a low-shipped-value task source, or an on-demand request.",
+    "pipeline_forensics_fix": "Turns a confirmed pipeline_forensics fix candidate (Docs/PIPELINE_FIX_CANDIDATES.md) into a real src/ diff on an agent/ branch for manual merge.",
     "ui_visibility_audit": "Checks that pipeline state a human needs is actually surfaced in the dashboard; files an advisory for a gap.",
     "staleness_audit": "Deterministically scans queue/blocked/ and queue/needs-clarification/ for an old or repeatedly-rejected task; files an advisory asking whether the original concern still holds. Never applies anything.",
     "product_spec": "GREENFIELD lane: drafts or updates a concept-only product's spec doc blind on the local model (request text + current spec are the only grounding). A brownfield request goes to product_spec_outline instead.",
