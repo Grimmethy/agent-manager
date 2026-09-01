@@ -228,14 +228,34 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   if (resolution === 'decompose') {
     const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
     const subTasks = parseSubTaskProposals(afterResolution);
-    if (!subTasks || subTasks.length < 2) {
-      // The model reached a conclusion ("this is too big, split it") but botched the
-      // sub-task JSON. A redraft can plausibly fix that (emit valid JSON, or just do the
-      // change directly) -- mark it redraft-eligible so reject-retry-check.js requeues it
-      // once with a format reminder instead of leaving it dead in blocked/.
+    const n = subTasks ? subTasks.length : 0;
+
+    if (n === 0) {
+      // The model reached a conclusion ("this is too big, split it") but produced no
+      // usable sub-task JSON at all. A redraft can plausibly fix that (emit valid JSON,
+      // or just do the change directly) -- redraft-eligible with a format reminder.
       task.retryableDraftBlock = true;
-      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks', ...meta, capturedDiff: bestEffortDiff() };
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
     }
+
+    if (n === 1) {
+      // A "decompose" into exactly ONE sub-task is the model saying "this is atomic" --
+      // usually it just could not commit to editing. Treat the single sub-task as a
+      // sharper re-scope of THIS task and requeue once (reject-retry-check.js swaps in the
+      // sharper rawText). If it decomposes-to-one AGAIN after being re-scoped, that is a
+      // real signal it needs a human -- escalate instead of looping.
+      if (task.rescopedFromDecompose === true) {
+        task.adhocResolution = 'needs-human-decision';
+        task.rawDiff = '';
+        task.implementResponse = `${summary}\n\n(decomposed to a single atomic sub-task twice without implementing it -- needs a human)`;
+        return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+      }
+      task.rescopedFromDecompose = true;
+      task.rescopedRawText = subTasks[0].rawText;
+      task.retryableDraftBlock = true;
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
+    }
+
     task.adhocResolution = resolution;
     task.subTaskProposals = subTasks;
     task.rawDiff = '';

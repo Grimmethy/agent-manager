@@ -199,6 +199,27 @@ test('an adhoc malformed-decompose block is requeued with a decompose-format fee
   assert.doesNotMatch(out.priorRejectionFeedback[0], /made ZERO edits/);
 });
 
+test('an adhoc decompose-into-one re-scope block is requeued with promptContext.rawText swapped in', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-rs', domain: 'adhoc', source: 'manual', retryableDraftBlock: true,
+    rescopedFromDecompose: true, rescopedRawText: 'add POST /api/chat/inject to python/dashboard/app.py',
+    promptContext: { rawText: 'the original broader ask' },
+    blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-rs.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-rs.json'), 'utf8'));
+  assert.equal(out.promptContext.rawText, 'add POST /api/chat/inject to python/dashboard/app.py');
+  assert.equal(out.rescopedFromDecompose, true, 'kept for the escalation cap');
+  assert.equal(out.rescopedRawText, undefined, 'consumed');
+  assert.match(out.priorRejectionFeedback[0], /Do not decompose again/);
+});
+
 test('an adhoc retryable draft block at the retry cap escalates to needs-clarification (honest, after real retries)', () => {
   const d = setupAdhocDirs();
   const task = {
