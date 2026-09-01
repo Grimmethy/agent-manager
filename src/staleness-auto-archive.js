@@ -85,8 +85,10 @@ function archiveOriginalTask(pipelineDir, originalTaskId, stalenessAuditTaskId, 
     let data;
     try {
       data = JSON.parse(fs.readFileSync(srcPath, 'utf8'));
-    } catch {
-      continue; // not here -- try the other dir, or it's genuinely already gone
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue; // not here -- try the other dir, or it's genuinely already gone
+      console.error('[staleness-auto-archive] candidate-path read failed:', srcPath, err.code, err.message);
+      continue;
     }
 
     data.history = Array.isArray(data.history) ? data.history : [];
