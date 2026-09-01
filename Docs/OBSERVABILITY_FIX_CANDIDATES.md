@@ -1605,3 +1605,26 @@ Inside the existing `catch (err)` block, branch on `err.code === 'ENOENT'`: for 
 
 Benefits:
 An operator scanning `stderr` or the process log can now see, at the moment it happens, that a candidate path failed for a reason other than "not found," including the specific path and error code. This converts an otherwise invisible silent-empty-return into a one-line diagnostic that points directly at the root cause (permission issue, corrupt file, etc.) without adding noise for the common ENOENT case, and without introducing any new dependency or telemetry system the project does not have.
+
+### AC-93 · Broad catch in fall-through path swallows error silently
+Strength: Strong
+Files: src/staleness-auto-archive.js
+Snippet:
+```
+  const ncPath = path.join(queueDir, 'needs-clarification', `${originalTaskId}.json`);
+  try {
+    const data = JSON.parse(fs.readFileSync(ncPath, 'utf8'));
+    appendHistoryEvent(data, 'advisory', `staleness_audit ${stalenessAuditTaskId} recommended archive, but with no verifiable resolution signal -- left here for you: ${excerpt.slice(0, 200)}`);
+    fs.writeFileSync(ncPath, JSON.stringify(data, null, 2));
+    return originalTaskId;
+  } catch { /* not in needs-clarification/ -- try blocked/ */ }
+```
+
+Problem:
+The `catch` block that guards the `needs-clarification/` attempt and triggers the fall-through to `blocked/` discards the caught error entirely — no `console.error`, no `console.warn`, no rethrow, no context. The comment `/* not in needs-clarification/ -- try blocked/ */` makes the intent clear (try path A, fall through to path B), but because the error object is dropped on the floor, an operator who later sees an item land in `blocked/` has zero signal about *why* the primary path failed. A transient filesystem hiccup, a permissions issue, or a genuine logic bug all look identical: the item is simply in the wrong folder and nothing in the log explains it.
+
+Solution:
+Inside the existing `catch (err)` block, emit a single `console.error` call (matching the project's Node logging convention) that includes the item identifier being processed, the path that was attempted (`needs-clarification/`), the error message, and the error stack (`err.stack`). Do **not** rethrow: the caller's explicit intent is to fall through to `blocked/`, and rethrowing would break that control flow. Do **not** add a metrics counter or health-signal number — this project has no telemetry system. The one-line log is the entire fix; it preserves the fall-through semantics while making the swallowed failure visible in stdout/stderr.
+
+Benefits:
+Once the error is logged with item context, an operator can correlate a `blocked/` placement with the specific exception that caused the `needs-clarification/` attempt to fail, turning an opaque silent mis-route into a one-line log entry. Debugging time for "why is this ticket in the wrong folder?" drops from a code-reading exercise to a grep, and the fall-through design (which is legitimate) is preserved without modification.
