@@ -1674,3 +1674,26 @@ Replace the bare `except Exception:` body with a `logging.exception("ollama_nati
 
 Benefits:
 Once deployed, any regression in the decode or token-accounting path produces an immediate, greppable WARNING/ERROR line in the application log that names the model, session, and scope, and carries the full traceback. Operators can correlate the failure to a specific Ollama model or session within seconds instead of discovering the silent degradation only when a downstream consumer reports unexpected raw JSON. Developers iterating on the adapter see the exact exception type and stack frame in the log, collapsing the debug cycle from "why is the response raw?" to a single `grep` of the log file. Because no new dependency or metrics endpoint is required, the change is a one-line-plus-context edit that is safe to ship in any environment the project already targets.
+
+### AC-96 · Log silent decode/record degradation in Ollama native adapter
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/ollama_native.py
+Snippet:
+```
+                obj["response"] = eng.decode(raw_txt, sid, scope=scope_hdr)
+                eng.record_output(model, raw_txt, obj["response"], sid, scope=scope_hdr)
+            return JSONResponse(obj, status_code=r.status_code)
+        except Exception:
+            return Response(r.content, r.status_code)
+
+    # -----------------------------------------------------------------
+```
+
+Problem:
+The `except Exception` handler around `eng.decode(...)` and `eng.record_output(...)` swallows every exception and falls back to returning the raw `Response` (bytes + status code) instead of the structured `JSONResponse`. Because the block contains no `logging` call, no re-raise, and no other side-effect, a persistent failure (e.g. a new Ollama model emitting an unexpected JSON shape, a decode-engine regression, a missing `sid` key) causes every subsequent request to silently degrade to raw bytes. Downstream consumers that read `obj["response"]` will break, yet no log line, stack trace, or operator-visible signal is ever produced. In a `vendor/` adapter the exception is especially invisible because it never propagates into the caller's frame.
+
+Solution:
+Inside the existing `except Exception` block, add a single `logging.warning` call (using the module-level `logger = logging.getLogger(__name__)` that the file already establishes, or creating one if absent) that captures: (1) the exception type and message via `exc_info=True`, (2) the model name or request identifier available in the local scope (e.g. `model`, `sid`, or the request path), and (3) a short static message such as `"Ollama native adapter: decode/record failed, falling back to raw response"`. Do **not** re-raise — the caller still receives a valid HTTP response (raw bytes), so changing control flow would break the adapter contract. Do **not** add any metric, counter, or health-signal primitive; the project has no telemetry system. The one `logging.warning` line is the entire fix.
+
+Benefits:
+The moment a decode or record step starts failing, an operator sees a timestamped warning with the exception traceback and the affected model/request identifier in the application log. This converts an invisible, persistent format degradation into a one-line diagnostic that is searchable, attributable, and actionable within seconds of the first bad request, rather than only after a downstream consumer reports a missing `response` field. No new dependency, no new subsystem, no change to the adapter's return contract.
