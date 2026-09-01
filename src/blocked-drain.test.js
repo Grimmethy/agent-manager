@@ -113,16 +113,35 @@ test('with dirs: [blocked, needs-clarification] it drains a matching task out of
   assert.deepEqual(pending.requeuedForSignatures, ['manual::empty-degenerate-draft']);
 });
 
-test('a design-decision hold is left alone -- no pipeline fix answers a "do you want this feature" question', () => {
+test('a GENUINE design-decision hold (RESOLUTION: needs-human-decision, no exhausted event) is left alone', () => {
   const dir = tempPipelineDir();
   writeInState(dir, 'needs-clarification', 'adhoc-dd-1', {
     source: 'manual', domain: 'adhoc',
-    needsClarification: { reason: 'design-decision' },
+    needsClarification: { reason: 'design-decision', openQuestions: 'Which of these two graph layouts do you want?' },
     blockedReason: 'Plan pass degenerate: empty',
+    history: [{ stage: 'implement-done' }, { stage: 'needs-clarification' }],
   });
   const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::empty-degenerate-draft', { dirs: ['blocked', 'needs-clarification'] });
   assert.deepEqual(requeuedIds, []);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 'adhoc-dd-1.json')), true);
+});
+
+test('a design-decision hold that is really an exhausted-retries auto-escalation IS requeued when its fix lands', () => {
+  const dir = tempPipelineDir();
+  writeInState(dir, 'needs-clarification', 'adhoc-dd-exhausted-1', {
+    source: 'manual', domain: 'adhoc',
+    // reject-retry-check.js stamps reason:'design-decision' here too, but always alongside
+    // an 'exhausted' history event -- that is the tell that it's a drafting failure a
+    // signature-scoped fix can now unblock, not a real human question.
+    needsClarification: { reason: 'design-decision', openQuestions: 'The automated handler could not get this past review after 3 attempts:' },
+    blockedReason: 'Plan pass degenerate: empty',
+    history: [{ stage: 'draft-attempt' }, { stage: 'exhausted', detail: '2/2 retries used' }, { stage: 'needs-clarification', detail: 'escalated to a human after exhausting redraft retries' }],
+  });
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'manual::empty-degenerate-draft', { dirs: ['blocked', 'needs-clarification'] });
+  assert.deepEqual(requeuedIds, ['adhoc-dd-exhausted-1']);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 'adhoc-dd-exhausted-1.json')), false);
+  const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'adhoc-dd-exhausted-1.json'), 'utf8'));
+  assert.deepEqual(pending.requeuedForSignatures, ['manual::empty-degenerate-draft']);
 });
 
 test('a task already auto-requeued for this signature is not requeued again', () => {
