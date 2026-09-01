@@ -257,10 +257,10 @@ function classifyVote(markers, minReasoningChars) {
 }
 
 /**
- * The actual review logic, independent of the CLI/stdout wrapper below -- exported so
- * tests can call it directly with a fake localMajorityVote.
+ * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
+ * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -535,6 +535,20 @@ async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domains
   recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
   appendHistoryEvent(task, 'blocked', reason);
   return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+}
+
+// Thin wrapper over runReview: keeps task.status in step with the verdict (and so with the
+// queue directory review-runner.sh moves the file to next -- approved/ or blocked/). Only
+// local-draft.js was ever maintaining task.status ('needs-review'), so every approved task
+// kept that stale value and the dashboard list view -- which reads task.status straight
+// through task_summary() -- showed the whole approved/ backlog as "needs-review". The
+// verdict strings ('approved' / 'blocked') are already exactly the status values we want.
+async function reviewTask(task, opts = {}) {
+  const result = await runReview(task, opts);
+  if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
+    task.status = result.verdict;
+  }
+  return result;
 }
 
 async function main() {
