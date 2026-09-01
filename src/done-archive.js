@@ -63,7 +63,9 @@ function readState(sp) {
   try {
     return JSON.parse(fs.readFileSync(sp, 'utf8'));
   } catch (e) {
-    return {};
+    if (e.code === 'ENOENT') return {};
+    console.error(`[done-archive] read failed at ${sp}: ${e.code || e.name} — ${e.message}`);
+    throw e;
   }
 }
 
