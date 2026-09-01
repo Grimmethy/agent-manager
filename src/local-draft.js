@@ -458,6 +458,10 @@ async function draftAdhocBranch(task, {
   }
 
   let localTierApplied = harnessResult.applied;
+  // Carried from a declined tier 2 into the tier-3 write prompt (see the tier-3 call
+  // below) so tier 3 starts from the read-only pass's map instead of re-orienting from
+  // cold and running out of turns before it edits anything.
+  let priorInvestigation = null;
   if (!localTierApplied) {
     appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
     const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
@@ -469,6 +473,9 @@ async function draftAdhocBranch(task, {
     appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog });
     if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
       return { succeeded: false, reason: localAgenticResult.reason };
+    }
+    if (!localAgenticResult.applied && localAgenticResult.investigationSummary) {
+      priorInvestigation = localAgenticResult.investigationSummary;
     }
     localTierApplied = localAgenticResult.applied;
   }
@@ -484,7 +491,12 @@ async function draftAdhocBranch(task, {
   // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
   // genuine infra error (retry), everything else is terminal.
   appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
+  // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
+  // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
+  // task (same pattern as runPlanPass's task._seedPlan).
+  if (priorInvestigation) task._priorInvestigation = priorInvestigation;
   const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
+  delete task._priorInvestigation;
   recordTier(attempt, {
     tier: 'local-agentic-write',
     resolution: agenticResult.resolution || task.adhocResolution,
