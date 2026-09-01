@@ -751,6 +751,7 @@ test('recordApplyOutcome overwrites a stale blockedStage:"review" with "apply" o
   assert.equal(task.blockedStage, 'apply');
   assert.equal(task.blockedReason, result.reason);
   assert.notEqual(task.blockedStage, 'review', 'reject-retry-check.js\'s isReviewRejection() must not match this');
+  assert.equal(task.status, 'blocked', 'status tracks the queue/blocked/ dir apply-task.sh moves it to');
 });
 
 test('recordApplyOutcome does not touch blockedStage/blockedReason on a successful apply', () => {
@@ -762,6 +763,7 @@ test('recordApplyOutcome does not touch blockedStage/blockedReason on a successf
   assert.equal(stage, 'applied');
   assert.equal(task.blockedStage, undefined);
   assert.equal(task.blockedReason, undefined);
+  assert.equal(task.status, 'done', 'status tracks the queue/done/ dir apply-task.sh moves it to');
 });
 
 test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needsConfirmation hold, and does not stamp blockedStage', () => {
@@ -772,6 +774,7 @@ test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needs
 
   assert.equal(stage, 'awaiting-confirm');
   assert.equal(task.blockedStage, undefined);
+  assert.equal(task.status, 'awaiting-confirm');
 });
 
 // coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script

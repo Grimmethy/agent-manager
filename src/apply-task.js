@@ -510,6 +510,11 @@ function recordApplyOutcome(task, result) {
     task.blockedStage = 'apply';
     task.blockedReason = result.reason;
   }
+  // Keep task.status in step with the queue directory apply-task.sh moves the file to next
+  // (applied -> done/, apply-failed -> blocked/, awaiting-confirm -> awaiting-confirm/) --
+  // same reason review-task.js's main() now does: the dashboard list view reads task.status
+  // straight through, and nothing downstream of local-draft.js was updating it.
+  task.status = { applied: 'done', 'apply-failed': 'blocked', 'awaiting-confirm': 'awaiting-confirm' }[applyStage];
   appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
   return applyStage;
 }
