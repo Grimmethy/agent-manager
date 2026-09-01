@@ -1191,3 +1191,26 @@ Add a single `console.warn` call inside each of the two catch blocks, logging th
 
 Benefits:
 An operator investigating unexpected disk growth or stale refs now has a timestamped, greppable log line identifying exactly which worktree path or branch name failed and why (e.g. "fatal: cannot remove worktree: Directory not empty"). The silent-failure cost no longer compounds silently across a long pipeline session. Debugging "why are there 40 stale worktrees?" drops from a multi-hour forensic exercise to a single `grep "cleanupAdhocWorktree" server.log`. The best-effort semantics are unchanged — the caller still proceeds regardless — so no downstream behavior shifts.
+
+### AC-75 · Log swallowed cleanup errors in draft pipeline teardown
+Strength: Strong
+Files: src/agentic-draft-common.js
+Snippet:
+```
+
+function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+}
+
+// Convenience: prepare -> run -> resolve -> cleanup for one agentic draft. `runInWorktree`
+```
+
+Problem:
+The two `catch` blocks at the end of the prepare → run → resolve → cleanup pipeline (one around `git worktree remove --force`, one around `git branch -D`) are empty — the only content is a `/* best-effort */` comment. If either command fails systematically (corrupted `.git` directory, a permissions change, a missing `git` binary in a container), every subsequent draft cycle silently leaks a worktree directory on disk and a branch in refs, and nothing in the log stream reveals the failure. An operator has no signal to investigate until disk-space exhaustion or ref clutter becomes visible through unrelated means.
+
+Solution:
+In each of the two empty `catch` blocks, replace the bare comment with a `console.error` call that names the operation, the specific resource (worktree path or branch name), and the caught error's message and stack. For example: `console.error(\`[draft-cleanup] git worktree remove failed for ${worktreePath}: ${err.message}\`, err.stack)` and `console.error(\`[draft-cleanup] git branch -D failed for ${branchName}: ${err.message}\`, err.stack)`. Do not rethrow — the main pipeline work is already complete and the caller cannot act on a teardown failure — but do surface the error to stderr so it appears in whatever log capture the operator already has.
+
+Benefits:
+Operators gain an immediate, greppable signal in their existing stderr log stream whenever a worktree or branch cleanup fails, turning a silent, accumulating resource leak into a visible, actionable log line. The fix adds zero new dependencies, changes no control flow, and preserves the correct "best-effort, do not abort" semantics while eliminating the observability gap.
