@@ -4657,7 +4657,7 @@ function renderBrainDumpEditCard(entry) {
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       ${serialBadge ? `<div class="row meta" style="margin-bottom:4px">${serialBadge}</div>` : ''}
       <div class="capture-row" style="margin-bottom:0">
-        <input data-edit-input="${escapeAttr(entry.id)}" value="${escapeAttr(entry.rawText)}">
+        <textarea data-edit-input="${escapeAttr(entry.id)}" rows="4" style="width:100%;white-space:pre-wrap;overflow-wrap:break-word;resize:vertical;">${escapeHtml(entry.rawText)}</textarea>
       </div>
       <div class="row" style="margin-top:8px">
         <span></span>
@@ -4781,8 +4781,8 @@ function wireBrainDumpCardHandlers(el) {
 
   el.querySelectorAll('[data-edit-input]').forEach((input) => {
     input.onkeydown = (e) => {
-      if (e.key === 'Enter') el.querySelector(`[data-save="${CSS.escape(input.dataset.editInput)}"]`).click();
-      if (e.key === 'Escape') el.querySelector(`[data-cancel-edit="${CSS.escape(input.dataset.editInput)}"]`).click();
+      if (e.key === 'Escape') { el.querySelector(`[data-cancel-edit="${CSS.escape(input.dataset.editInput)}"]`).click(); return; }
+      if (e.key === 'Enter' && !e.shiftKey && input.tagName !== 'TEXTAREA') el.querySelector(`[data-save="${CSS.escape(input.dataset.editInput)}"]`).click();
     };
   });
 
