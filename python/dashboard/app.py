@@ -1662,6 +1662,11 @@ def api_benchmark_status():
     try:
         return jsonify(json.loads(progress_path.read_text(encoding="utf-8")))
     except json.JSONDecodeError:
+        logger.warning(
+            "Progress file %s is not valid JSON; reporting status as idle",
+            progress_path,
+            exc_info=True,
+        )
         return jsonify({"status": "idle"})
 
 
