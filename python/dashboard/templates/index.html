@@ -2434,6 +2434,15 @@ function renderTaskDetailModal(task) {
       + `</div>`;
   }
   html += renderForensicsStudyBlock(task);
+  // For advisoryProse sources (pipeline_forensics) the deliverable IS implementResponse --
+  // a root-cause report, not a diff. Rendered dead last under a generic "Implement" label,
+  // it reads as buried; hoist it right below the study framing so the modal leads with the
+  // conclusion. The bottom-of-modal block is then skipped (reportShown).
+  let reportShown = false;
+  if (PROSE_REPORT_SOURCES.has(task.source) && task.implementResponse) {
+    html += `<div class="field-label">Root-Cause Report</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+    reportShown = true;
+  }
   if (task.needsClarification) html += renderClarificationPicker(task);
   // Pipeline History: task.history[] (task-history.js's appendHistoryEvent -- see that
   // module for the schema). Was written correctly the whole time this session but never
@@ -2472,7 +2481,7 @@ function renderTaskDetailModal(task) {
   const emptyImpl = !task.implementResponse && /implement pass degenerate/i.test(task.blockedReason || '');
   if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
   else if (emptyPlan) html += `<div class="field-label">Plan</div><pre class="meta">(the plan pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
-  if (task.implementResponse) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+  if (task.implementResponse && !reportShown) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
   else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   content.innerHTML = html;
   backdrop.classList.add('open');
@@ -2494,6 +2503,9 @@ function renderTaskDetailModal(task) {
 // reopen; a terminal state stops the poll.
 let taskDetailPoll = null;
 const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review']);
+// Sources whose real deliverable is a prose report in implementResponse (advisoryProse),
+// not a diff -- the task modal promotes it to the top under "Root-Cause Report".
+const PROSE_REPORT_SOURCES = new Set(['pipeline_forensics']);
 function stopTaskDetailAutoRefresh() {
   if (taskDetailPoll) { clearInterval(taskDetailPoll); taskDetailPoll = null; }
 }
@@ -3138,7 +3150,7 @@ async function renderJobListTab() {
       <td>${priorityCell}</td>
       <td>${approvalModeCell}</td>
       <td>${workerTypeCell}</td>
-      <td>${j.name}</td>
+      <td><a href="#" class="job-log-link" data-job-log="${escapeAttr(j.name)}" title="Recent runs of this job type">${escapeHtml(j.name)}</a></td>
       <td>${domainByName[j.name] ?? '—'}</td>
       <td>${behaviorCell}</td>
       <td>${liveCell}</td>
@@ -3186,6 +3198,10 @@ async function renderJobListTab() {
     + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
     + unregisteredHtml
     + detailInsetsHtml;
+
+  main.querySelectorAll('.job-log-link').forEach((a) => {
+    a.onclick = (e) => { e.preventDefault(); openJobLog(a.dataset.jobLog); };
+  });
 
   const resetButton = document.getElementById('reset-job-type-counts');
   if (resetButton) {
@@ -3712,6 +3728,43 @@ function openDiscoveryCandidate(id) {
     + `<h2>AC-${String(c.id).padStart(3, '0')} · ${escapeHtml(c.title)}</h2>`
     + `<pre>${escapeHtml(c.content)}</pre>`;
   document.getElementById('modal-backdrop').classList.add('open');
+}
+
+// Job List tab click-through: a source -> its last ~25 runs (any queue state, done, or
+// archived), newest first, each drillable to the task-detail modal. Borrows the shared
+// task-modal DOM like openDiscoveryCandidate; the runs table mirrors the Discovery tab's.
+async function openJobLog(source) {
+  const content = document.getElementById('modal-content');
+  let data;
+  try {
+    data = await fetchJson(`/api/job-log/${encodeURIComponent(source)}`);
+  } catch (e) {
+    alert('Could not load job log: ' + e.message);
+    return;
+  }
+  const stateBadge = (s) => {
+    const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+      : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+    return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+  };
+  const rows = (data.runs || []).map((r) => `
+    <tr class="clickable" data-task-id="${escapeAttr(r.id)}" title="Open this run's task log">
+      <td>${escapeHtml(r.title || r.id)}</td>
+      <td>${stateBadge(r.state)}</td>
+      <td>${r.at ? new Date(r.at).toLocaleString() : ''}</td>
+      <td class="meta">${escapeHtml((r.outcome || '').slice(0, 140))}${(r.outcome || '').length > 140 ? '…' : ''}</td>
+    </tr>`).join('');
+  const body = (data.runs || []).length === 0
+    ? `<div class="empty">No runs of <code>${escapeHtml(source)}</code> in the queue yet.</div>`
+    : `<table><thead><tr><th>Run</th><th>State</th><th>When</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table>`;
+  content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button>`
+    + `<h2>Job Log · ${escapeHtml(source)}</h2>`
+    + `<div class="meta" style="margin-bottom:10px">Showing ${(data.runs || []).length} of ${data.total} run(s), newest first.</div>`
+    + body;
+  document.getElementById('modal-backdrop').classList.add('open');
+  content.querySelectorAll('tr[data-task-id]').forEach((row) => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
 }
 
 // Time Tracking tab (2026-08-19 brain dump: hourly/daily/weekly reports showing
