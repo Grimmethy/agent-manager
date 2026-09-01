@@ -195,7 +195,7 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
       harnessHits = result.hits || [];
       harnessFiles = result.files || [];
     } catch (e) {
-      // Non-fatal -- implement proceeds with no hits (its own prompt handles an empty list).
+      console.warn(`archImportFetch failed, continuing with empty harness data: ${e && e.message ? e.message : e}`);
     }
   }
   task.promptContext.harnessHits = harnessHits;
