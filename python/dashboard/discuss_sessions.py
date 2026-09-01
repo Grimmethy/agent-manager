@@ -141,6 +141,9 @@ def _expand_grep_terms(raw_queries: list) -> list:
     return terms
 
 
+import logging
+
+
 def _maybe_locked(instances_dir):
     """single_flight_lock.held() (the GPU/local-model lock -- see that module's own
     header for why there's only one) when instances_dir is known, a real (no-op)
@@ -198,10 +201,11 @@ def _local_harness_context(subject_text: str, transcript: list, repo_root: str, 
 
     try:
         fetched = grep_fetch_client.fetch_for_queries(_expand_grep_terms(queries), repo_root, grep_dirs)
-    except grep_fetch_client.GrepFetchError:
+    except grep_fetch_client.GrepFetchError as exc:
         # Best-effort -- a broken search must never break the actual conversation turn,
         # same "non-fatal, fall through" treatment local-draft.js's own harness-search
         # branches give a failed archImportFetch() call.
+        logging.warning("grep search failed (non-fatal, continuing without results): %s", exc, exc_info=True)
         return None
 
     files = fetched.get("files") or []
