@@ -57,6 +57,38 @@ function localDraftModelLabel() {
   return process.env.LOCAL_MODEL;
 }
 
+// The blind plan from runPlanPass (task.planResponse), handed to tier 3 as a starting
+// point. WITHOUT the disclaimer, tier 3 previously started cold and burned its whole turn
+// budget re-grepping for targets the plan already named -- but the plan is a no-tool
+// completion (see runPlanPass), so its file paths / line numbers / "already exists" claims
+// are guesses and are frequently stale. The disclaimer keeps the model from trusting them
+// blindly while still giving it a map. Returns '' when there is no plan.
+function blindPlanBlock(task) {
+  const plan = task && typeof task.planResponse === 'string' ? task.planResponse.trim() : '';
+  if (!plan) return '';
+  return [
+    'A PLAN for this task was drafted earlier by a separate pass that could NOT read any files. Use it as a map of intent and rough shape -- but every path, line number, function name and "already exists / does not exist" claim in it is UNVERIFIED. Confirm each against the real code with read_file / grep_codebase before you rely on it; where the plan and the real code disagree, the real code wins.',
+    '',
+    plan,
+    '',
+  ].join('\n');
+}
+
+// The read-only investigation tier 2 already did (task._priorInvestigation, built by
+// draftAdhocBranch from the declined tier-2 result). Tier 2 spends real turns reading files
+// and grepping; without this, tier 3 repeats all of that from scratch and runs out of
+// budget before it edits anything. Returns '' when tier 2 produced nothing worth carrying.
+function priorInvestigationBlock(task) {
+  const inv = task && typeof task._priorInvestigation === 'string' ? task._priorInvestigation.trim() : '';
+  if (!inv) return '';
+  return [
+    'PRIOR INVESTIGATION -- a read-only pass already explored this task. Treat it as a map to build on, NOT as verified conclusions: it did not reach a decision, and its own reads may be incomplete. Start from what it already found rather than re-grepping the tree from scratch, then go make the change.',
+    '',
+    inv,
+    '',
+  ].join('\n');
+}
+
 function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   return [
@@ -68,6 +100,8 @@ function buildWriteAgenticPrompt(task) {
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
     priorRejectionBlock(task),
+    blindPlanBlock(task),
+    priorInvestigationBlock(task),
     'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or decompose/ask, per below).',
     '',
     'If it is NOT already resolved and is a concrete, scoped change you can make confidently: implement it with edit_file / write_file. Read whatever real files you need first -- do not guess at code you have not looked at. Run a targeted check (py_compile / one test module) for what you changed before finishing, and fix any failure your own change introduced.',

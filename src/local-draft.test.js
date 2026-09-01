@@ -180,6 +180,59 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
   });
 });
 
+// 2026-09-01: a declined read-only tier 2 does real exploration; forward its map into
+// tier 3 so tier 3 doesn't re-orient from cold and run out of turns before it edits.
+test('adhoc: a declined tier-2 investigationSummary reaches tier 3 as task._priorInvestigation and is never persisted', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { withLockFn } = spyLock();
+    const task = { id: 'adhoc-fwd', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+    let seenAtTier3;
+
+    const result = await draftTask(task, {
+      localCall: fakeLocalCall('no confident match'),
+      withLockFn,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({
+        applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line',
+        investigationSummary: 'Files already read: python/dashboard/app.py\nSearches that returned NOTHING: "/api/chat/inject" in python',
+      }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        seenAtTier3 = t._priorInvestigation;
+        t.adhocResolution = 'implemented';
+        t.implementResponse = 'RESOLUTION: implemented\ndone';
+        return { succeeded: true, blocked: false };
+      },
+    });
+
+    assert.equal(result.succeeded, true);
+    assert.match(seenAtTier3, /Files already read: python\/dashboard\/app\.py/);
+    assert.equal(task._priorInvestigation, undefined, 'transient -- deleted after tier 3, never persisted');
+  });
+});
+
+test('adhoc: tier 3 gets no _priorInvestigation when tier 2 produced no investigation summary', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { withLockFn } = spyLock();
+    const task = { id: 'adhoc-fwd-none', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+    let seenAtTier3 = 'SENTINEL';
+
+    await draftTask(task, {
+      localCall: fakeLocalCall('no confident match'),
+      withLockFn,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        seenAtTier3 = t._priorInvestigation;
+        t.adhocResolution = 'no-changes-needed';
+        t.implementResponse = 'nothing';
+        return { succeeded: true, blocked: false };
+      },
+    });
+
+    assert.equal(seenAtTier3, undefined);
+  });
+});
+
 test('adhoc: every tier lock-cycle is fully closed before the next tier runs (no nesting)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();

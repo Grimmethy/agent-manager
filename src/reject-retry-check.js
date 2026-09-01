@@ -108,7 +108,15 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // that happens to still carry localVotes from an earlier, unrelated successful
       // review (redrafting can't fix that; see agent-manager-common.sh's
       // test_review_rejection, the bash equivalent of this exact check).
-      if (!isReviewRejection(task)) continue;
+      //
+      // 2026-09-01: also eligible -- an adhoc tier-3 run that exhausted its turn budget
+      // without making a single edit (resolveAgenticDraft sets task.turnBudgetExhausted).
+      // The redraft is NOT blind for this case: the plan and the tier-2 investigation are
+      // now folded into the tier-3 prompt, and the feedback line below tells it to edit
+      // early. Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the
+      // same adhoc -> needs-clarification escalation as a stuck review rejection.
+      const turnBudgetBlocked = isAdhocTask(task) && task.turnBudgetExhausted === true;
+      if (!isReviewRejection(task) && !turnBudgetBlocked) continue;
 
       const retryCount = Number(task.localRejectCount) || 0;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
@@ -149,7 +157,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       }
 
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-      priorFeedback.push(String(task.blockedReason || ''));
+      if (turnBudgetBlocked) {
+        priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
+        delete task.turnBudgetExhausted;
+      } else {
+        priorFeedback.push(String(task.blockedReason || ''));
+      }
       task.priorRejectionFeedback = priorFeedback;
       task.localRejectCount = retryCount + 1;
 

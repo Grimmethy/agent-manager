@@ -183,3 +183,40 @@ test('buildLocalAgenticPrompt carries the extend-vs-done coverage framing', () =
   assert.match(p, /Enumerate every concrete object the request names/i);
   assert.match(p, /Already covered:/);
 });
+
+// --- summariseInvestigation: the map a declined read-only tier-2 hands forward to tier 3 ---
+
+test('summariseInvestigation maps a declined tier-2 transcript into a compact block', () => {
+  const { summariseInvestigation } = require('./local-agentic-draft.js');
+  const log = [
+    { tool: 'read_file', args: { path: 'python/dashboard/app.py' }, result: { path: 'python/dashboard/app.py', content: 'x'.repeat(500) } },
+    { tool: 'read_file', args: { path: 'python/dashboard/chat_sessions.py' }, result: { content: 'y' } },
+    { tool: 'grep_codebase', args: { query: '/api/chat/inject', dir: 'python' }, result: [] },
+    { tool: 'grep_codebase', args: { query: 'api/chat', dir: 'python' }, result: [{ file: 'a', line: 1, text: 'z' }, { file: 'b', line: 2, text: 'z' }] },
+    { tool: 'grep_codebase', args: { query: 'start_new_conversation', dir: 'python' }, result: [] },
+  ];
+  const s = summariseInvestigation('It looked but never concluded. The chat backend is in app.py.', log);
+  assert.match(s, /Files already read: python\/dashboard\/app\.py, python\/dashboard\/chat_sessions\.py/);
+  assert.match(s, /found something: "api\/chat" in python -> 2 hit\(s\)/);
+  assert.match(s, /returned NOTHING[^\n]*"\/api\/chat\/inject" in python[^\n]*"start_new_conversation" in python/);
+  assert.match(s, /never concluded/);
+});
+
+test('summariseInvestigation caps a long response and surfaces a read_file error', () => {
+  const { summariseInvestigation } = require('./local-agentic-draft.js');
+  const s = summariseInvestigation('w'.repeat(5000), [
+    { tool: 'read_file', args: { path: 'x.js' }, result: { content: 'x' } },
+    { tool: 'read_file', args: { path: 'gone.js' }, result: { error: 'could not read gone.js: ENOENT' } },
+  ]);
+  assert.ok(s.length < 2500, `expected a capped block, got ${s.length} chars`);
+  assert.match(s, /\[truncated\]/);
+  assert.match(s, /Files already read: x\.js/);
+  assert.match(s, /Tool errors it hit: read_file gone\.js/);
+});
+
+test('summariseInvestigation returns empty when there is nothing worth carrying', () => {
+  const { summariseInvestigation } = require('./local-agentic-draft.js');
+  assert.equal(summariseInvestigation('', []), '');
+  assert.equal(summariseInvestigation('short note', []), '');
+  assert.equal(summariseInvestigation('', [{ tool: 'list_directory', args: { path: '.' }, result: { entries: [] } }]), '');
+});

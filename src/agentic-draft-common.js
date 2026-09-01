@@ -145,6 +145,11 @@ async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repo
 // diff. `retriedForTurnBudget` only tunes the "did not end with RESOLUTION" note.
 function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
   const summary = (result && result.response) || '';
+  // Cleared on every outcome; set true again below only for the specific "ran the whole
+  // turn budget, made zero edits, produced no diff" case, which reject-retry-check.js
+  // requeues (with the plan + prior-investigation grounding) instead of dead-ending in
+  // needs-clarification. A stale true from an earlier attempt must not survive a later one.
+  task.turnBudgetExhausted = false;
   // draft-attempt-record.js: the caller records this tier's real output, tool activity,
   // and -- on a NON-clean outcome (degenerate / no RESOLUTION line / bad decompose) where
   // resolveAgenticDraft otherwise stages nothing -- whatever the model left in the
@@ -183,11 +188,31 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     // transcript and whatever partial work landed in the worktree -- the same terminal
     // shape a real RESOLUTION: needs-human-decision produces.
     if (result && result.forcedSummary) {
+      const capturedDiff = bestEffortDiff();
+      const edits = ((result && result.toolCallLog) || [])
+        .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+      // The failure class this whole grounding change targets: the model spent its entire
+      // turn budget exploring and never edited a single file (no edit/write calls, empty
+      // worktree). A hardcoded "needs-human-decision" placeholder is neither a real
+      // question nor a retryable state -- record a clean, honest block that
+      // reject-retry-check.js can requeue once with the plan + prior-investigation map.
+      if (edits === 0 && !capturedDiff) {
+        task.turnBudgetExhausted = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
+          ...meta,
+          capturedDiff: undefined,
+        };
+      }
+      // Otherwise the model got somewhere (partial work in the worktree, or the forced
+      // summary produced real content) -- keep the existing human-clarification path.
       task.adhocResolution = 'needs-human-decision';
       task.rawDiff = '';
       task.implementResponse = summary
         || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
-      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff: bestEffortDiff() };
+      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
     }
     const budgetNote = retriedForTurnBudget
       ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'

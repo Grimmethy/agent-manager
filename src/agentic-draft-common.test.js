@@ -141,6 +141,53 @@ test('resolveAgenticDraft: no RESOLUTION line but result.forcedSummary -> needsC
   });
 });
 
+test('resolveAgenticDraft: forcedSummary + zero edits + empty worktree -> clean retryable BLOCK with turnBudgetExhausted, not a fake needs-human-decision', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't4d' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: '', forcedSummary: true, turnsUsed: 35,
+        toolCallLog: [{ tool: 'grep_codebase' }, { tool: 'read_file' }, { tool: 'run_bash' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.succeeded, true);
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /without making any edits/);
+    assert.ok(!out.needsClarification);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.adhocResolution, undefined, 'no fake needs-human-decision');
+    assert.equal(task.implementResponse, undefined, 'no placeholder string written');
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary + an edit_file call keeps the needs-human-decision path even with an empty worktree', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't4e' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'I edited but then ran out of budget', forcedSummary: true, turnsUsed: 35,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.equal(task.turnBudgetExhausted, false);
+  });
+});
+
+test('resolveAgenticDraft: turnBudgetExhausted is cleared on a normal implemented outcome', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'changed\n');
+    const task = { id: 't4f', turnBudgetExhausted: true };
+    resolveAgenticDraft(task, { result: { response: 'RESOLUTION: implemented\ndone' }, worktreeDir: wt });
+    assert.equal(task.turnBudgetExhausted, false);
+    assert.equal(task.adhocResolution, 'implemented');
+  });
+});
+
 test('resolveAgenticDraft: forcedSummary that DID reach a RESOLUTION is parsed normally', () => {
   withRealRepo((wt) => {
     const task = { id: 't4c' };
