@@ -984,3 +984,26 @@ Add a single `logging.warning("grep search failed (non-fatal, continuing without
 
 Benefits:
 Any future occurrence of a `GrepFetchError` produces a single, greppable warning line in the application log that names the exception type, carries its message, and includes the full stack trace. On-call or debugging sessions can immediately distinguish "search infrastructure failed" from "no matches in the repo," eliminating a class of silent-missing-data incidents that currently require code-reading to even suspect. The fix is one line, introduces no new dependency, and does not alter any control-flow or API contract.
+
+### AC-66 · Log `JSONDecodeError` instead of silently swallowing corrupt session data
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+Snippet:
+```
+        return {}
+    try:
+        sessions = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    # One-time migration: sessions written before 2026-08-16 (brain-dump-only, this
+    # module's original scope) used "entryId" -- renamed to the generic "subjectId" once
+```
+
+Problem:
+The `except (OSError, json.JSONDecodeError)` clause lumps two fundamentally different failure modes into the same silent `return {}`. A `FileNotFoundError` (a subset of `OSError`) means the optional sessions file was never created, and an empty dict is the correct "no data" response. But a `json.JSONDecodeError` means the file *exists* and its contents are malformed—typically a partial write after a crash, a disk-level glitch, or a manual edit that broke the JSON. Collapsing that into `{}` is indistinguishable from "the user has zero sessions," so an operator or the end-user sees an empty dashboard and assumes the data was always absent, delaying diagnosis of genuine data corruption.
+
+Solution:
+Split the `except` clause into two. Keep `except OSError: return {}` for the legitimate file-absent case. Add a separate `except json.JSONDecodeError as exc:` branch that calls `logging.getLogger(__name__).warning("Corrupt sessions file %s: %s", p, exc)` (using the stdlib `logging` module already available in this Python codebase), then still `return {}` so the dashboard degrades gracefully rather than crashing the page. The log line carries the resolved file path and the decoder's offset/message, giving an operator enough to locate and inspect the bad file without needing to add any new dependency or metrics system the project does not have.
+
+Benefits:
+Operators and users can now distinguish "no sessions file" from "sessions file is corrupt" in the application log, turning a silent data-loss symptom into a one-line, greppable warning that points directly at the offending path. The dashboard still renders (graceful degradation is preserved), but the corruption is no longer invisible, which shortens the time-to-diagnose for partial-write or disk-integrity incidents and prevents the confusing "my sessions vanished" support ticket.
