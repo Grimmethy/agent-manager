@@ -82,22 +82,27 @@ test('appendTierWorkLog is a no-op for an empty / missing tool log and never thr
   assert.equal(fs.existsSync(worklogPath('wl-4', PIPELINE_DIR)), false);
 });
 
-test('pruneWorkLogs deletes logs for tasks that have left the pre-merge queue, keeps live ones', () => {
-  for (const id of ['live-pending', 'live-approved', 'gone', 'done-task']) {
+test('pruneWorkLogs keeps logs for live + done/ tasks, deletes gone + archived ones', () => {
+  for (const id of ['live-pending', 'live-approved', 'gone', 'done-task', 'archived-task', 'no-action-task']) {
     appendTierWorkLog({ id }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
   }
   fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'pending'), { recursive: true });
   fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'approved'), { recursive: true });
-  fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'done'), { recursive: true });
+  fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'done', '_archived', '2026-09'), { recursive: true });
+  fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'done', '_archived_no_action'), { recursive: true });
   fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'pending', 'live-pending.json'), '{}');
   fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'approved', 'live-approved.json'), '{}');
   fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'done', 'done-task.json'), '{}');
+  fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'done', '_archived', '2026-09', 'archived-task.json'), '{}');
+  fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'done', '_archived_no_action', 'no-action-task.json'), '{}');
 
   const { pruned } = pruneWorkLogs(PIPELINE_DIR);
 
-  assert.equal(pruned, 2, 'gone (nowhere) and done-task (in done/) are pruned');
+  assert.equal(pruned, 3, 'gone, archived-task (rotated to _archived/<month>/), and no-action-task are pruned');
   assert.ok(readWorkLog('live-pending', PIPELINE_DIR));
   assert.ok(readWorkLog('live-approved', PIPELINE_DIR));
+  assert.ok(readWorkLog('done-task', PIPELINE_DIR), 'a task still in queue/done/ top-level keeps its worklog');
   assert.equal(readWorkLog('gone', PIPELINE_DIR), null);
-  assert.equal(readWorkLog('done-task', PIPELINE_DIR), null);
+  assert.equal(readWorkLog('archived-task', PIPELINE_DIR), null);
+  assert.equal(readWorkLog('no-action-task', PIPELINE_DIR), null);
 });

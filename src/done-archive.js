@@ -30,6 +30,12 @@
 // back-date a bucket to a task's own (possibly much older, if this pass was ever paused)
 // completion time.
 //
+// Side effect for work-log.js: a task's worklog (queue/worklogs/<id>.json) is kept as long
+// as the task file is in queue/done/ top-level (LIVE_QUEUE_DIRS includes 'done'). Once THIS
+// pass moves the task into _archived/<YYYY-MM>/, work-log.js's taskIsLive() stops seeing it
+// and the next pruneWorkLogs() pass deletes the worklog -- so this retention window doubles
+// as the done-task worklog retention window. No separate worklog timer exists.
+//
 // mtime is the retention signal, not a field parsed out of the task JSON itself -- checked
 // live against real done/ tasks before picking: every task's file mtime already reflects
 // "when did this task's processing last write," and a done/ task is terminal (nothing ever
