@@ -1021,6 +1021,7 @@ test('applyForensicsReport: confirmed pass files an AC candidate with the fix + 
   try {
     const r = applyForensicsReport({ implementResponse: REPORT, task: { id: 't', title: 'Pipeline forensics: read_file paging', forensicsReportConfirmedAt: 'now' } });
     assert.equal(r.succeeded, true);
+    assert.equal(r.file, doc, 'returns the candidates-doc path so apply-task.js can stage it (not undefined)');
     const text = fs.readFileSync(doc, 'utf8');
     assert.match(text, /### AC-1 · read_file paging/);
     assert.match(text, /Strength: Strong/);
