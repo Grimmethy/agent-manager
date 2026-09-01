@@ -846,6 +846,88 @@ function stalenessAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// pipeline_forensics (2026-09-01) -- deep root-cause study of why a class of pipeline
+// tasks keeps failing. Two-call harness shape like stalenessAudit*: the plan pass proposes
+// greps to locate the implicated pipeline code, the harness runs them against this repo's
+// OWN src/, and the implement pass writes a RANKED prose report (no diff -- advisoryProse).
+// The forensic evidence bundle (forensic-bundle.js) is already in ctx.evidenceText, incl.
+// a contrast set of tasks that SUCCEEDED.
+function pipelineForensicsPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'A deterministic scan assembled the forensic evidence below about a class of pipeline tasks that keep FAILING. Your eventual job is to rank the root causes and recommend ONE pipeline fix -- but first, locate the real code.',
+    '',
+    `Subject: ${ctx.subjectKind || '?'} "${ctx.subjectKey || '?'}"  (signature: ${ctx.signature || '?'})`,
+    '',
+    ctx.evidenceText || '(no evidence text)',
+    '',
+    'Propose 1 to 3 SHORT search terms (a function name, a file name, a config key, or a few-word phrase) that would let you read the CURRENT code of the pipeline paths implicated above -- use the TIER -> SOURCE FILE map in the evidence to pick real targets (e.g. the tier where the failing tasks died, the tool the winners used that the losers did not).',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function pipelineForensicsImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing new in this repo; work from the draftAttempts evidence)';
+  const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+
+  const stable = [
+    'You are running a pipeline FORENSIC STUDY: figuring out why a class of agent-manager tasks keeps failing, so the PIPELINE can be fixed. This is analysis, not a code change -- output prose, never a diff.',
+    '',
+    'METHOD -- follow it exactly:',
+    '1. Rank the candidate ROOT CAUSES by COUNTERFACTUAL impact. For each cause, state plainly: "if this cause alone were fixed, the failing case WOULD / WOULD NOT have gone through, because <reason grounded in the evidence>."',
+    '2. CONTRAST the failing tasks with the WINNER tasks named in the evidence (same task source / same decomposition parent, but they succeeded). What did the winners do -- which tier reached, which tool called, at which turn -- that the failing tasks did not? The divergence point is usually the root cause.',
+    '3. Cite REAL files: every file you name must be a real src/... path from the harness matches below or the "TIER -> SOURCE FILE" map in the evidence. Never invent a module or symbol name.',
+    '4. The deliverable is a fix to THIS PIPELINE\'s code. NOT a re-attempt of the failed task. NOT a hand-built version of the feature the failed task was trying to build.',
+    '',
+    'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CLEAR ROOT CAUSE" if the evidence genuinely does not support one:',
+    '',
+    'ROOT CAUSE RANKING',
+    '1. <cause> -- Counterfactual: if fixed alone, WOULD / WOULD NOT have shipped, because <...>. Evidence: <src/file:line, draftAttempt tier X response, worklog call N>. Confidence: high|med|low.',
+    '2. <cause> -- ...',
+    '',
+    'CONTRAST WITH SUCCESSFUL SIBLINGS',
+    '<one short paragraph: what the winners did that the losers did not, and where their paths diverge>',
+    '',
+    'RECOMMENDED FOLLOW-UP FIX',
+    'Strength: Strong | Worth exploring',
+    'Files: src/<file>, ...',
+    'Problem: <the ranked analysis, condensed to 2-4 sentences>',
+    'Solution: <one concrete, safely-scoped change to the named files + a specific acceptance check that would prove it worked>',
+    'Benefits: <what class of task stops failing>',
+    '',
+    'If instead the evidence does not support a confident root cause, output ONLY:',
+    'NO CLEAR ROOT CAUSE -- <the one additional signal that would be needed>',
+  ];
+  const volatile = [
+    'Earlier you proposed search terms to locate the implicated pipeline code:',
+    '',
+    planText,
+    '',
+    'FORENSIC EVIDENCE:',
+    ctx.evidenceText || '(none)',
+    '',
+    `Failing tasks: ${(ctx.loserIds || []).join(', ') || '(see evidence)'}`,
+    `Successful sibling tasks to contrast against: ${(ctx.winnerIds || []).join(', ') || '(see evidence)'}`,
+    '',
+    'The harness ran your searches against THIS repo\'s CURRENT src/. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+  ];
+  return assemblePrompt(stable, volatile);
+}
+
 // adhoc harness-search tier (2026-08-22, Grimmethy: "expand the tooling capabilities so
 // that the local reasoning model can handle the work... I'd like to see the automated
 // work being handled entirely locally"): a FIRST, cheap attempt at an adhoc-domain task
@@ -1362,6 +1444,7 @@ updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlan
 updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAuditPlanPrompt, buildImplementPrompt: pipelineHealthAuditImplementPrompt });
 updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
+updateTaskSource('pipeline_forensics', { buildPlanPrompt: pipelineForensicsPlanPrompt, buildImplementPrompt: pipelineForensicsImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('product_spec_outline', { buildPlanPrompt: productSpecOutlinePlanPrompt, buildImplementPrompt: productSpecOutlineImplementPrompt });
 updateTaskSource('product_spec_section', { buildPlanPrompt: productSpecSectionPlanPrompt, buildImplementPrompt: productSpecSectionImplementPrompt });
@@ -1472,6 +1555,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock,
+  pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
   // Bodies stay here; archReview{Plan,Implement}Prompt also stay wired below for core
