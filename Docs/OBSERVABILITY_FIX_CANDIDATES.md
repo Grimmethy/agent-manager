@@ -370,3 +370,26 @@ Narrow the primary catch to the two exception families the comment actually anti
 
 Benefits:
 Operators can now distinguish "fewer alerts today" from "feed file has been unreadable for three days" by grepping the dashboard log for the warning line, and any genuine programming error in the feed-parsing path produces a full traceback instead of vanishing. The graceful-degradation contract (never 500 the whole dashboard because one optional feed is down) is preserved exactly, while the silent-failure gap that the scanner flagged is closed with two lines of logging and a tighter exception scope.
+
+### AC-40 · Log-and-continue on project-registry write failure
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            "label": Path(normalized_root).name,
+        })
+        PROJECT_REGISTRY_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+# Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
+```
+
+Problem:
+The `except OSError: pass` surrounding the `PROJECT_REGISTRY_PATH` write swallows every filesystem failure—`PermissionError`, `FileNotFoundError` (parent directory absent), `OSError(30, 'Read-only file system')`, `DiskFullError`—with zero log line, zero metric increment, and zero user-facing signal. Because the dashboard's Project tab reads this registry to populate its browse/graph UI, a failed write means the user silently sees a stale or missing project list with no diagnostic trail. A one-time transient hiccup is tolerable to skip, but a persistent misconfiguration (wrong path, read-only volume, missing directory) is masked indefinitely because nothing is ever recorded.
+
+Solution:
+Replace the bare `pass` with a `logger.warning("Failed to write project registry at %s: %s", PROJECT_REGISTRY_PATH, exc)` inside the except clause (binding the exception with `as exc`). Keep the `except OSError` scope as-is—it is the correct catch for filesystem I/O—and keep the non-raising, best-effort posture so the core flow is unaffected. Optionally increment a `registry_write_failures_total` counter for alerting, but the log line alone closes the observability gap.
+
+Benefits:
+Operators immediately see in application logs that the registry write failed and *why* (permission, missing directory, read-only mount), turning a silent, unexplainable "my project is missing from the dashboard" into a one-line grep. Persistent misconfigurations that would otherwise mask themselves forever become diagnosable within minutes of deployment. The fix is a single-line change with no behavioral risk to the core flow.
