@@ -1030,3 +1030,26 @@ Add `import logging` at module top and a module-level `log = logging.getLogger(_
 
 Benefits:
 Any future regression that causes `psutil.cpu_percent` to raise a programming error (wrong kwarg name, removed attribute, type mismatch after a dependency bump) will now appear in the log within seconds of the first call, with the exception class and message, instead of masquerading as a legitimate "no data" state indefinitely. The expected container/`/proc`-restricted case still returns `None` cleanly, but now a developer can distinguish "the environment can't read CPU" from "the code is broken" by checking whether the warning line is present. No new dependency, no metrics infrastructure, no change to the public `float | None` contract.
+
+### AC-68 · Swallowed psutil exception in memory-stats helper leaves no diagnostic trail
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+    try:
+        vm = psutil.virtual_memory()
+        return {"usedBytes": vm.used, "totalBytes": vm.total}
+    except Exception:
+        return None
+
+
+```
+
+Problem:
+The `get_memory_stats` helper wraps `psutil.virtual_memory()` in a bare `except Exception: return None` block that discards the exception object entirely. Because `psutil.virtual_memory()` failing is an abnormal condition (broken C extension, missing `/proc/meminfo` in a minimal container, a permission regression, a future `psutil.AccessDenied` on a hardened kernel), silently mapping every such failure to `None` erases the only diagnostic signal available. The dashboard consumer sees blank memory fields with zero log line, zero metric, and zero alert; an on-call engineer investigating a production incident has no way to distinguish "host genuinely reports no memory" from "psutil is misbehaving" from "a transient I/O error occurred," and the failure stays invisible until a user complains.
+
+Solution:
+Add a module-level `logger = logging.getLogger(__name__)` (stdlib `logging`, already the project's Python logging primitive) and replace the bare `except Exception: return None` with `except Exception: logger.warning("Failed to read virtual memory stats via psutil", exc_info=True); return None`. The `exc_info=True` keyword attaches the full traceback (exception type, message, stack frames) to the log record so the root cause is recoverable from the log stream. The `return None` sentinel is preserved so the existing dashboard contract—treating `None` as "stats unavailable"—is unchanged and no caller code needs modification. No new dependency is introduced; the fix uses only the stdlib `logging` module that the project already relies on for Python-side diagnostics.
+
+Benefits:
+Once fixed, every failure path through `psutil.virtual_memory()` produces a single, greppable `WARNING` line in the application log that includes the exception class, message, and full traceback. An on-call engineer can immediately identify whether the cause is a missing `/proc/meminfo`, a `psutil.AccessDenied` after a kernel hardening change, a segfault in the C extension, or any other regression—and can correlate the timestamp with the dashboard's blank memory fields. The fix costs zero runtime overhead on the happy path (the `except` block is never entered), adds no new dependency, and preserves the existing `None`-return contract so no downstream code changes are required.
