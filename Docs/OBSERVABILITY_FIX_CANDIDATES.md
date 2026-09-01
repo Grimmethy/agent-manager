@@ -1536,3 +1536,26 @@ Narrow the catch to inspect `err.code`. When the code is `ENOENT`, keep the exis
 
 Benefits:
 A transient filesystem error no longer silently degrades the lock into a no-op. Operators get one greppable, context-rich log line identifying the exact directory and errno, and the calling code receives a thrown exception it can act on (bounded retry, process abort, alert) instead of proceeding under a false assumption of exclusivity. The `ENOENT` fast-path remains a zero-cost `return false`, so the common "directory not yet created" case is unchanged.
+
+### AC-90 · Log swallowed exception in commit-claim staleness predicate
+Strength: Strong
+Files: src/staleness-auto-archive.js
+Snippet:
+```
+  if (reasons.includes('possibly-resolved')) return true;
+  // 2. The report cites a commit hash that git confirms is a real object in this repo.
+  let repoRoot;
+  try { ({ repoRoot } = require('./config.js').getConfig()); } catch { return false; }
+  try {
+    return checkCommitClaims(reportText || '', repoRoot).some((c) => c.exists === true);
+  } catch { return false; }
+```
+
+Problem:
+The `catch` block around `checkCommitClaims(...)` (line 47) silently returns `false` for every exception—whether it is a transient git I/O error, a `TypeError` from a malformed `reportText`, or a missing git binary. Because the project has no metrics system and no third-party logger, the only available observability primitive is the Node `console`/`stderr` path. With zero log output, an unattended cron or scheduler job that hits this branch repeatedly produces no trace at all, so an operator cannot distinguish "commit genuinely not found" from "the check is broken" until they add logging after the fact.
+
+Solution:
+Inside the existing `catch (err)` block, emit a single `console.error` line that includes the report identifier (or whatever key the caller passes to identify the record), the stringified error message, and the error stack, e.g. `console.error(\`[staleness-auto-archive] checkCommitClaims failed for report "${reportId}": ${err.message}\`, err.stack)`. Keep the `return false` immediately after so the safe-direction semantics (do not archive on this signal) are unchanged. Do not rethrow—the caller's `reasons` array already tolerates a missing signal, and rethrowing would alter control flow beyond this finding's scope. No new dependency, no metric, no gauge; just the one `console.error` call that the project's existing Node logging convention already supports.
+
+Benefits:
+Once the line is in place, any grep of the job's stderr for `checkCommitClaims failed` immediately surfaces how often and for which reports the predicate is silently no-oping. A systemic misconfiguration (wrong repo root, missing git binary) becomes visible on the first run rather than after days of "why is archiving behaving oddly." The operator can correlate the log timestamp with the report ID to confirm whether the failure is transient or persistent, and the safe `return false` still guarantees no incorrect archive decision is made.
