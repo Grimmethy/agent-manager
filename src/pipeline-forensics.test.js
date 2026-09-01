@@ -187,6 +187,29 @@ test('nextPipelineForensicsTask: a needs-clarification cluster of 3 yields a wel
   assert.equal(ts.nextPipelineForensicsTask(), null);
 });
 
+test('nextPipelineForensicsTask: an on-demand SIGNATURE request resolves needs-clarification members (clarification-aware signature)', () => {
+  const dir = makePipeline();
+  // two members whose generic blockedReason makes signatureForTask() return null, but
+  // whose history detail is a botched decompose
+  for (const id of ['nc1', 'nc2']) {
+    write(dir, 'needs-clarification', {
+      id, source: 'adhoc', domain: 'adhoc',
+      blockedReason: 'could not get this past review after 3 attempts',
+      needsClarification: { reason: 'design-decision' },
+      history: [{ stage: 'needs-clarification', detail: 'chose RESOLUTION: decompose but the sub-task JSON was malformed' }],
+      draftAttempts: [{ tiers: [{ tier: 'local-agentic-write', response: 'x' }] }],
+    });
+  }
+  fs.writeFileSync(path.join(dir, 'queue', 'forensics-requests', 'sig.json'), JSON.stringify({ signature: 'adhoc::botched-decompose', note: 'study this pattern now' }));
+
+  const ts = freshTaskSources(dir);
+  const task = ts.nextPipelineForensicsTask();
+  assert.ok(task, 'a task was generated from the signature request');
+  assert.equal(task.promptContext.triggerType, 'on-demand');
+  assert.equal(task.promptContext.subjectKind, 'signature');
+  assert.deepEqual(task.promptContext.loserIds.sort(), ['nc1', 'nc2']);
+});
+
 test('nextPipelineForensicsTask: an on-demand request file beats a cluster and is consumed', () => {
   const dir = makePipeline();
   // a cluster exists...
