@@ -1467,3 +1467,26 @@ Replace the empty `catch {}` with `catch (err)` and emit a single `console.warn`
 
 Benefits:
 A developer or operator who added a `taskTierOverrides` entry and sees it not taking effect can now `grep` the log for `[model-provider]` and immediately see the underlying error (missing file, bad JSON, permission denied) instead of silently debugging a "missing" override. A transient I/O blip that previously left no trace is now visible in process stdout/stderr, making it discoverable during post-incident review. The fix is a two-line change, introduces no new dependency, and preserves the existing graceful-fallback semantics.
+
+### AC-87 · Silent catch discards grounding-source generation error
+Strength: Strong
+Files: src/review-task.js
+Snippet:
+```
+  try {
+    fs.writeFileSync(taskPathForGrounding, JSON.stringify(task));
+    groundingText = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPathForGrounding], { encoding: 'utf8' });
+  } catch (e) {
+    groundingText = '';
+  } finally {
+    try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
+```
+
+Problem:
+The `catch (e)` block surrounding the `execFileSync` call to `get-grounding-source.js` discards the error object entirely — no log line, no rethrow, no side-channel. In a project with no metrics or telemetry stack and no third-party logging framework, this means a persistent failure (schema drift after a task-shape change, a missing dependency in the spawned child, an OOM kill) causes every review task to silently lose its grounding context with zero diagnostic signal in any log or alert. An operator investigating "why are review outputs degraded?" has no stack trace, no child-process exit code, and no file path to start from, making root-causing effectively impossible.
+
+Solution:
+In the `catch (e)` body, emit a single `console.error` line that includes a stable prefix tag (`[review-task]`) for grep-ability, the `taskPathForGrounding` value for correlation to a specific task, and the error's `stack` (falling back to `message`, then `String(e)`) for root-causing. Keep the `groundingText = ''` fallback assignment and the `finally`-block best-effort `unlinkSync` cleanup unchanged — the behavioral contract of graceful degradation is preserved; the only addition is the missing diagnostic signal. No new dependency, no metrics emission, no rethrow (the caller cannot act on the error since the task is designed to proceed without grounding).
+
+Benefits:
+Any future regression in `get-grounding-source.js` — a task-shape mismatch, a missing native module, a child-process crash — will produce an immediate, greppable `console.error` line containing the offending task path and a full stack trace. Operators can correlate the line to a specific task, identify the root cause from the stack, and verify the fix by confirming the log line disappears. The graceful-degradation behavior is fully preserved: the review task still completes successfully, simply without grounding context, and the temporary task file is still cleaned up in the `finally` block.
