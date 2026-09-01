@@ -50,7 +50,11 @@ function cloneRepoForInvestigation(repoUrl, taskId) {
   try {
     execFileSync('git', ['clone', '--depth', '1', repoUrl, dir], { env: GIT_ENV, timeout: GIT_CLONE_TIMEOUT_MS, stdio: 'pipe' });
     return dir;
-  } catch {
+  } catch (err) {
+    const detail = [err.message];
+    if (err.code) detail.push(`code=${err.code}`);
+    if (err.signal) detail.push(`signal=${err.signal}`);
+    console.warn(`git clone failed for ${repoUrl}: ${detail.join(' ')}`);
     return null;
   }
 }
