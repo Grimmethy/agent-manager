@@ -1122,3 +1122,26 @@ Add `import logging` and a module-level `logger = logging.getLogger(__name__)` a
 
 Benefits:
 Once fixed, any failure in the hardware-history query is immediately visible in application logs with full traceback context, so an operator can distinguish "table is empty" from "the query is broken" at a glance. The dashboard continues to render (showing an empty widget) rather than crashing, preserving the existing graceful-degradation contract. Because the fix uses only the stdlib `logging` module already present in the project, there is zero new dependency surface, zero configuration change, and zero risk of introducing a new failure mode.
+
+### AC-72 · Log swallowed exceptions in best-effort model-stats client
+Strength: Strong
+Files: python/dashboard/model_stats_client.py
+Snippet:
+```
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+```
+
+Problem:
+The `except (OSError, subprocess.SubprocessError, json.JSONDecodeError): return None` block in the model-stats client silently discards three fundamentally different failure modes—missing or non-executable binary (OSError), abnormal process termination (SubprocessError), and malformed or empty output (JSONDecodeError)—with no log line, no stderr write, and no other diagnostic surface. Because the function's contract is best-effort ("return None if unavailable"), rethrowing would break the dashboard's graceful-degradation path, so the only correct remedy is to *record* the failure before returning. As written, an operator who misconfigures the stats binary or whose dependency is removed will see a permanent "no data" widget with zero trail to investigate, and the only way to discover the root cause is to add ad-hoc debugging later.
+
+Solution:
+At module level, add `import logging` and `logger = logging.getLogger(__name__)`. Inside the existing `except (OSError, subprocess.SubprocessError, json.JSONDecodeError):` block, emit a single `logger.warning("model-stats client failed: %s", exc, exc_info=True)` (or equivalently `logger.warning("model-stats client failed", exc_info=True)` with the exception object passed as the last argument) immediately before the `return None`. The `exc_info=True` flag captures the full traceback, which distinguishes the three exception types and their specific causes (e.g. `FileNotFoundError` under `OSError`, a `CalledProcessError` under `SubprocessError`, a line/column offset under `JSONDecodeError`). No rethrow is added—the function still returns `None` and the dashboard widget continues to render its "no data" fallback. No new dependency is introduced; the stdlib `logging` module is already the project's Python logging primitive.
+
+Benefits:
+Once deployed, any of the three failure modes produces a single, greppable WARNING line in the application log carrying the exception class, message, and full traceback. An operator (or on-call engineer) can immediately tell whether the binary is missing, the process was killed, or the output was non-JSON—without attaching a debugger or adding temporary `print` statements. The dashboard's graceful-degradation contract is unchanged: it still receives `None` and renders its fallback, so no caller-side code needs modification. The fix is a two-line addition (one module-level logger, one log call) that costs nothing on the happy path and requires no new dependency.
