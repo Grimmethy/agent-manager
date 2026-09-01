@@ -92,6 +92,42 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+test('write tier: buildWriteAgenticPrompt folds in the plan (with a blind-plan disclaimer) and the prior investigation, in order', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+
+    // no plan, no investigation -> neither block appears
+    const bare = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' } });
+    assert.doesNotMatch(bare, /could NOT read any files/);
+    assert.doesNotMatch(bare, /PRIOR INVESTIGATION/);
+
+    // plan only -> disclaimer + plan text
+    const withPlan = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' }, planResponse: '1. Add the /api/chat/inject route near line 3622' });
+    assert.match(withPlan, /drafted earlier by a separate pass that could NOT read any files/);
+    assert.match(withPlan, /every path, line number, function name and "already exists.*is UNVERIFIED/);
+    assert.match(withPlan, /1\. Add the \/api\/chat\/inject route near line 3622/);
+
+    // investigation only
+    const withInv = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' }, _priorInvestigation: 'Files already read: python/dashboard/app.py' });
+    assert.match(withInv, /PRIOR INVESTIGATION -- a read-only pass already explored this/);
+    assert.match(withInv, /Files already read: python\/dashboard\/app\.py/);
+
+    // all three present -> prior-rejection, then plan, then prior-investigation, then the static instructions
+    const full = buildWriteAgenticPrompt({
+      title: 'T', promptContext: { rawText: 'x' },
+      priorRejectionFeedback: ['REJECTION_MARKER'],
+      planResponse: 'PLAN_MARKER',
+      _priorInvestigation: 'INVEST_MARKER',
+    });
+    const iRej = full.indexOf('REJECTION_MARKER');
+    const iPlan = full.indexOf('PLAN_MARKER');
+    const iInv = full.indexOf('INVEST_MARKER');
+    const iStatic = full.indexOf('First, investigate whether this specific request is ALREADY satisfied');
+    assert.ok(iRej > -1 && iRej < iPlan && iPlan < iInv && iInv < iStatic,
+      `expected rejection < plan < investigation < static, got ${iRej}/${iPlan}/${iInv}/${iStatic}`);
+  });
+});
+
 test('write tier: turn cap default is 35, env override still wins', async () => {
   await withRepo(async () => {
     const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;

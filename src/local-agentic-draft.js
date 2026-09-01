@@ -76,6 +76,60 @@ function localDraftModelLabel() {
   return process.env.LOCAL_MODEL;
 }
 
+const PRIOR_INVESTIGATION_RESPONSE_CAP = 1500;
+
+// Build a compact "here is what a read-only pass already found" map from a declined tier-2
+// run's transcript, for forwarding into the tier-3 write prompt. Deliberately does NOT use
+// draft-attempt-record.js's summariseToolCalls() -- that strips every arg VALUE (paths,
+// queries), which is exactly what tier 3 needs here. Returns '' when there is nothing
+// worth carrying.
+function summariseInvestigation(responseText, toolCallLog) {
+  const log = Array.isArray(toolCallLog) ? toolCallLog : [];
+  const trimmed = (responseText || '').trim();
+  if (log.length === 0 && trimmed.length < 200) return '';
+
+  const filesRead = [];
+  const grepsWithHits = [];
+  const grepsEmpty = [];
+  const toolErrors = [];
+  for (const entry of log) {
+    if (!entry || !entry.tool) continue;
+    const args = entry.args || {};
+    const res = entry.result;
+    const errored = !!(res && typeof res === 'object' && res.error);
+    if (entry.tool === 'read_file') {
+      const p = args.path || (res && res.path);
+      if (!p) continue;
+      if (errored) toolErrors.push(`read_file ${p}: ${String(res.error).slice(0, 120)}`);
+      else if (!filesRead.includes(p)) filesRead.push(p);
+    } else if (entry.tool === 'grep_codebase') {
+      const q = args.query != null ? String(args.query) : '';
+      const label = `"${q}"${args.dir ? ` in ${args.dir}` : ''}`;
+      const hits = Array.isArray(res) ? res.length : 0;
+      if (hits > 0) {
+        if (!grepsWithHits.some((g) => g.startsWith(label))) grepsWithHits.push(`${label} -> ${hits} hit(s)`);
+      } else if (!errored && !grepsEmpty.includes(label)) {
+        grepsEmpty.push(label);
+      }
+    }
+  }
+
+  const lines = [];
+  if (trimmed) {
+    lines.push('What the read-only pass concluded (it did NOT reach a RESOLUTION):');
+    lines.push(trimmed.length > PRIOR_INVESTIGATION_RESPONSE_CAP
+      ? `${trimmed.slice(0, PRIOR_INVESTIGATION_RESPONSE_CAP)}\n...[truncated]`
+      : trimmed);
+    lines.push('');
+  }
+  if (filesRead.length) lines.push(`Files already read: ${filesRead.join(', ')}`);
+  if (grepsWithHits.length) lines.push(`Searches that found something: ${grepsWithHits.join('; ')}`);
+  if (grepsEmpty.length) lines.push(`Searches that returned NOTHING (do not repeat these): ${grepsEmpty.join('; ')}`);
+  if (toolErrors.length) lines.push(`Tool errors it hit: ${toolErrors.join('; ')}`);
+
+  return lines.join('\n').trim();
+}
+
 function buildLocalAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   return [
@@ -153,10 +207,15 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   // output + tool activity even when it DECLINES -- previously response/toolCallLog were
   // dropped as locals here, so a blocked task's investigation was a black box. Additive
   // fields only; draftAdhocBranch reads .applied/.succeeded/.reason exactly as before.
+  // `investigationSummary` (2026-09-01): when this read-only tier declines, draftAdhocBranch
+  // forwards this compact map of what it already read/searched into the tier-3 write
+  // prompt so tier 3 doesn't burn its whole turn budget re-doing the same orientation and
+  // never getting to an edit.
   const modelMeta = {
     response: responseText,
     toolCallLog: (result && result.toolCallLog) || undefined,
     turnsUsed: result && result.turnsUsed,
+    investigationSummary: summariseInvestigation(responseText, result && result.toolCallLog) || undefined,
   };
   const resolutionMatch = responseText.match(RESOLUTION_RE);
   if (!resolutionMatch) {
@@ -205,4 +264,4 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   return { applied: true, succeeded: true, ...modelMeta };
 }
 
-module.exports = { draftAdhocViaLocalAgentic, isEnabled, buildLocalAgenticPrompt, LOCAL_AGENTIC_MAX_TURNS };
+module.exports = { draftAdhocViaLocalAgentic, isEnabled, buildLocalAgenticPrompt, summariseInvestigation, LOCAL_AGENTIC_MAX_TURNS };
