@@ -1444,3 +1444,26 @@ Replace the bare `catch (e) { /* … */ }` with a handler that (1) writes a sing
 
 Benefits:
 The agent loop now receives a well-formed error object it can surface to the user or retry, and any operator tailing stderr sees a single line that names the exact path and the underlying OS error (EACCES, ENOSPC, EROFS, etc.) without needing to add a debugger. The function's error contract becomes uniform: every failure path—unresolved path, permission denial, disk full—yields the same `{ error: … }` shape, eliminating the silent-success blind spot.
+
+### AC-86 · Silent catch on taskTierOverrides config load hides misconfiguration
+Strength: Strong
+Files: src/model-provider.js
+Snippet:
+```
+  let taskTierOverrides;
+  try {
+    ({ taskTierOverrides } = getConfig());
+  } catch {
+    taskTierOverrides = null;
+  }
+  if (taskTierOverrides && taskTierOverrides[sourceName]) return taskTierOverrides[sourceName];
+```
+
+Problem:
+The `try/catch` around `getConfig()` for `taskTierOverrides` swallows any thrown error (wrong path, corrupt JSON, missing env var, permission error) into a bare `catch {}` with no log output. The system silently falls back to default tier assignments, so an operator who added an override entry and sees it "not taking effect" has zero signal in any log to identify the root cause. In a long-running service a transient I/O error on the config file would be invisible for the lifetime of the process, and no trace would appear in stdout/stderr for later diagnosis.
+
+Solution:
+Replace the empty `catch {}` with `catch (err)` and emit a single `console.warn` line that includes a module-scoped prefix (`[model-provider]`), a short human-readable description ("Failed to load taskTierOverrides from config; falling back to defaults"), and `err.message` so the operator sees the concrete reason (e.g. `ENOENT`, `SyntaxError: Unexpected token`). Do not rethrow — the code is explicitly designed to proceed without overrides, and `warn` (not `error`) is the correct severity because the service remains fully operational. No new dependency, no metrics emission; `console.warn` is the only primitive this project uses for non-fatal diagnostics.
+
+Benefits:
+A developer or operator who added a `taskTierOverrides` entry and sees it not taking effect can now `grep` the log for `[model-provider]` and immediately see the underlying error (missing file, bad JSON, permission denied) instead of silently debugging a "missing" override. A transient I/O blip that previously left no trace is now visible in process stdout/stderr, making it discoverable during post-incident review. The fix is a two-line change, introduces no new dependency, and preserves the existing graceful-fallback semantics.
