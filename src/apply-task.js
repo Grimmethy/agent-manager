@@ -387,6 +387,21 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       return { succeeded: true, doneMarker: artifact.reason };
     }
 
+    // A Group A `apply` can also return { succeeded:false, needsConfirmation:true } to
+    // hold the task at queue/awaiting-confirm/ for a human before anything is written --
+    // pipeline_forensics does this so its ranked report is read before a fix candidate is
+    // filed. Without this, the artifact has no `file` and the git-branch-diff staging
+    // below runs `git add [undefined]` -> "fatal: pathspec 'undefined' did not match any
+    // files" (confirmed live 2026-09-01, the first real forensic report). The delete-mode
+    // needsConfirmation gate above only covers usesGroupB tasks; this is its Group A
+    // counterpart. recordApplyOutcome routes `needsConfirmation` to awaiting-confirm/.
+    if (artifact && artifact.needsConfirmation) {
+      if (branchName) {
+        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort */ }
+      }
+      return artifact;
+    }
+
     // Group A functions return { file: '...' } (one artifact); Group B returns
     // { files: [...] } (one or more). Normalize to an array so both shapes stage
     // correctly regardless of which path produced the artifact.
@@ -559,6 +574,10 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
       if (artifact && artifact.skipped) {
         results[task.id] = { succeeded: true, doneMarker: artifact.reason };
         closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+        continue;
+      }
+      if (artifact && artifact.needsConfirmation) {
+        results[task.id] = artifact; // -> awaiting-confirm/, nothing staged for this one
         continue;
       }
       const files = artifact.files || [artifact.file];

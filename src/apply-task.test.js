@@ -922,3 +922,29 @@ test('a pipeline_self_audit task with no signature never attempts to drain anyth
   assert.equal(result.succeeded, true);
   assert.equal(fs.existsSync(path.join(PIPELINE_DIR, 'queue', 'pending')), false);
 });
+
+test('a Group-A apply returning needsConfirmation holds at awaiting-confirm without staging anything (no "pathspec undefined")', () => {
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('needs_confirm_src')) {
+    registerTaskSource('needs_confirm_src', {
+      priority: 66, next: () => null, advisoryProse: true,
+      apply: ({ task }) => task.confirmedAt
+        ? { succeeded: true, doneMarker: 'filed' }
+        : { succeeded: false, needsConfirmation: true, reason: 'held for human review' },
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ id: 'nc-task', source: 'needs_confirm_src', implementResponse: 'a prose report' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.equal(result.needsConfirmation, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('add'), 'nothing is staged');
+  assert.ok(!names.includes('commit'), 'nothing is committed');
+  // the throwaway branch that was created is cleaned back up
+  assert.ok(names.includes('checkoutMain'));
+
+  // recordApplyOutcome routes it to awaiting-confirm/
+  assert.equal(recordApplyOutcome(task, result), 'awaiting-confirm');
+});
