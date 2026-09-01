@@ -98,7 +98,12 @@ function findByBasename(root, basename, maxResults = 10) {
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // directory not yet created; nothing to process
+        return;
+      }
+      console.error(`[fact-checker] readdirSync failed for ${dir}: ${err.message}${err.code ? ` [${err.code}]` : ''}`);
       return;
     }
     for (const entry of entries) {
