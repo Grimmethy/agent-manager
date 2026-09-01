@@ -2080,6 +2080,21 @@ def _task_input_summary(task: dict) -> list[dict]:
         rel = pc.get("specRelPath")
         if rel:
             out.append({"label": "Output", "text": f"{rel} (fills one section's placeholder block)"})
+    elif task.get("source") == "pipeline_forensics":
+        # Forensics promptContext keys (subjectKind/subjectKey/signature/triggerType) don't
+        # match _TASK_INPUT_FIELDS, so without this the modal has no "what did this study
+        # examine" line at all -- the reader lands in the report with no framing.
+        kind = pc.get("subjectKind")
+        key = pc.get("subjectKey") or pc.get("signature")
+        trigger = pc.get("triggerType")
+        if key:
+            if kind and kind != "signature":
+                text = f"{kind} {key}"
+            else:
+                text = f'signature "{key}"'
+            if trigger:
+                text += f" (trigger: {trigger})"
+            out.append({"label": "Study", "text": text})
     return out
 
 
@@ -2515,10 +2530,31 @@ def api_task_anywhere(task_id):
             if data:
                 return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
 
+    def _payload(data, found_state):
+        return jsonify({**data, "_foundState": found_state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return jsonify({**data, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+            return _payload(data, state)
+
+    # A job-log / recent-tasks row can point at a task that has since been archived (by the
+    # daily done-archive pass or by hand) or that lives in adhoc/ -- none of which are in
+    # QUEUE_STATES. Check those too so the row still opens.
+    data = read_json_safe(qdir / "adhoc" / f"{task_id}.json")
+    if data:
+        return _payload(data, "adhoc")
+    data = read_json_safe(qdir / "done" / "_archived_no_action" / f"{task_id}.json")
+    if data:
+        return _payload(data, "archived")
+    dated_archive_root = qdir / "done" / "_archived"
+    if dated_archive_root.is_dir():
+        for month_dir in sorted(dated_archive_root.iterdir(), reverse=True):
+            if not month_dir.is_dir():
+                continue
+            data = read_json_safe(month_dir / f"{task_id}.json")
+            if data:
+                return _payload(data, "archived")
 
     abort(404, description=f"task {task_id} not found in any queue state")
 
@@ -5790,6 +5826,80 @@ def api_job_types():
         }
         for name in task_source_catalog()
     ])
+
+
+def _job_log_task_dirs(qdir):
+    """Every location a task JSON can sit -- same set _task_state_index walks -- yielded as
+    (state_label, dir_path) so a per-source history sweep sees in-flight, done, and
+    archived runs alike."""
+    for state in QUEUE_STATES:
+        yield state, qdir / state
+    yield "adhoc", qdir / "adhoc"
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for sub in sorted(drafting_root.iterdir()):
+            if sub.is_dir():
+                yield "drafting", sub
+        yield "drafting", drafting_root  # legacy: no per-worker subfolder
+    yield "archived", qdir / "done" / "_archived_no_action"
+    dated_archive_root = qdir / "done" / "_archived"
+    if dated_archive_root.is_dir():
+        for month_dir in sorted(dated_archive_root.iterdir(), reverse=True):
+            if month_dir.is_dir():
+                yield "archived", month_dir
+
+
+def _job_log_row_when(data: dict):
+    hist = data.get("history") or []
+    last_at = hist[-1].get("at") if hist and isinstance(hist[-1], dict) else None
+    return data.get("updatedAt") or last_at or data.get("createdAt") or ""
+
+
+def _job_log_outcome(data: dict) -> str:
+    # Same signal priority as the Discovery tab's runRows / _adhoc_task_excerpt.
+    if data.get("blockedReason"):
+        return str(data["blockedReason"])[:200]
+    if data.get("doneMarker"):
+        return str(data["doneMarker"])
+    if data.get("implementResponse"):
+        return "draft written"
+    if data.get("planResponse"):
+        return "plan written"
+    return ""
+
+
+@app.route("/api/job-log/<source>")
+def api_job_log(source):
+    """Job List tab: click a source -> its last ~25 runs, newest first, each drillable to
+    the task-detail modal via /api/task-anywhere. Sweeps every queue state + drafting/ +
+    adhoc/ + the archive buckets, matching on the same resolved source name the pipeline
+    map uses."""
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    seen: set[str] = set()
+    rows: list[dict] = []
+    for state_label, d in _job_log_task_dirs(qdir):
+        if not d or not d.is_dir():
+            continue
+        for f in d.glob("*.json"):
+            if f.stem in seen:
+                continue
+            data = read_json_safe(f)
+            if not data or _resolve_source_name(data) != source:
+                continue
+            seen.add(f.stem)
+            cost = _task_cost_summary(f.stem)
+            rows.append({
+                "id": data.get("id") or f.stem,
+                "title": (data.get("title") or "").strip(),
+                "state": state_label,
+                "at": _job_log_row_when(data),
+                "outcome": _job_log_outcome(data),
+                "latencyMs": cost.get("totalLatencyMs") if cost else None,
+            })
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return jsonify({"source": source, "total": len(rows), "runs": rows[:25]})
 
 
 @app.route("/api/job-types/reset-counts", methods=["POST"])
