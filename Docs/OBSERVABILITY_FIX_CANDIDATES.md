@@ -416,3 +416,502 @@ Replace the bare `except Exception: pass` with a `logger.warning` call that incl
 
 Benefits:
 Operators gain a single, greppable log line per failure that names the session, the storage directory, and the root-cause exception, turning an invisible state-drift into a one-line diagnosis. The optional counter gives a trend signal: a spike or sustained non-zero rate immediately distinguishes a transient blip from a systemic misconfiguration (renamed path, schema change) before it accumulates into thousands of stuck reserved sessions. No behavioural change to the happy path; the lock-release semantics are untouched.
+
+### AC-42 · Add warning-level logs to silent timeout and crash branches in reasoning-bench-cases endpoint
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            ["node", "-e", script, str(SRC_DIR / "reasoning-bench-cases.js")],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify([])
+    if result.returncode != 0:
+        return jsonify([])
+```
+
+Problem:
+The endpoint that shells out to `reasoning-bench-cases.js` (15 s timeout) catches both `subprocess.TimeoutExpired` and a non-zero `returncode`, and in either case simply returns `jsonify([])` with no `logger` call, no metric increment, and no comment. A dashboard panel consuming this endpoint therefore sees an empty list whether the script legitimately produced zero cases, timed out, or crashed on a bad import — three fundamentally different states that are indistinguishable in logs, metrics, and the response body. An operator has no signal that a persistent timeout or crash is occurring until they manually re-run the script.
+
+Solution:
+Keep the response payload exactly as it is today — `jsonify([])` (a plain JSON array) — so no frontend contract changes. In the `except subprocess.TimeoutExpired` branch, add `logger.warning("reasoning-bench-cases.js timed out after %s s; returning empty list", timeout_value)` before the `return jsonify([])`. In the `if result.returncode != 0` branch, add `logger.warning("reasoning-bench-cases.js exited with code %s; stderr=%s; returning empty list", result.returncode, result.stderr.decode(errors="replace")[:500])` before the same `return jsonify([])`. Both log lines go through the module-level `logger = logging.getLogger(__name__)` already present in the file. No changes to the response shape, no new exception re-raise, no new metric endpoint — just the two `logger.warning` calls so the failure is visible in the existing log pipeline.
+
+Benefits:
+Once deployed, any timeout or crash of the Node script immediately produces a greppable `WARNING` line in the application log (and, if the team ships structured logs, in their log aggregator), naming the script, the failure mode, the timeout duration or exit code, and a truncated stderr excerpt. An on-call engineer can distinguish "script timed out" from "script crashed" from "script returned zero cases" without SSH-ing into the host, and a persistent degradation (e.g. a dependency upgrade that makes the script hang) becomes visible within one request cycle rather than remaining invisible until someone notices an empty dashboard panel.
+
+### AC-43 · Log the raw subprocess output when JSON parsing fails in the case-list endpoint
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        return jsonify([])
+    try:
+        cases = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return jsonify([])
+
+    stats = _compute_case_stats()
+```
+
+Problem:
+The `except json.JSONDecodeError` branch in the Flask case-list handler returns `jsonify([])` with a 200 status and performs no logging, no response-body annotation, and no non-200 status code. The observable result—HTTP 200 with body `[]`—is byte-for-byte identical to the legitimate "zero cases" early-return path. If the upstream subprocess regresses (prints a human-readable error, emits a UTF-8 BOM, changes its schema after a dependency upgrade), the dashboard silently goes blank and no log line, alert, or status-code change is produced. In a production agent-manager where operators rely on this endpoint for situational awareness, the failure is invisible until a human notices the empty list and spends time chasing a data-source problem that is actually a parse problem.
+
+Solution:
+Add a module-level `logger = logging.getLogger(__name__)` at the top of the file. Inside the existing `except json.JSONDecodeError as exc:` block, before the `return jsonify([])`, emit a single `logger.warning("case-list: subprocess output was not valid JSON (%s); returning empty list. Raw output (first 500 chars): %r", exc, result.stdout[:500])`. This keeps the graceful-fallback behaviour intact (the endpoint still returns 200 + `[]` so the dashboard does not crash), while producing a searchable, greppable log line that names the endpoint, the exception type, and a truncated sample of the offending output. No new dependencies, no response-shape change, no additional code path.
+
+Benefits:
+Once the warning is in place, an on-call engineer or a log-based alert (e.g. a Datadog/Prometheus rule on `level=WARNING AND message~"case-list.*not valid JSON"`) can detect the parse regression within seconds rather than waiting for a human to notice a blank dashboard. The truncated raw output in the log message lets the operator immediately see whether the subprocess printed a stack trace, a BOM, a changed schema, or a deprecation notice—reducing mean-time-to-diagnose from a multi-hour investigation to a single `grep`. Because the change is a single `logger.warning` call inside an already-existing except block, it introduces no new failure mode, no new dependency, and no change to the API contract consumed by the frontend.
+
+### AC-44 · Log the JSON-decode fallback in the dashboard status endpoint
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        return jsonify({"status": "idle"})
+    try:
+        return jsonify(json.loads(progress_path.read_text(encoding="utf-8")))
+    except json.JSONDecodeError:
+        return jsonify({"status": "idle"})
+
+
+```
+
+Problem:
+The `except json.JSONDecodeError` branch in the progress-status endpoint returns `{"status": "idle"}` with no log line, metric increment, or any other side-effect. If the upstream progress writer begins emitting truncated or malformed JSON persistently, the dashboard will display "idle" indefinitely while the agent is actually running, and no log, metric, or alert will ever surface the discrepancy. An operator troubleshooting "why does the agent look idle?" has zero trace to follow.
+
+Solution:
+Inside the `except json.JSONDecodeError` block, add a `logger.warning("progress file at %s is not valid JSON; reporting status as idle", progress_path, exc_info=True)` before the `return` statement. This is a single-line addition that preserves the graceful-degradation behaviour (the endpoint still returns 200 with `"idle"`) while leaving a searchable, timestamped record in the application log. No new metric, alert rule, or schema change is required; the log line is sufficient for a low-frequency, read-only status endpoint.
+
+Benefits:
+An operator who sees the dashboard stuck on "idle" can immediately grep the application log for the warning, confirm the progress file is the root cause, and inspect the file contents without guessing. The `exc_info=True` attachment also captures the exact byte offset of the parse failure, shortening diagnosis from "something is wrong" to a concrete pointer. Because the change is a single log call in an already-narrow except block, it introduces no new failure mode and does not alter the endpoint's contract.
+
+### AC-45 · Silent `except Exception: pass` around `chat_sessions.set_reserved`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                single_flight_lock.release(record["fh"])
+                try:
+                    chat_sessions.set_reserved(record["storageDir"], sid, False)
+                except Exception:
+                    pass  # best-effort -- the lock is already released, which is what matters
+
+
+```
+
+Problem:
+After the single-flight lock is successfully released, the code calls `chat_sessions.set_reserved(record["storageDir"], sid, False)` to clear the reserved flag. If that call raises for any reason — a missing directory, a serialization error, a `KeyError` on a malformed `storageDir`, even a `MemoryError` under pressure — the bare `except Exception: pass` swallows it entirely. There is no log line, no metric increment, no structured event. In a batch-processing loop the shape of `record["fh"]` / `record["storageDir"]` implies, a persistent failure mode (e.g. a renamed storage path, a race on the underlying store) will leave every session permanently flagged as reserved, and the dashboard, scheduler, and reaper will all silently operate on stale state with zero signal to an operator.
+
+Solution:
+Replace the bare `except Exception: pass` with a `logger.warning` call that includes the offending `sid`, `record["storageDir"]`, the exception type, and the exception message, followed by `pass` (the lock is already released, so re-raising would be incorrect). Concretely: `except Exception as exc: logger.warning("Failed to clear reserved flag for session %s in %s: %s: %s", sid, record["storageDir"], type(exc).__name__, exc)`. If the project already exposes a metrics registry, add a single `counter.inc("chat_sessions.set_reserved_failures")` on the same path so the rate is visible in dashboards and can drive an alert threshold.
+
+Benefits:
+Operators gain a single, greppable log line per failure that names the session, the storage directory, and the root-cause exception, turning an invisible state-drift into a one-line diagnosis. The optional counter gives a trend signal: a spike or sustained non-zero rate immediately distinguishes a transient blip from a systemic misconfiguration (renamed path, schema change) before it accumulates into thousands of stuck reserved sessions. No behavioural change to the happy path; the lock-release semantics are untouched.
+
+### AC-46 · Log the swallowed OSError in the projects-list endpoint
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    an empty list rather than a 500."""
+    try:
+        candidates = sorted(GITHUB_PROJECTS_ROOT.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    repos = []
+    for child in candidates:
+```
+
+Problem:
+The `except OSError` branch in the projects-list helper returns `[]` with no log, metric, or other side-channel emission. Because `OSError` covers missing directories, permission denials, NFS timeouts, and container-mount failures, every one of those production incidents produces a byte-for-byte identical `200 []` response to the case where the user genuinely has zero projects configured. An operator polling the dashboard or an automated health-check sees a green, empty list and has zero signal that `GITHUB_PROJECTS_ROOT` is misconfigured or the underlying volume is gone.
+
+Solution:
+Inside the existing `except OSError as exc:` block, before the `return []`, emit a single `logger.warning` call that includes the resolved value of `GITHUB_PROJECTS_ROOT` and the exception string (e.g. `logger.warning("GITHUB_PROJECTS_ROOT (%s) is inaccessible; returning empty project list: %s", GITHUB_PROJECTS_ROOT, exc)`). Use `WARNING` rather than `ERROR` because the HTTP contract is preserved and the endpoint still succeeds. Add `import logging` and `logger = logging.getLogger(__name__)` at module scope if they are not already present. No other lines change; the `return []` and the 200 status remain intact.
+
+Benefits:
+Once deployed, any filesystem-level failure on the projects root produces a greppable, path-annotated warning line in the application log (and, if the project ships a structured-logging handler, in the log aggregator), turning an otherwise invisible "green but broken" state into a one-line diagnostic. Operators can correlate the warning with the empty dashboard view to distinguish a misconfigured `GITHUB_PROJECTS_ROOT` from a legitimately empty project set, and on-call runbooks can add a simple `grep` for the message to their escalation checklist without any change to the API contract or client expectations.
+
+### AC-47 · Silent domain-list read failure in apply-group-a IIFE
+Strength: Strong
+Files: src/apply-group-a.js
+Snippet:
+```
+    const validDomains = (() => {
+      try {
+        return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
+      } catch {
+        return [];
+      }
+    })();
+```
+
+Problem:
+The IIFE in src/apply-group-a.js reads and parses `matchedProject.domainsPath` to build `validDomains`, but its catch block simply returns `[]` with no log, no rethrow, and no metric. A missing file, a permission error, and a genuinely empty list are all indistinguishable downstream: any code that treats `[]` as "no restriction / allow-all" will silently widen access scope, and an operator debugging "why is agent X unrestricted?" has zero signal in logs, metrics, or exit codes to find the root cause.
+
+Solution:
+Replace the bare `return []` in the catch block with a two-line stderr write that is fully self-contained (no imports, no external metric library, no new module-level state). The first line is a human-readable diagnostic that names the offending path and the error; the second line is a single OpenMetrics-format counter increment that existing textfile collectors or log-grep alerts can pick up. Concretely, the catch block becomes:
+
+```js
+} catch (err) {
+  const path = matchedProject && matchedProject.domainsPath || '<unknown>';
+  const reason = (err && err.message) || String(err);
+  process.stderr.write(
+    `[apply-group-a] domain-list read failed path=${path} reason=${reason}\n`
+  );
+  process.stderr.write(
+    'apply_group_a_domain_list_read_errors_total 1\n'
+  );
+  return [];
+}
+```
+
+`process.stderr.write` is a synchronous, always-available Node built-in—no `require`, no logger import, no metric-registry setup. The IIFE's return contract (`[]` on failure) is unchanged, so no downstream caller needs modification. If the project later adopts a structured logger or a Prometheus client, these two lines can be swapped for `logger.error(...)` and `counter.inc()` without altering the surrounding logic.
+
+Benefits:
+Once in place, every failed domain-list load produces a timestamped, path-qualified line in stderr that an operator can `grep apply-group-a` to find immediately, and the counter line gives a monotonic signal for alerting (e.g., page when `apply_group_a_domain_list_read_errors_total` increments). The critical "empty list means allow-all" ambiguity is resolved: a legitimately empty file produces no stderr line, while an unreadable or missing file does, so the operator can distinguish the two cases at a glance without changing any downstream access-control logic.
+
+### AC-48 · Catch block discards error context in per-task retry requeue loop
+Strength: Strong
+Files: src/apply-retry-check.js
+Snippet:
+```
+      fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+      fs.unlinkSync(filePath);
+      summary.requeued++;
+    } catch (e) {
+      summary.errors++;
+    }
+  }
+```
+
+Problem:
+Inside the per-task retry loop, the catch block increments `summary.errors` and then drops the caught exception `e` entirely. There is no `console.error`, no append to a details array, no rethrow, and no correlation of the failure back to the specific task ID or the exact step (write-to-new-path vs. unlink-of-original) that threw. An operator who sees `errors: 50` out of 200 tasks has no way to determine which tasks were affected, whether the failure was a disk-full on the write, a permissions error on the unlink, a JSON serialisation crash, or a partial-move that left the task duplicated at both paths (a correctness hazard for side-effecting tasks). The counter acknowledges that something went wrong but surfaces zero diagnostic information.
+
+Solution:
+In the catch block, after incrementing `summary.errors`, push a structured entry onto a new `summary.errorDetails` array (initialised to `[]` before the loop). Each entry should carry the task's `id` (or a stable key from the loop variable), the step that failed (determined by a small `let step = 'write'` / `step = 'unlink'` marker set immediately before each `fs` call), and `e.message` plus `e.code` if present. Additionally, emit a single `console.error` per failure with the same fields so the information is visible in real-time log streams, not only in the final summary object. Do not rethrow; the batch-aggregate pattern of continuing to the next task on individual failure is intentional and should be preserved.
+
+Benefits:
+Operators can now triage a batch run by reading `summary.errorDetails` (or the log stream) to see exactly which task IDs failed, at which filesystem step, and with what OS-level error code. The partial-move / task-duplication scenario becomes immediately visible because the entry records that the write succeeded but the unlink threw, prompting the operator to check for a stray file at the original path before the next retry pass. The fix adds one array push and one `console.error` per failure—negligible overhead in a loop that already performs synchronous I/O per task—while converting an opaque counter into an actionable diagnostic trail.
+
+### AC-49 · Silent catch discards requeue failure with no log, metric, or trace
+Strength: Strong
+Files: src/apply-task.js
+Snippet:
+```
+        if (requeuedIds.length > 0) {
+          console.error(`[apply-task] auto-requeued ${requeuedIds.length} blocked task(s) sharing signature "${task.promptContext.signature}": ${requeuedIds.join(', ')}`);
+        }
+      } catch (e) {
+        // Non-fatal -- see comment above.
+      }
+    }
+```
+
+Problem:
+The `catch (e) { }` block in the auto-requeue path binds the thrown error to `e` and then performs no action: no `console.warn`, no structured log, no metric emission, no rethrow. The success path logs "auto-requeued N blocked task(s)…" via `console.error`, so an operator searching logs for a stuck task sees evidence of requeue activity for other signatures but absolute silence for the one whose requeue threw. The comment `// Non-fatal -- see comment above.` defers its justification to a comment outside the visible window, and the bound-but-unused `e` reads as an oversight rather than a deliberate no-op. If the underlying write (queue broker, DB connection pool, in-flight schema migration) fails, the blocked tasks are not requeued and there is zero trace in logs, metrics, or alerts to explain why they remain stuck.
+
+Solution:
+Replace the empty `catch (e) { }` with a `catch (e) { console.warn("auto-requeue failed for blocked tasks (non-fatal); will rely on next scheduler pass", { requeuedIds, promptSignature, error: e?.message ?? String(e), stack: e?.stack }); }`. This keeps the path non-fatal (no rethrow, no process-level alert) but emits a single `warn`-level line that includes the affected task IDs, the prompt signature that triggered the requeue, and the error message/stack. If the project already has a structured-logger or metrics facade, route through that instead of `console.warn`, but the key requirement is that the error object is inspected and its message is persisted somewhere an operator can grep.
+
+Benefits:
+An operator investigating "why is task X still blocked?" will find a single `warn` line naming the exact task IDs, the prompt signature, and the root-cause error message, turning a silent, unexplained stall into a one-grep diagnosis. The asymmetry between the success log and the silent failure is eliminated, so log-based dashboards and alert rules that already key off the success line can be extended to the warn line with minimal effort. The bound-but-discarded `e` is no longer a code-review red flag, and the "see comment above" dependency is removed because the intent (non-fatal, best-effort, rely on next scheduler pass) is now stated co-located in the log message itself.
+
+### AC-50 · Add structured warn-log and counter to best-effort snapshot-persist catch
+Strength: Strong
+Files: src/apply-task.js
+Snippet:
+```
+  const applyStage = recordApplyOutcome(task, result);
+  try {
+    fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+  } catch (e) {
+    // Non-fatal -- the apply outcome itself (result, already computed above) is what
+    // actually gates the caller's file-move decision; a failure to also persist the
+    // history event shouldn't turn a real apply success into a reported failure.
+```
+
+Problem:
+The `catch` block that guards the JSON snapshot write to `taskPath` discards the caught error entirely — no `console.warn`, no structured log, no metric increment, no event emission. Because the primary apply outcome (`result`) is already computed and returned to the caller, this failure is intentionally non-fatal, which is correct control flow. However, the complete absence of any observability signal means that a disk-full condition, a volume unmount, or a permission revocation on the storage backing `taskPath` will cause every subsequent task to silently lose its persisted state with no log line, no counter, and no alert to distinguish "the write failed" from "the write never happened." The failure would only surface indirectly, if at all, when a downstream consumer expects the snapshot file to exist and finds it missing.
+
+Solution:
+Inside the existing `catch (e)` block, emit a single structured `warn`-level log that includes the task identifier, the resolved `taskPath`, and `e.message` (plus `e.code` if present, to distinguish `ENOSPC` / `EACCES` / `EIO`). Additionally, increment a dedicated counter metric (e.g. `apply_task_snapshot_persist_failures_total`) so that a dashboard or alert rule can fire when the rate is non-zero over a sliding window. Do not rethrow, do not change the return value, and do not add any retry logic — the fix is purely additive observability scoped to this one catch block.
+
+Benefits:
+Operators gain a single, greppable log line and a queryable metric the moment the first snapshot write fails, turning an invisible, cumulative data-loss blind spot into an immediately visible, alertable event. Correlating the `e.code` field with the task path lets an on-call engineer distinguish a transient I/O hiccup from a systemic volume failure within seconds rather than discovering the gap only when a downstream consumer reports a missing file. The primary apply path and its return contract remain completely unchanged, so no caller behavior shifts.
+
+### AC-51 · Silent catch in watchdog tick discards readdirSync failure
+Strength: Strong
+Files: src/dead-process-check.js
+Snippet:
+```
+    // had to reject (agent-manager-common.sh's check_instance_liveness) -- harmless once
+    // rejected, but a needless spawn/reject cycle roughly every watchdog tick.
+    names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
+  } catch (e) {
+    return actions;
+  }
+
+```
+
+Problem:
+The `catch` block around `fs.readdirSync(instancesDir)` binds the thrown error to `e` and then immediately returns the partially-built `actions` array without ever reading, logging, or attaching `e`. When the instances directory is missing, hit by a transient NFS hiccup, or blocked by a brief permission race, the watchdog tick produces zero or partial actions with no observable signal—no `console.warn`, no `process.emitWarning`, no counter increment, no structured-log entry. In a long-running agent-manager this manifests as a quiet accumulation of zombie processes while every health check and dashboard still reports the supervisor as healthy, because the only code path that would surface the failure (the exception itself) is captured and discarded.
+
+Solution:
+Inside the `catch` block, before the `return actions`, emit a single structured warning that names the directory, the error code, and the tick identifier: `process.emitWarning(\`watchdog tick skipped readdirSync(${instancesDir}): ${e.code ?? e.message}\`, { code: 'WATCHDOG_REaddir_FAIL', dir: instancesDir, error: e })`. Additionally, increment a module-level counter (e.g. `let readdirFailCount = 0; readdirFailCount++`) and expose it via the existing health/metrics endpoint so operators can alert on `readdirFailCount > 0` over a sliding window. Keep the `return actions` so a single bad tick does not crash the supervisor—the fix is purely additive observability, not a behavioural change.
+
+Benefits:
+Operators gain an immediate, greppable signal the moment the watchdog goes blind: a one-line warning in the log stream and a non-zero counter on the health endpoint. Alerting rules can fire on sustained `readdirFailCount` growth, turning a silent zombie-accumulation scenario into a pageable incident. The cost is two lines of code and no change to the tick's return contract, so the graceful-degradation behaviour that makes `return actions` correct for a periodic callback is preserved.
+
+### AC-52 · Distinguish expected ENOENT from real I/O and parse failures in cooldown read
+Strength: Strong
+Files: src/dead-process-check.js
+Snippet:
+```
+function readCooldowns(cooldownPath) {
+  try {
+    return JSON.parse(fs.readFileSync(cooldownPath, 'utf8'));
+  } catch (e) {
+    return {};
+  }
+}
+```
+
+Problem:
+The `catch (e)` around the cooldown-file read and `JSON.parse` swallows every error path identically and returns `{}`. That is correct for `ENOENT` on first boot, but it is also what happens when the file is permission-denied (`EACCES`/`EPERM`), the disk is failing (`EIO`/`ENOSPC`), or the JSON is corrupt from a partial write (`SyntaxError`). In the corrupt-file case the caller sees "no active cooldowns" and the agent-manager restarts processes that were supposed to be held back, potentially re-entering the very restart loop the cooldown exists to prevent — and there is no log line, metric, or trace to explain why the protection silently vanished.
+
+Solution:
+Replace the blanket `catch (e) { return {}; }` with a narrow check: if `e.code === 'ENOENT'`, return `{}` silently (the expected first-run case). For every other error — including `SyntaxError` from `JSON.parse`, which will not carry an `e.code` — emit a `logger.warn` (or `logger.error` for `SyntaxError`, since it implies data corruption) that includes the error message, the file path, and the error code/name, then still return `{}` so the caller's best-effort contract is preserved. No rethrow, no new dependency, no change to the function signature; the only change is the conditional log before the existing `return {}`.
+
+Benefits:
+An operator watching logs or a dashboard will see a single, clearly-labelled warning the moment a cooldown file becomes unreadable or corrupt, with enough context (path, error code, message) to diagnose whether it is a permissions issue, a disk fault, or a torn write. The common first-boot `ENOENT` path stays silent, so log volume is unchanged in the normal case. The restart-loop failure mode that motivated the cooldown feature now leaves an audit trail instead of vanishing silently, making post-incident review of "why did the agent restart?" a one-line grep instead of an archaeology dig.
+
+### AC-53 · done-archive swallows all read errors into an empty object
+Strength: Strong
+Files: src/done-archive.js
+Snippet:
+```
+function readState(sp) {
+  try {
+    return JSON.parse(fs.readFileSync(sp, 'utf8'));
+  } catch (e) {
+    return {};
+  }
+}
+```
+
+Problem:
+The catch block around `JSON.parse(fs.readFileSync(sp, 'utf8'))` catches every possible failure — `ENOENT`, `EACCES`, `EIO`, and `SyntaxError` from a truncated or corrupted file — and returns the identical value `{}`. In an `agent-manager` context where this file tracks completed agents, a partial write (crash mid-`writeFile`, disk full, NFS hiccup) leaves invalid JSON on disk. On the next read, `JSON.parse` throws, the catch fires, and the caller receives `{}` indistinguishable from a legitimate first-run state. The manager then re-processes already-completed agents or overwrites the corrupted file with a fresh empty archive, silently destroying the completion record. No log line, no metric, no stack trace is emitted; an operator sees nothing until duplicate work or missing history surfaces downstream.
+
+Solution:
+Narrow the catch to treat `ENOENT` as the sole condition that maps to `{}` (preserving the first-run convenience). For every other error code or `SyntaxError`, log a structured line to stderr including the file path, the error code, and the message (e.g. `[done-archive] read failed at ${sp}: ${e.code ?? e.name} — ${e.message}`), then rethrow the original error so the caller can abort, retry, or fall back to a backup rather than silently proceeding with an empty archive. If the caller's contract must remain non-throwing, return a distinct sentinel such as `null` (documented) so the caller can branch on "genuinely empty" vs. "unreadable" and emit its own alert.
+
+Benefits:
+Operators gain an immediate, greppable log line the moment a state file becomes unreadable or malformed, turning a silent data-loss scenario into a visible, actionable alert. The distinction between "no archive yet" and "archive is broken" is preserved in the return contract, preventing the manager from re-processing completed agents or clobbering a corrupted file with an empty one. Because the fix is a single `if (e.code === 'ENOENT')` guard plus one `console.error` call, it introduces no new dependencies and no behavioral change for the happy path.
+
+### AC-54 · Silent null return discards all error context in model-stats-client
+Strength: Strong
+Files: src/model-stats-client.js
+Snippet:
+```
+  try {
+    const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'cost-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
+    return JSON.parse(stdout);
+  } catch (e) {
+    return null;
+  }
+}
+```
+
+Problem:
+The catch block in the cost-summary helper binds the thrown error to `e` and then immediately discards it, returning a bare `null` with no `console.warn`, no structured log, no rethrow, and no `process.emitWarning`. Both failure modes — `execFileSync` failing (missing binary, bad path, non-zero exit) and `JSON.parse` failing (non-JSON output, partial write, stray stderr) — collapse into the same indistinguishable `null`. Because this file lives in `agent-manager` and feeds an operator-facing stats or cost panel, a regression in the child script (dependency bump, path refactor, Node version change) will silently produce "no data" with zero breadcrumb in any log stream, making the failure invisible until someone manually re-runs the script.
+
+Solution:
+Inside the existing `catch (e)` block, emit a single diagnostic line before the `return null`. If the project already uses a structured logger (pino, winston, or a shared `log` helper), call it at `warn` level with the message `[model-stats] cost-summary failed` and attach `e.message` plus `e.stack`. If no logger is available, fall back to `console.warn('[model-stats] cost-summary failed:', e.message)`. The `return null` contract is preserved so the caller's soft-failure path is unchanged; the only addition is the one-line breadcrumb that makes the failure visible in whatever stream the operator already monitors.
+
+Benefits:
+An operator or on-call engineer can now see, in the same log stream they already watch, that the cost-summary child process failed and why (missing binary, parse error, non-zero exit), turning an invisible "no data" state into a one-line warning that points directly at the root cause. This eliminates the silent-drift failure mode where a dependency or path change silently zeroes out the stats panel for days or weeks, and it costs nothing in terms of control-flow changes or caller-side impact.
+
+### AC-55 · Silent error swallowing in turns-summary exec call
+Strength: Strong
+Files: src/model-stats-client.js
+Snippet:
+```
+  try {
+    const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'turns-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
+    return JSON.parse(stdout);
+  } catch (e) {
+    return null;
+  }
+}
+```
+
+Problem:
+The catch block in the turns-summary helper discards the caught error object entirely (the binding `e` is never read) and returns `null` with no log line, no `process.emitWarning`, and no structured error field. This conflates at least two distinct failure modes—a missing or crashed `turns-summary` script (non-zero exit, ENOENT, EACCES) and a script that exits 0 but emits malformed JSON—into a single indistinguishable `null`. Because this module is a stats/telemetry client, the absence of any diagnostic signal means an operator or developer who notices "turn-stats are always empty" has nothing to grep for, no exit code to inspect, and no way to tell whether the underlying script is broken or merely producing unexpected output.
+
+Solution:
+Inside the catch block, differentiate the two failure paths before returning. If the failure originates from `execFileSync` (check for a non-zero `status` or an `ENOENT`/`EACCES` `code`), emit a `console.warn` (or the project's logger at `warn` level) that includes the script name, the exit code or OS error code, and a one-line hint ("turns-summary script unavailable or crashed"). If the failure is a `JSON.parse` error on otherwise-valid stdout, log at `debug` level with the first 200 characters of the raw stdout so the shape mismatch is visible. In both cases, return `null` (preserving the existing contract) but attach the error as a non-enumerable property or include a `lastError` field on a module-level singleton so callers that need it can inspect it without changing the return type.
+
+Benefits:
+A developer debugging empty turn-stats can immediately see in the log whether the script is missing, crashed, or emitting bad JSON, and can act on the specific cause instead of guessing. The two failure modes become distinguishable in log output, reducing mean-time-to-diagnose for a class of "why is my telemetry blank" tickets. Because the fix is scoped to the catch block and adds no new public API surface, it carries negligible regression risk while closing a real observability gap in a module whose entire purpose is to surface operational data.
+
+### AC-56 · Silent catch around readdirSync in pipeline-health-audit.js
+Strength: Strong
+Files: src/pipeline-health-audit.js
+Snippet:
+```
+  let names;
+  try {
+    names = fs.readdirSync(logDir).filter((f) => f.endsWith('.log'));
+  } catch {
+    return findings;
+  }
+  for (const name of names) {
+```
+
+Problem:
+In the `try` block that calls `fs.readdirSync(logDir)` and filters entries for `.log` files, the `catch` block executes a bare `return findings;` with no log statement, no rethrow, and no metadata attached to the returned array. The caller cannot distinguish between "the directory exists and contains no `.log` files" and "the directory is missing, is a file, or is unreadable due to permissions." For a module whose entire purpose is to surface degraded or broken state to an operator, this silent exit means the audit reports a clean bill of health in a situation where the log directory simply could not be inspected.
+
+Solution:
+In the `catch` block, before returning, emit a structured log line (via the project's existing logger or `console.error`) that includes the `logDir` path and the caught error's `message` and `code` properties. Additionally, push a finding object into the `findings` array that records the failure (for example `{ severity: 'warn', source: 'logDir', message: err.message, code: err.code }`) so that the returned array carries an explicit signal that the directory read failed, rather than looking identical to a successful read of an empty directory.
+
+Benefits:
+Operators and downstream health-check consumers will see an explicit, attributable signal when the log directory is unreadable or missing, rather than a silent empty findings list. The audit's output becomes trustworthy: an empty findings array now genuinely means "no issues found" rather than "we could not check." Debugging a misconfigured or permission-restricted log path becomes a matter of reading one log line instead of tracing through the call stack to discover that a `catch` block was silently returning.
+
+### AC-57 · countPending silently converts I/O errors to a false-healthy zero
+Strength: Strong
+Files: src/pipeline-health-audit.js
+Snippet:
+```
+function countPending(pipelineDir) {
+  try {
+    return fs.readdirSync(path.join(pipelineDir, 'queue', 'pending')).filter((f) => f.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+}
+```
+
+Problem:
+The `countPending` helper in the pipeline-health-audit module wraps `fs.readdirSync` in a bare `catch {}` that returns `0` for *any* exception. The only benign case is `ENOENT` (the `queue/pending` directory simply hasn't been created yet on a fresh install), but the catch also swallows `EACCES`, `EPERM`, `EIO`, and `ENOTDIR`. Because this module's sole purpose is to report pipeline state, converting an unreadable queue into `0` makes the audit emit a "queue drained / healthy" signal when the true state is "I could not read the queue." In a long-running audit loop the metric looks normal, dashboards stay green, and stuck jobs go unnoticed until someone investigates manually days later.
+
+Solution:
+Narrow the catch to the single benign case by checking `err.code === 'ENOENT'` and returning `0` only in that branch. For every other error code, throw a small typed error (e.g. `class QueueReadError extends Error { constructor(code, dir) { super(`countPending: ${code} reading ${dir}`); this.code = code; } }`) so the caller in the audit loop can catch it, record the metric as `null` / `"unknown"` rather than `0`, and emit a structured warning log (`logger.warn({ err, pendingDir }, 'countPending: unable to read pending queue')`). This preserves the zero-cost ENOENT shortcut while making every other failure visible to the operator.
+
+Benefits:
+Operators and dashboards can now distinguish "genuinely zero pending jobs" from "the audit could not read the queue," eliminating the false-healthy reading that is the core observability gap. A structured warning log gives a concrete, greppable trace (error code + resolved path) for on-call triage, and the `null`/`"unknown"` sentinel prevents the metric from silently anchoring downstream SLO calculations to a fabricated zero. The fix is a two-line change to the catch block plus a one-line throw, so it carries no behavioral risk beyond making previously invisible errors visible.
+
+### AC-58 · Log non-ENOENT errors in reclaim-orphaned-drafts catch block
+Strength: Strong
+Files: src/reclaim-orphaned-drafts.js
+Snippet:
+```
+  let names = [];
+  try {
+    names = fs.readdirSync(draftingDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return { reclaimed: 0, ids: [] };
+  }
+
+```
+
+Problem:
+The `catch` block around `readdirSync` discards the error object unconditionally and returns `{ reclaimed: 0, ids: [] }`. For the expected `ENOENT` case (drafting directory not yet created on a fresh install) this is correct and intentional. However, the catch is unqualified: a permissions regression (`EACCES`, `EPERM`), a read-only mount, or a transient I/O fault produces the identical return value as a healthy empty directory. The operator's dashboard or caller log line reads "0 reclaimed" and the underlying fault is invisible, allowing orphaned drafts to accumulate with no alert.
+
+Solution:
+Inside the existing `catch (err)` block, add a single guard: if `err.code === 'ENOENT'`, fall through to the existing `return { reclaimed: 0, ids: [] }` with no additional output (preserving the current silent-path for the fresh-install case). For every other error code, emit a `console.warn` (or the project's structured-logger equivalent) that includes the function name, the directory path, `err.code`, and `err.message`, and then still `return { reclaimed: 0, ids: [] }`. Do not rethrow; do not alter the return shape or add new fields. The contract "return a result, don't throw" is preserved in all cases.
+
+Benefits:
+Operators gain a single, greppable warning line the moment a non-ENOENT I/O fault occurs, making permissions regressions and volume degradation visible in existing log pipelines without any new alerting infrastructure. The common fresh-install path remains completely silent, so log volume is unchanged for the overwhelmingly typical case. Callers continue to receive the same structured object and can rely on the existing "no-throw" contract, so no downstream code changes are required.
+
+### AC-59 · Log skipped draft files in reclaim-orphaned-drafts catch block
+Strength: Strong
+Files: src/reclaim-orphaned-drafts.js
+Snippet:
+```
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      continue; // unreadable/mid-write -- leave it, next startup can try again
+    }
+
+```
+
+Problem:
+The `catch` block in the startup reclaim loop discards every read/parse failure via a bare `continue`. The inline comment documents the intended transient case (a sibling process is mid-`writeFile` and the JSON is momentarily truncated), but the same `catch` also silently absorbs permanent failure modes — genuinely corrupt or zero-length JSON, `EACCES`/`EPERM` from a permission or SELinux change, `ENOSPC` on a temp buffer, or a FUSE/overlayfs quirk. In any of those cases the file is skipped on every subsequent boot with no log line, counter increment, or `process.emitWarning` emitted, so the operator sees "my drafts keep disappearing" with zero diagnostic breadcrumb in any log, metric, or alert.
+
+Solution:
+Add a single `console.warn` (or the project's structured-logger equivalent) inside the `catch` block, before the `continue`, that includes the file path and the error message, e.g. `console.warn(\`[reclaim-orphaned-drafts] skipping ${filePath}: ${err.message}\`)`. This is a one-line addition that does not alter control flow — the `continue` still fires, the rest of the batch still processes — but every skip, whether transient or permanent, now leaves a trace in the startup log. If the project already routes through a `pino`/`winston`/`bunyan` logger, use that instead; the requirement is simply that the event is observable.
+
+Benefits:
+An operator investigating "drafts keep disappearing" can grep the startup log for the file path and immediately see which file was skipped and why (corrupt JSON, permission denied, disk full, etc.), turning an infinite silent loop into a one-line diagnostic. The transient mid-write case still produces a harmless, easily-filtered warning, while permanent failures become visible on the very first boot after the condition appears. No behavioral change, no new dependency, no hot-path cost — the module still runs once at startup and the batch still completes.
+
+### AC-60 · Silent catch discards git-clone failure context in best-effort research pipeline
+Strength: Strong
+Files: src/research-agentic-draft.js
+Snippet:
+```
+  try {
+    execFileSync('git', ['clone', '--depth', '1', repoUrl, dir], { env: GIT_ENV, timeout: GIT_CLONE_TIMEOUT_MS, stdio: 'pipe' });
+    return dir;
+  } catch {
+    return null;
+  }
+}
+```
+
+Problem:
+The `catch { return null; }` block in the clone helper swallows the thrown `Error` object entirely. `execFileSync('git', ['clone', …])` can fail for at least five categorically different reasons—network timeout, authentication/403, repository 404 or rename, missing `git` binary or PATH misconfiguration, and disk-full or permission errors—yet the caller receives an identical `null` in every case. In the agent-manager pipeline this `null` drives a downstream decision (skip source, mark research incomplete), so a transient timeout becomes indistinguishable from a permanent 404, and an operator investigating "why did the agent drop repo X?" has no log line to grep. Because the file is a working draft (`research-agentic-draft.js`), the omission is especially likely to be promoted to production without a second review pass.
+
+Solution:
+Capture the error in the catch binding (`catch (err)`) and emit a single structured warning before returning `null`. The log line should include the repository URL, `err.message`, and—when present—`err.code` (e.g. `ETIMEDOUT`, `ENOENT`) and `err.signal` (e.g. `SIGTERM` from the `timeout` option) so that transient vs. permanent failures are immediately distinguishable in any log aggregator. The function's public contract (return the cloned directory path or `null`) is unchanged; the fix is purely additive observability. If the project already routes through a structured logger (pino, winston, etc.), prefer `logger.warn('git clone failed', { repoUrl, code: err.code, signal: err.signal, message: err.message })` over a bare `console.warn` so the fields are queryable.
+
+Benefits:
+Operators can grep a single log line to identify the exact failure mode within seconds instead of reproducing the clone manually in a different environment. The agent pipeline can later branch on the logged `code`/`signal` (e.g. retry on `ETIMEDOUT`, alert on `ENOENT`) without changing the function signature. Because the fix is one added statement inside an existing catch block, it carries no runtime cost on the success path and no API break for existing callers, making it safe to land in a draft module that is about to be promoted.
+
+### AC-61 · Log and count non-ENOENT fastpath read failures
+Strength: Strong
+Files: src/staleness-fastpath.js
+Snippet:
+```
+  let text;
+  try {
+    text = fs.readFileSync(absPath, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return fileGoneArchive();
+    return null; // any other read failure (permissions, etc.) -- not confident enough to auto-resolve, fall back to the LLM path
+  }
+```
+
+Problem:
+In the catch block that guards the fastpath file read, the `ENOENT` branch correctly archives the missing file and returns `null`. The remaining `else` branch (all other error codes) also returns `null` with no side-effect: no `log.debug`, no `log.warn`, no counter increment, no rethrow. The error object `e` is destructured only to check `e.code === 'ENOENT'` and then discarded. If a volume mount flips read-only, a service-account token expires, or the process hits an fd limit, every subsequent fastpath call silently degrades to the LLM path. Operators have no grep-able signal, no metric to alert on, and no correlation point to tie a latency or cost spike back to the underlying I/O or permission fault.
+
+Solution:
+In the non-`ENOENT` branch, before the `return null`, emit a single `log.debug` (or `log.warn` if the project treats unexpected I/O errors as operator-facing) that includes `e.code`, `e.errno`, `e.syscall`, and the file path being read. Additionally, increment a lightweight counter (e.g. `fastpath_read_errors_total`) tagged with `e.code` so a monitoring dashboard or alert can fire when the rate exceeds zero over a short window. Do not rethrow and do not change the fallback-to-LLM behavior; the fix is purely additive observability.
+
+Benefits:
+An operator can `grep` for `EACCES` or `EMFILE` in structured logs and immediately correlate the spike with a deploy, mount change, or resource-limit bump instead of spending 30+ minutes bisecting a latency regression. The tagged counter gives a ready-made alert rule ("non-ENOENT fastpath errors > 0 for 2 min") that fires before cost or p99 latency alerts do, turning a silent degradation into a 30-second diagnosis.
+
+### AC-62 · Distinguish ENOENT from other read failures in loadSchedule
+Strength: Strong
+Files: src/system-report.js
+Snippet:
+```
+function loadSchedule(instancesDir) {
+  try {
+    return JSON.parse(fs.readFileSync(schedulePath(instancesDir), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+```
+
+Problem:
+In `src/system-report.js`, the `loadSchedule` helper wraps `fs.readFileSync` + `JSON.parse` in a bare `catch` that unconditionally returns an empty object. This means a malformed JSON file, a permission-denied error, or any other I/O failure is indistinguishable from the perfectly normal "schedule file has not been created yet" case. Because this module's entire purpose is to surface system state in a report, a corrupted or unreadable schedule silently degrades to "no schedule configured," producing a report that looks healthy when it is not, and leaving no log line for an operator to diagnose the discrepancy.
+
+Solution:
+Inside the existing `catch` block, inspect `err.code`. If it is `'ENOENT'`, treat the case as the expected "file not yet present" path and return the empty object silently, exactly as before. For every other error code (or a missing `code` property, which covers `JSON.parse` syntax errors), emit a single `console.warn` line that includes the module tag `[agent-manager]`, the function name `loadSchedule`, the `instancesDir` argument for context, and `err.message`. After logging, still return the empty object so downstream callers receive a valid shape and no new crash path is introduced. No new dependencies are needed; `fs` is already imported in the file and `console.warn` is available globally.
+
+Benefits:
+Operators will now see a single, greppable warning line whenever the schedule file exists but cannot be parsed or read, immediately distinguishing "feature not configured" from "configuration is broken." The benign first-run path remains completely silent, so log volume is unchanged in the common case. The fix is a two-line change inside an existing block, introduces no new control flow, and preserves the function's return contract, making it safe to apply without further testing beyond confirming the warning appears for a deliberately corrupted file.
