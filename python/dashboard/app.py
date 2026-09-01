@@ -1565,8 +1565,10 @@ def api_benchmark_cases():
             capture_output=True, text=True, timeout=15,
         )
     except subprocess.TimeoutExpired:
+        logger.warning("reasoning-bench-cases node script timed out after 15s")
         return jsonify([])
     if result.returncode != 0:
+        logger.warning("reasoning-bench-cases node script exited with code %d: %s", result.returncode, result.stderr[:500])
         return jsonify([])
     try:
         cases = json.loads(result.stdout)
