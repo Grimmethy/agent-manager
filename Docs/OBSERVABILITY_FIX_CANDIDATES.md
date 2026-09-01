@@ -1421,3 +1421,26 @@ Replace the empty `{}` with a `console.error` call that includes the task identi
 
 Benefits:
 Any future regression in `appendHistoryEvent`—a schema mismatch, a permissions issue on the history file, a race during concurrent draft edits—will now produce a single, greppable line in stderr that names the task, the event, and the root-cause stack. Operators can correlate the log with the surrounding draft operation, confirm whether the history gap is expected (e.g., a test fixture) or a real data-loss incident, and file a targeted bug. The primary draft flow remains unaffected because the error is still contained, but it is no longer invisible.
+
+### AC-85 · Swallowed filesystem-write error in local tool client
+Strength: Strong
+Files: src/local-tool-client.js
+Snippet:
+```
+  if (!resolved) {
+    return { error: `path is not inside any accessible repo, refusing to write: ${relPath}` };
+  }
+  const { full } = resolved;
+  try {
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, typeof content === 'string' ? content : '');
+```
+
+Problem:
+At line 206 the `try` block wraps `fs.mkdirSync` (parent-directory creation) and `fs.writeFileSync` (the actual payload write). The adjacent `catch` block silently discards the thrown `Error`—it neither logs it nor returns the `{ error: … }` object that the function's own guard two lines above (`if (!resolved) return { error: … }`) establishes as the contract for failure. An agent-loop caller that branches on the returned object to decide whether the write landed will see `undefined` (or a stale success shape) and proceed as if the file exists, with no diagnostic in any log stream to explain why the expected path is missing.
+
+Solution:
+Replace the bare `catch (e) { /* … */ }` with a handler that (1) writes a single `console.error` line containing the operation name, the resolved target path, and the original error message plus stack (`console.error(\`[local-tool-client] write failed for ${resolvedPath}: ${e.message}\`, e.stack)`), and (2) returns the same `{ error: \`write failed: ${e.message}\` }` object the `!resolved` guard already uses, so the caller's existing branch logic fires correctly. No new dependency, no metrics emission—just the stdlib `console.error` the rest of this file already uses, plus the contract-shaped return value.
+
+Benefits:
+The agent loop now receives a well-formed error object it can surface to the user or retry, and any operator tailing stderr sees a single line that names the exact path and the underlying OS error (EACCES, ENOSPC, EROFS, etc.) without needing to add a debugger. The function's error contract becomes uniform: every failure path—unresolved path, permission denial, disk full—yields the same `{ error: … }` shape, eliminating the silent-success blind spot.
