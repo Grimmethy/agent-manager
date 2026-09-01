@@ -1168,3 +1168,26 @@ Add `import logging` at the top of the module (the stdlib `logging` module is al
 
 Benefits:
 Once fixed, any operator or on-call engineer inspecting the log stream can immediately see which file was skipped, why (truncated JSON, permission error, encoding mismatch), and how many files were affected, turning an otherwise silent zero-output condition into a one-line diagnostic. The cost is a single `logging.warning` call per failure (a no-op at the default `INFO` level if the handler is not configured, but present in any `DEBUG`/`WARNING`-level log sink), so the happy path is unaffected and no new dependency or metrics infrastructure is introduced.
+
+### AC-74 · Log swallowed errors in cleanupAdhocWorktree
+Strength: Strong
+Files: src/agentic-draft-common.js
+Snippet:
+```
+}
+
+function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* best-effort */ }
+}
+
+```
+
+Problem:
+`cleanupAdhocWorktree` performs two independent git operations (`git worktree remove` and `git branch -D`) and catches each error in a bare `catch (e) { /* best-effort */ }` with no log, rethrow, or other side-effect. In a long-lived agent pipeline that spawns many ad-hoc worktrees per session, a silent failure (zombie process holding the worktree, read-only mount, branch already merged) leaves stale worktrees on disk and orphan branches in the ref namespace. Over hours or days this accumulates into a real disk-space leak and ref clutter, yet `git worktree list` and `git branch` will show the residue with zero log lines to explain why cleanup failed. The scanner's `silent-catch-block` rule correctly flags this: the catch blocks are invisible.
+
+Solution:
+Add a single `console.warn` call inside each of the two catch blocks, logging the operation that failed and the caught error. For the worktree-removal catch, emit `console.warn(\`cleanupAdhocWorktree: failed to remove worktree ${worktreePath}: ${e.message}\`)`. For the branch-deletion catch, emit `console.warn(\`cleanupAdhocWorktree: failed to delete branch ${branchName}: ${e.message}\`)`. Do not rethrow — the best-effort contract (caller must not crash) is preserved. No new dependency, no metrics, no framework; only `console.warn` from Node stdlib, matching the project's existing logging convention.
+
+Benefits:
+An operator investigating unexpected disk growth or stale refs now has a timestamped, greppable log line identifying exactly which worktree path or branch name failed and why (e.g. "fatal: cannot remove worktree: Directory not empty"). The silent-failure cost no longer compounds silently across a long pipeline session. Debugging "why are there 40 stale worktrees?" drops from a multi-hour forensic exercise to a single `grep "cleanupAdhocWorktree" server.log`. The best-effort semantics are unchanged — the caller still proceeds regardless — so no downstream behavior shifts.
