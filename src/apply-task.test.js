@@ -432,6 +432,72 @@ test('performance_review: same direct-to-main shape (domain: default, source: pe
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
+// --- applyDirectToMainBatch: N directToMain triage tasks -> ONE fetch/reset/commit/push
+// instead of N. This is the fix for a 140-task backlog drain producing 140 pushed commits
+// to master (see the function's own header). --------------------------------------------
+
+const { applyDirectToMainBatch } = require('./apply-task.js');
+
+let _batchAc = 0;
+function batchTriageTask(id, extra) {
+  _batchAc += 1;
+  return archDiscoveryTask({
+    id,
+    source: 'observability_review',
+    implementResponse: [`### AC-${_batchAc} · candidate ${id}`, 'Strength: Strong', 'Files: foo.js', '', 'Problem: p', 'Solution: s'].join('\n'),
+    title: `Triage ${id}`,
+    ...extra,
+  });
+}
+
+test('applyDirectToMainBatch: three triage tasks share ONE fetch/reset/commit/push', () => {
+  const gitRunner = createFakeGitRunner();
+  const tasks = [batchTriageTask('b1'), batchTriageTask('b2'), batchTriageTask('b3')];
+  const out = applyDirectToMainBatch(tasks, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.committed, true);
+  assert.equal(out.pushed, true);
+  for (const id of ['b1', 'b2', 'b3']) assert.equal(out.results[id].succeeded, true);
+
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.equal(names.filter((n) => n === 'fetchMain').length, 1);
+  assert.equal(names.filter((n) => n === 'resetToMain').length, 1);
+  assert.equal(names.filter((n) => n === 'commit').length, 1, 'exactly one commit for the whole batch');
+  assert.equal(names.filter((n) => n === 'pushMain').length, 1, 'exactly one push for the whole batch');
+});
+
+test('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
+  const gitRunner = createFakeGitRunner();
+  const good = batchTriageTask('ok1');
+  const bad = baseTask({ id: 'branchy-1', source: 'trouble_log' }); // real branch source, not directToMain
+  const out = applyDirectToMainBatch([good, bad], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.results.ok1.succeeded, true);
+  assert.equal(out.results['branchy-1'].succeeded, false);
+  assert.match(out.results['branchy-1'].reason, /not directToMain/i);
+  // the bad task never reached git
+  assert.ok(!gitRunner.calls.some((c) => c.name === 'createBranch'));
+});
+
+test('applyDirectToMainBatch: a push failure marks every batched task failed, commit kept local', () => {
+  const gitRunner = createFakeGitRunner({ failOn: 'pushMain', failMessage: 'remote: connection reset' });
+  const out = applyDirectToMainBatch([batchTriageTask('p1'), batchTriageTask('p2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.committed, true);
+  assert.equal(out.pushed, false);
+  assert.equal(out.results.p1.succeeded, false);
+  assert.equal(out.results.p2.succeeded, false);
+  assert.match(out.results.p1.reason, /push to main failed/i);
+  assert.equal(gitRunner.calls.filter((c) => c.name === 'commit').length, 1);
+});
+
+test('applyDirectToMainBatch: empty input does not touch git', () => {
+  const gitRunner = createFakeGitRunner();
+  const out = applyDirectToMainBatch([], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.committed, false);
+  assert.equal(gitRunner.calls.length, 0);
+});
+
 // --- awaiting-confirm gate: a Group B batch containing a delete holds for human
 // confirmation instead of touching git or disk (src/apply-group-b.js's
 // batchContainsDeleteMode + src/apply-task.js's gate just before the git-branch-diff

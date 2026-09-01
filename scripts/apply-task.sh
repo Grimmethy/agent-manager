@@ -80,7 +80,46 @@ fi
 
 mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR"
 
-for file in "${files[@]}"; do
+# Split approved tasks into directToMain triage tasks (candidate-doc appends -- batchable
+# into ONE commit+push) and everything else (per-task apply to an agent/<id> branch).
+# Without this, a backlog of N reviewed triage tasks becomes N tiny commits pushed to main
+# one at a time (each forced to push because an unpushed commit ahead of origin is wiped by
+# the next task's resetToMain). See apply-task.js applyDirectToMainBatch.
+partition="$(node "${REPO_DIR}/src/apply-task.js" --partition "${files[@]}")"
+mapfile -t direct_files < <(printf '%s' "$partition" | node -e 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).direct.forEach((f)=>console.log(f))}catch(e){}')
+mapfile -t other_files  < <(printf '%s' "$partition" | node -e 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).other.forEach((f)=>console.log(f))}catch(e){}')
+
+# If --partition itself failed (empty output / both arrays empty despite having files),
+# fall back to treating everything as individual -- never silently skip approved work.
+if [[ ${#direct_files[@]} -eq 0 && ${#other_files[@]} -eq 0 ]]; then
+  other_files=("${files[@]}")
+fi
+
+if [[ ${#direct_files[@]} -gt 0 ]]; then
+  printf '[apply-task] batching %s directToMain triage task(s) into one commit...\n' "${#direct_files[@]}"
+  batch_result="$(node "${REPO_DIR}/src/apply-task.js" --batch "${direct_files[@]}")"
+  # One TSV line per task: <path>\t<succeeded 1|0>\t<note>
+  printf '%s' "$batch_result" | node -e '
+    try {
+      const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      for (const r of (o.results || [])) {
+        console.log([r.path, r.succeeded ? "1" : "0", String(r.doneMarker || r.reason || "").replace(/\s+/g, " ")].join("\t"));
+      }
+    } catch (e) { /* handled below: any direct_file not printed stays in approved/ for next tick */ }
+  ' | while IFS=$'\t' read -r bpath bok bnote; do
+      [[ -z "$bpath" ]] && continue
+      btid="$(basename "$bpath" .json)"
+      if [[ "$bok" == "1" ]]; then
+        mv "$bpath" "${DONE_DIR}/${btid}.json"
+        printf '[apply-task] %s: applied (triage batch) -- %s\n' "$btid" "$bnote"
+      else
+        mv "$bpath" "${BLOCKED_DIR}/${btid}.json"
+        printf '[apply-task] %s: FAILED (triage batch) -- %s\n' "$btid" "$bnote" >&2
+      fi
+    done
+fi
+
+for file in "${other_files[@]}"; do
   task_id="$(basename "$file" .json)"
   printf '[apply-task] applying %s...\n' "$task_id"
 
@@ -103,3 +142,8 @@ for file in "${files[@]}"; do
     printf '[apply-task] %s: FAILED -> %s\n' "$task_id" "$result" >&2
   fi
 done
+
+# Housekeeping: drop per-task work logs (queue/worklogs/) for tasks that have left the
+# pre-merge queue. local-draft.js prunes too, but this covers a deployment where drafts
+# are rare and the apply loop is the regularly-running daemon.
+node "${REPO_DIR}/src/work-log.js" --prune >/dev/null 2>&1 || true
