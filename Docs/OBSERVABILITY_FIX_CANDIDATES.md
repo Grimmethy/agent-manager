@@ -1513,3 +1513,26 @@ Replace the empty `catch (e) {}` with a handler that writes a well-formed JSON f
 
 Benefits:
 The CLI's single output contract (one JSON object on stdout) is preserved for every code path, so downstream parsers never see a malformed or missing result. Operators get a machine-readable `reason` string that names the file and the underlying error, making "bad path" vs. "truncated JSON" immediately distinguishable in CI logs or agent transcripts. The non-zero exit code lets shell scripts and CI pipelines fail fast instead of proceeding with `undefined` task data, eliminating the class of confusing secondary crashes and silent no-ops this bug currently produces.
+
+### AC-89 · Over-broad catch in single-flight lock readdir swallows non-ENOENT errors as "nobody waiting"
+Strength: Strong
+Files: src/single-flight-lock.js
+Snippet:
+```
+function someoneIsWaiting(instancesDir) {
+  try {
+    return fs.readdirSync(priorityWaitDirPath(instancesDir)).length > 0;
+  } catch (e) {
+    return false; // directory doesn't exist yet -- nobody has ever waited.
+  }
+}
+```
+
+Problem:
+The `catch` block around `fs.readdirSync` returns `false` for every error code, not just the documented `ENOENT` case (directory was never created, so no other instance is queued). A transient `EMFILE`/`ENFILE` under load, a post-deploy `EACCES`, or an `ENOTDIR` typo all collapse into the same "nobody is waiting" answer. Because this function is the sole gate of a single-flight lock, a spurious `false` lets two or more instances simultaneously believe they hold the lock, silently breaking mutual exclusion with no log line, no metric, and no signal to the operator.
+
+Solution:
+Narrow the catch to inspect `err.code`. When the code is `ENOENT`, keep the existing `return false` (the directory was never created, so no peer is queued). For every other code, emit a single `console.error` line that names the lock directory path, the `err.code`, and `err.message` (e.g. `console.error(\`[single-flight-lock] readdir failed for ${dir}: ${err.code} ${err.message}\`)`), then `throw err` so the caller's existing error-handling path can decide whether to retry, fail-fast, or escalate. This uses only `console.error`, which is the project's established Node logging primitive, and introduces no new dependency.
+
+Benefits:
+A transient filesystem error no longer silently degrades the lock into a no-op. Operators get one greppable, context-rich log line identifying the exact directory and errno, and the calling code receives a thrown exception it can act on (bounded retry, process abort, alert) instead of proceeding under a false assumption of exclusivity. The `ENOENT` fast-path remains a zero-cost `return false`, so the common "directory not yet created" case is unchanged.
