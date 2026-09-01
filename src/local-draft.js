@@ -647,7 +647,17 @@ async function runPlanPass(task, {
   // every clean community is a coin-flip between those two fates. Candidate-
   // FULFILLMENT sources (arch_review, observability_fix, ...) are excluded: they have a
   // specific candidate to implement, so an empty plan there is a genuine model failure.
-  const allowEmptyPlan = isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source);
+  // advisoryProse sources (pipeline_forensics, staleness_audit, observability_review, ...)
+  // produce a prose report/verdict, not a code diff -- the plan pass's QUERY-line output is
+  // supplementary grounding, never a required artifact, and critique is already skipped for
+  // them (runCritiqueAndRevision). An empty plan roll must not block the whole draft:
+  // confirmed live 2026-09-01, the pipeline_forensics study of the "empty-degenerate-draft"
+  // signature blocked at "Plan pass degenerate: empty" -- a 1400-token plan budget spent on
+  // the think trace against a 26KB evidence prompt -- so the report pass (which PR #64 gave
+  // a real 16K budget) never ran at all. Let it fall through to implement, same as the
+  // emptyApproval generators below.
+  const allowEmptyPlan = (isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source))
+    || isAdvisoryProseSource(resolveSourceName(task));
   // Fix 1/2 (2026-08-31, bra-1788142124203): for adhoc tasks, gate the plan on real
   // substance and, when a prior attempt on this same task already produced a good plan,
   // seed the pass with it rather than cold-roll every retry. Scoped to adhoc -- the
