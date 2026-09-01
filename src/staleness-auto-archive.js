@@ -127,7 +127,9 @@ function holdForHumanReview(pipelineDir, originalTaskId, stalenessAuditTaskId, r
     appendHistoryEvent(data, 'advisory', `staleness_audit ${stalenessAuditTaskId} recommended archive, but with no verifiable resolution signal -- left here for you: ${excerpt.slice(0, 200)}`);
     fs.writeFileSync(ncPath, JSON.stringify(data, null, 2));
     return originalTaskId;
-  } catch { /* not in needs-clarification/ -- try blocked/ */ }
+  } catch (err) {
+    console.error(`staleness-auto-archive: needs-clarification attempt failed, falling through to blocked/ -- task=${originalTaskId} path=${ncPath} error=${err.message}\n${err.stack}`);
+  }
 
   const blockedPath = path.join(queueDir, 'blocked', `${originalTaskId}.json`);
   let data;
