@@ -459,3 +459,59 @@ test('buildToolHandlers/grep_codebase rejects a `root` that is not one of the al
     assert.match(h.grep_codebase({ query: 'x', dir: '.', root: os.homedir() }).error, /not an accessible repo/);
   });
 });
+
+// --- Edit-by-turn-N forcing function (nudgeToEditEarly) --------------------------------
+
+test('nudgeToEditEarly: after ORIENT_TURN_LIMIT turns with zero edits, one "stop exploring" message is injected', async () => {
+  const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '3';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nwhich approach?' };
+    // turns 1..5 explore, turn 6 concludes
+    await withMockedChat([explore, explore, explore, explore, explore, finish], async (mod, _dir, { sentBodies }) => {
+      const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, nudgeToEditEarly: true });
+      assert.match(result.response, /needs-human-decision/);
+      // withMockedChat stores each request body BY REFERENCE and runPlanWithTools mutates
+      // `messages` in place, so every sentBodies[i].messages is the same, final array --
+      // assert on that final conversation instead of on per-request snapshots.
+      const msgs = sentBodies[sentBodies.length - 1].messages;
+      const nudgeIdx = msgs.findIndex((m) => m.role === 'user' && /Stop exploring now/.test(m.content || ''));
+      assert.ok(nudgeIdx > 0, 'a nudge message was injected');
+      assert.equal(msgs.filter((m) => m.role === 'user' && /Stop exploring now/.test(m.content || '')).length, 1, 'exactly one nudge, ever');
+      // it lands only after the orientation budget (3) is spent: >= 3 assistant turns before it
+      const assistantsBeforeNudge = msgs.slice(0, nudgeIdx).filter((m) => m.role === 'assistant').length;
+      assert.ok(assistantsBeforeNudge >= 3, `nudge should follow >= 3 explore turns, followed ${assistantsBeforeNudge}`);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+    else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prev;
+  }
+});
+
+test('nudgeToEditEarly: NO nudge when the model edits within the orientation budget', async () => {
+  const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '3';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const edit = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'x', replace: 'y' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndid it' };
+    await withMockedChat([explore, edit, explore, explore, explore, finish], async (mod, dir, { sentBodies }) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, nudgeToEditEarly: true, primaryRoot: dir });
+      const nudged = sentBodies.some((b) => (b.messages || []).some((m) => m.role === 'user' && /Stop exploring now/.test(m.content || '')));
+      assert.equal(nudged, false, 'an edit within the budget suppresses the nudge');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+    else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prev;
+  }
+});
+
+test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
+  const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  await withMockedChat([explore, explore, explore, { role: 'assistant', content: 'done' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 20 });
+    assert.ok(!sentBodies.some((b) => (b.messages || []).some((m) => /Stop exploring now/.test(m.content || ''))));
+  });
+});

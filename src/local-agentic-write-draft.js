@@ -25,7 +25,7 @@
 const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
-const { runPlanWithTools } = require('./local-tool-client.js');
+const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
 
@@ -94,6 +94,7 @@ function buildWriteAgenticPrompt(task) {
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Reserve run_bash for the final targeted check on files you actually changed; do not use it to grep, find, cat, or list the tree.',
+    `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${ORIENT_TURN_LIMIT} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`,
     '',
     `Title: ${task.title || ''}`,
     '',
@@ -172,6 +173,11 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
       // so resolveAgenticDraft has something to route on instead of a hard block.
       forceSummaryOnCap: true,
+      // Edit-by-turn-N forcing function: this tier's whole job is to produce a diff, and
+      // it has repeatedly burned its entire budget on read-only orientation. If it hasn't
+      // edited anything by ORIENT_TURN_LIMIT turns, runPlanWithTools pushes one firm
+      // "stop exploring, act now" message.
+      nudgeToEditEarly: true,
     });
     modelStatsSafe(recordModelCall, {
       taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
