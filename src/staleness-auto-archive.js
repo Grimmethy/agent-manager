@@ -47,7 +47,10 @@ function hasResolutionSignal(task, reportText) {
   try { ({ repoRoot } = require('./config.js').getConfig()); } catch { return false; }
   try {
     return checkCommitClaims(reportText || '', repoRoot).some((c) => c.exists === true);
-  } catch { return false; }
+  } catch (err) {
+    console.error('[staleness-auto-archive] checkCommitClaims failed:', (reportText || '').slice(0, 80), err.message, err.stack);
+    return false;
+  }
 }
 
 // Same three-part structure stalenessAuditImplementPrompt (prompts.js) asks the model
