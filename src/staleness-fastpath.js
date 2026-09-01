@@ -136,6 +136,7 @@ function deterministicRecheck(task, repoRoot) {
     text = fs.readFileSync(absPath, 'utf8');
   } catch (e) {
     if (e.code === 'ENOENT') return fileGoneArchive();
+    console.warn('fastpath read failed (non-ENOENT):', e.code, e.errno, e.syscall, absPath);
     return null; // any other read failure (permissions, etc.) -- not confident enough to auto-resolve, fall back to the LLM path
   }
 
