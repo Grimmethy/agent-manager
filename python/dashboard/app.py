@@ -3722,6 +3722,51 @@ def api_chat_new():
     return jsonify(session)
 
 
+@app.route("/api/chat/inject", methods=["POST"])
+def api_chat_inject():
+    """Appends a chunk of text as a user message into a dashboard chat session for
+    follow-up -- the single endpoint the dashboard's "Send to chat" buttons (task
+    detail, Brain Dump) POST the task log / brain-dump text to. It only RECORDS the
+    user turn (persisted, visible in the panel); it deliberately does NOT call the
+    model -- the user reads the injected context and then sends their own follow-up
+    question via the normal /api/chat/<session_id>/message route.
+
+    Body: {text: string, sessionId?: string}. Without sessionId: the currently active
+    session is used (get_active_session creates one if none exists yet, matching what
+    /api/chat/active does on panel load); if that still yields nothing a brand-new
+    conversation is started. Either way the resulting session id comes back in the
+    response so the button's caller can link back to it."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        abort(400, description="text is required")
+
+    from chat_sessions import get_active_session, get_session, inject_user_message
+    from chat_sessions import start_new_conversation, PROVIDER_LOCAL
+
+    session_id = (body.get("sessionId") or "").strip()
+    if session_id:
+        existing = get_session(CHAT_STORAGE_DIR, session_id)
+        if not existing or existing.get("status") != "active":
+            abort(404, description="no active chat session with that id")
+    else:
+        session = _call_chat(get_active_session, CHAT_STORAGE_DIR, _chat_roots(),
+                             instances_dir(), provider=PROVIDER_LOCAL)
+        session_id = (session or {}).get("id") or (session or {}).get("session_id")
+        if not session_id:
+            provider, model, effort = _discuss_provider_args()
+            session = _call_chat(start_new_conversation, CHAT_STORAGE_DIR, _chat_roots(),
+                                 instances_dir(), provider=provider, model=model, effort=effort)
+            session_id = (session or {}).get("id") or (session or {}).get("session_id")
+        if not session_id:
+            abort(500, description="could not resolve or start a chat session")
+
+    injected = _call_chat(inject_user_message, CHAT_STORAGE_DIR, session_id, text)
+    if not injected:
+        abort(404, description="no active chat session with that id")
+    return jsonify({"session": injected, "sessionId": injected.get("id") or session_id})
+
+
 # --- Chat "make GPU space" preemption (brain dump #5) ----------------------------------
 # The Chat panel is for live repo investigation and shares the one resident local model
 # with the pipeline's worker/reviewer lanes on the same single-flight lock. When they're
