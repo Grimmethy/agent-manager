@@ -1762,7 +1762,10 @@ registerTaskSource('pipeline_forensics', {
   priority: taskPriority('pipeline_forensics', 66),
   next: nextPipelineForensicsTask,
   apply: applyForensicsReport,
-  emptyApproval: true,
+  // NOT emptyApproval: the detector already guarantees a real subject to study, so an
+  // empty implement response means the model failed to produce the report -- reject and
+  // retry it, don't auto-approve nothing. (An "insufficient evidence" outcome is the
+  // explicit "NO CLEAR ROOT CAUSE" line, which is non-empty.)
   advisoryProse: true,
   harnessSearch: 'archImport',
   reasoningTier: 'low',
