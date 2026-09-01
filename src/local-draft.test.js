@@ -1461,3 +1461,19 @@ test('planIsThin: fewer than 2 numbered steps or under the char floor is thin; a
   assert.equal(planIsThin(undefined), true);
   assert.equal(planIsThin(PLAN_STUB), false);
 });
+
+test('planIsThin: a real plan whose steps are markdown headings ("## 1.") is not thin', () => {
+  const { planIsThin } = require('./local-draft.js');
+  const headingPlan = [
+    '## 1. Locate the detail modal',
+    'The modal is rendered in src/ui.js; find the component that owns tailModal and actionHeader.',
+    '',
+    '## 2. Adjust the header layout',
+    'Update the flex container so the action buttons align right without wrapping on narrow widths.',
+    '',
+    '### 3. Verify',
+    'Run the dashboard and confirm the header renders correctly at 320px and 1280px.',
+  ].join('\n');
+  assert.ok(headingPlan.length >= 200);
+  assert.equal(planIsThin(headingPlan), false);
+});
