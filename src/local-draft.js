@@ -875,10 +875,21 @@ function computeImplementBudget(task, implPrompt) {
   // exceeding what a single code diff needs. product_spec_outline (2026-08-30) is the
   // brownfield analogue of backlog_decomposition -- it writes the same multi-candidate
   // AC-NNN block list -- so it belongs in the same higher-ceiling class.
-  const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline') ? 16000 : 8000;
+  // pipeline_forensics (2026-09-01): the same "whole document, no natural ceiling" class
+  // as product_spec -- its implement pass writes a full ranked root-cause report (RANKING /
+  // CONTRAST / RECOMMENDED FIX). But its PLAN is deliberately tiny (2-3 `QUERY:` lines), so
+  // the planChars*2 floor lands on 2800 -- and think:true then spends that entire budget on
+  // the reasoning trace, emitting zero final content (confirmed live on the first real run:
+  // eval_count 2800, implementResponse empty). Its "how much output" signal is the evidence
+  // blob, not the plan, so it gets its own higher floor plus the 16000 ceiling.
+  const isWholeDocReport = task.source === 'pipeline_forensics';
+  const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline' || isWholeDocReport) ? 16000 : 8000;
+  const forensicsFloor = isWholeDocReport
+    ? Math.max(6000, Math.ceil(((task.promptContext && task.promptContext.evidenceText) || '').length / 8))
+    : 2800;
   const implNumPredict = hasFixedLiterals
     ? Math.min(implNumPredictCeiling, Math.max(1400, fixedLiteralsChars))
-    : Math.min(implNumPredictCeiling, Math.max(2800, planChars * 2));
+    : Math.min(implNumPredictCeiling, Math.max(forensicsFloor, planChars * 2));
   // think:false when fixedLiterals are present -- num_predict is a cap on TOTAL
   // generated tokens, thinking trace included, so a "think" pass spent reasoning
   // about a plain transcription task eats directly into the same budget the actual

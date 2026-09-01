@@ -392,6 +392,19 @@ test('computeImplementBudget still grows implNumCtx past the floor for a whole-d
   assert.ok(big.implNumCtx <= 32768, 'still capped at 32768');
 });
 
+test('computeImplementBudget gives pipeline_forensics a large implement budget despite a tiny plan', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const tinyPlan = { source: 'pipeline_forensics', planResponse: 'QUERY: a\nQUERY: b', promptContext: { evidenceText: 'x'.repeat(24000) } };
+  const b = computeImplementBudget(tinyPlan, 'z'.repeat(20000));
+  assert.ok(b.implNumPredict >= 6000, `floor should clear the report length, got ${b.implNumPredict}`);
+  assert.ok(b.implNumPredict <= 16000, 'capped at the whole-document ceiling');
+  assert.equal(b.allowEmptyImplement, false, 'an empty forensic report is a failure, not a valid answer');
+
+  // contrast: a normal source with the same tiny plan stays at the 2800 floor
+  const normal = computeImplementBudget({ source: 'manual', planResponse: 'QUERY: a\nQUERY: b' }, 'z'.repeat(20000));
+  assert.equal(normal.implNumPredict, 2800);
+});
+
 test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
   const { computeImplementBudget } = require('./local-draft.js');
   const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
