@@ -208,6 +208,7 @@ function writeFileTool(a, b) {
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, typeof content === 'string' ? content : '');
   } catch (e) {
+    console.error(`[local-tool-client] write failed ${full}: ${e.message}`, e.stack);
     return { error: `could not write ${relPath}: ${e.message}` };
   }
   return { path: relPath, written: true };
