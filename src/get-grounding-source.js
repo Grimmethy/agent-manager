@@ -282,7 +282,7 @@ function main() {
   try {
     ({ repoRoot } = getConfig());
   } catch (e) {
-    repoRoot = null;
+    console.warn(`[get-grounding-source] getConfig() failed, repoRoot will remain null: ${e?.message ?? e}`);
   }
 
   if (pc) {
