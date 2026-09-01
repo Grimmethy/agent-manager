@@ -195,6 +195,7 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   try {
     result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source });
   } catch (e) {
+    console.error(`[local-agentic-draft] runPlan failed for task ${task.id ?? task.source}: ${e?.message ?? String(e)}`);
     return { applied: false, succeeded: true, reason: `local agentic investigation failed: ${e.message}` };
   }
   modelStatsClient.recordCall({
