@@ -109,6 +109,7 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
     // rejected, but a needless spawn/reject cycle roughly every watchdog tick.
     names = fs.readdirSync(instancesDir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
   } catch (e) {
+    console.warn(`[dead-process-check] readdirSync failed for ${instancesDir}: ${e.code ?? e.message}`);
     return actions;
   }
 
