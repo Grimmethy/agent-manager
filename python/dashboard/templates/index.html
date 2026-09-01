@@ -220,6 +220,14 @@
   .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .grill-msg-assistant .grill-msg-role { color: var(--accent); }
   .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  /* 2026-09-01 (Grimmethy: "each thinking segment to include a full blank line space
+     between each other" + "time stamps to the second programmed into each thought
+     segment"): transcript text is now split on blank lines into <p> blocks (see
+     grillRenderTranscript) -- each gets a per-segment HH:MM:SS stamp and a full
+     blank-line gap between it and the next segment. */
+  .grill-msg-text p { margin: 0 0 1em 0; }
+  .grill-msg-text p:last-child { margin-bottom: 0; }
+  .grill-seg-ts { display: inline-block; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 0.5em; }
   .grill-msg-user { align-self: flex-end; max-width: 85%; }
   .grill-msg-user .grill-msg-role { text-align: right; }
   .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }
@@ -5293,7 +5301,24 @@ function grillRenderTranscript(transcript, session) {
   const rows = transcript.map((t) => {
     const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
     const cls = t.role === 'assistant' ? 'grill-msg-assistant' : 'grill-msg-user';
-    return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${escapeHtml(t.text)}</div></div>`;
+    // 2026-09-01 (Grimmethy: "each thinking segment to include a full blank line space
+    // between each other" + "time stamps to the second programmed into each thought
+    // segment"): split the turn's text on blank lines into <p> blocks (CSS gives them
+    // the full-line gap) and, when the turn carries a `timestamp` (chat_sessions.py
+    // started recording one per turn, to the second), stamp every segment with it.
+    // Turns persisted before that change have no `timestamp` -- they just render
+    // plain, as before.
+    let body;
+    if (t.timestamp) {
+      const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
+      const stamp = m ? `${m[1]}:${m[2]}:${m[3]}` : String(t.timestamp).slice(11, 19);
+      body = String(t.text).split(/\n{2,}/).map(seg =>
+        `<p><span class="grill-seg-ts">${escapeHtml(stamp)}</span>${escapeHtml(seg)}</p>`
+      ).join('');
+    } else {
+      body = escapeHtml(t.text);
+    }
+    return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${body}</div></div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="grill-transcript">${rows}</div>`;
 }
