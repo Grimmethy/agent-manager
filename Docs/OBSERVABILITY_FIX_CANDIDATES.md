@@ -347,3 +347,26 @@ Immediately above the `} catch (err) {` line in the brain-dump sort function (th
 
 Benefits:
 Documents the intentional retry-by-silence design decision inline, reducing the chance of a well-meaning refactor breaking the worker loop. Pairs with the diagnostic from sub-candidate 1 to give both runtime visibility (console.warn) and static context (comment) for the same code path.
+
+### AC-39 · Silent exception swallowing in alert-feed reader leaves no trace of degradation
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            data = json.loads(p.read_text(encoding="utf-8"))
+            generated_at = data.get("generatedAt")
+            alerts.extend(data.get("alerts") or [])
+        except Exception:
+            pass  # unreadable feed file -- queue-derived alerts still go out
+
+    return jsonify({"generatedAt": generated_at, "alerts": alerts})
+```
+
+Problem:
+The `except Exception` block around the file-based alert feed read catches every exception type—including `TypeError`, `AttributeError`, or any future programming error inside the `data.get(...)` / `alerts.extend(...)` lines—and discards it with no log line, counter increment, or response-header signal. In a dashboard whose sole purpose is to surface alerts to operators, a persistent `FileNotFoundError` or a malformed-JSON feed is indistinguishable from a genuinely quiet day, and a genuine code bug is equally invisible. The comment documents the *intent* (graceful degradation) but the implementation provides zero observability for the degradation event itself.
+
+Solution:
+Narrow the primary catch to the two exception families the comment actually anticipates—`OSError` (which covers `FileNotFoundError`, `PermissionError`, and other I/O failures) and `json.JSONDecodeError` (malformed feed content)—and emit a `logger.warning("Alert feed %s unreadable, skipping: %s", p, exc)` before falling through to the queue-derived alerts. Add a second, broader `except Exception` backstop that calls `logger.exception("Unexpected error reading alert feed %s", p)` so any unforeseen bug still degrades gracefully but leaves a full traceback in the log stream. No re-raise, no status-code change; the endpoint still returns 200 with whatever alerts it could assemble.
+
+Benefits:
+Operators can now distinguish "fewer alerts today" from "feed file has been unreadable for three days" by grepping the dashboard log for the warning line, and any genuine programming error in the feed-parsing path produces a full traceback instead of vanishing. The graceful-degradation contract (never 500 the whole dashboard because one optional feed is down) is preserved exactly, while the silent-failure gap that the scanner flagged is closed with two lines of logging and a tighter exception scope.
