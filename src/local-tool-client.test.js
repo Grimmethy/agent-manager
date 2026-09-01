@@ -348,6 +348,32 @@ test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when the model
   });
 });
 
+test('runPlanWithTools with forceSummaryOnCap adds a turn when the model STOPS EARLY with no RESOLUTION line', async () => {
+  const toolTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const earlyStop = { role: 'assistant', content: 'I have looked around and I think the modal lives in ui.js.' };
+  const summaryTurn = { role: 'assistant', content: 'Final answer.\n\nRESOLUTION: needs-human-decision\nwhich file owns the header?' };
+  await withMockedChat([toolTurn, earlyStop, summaryTurn], async (mod, _dir, { sentBodies }) => {
+    // cap is 10 but the model quits after turn 2 -- the forced turn still fires
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.turnsUsed, 3, 'the early stop (2) plus the forced summary turn');
+    assert.match(result.response, /RESOLUTION: needs-human-decision/);
+    const last = sentBodies[sentBodies.length - 1];
+    assert.deepEqual(last.tools, []);
+  });
+});
+
+test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when an early stop already has a RESOLUTION line', async () => {
+  const toolTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const earlyStop = { role: 'assistant', content: 'Done.\n\nRESOLUTION: no-changes-needed\nthe behaviour is already correct.' };
+  await withMockedChat([toolTurn, earlyStop], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, forceSummaryOnCap: true });
+    assert.equal(result.turnsUsed, 2);
+    assert.equal(result.forcedSummary, undefined);
+    assert.match(result.response, /RESOLUTION: no-changes-needed/);
+  });
+});
+
 test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the kill switch file is present', async () => {
   await withMockedChat([], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'hi' });

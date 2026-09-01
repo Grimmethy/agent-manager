@@ -684,6 +684,34 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const turnStartLengths = [];
   const turnStartLogLengths = [];
 
+  // A final no-tools message that already carries a RESOLUTION: line is a clean finish and
+  // needs no forced-summary turn. Anchored + multiline so it matches the line the
+  // agentic-draft resolvers actually parse, not the word appearing mid-sentence.
+  const HAS_RESOLUTION_RE = /^\s*RESOLUTION:/im;
+
+  // One extra no-tools turn that asks only for the RESOLUTION line, reusing whatever the
+  // model already learned. Shared by the two forceSummaryOnCap paths below (cap hit while
+  // still calling tools; stopped early with no RESOLUTION line). See the header on the
+  // forceSummaryOnCap param and the call sites for why each path needs it.
+  const runForcedSummaryTurn = async () => {
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+    messages.push({
+      role: 'user',
+      content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
+    });
+    turnsUsed += 1;
+    const { message: summaryMsg, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
+    const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+    return {
+      response: summaryContent || (lastMessage && lastMessage.content) || '',
+      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
+    };
+  };
+
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
     turnStartLengths.push(messages.length);
@@ -704,7 +732,20 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     lastMessage = message;
     const toolCalls = message.tool_calls || [];
     if (toolCalls.length === 0) {
-      return { response: message.content || '', toolCallLog, turnsUsed, toolsDisabled: false };
+      const content = message.content || '';
+      // forceSummaryOnCap, voluntary-stop case (bra-1788142124203 follow-up): the model can
+      // also just END early -- a final no-tools message well before the cap -- without ever
+      // writing a RESOLUTION: line. resolveAgenticDraft reads that exactly as fatally as a
+      // cap-out ("cannot determine outcome -> hard block"), throwing away a run that may
+      // have gotten most of the way there. Confirmed live: a tier-3 write run stopped at
+      // turn 12 of 20 with a plain no-tools message and blocked with zero salvageable
+      // output. Same remedy as the cap path -- one more no-tools turn asking only for the
+      // sentinel -- gated on the caller opting in and the line genuinely being absent (a
+      // clean finish still returns immediately, as before).
+      if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content)) {
+        return runForcedSummaryTurn();
+      }
+      return { response: content, toolCallLog, turnsUsed, toolsDisabled: false };
     }
     executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
   }
@@ -718,26 +759,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // resolveAgenticDraft can only read that as "did not end with a RESOLUTION: line ->
   // hard block", discarding the entire run (a real tier-3 case burned all 20 turns on
   // read-only exploration and blocked with zero salvageable output). Spend ONE final
-  // no-tools turn asking only for the RESOLUTION line. Off by default so the Chat panel
-  // CLI path (which has its own "ran out of budget" explainer keyed on turnsUsed) is
-  // unaffected.
+  // no-tools turn asking only for the RESOLUTION line (runForcedSummaryTurn, shared with
+  // the voluntary-stop path above). Off by default so the Chat panel CLI path (which has
+  // its own "ran out of budget" explainer keyed on turnsUsed) is unaffected.
   if (forceSummaryOnCap) {
-    turnStartLengths.push(messages.length);
-    turnStartLogLengths.push(toolCallLog.length);
-    messages.push({
-      role: 'user',
-      content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
-    });
-    turnsUsed += 1;
-    const { message: summaryMsg, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
-      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
-      toolCallLog, turnStartLengths, turnStartLogLengths,
-    });
-    const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
-    return {
-      response: summaryContent || (lastMessage && lastMessage.content) || '',
-      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
-    };
+    return runForcedSummaryTurn();
   }
 
   return { response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false };
