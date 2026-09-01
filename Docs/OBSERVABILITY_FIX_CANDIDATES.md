@@ -1329,3 +1329,26 @@ Inside the existing `catch (err)` block, add a single `console.error` call that 
 
 Benefits:
 Once the error is logged, a persistent `runPlan` failure becomes immediately visible in stderr or whatever log collector the operator already uses. The task identifier in the log line lets an operator correlate the failure to a specific task and distinguish "agent declined" (no log, no error) from "agent crashed" (log line with error message). This converts a class of silent, undiagnosable pipeline stalls into a one-line grep-able event, while preserving the existing best-effort control flow that downstream code already depends on.
+
+### AC-81 · Silent catch in quorum vote swallows per-vote failure detail
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict }, 1);
+    } catch (e) {
+      // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
+      // retry above) -- must not abort the other n-1 votes, which may well succeed under
+      // exactly the same slow-but-not-dead conditions. See this function's own 2026-08-23
+```
+
+Problem:
+Inside the multi-vote (quorum) fan-out, each individual vote is wrapped in a `try/catch` whose body consists solely of a comment explaining *why* the error must not be rethrown. No `console.warn`, `console.error`, or `process.stderr.write` call records the failure. The design intent—do not abort the remaining n−1 votes—is correct and already implemented, but the orthogonal concern of leaving an operator-visible trace is entirely absent. If every vote fails (endpoint down, DNS blip, TLS cert expiry), the caller sees only a bare "all votes failed" with zero underlying detail, forcing temporary instrumentation to diagnose the root cause.
+
+Solution:
+Add a single `console.warn` line as the first statement inside the existing `catch (e) { … }` block, before the function proceeds to the next vote. The message should include the vote index and total (e.g. `[agent-manager] vote 2/5 failed:`) followed by `e?.message ?? e` so both structured and string errors are captured. Do **not** rethrow: the quorum logic requires the remaining votes to still execute, and the caller's aggregation already accounts for a `undefined` result. No new dependency, no metric, no change to the control flow—just one log statement using the `console.warn` primitive the project already uses elsewhere in this file.
+
+Benefits:
+Operators now get a per-vote line in the log stream the moment a single vote hard-fails, showing which vote (index/total) and the underlying error message. In a total-outage scenario where all n votes fail, the log will contain n distinct lines with the same root-cause message, making the diagnosis immediate rather than requiring a code change and redeploy. The quorum semantics are unchanged: one vote failing still does not abort the others, and the caller's success/failure aggregation is untouched.
