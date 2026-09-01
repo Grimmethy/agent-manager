@@ -915,3 +915,26 @@ Inside the existing `catch` block, inspect `err.code`. If it is `'ENOENT'`, trea
 
 Benefits:
 Operators will now see a single, greppable warning line whenever the schedule file exists but cannot be parsed or read, immediately distinguishing "feature not configured" from "configuration is broken." The benign first-run path remains completely silent, so log volume is unchanged in the common case. The fix is a two-line change inside an existing block, introduces no new control flow, and preserves the function's return contract, making it safe to apply without further testing beyond confirming the warning appears for a deliberately corrupted file.
+
+### AC-63 · Log swallowed git errors in per-branch ahead-count loop
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        task_id = branch.removeprefix("agent/")
+
+        try:
+            ahead_raw = _run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root)
+            ahead = int(ahead_raw.strip() or "0")
+        except (RuntimeError, ValueError):
+            continue
+```
+
+Problem:
+Inside the per-branch iteration that computes an "ahead" count via `git rev-list --count`, the `except (RuntimeError, ValueError)` block silently executes `continue` with no log output. When the failure is systemic—wrong `repo_root`, detached HEAD, missing git binary, broken PATH in the container, or a permissions change on `.git`—every branch hits the except path, the dashboard renders an empty list, and the operator sees no log line, no metric, and no error message to explain why. The individual `continue` is correct control flow (one bad ref should not crash the whole render), but the total absence of a diagnostic signal makes a systemic outage indistinguishable from "there are simply no branches."
+
+Solution:
+Add a module-level `log = logging.getLogger(__name__)` (or reuse one already present in the file) and, inside the `except (RuntimeError, ValueError)` block, emit a single `log.warning("Skipping branch %s: failed to compute ahead-count (%s: %s)", full_ref, type(exc).__name__, exc)` before the `continue`. This uses only the stdlib `logging` module that the project already relies on for Python code, introduces no new dependency, and carries enough context (the branch ref, the exception type, and the message) for an operator to immediately identify whether the failure is per-branch or systemic. No rethrow is warranted here because the caller (the dashboard render loop) has no meaningful recovery action beyond skipping the item; the log line is the appropriate and sufficient signal.
+
+Benefits:
+An on-call operator who sees a blank branch list can now `grep` the application log for "Skipping branch" and immediately see the underlying `RuntimeError` or `ValueError` with the offending ref, distinguishing a systemic git/PATH/permissions problem from a single malformed ref. The fix costs one log line per failed iteration (bounded by the number of branches), introduces no new dependency, and does not alter the existing control flow or the dashboard's render contract.
