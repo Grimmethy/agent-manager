@@ -99,6 +99,35 @@ function isLeafTask(task) {
   return !!(ctx.decomposedFrom || (task && task.rescopedFromDecompose));
 }
 
+// A prior tier-3 (local-agentic-write) attempt on this same task that ended WITHOUT an
+// edit still produced a real final message -- often (see the /api/chat/inject forensics) an
+// accurate, detailed spec of exactly the change, it just never committed to writing it.
+// draft-attempt-record.js keeps that text on task.draftAttempts[].tiers[].response across
+// reject-retry requeues. Feed the most recent one back so the next attempt starts from its
+// own verified findings instead of re-orienting from scratch. Returns '' when there is none.
+function priorAttemptAnalysisBlock(task) {
+  const attempts = Array.isArray(task && task.draftAttempts) ? task.draftAttempts : [];
+  let response = '';
+  for (let i = attempts.length - 1; i >= 0 && !response; i--) {
+    const tiers = Array.isArray(attempts[i] && attempts[i].tiers) ? attempts[i].tiers : [];
+    for (let j = tiers.length - 1; j >= 0; j--) {
+      const t = tiers[j];
+      if (t && t.tier === 'local-agentic-write' && typeof t.response === 'string' && t.response.trim()) {
+        response = t.response.trim();
+        break;
+      }
+    }
+  }
+  if (!response) return '';
+  const CAP = 2500;
+  return [
+    'YOUR OWN PRIOR ATTEMPT at this task ended without making an edit. Here is the analysis it produced -- treat its file/line findings as verified starting points, confirm them quickly, then GO EDIT. Do not re-run the whole investigation.',
+    '',
+    response.length > CAP ? `${response.slice(0, CAP)}\n...[truncated]` : response,
+    '',
+  ].join('\n');
+}
+
 function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   const leaf = isLeafTask(task);
@@ -123,6 +152,7 @@ function buildWriteAgenticPrompt(task) {
     priorRejectionBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
+    priorAttemptAnalysisBlock(task),
     'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or ask, per below).',
     '',
     'If it is NOT already resolved and is a concrete, scoped change you can make confidently: implement it with edit_file / write_file. Read whatever real files you need first -- do not guess at code you have not looked at. Run a targeted check (py_compile / one test module) for what you changed before finishing, and fix any failure your own change introduced.',
@@ -198,6 +228,10 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       // edited anything by ORIENT_TURN_LIMIT turns, runPlanWithTools pushes one firm
       // "stop exploring, act now" message.
       nudgeToEditEarly: true,
+      // A confirmed-atomic leaf (decomposedFrom / rescopedFromDecompose) that still hasn't
+      // edited a few turns after the soft nudge gets one firmer push: edit now or conclude
+      // needs-human-decision -- decompose is off the table for a leaf.
+      leafMustEdit: isLeafTask(task),
     });
     modelStatsSafe(recordModelCall, {
       taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
@@ -223,4 +257,5 @@ function modelStatsSafe(fn, args) {
 
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
+  isLeafTask, priorAttemptAnalysisBlock,
 };

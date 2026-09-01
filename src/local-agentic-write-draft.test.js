@@ -118,6 +118,36 @@ test('write tier: rescopedFromDecompose alone also triggers leaf mode', async ()
   });
 });
 
+test('write tier: buildWriteAgenticPrompt feeds back a prior local-agentic-write attempt analysis', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const bare = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' } });
+    assert.doesNotMatch(bare, /YOUR OWN PRIOR ATTEMPT/);
+
+    const withPrior = buildWriteAgenticPrompt({
+      title: 'T', promptContext: { rawText: 'x' },
+      draftAttempts: [
+        { tiers: [{ tier: 'local-agentic', response: 'read-only pass note' }] },
+        { tiers: [{ tier: 'harness-search' }, { tier: 'local-agentic-write', response: '_call_chat is at app.py:3654; add the route after the message route' }] },
+      ],
+    });
+    assert.match(withPrior, /YOUR OWN PRIOR ATTEMPT at this task ended without making an edit/);
+    assert.match(withPrior, /_call_chat is at app\.py:3654/);
+    // the read-only tier's response is NOT what this block surfaces
+    assert.doesNotMatch(withPrior, /read-only pass note/);
+  });
+});
+
+test('write tier: isLeafTask is true for decomposedFrom or rescopedFromDecompose, false otherwise', async () => {
+  await withRepo(async () => {
+    const { isLeafTask } = freshModule();
+    assert.equal(isLeafTask({ promptContext: { decomposedFrom: 'p-1' } }), true);
+    assert.equal(isLeafTask({ rescopedFromDecompose: true }), true);
+    assert.equal(isLeafTask({ promptContext: { rawText: 'x' } }), false);
+    assert.equal(isLeafTask({}), false);
+  });
+});
+
 test('write tier: buildWriteAgenticPrompt folds in the plan (with a blind-plan disclaimer) and the prior investigation, in order', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
