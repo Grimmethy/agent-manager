@@ -150,6 +150,7 @@ function getCostSummary() {
     const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'cost-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
     return JSON.parse(stdout);
   } catch (e) {
+    console.warn(`[model-stats] cost-summary failed: ${e.message}\n${e.stack}`);
     return null;
   }
 }
