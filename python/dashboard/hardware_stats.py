@@ -20,6 +20,7 @@ sampling; nothing currently calls it.
 
 Run: .venv/bin/python -m unittest python.dashboard.test_hardware_stats -v
 """
+import logging
 import os
 import sqlite3
 import subprocess
@@ -30,6 +31,8 @@ from pathlib import Path
 
 import psutil
 
+log = logging.getLogger(__name__)
+
 GPU_QUERY_TIMEOUT_SECONDS = 5
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 60
 DEFAULT_RETENTION_HOURS = 24
@@ -38,7 +41,8 @@ DEFAULT_RETENTION_HOURS = 24
 def _cpu_percent() -> float | None:
     try:
         return psutil.cpu_percent(interval=0.1)
-    except Exception:
+    except Exception as exc:
+        log.warning("cpu_percent sampling failed: %s: %s", type(exc).__name__, exc)
         return None
 
 
