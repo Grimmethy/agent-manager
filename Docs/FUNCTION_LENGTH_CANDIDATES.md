@@ -589,3 +589,51 @@ Extract the pure data-transformation prefix into a small helper, e.g. `aggregate
 
 Benefits:
 Readability improves because a reviewer can verify a single section's formatting logic in 15–25 lines instead of scanning 137; the aggregation logic becomes independently testable (feed a synthetic `tasks` array, assert the shape of `bySource`/`byClassification`) without exercising any rendering code; and future changes—adding a new classification bucket, reordering sections, or swapping the sort criterion—are localized to one small function, reducing the chance of an accidental cross-section regression that the current monolithic body makes easy to miss in code review.
+
+### AC-13 · Extract proxy request-handling pipeline into named sub-functions
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/proxy.py
+Snippet:
+```
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            raw = await request.body()
+            r = await client.post(f"{_upstream(request)}/chat/completions",
+                                  content=raw, headers=_fwd_headers(request))
+            return Response(r.content, r.status_code)
+
+        mode_hdr = request.headers.get("x-tokenfold-mode")
+        route_hdr = request.headers.get("x-tokenfold-route")
+        if mode_hdr:
+            eng.cfg.mode = mode_hdr.upper()
+            eng.cfg.clamp()
+        if route_hdr:
+            eng.cfg.route_mode = route_hdr.lower()
+            eng.cfg.clamp()
+
+        model = body.get("model", "")
+        messages = body.get("messages", [])
+        sid_hdr = request.headers.get("x-tokenfold-session")
+        scope_hdr = request.headers.get("x-tokenfold-scope")
+        encoded, report = eng.encode(messages, model, session_id=sid_hdr, scope=scope_hdr)
+        body["messages"] = encoded
+        sid = report.session_id
+
+        upstream = f"{_upstream(request)}/chat/completions"
+        headers = _fwd_headers(request)
+        headers["content-type"] = "application/json"
+
+        if body.get("stream"):
+```
+
+Problem:
+The 103-line proxy handler interleaves at least four distinct responsibilities in a single flat body: (1) deserializing the inbound request with a raw-body fallback on JSON-parse failure, (2) reading per-request configuration overrides from HTTP headers and clamping them into the session object, (3) performing the core token-fold encoding (session/scope extraction, token mapping, response shaping), and (4) branching into a streaming path that builds a chunked response iterator. Each concern has its own try/except surface, its own early-return conditions, and its own set of unit-test cases, yet they all share one indentation level and one local-variable namespace. A developer fixing the streaming branch must scroll past the header-clamping logic to find it; a developer adding a new config header must reason about whether it interacts with the token-encoding step. The length is not a line-count artifact—it is four mini-functions glued together by shared mutable state.
+
+Solution:
+Split the handler into four private helpers called sequentially from a thin orchestrator. First, `_parse_inbound(raw_body, content_type) -> dict` encapsulates the JSON-parse-with-fallback and returns a normalized payload dict (or raises a typed `MalformedRequestError`). Second, `_apply_header_overrides(headers, session) -> None` reads the two (or more) config headers, clamps values, and mutates the session object in place. Third, `_encode_tokens(payload, session) -> EncodedResponse` contains the actual token-fold mapping logic—session/scope extraction, token substitution, and response dict construction. Fourth, `_build_stream_response(payload, session)` returns the async generator / chunked iterator for the `stream: true` path. The public handler becomes roughly 15 lines: parse, override, then either call `_encode_tokens` and return a JSON response, or call `_build_stream_response` and return the streaming response. Each helper is independently importable and testable.
+
+Benefits:
+Each extracted helper can be unit-tested in isolation with a minimal fixture (a dict in, a dict out) without standing up the full proxy transport. Code review diffs shrink: a change to header clamping no longer appears in the same hunk as a change to token mapping. The streaming branch, which is the most complex and most likely to change, becomes a single named function whose signature documents its contract. New contributors can read the 15-line orchestrator to understand the request lifecycle at a glance, then drill into whichever helper is relevant to their task.
