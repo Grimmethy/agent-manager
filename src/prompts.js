@@ -1454,6 +1454,7 @@ updateTaskSource('backlog_decomposition', { buildPlanPrompt: backlogDecompositio
 // regardless of which candidates doc it came from; see task-sources.js's
 // registerTaskSource('backlog_fulfillment', ...) header for the full reasoning.
 updateTaskSource('backlog_fulfillment', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
+updateTaskSource('pipeline_forensics_fix', { buildPlanPrompt: archReviewPlanPrompt, buildImplementPrompt: archReviewImplementPrompt });
 
 // ---- Thin lookup functions -- the real public API of this file ----
 
