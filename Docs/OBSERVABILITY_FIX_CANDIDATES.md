@@ -1214,3 +1214,26 @@ In each of the two empty `catch` blocks, replace the bare comment with a `consol
 
 Benefits:
 Operators gain an immediate, greppable signal in their existing stderr log stream whenever a worktree or branch cleanup fails, turning a silent, accumulating resource leak into a visible, actionable log line. The fix adds zero new dependencies, changes no control flow, and preserves the correct "best-effort, do not abort" semantics while eliminating the observability gap.
+
+### AC-76 · Log the swallowed exception in the pause-state check
+Strength: Strong
+Files: src/claude-pause.js
+Snippet:
+```
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    return settings.claudePaused === true;
+  } catch (e) {
+    return false;
+  }
+}
+```
+
+Problem:
+The helper that answers "is Claude currently paused?" reads a JSON settings file and checks `settings.claudePaused === true`, but its `catch (e) { return false; }` block discards the exception entirely. No `console.error`, `console.warn`, or `process.stderr.write` call is made. If the settings file is present but corrupted (truncated write, bad merge, hand-edit that broke the JSON), the pause feature silently stops working: the operator sees `claudePaused: true` in the file, the agent keeps running, and there is no log line anywhere explaining why the check is failing. In a long-running agent-manager process this can go unnoticed for days.
+
+Solution:
+Replace the bare `catch (e) { return false; }` with a `catch (e) { console.error('claude-pause: failed to read settings file:', e.message); return false; }`. This uses only `console.error`, which is already the project's available logging primitive. The message includes a short scope tag (`claude-pause:`) and the exception's own `message` so the operator can immediately see whether it was a `SyntaxError` (malformed JSON), an `ENOENT` (file missing), or an `EACCES` (permission denied). The function still returns `false` on error, preserving the existing boolean contract for callers; no rethrow is needed because the caller's only question is "paused or not" and a missing/corrupt settings file is a reasonable "not paused" default.
+
+Benefits:
+An operator who notices the agent is still running despite `claudePaused: true` in the settings file can now `grep` the process log for `claude-pause:` and immediately see the underlying exception (e.g. `Unexpected token } in JSON at position 42`) instead of having to manually `cat` the file and guess. The fix adds one line, introduces no new dependency, changes no public API, and keeps the function's return-type contract intact.
