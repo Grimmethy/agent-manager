@@ -78,6 +78,12 @@ function readCooldowns(cooldownPath) {
   try {
     return JSON.parse(fs.readFileSync(cooldownPath, 'utf8'));
   } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    if (e.name === 'SyntaxError') {
+      console.error(`readCooldowns: failed to parse cooldown file ${cooldownPath} -- ${e.message}`);
+      return {};
+    }
+    console.warn(`readCooldowns: failed to read cooldown file ${cooldownPath} -- ${e.code} -- ${e.message}`);
     return {};
   }
 }
