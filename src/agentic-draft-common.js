@@ -145,11 +145,15 @@ async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repo
 // diff. `retriedForTurnBudget` only tunes the "did not end with RESOLUTION" note.
 function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
   const summary = (result && result.response) || '';
-  // Cleared on every outcome; set true again below only for the specific "ran the whole
-  // turn budget, made zero edits, produced no diff" case, which reject-retry-check.js
-  // requeues (with the plan + prior-investigation grounding) instead of dead-ending in
-  // needs-clarification. A stale true from an earlier attempt must not survive a later one.
+  // Both cleared on every outcome; set true again below only for the specific
+  // draft-stage blocks a redraft could plausibly fix, which reject-retry-check.js then
+  // requeues (bounded, with grounding) instead of leaving them to dead-end in blocked/.
+  // A stale true from an earlier attempt must not survive a later one.
+  //   turnBudgetExhausted  -- ran the whole turn budget, made zero edits, no diff
+  //   retryableDraftBlock  -- the broader "adhoc tier-3 block that is redraft-eligible"
+  //                           marker (turn-budget exhaustion OR a malformed decompose)
   task.turnBudgetExhausted = false;
+  task.retryableDraftBlock = false;
   // draft-attempt-record.js: the caller records this tier's real output, tool activity,
   // and -- on a NON-clean outcome (degenerate / no RESOLUTION line / bad decompose) where
   // resolveAgenticDraft otherwise stages nothing -- whatever the model left in the
@@ -198,6 +202,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       // reject-retry-check.js can requeue once with the plan + prior-investigation map.
       if (edits === 0 && !capturedDiff) {
         task.turnBudgetExhausted = true;
+        task.retryableDraftBlock = true;
         return {
           succeeded: true,
           blocked: true,
@@ -224,6 +229,11 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
     const subTasks = parseSubTaskProposals(afterResolution);
     if (!subTasks || subTasks.length < 2) {
+      // The model reached a conclusion ("this is too big, split it") but botched the
+      // sub-task JSON. A redraft can plausibly fix that (emit valid JSON, or just do the
+      // change directly) -- mark it redraft-eligible so reject-retry-check.js requeues it
+      // once with a format reminder instead of leaving it dead in blocked/.
+      task.retryableDraftBlock = true;
       return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks', ...meta, capturedDiff: bestEffortDiff() };
     }
     task.adhocResolution = resolution;
