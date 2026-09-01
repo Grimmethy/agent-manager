@@ -63,7 +63,9 @@ function summariseToolCalls(toolCallLog) {
   const byTool = {};
   let errors = 0;
   const calls = [];
+  let n = 0;
   for (const entry of toolCallLog) {
+    n += 1;
     const tool = (entry && entry.tool) || 'unknown';
     byTool[tool] = (byTool[tool] || 0) + 1;
     const result = entry && entry.result;
@@ -72,7 +74,7 @@ function summariseToolCalls(toolCallLog) {
     if (calls.length < TOOLCALL_LIST_CAP) {
       let bytes = 0;
       try { bytes = JSON.stringify(result == null ? '' : result).length; } catch { bytes = -1; }
-      const call = { tool, argKeys: entry && entry.args ? Object.keys(entry.args) : [], bytes };
+      const call = { n, tool, argKeys: entry && entry.args ? Object.keys(entry.args) : [], bytes };
       if (isError) call.error = true;
       calls.push(call);
     }

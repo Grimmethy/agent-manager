@@ -158,6 +158,17 @@
   .da-tier-name { font-family: monospace; font-weight: 600; }
   .da-tools { font-size: 11px; color: var(--muted); font-family: monospace; }
   .draft-attempt pre { max-height: 260px; }
+  /* Work Log: full per-tier tool transcript (task._workLog, src/work-log.js) for auditing. */
+  .work-log { border: 2px solid var(--border); border-radius: 6px; margin-top: 6px; padding: 0 10px; }
+  .work-log > summary { cursor: pointer; padding: 8px 0; font-weight: 600; list-style-position: inside; }
+  .work-log[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+  .wl-tier { border-top: 1px dashed var(--border); margin-top: 6px; padding-top: 4px; }
+  .wl-call { font-family: monospace; font-size: 11px; padding: 2px 0; line-height: 1.5; }
+  .wl-call > summary { cursor: pointer; }
+  .wl-call.wl-err { color: var(--bad); }
+  .wl-n { color: var(--muted); }
+  .wl-tool { font-weight: 600; }
+  .work-log pre { max-height: 220px; font-size: 11px; }
   /* Base state (Ornith) also gets its own look, not just the Claude state -- previously
      only .provider-toggle-claude had a distinct color, so the default Ornith state was
      visually identical to a plain .secondary button (Discuss/Edit/Delete), which is how
@@ -2177,6 +2188,13 @@ function renderDraftAttempts(task) {
       const byTool = Object.entries(tc.byTool || {}).map(([k, v]) => `${k}×${v}`).join(', ');
       h += `<div class="da-tools">${tc.total} tool call(s)${byTool ? ` — ${escapeHtml(byTool)}` : ''}`
         + `${tc.errors ? ` · ${tc.errors} error(s)` : ''}${tc.listTruncated ? ' · list truncated' : ''}</div>`;
+      // Per-call skeleton (tool + arg keys + result size) -- kept on the attempt record
+      // forever, unlike the full Work Log below which is pruned once the task reaches done/.
+      if (Array.isArray(tc.calls) && tc.calls.length) {
+        h += `<div class="da-tools">` + tc.calls.map((c) =>
+          `#${c.n != null ? c.n : '?'} ${escapeHtml(c.tool)}(${(c.argKeys || []).map(escapeHtml).join(', ')}) → ${c.bytes} B${c.error ? ' ERR' : ''}`
+        ).join('<br>') + (tc.listTruncated ? '<br>…' : '') + `</div>`;
+      }
     }
     if (t.response) {
       h += `<div class="meta">response${t.responseChars ? ` (${t.responseChars} chars)` : ''}:</div>`
@@ -2241,6 +2259,43 @@ function renderDraftAttempts(task) {
 
   const rows = attempts.slice().reverse().map(one).join('');
   return `<div class="field-label">Draft Attempts (${attempts.length})</div>${rows}`;
+}
+
+// The full per-tier tool transcript (server provides task._workLog from
+// queue/worklogs/<id>.json -- src/work-log.js). renderDraftAttempts above shows only the
+// stripped summary (tool name + arg keys, never values); this is what the model actually
+// read, searched, ran and edited -- the detail you need to audit a result before approving
+// or merging it. Open by default while the task is still pre-merge.
+function renderWorkLog(task) {
+  const wl = task._workLog;
+  if (!wl || !Array.isArray(wl.tiers) || !wl.tiers.length) return '';
+  const preMerge = ['approved', 'needs-review', 'blocked', 'awaiting-confirm'].includes(task.status);
+  const totalCalls = wl.tiers.reduce((n, t) => n + ((t.calls && t.calls.length) || 0), 0);
+
+  const callRow = (c) => {
+    const argStr = Object.entries(c.args || {}).map(([k, v]) => {
+      const s = String(v);
+      return `${escapeHtml(k)}=${escapeHtml(s.length > 200 ? s.slice(0, 200) + '…' : s)}`;
+    }).join(', ');
+    const head = `<span class="wl-n">#${c.n}</span> <span class="wl-tool">${escapeHtml(c.tool)}</span>(${argStr})`
+      + ` <span class="meta">→ ${c.resultBytes} B${c.error ? ' · ERROR' : ''}</span>`;
+    if (!c.resultPreview) return `<div class="wl-call${c.error ? ' wl-err' : ''}">${head}</div>`;
+    return `<details class="wl-call${c.error ? ' wl-err' : ''}"><summary>${head}</summary>`
+      + `<pre>${escapeHtml(c.resultPreview)}</pre></details>`;
+  };
+
+  const tierBlocks = wl.tiers.map((t) => {
+    const n = (t.calls && t.calls.length) || 0;
+    return `<div class="wl-tier"><div class="meta">${escapeHtml(t.tier)}`
+      + `${t.turnsUsed != null ? ` · ${t.turnsUsed} turn(s)` : ''} · ${n} tool call(s)`
+      + `${t.truncated ? ' · older calls trimmed for size' : ''}</div>`
+      + (t.calls || []).map(callRow).join('') + `</div>`;
+  }).join('');
+
+  return `<details class="work-log"${preMerge ? ' open' : ''}>`
+    + `<summary><span class="field-label">Work Log</span> `
+    + `<span class="meta">${totalCalls} tool call(s) across ${wl.tiers.length} tier(s)</span></summary>`
+    + tierBlocks + `</details>`;
 }
 
 function renderTaskDetailModal(task) {
@@ -2350,6 +2405,7 @@ function renderTaskDetailModal(task) {
   // every tier-3 worktree diff -- so following up on a task that failed N times no longer
   // means re-investigating from scratch.
   html += renderDraftAttempts(task);
+  html += renderWorkLog(task);
   // A "degenerate: empty" block means the model returned nothing for that pass -- the
   // field is absent, not present-and-empty, so without this the modal just omits the
   // section and the timeline is the only hint anything ran. Say it explicitly.
