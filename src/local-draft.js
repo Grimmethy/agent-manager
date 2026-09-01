@@ -174,6 +174,7 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
       try {
         searchResults = await projectSearchFetch(queries);
       } catch (e) {
+        console.warn(`[local-draft] projectSearchFetch failed, proceeding with no results:`, e?.message ?? e);
         // Non-fatal -- implement proceeds with no results (its own prompt handles an empty
         // list: "(no results -- the searches returned nothing usable)").
       }
