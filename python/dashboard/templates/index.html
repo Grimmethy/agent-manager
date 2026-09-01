@@ -389,6 +389,10 @@ let brainDumpEntriesInterval = null;
 // mirrors the ?status= values api_brain_dump() (app.py) already accepts; not persisted
 // to localStorage, same as queueSourceFilter's per-tab-visit reset (queue-source-filter).
 let brainDumpStatusFilter = '';
+// 2026-09-01: last fetched entry objects, id -> entry. The Brain Dump "Send to
+// Chat" button needs the full entry (serial, rawText) at click time; the DOM only
+// carries the id, so we keep the freshest copy here instead of scraping the card.
+const brainDumpEntryById = new Map();
 
 // Single choke point for every place that changes which project is active (typed input,
 // History panel, Browse panel, and the server-sync in refreshPipelineStatus). grepDirs is
@@ -957,6 +961,29 @@ function chatSetCollapsed(collapsed) {
   const panel = document.getElementById('chat-panel');
   if (panel) panel.classList.toggle('chat-collapsed', collapsed);
   localStorage.setItem('agentManagerChatPanel', collapsed ? 'collapsed' : 'expanded');
+}
+
+// 2026-09-01 (Brain Dump "Send to Chat" fix): injects a block of plain text as a user
+// turn into the System Chat panel via POST /api/chat/inject -- which deliberately
+// RECORDS the message without calling the model, so it works even while the local
+// model is busy serving a worker lane (the old per-entry Discuss start 404'd on
+// exactly that). Raw fetch here because fetchJson above is GET-only. Throws on
+// !ok with the server's error detail so the caller's catch can toast it; on
+// success the response carries the chat session id and the panel is expanded +
+// re-rendered so the injected turn is immediately visible.
+async function sendTextToChat(text) {
+  const r = await fetch('/api/chat/inject', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error(body.detail || body.description || `HTTP ${r.status}`);
+  }
+  await r.json().catch(() => null);
+  chatSetCollapsed(false);
+  chatRender();
 }
 
 async function chatPanelInit() {
@@ -4786,6 +4813,18 @@ function wireBrainDumpCardHandlers(el) {
     };
   });
 
+  el.querySelectorAll('[data-bd-send-to-chat]').forEach((btn) => {
+    btn.onclick = () => {
+      const entry = brainDumpEntryById.get(btn.dataset.bdSendToChat);
+      if (!entry) { showToast('Could not send to chat: that brain-dump entry is no longer in the list.'); return; }
+      const block =
+        `Brain Dump entry #${entry.serial} -- id: ${entry.id}\n\n` +
+        `${entry.rawText}\n` +
+        `Discuss this brain-dump entry. Its id is ${entry.id}.`;
+      sendTextToChat(block)
+        .catch((e) => showToast(`Could not send to chat: ${e.message}`));
+    };
+  });
   el.querySelectorAll('[data-discuss]').forEach((btn) => {
     btn.onclick = () => brainDumpDiscussStart(btn.dataset.discuss);
   });
@@ -4954,6 +4993,7 @@ async function refreshBrainDumpEntries(force = false) {
   try {
     const qs = brainDumpStatusFilter ? `?status=${encodeURIComponent(brainDumpStatusFilter)}` : '';
     entries = await fetchJson('/api/brain-dump' + qs);
+    entries.forEach((entry) => brainDumpEntryById.set(entry.id, entry));
   } catch (e) {
     el.innerHTML = `<div class="empty">Could not load: ${e.message}</div>`;
     return;
@@ -5044,7 +5084,7 @@ function renderBrainDumpCard(entry) {
         <span>${queuedBadge}</span>
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}" title="Queue this entry for drafting right away instead of waiting on the normal sort/priority order">Process now</button>
-          <button class="secondary" data-discuss="${escapeAttr(entry.id)}" title="Start (or resume) an open-ended conversation to add context to this entry before it gets sorted">Send to Chat</button>
+          <button class="secondary" data-bd-send-to-chat="${escapeAttr(entry.id)}" title="Send this entry to the System Chat panel as a message -- no AI call, works even while the local model is busy">Send to Chat</button>
           <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}" title="Copy this entry's raw text to the clipboard">Copy</button>
           <button class="secondary" data-edit="${escapeAttr(entry.id)}" title="Edit this entry's raw text">Edit</button>
           <button class="secondary" data-delete="${escapeAttr(entry.id)}" title="Delete this brain dump entry">Delete</button>
