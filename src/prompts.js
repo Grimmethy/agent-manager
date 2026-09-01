@@ -260,6 +260,26 @@ function pathPrefetchResolveImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// Fix (2026-08-31, bra-1788142124203): when a prior draft attempt on this SAME task
+// already produced a real plan (runPlanPass surfaces it as task._seedPlan from
+// task.draftAttempts[].plan.text / task.lastGoodPlan), hand it to the plan pass as a
+// starting point instead of cold-rolling from scratch every retry -- a reject-retry or
+// cross-repo requeue otherwise regenerates each time and can trade a good plan for a stub.
+// Returns [] (no lines) when there is no seed. Kept as trailing lines so it never displaces
+// the stable instruction text.
+function seedPlanBlock(task) {
+  const seed = task && typeof task._seedPlan === 'string' ? task._seedPlan.trim() : '';
+  if (!seed) return [];
+  return [
+    '',
+    'A PRIOR attempt on this exact task already produced this plan:',
+    '',
+    seed,
+    '',
+    'Use it as your starting point. Review it against the CURRENT repository: fix anything repo-specific, wrong, or missing, and tighten each step to name real files/functions. Produce an improved numbered PLAN — do NOT start from scratch and do NOT just restate it unchanged.',
+  ];
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -271,6 +291,7 @@ function adhocPlanPrompt(task) {
     '',
     'Write a numbered, actionable PLAN.',
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
+    ...seedPlanBlock(task),
   ].join('\n');
 }
 
@@ -1450,7 +1471,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
-  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
   // Bodies stay here; archReview{Plan,Implement}Prompt also stay wired below for core

@@ -87,5 +87,20 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
     assert.match(p, /RESOLUTION: decompose/);
     assert.match(p, /RESOLUTION: needs-human-decision/);
     assert.match(p, /the ask/);
+    // Fix 5: steer exploration onto the structured read-only tools, not run_bash.
+    assert.match(p, /grep_codebase \/ read_file \/ list_directory/);
   });
 });
+
+test('write tier: turn cap default is 35, env override still wins', async () => {
+  await withRepo(async () => {
+    const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
+    delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
+    assert.equal(freshModule().LOCAL_AGENTIC_WRITE_MAX_TURNS, 35);
+    process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS = '50';
+    assert.equal(freshModule().LOCAL_AGENTIC_WRITE_MAX_TURNS, 50);
+    if (prev === undefined) delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
+    else process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS = prev;
+  });
+});
+

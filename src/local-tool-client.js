@@ -616,7 +616,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [] }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -711,6 +711,35 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
   // not a crash, matching how this pipeline already treats an empty/degenerate plan pass.
+  //
+  // forceSummaryOnCap (2026-08-31, bra-1788142124203): the agentic-draft callers need one
+  // more thing here. A run that hits the cap while still calling tools never wrote a
+  // verdict, so `lastMessage.content` is usually empty or a half-thought -- and
+  // resolveAgenticDraft can only read that as "did not end with a RESOLUTION: line ->
+  // hard block", discarding the entire run (a real tier-3 case burned all 20 turns on
+  // read-only exploration and blocked with zero salvageable output). Spend ONE final
+  // no-tools turn asking only for the RESOLUTION line. Off by default so the Chat panel
+  // CLI path (which has its own "ran out of budget" explainer keyed on turnsUsed) is
+  // unaffected.
+  if (forceSummaryOnCap) {
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+    messages.push({
+      role: 'user',
+      content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
+    });
+    turnsUsed += 1;
+    const { message: summaryMsg, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
+    const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+    return {
+      response: summaryContent || (lastMessage && lastMessage.content) || '',
+      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
+    };
+  }
+
   return { response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false };
 }
 
