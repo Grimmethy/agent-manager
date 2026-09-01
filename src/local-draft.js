@@ -945,7 +945,17 @@ function computeImplementBudget(task, implPrompt) {
   // source's own registerTaskSource() entry now (see its own comment above) instead of
   // a hardcoded array.
   const allowEmptyImplement = isEmptyApprovalSource(task.source);
-  return { hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement };
+  // pipeline_forensics: the implement prompt's METHOD section already forces explicit
+  // step-by-step reasoning INTO the report itself (a counterfactual line per ranked cause,
+  // the contrast paragraph). qwen3 think:true then runs a SECOND full reasoning pass
+  // first and, on a task this analytically heavy against ~26KB of evidence, spends the
+  // entire num_predict budget inside <think> -- emitting an empty final answer. Confirmed
+  // live 2026-09-01: 3 consecutive attempts, ~166s eval each, implementResponse empty
+  // every time (this is the same "reasoning trace eats the budget" starvation the
+  // fixedLiterals branch above already fixes by disabling think). Hand the whole budget
+  // to the report.
+  const implNoThink = hasFixedLiterals || task.source === 'pipeline_forensics';
+  return { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement };
 }
 
 // Post-processing for the five candidate-fulfillment sources only, which are the only
@@ -956,7 +966,7 @@ function computeImplementBudget(task, implPrompt) {
 // falls through to critique.
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
-}, { implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
+}, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
   const split = parseCandidateSplit(task.implementResponse);
   if (split) {
     if (split.invalid) {
@@ -973,7 +983,7 @@ async function finalizeCandidateFulfillment(task, {
   const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
   if (unverified) {
     const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
-    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement-retry');
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
@@ -993,7 +1003,7 @@ async function finalizeCandidateFulfillment(task, {
 // call result (which may carry `degenerate`); the caller owns what to do with it.
 async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
-  const { hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
+  const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
   const implStartMs = Date.now();
 
@@ -1036,7 +1046,7 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
       model: abModel,
     }), 'implement');
   } else {
-    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !hasFixedLiterals, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement');
+    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement');
   }
 
   // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -1103,7 +1113,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
 
   const implPrompt = buildImplementPrompt(task, task.planResponse);
   const budget = computeImplementBudget(task, implPrompt);
-  const { hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
+  const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
 
   // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
   // have. A single implement call can legitimately run close to its timeout; with the
@@ -1130,7 +1140,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // third guess would likely fix either.
   if (isCandidateFulfillmentSource(task.source)) {
     return await finalizeCandidateFulfillment(task, ctx, {
-      implResult, implPrompt, hasFixedLiterals, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
+      implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
     });
   }
   recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
