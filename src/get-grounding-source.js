@@ -89,6 +89,7 @@ function buildRequestObjectGrounding(rawText) {
   try {
     hits = require('./arch-import-fetch.js').fetchForQueries(queries).hits || [];
   } catch (e) {
+    console.error('[get-grounding-source] fetchForQueries failed:', e && e.message ? e.message : String(e));
     return '';
   }
   const byTok = new Map(tokens.map((t) => [t, []]));
