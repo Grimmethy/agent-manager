@@ -1260,3 +1260,26 @@ Narrow the catch so that only `err.code === 'ENOENT'` is treated as the benign "
 
 Benefits:
 Once the fix lands, any non-`ENOENT` failure (mount hiccup, fd exhaustion, permission change) produces a single identifiable line on stderr that an operator or CI log scraper can grep for the directory path and error code, turning a silent batch-skip into a visible, debuggable event. The `ENOENT` path remains a clean no-op, so the common "directory created lazily" case does not generate noise. No new dependency, no new telemetry surface, and the change is a two-line edit inside an existing block.
+
+### AC-78 · Log swallowed fetch error in get-grounding-source catch block
+Strength: Strong
+Files: src/get-grounding-source.js
+Snippet:
+```
+  let hits = [];
+  try {
+    hits = require('./arch-import-fetch.js').fetchForQueries(queries).hits || [];
+  } catch (e) {
+    return '';
+  }
+  const byTok = new Map(tokens.map((t) => [t, []]));
+```
+
+Problem:
+The `catch (e)` block in `get-grounding-source.js` binds the thrown error to `e` but never reads it—no `console.error`, no `console.warn`, no `process.stderr.write`, no rethrow. The variable is dead. If `fetchForQueries` throws due to a persistent misconfiguration (bad URL, missing credential, a bug inside `arch-import-fetch.js`), the agent-manager silently returns the `''` sentinel on every call and no log line is ever emitted. An operator cannot distinguish "grounding source returned zero hits" from "the fetch is broken and has been for days," and the only discovery path is adding a temporary `console.log` in production or noticing the downstream symptom of ungrounded agent answers and manually tracing back.
+
+Solution:
+Inside the existing `catch (e)` block, before the `return ''`, emit a single `console.error` line that includes a module tag (`[get-grounding-source]`), the human-readable message (`e && e.message ? e.message : e`), and preserves the graceful-degradation return. No new dependency, no metric (the project has none), no rethrow (the caller contract is "return `''` on failure" and changing that would break every call site). The success path and the `|| []` fallback are untouched.
+
+Benefits:
+Once the line is in place, any exception from `fetchForQueries` produces an immediately visible stderr entry with enough context (module tag + error message) to identify the root cause without attaching a debugger or adding temporary instrumentation. Operators can distinguish a broken grounding pipeline from a legitimate zero-hit response, and the debugging cost drops from "trace downstream symptoms back through the call stack" to "read the log line." The fix is a one-line addition using only the Node `console.error` primitive the project already uses elsewhere, so it introduces no new dependency and no behavioral change to the success path or the return contract.
