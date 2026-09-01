@@ -1651,3 +1651,26 @@ Inside the existing `catch (err)` block, add a single `console.warn` call that i
 
 Benefits:
 An operator watching stdout/stderr (or a log aggregator tailing the process) immediately sees which task failed to persist and why, turning an invisible, compounding data-loss scenario into a single, greppable warning line. The "never abort a pass" contract is preserved exactly as documented, so no caller-side behavior changes. The fix is one line, introduces no dependency, and closes the scanner finding without suppressing it, keeping the codebase's observability baseline consistent with the rest of the project.
+
+### AC-95 · Silent exception swallowing in Ollama native adapter decode path
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/ollama_native.py
+Snippet:
+```
+                msg["content"] = eng.decode(raw_txt, sid, scope=scope_hdr)
+                eng.record_output(model, raw_txt, msg["content"], sid, scope=scope_hdr)
+            return JSONResponse(obj, status_code=r.status_code)
+        except Exception:
+            return Response(r.content, r.status_code)
+
+    # -----------------------------------------------------------------
+```
+
+Problem:
+The `except Exception` block around the `eng.decode()` / `eng.record_output()` call (line 131) falls through to the raw-body fallback with no log statement, no stack trace, and no identifying context (model name, session id, scope header). If the adapter or engine raises due to schema drift, a missing key, or a library upgrade, every subsequent request silently returns the undecoded HTTP payload. Because the project has no metrics or telemetry system, this silent path is the *only* signal that the decode/accounting pipeline has broken, and currently even that signal is absent. A `KeyError` or `AttributeError` (i.e., a genuine bug in the adapter) is indistinguishable from a benign "unexpected response shape" case, making the failure invisible during development and in production alike.
+
+Solution:
+Replace the bare `except Exception:` body with a `logging.exception("ollama_native decode/record failed; falling back to raw body", exc_info=True)` call (the stdlib `logging` module is already imported or importable in this file), and include the three correlation fields that are in scope at that point—`model`, `sid`, and `scope_hdr`—as keyword arguments to the log message (e.g. `extra={"model": model, "sid": sid, "scope_hdr": scope_hdr}`) or interpolated into the message string. Do **not** re-raise: the caller's contract is "return the raw body on decode failure," so the exception must be absorbed. The `exc_info=True` flag ensures the full traceback (including the originating `KeyError` / `AttributeError` / `TypeError`) is captured in the log record, letting a developer distinguish a programmer error from a genuinely malformed upstream response. No new dependency is introduced; the fix uses only the Python stdlib `logging` module that the project already relies on.
+
+Benefits:
+Once deployed, any regression in the decode or token-accounting path produces an immediate, greppable WARNING/ERROR line in the application log that names the model, session, and scope, and carries the full traceback. Operators can correlate the failure to a specific Ollama model or session within seconds instead of discovering the silent degradation only when a downstream consumer reports unexpected raw JSON. Developers iterating on the adapter see the exact exception type and stack frame in the log, collapsing the debug cycle from "why is the response raw?" to a single `grep` of the log file. Because no new dependency or metrics endpoint is required, the change is a one-line-plus-context edit that is safe to ship in any environment the project already targets.
