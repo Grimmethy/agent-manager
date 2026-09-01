@@ -610,9 +610,10 @@ function applyVerdictOnly({ implementResponse }) {
 //     a pipeline-fix candidate is filed. `needsConfirmation` is the generic, non-source-
 //     name-gated hold apply-task.js already maps to awaiting-confirm/.
 //  2. Second reach (dashboard stamped forensicsReportConfirmedAt, task back in approved/):
-//     extract the RECOMMENDED FOLLOW-UP FIX block and append it -- with the full ranked
-//     report as context -- to Docs/PIPELINE_FIX_CANDIDATES.md as a `### AC-NNN` candidate,
-//     which the pipeline_forensics_fix source then turns into a real src/ diff.
+//     extract the RECOMMENDED FOLLOW-UP FIX block (fix spec only -- Problem/Solution/
+//     Benefits, kept lean so nextCandidateFulfillmentTask's 4000-char guard actually lets
+//     it through) and append it to Docs/PIPELINE_FIX_CANDIDATES.md as a `### AC-NNN`
+//     candidate, which the pipeline_forensics_fix source then turns into a real src/ diff.
 function applyForensicsReport({ implementResponse, task }) {
   const { getConfig } = require('./config.js');
   const text = (implementResponse || '').trim();
@@ -633,20 +634,30 @@ function applyForensicsReport({ implementResponse, task }) {
     return { skipped: true, reason: 'confirmed forensic report has no RECOMMENDED FOLLOW-UP FIX section; nothing to file' };
   }
   const section = text.slice(idx).replace(/^RECOMMENDED FOLLOW-UP FIX\s*$/m, '').trim();
-  const strength = (section.match(/^Strength:\s*(.+)$/m) || [])[1] || 'Worth exploring';
   const files = (section.match(/^Files:\s*(.+)$/m) || [])[1] || '';
   const title = String(task.title || 'pipeline fix').replace(/^Pipeline forensics:\s*/i, '').slice(0, 100);
+  const modelConfidence = (section.match(/^Strength:\s*(.+)$/m) || [])[1] || 'Worth exploring';
 
-  // Body carries the full ranked report so the fix pass sees the whole analysis, not just
-  // the one-paragraph Solution.
+  // Strength is ALWAYS "Strong" here: nextCandidateFulfillmentTask (the pipeline_forensics_fix
+  // consumer) only acts on Strong candidates, and every candidate filed from this path has
+  // already cleared three gates -- the report's own "NO CLEAR ROOT CAUSE" escape hatch,
+  // majority review APPROVE, and an explicit human confirm. The model's own less-certain
+  // self-assessment is kept as a visible note, not as a silent block on consumption.
+  //
+  // The body is the FIX SPEC ONLY (Problem / Solution / Benefits) -- lean enough to clear
+  // nextCandidateFulfillmentTask's MAX_ARCH_REVIEW_TASK_CHARS (4000) guard, which the old
+  // "embed the whole ranked report for context" body blew past every time (confirmed live
+  // 2026-09-01: AC-1/2/3 were all 4.4-6.7KB and silently never consumed). The full ranked
+  // analysis stays on the forensic task's own record for a human who wants the deep context.
+  const fixSpec = section.replace(/^Strength:.*$/m, '').replace(/^Files:.*$/m, '').trim();
   const body = [
-    section.replace(/^Strength:.*$/m, '').replace(/^Files:.*$/m, '').trim(),
+    modelConfidence.trim() !== 'Strong' ? `Model confidence: ${modelConfidence.trim()}` : null,
+    fixSpec,
     '',
-    '--- full forensic report ---',
-    text.slice(0, idx).trim(),
-  ].join('\n');
+    `Full ranked root-cause analysis: forensic task ${task.id}`,
+  ].filter((l) => l !== null).join('\n');
 
-  const block = [`### AC-1 · ${title}`, `Strength: ${strength}`, files ? `Files: ${files}` : '', '', body]
+  const block = [`### AC-1 · ${title}`, `Strength: Strong`, files ? `Files: ${files}` : '', '', body]
     .filter((l) => l !== null).join('\n');
 
   const res = applyArchDiscoveryCandidates({
