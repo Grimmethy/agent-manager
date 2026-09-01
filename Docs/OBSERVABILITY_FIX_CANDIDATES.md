@@ -1375,3 +1375,26 @@ Add a single `console.warn` call inside the existing `catch` block that logs a g
 
 Benefits:
 Once the warning is in place, any backend outage, auth failure, or regression in `projectSearchFetch` produces a single greppable line (`[local-draft] projectSearchFetch failed`) in the operator's stdout/stderr stream, carrying the specific error message. This lets an on-call engineer immediately distinguish "the search API is down" from "the query legitimately returned zero hits" without attaching a debugger or adding temporary logging. The degrade-to-empty control flow and the agent's user-facing behaviour are completely unchanged, so no downstream prompt logic or test fixtures need modification.
+
+### AC-83 · Swallowed archImportFetch error leaves no runtime breadcrumb
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+    try {
+      const result = archImportFetch(queries);
+      harnessHits = result.hits || [];
+      harnessFiles = result.files || [];
+    } catch (e) {
+      // Non-fatal -- implement proceeds with no hits (its own prompt handles an empty list).
+    }
+```
+
+Problem:
+The `catch (e)` block in the `archImportFetch` enrichment path captures the exception and discards it entirely — no `console.warn`, no `console.error`, no `process.stderr.write`. The comment documents the intent ("proceed with empty list"), but that intent is invisible at runtime. If the upstream endpoint begins failing persistently (DNS change, upstream 5xx, schema drift in `result.hits`), the only observable symptom is subtly weaker prompt output with zero log lines, stack traces, or stderr output to grep. An operator cannot distinguish "fetch failed" from "fetch returned zero hits" without adding instrumentation after the fact.
+
+Solution:
+Replace the empty catch body with a single `console.warn('archImportFetch failed, continuing with empty harness data:', e?.message ?? e);` line. This uses only the Node stdlib `console.warn` primitive already available in the project (no third-party logging framework, no metrics system). The message identifies the failing call site and the reason (timeout, HTTP 500, TypeError, etc.) while the `e?.message ?? e` expression avoids dumping a full stack for what is an expected-to-be-transient, non-fatal enrichment. No rethrow is added, preserving the documented "continue with empty list" contract that downstream prompt-building code relies on. No metric, counter, or gauge is introduced because the project has no telemetry system.
+
+Benefits:
+Once the warning is in place, any operator tailing stdout/stderr (or a CI log stream) immediately sees that the enrichment call is failing and why, without needing to add temporary instrumentation. The `warn` level correctly signals "degraded but non-fatal," distinguishing it from hard errors that would warrant `console.error`. The one-line change costs zero dependencies, zero new abstraction, and zero change to the control-flow contract, while closing the gap between "the code degrades gracefully" and "the operator can tell it is degrading."
