@@ -1762,6 +1762,11 @@ registerTaskSource('pipeline_forensics', {
   priority: taskPriority('pipeline_forensics', 66),
   next: nextPipelineForensicsTask,
   apply: applyForensicsReport,
+  // pass 2 (post-confirm) appends the RECOMMENDED FOLLOW-UP FIX to
+  // Docs/PIPELINE_FIX_CANDIDATES.md -- an additive doc write, already human-confirmed,
+  // committed straight to master exactly like arch_discovery / observability_review.
+  // (pass 1 still returns needsConfirmation before this ever commits.)
+  directToMain: true,
   // NOT emptyApproval: the detector already guarantees a real subject to study, so an
   // empty implement response means the model failed to produce the report -- reject and
   // retry it, don't auto-approve nothing. (An "insufficient evidence" outcome is the

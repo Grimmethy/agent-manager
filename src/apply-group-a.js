@@ -655,7 +655,11 @@ function applyForensicsReport({ implementResponse, task }) {
     docTitle: '# Pipeline Fix Candidates',
   });
   if (res.skipped) return res;
-  return { succeeded: true, doneMarker: `filed ${(res.candidateIds || []).join(', ')} to ${res.file}` };
+  // Return res.file so apply-task.js's git-branch-diff flow stages the doc it just wrote
+  // (`filesToAdd = [artifact.file]`) -- same shape arch_discovery's apply returns. Without
+  // `file` here the flow ran `git add [undefined]` -> "pathspec 'undefined'". pipeline_
+  // forensics is directToMain, so this append is committed straight to master.
+  return { succeeded: true, file: res.file, doneMarker: `filed ${(res.candidateIds || []).join(', ')} to ${res.file}` };
 }
 
 // Parses path_prefetch_resolve's implement-pass output -- a single JSON object (see
