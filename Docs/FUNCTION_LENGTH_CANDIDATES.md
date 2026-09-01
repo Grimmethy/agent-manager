@@ -541,3 +541,51 @@ Extract two cohesive helpers from reviewTask, leaving the remainder as a short o
 
 Benefits:
 Each extracted helper has a single, clearly-named responsibility and a small parameter list, so a reviewer can verify the routing rule or the profile-resolution logic in isolation without scrolling through 276 lines. Unit tests for resolveReviewBackend need no filesystem fixtures because the function is pure given task.source, and tests for executeAndRecord can mock the callable and the recorder independently. The orchestration shell becomes a readable three-step sequence, making it straightforward to add a future step (such as a post-review cache write) without further inflating an already-long function.
+
+### AC-12 · Split renderMarkdown's fused aggregation-and-rendering pipeline
+Strength: Strong
+Files: src/system-report.js
+Snippet:
+```
+
+function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
+  const bySource = {};
+  const byClassification = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0 };
+  for (const t of tasks) {
+    bySource[t.source || 'unknown'] = (bySource[t.source || 'unknown'] || 0) + 1;
+    byClassification[t.classification] = (byClassification[t.classification] || 0) + 1;
+  }
+
+  const lines = [];
+  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${fmtLocal(startIso)} to ${fmtLocal(endIso)}`);
+  lines.push('');
+  lines.push(`**Tasks completed:** ${tasks.length}`);
+  lines.push('');
+
+  lines.push('## Summary');
+  lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }));
+  lines.push('');
+
+  lines.push('## By Source');
+  for (const [source, count] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
+    lines.push(`- ${source}: ${count}`);
+  }
+  lines.push('');
+
+  lines.push('## Junk vs. Benefit (by task count)');
+  lines.push(`- Benefit: ${byClassification.benefit}`);
+  lines.push(`- Signal-filtering (correctly dismissed false positives): ${byClassification.filtering}`);
+  lines.push(`- Housekeeping: ${byClassification.housekeeping}`);
+  lines.push(`- Junk (blocked / confirmed-bad): ${byClassification.junk}`);
+  if (byClassification.unclear) lines.push(`- Unclear (not classified): ${byClassification.unclear}`);
+  lines.push('');
+```
+
+Problem:
+`renderMarkdown` is 137 lines long not because it is a long string template, but because it interleaves at least two distinct responsibilities in a single linear body: (1) data transformation—two aggregation loops over `tasks` that build `bySource` and `byClassification` counters, a `.sort` on the source map, and a conditional branch on `byClassification.unclear`—and (2) section-by-section rendering of five or six heterogeneous report blocks (Summary, By Source, Junk-vs-Benefit, Downtime, Queue Health, Self-Audit, Blocked Patterns), each with its own formatting rules and conditionals. Because the aggregation step feeds directly into `buildPlainEnglishSummary` and into the per-section `lines.push` calls, a reader must hold the entire compute-then-render pipeline in working memory to understand why any given line of output looks the way it does, and a change to the aggregation logic (e.g., adding a new classification bucket) forces the reviewer to scan all 137 lines to confirm no rendering section silently depends on the old shape.
+
+Solution:
+Extract the pure data-transformation prefix into a small helper, e.g. `aggregateTaskStats(tasks)`, that returns `{ bySource, byClassification, sortedSources }` and contains the two loops, the sort, and the `unclear` flag. Then break the rendering body into one clearly-named function per report section—`renderSummarySection`, `renderBySourceSection`, `renderJunkVsBenefitSection`, `renderDowntimeSection`, `renderQueueHealthSection`, `renderSelfAuditSection`, `renderBlockedPatternsSection`—each accepting the pre-computed stats object (and any section-specific parameters) and returning an array of markdown lines. `renderMarkdown` itself shrinks to a thin orchestrator: call `aggregateTaskStats`, call `buildPlainEnglishSummary` with the result, then concatenate the per-section line arrays. Each extracted function is small enough to unit-test in isolation with a fixed stats fixture, and the conditional branching (e.g., the `unclear` guard) lives next to the section it affects rather than being buried mid-function.
+
+Benefits:
+Readability improves because a reviewer can verify a single section's formatting logic in 15–25 lines instead of scanning 137; the aggregation logic becomes independently testable (feed a synthetic `tasks` array, assert the shape of `bySource`/`byClassification`) without exercising any rendering code; and future changes—adding a new classification bucket, reordering sections, or swapping the sort criterion—are localized to one small function, reducing the chance of an accidental cross-section regression that the current monolithic body makes easy to miss in code review.
