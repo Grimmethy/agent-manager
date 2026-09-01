@@ -547,8 +547,8 @@ def _chat_reservation_watchdog():
                 single_flight_lock.release(record["fh"])
                 try:
                     chat_sessions.set_reserved(record["storageDir"], sid, False)
-                except Exception:
-                    pass  # best-effort -- the lock is already released, which is what matters
+                except Exception as exc:
+                    logger.warning("Failed to clear reserved flag for session %s in %s: %s: %s", sid, record["storageDir"], type(exc).__name__, exc)  # best-effort -- logged, not re-raised; lock already released
 
 
 def project_slug(path_str: str) -> str:
