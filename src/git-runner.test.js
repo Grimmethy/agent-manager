@@ -147,6 +147,32 @@ test('resetToMain throws instead of discarding history when local and origin hav
   assert.match(log, /local fix/);
 });
 
+test('resetToMain fast-forwards when local is simply behind origin (an out-of-band push to master)', () => {
+  // Regression: resetToMain() used to `git push origin main:main` unconditionally, which a
+  // strictly-behind local fails with a non-fast-forward rejection -- and the catch then
+  // mislabeled it "genuinely diverged" and threw, wedging the apply loop crash-looping.
+  // A behind local has nothing to preserve; it should just reset forward. (Confirmed live
+  // 2026-09-01 after pushing a fix straight to origin/master out of band.)
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+
+  // Someone pushes a new commit straight to origin/main; this clone knows nothing of it.
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'tracked.txt'), 'v2 pushed out of band\n');
+  git(['commit', '-am', 'out-of-band push straight to master'], otherClone);
+  git(['push', 'origin', 'main'], otherClone);
+  const originTip = git(['rev-parse', 'main'], bareDir).trim();
+
+  assert.doesNotThrow(() => runner.resetToMain());
+
+  assert.equal(git(['rev-parse', 'HEAD'], repoDir).trim(), originTip);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2 pushed out of band\n');
+  assert.equal(git(['stash', 'list'], repoDir).trim(), '');
+});
+
 test('resetToMain still lands on a real, clean checkout of the default branch', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);

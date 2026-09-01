@@ -73,6 +73,16 @@ function createRealGitRunner(repoRoot) {
         throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
       }
       run(['checkout', mainBranch]);
+      // Refresh origin/<mainBranch> so the ancestry checks below are against reality, not
+      // a stale remote-tracking ref -- callers normally fetchMain() first, but resetToMain
+      // must be correct on its own (a stale ref here misclassifies "local is simply
+      // behind" as "diverged" and wedges the apply loop -- confirmed live 2026-09-01 after
+      // an out-of-band push straight to master).
+      run(['fetch', 'origin', mainBranch]);
+      const remote = `origin/${mainBranch}`;
+      const isAncestor = (a, b) => {
+        try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+      };
       // 2026-08-27, Grimmethy: "This reset has consistently caused us to lose work and
       // reintroduces bugs after we fix them." Root-caused live: the plain `git reset
       // --hard origin/<mainBranch>` below discards ANY local commit on mainBranch that
@@ -84,24 +94,30 @@ function createRealGitRunner(repoRoot) {
       // silently reverted out from under the pipeline, reintroducing the exact bug it
       // had just fixed, recoverable only because git hadn't pruned the reflog yet. A
       // local commit ahead of origin here is real, intentional work (this repo is
-      // sometimes committed to directly in the shared working tree, same premise the
-      // auto-stash fix above already accepted at the uncommitted-changes layer, and the
-      // same premise pushMain()'s own comment already documented for the narrower
-      // DIRECT_TO_MAIN_SOURCES case) -- never something to discard by default. Push it
-      // forward to origin FIRST: a plain, non-force push, safe by construction whenever
-      // mainBranch is a fast-forward superset of origin (the overwhelmingly common
-      // case -- exits 0 as a no-op "Everything up-to-date" when there's nothing to
-      // push), so the hard reset just below becomes a no-op for any real commit. Only
-      // genuinely diverged history (origin has a commit mainBranch doesn't) fails a
-      // plain push, and that failure is surfaced as a thrown error -- caught by
-      // applyTask()'s own top-level try/catch, which blocks this one task for a human
-      // to reconcile -- rather than silently resolved by throwing local history away.
-      try {
-        run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
-      } catch (e) {
-        throw new Error(`resetToMain: local ${mainBranch} has commit(s) origin doesn't, and fast-forwarding them to origin failed (likely genuinely diverged history -- needs a human to reconcile, not an automatic reset): ${e.message}`);
+      // sometimes committed to directly in the shared working tree) -- never something to
+      // discard by default. Classify the three cases explicitly:
+      const originInLocal = isAncestor(remote, mainBranch); // origin ⊆ local (local ahead or equal)
+      const localInOrigin = isAncestor(mainBranch, remote); // local ⊆ origin (local behind or equal)
+      if (originInLocal && !localInOrigin) {
+        // Local has real commit(s) origin lacks -- fast-forward origin FIRST so the hard
+        // reset below becomes a no-op instead of discarding them. A plain non-force push,
+        // safe by construction here (local is a strict superset of origin).
+        try {
+          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+        }
+      } else if (!originInLocal && !localInOrigin) {
+        // Neither is an ancestor of the other -- genuinely diverged history (origin got a
+        // commit local doesn't have AND local has one origin doesn't). Not something to
+        // resolve by throwing either side away; surface it for a human. Caught by
+        // applyTask()'s top-level try/catch, which blocks just this one task.
+        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
       }
-      run(['reset', '--hard', `origin/${mainBranch}`]);
+      // Remaining cases -- local behind origin (an out-of-band push straight to
+      // ${mainBranch}) or exactly equal -- have nothing local worth preserving: just
+      // fast-forward onto origin.
+      run(['reset', '--hard', remote]);
     },
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
