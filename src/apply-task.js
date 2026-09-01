@@ -476,17 +476,24 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     closeOriginatingBrainDumpEntry(task, brainDumpPath, `Implemented and pushed to branch ${branchName} -- Task: ${task.id}`);
 
     // Auto-drain (2026-08-20, blocked-drain.js -- see its own header for the full
-    // design): a pipeline_self_audit fix just landed for real (this is the genuine
-    // committed-and-pushed outcome, not the earlier unconfirmed pass and not a "nothing
+    // design): a signature-scoped fix just landed for real (this is the genuine
+    // committed-and-pushed outcome, not an earlier unconfirmed pass and not a "nothing
     // groundable" no-op, which returns doneMarker instead and never reaches this line) --
-    // requeue every currently-blocked task sharing the same failure signature. Best-
-    // effort: a drain failure must never turn a real, successful apply into a reported
+    // requeue every currently-stuck task sharing that failure signature.
+    //   pipeline_self_audit    -> sweep queue/blocked/
+    //   pipeline_forensics_fix -> sweep queue/blocked/ AND queue/needs-clarification/
+    //     (2026-09-01: a forensic study clusters tasks that landed in either state, so the
+    //     fix has to drain both -- otherwise confirming the report files the fix and
+    //     nothing ever pulls the studied tasks back, the exact gap this closes).
+    // Best-effort: a drain failure must never turn a real, successful apply into a reported
     // failure; the fix itself already landed regardless.
-    if (task.source === 'pipeline_self_audit' && task.promptContext && task.promptContext.signature) {
+    const drainSources = { pipeline_self_audit: ['blocked'], pipeline_forensics_fix: ['blocked', 'needs-clarification'] };
+    if (drainSources[task.source] && task.promptContext && task.promptContext.signature) {
+      let requeuedIds = [];
       try {
-        const { requeuedIds } = requeueBlockedTasksForSignature(pipelineDir, task.promptContext.signature);
+        ({ requeuedIds } = requeueBlockedTasksForSignature(pipelineDir, task.promptContext.signature, { dirs: drainSources[task.source] }));
         if (requeuedIds.length > 0) {
-          console.error(`[apply-task] auto-requeued ${requeuedIds.length} blocked task(s) sharing signature "${task.promptContext.signature}": ${requeuedIds.join(', ')}`);
+          console.error(`[apply-task] auto-requeued ${requeuedIds.length} stuck task(s) sharing signature "${task.promptContext.signature}": ${requeuedIds.join(', ')}`);
         }
       } catch (e) {
         // Non-fatal: the fix already landed; the next scheduler pass will retry.
