@@ -1145,3 +1145,26 @@ At module level, add `import logging` and `logger = logging.getLogger(__name__)`
 
 Benefits:
 Once deployed, any of the three failure modes produces a single, greppable WARNING line in the application log carrying the exception class, message, and full traceback. An operator (or on-call engineer) can immediately tell whether the binary is missing, the process was killed, or the output was non-JSON—without attaching a debugger or adding temporary `print` statements. The dashboard's graceful-degradation contract is unchanged: it still receives `None` and renders its fallback, so no caller-side code needs modification. The fix is a two-line addition (one module-level logger, one log call) that costs nothing on the happy path and requires no new dependency.
+
+### AC-73 · Log silently skipped brain-dump-sort files instead of bare `continue`
+Strength: Strong
+Files: python/dspy_brain_dump_sort_pilot.py
+Snippet:
+```
+    for f in sorted(done_dir.glob("brain-dump-sort-*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        ctx = data.get("promptContext") or {}
+        raw_text = ctx.get("rawText")
+```
+
+Problem:
+The loop over `done_dir.glob("brain-dump-sort-*.json")` catches `OSError` and `json.JSONDecodeError` per file and immediately executes `continue`, discarding the exception object, the filename, and any diagnostic context. Because the glob has already confirmed the file exists, a subsequent read or parse failure is an unexpected condition, not a known-safe no-op. If a writer bug, encoding change, or mid-write truncation causes every matched file to fail, the loop terminates with zero records and the caller cannot distinguish "all files were corrupt" from "the glob matched nothing," making the failure invisible in downstream pipeline steps.
+
+Solution:
+Add `import logging` at the top of the module (the stdlib `logging` module is already used elsewhere in this project per the capability manifest) and replace the bare `continue` with a `logging.warning` call that records the file path, the exception class, and the exception message, e.g. `logging.warning("Skipping %s: %s: %s", f, type(e).__name__, e)`. The loop still `continue`s after logging so that one bad file does not abort processing of the remaining files; no rethrow is warranted because the caller's contract is "process whatever valid files exist" and a single-file failure is not actionable at the call site. No new dependency, no metrics, no third-party logger — only the stdlib `logging` primitive the project already relies on.
+
+Benefits:
+Once fixed, any operator or on-call engineer inspecting the log stream can immediately see which file was skipped, why (truncated JSON, permission error, encoding mismatch), and how many files were affected, turning an otherwise silent zero-output condition into a one-line diagnostic. The cost is a single `logging.warning` call per failure (a no-op at the default `INFO` level if the handler is not configured, but present in any `DEBUG`/`WARNING`-level log sink), so the happy path is unaffected and no new dependency or metrics infrastructure is introduced.
