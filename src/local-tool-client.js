@@ -516,6 +516,15 @@ const CHAT_FLAKE_MAX_ATTEMPTS = 3;
 // redo a whole prior turn (a real generation, not a cheap resend), so this stays small.
 const MAX_ROLLBACK_ATTEMPTS = 2;
 
+// Edit-by-turn-N forcing function (2026-09-01): a real live failure class -- the local
+// write-agentic tier repeatedly spent its ENTIRE turn budget on grep/read/list orientation
+// and never once called edit_file/write_file, then blocked. Grounding the prompt with the
+// plan + a prior read-only investigation helped it find the right files faster but did NOT
+// get it off the fence. So once a `nudgeToEditEarly` run has used this many turns with zero
+// edits, inject one firm mid-run message: stop exploring, next action is an edit or a
+// RESOLUTION line. Env-overridable; clamped below maxTurns so it always leaves room to act.
+const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS) || 10;
+
 // Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
 // no multi-turn loop. local-client.js's own call() doesn't self-lock, so it's wrapped
 // externally here, the same discipline local-draft.js's maybeLocked() applies for its
@@ -616,7 +625,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -712,10 +721,29 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     };
   };
 
+  // Edit-by-turn-N forcing function -- fired at most once, see ORIENT_TURN_LIMIT.
+  let editNudgeFired = false;
+  const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
+
+    // If this run is meant to produce a diff and has spent its orientation budget without
+    // a single edit, one firm push before the next turn: stop exploring, act now. The
+    // model still has (maxTurns - ORIENT_TURN_LIMIT) turns left to implement or conclude.
+    if (nudgeToEditEarly && !editNudgeFired && turn >= ORIENT_TURN_LIMIT
+        && turn < maxTurns - 1 && editToolCallCount() === 0) {
+      editNudgeFired = true;
+      messages.push({
+        role: 'user',
+        content: `You have used ${turn} turns exploring and have not made a single edit. Stop exploring now -- you have enough information. Your next action MUST be an edit_file or write_file call to start implementing, OR your final message with exactly one RESOLUTION: line (implemented / no-changes-needed / decompose / needs-human-decision). Do not call grep_codebase / read_file / list_directory / run_bash again.`,
+      });
+      // Keep the flake-rollback anchor for THIS turn after the nudge, so a rollback re-does
+      // only the (poisoned) assistant turn and preserves the nudge.
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
 
     const { message, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
@@ -774,7 +802,7 @@ module.exports = {
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
   buildToolHandlers, buildWriteToolHandlers,
-  withApplyLock, APPLY_LOCK_PATH,
+  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
 };
 
 // CLI: node local-tool-client.js <request.json>
