@@ -86,7 +86,10 @@ function appendHistoryEvent(task, stage, detail) {
   }
 
   if (persistHook) {
-    try { persistHook(task); } catch (_) { /* best-effort: never abort a pass on a flush failure */ }
+    try { persistHook(task); } catch (err) {
+      /* best-effort: never abort a pass on a flush failure */
+      console.warn('[task-history] persistHook failed for task', task.id ?? task.name ?? '<unknown>', err?.message ?? String(err));
+    }
   }
   return entry;
 }
