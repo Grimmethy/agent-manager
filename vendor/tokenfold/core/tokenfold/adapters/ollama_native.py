@@ -40,7 +40,12 @@ HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
 
 def add_ollama_routes(app: FastAPI, eng: Engine, client: httpx.AsyncClient) -> None:
 
-    def _upstream(req: Request) -> str:
+    import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _upstream(req: Request) -> str:
         base = (req.headers.get("x-tokenfold-upstream")
                 or eng.cfg.upstream).rstrip("/")
         if base.endswith("/v1"):
@@ -129,6 +134,9 @@ def add_ollama_routes(app: FastAPI, eng: Engine, client: httpx.AsyncClient) -> N
                 eng.record_output(model, raw_txt, msg["content"], sid, scope=scope_hdr)
             return JSONResponse(obj, status_code=r.status_code)
         except Exception:
+            logger.exception(
+                "ollama_chat decode failed (model=%s sid=%s scope=%s)",
+                model, sid, scope_hdr)
             return Response(r.content, r.status_code)
 
     # -----------------------------------------------------------------
@@ -205,6 +213,9 @@ def add_ollama_routes(app: FastAPI, eng: Engine, client: httpx.AsyncClient) -> N
                 eng.record_output(model, raw_txt, obj["response"], sid, scope=scope_hdr)
             return JSONResponse(obj, status_code=r.status_code)
         except Exception:
+            logger.exception(
+                "ollama_generate decode failed (model=%s sid=%s scope=%s)",
+                model, sid, scope_hdr)
             return Response(r.content, r.status_code)
 
     # -----------------------------------------------------------------
