@@ -2298,6 +2298,62 @@ function renderWorkLog(task) {
     + tierBlocks + `</details>`;
 }
 
+// pipeline_forensics (2026-09-01, Grimmethy: "Is the work done by forensics properly
+// visible on the task log?"). A forensic study is a non-agentic review task, so it has no
+// Work Log and its Draft Attempts record is thin (plan chars / implement chars). The thing
+// a reviewer actually needs to judge the ranked report -- BEFORE confirming it files a
+// pipeline-fix candidate -- is what the study looked at: which failing tasks, which
+// contrast "winners", and the raw evidence bundle it reasoned over. All of that is on
+// task.promptContext but was never surfaced in the modal.
+function taskLink(id) {
+  return `<a href="#" class="task-jump" data-open-task-anywhere="${escapeAttr(id)}"><code>${escapeHtml(id)}</code></a>`;
+}
+function renderForensicsStudyBlock(task) {
+  if (task.source !== 'pipeline_forensics') return '';
+  const pc = task.promptContext || {};
+  const losers = Array.isArray(pc.loserIds) ? pc.loserIds : [];
+  const winners = Array.isArray(pc.winnerIds) ? pc.winnerIds : [];
+  let html = `<div class="field-label">Forensic Study</div><div>`;
+  html += `<span class="meta">Trigger: ${escapeHtml(pc.triggerType || '?')}`;
+  if (pc.signature) html += ` &middot; Signature: <code>${escapeHtml(pc.signature)}</code>`;
+  if (pc.subjectKind && pc.subjectKey && pc.subjectKey !== pc.signature) html += ` &middot; Subject: ${escapeHtml(pc.subjectKind)} <code>${escapeHtml(pc.subjectKey)}</code>`;
+  html += `</span>`;
+  if (losers.length) html += `<div style="margin-top:6px"><strong>Failing tasks studied (${losers.length}):</strong><br>${losers.map(taskLink).join('<br>')}</div>`;
+  if (winners.length) html += `<div style="margin-top:6px"><strong>Contrast set — tasks that SUCCEEDED (${winners.length}):</strong><br>${winners.map(taskLink).join('<br>')}</div>`;
+  html += `</div>`;
+  return html;
+}
+
+// The real greps a harness-grounded audit ran against this pipeline's OWN src/ and their
+// hits -- used by staleness_audit / pipeline_self_audit / pipeline_health_audit /
+// pipeline_forensics / ui_visibility_audit. Collapsible; the drafting model already read
+// these, this just makes them auditable by a human too.
+function renderHarnessHits(task) {
+  const pc = task.promptContext || {};
+  const hits = Array.isArray(pc.harnessHits) ? pc.harnessHits : [];
+  if (!hits.length) return '';
+  const rows = hits.map((h) => `<div class="wl-call">`
+    + `<code>${escapeHtml(h.file || '?')}${h.line != null ? ':' + h.line : ''}</code>`
+    + (h.query ? ` <span class="meta">(query "${escapeHtml(h.query)}")</span>` : '')
+    + (h.text ? `<pre style="margin:2px 0">${escapeHtml(h.text)}</pre>` : '')
+    + `</div>`).join('');
+  return `<details class="work-log"><summary><span class="field-label">Harness Hits</span> `
+    + `<span class="meta">${hits.length} match(es) in this repo's own code</span></summary>${rows}</details>`;
+}
+
+// The full pre-computed evidence bundle a deterministic detector assembled for the drafting
+// model (promptContext.evidenceText) -- pipeline_forensics' contrast-set bundle,
+// pipeline_health_audit's anomaly dump, pipeline_self_audit's cluster description. Large,
+// so collapsed by default.
+function renderEvidenceBundle(task) {
+  const pc = task.promptContext || {};
+  const ev = typeof pc.evidenceText === 'string' ? pc.evidenceText.trim() : '';
+  if (!ev) return '';
+  return `<details class="work-log"><summary><span class="field-label">Evidence Bundle</span> `
+    + `<span class="meta">${ev.length.toLocaleString()} chars — what the study reasoned over</span></summary>`
+    + `<pre>${escapeHtml(ev)}</pre></details>`;
+}
+
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
@@ -2377,6 +2433,7 @@ function renderTaskDetailModal(task) {
       + (pc.reasons && pc.reasons.length ? `<br><span class="meta">Flagged: ${pc.reasons.map(escapeHtml).join(', ')}</span>` : '')
       + `</div>`;
   }
+  html += renderForensicsStudyBlock(task);
   if (task.needsClarification) html += renderClarificationPicker(task);
   // Pipeline History: task.history[] (task-history.js's appendHistoryEvent -- see that
   // module for the schema). Was written correctly the whole time this session but never
@@ -2406,6 +2463,8 @@ function renderTaskDetailModal(task) {
   // means re-investigating from scratch.
   html += renderDraftAttempts(task);
   html += renderWorkLog(task);
+  html += renderHarnessHits(task);
+  html += renderEvidenceBundle(task);
   // A "degenerate: empty" block means the model returned nothing for that pass -- the
   // field is absent, not present-and-empty, so without this the modal just omits the
   // section and the timeline is the only hint anything ran. Say it explicitly.
@@ -2417,6 +2476,11 @@ function renderTaskDetailModal(task) {
   else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   content.innerHTML = html;
   backdrop.classList.add('open');
+  // Jump to another task from an in-modal link (the forensic study's failing/winner ids) --
+  // same delegated pattern the Recent Tasks / Workers lists use.
+  content.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
+    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
+  });
   if (task.needsClarification) wireClarificationPicker(task.id);
   armTaskDetailAutoRefresh(task);
 }
