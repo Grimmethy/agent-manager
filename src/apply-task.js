@@ -474,7 +474,13 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
           console.error(`[apply-task] auto-requeued ${requeuedIds.length} blocked task(s) sharing signature "${task.promptContext.signature}": ${requeuedIds.join(', ')}`);
         }
       } catch (e) {
-        // Non-fatal -- see comment above.
+        // Non-fatal: the fix already landed; the next scheduler pass will retry.
+        console.warn("[apply-task] auto-requeue failed (non-fatal)", {
+          requeuedIds,
+          signature: task.promptContext.signature,
+          message: e?.message ?? String(e),
+          stack: e?.stack,
+        });
       }
     }
 
