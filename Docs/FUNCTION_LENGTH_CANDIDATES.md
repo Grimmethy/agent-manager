@@ -685,3 +685,29 @@ Extract five helpers from the body of `_encode`, each with a single entry/exit c
 
 Benefits:
 Each extracted helper can be unit-tested with a stub `prof`/`cfg` and a fixed message list, eliminating the need for full-pipeline integration tests to verify, say, that the tiny-request path still calls `phrases.compress`. Code review becomes tractable because a reviewer can assess the never-larger invariant in `_run_pipeline` without scrolling past session bookkeeping and OFF-mode logic. The orchestrator reads as a top-down narrative of pipeline stages, making it immediately obvious which branch a new requirement (e.g., a third early-exit mode) belongs in, and reducing the risk that a future edit to one concern accidentally breaks an invariant in another.
+
+### AC-15 · Extract parseCandidateSections from nextCandidateFulfillmentTask
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+The nextCandidateFulfillmentTask function inlines a ~20-line while-loop that walks a markdown string, finds `### ` headings, determines each section's end boundary (next `\n## ` or `\n### `), and pushes raw section strings into a local `sections` array. This parsing logic is tangled together with the candidate-selection business logic that follows, making it impossible to unit-test the section-boundary logic in isolation or reuse it if another consumer needs the same `###`-section split.
+
+Solution:
+Define a new function `parseCandidateSections(text)` immediately above `nextCandidateFulfillmentTask`. It takes the raw markdown string and returns the `sections` array (array of strings, each starting at a `### ` heading and ending just before the next `\n## ` or `\n### ` heading, or at end-of-string). Move the entire while-loop body (from `const sections = []; let pos = 0;` through `pos = end === -1 ? text.length : end + 1;`) into this new function. In `nextCandidateFulfillmentTask`, replace that inline loop with a single call: `const sections = parseCandidateSections(text);`. No other lines in the function are touched.
+
+Benefits:
+The markdown-section parser is now independently testable (feed a synthetic multi-section string, assert boundaries). The main function's body shrinks by ~20 lines, making the selection logic that follows easier to read in context. Pure extraction—zero behavior change.
+
+### AC-16 · Extract selectNextCandidate from nextCandidateFulfillmentTask
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+After the section-parsing loop, nextCandidateFulfillmentTask contains a long for-loop (~100 lines) that: filters sections by AC-ID presence, Strength: Strong, length cap, placeholder-body detection; checks taskIdExistsInQueue; assembles the task object (title, filesArray, fetchedFiles via fs.readFileSync, promptContext); and returns the first qualifying candidate or null. This selection/assembly logic is the bulk of the function and depends on taskIdExistsInQueue, getConfig (defaultDomain, repoRoot), path, and fs—making the function hard to test without the full module context and impossible to reuse for a different candidate doc shape.
+
+Solution:
+Define a new function `selectNextCandidate(sections, deps)` immediately above `nextCandidateFulfillmentTask` (or below `parseCandidateSections`). `deps` is an object `{ taskIdExistsInQueue, defaultDomain, sourceName, repoRoot }` passed in from the caller. Move the entire for-loop and all code after it (from `for (const section of sections) {` through the function's final return) into this new function, replacing the direct `require('../task-sources.js')` call and `getConfig()` calls with the corresponding `deps` fields. The function returns the assembled task object or `null`. In `nextCandidateFulfillmentTask`, replace the inline selection logic with: `return selectNextCandidate(sections, { taskIdExistsInQueue, defaultDomain, sourceName, repoRoot: getConfig().repoRoot });`. The lazy `require` for `taskIdExistsInQueue` and the `getConfig()` call for `defaultDomain` remain in `nextCandidateFulfillmentTask` (or move to the caller) and are passed via `deps`. No other lines are touched.
+
+Benefits:
+The selection/assembly logic is now independently testable with a fixed `sections` array and stubbed `deps` (no fs, no require). The main function becomes a thin 5-line orchestrator: read file → parse sections → select → return. The `deps` injection makes it trivial to test the placeholder-rejection, queue-dedup, and fetchedFiles paths without a real repo. Pure extraction—zero behavior change.
