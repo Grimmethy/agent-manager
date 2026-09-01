@@ -68,3 +68,29 @@ Solution:
 
 Benefits:
 Verification-required tasks get a focused single-shot attempt where the model can make the edit and run the check in one pass, rather than burning multi-turn budget on investigation. The retry guard prevents an infinite single-shot loop. The multi-turn path remains available for tasks that genuinely need iterative exploration, so no capability is lost.
+
+### AC-6 · Add requiresVerification flag to the tier-3 task object
+Strength: Strong
+Files: src/local-agentic-write-draft.js
+
+Problem:
+Tier-3 adhoc tasks that carry a declared verification command (e.g. a py_compile string or a test-module path) are currently indistinguishable from tasks without one. The downstream dispatcher (runPlanWithTools in local-tool-client.js) has no way to know whether a task needs a focused single-shot verification pass before falling into the full multi-turn tool loop. The task object is assembled in local-agentic-write-draft.js just before it is passed to runPlanWithTools, but no boolean field marks verification intent.
+
+Solution:
+At the point in local-agentic-write-draft.js where the task object is finalised before the call to runPlanWithTools (the call site visible in the import `const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js')` and the downstream `runAgenticDraftInWorktree` usage), set a new boolean field `requiresVerification` on the task. The value is `true` iff the caller supplied a non-empty verification command (the exact key name for that command is whatever the existing prompt-building code already reads from `task` -- inspect `buildWriteAgenticPrompt` and the surrounding assembly code to find it). If no verification command is present, set `requiresVerification` to `false` explicitly. Do not alter any other field, the function signature, or the return type. If the task object passes through a JSON-serialisation whitelist before reaching local-tool-client.js, add `requiresVerification` to that whitelist.
+
+Benefits:
+Downstream code (the routing condition in local-tool-client.js) can use a simple `task.requiresVerification === true` truthiness check without undefined edge-cases. The flag is purely additive -- no existing behaviour changes for tasks that do not carry a verification command. The field survives reject-retry requeues because it is a plain boolean on the task object that draft-attempt-record.js already threads through task.draftAttempts.
+
+### AC-7 · Route verification-required adhoc tasks to the single-shot path with a retry guard
+Strength: Strong
+Files: src/local-tool-client.js, src/local-agentic-write-draft.js
+
+Problem:
+Every tier-3 adhoc task currently enters the full multi-turn tool loop (runPlanWithTools) regardless of whether it carries a verification command. For tasks that only need a focused single-shot generation (e.g. produce a py_compile-clean patch), the multi-turn loop wastes the 35-turn budget on orientation turns before it ever attempts the edit. Additionally, if a single-shot attempt is tried and fails, the reject-retry mechanism re-dispatches the same task object back into the dispatcher, which would re-enter the single-shot path indefinitely (no marker distinguishes 'already tried single-shot' from 'first attempt').
+
+Solution:
+In the dispatch path that local-agentic-write-draft.js uses to invoke runPlanWithTools (the call site in local-agentic-write-draft.js, or the entry of runPlanWithTools in local-tool-client.js -- whichever is the natural guard point), insert a conditional BEFORE the multi-turn loop begins. The condition has three conjuncts: (a) the task is adhoc (use the existing discriminator -- `isLeafTask` or the tier/kind field already on the task; confirm by reading the assembly code in local-agentic-write-draft.js); (b) `task.requiresVerification === true`; (c) `task.singleShotAttempted !== true`. If all three hold, set `task.singleShotAttempted = true`, then invoke the existing single-shot /api/generate path (the function in local-client.js that local-tool-client.js already imports KEEP_ALIVE from -- find the actual generate call or add a thin wrapper that calls Ollama's /api/generate with the task's prompt text plus the verification command as a focused instruction). Parse the returned text for a RESOLUTION line (reuse whatever RESOLUTION-parsing helper already exists in the codebase; if none, check for the literal string 'RESOLUTION:'). If a RESOLUTION line is present, return the result as a resolved task. If absent, do NOT throw -- fall through to the existing failure/retry path so reject-retry-check.js requeues the task normally. Because `singleShotAttempted` is now `true`, the requeued task will skip the single-shot branch and enter the multi-turn loop as it does today. If any conjunct is false, proceed into the multi-turn loop with zero behavioural change.
+
+Benefits:
+Verification-required adhoc tasks get a fast, focused single-shot attempt before burning the 35-turn multi-turn budget. The singleShotAttempted marker guarantees at most one single-shot try per task lifetime, preventing infinite single-shot loops on retry. Non-verification and non-adhoc tasks are completely unaffected (all three conjuncts must hold). The change is purely additive to the dispatch path -- no existing multi-turn behaviour is altered for any task that does not carry requiresVerification.
