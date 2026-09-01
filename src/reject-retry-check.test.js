@@ -153,14 +153,14 @@ test('a NON-adhoc exhausted rejection keeps the original "stamp and stay in bloc
   assert.equal(out.needsClarification, undefined);
 });
 
-// --- 2026-09-01: an adhoc tier-3 run that exhausted its turn budget without editing
-// (resolveAgenticDraft stamps task.turnBudgetExhausted) is now a retryable draft-stage
-// block, not a permanent dead end. -----------------------------------------------------
+// --- 2026-09-01: an adhoc tier-3 draft-stage block a redraft could plausibly fix
+// (resolveAgenticDraft stamps task.retryableDraftBlock -- turn-budget exhaustion OR a
+// malformed decompose) is now retried, not a permanent dead end. -----------------------
 
-test('an adhoc turn-budget-exhausted block (no blockedStage) is requeued to queue/adhoc/ with an edit-early feedback line', () => {
+test('an adhoc turn-budget-exhausted block is requeued to queue/adhoc/ with an edit-early feedback line', () => {
   const d = setupAdhocDirs();
   const task = {
-    id: 'adhoc-tb', domain: 'adhoc', source: 'manual', turnBudgetExhausted: true,
+    id: 'adhoc-tb', domain: 'adhoc', source: 'manual', retryableDraftBlock: true, turnBudgetExhausted: true,
     blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
     localRejectCount: 0, history: [],
   };
@@ -172,16 +172,37 @@ test('an adhoc turn-budget-exhausted block (no blockedStage) is requeued to queu
   assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-tb.json')), 'lands in queue/adhoc/');
   const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-tb.json'), 'utf8'));
   assert.equal(out.localRejectCount, 1);
-  assert.equal(out.turnBudgetExhausted, undefined, 'flag cleared on requeue');
+  assert.equal(out.turnBudgetExhausted, undefined, 'flags cleared on requeue');
+  assert.equal(out.retryableDraftBlock, undefined, 'flags cleared on requeue');
   assert.equal(out.priorRejectionFeedback.length, 1);
   assert.match(out.priorRejectionFeedback[0], /made ZERO edits/);
   assert.match(out.priorRejectionFeedback[0], /edit_file within the first few turns/);
 });
 
-test('an adhoc turn-budget block at the retry cap escalates to needs-clarification (honest, after real retries)', () => {
+test('an adhoc malformed-decompose block is requeued with a decompose-format feedback line', () => {
   const d = setupAdhocDirs();
   const task = {
-    id: 'adhoc-tb2', domain: 'adhoc', source: 'manual', turnBudgetExhausted: true,
+    id: 'adhoc-md', domain: 'adhoc', source: 'manual', retryableDraftBlock: true,
+    blockedReason: 'Agentic implement pass said RESOLUTION: decompose but did not follow it with a valid JSON array of at least 2 {title, rawText} sub-tasks',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-md.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-md.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 1);
+  assert.equal(out.retryableDraftBlock, undefined);
+  assert.match(out.priorRejectionFeedback[0], /chose RESOLUTION: decompose but the sub-task JSON was malformed/);
+  assert.match(out.priorRejectionFeedback[0], /valid JSON array of 2\+ objects/);
+  assert.doesNotMatch(out.priorRejectionFeedback[0], /made ZERO edits/);
+});
+
+test('an adhoc retryable draft block at the retry cap escalates to needs-clarification (honest, after real retries)', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-tb2', domain: 'adhoc', source: 'manual', retryableDraftBlock: true, turnBudgetExhausted: true,
     blockedReason: 'exhausted its turn budget without making any edits',
     localRejectCount: 2, priorRejectionFeedback: ['made ZERO edits (1)', 'made ZERO edits (2)'], history: [],
   };
@@ -196,9 +217,9 @@ test('an adhoc turn-budget block at the retry cap escalates to needs-clarificati
   assert.match(out.needsClarification.openQuestions, /could not get this past review after 3 attempts/);
 });
 
-test('a NON-adhoc task carrying turnBudgetExhausted is NOT requeued (guarded on isAdhocTask)', () => {
+test('a NON-adhoc task carrying retryableDraftBlock is NOT requeued (guarded on isAdhocTask)', () => {
   const d = setupAdhocDirs();
-  const task = { id: 'nonadhoc-tb', source: 'trouble_log', turnBudgetExhausted: true, blockedReason: 'r', localRejectCount: 0, history: [] };
+  const task = { id: 'nonadhoc-tb', source: 'trouble_log', retryableDraftBlock: true, blockedReason: 'r', localRejectCount: 0, history: [] };
   fs.writeFileSync(path.join(d.blockedDir, 'nonadhoc-tb.json'), JSON.stringify(task));
 
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
