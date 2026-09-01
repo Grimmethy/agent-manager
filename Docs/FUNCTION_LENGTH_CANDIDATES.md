@@ -493,3 +493,51 @@ Extract three clearly-named helpers from the body of applyBrainDumpSort. First, 
 
 Benefits:
 A reviewer changing the staleness window now reads a 15-line predicate instead of hunting through 200 lines for the one `if` that matters. The classification rule becomes independently testable: you can assert "this note is actionable" or "this note is code" without mocking file-system calls or config plumbing. Because each helper has a single responsibility and a named contract, the main function reads as a three-line narrative (validate → classify → persist), which makes the overall flow obvious in code review and gives future contributors a clear insertion point when a sixth guard or a second classification sub-rule appears.
+
+### AC-11 · Decompose reviewTask's layered orchestration
+Strength: Strong
+Files: src/review-task.js
+Snippet:
+```
+ */
+async function reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+  // Resolved here rather than as a static default param, same reasoning as
+  // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
+  // tier, only known once the task object is in hand. Passing the whole task (not just
+  // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
+  // caller override always wins.
+  // 2026-08-24 (model-profile-registry.js): same pattern as local-draft.js's own
+  // resolvedLocalCall wrapping -- when the task's own source declares a modelProfile,
+  // its overrides become defaults spread BEFORE the real majorityVote() call below (opts
+  // spread after wins, though the one real call site doesn't set model/numCtx/numPredict/
+  // effort/timeoutMs itself today, so the profile's values reliably take effect). Passing
+  // both local-only (numCtx/numPredict) and claude-only (effort/timeoutMs) keys
+  // unconditionally is safe -- whichever backend's majorityVote() runs only destructures
+  // the params it recognizes, ignoring the rest. Skipped for an injected
+  // localMajorityVote (test/caller override), same as local-draft.js.
+  const modelProfile = resolveModelProfile(task);
+  const profileOverrides = modelProfile
+    ? {
+      model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict,
+      effort: modelProfile.effort, timeoutMs: modelProfile.timeoutMs,
+    }
+    : null;
+  // 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
+  // the local model to review them" -- ALWAYS the local backend, never providerFor(task)
+  // (which would route a high-reasoning-tier task to Claude). Root-caused live: this
+  // review call had, in practice, ALREADY always run local regardless of tier -- nothing
+  // in review-task.js's own require graph ever loaded task-sources.js, so
+  // providerFor()'s tier lookup silently saw an empty registry and defaulted to local
+  // every time -- but review-runner.sh's separate bash-side pre-check DID load that
+  // registry (to compute its own Claude-budget gate), correctly saw a high-tier task,
+  // and skipped it whenever Claude was paused/rate-limited: a real task that would have
+```
+
+Problem:
+reviewTask is a 276-line async function that bundles at least three independently testable concerns behind a single entry point: resolving model-profile overrides from task.source, deciding which backend callable to invoke (the 2026-08-27 "always local" rule versus the legacy providerFor path, plus the localMajorityVote injection), and then performing the majorityVote call followed by outcome recording. The parameter surface—task plus eight destructured options including six filesystem paths, an injectable model stub, and an injectable recorder—confirms this is an orchestration function, not a single linear task. Because the three concerns are interleaved with conditional branching (the modelProfile ternary, the injected-override path, the dated backend-routing decision), a regression in any one layer is only observable by exercising the entire 276-line body, and a reader cannot hold the full control flow in working memory.
+
+Solution:
+Extract two cohesive helpers from reviewTask, leaving the remainder as a short orchestration shell. First, pull the profile-resolution and backend-selection logic—reading task.source's declared profile, building the overrides object, applying the 2026-08-27 local-backend rule, and honouring the localMajorityVote injection—into a pure function resolveReviewBackend(task, { localMajorityVote }) that returns { callable, profileOverrides }. Second, pull the call-and-record sequence—invoking the resolved callable with the resolved overrides, then calling recordModelOutcome with the result—into a thin wrapper executeAndRecord(callable, profileOverrides, task, { recordModelOutcome }). The remaining reviewTask body then reads as resolve, execute, return—roughly thirty to forty lines—with each extracted helper independently unit-testable without touching the filesystem or the model.
+
+Benefits:
+Each extracted helper has a single, clearly-named responsibility and a small parameter list, so a reviewer can verify the routing rule or the profile-resolution logic in isolation without scrolling through 276 lines. Unit tests for resolveReviewBackend need no filesystem fixtures because the function is pure given task.source, and tests for executeAndRecord can mock the callable and the recorder independently. The orchestration shell becomes a readable three-step sequence, making it straightforward to add a future step (such as a post-review cache write) without further inflating an already-long function.
