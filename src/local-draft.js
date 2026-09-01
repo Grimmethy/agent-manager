@@ -470,7 +470,7 @@ async function draftAdhocBranch(task, {
       response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
       toolCallLog: localAgenticResult.toolCallLog,
     });
-    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog });
+    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog, finalMessage: localAgenticResult.response });
     if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
       return { succeeded: false, reason: localAgenticResult.reason };
     }
@@ -507,7 +507,7 @@ async function draftAdhocBranch(task, {
     turnsUsed: agenticResult.turnsUsed,
     toolCallLog: agenticResult.toolCallLog,
   });
-  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog });
+  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog, finalMessage: agenticResult.response });
   if (!agenticResult.succeeded) {
     return { succeeded: false, reason: agenticResult.reason };
   }

@@ -140,6 +140,7 @@ function buildLocalAgenticPrompt(task) {
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
     'You have real, read-only tools: grep_codebase (search for a term), read_file (read a real file), list_directory (list a real directory). Use them across as many turns as you need -- read a file, then based on what you saw, read a DIFFERENT file if that is what you need next. You do NOT have write/edit/bash tools -- you cannot directly change anything, only investigate.',
+    'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page further -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); literal substring / all-words match, not a regex; matching lines only -- read_file around a hit for context.',
     '',
     'Before you could conclude "already resolved": a feature that MENTIONS the same topic is not proof this request is done. If the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element), the base feature existing is not enough -- the SPECIFIC delta must be present. A feature with the same NAME may act on a DIFFERENT object than the one this request names. Enumerate every concrete object the request names and confirm current code covers EACH before saying no-changes-needed.',
     '',

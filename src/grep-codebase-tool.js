@@ -18,6 +18,31 @@ const { getConfig } = require('./config.js');
 // types rather than assuming every consumer repo is JS/TS.
 const MATCH_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.sh', '.ps1', '.md'];
 const MAX_MATCHES = 20;
+// With context lines each hit is several lines, so fewer of them before the payload gets
+// unwieldy.
+const MAX_MATCHES_WITH_CONTEXT = 12;
+const MAX_CONTEXT_LINES = 5;
+
+// A model-supplied `dir` for the PRIMARY repo used to require an exact string match against
+// grepAllowedDirs (src, python, ...) -- anything else (`python/dashboard`, `.`, `src/`)
+// silently returned [], indistinguishable from "no matches", and the prompt never listed
+// the valid names. Resolve it leniently instead: exact dir, a subpath of an allowed dir, an
+// allowed dir that is itself under the requested dir, or "."/"" meaning "all of them".
+// Returns { roots: [absolute paths] } or { error }.
+function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
+  const norm = String(dir == null ? '' : dir).trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  if (norm === '' || norm === '.') {
+    return { roots: allowedDirs.map((d) => path.join(repoRoot, d)) };
+  }
+  if (allowedDirs.includes(norm)) return { roots: [path.join(repoRoot, norm)] };
+  // requested dir is inside an allowed dir, e.g. "python/dashboard" under "python"
+  const underAllowed = allowedDirs.some((d) => norm === d || norm.startsWith(`${d}/`));
+  if (underAllowed) return { roots: [path.join(repoRoot, norm)] };
+  // an allowed dir is inside the requested dir, e.g. dir="." handled above, or a parent
+  const containedAllowed = allowedDirs.filter((d) => d.startsWith(`${norm}/`));
+  if (containedAllowed.length) return { roots: containedAllowed.map((d) => path.join(repoRoot, d)) };
+  return { error: `unknown dir '${dir}'. Searchable dirs: ${allowedDirs.join(', ')}. Pass one of those, a subpath of one (e.g. "${allowedDirs[0]}/sub"), or "." for all of them.` };
+}
 
 // Both call sites' own plan prompts explicitly invite "a few-word phrase" as a valid
 // query (see archImportPlanPrompt/projectSearchPlanPrompt in prompts.js), but a full
@@ -43,19 +68,24 @@ function lineMatches(line, query) {
 // that has no per-repo grep-dirs config -- and an omitted / "." dir walks the whole root.
 // Every existing caller (arch-import-fetch.js, the pipeline's read-only tool loop) passes
 // no `root` and hits the unchanged path below.
-function grepCodebase({ query, dir, root }) {
+function grepCodebase({ query, dir, root, contextLines }) {
   const { repoRoot, grepAllowedDirs } = getConfig();
   if (!query) return [];
 
   const altRoot = root && path.resolve(root) !== path.resolve(repoRoot) ? path.resolve(root) : null;
   const base = altRoot || repoRoot;
-  let searchRoot;
+
+  let searchRoots;
   if (altRoot) {
-    searchRoot = !dir || dir === '.' ? altRoot : path.join(altRoot, dir);
+    searchRoots = [!dir || dir === '.' ? altRoot : path.join(altRoot, dir)];
   } else {
-    if (!grepAllowedDirs.includes(dir)) return [];
-    searchRoot = path.join(repoRoot, dir);
+    const resolved = resolvePrimaryDirs(repoRoot, grepAllowedDirs, dir);
+    if (resolved.error) return { error: resolved.error };
+    searchRoots = resolved.roots;
   }
+
+  const ctx = Math.max(0, Math.min(MAX_CONTEXT_LINES, Number(contextLines) || 0));
+  const maxMatches = ctx > 0 ? MAX_MATCHES_WITH_CONTEXT : MAX_MATCHES;
   const hits = [];
 
   function walk(current) {
@@ -67,7 +97,7 @@ function grepCodebase({ query, dir, root }) {
       return;
     }
     for (const entry of entries) {
-      if (hits.length >= MAX_MATCHES) return;
+      if (hits.length >= maxMatches) return;
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         if (['node_modules', '.git', 'queue'].includes(entry.name)) continue;
@@ -81,9 +111,9 @@ function grepCodebase({ query, dir, root }) {
         }
         const lines = text.split('\n');
         for (let i = 0; i < lines.length; i++) {
-          if (hits.length >= MAX_MATCHES) return;
+          if (hits.length >= maxMatches) return;
           if (lineMatches(lines[i], query)) {
-            hits.push({
+            const hit = {
               file: path.relative(base, fullPath).replace(/\\/g, '/'),
               line: i + 1,
               text: lines[i].trim(),
@@ -91,14 +121,22 @@ function grepCodebase({ query, dir, root }) {
               // a hit into read_file with an absolute path. Only set for an alternate
               // root so existing single-root callers see a byte-identical shape.
               ...(altRoot ? { root: altRoot } : {}),
-            });
+            };
+            if (ctx > 0) {
+              hit.before = lines.slice(Math.max(0, i - ctx), i);
+              hit.after = lines.slice(i + 1, i + 1 + ctx);
+            }
+            hits.push(hit);
           }
         }
       }
     }
   }
 
-  walk(searchRoot);
+  for (const sr of searchRoots) {
+    if (hits.length >= maxMatches) break;
+    walk(sr);
+  }
   return hits;
 }
 
