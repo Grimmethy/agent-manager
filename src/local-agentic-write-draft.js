@@ -89,26 +89,45 @@ function priorInvestigationBlock(task) {
   ].join('\n');
 }
 
+// A task carrying promptContext.decomposedFrom was itself split off a larger feature by a
+// prior decompose pass; one carrying rescopedFromDecompose was re-scoped down to a single
+// sub-task the model proposed. Either way it is a confirmed-atomic leaf -- offering it the
+// "decompose / too large" escape hatch (which it then over-picks and dead-ends on) is
+// exactly wrong.
+function isLeafTask(task) {
+  const ctx = (task && task.promptContext) || {};
+  return !!(ctx.decomposedFrom || (task && task.rescopedFromDecompose));
+}
+
 function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
+  const leaf = isLeafTask(task);
+  const stillLostAdvice = leaf
+    ? `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
+    : `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
+  const tooLargeClause = leaf
+    ? 'This task has already been scoped by a prior decompose pass to be implementable in ONE pass. If you genuinely cannot, answer RESOLUTION: needs-human-decision with the specific blocker -- do not answer RESOLUTION: decompose and do not leave a partial edit.'
+    : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task.';
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
-    `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${ORIENT_TURN_LIMIT} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`,
+    `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${ORIENT_TURN_LIMIT} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
     '',
     `Title: ${task.title || ''}`,
+    leaf ? 'This task is a CONFIRMED-ATOMIC LEAF: a prior decompose pass already split the larger feature and this is one indivisible piece. It MUST be implemented in this pass with edit_file / write_file. Do NOT answer RESOLUTION: decompose.' : '',
+    (leaf && ctx.decomposedFrom) ? `(decomposed from parent task ${ctx.decomposedFrom})` : '',
     '',
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
     priorRejectionBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
-    'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or decompose/ask, per below).',
+    'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or ask, per below).',
     '',
     'If it is NOT already resolved and is a concrete, scoped change you can make confidently: implement it with edit_file / write_file. Read whatever real files you need first -- do not guess at code you have not looked at. Run a targeted check (py_compile / one test module) for what you changed before finishing, and fix any failure your own change introduced.',
     '',
-    'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task.',
+    tooLargeClause,
     '',
     'If implementing genuinely requires a PRODUCT/DESIGN DECISION only a human should make (which library/approach when none exists yet, what data to keep and for how long, which of several reasonable designs) -- NOT the same as too large, NOT the same as already resolved -- do not guess and do not falsely claim nothing needs to change. Stop and state the real open question(s).',
     '',
