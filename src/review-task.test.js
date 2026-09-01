@@ -376,6 +376,30 @@ test('reviewTask leaves the vote-error suffix out entirely when every vote succe
   assert.doesNotMatch(approvedEntry.detail, /hard-failed/);
 });
 
+test('reviewTask overwrites the stale "needs-review" status with the verdict, so it tracks the queue dir the file moves to', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+
+  const approvedTask = baseTask({ status: 'needs-review' });
+  await reviewTask(approvedTask, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: fakeApprove([]),
+    recordModelOutcome: () => {},
+  });
+  assert.equal(approvedTask.status, 'approved');
+
+  const blockedTask = baseTask({ status: 'needs-review' });
+  await reviewTask(blockedTask, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: async () => ({
+      confident: true, verdict: 'REJECT',
+      votes: [{ verdict: 'REJECT', response: 'REJECT: incomplete' }],
+      realVoteCount: 3, requestedVotes: 3,
+    }),
+    recordModelOutcome: () => {},
+  });
+  assert.equal(blockedTask.status, 'blocked');
+});
+
 test('reviewTask fact-checks brain_dump_sort secondBrainPath against secondBrainDir, not repoRoot -- exists:true for a note that is only in the vault', async () => {
   const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
   fs.mkdirSync(path.join(secondBrainDir, 'references'), { recursive: true });
