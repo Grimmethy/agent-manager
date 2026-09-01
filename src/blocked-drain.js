@@ -61,11 +61,19 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
       }
       if (!taskMatchesSignature(data, signature)) continue;
 
-      // A genuine "design-decision" hold is a human's judgment call ("do you want this
-      // feature built even though it doesn't exist yet?") -- no pipeline fix makes that
-      // question go away, so auto-requeuing it just churns the task through a re-fail.
-      // Leave it for the human.
-      if (data.needsClarification && data.needsClarification.reason === 'design-decision') continue;
+      // reason:'design-decision' covers two very different holds:
+      //  (a) a GENUINE human question -- the agentic pass emitted RESOLUTION:
+      //      needs-human-decision (local-draft.js), or a duplicate / staleness escalation.
+      //      No pipeline fix answers "do you want this?" -- leave it for the human.
+      //  (b) an AUTO-escalation after the blind-redraft retries were exhausted
+      //      (reject-retry-check.js stamps reason:'design-decision' AND an 'exhausted'
+      //      history event). That's a DRAFTING failure, not a question -- exactly what a
+      //      signature-scoped fix exists to unblock -- so let it requeue (once per
+      //      signature, guarded just below, so a wrong bet can't thrash it).
+      const isDesignDecision = data.needsClarification && data.needsClarification.reason === 'design-decision';
+      const fromRetryExhaustion = Array.isArray(data.history)
+        && data.history.some((h) => (h.stage || h.status) === 'exhausted');
+      if (isDesignDecision && !fromRetryExhaustion) continue;
 
       // Requeue a given task at most once per distinct signature: if it re-fails with the
       // SAME signature and a second fix for it lands, don't thrash it; a fix for a
