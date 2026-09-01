@@ -489,8 +489,8 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
             "label": Path(normalized_root).name,
         })
         PROJECT_REGISTRY_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Failed to write project registry at %s: %s", PROJECT_REGISTRY_PATH, exc)
 
 # Project tab: browsing/graphing an arbitrary codebase is decoupled from whichever repo
 # the live worker/review-runner/apply-runner/queue-watchdog loops are actually pointed at
