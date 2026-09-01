@@ -393,3 +393,26 @@ Replace the bare `pass` with a `logger.warning("Failed to write project registry
 
 Benefits:
 Operators immediately see in application logs that the registry write failed and *why* (permission, missing directory, read-only mount), turning a silent, unexplainable "my project is missing from the dashboard" into a one-line grep. Persistent misconfigurations that would otherwise mask themselves forever become diagnosable within minutes of deployment. The fix is a single-line change with no behavioral risk to the core flow.
+
+### AC-41 · Silent `except Exception: pass` around `chat_sessions.set_reserved`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                single_flight_lock.release(record["fh"])
+                try:
+                    chat_sessions.set_reserved(record["storageDir"], sid, False)
+                except Exception:
+                    pass  # best-effort -- the lock is already released, which is what matters
+
+
+```
+
+Problem:
+After the single-flight lock is successfully released, the code calls `chat_sessions.set_reserved(record["storageDir"], sid, False)` to clear the reserved flag. If that call raises for any reason — a missing directory, a serialization error, a `KeyError` on a malformed `storageDir`, even a `MemoryError` under pressure — the bare `except Exception: pass` swallows it entirely. There is no log line, no metric increment, no structured event. In a batch-processing loop the shape of `record["fh"]` / `record["storageDir"]` implies, a persistent failure mode (e.g. a renamed storage path, a race on the underlying store) will leave every session permanently flagged as reserved, and the dashboard, scheduler, and reaper will all silently operate on stale state with zero signal to an operator.
+
+Solution:
+Replace the bare `except Exception: pass` with a `logger.warning` call that includes the offending `sid`, `record["storageDir"]`, the exception type, and the exception message, followed by `pass` (the lock is already released, so re-raising would be incorrect). Concretely: `except Exception as exc: logger.warning("Failed to clear reserved flag for session %s in %s: %s: %s", sid, record["storageDir"], type(exc).__name__, exc)`. If the project already exposes a metrics registry, add a single `counter.inc("chat_sessions.set_reserved_failures")` on the same path so the rate is visible in dashboards and can drive an alert threshold.
+
+Benefits:
+Operators gain a single, greppable log line per failure that names the session, the storage directory, and the root-cause exception, turning an invisible state-drift into a one-line diagnosis. The optional counter gives a trend signal: a spike or sustained non-zero rate immediately distinguishes a transient blip from a systemic misconfiguration (renamed path, schema change) before it accumulates into thousands of stuck reserved sessions. No behavioural change to the happy path; the lock-release semantics are untouched.
