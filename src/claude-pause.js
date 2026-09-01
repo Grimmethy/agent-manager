@@ -52,6 +52,7 @@ function isClaudePaused(settingsPath = settingsPathFor()) {
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     return settings.claudePaused === true;
   } catch (e) {
+    console.error(`claude-pause: ${e.message}`, e);
     return false;
   }
 }
