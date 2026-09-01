@@ -44,7 +44,11 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
   let names = [];
   try {
     names = fs.readdirSync(draftingDir).filter((f) => f.endsWith('.json'));
-  } catch {
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return { reclaimed: 0, ids: [] };
+    }
+    console.warn(`reclaimOrphanedDrafts: failed to read ${draftingDir} -- code=${err.code}, message=${err.message}`);
     return { reclaimed: 0, ids: [] };
   }
 
