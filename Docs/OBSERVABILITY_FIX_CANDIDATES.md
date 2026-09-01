@@ -1283,3 +1283,26 @@ Inside the existing `catch (e)` block, before the `return ''`, emit a single `co
 
 Benefits:
 Once the line is in place, any exception from `fetchForQueries` produces an immediately visible stderr entry with enough context (module tag + error message) to identify the root cause without attaching a debugger or adding temporary instrumentation. Operators can distinguish a broken grounding pipeline from a legitimate zero-hit response, and the debugging cost drops from "trace downstream symptoms back through the call stack" to "read the log line." The fix is a one-line addition using only the Node `console.error` primitive the project already uses elsewhere, so it introduces no new dependency and no behavioral change to the success path or the return contract.
+
+### AC-79 · Silent catch in grounding-source config lookup leaves no diagnostic trail
+Strength: Strong
+Files: src/get-grounding-source.js
+Snippet:
+```
+  // identical getConfig() call.
+  let repoRoot = null;
+  try {
+    ({ repoRoot } = getConfig());
+  } catch (e) {
+    repoRoot = null;
+  }
+```
+
+Problem:
+The `try/catch` around `getConfig()` in `src/get-grounding-source.js` assigns `repoRoot = null` on failure but discards the caught error entirely—no `console.warn`, no `process.stderr.write`, no stack trace. Because the project has no third-party logger and no metrics/telemetry system, the only available diagnostic channel is Node's `console.*` / `process.stderr`, and none of it is used here. The result is that a benign "module not yet initialised" case and a non-benign "corrupt config file / permission error / regression in getConfig" case are indistinguishable at runtime: the system silently degrades to `repoRoot = null` and an operator debugging broken grounding-source resolution has zero breadcrumbs in any log output.
+
+Solution:
+Replace the bare `repoRoot = null` assignment in the catch block with a `console.warn` call that includes the originating module tag, the fact that `repoRoot` will remain `null`, and the error's message (with a `e?.message ?? e` guard for non-Error throws). Do not rethrow—the caller is explicitly designed to handle `repoRoot === null` and rethrowing would change the contract. Do not add any metric, counter, or gauge; the project has no telemetry system and `console.warn` is the sole appropriate signal. The redundant `repoRoot = null` re-assignment is removed since the variable is already `null` from its initialisation.
+
+Benefits:
+Once the warning is in place, any unexpected `getConfig()` failure (corrupt file, missing dependency, permission error, internal regression) produces a single identifiable line in stderr that names the module, the failed call, and the error message, giving an operator or CI log scraper enough context to triage without attaching a debugger. The benign "config module intentionally absent" path still proceeds silently to `repoRoot = null` from the caller's perspective, so no behavioural contract changes. The redundant re-assignment is cleaned up, making the intent of the fallback explicit in the code rather than implied by a no-op write.
