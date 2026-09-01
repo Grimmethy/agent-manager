@@ -938,3 +938,26 @@ Add a module-level `log = logging.getLogger(__name__)` (or reuse one already pre
 
 Benefits:
 An on-call operator who sees a blank branch list can now `grep` the application log for "Skipping branch" and immediately see the underlying `RuntimeError` or `ValueError` with the offending ref, distinguishing a systemic git/PATH/permissions problem from a single malformed ref. The fix costs one log line per failed iteration (bounded by the number of branches), introduces no new dependency, and does not alter the existing control flow or the dashboard's render contract.
+
+### AC-64 · Log swallowed Ollama proposal exception instead of silently discarding it
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+Snippet:
+```
+            proposal = ollama_client.generate(
+                _build_search_proposal_prompt(subject_text, transcript), think=False, temperature=0.2, num_predict=120,
+            )
+    except Exception:
+        # 2026-08-24 -- caught live BEFORE the _maybe_locked() coordination above existed:
+        # with no lock, this call queued behind an actively-drafting worker and blew
+        # ollama_client.py's own 240s timeout outright. The lock now makes that the common
+```
+
+Problem:
+The `except Exception:` at line 181 catches every failure from the optional Ollama "search proposal" call and discards the exception object entirely. The accompanying comment explains the historical 240-second timeout, but at runtime there is zero signal: no log line, no timestamp, no exception type or message, no stack trace. In production the only observable symptom is "the proposal is missing," making it impossible to distinguish the expected queued-behind-drafting-worker timeout from a genuinely new failure mode (Ollama server down, malformed JSON response, OOM kill, a regression in the lock). Because the project has no metrics or telemetry system, the stdlib `logging` module is the sole channel through which this event can surface to operators.
+
+Solution:
+Inside the existing `except Exception:` block, before the variable falls back to its default, emit a single `logging.getLogger(__name__).warning("Ollama search-proposal call failed; proceeding without proposal", exc_info=True)` (or, if the file already uses a module-level `logger = logging.getLogger(__name__)`, call `logger.warning(...)` with the same message and `exc_info=True`). The message should include any readily-available correlation context already in scope (e.g., the session or conversation identifier) so the line is greppable. Do **not** re-raise: the caller is explicitly designed to continue without the proposal, and re-raising would turn an optional enrichment into a hard failure. No new dependency, no metric, no counter — just the one stdlib log call that the project's existing Python code already uses.
+
+Benefits:
+Operators gain a timestamped, greppable log line with the full exception type, message, and traceback the moment the auxiliary call fails, letting them immediately tell an expected timeout apart from a server outage or a code regression. The graceful-degradation contract is unchanged — the dashboard session still proceeds without the proposal — but the silent swallow is replaced by a single, low-noise warning that is visible in the same log stream the rest of the Python code already writes to. No new dependency, no new subsystem, no behavioural change beyond the added log line.
