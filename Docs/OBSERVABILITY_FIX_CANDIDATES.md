@@ -1398,3 +1398,26 @@ Replace the empty catch body with a single `console.warn('archImportFetch failed
 
 Benefits:
 Once the warning is in place, any operator tailing stdout/stderr (or a CI log stream) immediately sees that the enrichment call is failing and why, without needing to add temporary instrumentation. The `warn` level correctly signals "degraded but non-fatal," distinguishing it from hard errors that would warrant `console.error`. The one-line change costs zero dependencies, zero new abstraction, and zero change to the control-flow contract, while closing the gap between "the code degrades gracefully" and "the operator can tell it is degrading."
+
+### AC-84 · Empty catch swallows draft-lifecycle error with zero trace
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+  const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked } =
+    resolveDraftContext(task, { localCall, withLockFn });
+
+  try {
+    appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
+
+    // Deterministic staleness-recheck short-circuit -- see runStalenessFastpath().
+```
+
+Problem:
+At line 1167 the `catch` clause for the `appendHistoryEvent(task, …)` call is an empty `{}` block. If `appendHistoryEvent` throws—due to a malformed task object, a filesystem error on the history store, or any internal assertion failure—the exception is silently discarded. No log line, no `console.error`, no stderr write, no rethrow. An operator debugging a missing or corrupted draft-history entry has no trace whatsoever to follow; the failure is invisible in every log stream and in every crash report.
+
+Solution:
+Replace the empty `{}` with a `console.error` call that includes the task identifier (or a safe subset of its fields), the event name being appended, and the original error (message + stack). For example: `console.error('[local-draft] appendHistoryEvent failed for task', task.id ?? task.name ?? '<unknown>', 'event:', eventName, err && err.stack || err);`. Do not rethrow: `appendHistoryEvent` is a best-effort audit append inside a larger draft-lifecycle flow, and propagating the error would abort the primary operation (save, delete, transition) for a non-critical side-effect. The project has no metrics or telemetry dependency, so a structured log line via `console.error` is the only available observability primitive and is sufficient here.
+
+Benefits:
+Any future regression in `appendHistoryEvent`—a schema mismatch, a permissions issue on the history file, a race during concurrent draft edits—will now produce a single, greppable line in stderr that names the task, the event, and the root-cause stack. Operators can correlate the log with the surrounding draft operation, confirm whether the history gap is expected (e.g., a test fixture) or a real data-loss incident, and file a targeted bug. The primary draft flow remains unaffected because the error is still contained, but it is no longer invisible.
