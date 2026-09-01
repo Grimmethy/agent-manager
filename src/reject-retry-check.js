@@ -161,7 +161,15 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       }
 
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-      if (retryableDraftBlock && task.turnBudgetExhausted === true) {
+      if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
+        // resolveAgenticDraft decided this task's real scope is exactly one sub-task the
+        // model proposed. Make that the task now, and tell the next pass to implement it
+        // (not decompose again).
+        task.promptContext = task.promptContext || {};
+        task.promptContext.rawText = task.rescopedRawText;
+        priorFeedback.push(`A prior pass decided this task's real scope is exactly: ${task.rescopedRawText}\nThat is the task now. Implement THAT with edit_file/write_file in this pass. Do not decompose again.`);
+        delete task.rescopedRawText; // keep rescopedFromDecompose set for the escalation cap in resolveAgenticDraft
+      } else if (retryableDraftBlock && task.turnBudgetExhausted === true) {
         priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
