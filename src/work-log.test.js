@@ -59,6 +59,21 @@ test('appendTierWorkLog appends a second tier to the same file', () => {
   assert.deepEqual(doc.tiers.map((t) => t.tier), ['local-agentic', 'local-agentic-write']);
 });
 
+test('appendTierWorkLog stores the tier final message when given', () => {
+  appendTierWorkLog({ id: 'wl-fm' }, { tier: 'local-agentic-write', turnsUsed: 12, toolCallLog: log, finalMessage: 'RESOLUTION: implemented\nadded the route' }, PIPELINE_DIR);
+  const doc = readWorkLog('wl-fm', PIPELINE_DIR);
+  assert.match(doc.tiers[0].finalMessage, /RESOLUTION: implemented/);
+});
+
+test('a requeued adhoc task keeps its worklog (queue/adhoc/ counts as live)', () => {
+  appendTierWorkLog({ id: 'adhoc-x' }, { tier: 'local-agentic-write', toolCallLog: log }, PIPELINE_DIR);
+  fs.mkdirSync(path.join(PIPELINE_DIR, 'queue', 'adhoc'), { recursive: true });
+  fs.writeFileSync(path.join(PIPELINE_DIR, 'queue', 'adhoc', 'adhoc-x.json'), '{}');
+  const { pruned } = pruneWorkLogs(PIPELINE_DIR);
+  assert.equal(pruned, 0);
+  assert.ok(readWorkLog('adhoc-x', PIPELINE_DIR));
+});
+
 test('appendTierWorkLog is a no-op for an empty / missing tool log and never throws', () => {
   appendTierWorkLog({ id: 'wl-4' }, { tier: 'x', toolCallLog: [] }, PIPELINE_DIR);
   appendTierWorkLog({ id: 'wl-4' }, { tier: 'x' }, PIPELINE_DIR);

@@ -37,7 +37,8 @@ function fetchForQueries(queries) {
 
   for (const query of queries) {
     for (const dir of grepAllowedDirs) {
-      const results = grepCodebase({ query, dir }).slice(0, MAX_HITS_PER_QUERY);
+      const raw = grepCodebase({ query, dir });
+      const results = (Array.isArray(raw) ? raw : []).slice(0, MAX_HITS_PER_QUERY);
       for (const r of results) {
         hits.push({ ...r, query });
         matchedFiles.add(r.file);
