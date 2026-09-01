@@ -60,7 +60,7 @@ legible.
 |---|---|---|
 | **agent-manager-hygiene** | code-quality review of the consumer repo: `observability_*`, `performance_*`, `function_length_*`, `arch_*`, `unused_export` | exists; half-extracted |
 | **project-development** (future, name TBD) | external-project study & adoption: `deep_dive`, `project_search`, `arch_import`'s external-repo side, possibly `backlog_*` | not started; its own effort (Stage H) |
-| **self-audit** (open question) | `pipeline_self_audit`, `pipeline_health_audit`, `ui_visibility_audit`, `staleness_audit` — and/or the platform's always-on I/O sources | see Open questions |
+| **self-audit** (open question) | `pipeline_self_audit`, `pipeline_health_audit`, `ui_visibility_audit`, `staleness_audit`, `pipeline_forensics` (+ `pipeline_forensics_fix`) — and/or the platform's always-on I/O sources | see Open questions |
 
 ### SDK additions
 
@@ -172,8 +172,14 @@ shared harness utility.
    hardcodes `adhoc` / `brain_dump_sort` as allowlist-exempt. Lean: keep in core for now,
    revisit after Stage G.
 2. `pipeline_self_audit` / `pipeline_health_audit` / `ui_visibility_audit` / `staleness_audit`
+   / `pipeline_forensics` (+ its `pipeline_forensics_fix` consumer, added 2026-09-01)
    audit the pipeline itself — legitimately core (the platform watching itself) or a
    `self-audit` plugin? This also decides where `arch-import-fetch.js` lands (Stage H).
+   `pipeline_forensics` reads deep core internals (`task.draftAttempts`, `work-log.js`,
+   `model_calls`, `pipeline-self-audit.js`'s signature primitives, `system-report.js`'s
+   accounting) that are deliberately *not* in `docs/PLUGIN_API.md`; if this cohort ever
+   becomes a plugin, `forensic-bundle.js` + `pipeline-forensics.js` move with it as one
+   unit and those internals join the contract then, not now.
 3. `backlog_*` home (Stage E): fold into `agent-manager-hygiene`, its own `backlog` plugin,
    or the Stage-H project-dev plugin? It is product-backlog work, closer to
    project-development than code-hygiene.
