@@ -1281,6 +1281,28 @@ test('nextCandidateFulfillmentTask fetches real, current content for a file that
   assert.equal(task.promptContext.fetchedFiles[0].content, 'try {\n  risky();\n} catch {}\n');
 });
 
+test('pipeline_forensics_fix: a candidate in Docs/PIPELINE_FIX_CANDIDATES.md mints a grounded fix task', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'local-tool-client.js'), 'function readFileTool() { /* no line window */ }\n');
+  const candidatesPath = writeCandidatesDocWithFiles(dir, path.join('Docs', 'PIPELINE_FIX_CANDIDATES.md'), 'src/local-tool-client.js');
+
+  freshTaskSources(dir);
+  delete require.cache[require.resolve('./prompts.js')];
+  require('./prompts.js'); // wires updateTaskSource('pipeline_forensics_fix', ...)
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  const src = getRegisteredSource('pipeline_forensics_fix');
+  assert.ok(src, 'pipeline_forensics_fix is registered');
+  assert.equal(src.candidateFulfillment, true);
+  assert.equal(typeof src.buildImplementPrompt, 'function', 'archReview implement prompt is wired');
+
+  const task = src.next();
+  assert.ok(task, 'a fix task was minted from the candidate doc');
+  assert.equal(task.source, 'pipeline_forensics_fix');
+  assert.equal(task.promptContext.fetchedFiles[0].path, 'src/local-tool-client.js');
+  assert.match(task.promptContext.fetchedFiles[0].content, /no line window/);
+});
+
 test('nextCandidateFulfillmentTask does not throw and returns an empty fetchedFiles for a named file that does not exist', () => {
   const dir = makeAdhocFixtureRepo();
   const candidatesPath = writeCandidatesDocWithFiles(dir, 'CANDIDATES.md', 'does/not/exist.js');
