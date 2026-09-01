@@ -9,6 +9,7 @@ Same "never let stats recording break the real feature" contract as the JS versi
 every function here swallows its own errors.
 """
 import json
+import logging
 import subprocess
 import tempfile
 import uuid
@@ -17,6 +18,8 @@ from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
 MODEL_STATS_DB_JS = SRC_DIR / "model-stats-db.js"
+
+logger = logging.getLogger(__name__)
 
 
 def _run_event(event: str, payload: dict):
@@ -80,7 +83,8 @@ def get_turns_summary() -> dict | None:
         if proc.returncode != 0:
             return None
         return json.loads(proc.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        logger.warning("model-stats client failed: %s", exc, exc_info=True)
         return None
 
 
