@@ -92,6 +92,32 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+test('write tier: a confirmed-atomic leaf (decomposedFrom) is told NOT to decompose and loses the "split into 2-6" clause', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const leaf = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'add one route', decomposedFrom: 'parent-123' } });
+    assert.match(leaf, /CONFIRMED-ATOMIC LEAF/);
+    assert.match(leaf, /decomposed from parent task parent-123/);
+    assert.match(leaf, /do NOT answer RESOLUTION: decompose/i);
+    assert.doesNotMatch(leaf, /split it into 2-6 smaller/);
+    // the RESOLUTION verb list itself is still intact (the parser needs the token)
+    assert.match(leaf, /RESOLUTION: decompose/);
+
+    const normal = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'do a big thing' } });
+    assert.doesNotMatch(normal, /CONFIRMED-ATOMIC LEAF/);
+    assert.match(normal, /split it into 2-6 smaller/);
+  });
+});
+
+test('write tier: rescopedFromDecompose alone also triggers leaf mode', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const leaf = buildWriteAgenticPrompt({ title: 'T', rescopedFromDecompose: true, promptContext: { rawText: 'the sharpened scope' } });
+    assert.match(leaf, /CONFIRMED-ATOMIC LEAF/);
+    assert.doesNotMatch(leaf, /decomposed from parent task/); // no parent id in this case
+  });
+});
+
 test('write tier: buildWriteAgenticPrompt folds in the plan (with a blind-plan disclaimer) and the prior investigation, in order', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
