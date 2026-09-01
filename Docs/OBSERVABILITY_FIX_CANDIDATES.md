@@ -1099,3 +1099,26 @@ Replace the bare `pass` with a `logger.warning(...)` call using the stdlib `logg
 
 Benefits:
 Once fixed, any failure in the stats-write path produces a single WARNING-level log line containing the exception class, message, and full traceback, giving an operator immediate visibility into *what* failed (IntegrityError, OperationalError, disk I/O error) and *where* it originated. The periodic collector continues running, so a transient blip self-recovers on the next cycle, while a persistent fault is immediately visible in the log stream rather than silently accumulating as a growing data gap on the dashboard. No behavioral change is introduced for the success path, and no new dependency or metrics infrastructure is required.
+
+### AC-71 · Silent exception swallow in hardware history fetch
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return [_row_to_history_entry(row) for row in rows]
+
+```
+
+Problem:
+The `except Exception: return []` block at line 245 catches every possible failure — missing table, permission denied, query-syntax error, connection timeout — and returns an empty list with no diagnostic output whatsoever. The caller (a dashboard rendering path) receives `[]`, which is byte-for-byte indistinguishable from a legitimately empty result set. In a hardware-stats dashboard this means a broken data source is silently indistinguishable from "no hardware events recorded," and no operator will ever notice the data pipeline is down until someone manually inspects the database.
+
+Solution:
+Add `import logging` and a module-level `logger = logging.getLogger(__name__)` at the top of the file (matching the stdlib `logging` module the project already uses). Replace the bare `except Exception: return []` with a block that calls `logger.exception("Failed to fetch hardware history rows; returning empty list")` before the `return []`. `logging.exception()` automatically appends the full traceback (exception type, message, and stack frames), giving an operator the exact SQL error, connection error, or permissions error that triggered the fallback. The `return []` is preserved so the dashboard widget degrades gracefully instead of raising a 500. No new dependency, no metrics emission, no re-raise — the only change is the single log call inside the existing except block.
+
+Benefits:
+Once fixed, any failure in the hardware-history query is immediately visible in application logs with full traceback context, so an operator can distinguish "table is empty" from "the query is broken" at a glance. The dashboard continues to render (showing an empty widget) rather than crashing, preserving the existing graceful-degradation contract. Because the fix uses only the stdlib `logging` module already present in the project, there is zero new dependency surface, zero configuration change, and zero risk of introducing a new failure mode.
