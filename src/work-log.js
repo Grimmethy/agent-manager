@@ -26,7 +26,10 @@ const FILE_BYTE_CAP = 1_000_000;   // whole-worklog ceiling; older tiers' call b
 
 // Queue dirs where a task is still pre-merge and its worklog is worth keeping. A task in
 // done/ has been applied (branch pushed or committed) -- audit happened or the window closed.
-const LIVE_QUEUE_DIRS = ['pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm'];
+// 'adhoc' matters specifically: reject-retry-check.js requeues a retryable adhoc draft block
+// to queue/adhoc/ (not pending/), so without it here pruneWorkLogs deleted the tier-3
+// transcript on the very next tick -- exactly the run a human most needs to see.
+const LIVE_QUEUE_DIRS = ['pending', 'adhoc', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm'];
 
 function worklogDir(pipelineDir) {
   return path.join(pipelineDir || getConfig().pipelineDir, 'queue', 'worklogs');
@@ -75,7 +78,7 @@ function slimTier(tier) {
 
 // Append one tier's full tool transcript to the task's worklog. No-op when there is no
 // tool activity to record. `pipelineDir` is resolved from config when omitted.
-function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog } = {}, pipelineDir) {
+function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog, finalMessage } = {}, pipelineDir) {
   try {
     if (!task || !task.id) return;
     if (!Array.isArray(toolCallLog) || toolCallLog.length === 0) return;
@@ -95,6 +98,9 @@ function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog } = {}, pipeline
       turnsUsed: turnsUsed != null ? turnsUsed : null,
       callCount: toolCallLog.length,
       calls: toolCallLog.map((e, i) => shapeCall(e, i + 1)),
+      ...(typeof finalMessage === 'string' && finalMessage.trim()
+        ? { finalMessage: capString(finalMessage, ARG_VALUE_CAP) }
+        : {}),
     });
 
     let out = JSON.stringify(doc, null, 2);

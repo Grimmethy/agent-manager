@@ -59,10 +59,48 @@ test('grepCodebase searches .py files, not just JS/TS', () => {
   });
 });
 
-test('grepCodebase refuses a dir not in the allowlist', () => {
+test('grepCodebase returns an error (not []) for a dir outside the allowlist, naming the allowed dirs', () => {
   const dir = makeFixtureRepo();
   withConfig(dir, 'src', () => {
-    assert.deepEqual(grepCodebase({ query: 'draft', dir: 'python' }), []);
+    const res = grepCodebase({ query: 'draft', dir: 'totally-unknown' });
+    assert.ok(!Array.isArray(res));
+    assert.match(res.error, /unknown dir 'totally-unknown'/);
+    assert.match(res.error, /Searchable dirs: src/);
+  });
+});
+
+test('grepCodebase accepts a subpath of an allowed dir', () => {
+  const dir = makeFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'python', 'dashboard'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python', 'dashboard', 'app.py'), 'def _call_chat():\n    pass\n');
+  withConfig(dir, 'src,python', () => {
+    const hits = grepCodebase({ query: '_call_chat', dir: 'python/dashboard' });
+    assert.ok(Array.isArray(hits));
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'python/dashboard/app.py');
+  });
+});
+
+test('grepCodebase with dir "." (or omitted) searches every allowed dir', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'const beacon = 1;\n');
+  fs.mkdirSync(path.join(dir, 'python'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python', 'b.py'), 'beacon = 2\n');
+  withConfig(dir, 'src,python', () => {
+    const dot = grepCodebase({ query: 'beacon', dir: '.' });
+    assert.deepEqual(dot.map((h) => h.file).sort(), ['python/b.py', 'src/a.js']);
+    const omitted = grepCodebase({ query: 'beacon' });
+    assert.equal(omitted.length, 2);
+  });
+});
+
+test('grepCodebase contextLines attaches before/after around each hit', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'src', 'c.js'), 'line1\nline2\nNEEDLE\nline4\nline5\n');
+  withConfig(dir, 'src', () => {
+    const [hit] = grepCodebase({ query: 'NEEDLE', dir: 'src', contextLines: 2 });
+    assert.deepEqual(hit.before, ['line1', 'line2']);
+    assert.deepEqual(hit.after, ['line4', 'line5']);
   });
 });
 
@@ -116,6 +154,6 @@ test('grepCodebase without `root` is byte-identical to before (no root field, al
     const hits = grepCodebase({ query: 'draftTask', dir: 'src' });
     assert.equal(hits.length, 1);
     assert.equal(hits[0].root, undefined);
-    assert.deepEqual(grepCodebase({ query: 'draftTask', dir: 'nope' }), []);
+    assert.ok(!Array.isArray(grepCodebase({ query: 'draftTask', dir: 'nope' })));
   });
 });

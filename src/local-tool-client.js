@@ -72,8 +72,17 @@ function rootsAndArgs(a, b) {
 
 // Same cap/truncation-suffix convention as nextCandidateFulfillmentTask()'s own
 // MAX_FETCHED_FILE_CHARS -- one huge file must not blow the model's context or the /api/chat
-// response payload.
+// response payload. This is only a hard SAFETY ceiling now: the primary control is the
+// line window below.
 const MAX_READ_FILE_CHARS = 8000;
+// 2026-09-01: a read_file with no way to page is why the local write-tier could never
+// implement a net-new route in python/dashboard/app.py -- the target region is ~130KB into
+// a ~4000-line file, and the old behaviour returned a silent first-8000-char HEAD cut. A
+// line window (offset/limit, 1-indexed, matching the Read tool the operator already knows)
+// + a nextOffset the model can page with fixes that. Defaults chosen so the common
+// "read a function" case is one call and a whole large file is a few deliberate pages.
+const READ_FILE_DEFAULT_LINES = 400;
+const READ_FILE_MAX_LINES = 800;
 
 function readFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
@@ -86,18 +95,49 @@ function readFileTool(a, b) {
     return { error: `path is not inside any accessible repo, refusing to read: ${relPath}` };
   }
   const { full } = resolved;
-  let content;
+  let raw;
   try {
-    content = fs.readFileSync(full, 'utf8');
+    raw = fs.readFileSync(full, 'utf8');
   } catch (e) {
     return { error: `could not read ${relPath}: ${e.message}` };
   }
-  const truncated = content.length > MAX_READ_FILE_CHARS;
-  return {
-    path: relPath,
-    content: truncated ? `${content.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated]` : content,
-    truncated,
-  };
+
+  const lines = raw.split('\n');
+  const totalLines = lines.length;
+  const windowGiven = args.offset != null || args.limit != null;
+
+  let offset = Number.isFinite(args.offset) ? Math.floor(args.offset) : 1;
+  if (offset < 1) offset = 1;
+  let limit = Number.isFinite(args.limit) ? Math.floor(args.limit) : READ_FILE_DEFAULT_LINES;
+  if (limit < 1) limit = 1;
+  if (limit > READ_FILE_MAX_LINES) limit = READ_FILE_MAX_LINES;
+
+  // offset past EOF -> empty content, but still report totalLines so the model can retry.
+  if (offset > totalLines) {
+    return { path: relPath, content: '', offset, limit, totalLines, nextOffset: null, truncated: false };
+  }
+
+  const endLine = Math.min(totalLines, offset - 1 + limit);
+  let slice = lines.slice(offset - 1, endLine).join('\n');
+
+  // Hard char ceiling still applies to the slice itself (a file with pathological line
+  // lengths must not blow the payload). If it bites, trim the slice and mark truncated.
+  let truncated = false;
+  if (slice.length > MAX_READ_FILE_CHARS) {
+    slice = `${slice.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`;
+    truncated = true;
+  }
+
+  const returnedThrough = truncated ? offset : endLine; // unknown exact line count when char-truncated
+  const nextOffset = endLine < totalLines ? endLine + 1 : null;
+
+  const out = { path: relPath, content: slice, offset, limit, totalLines, nextOffset, truncated };
+  if (!windowGiven && nextOffset != null) {
+    out.notice = `file has ${totalLines} lines; showing 1-${returnedThrough}. Re-call read_file with offset=${nextOffset} to page further (and limit=N, up to ${READ_FILE_MAX_LINES}).`;
+  } else if (nextOffset != null) {
+    out.notice = `showing lines ${offset}-${returnedThrough} of ${totalLines}. Re-call with offset=${nextOffset} for the next window.`;
+  }
+  return out;
 }
 
 function listDirectoryTool(a, b) {
@@ -346,13 +386,14 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'grep_codebase',
-      description: 'Search the codebase for a text/word match. Returns up to 20 matches with file path and line number. To search a repo other than the primary one, pass its absolute path (from list_roots) as "root".',
+      description: 'Search source files for a literal substring (or, for a multi-word query, lines containing every word). NOT a regex. Returns up to 20 matching lines with file path and line number, matching line only -- read_file around a hit for surrounding context. To search a repo other than the primary one, pass its absolute path (from list_roots) as "root".',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Plain substring/word to search for.' },
-          dir: { type: 'string', description: 'Which source subdirectory to search. For the primary repo, one of the configured allowed dirs; for another "root", any subdirectory, or "." / omitted to search the whole repo.' },
+          query: { type: 'string', description: 'Literal substring, or several words (a line matches if it contains all of them). No regex.' },
+          dir: { type: 'string', description: 'Which subdirectory to search: one of the primary repo\'s searchable dirs (see the error message if unsure), a subpath of one (e.g. "python/dashboard"), or "." / omitted to search all of them. For another "root", any subdirectory or "." for the whole repo.' },
           root: { type: 'string', description: 'Optional absolute path of another accessible repo to search instead of the primary one (see list_roots).' },
+          contextLines: { type: 'integer', description: 'Optional 0-5: include this many lines of context before and after each hit.' },
         },
         required: ['query', 'dir'],
       },
@@ -362,11 +403,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read the full content of a real file. Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots). Content over ~8000 characters is truncated.',
+      description: 'Read a real file as a window of lines. Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots). Returns { content, offset, limit, totalLines, nextOffset }. Files here can be thousands of lines: check totalLines and, if nextOffset is not null, re-call with offset=nextOffset to page. Never assume the first window is the whole file.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path relative to the primary repo root (e.g. "src/task-sources.js") or an absolute path inside another accessible repo.' },
+          offset: { type: 'integer', description: 'First line to return (1-indexed). Default 1.' },
+          limit: { type: 'integer', description: 'How many lines to return. Default 400, max 800.' },
         },
         required: ['path'],
       },
@@ -402,7 +445,9 @@ const TOOLS = [
 function buildToolHandlers(allowedRoots) {
   // A model-supplied `root` for grep_codebase must be one of THIS call's allowed roots --
   // otherwise the tool would grep any path on disk. allowedRoots is already realpath'd
-  // (see runPlanWithTools), so compare on realpath.
+  // (see runPlanWithTools), so compare on realpath. A `root` that resolves to the primary
+  // repo is fine (grepCodebase ignores it via its own primary-root check) -- only a path
+  // OUTSIDE every allowed root is rejected.
   const grepRoot = (raw) => {
     if (!raw) return { ok: true, root: undefined };
     let real;
@@ -414,12 +459,41 @@ function buildToolHandlers(allowedRoots) {
     grep_codebase: (args) => {
       const r = grepRoot(args.root);
       if (!r.ok) return { error: `root is not an accessible repo: ${args.root} (call list_roots)` };
-      return grepCodebase({ query: args.query, dir: args.dir, root: r.root });
+      return grepCodebase({ query: args.query, dir: args.dir, root: r.root, contextLines: args.contextLines });
     },
-    read_file: (args) => readFileTool(allowedRoots, { path: args.path }),
+    read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit }),
     list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path }),
     list_roots: () => listRootsTool(allowedRoots),
   };
+}
+
+// The grep_codebase `dir` description is generic in the static TOOLS array; fill in the
+// live searchable-dir list at call time so the model sees the real names (src, python, ...)
+// rather than guessing and getting an error. Returns a shallow copy with only that one
+// field rewritten.
+function grepDirsHint() {
+  try {
+    const dirs = getConfig().grepAllowedDirs || [];
+    return dirs.length ? dirs.join(', ') : null;
+  } catch { return null; }
+}
+function withGrepDirsHint(tools) {
+  const hint = grepDirsHint();
+  if (!hint) return tools;
+  return tools.map((t) => {
+    if (t.function?.name !== 'grep_codebase') return t;
+    const props = t.function.parameters.properties;
+    return {
+      ...t,
+      function: {
+        ...t.function,
+        parameters: {
+          ...t.function.parameters,
+          properties: { ...props, dir: { ...props.dir, description: `${props.dir.description} This repo's searchable dirs: ${hint}.` } },
+        },
+      },
+    };
+  });
 }
 
 function buildWriteToolHandlers(allowedRoots) {
@@ -464,16 +538,30 @@ function buildWriteToolHandlers(allowedRoots) {
 // turns routinely outlast 5 min: model reasoning + a 240s run_bash + worker-1 holding the
 // GPU lock in between). local-client.js's KEEP_ALIVE (LOCAL_KEEP_ALIVE || ORNITH_KEEP_ALIVE
 // || '30m') is exported now and reused here so both call paths agree.
+// Returns { message, usage } where usage carries Ollama's own token accounting for this
+// turn (prompt_eval_count / eval_count / eval_duration) -- summed across turns by
+// runPlanWithTools and surfaced on its result so model-stats-client.recordCall can persist
+// per-call token counts (they were silently dropped before 2026-09-01, leaving every
+// model_calls row's token columns NULL and forensics blind to context-window pressure).
+function pickUsage(o) {
+  return {
+    prompt_eval_count: Number(o && o.prompt_eval_count) || 0,
+    eval_count: Number(o && o.eval_count) || 0,
+    eval_duration: Number(o && o.eval_duration) || 0,
+  };
+}
+
 async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
       model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
-    return res.message || {};
+    return { message: res.message || {}, usage: pickUsage(res) };
   }
   let contentAcc = '';
   let toolCalls = null;
   let streamError = null;
+  let usage = pickUsage(null);
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
     model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
@@ -487,9 +575,11 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
       onChunk(msg.content);
     }
     if (msg.tool_calls && msg.tool_calls.length) toolCalls = msg.tool_calls;
+    // Ollama's final NDJSON frame carries done:true + the token counts for the turn.
+    if (obj.done) usage = pickUsage(obj);
   });
   if (streamError) throw new Error(streamError);
-  return { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined };
+  return { message: { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined }, usage };
 }
 
 // 2026-08-26 (Chat panel 502, Grimmethy): a real Ollama /api/chat call can
@@ -547,10 +637,13 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
   let rollbackAttempts = 0;
   for (;;) {
     let message;
+    let usage = null;
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
-        message = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+        const turnRes = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+        message = turnRes.message;
+        usage = turnRes.usage;
         attemptErr = null;
         break;
       } catch (e) {
@@ -558,7 +651,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
         attemptErr = e;
       }
     }
-    if (!attemptErr) return { message };
+    if (!attemptErr) return { message, usage };
     if (rollbackAttempts < MAX_ROLLBACK_ATTEMPTS && turnStartLengths.length >= 2) {
       const priorStart = turnStartLengths[turnStartLengths.length - 2];
       const priorLogStart = turnStartLogLengths[turnStartLengths.length - 2];
@@ -649,7 +742,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
 
-  const tools = allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS;
+  const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
   const toolHandlers = allowWrite
     ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
     : buildToolHandlers(allowedRoots);
@@ -685,6 +778,17 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   let turnsUsed = 0;
   let lastMessage = null;
 
+  // Ollama token accounting, summed across every turn (incl. flake-retried and
+  // forced-summary turns) -- surfaced on the result for model-stats-client.recordCall.
+  const usageAcc = { prompt_eval_count: 0, eval_count: 0, eval_duration: 0 };
+  const addUsage = (u) => {
+    if (!u) return;
+    usageAcc.prompt_eval_count += Number(u.prompt_eval_count) || 0;
+    usageAcc.eval_count += Number(u.eval_count) || 0;
+    usageAcc.eval_duration += Number(u.eval_duration) || 0;
+  };
+  const withUsage = (r) => ({ ...r, ...usageAcc });
+
   // messages.length / toolCallLog.length as of the START of each turn, in order -- lets a
   // later turn's unrecoverable flake roll back exactly the PRIOR turn's own additions
   // (the ones most likely to be the corrupting tool-call-only turn) rather than just the
@@ -710,15 +814,16 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
     });
     turnsUsed += 1;
-    const { message: summaryMsg, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+    const { message: summaryMsg, usage: summaryUsage, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
       messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
+    addUsage(summaryUsage);
     const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
-    return {
+    return withUsage({
       response: summaryContent || (lastMessage && lastMessage.content) || '',
       toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
-    };
+    });
   };
 
   // Edit-by-turn-N forcing function -- fired at most once, see ORIENT_TURN_LIMIT.
@@ -745,15 +850,16 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       turnStartLengths[turnStartLengths.length - 1] = messages.length;
     }
 
-    const { message, flakeErr } = await chatTurnWithFlakeRecovery({
+    const { message, usage, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
+    addUsage(usage);
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
       // model already produced real content on an earlier turn; otherwise rethrow.
-      if (lastMessage) return flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk);
+      if (lastMessage) return withUsage(flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk));
       throw flakeErr;
     }
 
@@ -773,7 +879,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content)) {
         return runForcedSummaryTurn();
       }
-      return { response: content, toolCallLog, turnsUsed, toolsDisabled: false };
+      return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
     executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
   }
@@ -794,7 +900,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     return runForcedSummaryTurn();
   }
 
-  return { response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false };
+  return withUsage({ response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false });
 }
 
 module.exports = {

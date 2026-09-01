@@ -32,13 +32,68 @@ test('readFileTool reads a real file relative to the repo root', () => {
   });
 });
 
-test('readFileTool truncates an oversized file rather than returning it whole', () => {
+test('readFileTool char-truncates a pathologically long single line rather than returning it whole', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'big.txt'), 'x'.repeat(9000));
     const result = mod.readFileTool({ path: 'big.txt' });
     assert.equal(result.truncated, true);
     assert.ok(result.content.length < 9000);
-    assert.match(result.content, /\.\.\.\[truncated\]$/);
+    assert.match(result.content, /\[truncated: slice exceeded/);
+  });
+});
+
+test('readFileTool returns a bounded line window for offset+limit', () => {
+  withFixtureRepo((mod, dir) => {
+    const lines = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join('\n');
+    fs.writeFileSync(path.join(dir, 'many.txt'), lines);
+    const result = mod.readFileTool({ path: 'many.txt', offset: 500, limit: 40 });
+    assert.equal(result.offset, 500);
+    assert.equal(result.totalLines, 1000);
+    assert.equal(result.content.split('\n').length, 40);
+    assert.match(result.content, /^line 500\n/);
+    assert.match(result.content, /line 539$/);
+    assert.equal(result.nextOffset, 540);
+    assert.equal(result.truncated, false);
+  });
+});
+
+test('readFileTool large file with NO window returns a paging notice, not a mid-line HEAD cut', () => {
+  withFixtureRepo((mod, dir) => {
+    const lines = Array.from({ length: 2000 }, (_, i) => `row ${i + 1}`).join('\n');
+    fs.writeFileSync(path.join(dir, 'huge.txt'), lines);
+    const result = mod.readFileTool({ path: 'huge.txt' });
+    assert.equal(result.offset, 1);
+    assert.equal(result.totalLines, 2000);
+    assert.equal(result.content.split('\n').length, 400); // READ_FILE_DEFAULT_LINES
+    assert.equal(result.nextOffset, 401);
+    assert.match(result.notice, /2000 lines/);
+    assert.match(result.notice, /offset=401/);
+    assert.doesNotMatch(result.content, /row 401/); // did NOT overshoot the window
+  });
+});
+
+test('readFileTool: limit is clamped to the max, offset past EOF returns empty content + totalLines', () => {
+  withFixtureRepo((mod, dir) => {
+    const lines = Array.from({ length: 50 }, (_, i) => `L${i}`).join('\n');
+    fs.writeFileSync(path.join(dir, 'small.txt'), lines);
+    const clamped = mod.readFileTool({ path: 'small.txt', offset: 1, limit: 99999 });
+    assert.ok(clamped.limit <= 800);
+    assert.equal(clamped.nextOffset, null); // whole small file fit
+    const past = mod.readFileTool({ path: 'small.txt', offset: 999 });
+    assert.equal(past.content, '');
+    assert.equal(past.totalLines, 50);
+    assert.equal(past.nextOffset, null);
+  });
+});
+
+test('readFileTool: small file, no window -> whole content, nextOffset null, no notice', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'tiny.js'), 'a\nb\nc\n');
+    const result = mod.readFileTool({ path: 'tiny.js' });
+    assert.equal(result.content, 'a\nb\nc\n');
+    assert.equal(result.nextOffset, null);
+    assert.equal(result.notice, undefined);
+    assert.equal(result.truncated, false);
   });
 });
 
@@ -244,7 +299,14 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
   }
   const sentBodies = [];
   stub('./ollama-http.js', {
-    postJson: async (_url, body) => { sentBodies.push(body); return { message: queue.length ? queue.shift() : {} }; },
+    postJson: async (_url, body) => {
+      sentBodies.push(body);
+      const turn = queue.length ? queue.shift() : {};
+      // A scripted turn may carry `_usage: { prompt_eval_count, eval_count }` to exercise
+      // token accounting -- lift it onto the response envelope where Ollama really puts it.
+      const { _usage, ...message } = turn || {};
+      return { message, ...(_usage || {}) };
+    },
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
@@ -513,5 +575,60 @@ test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
   await withMockedChat([explore, explore, explore, { role: 'assistant', content: 'done' }], async (mod, _dir, { sentBodies }) => {
     await mod.runPlanWithTools({ prompt: 'go', maxTurns: 20 });
     assert.ok(!sentBodies.some((b) => (b.messages || []).some((m) => /Stop exploring now/.test(m.content || ''))));
+  });
+});
+
+// --- token accounting (2026-09-01) ---------------------------------------------------
+
+test('runPlanWithTools sums Ollama token counts across turns onto the result', async () => {
+  const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }], _usage: { prompt_eval_count: 1000, eval_count: 50, eval_duration: 7 } };
+  const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndid it', _usage: { prompt_eval_count: 1500, eval_count: 80, eval_duration: 9 } };
+  await withMockedChat([explore, finish], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5 });
+    assert.equal(result.prompt_eval_count, 2500);
+    assert.equal(result.eval_count, 130);
+    assert.equal(result.eval_duration, 16);
+  });
+});
+
+test('runPlanWithTools token counts default to 0 when the provider reports none', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'hi' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go' });
+    assert.equal(result.prompt_eval_count, 0);
+    assert.equal(result.eval_count, 0);
+  });
+});
+
+// --- grep_codebase dir hint + error surfacing --------------------------------------
+
+test('the grep_codebase tool description lists the configured searchable dirs', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    process.env.AGENT_MANAGER_GREP_DIRS = 'src,python,scripts,docs';
+    await mod.runPlanWithTools({ prompt: 'go' });
+    const grepTool = (sentBodies[0].tools || []).find((t) => t.function.name === 'grep_codebase');
+    assert.match(grepTool.function.parameters.properties.dir.description, /src, python, scripts, docs/);
+    delete process.env.AGENT_MANAGER_GREP_DIRS;
+  });
+});
+
+test('buildToolHandlers/grep_codebase surfaces the unknown-dir error object to the model', () => {
+  withFixtureRepo((mod, dir) => {
+    process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+    const h = mod.buildToolHandlers([fs.realpathSync(dir)]);
+    const res = h.grep_codebase({ query: 'x', dir: 'made-up' });
+    assert.ok(!Array.isArray(res));
+    assert.match(res.error, /unknown dir 'made-up'/);
+    delete process.env.AGENT_MANAGER_GREP_DIRS;
+  });
+});
+
+test('buildToolHandlers/read_file forwards offset and limit', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'f.txt'), Array.from({ length: 100 }, (_, i) => `n${i + 1}`).join('\n'));
+    const h = mod.buildToolHandlers([fs.realpathSync(dir)]);
+    const res = h.read_file({ path: 'f.txt', offset: 10, limit: 5 });
+    assert.equal(res.offset, 10);
+    assert.equal(res.content.split('\n').length, 5);
+    assert.match(res.content, /^n10\n/);
   });
 });
