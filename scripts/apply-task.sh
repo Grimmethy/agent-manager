@@ -98,18 +98,27 @@ fi
 if [[ ${#direct_files[@]} -gt 0 ]]; then
   printf '[apply-task] batching %s directToMain triage task(s) into one commit...\n' "${#direct_files[@]}"
   batch_result="$(node "${REPO_DIR}/src/apply-task.js" --batch "${direct_files[@]}")"
-  # One TSV line per task: <path>\t<succeeded 1|0>\t<note>
+  # One TSV line per task: <path>\t<succeeded 1|0>\t<needsConfirmation 1|0>\t<note>
+  # needsConfirmation is checked BEFORE succeeded, exactly like the per-task path below: a
+  # directToMain source (pipeline_forensics) whose apply returns { succeeded:false,
+  # needsConfirmation:true } is a hold for a human, NOT a failure -- routing it to blocked/
+  # buries the ranked root-cause report where nobody confirms it (confirmed live 2026-09-01:
+  # the first two real forensic reports both landed in blocked/ with status awaiting-confirm,
+  # invisible to the Awaiting Confirm tab and unreachable by the confirm endpoint).
   printf '%s' "$batch_result" | node -e '
     try {
       const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
       for (const r of (o.results || [])) {
-        console.log([r.path, r.succeeded ? "1" : "0", String(r.doneMarker || r.reason || "").replace(/\s+/g, " ")].join("\t"));
+        console.log([r.path, r.succeeded ? "1" : "0", r.needsConfirmation ? "1" : "0", String(r.doneMarker || r.reason || "").replace(/\s+/g, " ")].join("\t"));
       }
     } catch (e) { /* handled below: any direct_file not printed stays in approved/ for next tick */ }
-  ' | while IFS=$'\t' read -r bpath bok bnote; do
+  ' | while IFS=$'\t' read -r bpath bok bneedsconfirm bnote; do
       [[ -z "$bpath" ]] && continue
       btid="$(basename "$bpath" .json)"
-      if [[ "$bok" == "1" ]]; then
+      if [[ "$bneedsconfirm" == "1" ]]; then
+        mv "$bpath" "${AWAITING_CONFIRM_DIR}/${btid}.json"
+        printf '[apply-task] %s: awaiting human confirmation (triage batch) -- %s\n' "$btid" "$bnote"
+      elif [[ "$bok" == "1" ]]; then
         mv "$bpath" "${DONE_DIR}/${btid}.json"
         printf '[apply-task] %s: applied (triage batch) -- %s\n' "$btid" "$bnote"
       else
