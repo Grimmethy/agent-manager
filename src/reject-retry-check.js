@@ -109,14 +109,18 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // review (redrafting can't fix that; see agent-manager-common.sh's
       // test_review_rejection, the bash equivalent of this exact check).
       //
-      // 2026-09-01: also eligible -- an adhoc tier-3 run that exhausted its turn budget
-      // without making a single edit (resolveAgenticDraft sets task.turnBudgetExhausted).
-      // The redraft is NOT blind for this case: the plan and the tier-2 investigation are
-      // now folded into the tier-3 prompt, and the feedback line below tells it to edit
-      // early. Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the
-      // same adhoc -> needs-clarification escalation as a stuck review rejection.
-      const turnBudgetBlocked = isAdhocTask(task) && task.turnBudgetExhausted === true;
-      if (!isReviewRejection(task) && !turnBudgetBlocked) continue;
+      // 2026-09-01: also eligible -- an adhoc tier-3 draft-stage block that a redraft could
+      // plausibly fix (resolveAgenticDraft sets task.retryableDraftBlock):
+      //   - the model exhausted its turn budget without making a single edit
+      //     (task.turnBudgetExhausted) -- the redraft is NOT blind: plan + tier-2
+      //     investigation are folded into the prompt and the feedback below says "edit early".
+      //   - the model chose RESOLUTION: decompose but botched the sub-task JSON -- a redraft
+      //     can emit valid JSON or just implement the change; the feedback reminds it of the
+      //     format.
+      // Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the same
+      // adhoc -> needs-clarification escalation as a stuck review rejection.
+      const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
+      if (!isReviewRejection(task) && !retryableDraftBlock) continue;
 
       const retryCount = Number(task.localRejectCount) || 0;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
@@ -157,12 +161,15 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       }
 
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-      if (turnBudgetBlocked) {
+      if (retryableDraftBlock && task.turnBudgetExhausted === true) {
         priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
-        delete task.turnBudgetExhausted;
+      } else if (retryableDraftBlock) {
+        priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
+      delete task.turnBudgetExhausted;
+      delete task.retryableDraftBlock;
       task.priorRejectionFeedback = priorFeedback;
       task.localRejectCount = retryCount + 1;
 

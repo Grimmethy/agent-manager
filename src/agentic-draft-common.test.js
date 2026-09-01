@@ -98,6 +98,7 @@ test('resolveAgenticDraft(decompose): sets subTaskProposals, no diff', () => {
     assert.equal(out.blocked, false);
     assert.equal(task.subTaskProposals.length, 2);
     assert.equal(task.rawDiff, '');
+    assert.equal(task.retryableDraftBlock, false, 'a valid decompose is not a retryable block');
   });
 });
 
@@ -156,8 +157,24 @@ test('resolveAgenticDraft: forcedSummary + zero edits + empty worktree -> clean 
     assert.match(out.blockedReason, /without making any edits/);
     assert.ok(!out.needsClarification);
     assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.retryableDraftBlock, true, 'reject-retry-check requeues this');
     assert.equal(task.adhocResolution, undefined, 'no fake needs-human-decision');
     assert.equal(task.implementResponse, undefined, 'no placeholder string written');
+  });
+});
+
+test('resolveAgenticDraft: RESOLUTION: decompose with a malformed sub-task array -> retryable BLOCK', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2b' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\nsplit it into a few pieces (no JSON here)' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /did not follow it with a valid JSON array/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.turnBudgetExhausted, false, 'not a turn-budget case');
+    assert.ok(!task.subTaskProposals);
   });
 });
 
