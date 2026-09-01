@@ -11,8 +11,13 @@
 // shell commands"), which is exactly the information an auditor needs. Bloating the task
 // file with full transcripts was the 244KB-task-file failure mode (see task-history.js's
 // collapse comment). A sidecar keyed by task id is lazily loaded by the dashboard only
-// when a task is opened, capped in size, and pruned once the task reaches done/ (the audit
-// window is pre-merge).
+// when a task is opened, capped in size, and kept for as long as the task file itself sits
+// in queue/ -- including queue/done/ top-level (2026-09-01, Grimmethy: "I want to be able
+// to see the work logs in done tasks"). It is pruned only once done-archive.js rotates the
+// task file out of queue/done/ into queue/done/_archived/<YYYY-MM>/ (default 30 days) or a
+// human archives it to _archived_no_action/ -- at which point taskIsLive() no longer sees
+// it and the next pruneWorkLogs() pass deletes it. That rotation IS the size bound; there
+// is no separate retention timer here.
 //
 // Best-effort throughout: a worklog write or prune must NEVER break or slow a real draft.
 
@@ -24,12 +29,13 @@ const ARG_VALUE_CAP = 4000;        // per individual arg value (grep queries, ed
 const RESULT_PREVIEW_CAP = 2000;   // per tool-call result preview
 const FILE_BYTE_CAP = 1_000_000;   // whole-worklog ceiling; older tiers' call bodies are dropped first
 
-// Queue dirs where a task is still pre-merge and its worklog is worth keeping. A task in
-// done/ has been applied (branch pushed or committed) -- audit happened or the window closed.
-// 'adhoc' matters specifically: reject-retry-check.js requeues a retryable adhoc draft block
-// to queue/adhoc/ (not pending/), so without it here pruneWorkLogs deleted the tier-3
-// transcript on the very next tick -- exactly the run a human most needs to see.
-const LIVE_QUEUE_DIRS = ['pending', 'adhoc', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm'];
+// Queue dirs whose tasks keep their worklog. 'adhoc' matters specifically: reject-retry-
+// check.js requeues a retryable adhoc draft block to queue/adhoc/ (not pending/), so
+// without it here pruneWorkLogs deleted the tier-3 transcript on the very next tick.
+// 'done' (top-level only -- taskIsLive's existsSync does not descend into
+// done/_archived/<month>/ or done/_archived_no_action/) keeps the transcript visible in
+// the dashboard for a merged task until done-archive.js rotates it out; see the header.
+const LIVE_QUEUE_DIRS = ['pending', 'adhoc', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'done'];
 
 function worklogDir(pipelineDir) {
   return path.join(pipelineDir || getConfig().pipelineDir, 'queue', 'worklogs');
@@ -134,8 +140,9 @@ function taskIsLive(queueRoot, id) {
   return false;
 }
 
-// Delete worklogs whose task has left the pre-merge queue dirs (reached done/, or gone).
-// Cheap: one readdir + a handful of existsSync per orphan. Safe to call every draft.
+// Delete worklogs whose task has left the live queue dirs (rotated out of queue/done/ by
+// done-archive.js, human-archived, or gone). Cheap: one readdir + a handful of existsSync
+// per orphan. Safe to call every draft.
 function pruneWorkLogs(pipelineDir) {
   try {
     const root = pipelineDir || getConfig().pipelineDir;
