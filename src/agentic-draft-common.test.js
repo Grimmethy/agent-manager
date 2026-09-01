@@ -163,7 +163,7 @@ test('resolveAgenticDraft: forcedSummary + zero edits + empty worktree -> clean 
   });
 });
 
-test('resolveAgenticDraft: RESOLUTION: decompose with a malformed sub-task array -> retryable BLOCK', () => {
+test('resolveAgenticDraft: RESOLUTION: decompose with no sub-task JSON -> retryable BLOCK', () => {
   withRealRepo((wt) => {
     const task = { id: 't2b' };
     const out = resolveAgenticDraft(task, {
@@ -171,10 +171,41 @@ test('resolveAgenticDraft: RESOLUTION: decompose with a malformed sub-task array
       worktreeDir: wt,
     });
     assert.equal(out.blocked, true);
-    assert.match(out.blockedReason, /did not follow it with a valid JSON array/);
+    assert.match(out.blockedReason, /no valid JSON array of \{title, rawText\}/);
     assert.equal(task.retryableDraftBlock, true);
     assert.equal(task.turnBudgetExhausted, false, 'not a turn-budget case');
     assert.ok(!task.subTaskProposals);
+    assert.ok(!task.rescopedFromDecompose);
+  });
+});
+
+test('resolveAgenticDraft: RESOLUTION: decompose into exactly ONE sub-task -> re-scope + retryable block (once)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2c' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\n[{"title":"add the route","rawText":"add POST /api/chat/inject to app.py"}]\nit is really one atomic change' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /re-scoped this to a single sharper sub-task/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.rescopedFromDecompose, true);
+    assert.equal(task.rescopedRawText, 'add POST /api/chat/inject to app.py');
+    assert.ok(!task.subTaskProposals);
+  });
+});
+
+test('resolveAgenticDraft: decompose-into-ONE again after already being re-scoped -> needs-human-decision', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2d', rescopedFromDecompose: true };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\n[{"title":"still one","rawText":"the same one thing"}]\nstill atomic' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.match(task.implementResponse, /twice without implementing/);
   });
 });
 
