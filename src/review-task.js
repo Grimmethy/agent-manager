@@ -334,6 +334,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     fs.writeFileSync(taskPathForGrounding, JSON.stringify(task));
     groundingText = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPathForGrounding], { encoding: 'utf8' });
   } catch (e) {
+    console.error(`[review-task] grounding-source generation failed for ${taskPathForGrounding}: ${e.stack || e.message || String(e)}`);
     groundingText = '';
   } finally {
     try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
