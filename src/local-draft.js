@@ -571,7 +571,10 @@ const MIN_PLAN_CHARS = 200;
 function planIsThin(text) {
   if (typeof text !== 'string') return true;
   if (text.trim().length < MIN_PLAN_CHARS) return true;
-  const numberedSteps = (text.match(/^\s*\d+[.)]/gm) || []).length;
+  // Count numbered steps whether the model wrote a bare list ("1.", "2)") or hung the
+  // number off a markdown heading ("## 1.", "### 2)") -- the latter is a real, structured
+  // plan and was being false-flagged as thin (bra-1788142124203 follow-up).
+  const numberedSteps = (text.match(/^\s*(?:#{1,6}\s*)?\d+[.)]/gm) || []).length;
   return numberedSteps < 2;
 }
 
