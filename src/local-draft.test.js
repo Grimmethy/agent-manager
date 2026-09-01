@@ -93,6 +93,15 @@ function fakeLocalCall(response) {
   return async () => ({ response, degenerate: null, attempts: 1 });
 }
 
+// A plan string with enough substance (>=200 chars, >=2 numbered steps) to clear
+// runPlanPass's adhoc thin-plan gate, so a test exercising downstream tier/lock/history
+// behaviour doesn't also trip the one-time plan re-roll.
+const PLAN_STUB = [
+  '1. Read the files the task names and confirm the current behaviour before changing anything.',
+  '2. Make the smallest change that satisfies the request, staying inside the files the task names.',
+  '3. Run a targeted check on what changed and hand back the resulting diff for review.',
+].join('\n');
+
 function spyLock() {
   const calls = [];
   const withLockFn = async (dir, fn) => {
@@ -122,7 +131,7 @@ test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls c
     const task = { id: 'adhoc-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
     await draftTask(task, {
-      localCall: fakeLocalCall('no real match -- nothing plausible'),
+      localCall: fakeLocalCall(PLAN_STUB),
       withLockFn,
       draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
       draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
@@ -220,7 +229,7 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
     const draftAdhocViaLocalAgenticWriteFn = async () => { throw new Error('must not reach the write tier when harness-search already applied'); };
 
     const result = await draftTask(task, {
-      localCall: fakeLocalCall('confident match: none -- no real match'),
+      localCall: fakeLocalCall(PLAN_STUB),
       withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
     });
 
@@ -617,7 +626,7 @@ test('a task with file+find+one fixedLiterals block fully specified skips the mo
     };
 
     let callCount = 0;
-    const localCall = async () => { callCount += 1; return { response: 'plan text', degenerate: null, attempts: 1 }; };
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
 
     const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
@@ -1387,4 +1396,68 @@ test('draft attempt record: a degenerate plan pass records the reason instead of
     assert.equal(a.plan.text, undefined);
     assert.equal(a.plan.attempts, 3);
   });
+});
+
+// --- Fix (2026-08-31, bra-1788142124203): plan-pass substance gate + prior-plan reuse ---
+
+test('runPlanPass (adhoc): a thin first plan is re-rolled once, and a substantive re-roll is kept', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-reroll', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: n === 1 ? '1. lone stub' : PLAN_STUB, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    assert.equal(n, 2, 'exactly one re-roll after the thin first plan (tiers are stubbed, so every localCall is a plan call)');
+    assert.equal(task.planResponse, PLAN_STUB);
+    assert.equal(task.lastGoodPlan, PLAN_STUB);
+    const planDone = (task.history || []).find((e) => e.stage === 'plan-done');
+    assert.match(planDone.detail, /re-rolled once/);
+  });
+});
+
+test('runPlanPass (adhoc): two thin rolls fall back to a prior attempt\'s plan verbatim', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const priorPlan = [
+      '1. Open python/dashboard/templates/index.html and locate renderTaskDetailModal / the actionHeader row.',
+      '2. Add a "Send to chat" button there and wire it to a new POST endpoint in python/dashboard/app.py.',
+      '3. Rename the Brain Dump "Discuss" button to "Send to Chat" and remove the provider toggle.',
+      '4. Run a targeted check on the changed files and hand back the diff.',
+    ].join('\n');
+    const task = {
+      id: 'adhoc-seed', domain: 'adhoc', source: 'manual', title: 't',
+      promptContext: { rawText: 'do the thing' },
+      draftAttempts: [{ attemptNo: 1, plan: { chars: priorPlan.length, text: priorPlan }, outcome: 'needs-clarification' }],
+    };
+    await draftTask(task, { localCall: fakeLocalCall('1. stub'), withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    assert.equal(task.planResponse, priorPlan);
+    assert.equal(task.lastGoodPlan, priorPlan);
+    const planDone = (task.history || []).find((e) => e.stage === 'plan-done');
+    assert.match(planDone.detail, /reused a prior attempt's plan/);
+    assert.equal(task.draftAttempts[1].plan.seededFromPrior, true);
+    assert.equal(task._seedPlan, undefined, 'the transient seed is not left on the task');
+  });
+});
+
+test('bestPriorPlan: newest usable plan wins; degenerate and thin records are skipped; lastGoodPlan is the fallback', () => {
+  const { bestPriorPlan } = require('./local-draft.js');
+  const good = Array.from({ length: 6 }, (_, i) => `${i + 1}. a reasonably detailed step that describes some real work to carry out`).join('\n');
+  assert.equal(bestPriorPlan({ draftAttempts: [
+    { plan: { text: good, chars: good.length } },
+    { plan: { degenerate: 'empty', chars: 0 } },
+    { plan: { text: '1. too short', chars: 12 } },
+  ] }), good, 'skips the newer degenerate + thin records');
+  assert.equal(bestPriorPlan({ draftAttempts: [{ plan: { text: '1. too short' } }], lastGoodPlan: good }), good);
+  assert.equal(bestPriorPlan({ draftAttempts: [] }), null);
+  assert.equal(bestPriorPlan({ draftAttempts: [{ collapsed: true, planChars: 999 }] }), null, 'a collapsed record carries no plan.text');
+});
+
+test('planIsThin: fewer than 2 numbered steps or under the char floor is thin; a real multi-step plan is not', () => {
+  const { planIsThin } = require('./local-draft.js');
+  assert.equal(planIsThin('1. **Inspect the current code before changing anything**'), true);
+  assert.equal(planIsThin('1. a\n2. b'), true, 'two steps but far too short');
+  assert.equal(planIsThin(''), true);
+  assert.equal(planIsThin(undefined), true);
+  assert.equal(planIsThin(PLAN_STUB), false);
 });

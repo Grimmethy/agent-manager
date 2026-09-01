@@ -562,15 +562,46 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
   return { succeeded: true, blocked: false };
 }
 
+// Fix (2026-08-31, bra-1788142124203): a plan can clear detectDegenerate (non-empty, no
+// repeat/gibberish loop) while still being useless -- e.g. a lone "1. Inspect the current
+// code" bullet. That stub then reaches every implement tier with no map, and for adhoc the
+// tier-3 agent burns its whole turn budget re-discovering what the task text already said.
+const MIN_PLAN_CHARS = 200;
+
+function planIsThin(text) {
+  if (typeof text !== 'string') return true;
+  if (text.trim().length < MIN_PLAN_CHARS) return true;
+  const numberedSteps = (text.match(/^\s*\d+[.)]/gm) || []).length;
+  return numberedSteps < 2;
+}
+
+// The best plan a PRIOR attempt on this same task already produced: newest non-degenerate,
+// non-thin draftAttempts[].plan.text, else task.lastGoodPlan (kept outside the
+// draftAttempts array precisely so draft-attempt-record.js's collapse of old records can't
+// drop it). null when there is nothing worth reusing. During runPlanPass the current
+// attempt is not yet on task.draftAttempts, so this only ever sees earlier attempts.
+function bestPriorPlan(task) {
+  const attempts = Array.isArray(task && task.draftAttempts) ? task.draftAttempts : [];
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    const plan = attempts[i] && attempts[i].plan;
+    if (plan && !plan.degenerate && typeof plan.text === 'string' && !planIsThin(plan.text)) {
+      return plan.text;
+    }
+  }
+  if (task && typeof task.lastGoodPlan === 'string' && !planIsThin(task.lastGoodPlan)) {
+    return task.lastGoodPlan;
+  }
+  return null;
+}
+
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
-// after emitting the 'blocked' event -- when the plan pass came back degenerate, else
-// { blocked: false }.
+// after emitting the 'blocked' event -- when the plan pass produced no usable plan (and no
+// prior plan to fall back on), else { blocked: false }.
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
 }) {
-  const planPrompt = buildPlanPrompt(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -598,16 +629,69 @@ async function runPlanPass(task, {
   // FULFILLMENT sources (arch_review, observability_fix, ...) are excluded: they have a
   // specific candidate to implement, so an empty plan there is a genuine model failure.
   const allowEmptyPlan = isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source);
-  const planResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
+  // Fix 1/2 (2026-08-31, bra-1788142124203): for adhoc tasks, gate the plan on real
+  // substance and, when a prior attempt on this same task already produced a good plan,
+  // seed the pass with it rather than cold-roll every retry. Scoped to adhoc -- the
+  // domain the incident lives in; other sources' plan passes are unchanged. Never blocks
+  // on its own: a thin plan with no prior plan to fall back on still proceeds (with a
+  // note), exactly as before -- the implement tiers, not this gate, decide feasibility.
+  const substanceGated = resolveSourceName(task) === 'adhoc';
+  const seedPlan = substanceGated ? bestPriorPlan(task) : null;
+
+  if (seedPlan) task._seedPlan = seedPlan;
+  const planPrompt = buildPlanPrompt(task);
+  delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
+
+  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
+  const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
+
+  let planResult = await callPlan();
+  let totalAttempts = planResult.attempts || 1;
+  let reRolled = false;
+  if (substanceGated && !planResult.degenerate && planIsThin(planResult.response)) {
+    // One thin (but not degenerate) roll -- give it exactly one more, then keep whichever
+    // of the two rolls carries more content.
+    reRolled = true;
+    const reRoll = await callPlan();
+    totalAttempts += reRoll.attempts || 1;
+    if (planLen(reRoll) > planLen(planResult)) planResult = reRoll;
+  }
+
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
-    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts });
+    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: totalAttempts });
     appendHistoryEvent(task, 'blocked', blockedReason);
     return { blocked: true, blockedReason };
   }
-  task.planResponse = planResult.response;
-  recordPlan(attempt, { text: planResult.response, attempts: planResult.attempts });
-  appendHistoryEvent(task, 'plan-done', `${planResult.attempts} attempt(s), ${task.planResponse.length} chars`);
+
+  const stillThin = substanceGated && planIsThin(planResult.response);
+
+  if (stillThin && seedPlan) {
+    // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
+    // than hand the implement tiers a stub with no map.
+    task.planResponse = seedPlan;
+    task.lastGoodPlan = seedPlan;
+    recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
+    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
+  } else {
+    task.planResponse = planResult.response;
+    // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
+    // it -- it is the seed source for any later retry). Never store a thin one.
+    if (!stillThin) task.lastGoodPlan = planResult.response;
+    recordPlan(attempt, {
+      text: planResult.response,
+      attempts: totalAttempts,
+      ...(reRolled ? { reRolled: true } : {}),
+      ...(seedPlan ? { seededFromPrior: true } : {}),
+      ...(stillThin ? { thin: true } : {}),
+    });
+    const notes = [
+      seedPlan ? 'seeded from a prior plan' : null,
+      reRolled ? 're-rolled once' : null,
+      stillThin ? 'still thin, no prior plan to fall back on' : null,
+    ].filter(Boolean);
+    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), ${task.planResponse.length} chars${notes.length ? `, ${notes.join(', ')}` : ''}`);
+  }
 
   // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a
   // real search harness and hand the hits to implement. Which harness (if any) is
@@ -1180,7 +1264,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget };
+module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan };
 
 if (require.main === module) {
   main();

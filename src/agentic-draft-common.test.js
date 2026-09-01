@@ -124,6 +124,35 @@ test('resolveAgenticDraft: no RESOLUTION line -> blocked (terminal, not an infra
   });
 });
 
+test('resolveAgenticDraft: no RESOLUTION line but result.forcedSummary -> needsClarification with the transcript + partial diff, not a block', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'half a change\n');
+    const task = { id: 't4b' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'I ran out of turns while still reading files', forcedSummary: true, turnsUsed: 35 },
+      worktreeDir: wt,
+    });
+    assert.equal(out.succeeded, true);
+    assert.equal(out.blocked, false);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.match(task.implementResponse, /ran out of turns/);
+    assert.match(out.capturedDiff, /a\.txt/); // whatever partial work landed is preserved
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary that DID reach a RESOLUTION is parsed normally', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't4c' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'out of turns, best guess:\n\nRESOLUTION: decompose\n[{"title":"p1","rawText":"a"},{"title":"p2","rawText":"b"}]\ntoo big', forcedSummary: true },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(task.subTaskProposals.length, 2);
+  });
+});
+
 test('resolveAgenticDraft: degenerate result -> blocked', () => {
   withRealRepo((wt) => {
     const out = resolveAgenticDraft({ id: 't5' }, { result: { degenerate: 'repetition-loop' }, worktreeDir: wt });

@@ -176,6 +176,19 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   meta.resolution = resolution || undefined;
 
   if (!resolution) {
+    // Fix (2026-08-31, bra-1788142124203): the run hit its turn cap and even
+    // runPlanWithTools' forced final no-tools turn (result.forcedSummary) didn't yield a
+    // parseable RESOLUTION. Hard-blocking here throws the whole run away as "cannot
+    // determine outcome". Instead hand it to a human as a clarification, carrying the
+    // transcript and whatever partial work landed in the worktree -- the same terminal
+    // shape a real RESOLUTION: needs-human-decision produces.
+    if (result && result.forcedSummary) {
+      task.adhocResolution = 'needs-human-decision';
+      task.rawDiff = '';
+      task.implementResponse = summary
+        || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff: bestEffortDiff() };
+    }
     const budgetNote = retriedForTurnBudget
       ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
       : '';
