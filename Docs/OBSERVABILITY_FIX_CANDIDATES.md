@@ -1628,3 +1628,26 @@ Inside the existing `catch (err)` block, emit a single `console.error` call (mat
 
 Benefits:
 Once the error is logged with item context, an operator can correlate a `blocked/` placement with the specific exception that caused the `needs-clarification/` attempt to fail, turning an opaque silent mis-route into a one-line log entry. Debugging time for "why is this ticket in the wrong folder?" drops from a code-reading exercise to a grep, and the fall-through design (which is legitimate) is preserved without modification.
+
+### AC-94 · Silent catch block discards persistHook failure with no log line
+Strength: Strong
+Files: src/task-history.js
+Snippet:
+```
+  }
+
+  if (persistHook) {
+    try { persistHook(task); } catch (_) { /* best-effort: never abort a pass on a flush failure */ }
+  }
+  return entry;
+}
+```
+
+Problem:
+The `catch` block around the `persistHook(task)` call is empty apart from a comment. When `persistHook` throws—due to a disk-full condition, a permission change, a serialization bug, or any other I/O error—the exception is swallowed with zero observability: no `console.warn`, no `console.error`, no `process.stderr.write`. Because the calling loop may invoke this path hundreds of times per pass, every subsequent call also fails silently, compounding data loss with no signal to an operator. The control-flow decision (do not rethrow, do not abort the pass) is intentional and correct, but the absence of any log line means an incident in the persistence side-effect is invisible until someone notices missing records much later.
+
+Solution:
+Inside the existing `catch (err)` block, add a single `console.warn` call that includes a stable prefix (`[task-history]`), the task identifier (`task.id ?? task.name ?? '<unknown>'`), and the error message (`err?.message ?? String(err)`). Do not rethrow: the documented contract is that a flush failure must not abort the surrounding pass, and the caller's primary work (`return entry`) is unaffected. Do not add a metric or counter—the project has no telemetry system. The one-line log is the complete fix; it uses only the `console.warn` primitive already available in this codebase.
+
+Benefits:
+An operator watching stdout/stderr (or a log aggregator tailing the process) immediately sees which task failed to persist and why, turning an invisible, compounding data-loss scenario into a single, greppable warning line. The "never abort a pass" contract is preserved exactly as documented, so no caller-side behavior changes. The fix is one line, introduces no dependency, and closes the scanner finding without suppressing it, keeping the codebase's observability baseline consistent with the rest of the project.
