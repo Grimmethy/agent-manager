@@ -961,3 +961,26 @@ Inside the existing `except Exception:` block, before the variable falls back to
 
 Benefits:
 Operators gain a timestamped, greppable log line with the full exception type, message, and traceback the moment the auxiliary call fails, letting them immediately tell an expected timeout apart from a server outage or a code regression. The graceful-degradation contract is unchanged — the dashboard session still proceeds without the proposal — but the silent swallow is replaced by a single, low-noise warning that is visible in the same log stream the rest of the Python code already writes to. No new dependency, no new subsystem, no behavioural change beyond the added log line.
+
+### AC-65 · Silent GrepFetchError swallow leaves no observability trail
+Strength: Strong
+Files: python/dashboard/discuss_sessions.py
+Snippet:
+```
+
+    try:
+        fetched = grep_fetch_client.fetch_for_queries(_expand_grep_terms(queries), repo_root, grep_dirs)
+    except grep_fetch_client.GrepFetchError:
+        # Best-effort -- a broken search must never break the actual conversation turn,
+        # same "non-fatal, fall through" treatment local-draft.js's own harness-search
+        # branches give a failed archImportFetch() call.
+```
+
+Problem:
+The `except grep_fetch_client.GrepFetchError:` block contains only an explanatory comment and no observable side-effect. When `fetch_for_queries` raises—whether from a network timeout, a missing `repo_root`, malformed expanded terms, or a permission error on `grep_dirs`—the exception object is discarded entirely. There is no `logging.warning`, no stderr write, no structured record. The conversation turn proceeds as though the search simply returned zero matches, making a failed fetch operationally indistinguishable from an empty result set. A developer later debugging "why are search results missing?" has no log line, no stack trace, and no starting point.
+
+Solution:
+Add a single `logging.warning("grep search failed (non-fatal, continuing without results): %s", exc, exc_info=True)` call inside the existing `except grep_fetch_client.GrepFetchError as exc:` block, immediately after the design-intent comment. This uses the stdlib `logging` module already available to Python code in this project (no new dependency). Control flow is unchanged: the exception is still caught, the turn is not broken, and downstream code that already handles the unset/`None` `fetched` path continues to work. The `exc_info=True` keyword captures the full traceback so the root cause (timeout vs. permission vs. bad input) is recoverable from the log without needing to reproduce the failure.
+
+Benefits:
+Any future occurrence of a `GrepFetchError` produces a single, greppable warning line in the application log that names the exception type, carries its message, and includes the full stack trace. On-call or debugging sessions can immediately distinguish "search infrastructure failed" from "no matches in the repo," eliminating a class of silent-missing-data incidents that currently require code-reading to even suspect. The fix is one line, introduces no new dependency, and does not alter any control-flow or API contract.
