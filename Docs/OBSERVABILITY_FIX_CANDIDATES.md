@@ -1007,3 +1007,26 @@ Split the `except` clause into two. Keep `except OSError: return {}` for the leg
 
 Benefits:
 Operators and users can now distinguish "no sessions file" from "sessions file is corrupt" in the application log, turning a silent data-loss symptom into a one-line, greppable warning that points directly at the offending path. The dashboard still renders (graceful degradation is preserved), but the corruption is no longer invisible, which shortens the time-to-diagnose for partial-write or disk-integrity incidents and prevents the confusing "my sessions vanished" support ticket.
+
+### AC-67 · Silent exception swallow in `_cpu_percent` hides both expected and unexpected failures
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+def _cpu_percent() -> float | None:
+    try:
+        return psutil.cpu_percent(interval=0.1)
+    except Exception:
+        return None
+
+
+```
+
+Problem:
+The `_cpu_percent` helper wraps `psutil.cpu_percent(interval=0.1)` in a bare `except Exception: return None` with no log statement, no `pass`-level comment, and no diagnostic of any kind. In the expected case (restricted `/proc` in a container or minimal VM) the `None` return is correct graceful degradation, but in the unexpected case—a `TypeError` from a bad kwarg, an `AttributeError` from a `psutil` version mismatch, a refactoring typo—the dashboard silently renders "N/A" forever and no log line, traceback, or stderr message is ever produced. An operator or developer has zero signal that the code path is broken versus the environment simply lacking the data source.
+
+Solution:
+Add `import logging` at module top and a module-level `log = logging.getLogger(__name__)`. Inside the existing `except Exception as exc:` block, emit `log.warning("cpu_percent sampling failed: %s: %s", type(exc).__name__, exc)` before the `return None`. This keeps the deliberate `None` contract intact (callers already handle it), requires no new dependency (stdlib `logging` is already in the project's capability set), and turns an undiagnosable blank tile into a single greppable line in the application log. No re-raise is added because the caller's only possible action is to display "unavailable," which it already does.
+
+Benefits:
+Any future regression that causes `psutil.cpu_percent` to raise a programming error (wrong kwarg name, removed attribute, type mismatch after a dependency bump) will now appear in the log within seconds of the first call, with the exception class and message, instead of masquerading as a legitimate "no data" state indefinitely. The expected container/`/proc`-restricted case still returns `None` cleanly, but now a developer can distinguish "the environment can't read CPU" from "the code is broken" by checking whether the warning line is present. No new dependency, no metrics infrastructure, no change to the public `float | None` contract.
