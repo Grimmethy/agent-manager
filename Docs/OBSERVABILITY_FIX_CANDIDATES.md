@@ -1490,3 +1490,26 @@ In the `catch (e)` body, emit a single `console.error` line that includes a stab
 
 Benefits:
 Any future regression in `get-grounding-source.js` — a task-shape mismatch, a missing native module, a child-process crash — will produce an immediate, greppable `console.error` line containing the offending task path and a full stack trace. Operators can correlate the line to a specific task, identify the root cause from the stack, and verify the fix by confirming the log line disappears. The graceful-degradation behavior is fully preserved: the review task still completes successfully, simply without grounding context, and the temporary task file is still cleaned up in the `finally` block.
+
+### AC-88 · Empty catch swallows task-file load errors in CLI entrypoint
+Strength: Strong
+Files: src/review-task.js
+Snippet:
+```
+    process.stdout.write(JSON.stringify({ succeeded: false, reason: 'usage: node review-task.js <review.json>' }));
+    return;
+  }
+
+  let task;
+  try {
+    task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
+```
+
+Problem:
+The `try` block around `fs.readFileSync(taskPath, 'utf8')` and `JSON.parse(…)` is paired with a bare `catch (e) {}` that discards the exception entirely. When the task file is missing, unreadable, truncated, or contains malformed JSON (e.g. a BOM left by an editor), `task` remains `undefined` and execution falls through into downstream dispatch logic. The caller of this single-purpose CLI receives either a secondary `TypeError` on an unrelated line or a silent no-op that looks like success, with no signal on stdout, stderr, or exit code distinguishing "file not found" from "task was a valid no-op." The file's own usage-error path two lines above already establishes the contract—write a JSON failure object to stdout, then `return`—and the empty catch violates that contract for the most common operational failure.
+
+Solution:
+Replace the empty `catch (e) {}` with a handler that writes a well-formed JSON failure object to stdout using the same `process.stdout.write(JSON.stringify(…))` idiom the script already uses for its usage error, including the offending `taskPath` and the original `err.message` for context. Set `process.exitCode = 1` so the shell and any wrapping orchestrator can detect the failure, then `return` to halt further execution. No new dependency, no metrics, no logging framework—only the primitives the file already employs.
+
+Benefits:
+The CLI's single output contract (one JSON object on stdout) is preserved for every code path, so downstream parsers never see a malformed or missing result. Operators get a machine-readable `reason` string that names the file and the underlying error, making "bad path" vs. "truncated JSON" immediately distinguishable in CI logs or agent transcripts. The non-zero exit code lets shell scripts and CI pipelines fail fast instead of proceeding with `undefined` task data, eliminating the class of confusing secondary crashes and silent no-ops this bug currently produces.
