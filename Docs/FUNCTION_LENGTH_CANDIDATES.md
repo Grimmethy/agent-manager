@@ -637,3 +637,51 @@ Split the handler into four private helpers called sequentially from a thin orch
 
 Benefits:
 Each extracted helper can be unit-tested in isolation with a minimal fixture (a dict in, a dict out) without standing up the full proxy transport. Code review diffs shrink: a change to header clamping no longer appears in the same hunk as a change to token mapping. The streaming branch, which is the most complex and most likely to change, becomes a single named function whose signature documents its contract. New contributors can read the 15-line orchestrator to understand the request lifecycle at a glance, then drill into whichever helper is relevant to their task.
+
+### AC-14 · Decompose `_encode` orchestrator into single-responsibility pipeline stages
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/encoder.py
+Snippet:
+```
+    # ------------------------------------------------------------------
+    def _encode(self, messages: list[dict], model: str, prof,
+                report: EncodeReport, t0: float,
+                session_id: str | None = None,
+                provider: str = "") -> tuple[list[dict], EncodeReport]:
+        cfg = self.cfg
+        sid = session_id or session_id_for(messages)
+        report.session_id = sid
+        session = Session(sid)
+        session.turn += 1
+
+        if cfg.mode == "OFF":
+            report.original_tokens = report.encoded_tokens = self._count_all(messages, prof)
+            report.latency_ms = (time.perf_counter() - t0) * 1000
+            return messages, report
+
+        # Tiny requests can never clear the min-savings thresholds: the full
+        # pipeline runs only to have the never-larger invariant revert it,
+        # which burned latency AND stamped fallback=True — live metrics showed
+        # a cluster of 5–35 token requests inflating fallback_pct with what is
+        # really just correct "nothing to do here" behavior. Skip early.
+        total_tok = self._count_all(messages, prof)
+        if total_tok < cfg.min_encode_tokens:
+            # Learning must NOT be gated with the pipeline: short boilerplate
+            # repeated across many tiny requests is exactly what the nursery
+            # exists to notice. Same observe step the candidate search runs.
+            for m in messages:
+                if m.get("role") in ("user", "system"):
+                    try:
+                        skel, _regs = protected.extract(self._text(m))
+                        terse = phrases.compress(skel)
+                    except Exception:
+```
+
+Problem:
+The `_encode` function spans roughly 355 lines and interleaves at least four distinct concerns in a single control-flow body: session bookkeeping (sid derivation, turn increment), OFF-mode early-exit, a sub-threshold branch that still performs nursery learning via `protected.extract` and `phrases.compress`, and the full encoding pipeline with candidate search, a never-larger invariant check that can revert prior work, and fallback stamping. The inline comments confirm these are not sequential steps but *interacting invariants*—learning must run on a subset of paths regardless of pipeline outcome, the never-larger check can undo compression, and fallback bookkeeping must fire only after a revert. This branching-plus-side-effect topology makes the function genuinely hard to review, reason about, or test in isolation; a single regression in one branch (e.g., forgetting to call `phrases.compress` on the tiny-request path) is invisible until integration tests catch it, and the 355-line body gives a reviewer no structural anchor.
+
+Solution:
+Extract five helpers from the body of `_encode`, each with a single entry/exit contract: (1) `_resolve_session(messages, session_id) -> Session` handling sid derivation and turn increment; (2) `_early_exit_off(messages, prof, report, t0)` for the OFF-mode count-and-return path; (3) `_observe_tiny(messages, prof)` encapsulating the nursery learning step (`protected.extract` + `phrases.compress`) that must run on sub-threshold requests independent of the pipeline; (4) `_run_pipeline(messages, model, prof, session, cfg)` containing candidate search, compression, the never-larger invariant check, and its revert logic; and (5) `_apply_fallback(messages, report, session)` for the revert-and-stamp `fallback=True` transition. The remaining `_encode` becomes a 30–50-line orchestrator that calls these in order, wires report fields, and owns only the top-level try/except and timing.
+
+Benefits:
+Each extracted helper can be unit-tested with a stub `prof`/`cfg` and a fixed message list, eliminating the need for full-pipeline integration tests to verify, say, that the tiny-request path still calls `phrases.compress`. Code review becomes tractable because a reviewer can assess the never-larger invariant in `_run_pipeline` without scrolling past session bookkeeping and OFF-mode logic. The orchestrator reads as a top-down narrative of pipeline stages, making it immediately obvious which branch a new requirement (e.g., a third early-exit mode) belongs in, and reducing the risk that a future edit to one concern accidentally breaks an invariant in another.
