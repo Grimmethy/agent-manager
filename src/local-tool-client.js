@@ -718,7 +718,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -828,6 +828,12 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
   // Edit-by-turn-N forcing function -- fired at most once, see ORIENT_TURN_LIMIT.
   let editNudgeFired = false;
+  // A second, firmer nudge for a task that is a CONFIRMED-ATOMIC LEAF (leafMustEdit): the
+  // soft nudge above did not always get the 27B off the fence (the /api/chat/inject leaf
+  // took the soft nudge, then still chose decompose instead of editing). A few turns after
+  // the soft one, if there is STILL no edit, one last message: edit now or conclude
+  // needs-human-decision -- decompose is not an option for a leaf.
+  let hardNudgeFired = false;
   const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
 
   for (let turn = 0; turn < maxTurns; turn++) {
@@ -847,6 +853,18 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       });
       // Keep the flake-rollback anchor for THIS turn after the nudge, so a rollback re-does
       // only the (poisoned) assistant turn and preserves the nudge.
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
+
+    // Firmer second push for a confirmed-atomic leaf that STILL has not edited a few turns
+    // after the soft nudge.
+    if (leafMustEdit && !hardNudgeFired && turn >= ORIENT_TURN_LIMIT + 3
+        && turn < maxTurns - 2 && editToolCallCount() === 0) {
+      hardNudgeFired = true;
+      messages.push({
+        role: 'user',
+        content: `Final warning: ${turn} turns used and zero edits on a task that a prior decompose pass already confirmed is implementable in one pass. Your NEXT message MUST be an edit_file or write_file call, OR exactly "RESOLUTION: needs-human-decision" followed by the one concrete fact you are missing. RESOLUTION: decompose is not available for this task.`,
+      });
       turnStartLengths[turnStartLengths.length - 1] = messages.length;
     }
 

@@ -578,6 +578,53 @@ test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
   });
 });
 
+test('leafMustEdit: a firmer "final warning" fires when a leaf still has not edited after the soft nudge', async () => {
+  const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nI need X' };
+    // soft nudge at turn 2, hard nudge at turn >= 5; run explores through then concludes
+    await withMockedChat([explore, explore, explore, explore, explore, explore, explore, finish], async (mod, _dir, { sentBodies }) => {
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns: 12, nudgeToEditEarly: true, leafMustEdit: true });
+      const msgs = sentBodies[sentBodies.length - 1].messages;
+      const hard = msgs.filter((m) => m.role === 'user' && /Final warning/.test(m.content || ''));
+      assert.equal(hard.length, 1, 'exactly one hard nudge');
+      assert.match(hard[0].content, /decompose is not available/i);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+    else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prev;
+  }
+});
+
+test('leafMustEdit: no hard nudge once an edit has been made', async () => {
+  const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const edit = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'x', replace: 'y' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndone' };
+    await withMockedChat([explore, explore, explore, edit, explore, explore, explore, finish], async (mod, dir, { sentBodies }) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns: 12, nudgeToEditEarly: true, leafMustEdit: true, primaryRoot: dir });
+      assert.ok(!sentBodies.some((b) => (b.messages || []).some((m) => /Final warning/.test(m.content || ''))));
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+    else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prev;
+  }
+});
+
+test('leafMustEdit defaults off: no hard nudge for a non-leaf run', async () => {
+  const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const turns = Array.from({ length: 20 }, () => explore).concat([{ role: 'assistant', content: 'done' }]);
+  await withMockedChat(turns, async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 15, nudgeToEditEarly: true });
+    assert.ok(!sentBodies.some((b) => (b.messages || []).some((m) => /Final warning/.test(m.content || ''))));
+  });
+});
+
 // --- token accounting (2026-09-01) ---------------------------------------------------
 
 test('runPlanWithTools sums Ollama token counts across turns onto the result', async () => {
