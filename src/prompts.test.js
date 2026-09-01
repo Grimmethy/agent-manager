@@ -380,3 +380,34 @@ test('adhocPlanPrompt: a _seedPlan is embedded as a trailing "improve this" bloc
   assert.match(prompt, /do NOT start from scratch/);
   assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('PRIOR attempt'), 'seed block trails the stable instruction text');
 });
+
+// --- pipeline_forensics -----------------------------------------------------------
+
+test('pipelineForensicsPlanPrompt emits QUERY: lines and carries the evidence + subject', () => {
+  const { pipelineForensicsPlanPrompt } = require('./prompts.js');
+  const p = pipelineForensicsPlanPrompt({
+    promptContext: { subjectKind: 'signature', subjectKey: 'adhoc::botched-decompose', signature: 'adhoc::botched-decompose', evidenceText: 'EVIDENCE_MARKER\nTIER → SOURCE FILE' },
+  });
+  assert.match(p, /QUERY: <search terms>/);
+  assert.match(p, /EVIDENCE_MARKER/);
+  assert.match(p, /adhoc::botched-decompose/);
+});
+
+test('pipelineForensicsImplementPrompt encodes the ranked-counterfactual method, the contrast step, and the output contract', () => {
+  const { pipelineForensicsImplementPrompt } = require('./prompts.js');
+  const p = pipelineForensicsImplementPrompt({
+    promptContext: {
+      evidenceText: 'EVID', winnerIds: ['win-a', 'win-b'], loserIds: ['lose-a'],
+      harnessHits: [{ file: 'src/local-agentic-write-draft.js', line: 90, query: 'decompose', text: 'RESOLUTION: decompose' }],
+      harnessFiles: [],
+    },
+  }, 'QUERY: decompose');
+  assert.match(p, /COUNTERFACTUAL/);
+  assert.match(p, /CONTRAST the failing tasks with the WINNER tasks/);
+  assert.match(p, /ROOT CAUSE RANKING/);
+  assert.match(p, /RECOMMENDED FOLLOW-UP FIX/);
+  assert.match(p, /NO CLEAR ROOT CAUSE/);
+  assert.match(p, /never a diff|output prose, never a diff/);
+  assert.match(p, /win-a, win-b/);          // winner ids surfaced
+  assert.match(p, /src\/local-agentic-write-draft\.js:90/); // harness hit rendered
+});

@@ -26,6 +26,8 @@ const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
+const pipelineForensics = require('./pipeline-forensics.js');
+const { buildForensicBundle } = require('./forensic-bundle.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 const { incrementJobTypeCounter } = require('./job-type-counters.js');
@@ -1226,6 +1228,9 @@ const PROJECT_SEARCH_REVIEW_GUIDANCE = 'This is a project-search task: the draft
 const STALENESS_AUDIT_REVIEW_GUIDANCE = 'This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," it must EARN it, not assert it: either it names a specific commit that implemented the original request (a real hash the fact-check above confirms), OR it shows the current code covers EVERY concrete thing the original task names (each named UI element / endpoint / data field / behavior, with a real file:symbol). REJECT an "archive" that rests on loosely-related code, a same-named feature acting on a different object, or the bare fact that the pipeline could not build the task (fabrication-repeat / retries-exhausted are "stuck," not "resolved") -- reject it the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without a verifiable cited commit or a full per-object coverage match in the real evidence above.';
 const STALENESS_AUDIT_COMPLETENESS_QUESTION = 'Does it contain a genuine three-part analysis (does the concern still hold, was the original fabrication finding genuine, and an explicit RECOMMENDATION), grounded in the real harness search results shown above rather than invented?';
 
+const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: the implement draft is DELIBERATELY an advisory prose report -- a RANKED root-cause analysis of why a class of pipeline tasks keeps failing -- not code or a diff. There is nothing to implement here. Judge it on: (1) does it rank concrete causes and, for each, state a real COUNTERFACTUAL ("if this alone were fixed, the failing case WOULD / WOULD NOT have shipped, because ...")? (2) does it actually CONTRAST the failing tasks with the named winner tasks in the evidence, rather than analysing the failures in isolation? (3) is every cited file a real src/ path from the harness hits or the tier->file map in the evidence -- not an invented module name? (4) is the RECOMMENDED FOLLOW-UP FIX a change to THIS PIPELINE, scoped and with an acceptance check, not a re-attempt of the failed task or a hand-built version of the feature it was trying to build? "NO CLEAR ROOT CAUSE" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a tier did something the draftAttempts/worklog show it did not), it proposes hand-building the failed feature instead of fixing the pipeline, or it asserts a root cause with no counterfactual and no contrast.';
+const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT CAUSE list with a counterfactual per cause, an explicit CONTRAST with the successful sibling tasks, and a RECOMMENDED FOLLOW-UP FIX (or a justified NO CLEAR ROOT CAUSE) -- all grounded in the real evidence and citing real src/ files?';
+
 // The PLAN section of an adhoc task is drafted blind, before investigation -- this guarantee
 // (never reject over a problem in the PLAN itself) was previously hoisted, unconditionally,
 // above every adhoc carve-out in review-task.js; it now prefixes whichever resolution-specific
@@ -1501,6 +1506,145 @@ function markPipelineSelfAuditReported(task) {
   fs.writeFileSync(selfAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
 
+// pipeline_forensics (2026-09-01, see pipeline-forensics.js + forensic-bundle.js) -- the
+// deep, report-producing sibling of pipeline_self_audit. Three triggers, checked in this
+// order (most-specific human intent first, broadest background flag last):
+//   1. an on-demand request file in queue/forensics-requests/
+//   2. a needs-clarification cluster (>= CLARIFICATION_CLUSTER_THRESHOLD, same signature)
+//   3. a low-shipped-value task source over a rolling 7-day window
+// Every path builds ONE task carrying forensic-bundle.js's evidence blob (a contrast set
+// of tasks that SUCCEEDED included) in promptContext.evidenceText. Coverage is recorded by
+// the CLI's markPipelineForensicsReported() AFTER writeTask() persists -- same tier-filter
+// lesson as nextPipelineSelfAuditTask().
+function nextPipelineForensicsTask() {
+  const { pipelineDir, forensicsCoveragePath, defaultDomain } = getConfig();
+  const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
+  const now = Date.now();
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(forensicsCoveragePath) || '{}'); } catch { coverage = {}; }
+
+  const finish = (subject, { titleKey, triggerType, coverageKey, signatureFn }) => {
+    const bundle = buildForensicBundle({ pipelineDir, dbPath, subject, signatureFn });
+    if (bundle.stats.subjectCount < 2 && subject.kind !== 'task') return null; // nothing to contrast
+    if (bundle.stats.subjectCount < 1) return null;
+    const id = `pipeline-forensics-${slugifyForId(String(titleKey)).slice(0, 80)}-${now}`;
+    if (taskIdExistsInQueue(id)) return null;
+    return {
+      id,
+      domain: defaultDomain,
+      source: 'pipeline_forensics',
+      title: `Pipeline forensics: ${titleKey}`.slice(0, 140),
+      promptContext: {
+        evidenceText: bundle.evidenceText,
+        signature: bundle.signature,
+        subjectKind: subject.kind,
+        subjectKey: subject.key,
+        winnerIds: bundle.winnerIds,
+        loserIds: bundle.loserIds,
+        triggerType,
+        coverageKey: coverageKey || bundle.signature,
+      },
+    };
+  };
+
+  // (1) on-demand -------------------------------------------------------------------
+  const requestsDir = path.join(pipelineDir, 'queue', 'forensics-requests');
+  let reqFiles = [];
+  try {
+    reqFiles = fs.readdirSync(requestsDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.json'))
+      .map((e) => ({ full: path.join(requestsDir, e.name), name: e.name, mtime: fs.statSync(path.join(requestsDir, e.name)).mtimeMs }))
+      .sort((a, b) => a.mtime - b.mtime);
+  } catch { /* no requests dir */ }
+  for (const f of reqFiles) {
+    let req;
+    try { req = JSON.parse(fs.readFileSync(f.full, 'utf8')); } catch { continue; }
+    if (!req || (!req.taskId && !req.signature && !req.source)) continue;
+    const subject = req.taskId ? { kind: 'task', key: req.taskId }
+      : req.signature ? { kind: 'signature', key: req.signature }
+        : { kind: 'source', key: req.source };
+    const coverageKey = `request::${f.name}`;
+    if (coverageEntryActiveLocal(coverage[coverageKey], now)) continue;
+    const task = finish(subject, { titleKey: `on-demand ${subject.kind} "${subject.key}"`, triggerType: 'on-demand', coverageKey });
+    if (task) { task.promptContext._requestFile = f.full; return task; }
+  }
+
+  // (2) needs-clarification cluster ------------------------------------------------
+  const ncDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  const ncRecords = [];
+  try {
+    for (const name of fs.readdirSync(ncDir).filter((n) => n.endsWith('.json'))) {
+      try { ncRecords.push({ task: JSON.parse(fs.readFileSync(path.join(ncDir, name), 'utf8')) }); } catch { /* skip */ }
+    }
+  } catch { /* no dir */ }
+  const clusters = pipelineForensics.findClarificationClusters(ncRecords, coverage, now);
+  if (clusters.length) {
+    const c = clusters[0];
+    const task = finish({ kind: 'signature', key: c.signature }, {
+      titleKey: `${c.tasks.length} needs-clarification tasks, same signature (${c.signature})`,
+      triggerType: 'needs-clarification-cluster',
+      coverageKey: c.signature,
+      signatureFn: pipelineForensics.signatureForClarificationTask,
+    });
+    if (task) return task;
+  }
+
+  // (3) low-value source ---------------------------------------------------------
+  const systemReport = require('./system-report.js');
+  const endIso = new Date(now).toISOString();
+  const startIso = new Date(now - pipelineForensics.VALUE_WINDOW_DAYS * 86400000).toISOString();
+  const windowTasks = systemReport.scanTaskActivity(pipelineDir, startIso, endIso);
+  const acct = systemReport.computeTimeAccounting(dbPath, windowTasks, startIso, endIso);
+  if (acct) {
+    const mergedIds = new Set();
+    try {
+      const doneDir = path.join(pipelineDir, 'queue', 'done');
+      for (const name of fs.readdirSync(doneDir).filter((n) => n.endsWith('.json'))) {
+        try {
+          const t = JSON.parse(fs.readFileSync(path.join(doneDir, name), 'utf8'));
+          if (t && t.mergedAt) mergedIds.add(t.id);
+        } catch { /* skip */ }
+      }
+    } catch { /* no done dir */ }
+    const offender = pipelineForensics.findLowValueSource(windowTasks, mergedIds, acct.hypotheticalCostBySource, coverage, now);
+    if (offender) {
+      const task = finish({ kind: 'source', key: offender.source }, {
+        titleKey: `"${offender.source}" — $${offender.hypCost.toFixed(2)} est. API cost, ${(offender.benefitRatio * 100).toFixed(0)}% benefit, ${offender.shipped} shipped over ${pipelineForensics.VALUE_WINDOW_DAYS}d`,
+        triggerType: 'low-value-source',
+        coverageKey: `value::${offender.source}`,
+      });
+      if (task) { task.promptContext._cooldownDays = pipelineForensics.VALUE_COOLDOWN_DAYS; return task; }
+    }
+  }
+
+  return null;
+}
+
+// Local copy of pipeline-forensics.js's coverageEntryActive (avoids a second import line
+// for a 3-line predicate; kept identical -- an entry with a future eligibleAgainAt is
+// still active, one whose eligibleAgainAt has passed is not).
+function coverageEntryActiveLocal(entry, now) {
+  return pipelineForensics.coverageEntryActive(entry, now);
+}
+
+// Called once from the CLI, only after writeTask() persists a pipeline_forensics task.
+function markPipelineForensicsReported(task) {
+  const { forensicsCoveragePath } = getConfig();
+  const ctx = task.promptContext || {};
+  const key = ctx.coverageKey || ctx.signature;
+  if (!key) return;
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(forensicsCoveragePath) || '{}'); } catch { coverage = {}; }
+  const entry = { reportedAt: new Date().toISOString(), taskId: task.id, triggerType: ctx.triggerType || 'unknown' };
+  if (ctx._cooldownDays) entry.eligibleAgainAt = new Date(Date.now() + ctx._cooldownDays * 86400000).toISOString();
+  coverage[key] = entry;
+  fs.mkdirSync(path.dirname(forensicsCoveragePath), { recursive: true });
+  fs.writeFileSync(forensicsCoveragePath, JSON.stringify(coverage, null, 2));
+  // Consume an on-demand request file so it doesn't re-fire.
+  if (ctx._requestFile) { try { fs.unlinkSync(ctx._requestFile); } catch { /* raced */ } }
+}
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header for the full design):
 // per-task counterpart to nextPipelineSelfAuditTask() right above -- reads queue/blocked/
 // and queue/needs-clarification/ fresh every call (same "no persistent flags file that
@@ -1595,6 +1739,24 @@ registerTaskSource('project_search', { priority: taskPriority('project_search', 
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
 registerTaskSource('pipeline_self_audit', { priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
+// pipeline_forensics (2026-09-01) -- the deep, report-producing sibling. advisoryProse:
+// its implement pass writes a ranked root-cause report, never a diff (see
+// pipelineForensicsImplementPrompt). reasoningTier:'low' -- runs on the local model like
+// every other reasoning worker; NOT added to AGENT_MANAGER_CLAUDE_SOURCES. Priority 66,
+// just above pipeline_self_audit: a full study is rarer and higher-value per run. `apply`
+// (applyForensicsReport) is attached in a follow-up PR -- until then it falls through to
+// applyVerdictOnly via advisoryProse.
+registerTaskSource('pipeline_forensics', {
+  priority: taskPriority('pipeline_forensics', 66),
+  next: nextPipelineForensicsTask,
+  emptyApproval: true,
+  advisoryProse: true,
+  harnessSearch: 'archImport',
+  reasoningTier: 'low',
+  reportClass: 'housekeeping',
+  reviewGuidance: PIPELINE_FORENSICS_REVIEW_GUIDANCE,
+  reviewCompletenessQuestion: PIPELINE_FORENSICS_COMPLETENESS_QUESTION,
+});
 // Priority 90, just under staleness_audit(91) -- an operational incident (today's real
 // example: every draft of one task type silently failing outright) can be actively
 // costing real throughput/compute for as long as it goes unnoticed, closer in urgency to
@@ -1967,6 +2129,7 @@ module.exports = {
   isTaskReady, pendingReadinessMap,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
+  nextPipelineForensicsTask, markPipelineForensicsReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
@@ -2270,6 +2433,7 @@ if (require.main === module) {
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
+      if (task.source === 'pipeline_forensics') markPipelineForensicsReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();
       if (task.source === 'staleness_audit') markStalenessAuditReported(task);
