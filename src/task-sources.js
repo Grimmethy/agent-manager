@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
+const { detectDefaultBranch } = require('./git-runner.js');
 const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
@@ -78,18 +79,71 @@ const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'd
 // queue/done/ alone would let a dependent task draft against code that doesn't have the
 // dependency's fix yet, reproducing the exact staleness bug this feature exists to
 // prevent.
+// Process-lifetime memo: nextAdhocTask() calls isDependencySatisfied() once per unclaimed
+// adhoc candidate per source-generator tick, so an un-memoized git call per check would be
+// a subprocess per candidate per tick. A dep that's on main stays on main; a dep that
+// isn't will be re-checked on the NEXT process (the watchdog re-execs node per sweep), so
+// caching only the positive answer for the process lifetime is safe and enough.
+const _depOnMainBranchMemo = new Map();
+
+function depWorkIsOnMainBranch(repoRoot, depId) {
+  if (_depOnMainBranchMemo.get(depId)) return true;
+  let onMain = false;
+  try {
+    const mainBranch = detectDefaultBranch(repoRoot);
+    // Every apply-task.js commit carries a `Task: <id> (<domain>/<source>)` trailer (see
+    // its commitMessage). If origin/<mainBranch> has a commit with this task's trailer,
+    // the dependency's code really is merged -- whether or not `mergedAt` was ever stamped
+    // (a hand-merge via `git` in a worktree, rather than the dashboard's merge button,
+    // never stamps it) and whether or not the agent/<id> branch still exists (it's
+    // deleted on merge). --fixed-strings so the id's own characters aren't a regex.
+    const out = execFileSync('git', [
+      '-C', repoRoot, 'log', `origin/${mainBranch}`, '-n', '1',
+      '--fixed-strings', `--grep=Task: ${depId} (`, '--format=%H',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000 }).trim();
+    onMain = out.length > 0;
+  } catch {
+    onMain = false; // no repoRoot, git missing, origin ref not fetched -- treat as unsatisfied
+  }
+  if (onMain) _depOnMainBranchMemo.set(depId, true);
+  return onMain;
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
-  for (const candidate of [
+  const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
-  ]) {
+  ];
+  for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       if (data && data.mergedAt) return true;
     } catch {
-      // not found here, or unparseable -- try the next candidate location / fall through to unsatisfied
+      // not found here, or unparseable -- try the next candidate location / fall through
+    }
+  }
+
+  // `mergedAt` isn't stamped -- but the dependency's task record IS in done/, and the work
+  // may still be on origin/<mainBranch> from a hand-merge that bypassed the dashboard's
+  // stamp. Reconcile against the commit trailer; stamp the record so the dashboard and
+  // every later check agree. Only when the done record exists -- a dep still mid-pipeline
+  // has no business being probed by git.
+  let repoRoot;
+  try { ({ repoRoot } = getConfig()); } catch { repoRoot = null; }
+  if (repoRoot) {
+    for (const candidate of candidates) {
+      let data;
+      try { data = JSON.parse(fs.readFileSync(candidate, 'utf8')); } catch { continue; }
+      if (!data) continue;
+      if (!depWorkIsOnMainBranch(repoRoot, trimmed)) return false;
+      if (!data.mergedAt) {
+        data.mergedAt = new Date().toISOString();
+        data.mergedAtSource = 'reconciled-from-commit-trailer';
+        try { fs.writeFileSync(candidate, JSON.stringify(data, null, 2)); } catch { /* stamp is best-effort; the true return is what matters */ }
+      }
+      return true;
     }
   }
   return false;

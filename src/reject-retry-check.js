@@ -89,15 +89,34 @@ function buildExhaustedAdhocQuestion(task) {
 
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
-  let names = [];
+  const entries = [];
   try {
-    names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
+    for (const n of fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'))) {
+      entries.push({ dir: blockedDir, name: n });
+    }
   } catch (e) {
-    return summary; // blocked/ doesn't exist yet -- nothing to check.
+    // blocked/ doesn't exist yet -- fall through, the adhoc/ scan below may still have work.
   }
+  // An adhoc tier draft-stage block writes the task file back IN PLACE in queue/adhoc/ --
+  // it never moves to blocked/. So a genuinely blocked adhoc task (retry cap hit, a
+  // real review rejection, ...) that happens to still be sitting in adhoc/ is invisible
+  // to this sweep: no blind retry, no needs-clarification escalation, forever. Confirmed
+  // live 2026-09-02: adhoc-...-plugins-install-...-1, blockedStage 'review',
+  // localRejectCount 2/2, stranded in queue/adhoc/. Pick those up here too -- everything
+  // downstream already keys off isAdhocTask(task) and the per-entry source dir.
+  try {
+    for (const n of fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'))) {
+      try {
+        const t = JSON.parse(fs.readFileSync(path.join(adhocDir, n), 'utf8'));
+        if (t && t.status === 'blocked') entries.push({ dir: adhocDir, name: n });
+      } catch { /* unparseable -- not this sweep's problem */ }
+    }
+  } catch { /* no adhoc/ dir -- fine */ }
 
-  for (const name of names) {
-    const filePath = path.join(blockedDir, name);
+  if (entries.length === 0) return summary;
+
+  for (const { dir: sourceDir, name } of entries) {
+    const filePath = path.join(sourceDir, name);
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       if (!raw) continue;
@@ -205,6 +224,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       }
       delete task.turnBudgetExhausted;
       delete task.retryableDraftBlock;
+      // Clear the terminal block state -- otherwise a task requeued into queue/adhoc/ still
+      // reads status:'blocked' and this sweep's adhoc/ scan re-requeues it every tick until
+      // the cap. blockedStage/blockedReason are left for priorRejectionFeedback's history.
+      if (task.status === 'blocked') task.status = 'pending';
       task.priorRejectionFeedback = priorFeedback;
       // A continuation is forward progress, not a spent redraft -- don't burn a slot of the
       // blind-redraft budget on it (its own MAX_AGENTIC_CONTINUATIONS cap bounds it).
@@ -220,7 +243,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       const newPath = path.join(destDir, name);
       fs.mkdirSync(destDir, { recursive: true });
       fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
-      fs.unlinkSync(filePath);
+      // A task picked up from queue/adhoc/ requeues back to queue/adhoc/ -- same path.
+      // Only unlink when the source and destination genuinely differ, or we'd delete the
+      // file we just wrote.
+      if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
       summary.requeued++;
     } catch (e) {
       console.warn('[reject-retry-check] requeue failed for', filePath, e.message, e.code);

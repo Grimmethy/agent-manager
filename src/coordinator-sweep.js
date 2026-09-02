@@ -61,6 +61,7 @@ function coordinatorSweep({ pipelineDir }) {
       // does not sit here forever.
       parent.status = 'done';
       parent.doneMarker = 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent);
       appendHistoryEvent(parent, 'done', parent.doneMarker);
       moveToDone(file, doneDir, name, parent);
       summary.checked += 1;
@@ -81,6 +82,7 @@ function coordinatorSweep({ pipelineDir }) {
     if (doneCount === parent.subTasks.length) {
       parent.status = 'done';
       parent.doneMarker = `coordinator complete: all ${parent.subTasks.length} sub-task(s) done`;
+      stampHubMerged(parent);
       appendHistoryEvent(parent, 'done', parent.doneMarker);
       moveToDone(file, doneDir, name, parent);
       summary.completed += 1;
@@ -95,6 +97,21 @@ function coordinatorSweep({ pipelineDir }) {
   }
 
   return summary;
+}
+
+// A coordinator hub has no branch of its own -- it never applies a diff, it only tracks
+// the sub-tasks it decomposed into. So the dashboard's merge button (the only thing that
+// normally stamps `mergedAt`) can never fire for it. Without a `mergedAt`, any sibling
+// task carrying `dependsOn: [<hubId>]` is blocked FOREVER by isDependencySatisfied()
+// (task-sources.js), which treats "done but not merged" as unsatisfied. "Every sub-task
+// reached a terminal-good state" IS the ship signal for a hub -- stamp it here so the
+// dependency gate can clear. Confirmed live 2026-09-02: the plugins-marketplace
+// coordinator chain, every downstream child frozen behind an unmergeable hub id.
+function stampHubMerged(parent) {
+  if (!parent.mergedAt) {
+    parent.mergedAt = new Date().toISOString();
+    parent.mergedAtSource = 'coordinator-hub-all-subtasks-done';
+  }
 }
 
 function moveToDone(srcFile, doneDir, name, parent) {

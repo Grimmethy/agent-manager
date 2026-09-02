@@ -988,6 +988,59 @@ test('nextAdhocTask skips past a blocked candidate to claim a later, unblocked o
   assert.equal(task.id, 'adhoc-ready-1');
 });
 
+test('nextAdhocTask claims a dependent when the dep is on origin/<main> by commit trailer even though mergedAt was never stamped (hand-merge reconcile)', () => {
+  const { execFileSync } = require('child_process');
+  const dir = makeAdhocFixtureRepo();
+  const g = (args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-origin-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bare], { stdio: 'pipe' });
+  g(['init', '-b', 'main']);
+  g(['config', 'user.email', 't@t.t']); g(['config', 'user.name', 't']);
+  g(['remote', 'add', 'origin', bare]);
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  // The exact trailer apply-task.js writes into every commit.
+  g(['commit', '-m', 'prereq change\n\nTask: adhoc-handmerged-prereq (adhoc/manual)']);
+  g(['push', 'origin', 'main']);
+
+  // done/ record exists, NO mergedAt -- exactly the hand-merge situation.
+  writeDoneFile(dir, 'adhoc-handmerged-prereq', { id: 'adhoc-handmerged-prereq', title: 'prereq', branch: 'agent/adhoc-handmerged-prereq' });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-dependent-1',
+    title: 'Depends on a hand-merged prereq',
+    dependsOn: ['adhoc-handmerged-prereq'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-dependent-1');
+
+  // and the reconcile stamped the done record so the dashboard / later checks agree
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'adhoc-handmerged-prereq.json'), 'utf8'));
+  assert.ok(rec.mergedAt);
+  assert.equal(rec.mergedAtSource, 'reconciled-from-commit-trailer');
+});
+
+test('nextAdhocTask still skips a dependent when the dep is done, unmerged, and NOT on origin/<main>', () => {
+  const { execFileSync } = require('child_process');
+  const dir = makeAdhocFixtureRepo();
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-origin-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bare], { stdio: 'pipe' });
+  const g = (args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+  g(['init', '-b', 'main']); g(['config', 'user.email', 't@t.t']); g(['config', 'user.name', 't']);
+  g(['remote', 'add', 'origin', bare]);
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'x'); g(['add', 'f.txt']);
+  g(['commit', '-m', 'unrelated\n\nTask: some-other-task (adhoc/manual)']);
+  g(['push', 'origin', 'main']);
+
+  writeDoneFile(dir, 'adhoc-notlanded-prereq', { id: 'adhoc-notlanded-prereq', title: 'prereq' });
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dep-2', title: 'x', dependsOn: ['adhoc-notlanded-prereq'] });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
 test('nextAdhocTask requires EVERY dependency to be merged, not just one of several', () => {
   const dir = makeAdhocFixtureRepo();
   writeDoneFile(dir, 'adhoc-prereq-merged', { id: 'adhoc-prereq-merged', mergedAt: '2026-08-22T00:00:00.000Z' });

@@ -107,6 +107,47 @@ test('an adhoc review-rejection under the cap is requeued to queue/adhoc/, not q
   assert.deepEqual(out.priorRejectionFeedback, ['cited app.py is fabricated']);
 });
 
+test('a status:blocked adhoc task stranded in queue/adhoc/ is picked up (not only queue/blocked/)', () => {
+  const d = setupAdhocDirs();
+  const task = { id: 'adhoc-stranded', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'cited a value nowhere in grounding', localRejectCount: 0, history: [] };
+  fs.writeFileSync(path.join(d.adhocDir, 'adhoc-stranded.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-stranded.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 1);
+  assert.equal(out.status, 'pending', 'terminal block state cleared so the next tick does not re-requeue it');
+  assert.deepEqual(out.priorRejectionFeedback, ['cited a value nowhere in grounding']);
+
+  // second tick: not re-requeued (status no longer 'blocked')
+  const again = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(again.requeued, 0);
+});
+
+test('a status:blocked adhoc task in queue/adhoc/ at the retry cap escalates to needs-clarification', () => {
+  const d = setupAdhocDirs();
+  const task = { id: 'adhoc-cap', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'never produced a real diff', localRejectCount: 2, history: [] };
+  fs.writeFileSync(path.join(d.adhocDir, 'adhoc-cap.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'adhoc-cap.json')));
+  assert.ok(fs.existsSync(path.join(d.needsClarificationDir, 'adhoc-cap.json')));
+});
+
+test('a non-blocked adhoc task in queue/adhoc/ is left completely alone', () => {
+  const d = setupAdhocDirs();
+  const task = { id: 'adhoc-fresh', domain: 'adhoc', source: 'manual', history: [] };
+  fs.writeFileSync(path.join(d.adhocDir, 'adhoc-fresh.json'), JSON.stringify(task));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-fresh.json')));
+});
+
 test('an agentic continuation is requeued to adhoc/ even past the redraft cap, without burning a redraft slot, with a "continue from here" feedback', () => {
   const d = setupAdhocDirs();
   const task = {
