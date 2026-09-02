@@ -410,6 +410,22 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // files that are ALL, simultaneously, brand new.
     if (filesArray.length >= 2 && declaredFetched.length === 0) continue;
 
+    // Deterministic, one-level candidate pre-split (2026-09-02). A candidate declaring >=2
+    // files, or laying out >=3 numbered edit steps in its Solution, is more than the local
+    // 27B reliably lands in a single diff (pipeline-forensics-fix-ac-1/-ac-14 blocked+
+    // exhausted exactly this way). `mustPreSplit` tells the implement pass to decompose it
+    // into single-concern sub-candidates FIRST. Every sub-candidate the split writes back
+    // carries `Split-Depth: 1`; this reader refuses to pre-split anything already at depth
+    // >= 1, a hard recursion stop that does NOT depend on the model's judgement (the earlier
+    // model-driven re-split went infinite -- AC-4..AC-12, 2026-09-01).
+    const depthMatch = section.match(/^Split-Depth:\s*(\d+)\s*$/m);
+    const splitDepth = depthMatch ? Number(depthMatch[1]) : 0;
+    // Count numbered steps off the raw section (the Solution-only capture above stops at
+    // the first end-of-line under /m, so it can't be used for this).
+    const solutionSlice = section.split(/^Solution:/m)[1] ? section.split(/^Solution:/m)[1].split(/^Benefits:/m)[0] : '';
+    const numberedSteps = (solutionSlice.match(/(?:^|\n)\s*\d+[.)]\s+\S/g) || []).length;
+    const mustPreSplit = splitDepth === 0 && (filesArray.length >= 2 || numberedSteps >= 3);
+
     return {
       id: taskId,
       domain: defaultDomain,
@@ -421,6 +437,8 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
         files: filesArray,
         fetchedFiles,
         body: section,
+        splitDepth,
+        mustPreSplit,
       },
     };
   }

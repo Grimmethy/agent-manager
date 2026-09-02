@@ -51,6 +51,25 @@ test('parseArchDiscoveryCandidates captures an optional Source: line (arch_impor
   assert.equal(c.source, 'some-project / item-9');
 });
 
+test('parseArchDiscoveryCandidates reads Split-Depth and applyArchDiscoveryCandidates round-trips it', () => {
+  const [c] = parseArchDiscoveryCandidates('### AC-4 · A sub-candidate\nStrength: Strong\nSplit-Depth: 1\nFiles: src/a.js\n\nProblem:\nX.\n\nSolution:\nY.');
+  assert.equal(c.splitDepth, 1);
+  assert.doesNotMatch(c.body, /Split-Depth/, 'the marker is metadata, not part of the body');
+
+  const docPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cd-split-')), 'D.md');
+  applyArchDiscoveryCandidates({ implementResponse: [
+    '### AC-1 · sub one', 'Strength: Strong', 'Split-Depth: 1', 'Files: src/a.js', '', 'Problem:', 'p', 'Solution:', 's',
+  ].join('\n'), candidatesPath: docPath });
+  const written = fs.readFileSync(docPath, 'utf8');
+  assert.match(written, /^Split-Depth: 1$/m);
+  assert.equal(parseArchDiscoveryCandidates(written.slice(written.indexOf('### AC-')))[0].splitDepth, 1);
+});
+
+test('parseArchDiscoveryCandidates leaves splitDepth 0 for a normal candidate', () => {
+  const [c] = parseArchDiscoveryCandidates('### AC-9 · Normal\nStrength: Strong\nFiles: src/a.js\n\nProblem:\nX.');
+  assert.equal(c.splitDepth, 0);
+});
+
 test('nextAvailableCandidateId returns 1 for empty text and max+1 otherwise', () => {
   assert.equal(nextAvailableCandidateId(''), 1);
   assert.equal(nextAvailableCandidateId('### AC-4 x\n### AC-41 y\n### AC-9 z'), 42);

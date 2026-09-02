@@ -487,14 +487,16 @@ function archReviewImplementPrompt(task, planText) {
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up. If the real content above does not actually contain what the plan assumed, the plan was wrong about the file\'s current state; do not force a `find` that only approximately matches.',
     '',
-    // pipeline_forensics_fix candidates are ALREADY the output of a decomposition -- the
-    // forensic study's RECOMMENDED FOLLOW-UP FIX. Re-splitting one just files more forensic
-    // candidates that get re-split forever (confirmed live 2026-09-01: AC-4..AC-12, all
-    // re-decompositions of the same 3 fixes). For this source the pass must produce a real
-    // diff or output the empty string (-> blocked for a human); split is not offered.
-    isNoCandidateSplitSource(task.source) ? null : candidateSplitInstructions,
-    isNoCandidateSplitSource(task.source) ? null : '',
-    groupBJsonInstructions,
+    // Deterministic one-level pre-split (2026-09-02): the reader (nextCandidateFulfillmentTask)
+    // sets mustPreSplit for a candidate spanning >=2 files or >=3 numbered steps -- more
+    // than the local model lands in one diff. Here it is REQUIRED to split, not offered the
+    // choice. Its sub-candidates come back stamped Split-Depth: 1 and can never be pre-split
+    // again (hard recursion stop), so the earlier "re-split forever" failure cannot recur.
+    ctx.mustPreSplit
+      ? `This candidate is too broad to land as one diff -- it ${(ctx.files || []).length >= 2 ? `spans ${ctx.files.length} files (${ctx.files.join(', ')})` : 'lays out several independent edit steps'}. You MUST decompose it. Output ONLY a {"mode": "split", ...} response -- do NOT attempt a single file-change diff.\n\n${candidateSplitInstructions}\n\nEach sub-candidate must touch ONE file and one logical concern, and be listed in the order it must be applied (if a later sub-candidate depends on code an earlier one adds, say so in its Problem). At least 2, covering the full original scope.`
+      : (isNoCandidateSplitSource(task.source) ? null : candidateSplitInstructions),
+    ctx.mustPreSplit || isNoCandidateSplitSource(task.source) ? null : '',
+    ctx.mustPreSplit ? null : groupBJsonInstructions,
   ].filter((l) => l !== null).join('\n');
 }
 

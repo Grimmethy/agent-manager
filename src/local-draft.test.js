@@ -1071,6 +1071,56 @@ test('draftTask recognizes a split implement response, skips critique, and goes 
   });
 });
 
+test('draftTask accepts a split from a noCandidateSplit source when the pre-split gate marked it mustPreSplit, and stamps children Split-Depth 1', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'pipeline-forensics-fix-presplit-1', domain: 'default', source: 'pipeline_forensics_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-9', title: 'x', files: ['src/a.js', 'src/b.js'],
+        fetchedFiles: [{ path: 'src/a.js', content: 'const a=1;\n' }, { path: 'src/b.js', content: 'const b=2;\n' }],
+        body: 'Files: src/a.js, src/b.js', splitDepth: 0, mustPreSplit: true,
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'edit a', problem: 'p1', solution: 's1', benefits: 'b1', files: 'src/a.js' },
+        { title: 'edit b', problem: 'p2', solution: 's2', benefits: 'b2', files: 'src/b.js' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.candidateSplitProposals[0].splitDepth, 1);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask blocks (recursion stop) when a Split-Depth 1 candidate itself emits a split', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'pipeline-forensics-fix-depthcap-1', domain: 'default', source: 'pipeline_forensics_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-10', title: 'x', files: ['src/a.js', 'src/b.js'],
+        fetchedFiles: [{ path: 'src/a.js', content: 'const a=1;\n' }],
+        body: 'Split-Depth: 1\nFiles: src/a.js, src/b.js', splitDepth: 1, mustPreSplit: false,
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'a', problem: 'p', solution: 's', benefits: 'b' }, { title: 'b', problem: 'p', solution: 's', benefits: 'b' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals, undefined);
+    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /already a one-level decomposition/);
+  });
+});
+
 test('draftTask blocks a candidate-fulfillment source that says mode "split" but does not follow through with well-formed sub-candidates', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {

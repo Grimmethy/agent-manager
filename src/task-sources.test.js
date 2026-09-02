@@ -1352,6 +1352,39 @@ function writeCandidatesDocWithFiles(dir, candidatesRelPath, filesLine) {
   return candidatesPath;
 }
 
+// Deterministic one-level pre-split (2026-09-02) --------------------------------------
+test('nextCandidateFulfillmentTask marks a >=2-file candidate mustPreSplit, a 1-file one not, and never a Split-Depth:1 one', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/a.js'), 'const a = 1;\n');
+  fs.writeFileSync(path.join(dir, 'src/b.js'), 'const b = 2;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+
+  const twoFile = path.join(dir, 'TWO.md');
+  fs.writeFileSync(twoFile, '### AC-1 · Two files\nStrength: Strong\nFiles: src/a.js, src/b.js\n\nProblem:\nx.\n\nSolution:\nchange both.\n\nBenefits:\ny.');
+  assert.equal(nextCandidateFulfillmentTask(twoFile, 'pipeline_forensics_fix').promptContext.mustPreSplit, true);
+
+  const oneFile = path.join(dir, 'ONE.md');
+  fs.writeFileSync(oneFile, '### AC-2 · One file\nStrength: Strong\nFiles: src/a.js\n\nProblem:\nx.\n\nSolution:\nchange it.\n\nBenefits:\ny.');
+  assert.equal(nextCandidateFulfillmentTask(oneFile, 'pipeline_forensics_fix').promptContext.mustPreSplit, false);
+
+  const alreadySplit = path.join(dir, 'SPLIT.md');
+  fs.writeFileSync(alreadySplit, '### AC-3 · A sub-candidate\nStrength: Strong\nSplit-Depth: 1\nFiles: src/a.js, src/b.js\n\nProblem:\nx.\n\nSolution:\nstill two files.\n\nBenefits:\ny.');
+  const t = nextCandidateFulfillmentTask(alreadySplit, 'pipeline_forensics_fix').promptContext;
+  assert.equal(t.splitDepth, 1);
+  assert.equal(t.mustPreSplit, false, 'a Split-Depth:1 candidate is never pre-split again -- the recursion stop');
+});
+
+test('nextCandidateFulfillmentTask marks a many-numbered-step single-file candidate mustPreSplit', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/x.js'), 'const x = 1;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'STEPS.md');
+  fs.writeFileSync(p, '### AC-1 · Many steps\nStrength: Strong\nFiles: src/x.js\n\nProblem:\nx.\n\nSolution:\n1. add a constant.\n2. define a helper.\n3. inject it into the loop.\n4. clear the field after.\n\nBenefits:\ny.');
+  assert.equal(nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix').promptContext.mustPreSplit, true);
+});
+
 test('nextCandidateFulfillmentTask fetches real, current content for a file that actually exists on disk', () => {
   const dir = makeAdhocFixtureRepo();
   fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch {}\n');
