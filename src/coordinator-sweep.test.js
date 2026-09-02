@@ -83,6 +83,29 @@ test('sweep moves the parent to done/ once every child is terminal-good (done / 
   assert.deepEqual(done.progress, { done: 4, total: 4 });
 });
 
+test('completing a hub stamps mergedAt so a dependent sibling can clear isDependencySatisfied', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'hub-1', status: 'coordinating', history: [],
+    subTasks: [{ id: 'h-a', title: 'A', status: 'in-progress' }],
+  });
+  write(dir, 'done', { id: 'h-a', mergedAt: 'x' });
+
+  coordinatorSweep({ pipelineDir: dir });
+
+  const done = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'hub-1.json'), 'utf8'));
+  assert.ok(done.mergedAt, 'hub gets a mergedAt on completion');
+  assert.equal(done.mergedAtSource, 'coordinator-hub-all-subtasks-done');
+});
+
+test('a hub with no sub-tasks is also stamped mergedAt when completed out', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', { id: 'hub-empty', status: 'coordinating', history: [], subTasks: [] });
+  coordinatorSweep({ pipelineDir: dir });
+  const done = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'hub-empty.json'), 'utf8'));
+  assert.ok(done.mergedAt);
+});
+
 test('sweep on a missing coordinating/ dir is a clean no-op', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coordinator-sweep-empty-'));
   assert.deepEqual(coordinatorSweep({ pipelineDir: dir }), { checked: 0, updated: 0, completed: 0, errors: 0 });
