@@ -176,6 +176,20 @@ test('applied:false immediately, with zero runPlan calls, when the task requires
   delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
 });
 
+// 2026-09-02: py_compile alone is a syntax check, not a suite run -- do not defer for it.
+test('a task whose only command mention is py_compile is NOT deferred (even when enabled)', async () => {
+  process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC = 'true';
+  await withFixtureRepo(async (mod) => {
+    const task = makeTask({
+      promptContext: { rawText: 'Add a validator and a GET /api/thing endpoint to app.py. Verify with: python3 -m py_compile python/dashboard/app.py.' },
+    });
+    const runPlan = async () => ({ response: 'RESOLUTION: needs-capability-i-dont-have\nnope' });
+    const result = await mod.draftAdhocViaLocalAgentic(task, { runPlan });
+    assert.notEqual(result.reason, 'task explicitly requires running a verification command (compile/test) this read-only tier cannot execute -- deferring to a tier with real command access');
+  });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
+});
+
 test('buildLocalAgenticPrompt carries the extend-vs-done coverage framing', () => {
   const { buildLocalAgenticPrompt } = require('./local-agentic-draft.js');
   const p = buildLocalAgenticPrompt({ title: 't', promptContext: { rawText: 'X should also hide tagged images' } });

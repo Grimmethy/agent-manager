@@ -49,19 +49,28 @@ function extractQueries(planText) {
 
 // 2026-08-25, root-caused live via a real blocked adhoc task (wikilink note-graph
 // builder): the task explicitly required a SECOND new file (a test module) plus actually
-// RUNNING `python3 -m py_compile` and the new tests before finishing -- a real,
-// unmeetable requirement for this tier, which is a single-shot text completion with no
-// Bash/command-execution access at all, ever (see this file's own header: "cheap,
-// single-shot, no iteration"). It confidently produced a complete-looking single file,
-// never wrote the required test module, and never ran anything -- not because it made a
-// mistake, but because doing so is structurally outside what a no-tool text completion
-// can do. Two retries independently landed back on this same tier and failed the exact
-// same way both times, since nothing about a fresh attempt changes what this tier is
-// capable of. Same INFRA_FAILURE_PATTERN-style "small, static, rarely-changed literal,
-// duplicated rather than shared" reasoning as local-worker.sh's own comment -- kept in
-// sync manually with local-agentic-draft.js's identical check, since neither tier can
-// execute a command regardless of how it drafts.
-const REQUIRES_COMMAND_EXECUTION_RE = /\bpy_compile\b|\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
+// RUNNING the new tests before finishing -- a real, unmeetable requirement for this tier,
+// which is a single-shot text completion with no Bash/command-execution access at all,
+// ever (see this file's own header: "cheap, single-shot, no iteration"). It confidently
+// produced a complete-looking single file, never wrote the required test module, and
+// never ran anything -- not because it made a mistake, but because doing so is
+// structurally outside what a no-tool text completion can do. Two retries independently
+// landed back on this same tier and failed the exact same way both times, since nothing
+// about a fresh attempt changes what this tier is capable of. Same INFRA_FAILURE_PATTERN-
+// style "small, static, rarely-changed literal, duplicated rather than shared" reasoning
+// as local-worker.sh's own comment -- kept in sync manually with local-agentic-draft.js's
+// identical check, since neither tier can execute a command regardless of how it drafts.
+//
+// 2026-09-02: `\bpy_compile\b` deliberately NOT in this list. `python3 -m py_compile` is a
+// pure syntax check -- a blind diff either parses or it does not, and a diff that does not
+// parse is caught at apply/review regardless, so there is nothing here for a slower tier
+// to iterate on. It also appears in nearly every adhoc task's "run these checks before
+// finishing" boilerplate, whether or not the task has anything to do with test execution;
+// matching it forced substantial-but-testless tasks (e.g. an "add a validator + endpoint,
+// verify with py_compile" task) straight to the slow tier-3 for no benefit. A task that
+// genuinely needs a suite RUN still matches via the pytest / -m unittest / "run the tests"
+// / "run the (new) test module|suite" alternatives below.
+const REQUIRES_COMMAND_EXECUTION_RE = /\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
 
 function requiresCommandExecution(task) {
   const rawText = (task.promptContext && task.promptContext.rawText) || '';
