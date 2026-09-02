@@ -3469,7 +3469,11 @@ async function renderPluginsTab() {
       <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
       <div id="plugin-add-msg" class="meta"></div>
-    </div>`;
+    </div>
+
+    <h3 style="margin-top:22px;">Available plugins</h3>
+    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
+    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
 
   main.querySelectorAll('.plugin-toggle').forEach((cb) => {
     cb.onchange = async () => {
@@ -3513,6 +3517,90 @@ async function renderPluginsTab() {
       addBtn.disabled = false;
     }
   };
+
+  // Marketplace: fetch catalog entries annotated with install status and render
+  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
+  (async () => {
+    const listEl = main.querySelector('#marketplace-list');
+    const noteEl = main.querySelector('#marketplace-note');
+    let mkt;
+    try {
+      mkt = await fetchJson('/api/plugins/marketplace');
+    } catch (e) {
+      listEl.innerHTML = '<div class="meta">Could not load marketplace: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    if (mkt.catalogError) {
+      noteEl.textContent = mkt.catalogError;
+    }
+    const entries = mkt.plugins || mkt.entries || [];
+    if (!entries.length) {
+      listEl.innerHTML = '<div class="meta">No plugins available in the catalog.</div>';
+      return;
+    }
+    listEl.innerHTML = entries.map((p) => {
+      const installed = p.installed === true;
+      const updateAvail = p.updateAvailable === true;
+      let priceText = '';
+      if (p.pricing && p.pricing.model && p.pricing.model !== 'free') {
+        const cur = p.pricing.currency || '';
+        const amt = p.pricing.amount_cents != null ? (p.pricing.amount_cents / 100) : 0;
+        const interval = p.pricing.interval || '';
+        priceText = escapeHtml(cur + ' ' + amt + (interval ? ' / ' + interval : ''));
+      }
+      let controlHtml = '';
+      if (installed && updateAvail) {
+        controlHtml = '<button class="action" data-mkt-action="update" data-id="' + escapeAttr(p.id) + '">Update</button>';
+      } else if (installed) {
+        controlHtml = '<span class="badge ok" style="margin-top:2px;">Installed</span>';
+      } else {
+        const isPaid = p.pricing && p.pricing.model && p.pricing.model !== 'free';
+        const paidStyle = isPaid ? ' style="opacity:0.7; border-style:dashed;" title="Paid plugin -- requires a license"' : '';
+        controlHtml = '<button class="action" data-mkt-action="install" data-id="' + escapeAttr(p.id) + '"' + paidStyle + '>Install</button>';
+      }
+      const versionLine = p.installedVersion
+        ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
+        : '';
+      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
+        + '<div style="flex:1; min-width:0;">'
+        + '<div style="font-weight:600;">' + escapeHtml(p.name) + (priceText ? ' <span class="meta" style="margin-left:8px;">' + priceText + '</span>' : '') + '</div>'
+        + '<div class="meta" style="margin-top:2px;">' + escapeHtml(p.summary || '') + '</div>'
+        + versionLine
+        + '</div>'
+        + '<div style="white-space:nowrap;">' + controlHtml + '</div>'
+        + '</div>';
+    }).join('');
+
+    listEl.querySelectorAll('[data-mkt-action]').forEach((btn) => {
+      btn.onclick = async () => {
+        const action = btn.dataset.mktAction;
+        const id = btn.dataset.id;
+        btn.disabled = true;
+        btn.textContent = action === 'update' ? 'Updating...' : 'Installing...';
+        try {
+          const r = await fetch('/api/plugins/' + action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            const errMsg = body.description || body.error || 'Error ' + r.status;
+            showToast(errMsg, 'error');
+            btn.textContent = action === 'update' ? 'Update' : 'Install';
+            btn.disabled = false;
+            return;
+          }
+          showToast(action === 'update' ? 'Plugin updated successfully' : 'Plugin installed successfully', 'success');
+          await renderPluginsTab();
+        } catch (e) {
+          showToast('Could not ' + (action === 'update' ? 'update' : 'install') + ' plugin: ' + e.message, 'error');
+          btn.textContent = action === 'update' ? 'Update' : 'Install';
+          btn.disabled = false;
+        }
+      };
+    });
+  })();
 }
 
 // Pipeline-map helpers, shared by the Job List tab above (2026-08-26, Grimmethy: "I want a
