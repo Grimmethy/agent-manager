@@ -1996,3 +1996,26 @@ Replace the bare `pass` with a `logging.getLogger(__name__).warning(...)` call t
 
 Benefits:
 Once the warning is in place, any future corruption of the candidates file, a bug introduced in `parse_arch_candidates`, or a race where the file is deleted between the `is_file()` check and the `open()` call will produce a single, greppable log line that names the exact file and the exact exception. On-call engineers can confirm within seconds whether the missing enrichment is expected (file genuinely absent, which the guard already handles before the `try`) or a real fault, eliminating the current "silent data loss" failure mode without changing any runtime behaviour or adding a new dependency.
+
+### AC-110 · Log swallowed per-source exception in dashboard aggregation loop
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    backlog = candidate_backlog_sources()
+    counts = {name: None for name in backlog}
+    task_states = _task_state_index(queue_dir())
+    for name, (doc_path, id_prefix) in backlog.items():
+        if not doc_path or not doc_path.is_file():
+            continue
+        try:
+```
+
+Problem:
+The aggregation loop that builds the `counts` dictionary iterates over multiple backlog sources inside a `try/except` pair. The `except` body is empty (or contains only `pass`), so when any single source raises—file-permission error, missing `id_prefix` key, JSON decode failure, a schema drift in the doc file—the exception is discarded with no log line, no re-raise, and no error written into `counts[name]`. The only observable symptom is a `None` entry in the rendered dashboard. An operator who notices a blank cell has no log line to grep, no traceback to inspect, and no way to distinguish "source returned zero items" from "source crashed on read." In a long-running process the failure is effectively invisible until someone notices a missing number.
+
+Solution:
+At the top of the module (or just above the loop), obtain a logger with `log = logging.getLogger(__name__)`. Inside the `except` clause, replace the bare `pass` with `log.exception("Backlog source %r failed during aggregation", name)`. `logging.exception` automatically appends the full traceback to the message, and the `name` argument identifies which source in the loop triggered the failure. Do **not** re-raise: the surrounding design intentionally isolates per-source faults so that one bad source does not prevent the remaining sources from rendering. Do **not** add a metric, counter, or health-signal number—this project has no metrics dependency. The single `log.exception` call is the complete fix; it is the only observability primitive available in this codebase (stdlib `logging`, no third-party framework).
+
+Benefits:
+Once the `except` body logs, every swallowed failure produces a timestamped, source-identified traceback in the process log. An operator who sees a `None` cell in the dashboard can immediately `grep` for the source name in the log and read the exact exception and stack frame that caused it, reducing diagnosis from "which file is broken and why?" to a one-line lookup. The fault-isolation guarantee is preserved—other sources still render—so the fix adds observability without changing runtime behaviour or adding any new dependency.
