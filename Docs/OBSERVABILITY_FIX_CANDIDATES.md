@@ -2111,3 +2111,26 @@ Import `logging` at the top of the module (or reuse an existing module-level log
 
 Benefits:
 A transient `record_sample` failure now produces a single structured ERROR log line (with traceback via `logger.exception`) that names the sampler's interval and retention window, making it greppable and alertable in any log pipeline. The sampler survives the failure and resumes on the next interval instead of silently ceasing to collect data. Operators can distinguish a one-off blip from a persistent failure by the cadence of the log lines, and the absence of such lines becomes a meaningful "sampler is healthy" signal.
+
+### AC-115 · Silent swallow of model-stats event failures in `_run_event`
+Strength: Strong
+Files: python/dashboard/model_stats_client.py
+Snippet:
+```
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        subprocess.run(["node", str(MODEL_STATS_DB_JS), event, str(tmp_path)],
+                        capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        try:
+```
+
+Problem:
+The `except (OSError, subprocess.SubprocessError): pass` on line 31 discards every failure from the temp-file write or the `node` subprocess invocation with no log, no re-raise, and no return value. The module already defines `logger = logging.getLogger(__name__)` on line 22 but never uses it, confirming the log line was simply forgotten. Because `_run_event` is the sole path that records model-stats events into the Node-side database, a persistent failure—missing `node` binary, broken `model-stats-db.js`, full disk, or a repeated 15-second timeout—produces zero signal in any log or monitoring output for the entire lifetime of the process, making the event pipeline appear healthy while silently dropping every event.
+
+Solution:
+Replace the bare `pass` with a `logger.warning` call that includes the event name, the exception type and message, and the relevant context (e.g. `logger.warning("model-stats event %r failed: %s", event, exc, exc_info=exc)`). Do not re-raise: `_run_event` is a fire-and-forget recorder whose callers cannot meaningfully recover from a transient write or subprocess failure, and changing the exception contract would ripple through every call site. Keep the `finally` block's own `except OSError: pass` as-is, since unlinking a temp file that was never created is a benign no-op. No new dependency is needed; the stdlib `logging` module and the already-created `logger` instance are sufficient.
+
+Benefits:
+Once the fix is in place, any operator or on-call engineer grepping the application log will immediately see which event failed, why (the exception message and traceback via `exc_info`), and when it happened, turning an invisible, permanent data-loss path into a diagnosable, alertable warning. The existing `finally` cleanup still runs, so no temp-file leak is introduced. Because the fix uses only the stdlib `logging` module already imported in the file, it adds no new dependency and no new runtime surface.
