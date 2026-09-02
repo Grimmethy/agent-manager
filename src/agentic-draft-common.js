@@ -255,12 +255,35 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
 
     if (n === 0) {
       // The model reached a conclusion ("this is too big, split it") but produced no
-      // usable sub-task JSON at all. A redraft can plausibly fix that (emit valid JSON,
-      // or just do the change directly) -- redraft-eligible with a format reminder.
-      // Sticky count of "said decompose, gave nothing usable" passes: local-agentic-write-
-      // draft.js's repeated-decompose backstop fires once this reaches 2 (do the split in a
-      // single clean call rather than requeue toward escalation). reject-retry-check.js does
-      // not reset it.
+      // usable sub-task JSON at all.
+      //
+      // If it made REAL edits first, that is "I did part of it then ran low on turns/
+      // confidence" -- redirect to a CONTINUATION (finish what you started) exactly like
+      // the n >= 2 branch below, rather than blocking and throwing the partial work away.
+      // Confirmed live 2026-09-02 (second-brain note-graph task): two passes each made
+      // several successful edit_file calls, then answered RESOLUTION: decompose with
+      // malformed JSON -- every retry restarted from origin/master.
+      const partialDiff = bestEffortDiff();
+      const priorContinuations = Number(task.agenticContinuationCount) || 0;
+      if (partialDiff && priorContinuations < MAX_AGENTIC_CONTINUATIONS) {
+        task.agenticContinuationCount = priorContinuations + 1;
+        task.agenticContinuationNote = summary;
+        task.priorPartialDiff = partialDiff;
+        task.retryableDraftBlock = true;
+        task.isAgenticContinuation = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish`,
+          ...meta,
+          capturedDiff: partialDiff,
+        };
+      }
+      // No partial work (or continuation budget spent): redraft-eligible with a format
+      // reminder. Sticky count of "said decompose, gave nothing usable" passes: local-
+      // agentic-write-draft.js's repeated-decompose backstop fires once this reaches 2 (do
+      // the split in a single clean call rather than requeue toward escalation).
+      // reject-retry-check.js does not reset it.
       task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
       task.retryableDraftBlock = true;
       return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };

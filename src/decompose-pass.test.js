@@ -93,3 +93,32 @@ test('extractSubTasks is directly usable and mirrors runDecomposePass parsing', 
   assert.equal(extractSubTasks(THREE).subTasks.length, 3);
   assert.equal(extractSubTasks(''), null);
 });
+
+test('extractSubTasks strips a leaked <think> block whose brackets would otherwise break the greedy array match', () => {
+  const arr = JSON.stringify([
+    { title: 'piece one', rawText: 'do part one in its own file' },
+    { title: 'piece two', rawText: 'do part two in its own file' },
+  ]);
+  const withThink = `<think>\nLet me consider the pieces: [cache module], [routes], [tests].\nActually [a], [b].\n</think>\n${arr}`;
+  const out = extractSubTasks(withThink);
+  assert.ok(out, 'must recover the real array after the think block');
+  assert.equal(out.subTasks.length, 2);
+});
+
+test('extractSubTasks drops an unclosed <think> prefix (ran out of budget mid-reasoning)', () => {
+  const arr = JSON.stringify([{ title: 'a', rawText: 'aaa' }, { title: 'b', rawText: 'bbb' }]);
+  // Real shape: reasoning first, THEN the answer -- but if <think> is unclosed there is no
+  // answer to recover, so this asserts we at least do not crash / mis-parse the reasoning.
+  assert.equal(extractSubTasks('<think> considering [x] and [y] but never finished'), null);
+  // Closed think followed by the array still works.
+  assert.equal(extractSubTasks(`<think>done thinking</think>\n${arr}`).subTasks.length, 2);
+});
+
+test('runDecomposePass calls the local model with think:false (think:true truncates the JSON on qwen3)', async () => {
+  let seenOpts = null;
+  await runDecomposePass(
+    { promptContext: { rawText: 'x' } },
+    { mode: 'repeated-decompose', call: async (opts) => { seenOpts = opts; return { response: '[]' }; } },
+  );
+  assert.equal(seenOpts.think, false);
+});

@@ -275,9 +275,16 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     //   - turnBudgetExhausted: a pass burned its whole budget without a single edit.
     //   - decomposeBlockCount >= 2: the model answered RESOLUTION: decompose on two separate
     //     passes but never produced usable sub-task JSON (agentic-draft-common.js counts it).
+    // Fires on ANY give-up verdict, not just verdict.blocked: confirmed live 2026-09-02
+    // (second-brain note-graph, gpu-single-flight-lock, job-list) -- after two decompose
+    // blocks the model punts the 3rd pass to needs-human-decision (a no-RESOLUTION forced
+    // summary, or a real needs-human-decision), which is `blocked:false, needsClarification:
+    // true`, so this gate was skipped and the deterministic split never ran -- all three
+    // landed in needs-clarification/ with a placeholder non-question instead of a coordinator.
     const autoN = Number(task.autoDecomposeCount) || 0;
     const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
-    if (verdict.blocked && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
+    const gaveUp = verdict.blocked || verdict.needsClarification;
+    if (gaveUp && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
       const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
       const split = await runDecomposePass(task, {
         mode,
@@ -295,6 +302,12 @@ async function draftAdhocViaLocalAgenticWrite(task, {
         delete task.turnBudgetExhausted;
         delete task.retryableDraftBlock;
         delete task.rescopedRawText;
+        // The give-up verdict may have stamped a needs-clarification routing on the task
+        // (needs-human-decision / no-RESOLUTION forced summary) -- clear it so recordApplyOutcome
+        // routes this to the decompose/coordinator path, not queue/needs-clarification/.
+        delete task.needsClarification;
+        delete task.priorPartialDiff;
+        delete task.isAgenticContinuation;
         return {
           succeeded: true, blocked: false, resolution: 'decompose',
           response: verdict.response, toolCallLog: verdict.toolCallLog, turnsUsed: verdict.turnsUsed,
