@@ -90,7 +90,8 @@ function coordinatorSweep({ pipelineDir }) {
       try {
         fs.writeFileSync(file, JSON.stringify(parent, null, 2));
         summary.updated += 1;
-      } catch {
+      } catch (err) {
+        console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`);
         summary.errors += 1;
       }
     }
