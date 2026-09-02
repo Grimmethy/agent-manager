@@ -2088,3 +2088,26 @@ Add `import logging` at the top of the file and a module-level `_logger = loggin
 
 Benefits:
 An operator now sees a `WARNING`-level log line with the offending key and a full traceback every time the fold/save path fails, turning an invisible, accumulating silent degradation into an immediately observable and debuggable event. The best-effort contract is preserved—no caller crash, no changed return value—so no downstream code needs modification. The fix uses only the Python stdlib `logging` module already sanctioned by the project's dependency manifest and introduces no new dependency, metric, or telemetry primitive.
+
+### AC-114 · Sampler thread dies silently on first record_sample() exception
+Strength: Strong
+Files: python/dashboard/hardware_stats.py
+Snippet:
+```
+    daemon=True fire-and-forget shape as app.py's _chat_reservation_watchdog."""
+
+    def _loop():
+        while True:
+            record_sample(retention_hours=retention_hours)
+            time.sleep(interval_seconds)
+
+```
+
+Problem:
+Inside `start_sampler`, the `_loop` closure calls `record_sample(retention_hours=retention_hours)` with no exception handling (line 269). If `record_sample` raises—whether a transient I/O fault, a malformed hardware reading, or a memory pressure error—the exception propagates out of `_loop`, the daemon thread terminates, and the sampler is dead for the life of the process. Python's default `threading.excepthook` prints a bare traceback to stderr once, but there is no structured log line identifying *which* sampler instance (interval, retention window) failed, no log level an operator can alert on, and no recovery: a single transient blip permanently stops all hardware-stat collection with no further signal.
+
+Solution:
+Import `logging` at the top of the module (or reuse an existing module-level logger if one is already present) and obtain `logger = logging.getLogger(__name__)`. Inside `_loop`, wrap the `record_sample(...)` call in a `try/except Exception as exc:` block. In the `except` clause, call `logger.exception("hardware_stats sampler failed (interval=%.1fs, retention=%.1fh): %s", interval_seconds, retention_hours, exc)` so the full traceback is captured at ERROR level with the identifying parameters. After logging, fall through to `time.sleep(interval_seconds)` so the loop continues and a transient error does not permanently kill the sampler. Do not rethrow: the caller of `start_sampler` has already returned the thread handle and cannot act on a per-iteration failure; the correct recovery is to log and retry on the next tick.
+
+Benefits:
+A transient `record_sample` failure now produces a single structured ERROR log line (with traceback via `logger.exception`) that names the sampler's interval and retention window, making it greppable and alertable in any log pipeline. The sampler survives the failure and resumes on the next interval instead of silently ceasing to collect data. Operators can distinguish a one-off blip from a persistent failure by the cadence of the log lines, and the absence of such lines becomes a meaningful "sampler is healthy" signal.
