@@ -146,6 +146,15 @@ while :; do
     coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
     printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
 
+    # Auto-confirm review: queue/awaiting-confirm/ is no longer a pure human gate. A held
+    # task (a Group B delete batch, or a pipeline_forensics root-cause report) gets a small
+    # local CONFIRM/DENY majority vote -- confident CONFIRM moves it back to approved/ for a
+    # real apply re-run, confident DENY archives it, anything inconclusive stays here for a
+    # human. Cheap when awaiting-confirm/ is empty (the common case). Disable with
+    # AGENT_MANAGER_AUTO_CONFIRM_REVIEW=false.
+    auto_confirm_result="$(node "${PACKAGE_SRC_DIR}/auto-confirm-review.js" 2>>"${HOME_LOGS}/auto-confirm-review.log")"
+    printf '[watchdog] auto-confirm-review: %s\n' "$auto_confirm_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the

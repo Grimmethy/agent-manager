@@ -324,7 +324,7 @@ const TABS = [
     { key: 'approved', label: 'Approved', description: 'Jobs that passed review and are approved to move forward.' },
     { key: 'blocked', label: 'Blocked', description: 'Jobs that cannot proceed until something outside the pipeline is resolved.' },
     { key: 'needs-clarification', label: '⚠ Needs Clarification', description: 'Jobs paused because the agent needs a human decision or missing information before it can continue.' },
-    { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm', description: 'Jobs finished and awaiting a human decision on whether to keep or discard the result.' },
+    { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm', description: 'Delete batches and forensics reports pending a confirm/deny call. Auto-reviewed each watchdog tick; only cases the automated review could not decide wait for you here.' },
     { key: 'coordinating', label: 'Coordinating', description: 'Decomposed parent tasks that stay alive as a hub, tracking their sub-tasks on a checklist until all are done.' },
     { key: 'done', label: 'Done', description: 'Jobs that have completed the full pipeline.' },
   ] },
