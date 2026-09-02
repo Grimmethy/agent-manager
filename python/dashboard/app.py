@@ -704,9 +704,14 @@ def resolve_writable_cache(path_str: str, grep_dirs: list[str] | None = None) ->
         cache["dir"].mkdir(parents=True, exist_ok=True)
         return cache
     except OSError:
-        cache = _fallback_cache_paths(path_str, grep_dirs)
-        cache["dir"].mkdir(parents=True, exist_ok=True)
-        return cache
+        fallback = _fallback_cache_paths(path_str, grep_dirs)
+        logger.warning(
+            "Cache mkdir failed for %s; falling back to %s",
+            cache["dir"], fallback["dir"],
+            exc_info=True,
+        )
+        fallback["dir"].mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def _migrate_legacy_cache_if_needed(path_str: str, cache: dict) -> None:
