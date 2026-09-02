@@ -4,6 +4,7 @@ per-request via headers (adapters map X-TokenFold-* headers onto fields)."""
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field, asdict
 from ..paths import config_dir
 
@@ -45,8 +46,8 @@ def load() -> Config:
         try:
             return Config(**{**asdict(Config()),
                              **json.loads(p.read_text(encoding="utf-8"))}).clamp()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("Config load failed (%s: %s); falling back to defaults", type(exc).__name__, exc)
     return Config()
 
 
