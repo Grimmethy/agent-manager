@@ -18,11 +18,14 @@ hashes so content can be re-expanded on demand.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from typing import Callable, Optional
 
 from .session import Session, content_hash
+
+logger = logging.getLogger(__name__)
 
 _FENCE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 _KEY_LINE = re.compile(
@@ -175,7 +178,8 @@ class AbstractiveFolder:
                 session.folds.append(Fold(start=start, end=end, summary=summary,
                                           kind="abstractive"))
                 session.save()
-        except Exception:
-            pass                          # extractive fold remains in use
+        except Exception as exc:
+            logger.warning("Abstractive fold failed; falling back to extractive fold: %s", exc, exc_info=True)
+            # extractive fold remains in use
         finally:
             self._inflight.discard(key)
