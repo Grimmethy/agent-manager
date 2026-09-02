@@ -92,3 +92,13 @@ Solution: Add a pre-implementation feasibility gate in `src/local-agentic-write-
 Benefits: Tasks that require external system state (repo creation, API credentials, network access) will no longer consume the full local-agentic-write budget before failing; instead, they will be routed to human-decision quickly, and any in-repo work they contain will be extracted and shipped independently.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-empty-degenerate-draft-1788307819363
+
+### AC-14 · "observability_review" — $3.00 est. API cost, 7% benefit, 0 shipped over 7d
+Strength: Strong
+Files: src/prompts.js, src/local-draft.js
+
+Problem: The implement prompt does not explicitly forbid meta-commentary or require concrete code artifacts, leading to LLM outputs that are rejected by review as "prose descriptions" or "refusals." The pipeline lacks a pre-review structural validation to catch these non-compliant drafts early.
+Solution: In src/prompts.js, add a strict instruction to the implement stage: "You MUST provide a concrete code diff or before/after block. Do NOT provide meta-commentary, hedging, or prose descriptions of code. If the finding is a false positive, state 'FALSE POSITIVE' with a one-line justification." In src/local-draft.js, add a pre-review check that rejects drafts lacking code blocks or explicit verdict keywords, triggering an immediate retry with the strengthened prompt. Acceptance check: Re-run the 4 failing subjects; all should pass review with 2/3+ votes.
+Benefits: Eliminates the class of failures where LLMs generate non-actionable prose instead of code or definitive verdicts, reducing review rejections and blocking.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-observability-review-3-00-est-api-cost-7-benefit-0-shipped-over-7d-1788329292571
