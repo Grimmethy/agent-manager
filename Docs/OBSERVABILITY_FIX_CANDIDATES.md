@@ -1812,3 +1812,26 @@ Add `import logging` at the top of the file if it is not already present (the pr
 
 Benefits:
 Once the log line is in place, a dictionary parse failure produces an immediate, greppable log entry with the dictionary name, a human-readable summary, and the full traceback. An operator (or an on-call engineer) can go from "aliases are empty" to "dictionary 'foo' failed at line 12 with a JSONDecodeError" in seconds instead of hours. The fail-open behavior is unchanged—traffic is never blocked—so the fix adds observability without altering runtime semantics or introducing any new dependency.
+
+### AC-102 · Log swallowed per-item extraction errors in encoder loop
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/encoder.py
+Snippet:
+```
+                    try:
+                        skel, _regs = protected.extract(self._text(m))
+                        terse = phrases.compress(skel)
+                    except Exception:
+                        continue
+                    for clause in [c.strip() for c in _CLAUSE_SPLIT.split(terse)
+                                   if len(c.strip()) > 15]:
+```
+
+Problem:
+The `except Exception: continue` in the per-item extraction/compression loop silently discards any failure. If `protected.extract` or `phrases.compress` begins failing systematically—a regression in the vendored tokenfold library, a data-format drift in `self._text(m)`, or a subtle encoding edge case—the operator sees no signal whatsoever. The output simply gets shorter or loses entries, and the root cause is invisible: no log line, no counter, nothing to grep for in the process output.
+
+Solution:
+Replace the bare `except Exception: continue` with a handler that logs at WARNING level via the stdlib `logging` module (the project's existing Python logging primitive), including the item index or identifier being processed, the exception class name, and the exception message. Keep the `continue` so the intentional best-effort per-item semantics are preserved. Do not rethrow—the caller's contract is "return whatever could be extracted," and a single bad item should not abort the batch.
+
+Benefits:
+An operator can now `grep WARNING` in the log stream and immediately see which items are failing and why, turning a silent output-quality regression into a visible, diagnosable event. The fix is a two-line change (add a `logger.warning(...)` call before `continue`) with zero new dependencies and zero behavioral change to the happy path.
