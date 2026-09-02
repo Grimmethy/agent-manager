@@ -1950,3 +1950,26 @@ In the `except` block, add a single `logging.warning` call that records the exce
 
 Benefits:
 Once the warning is in place, any failure of the stats sidecar—whether it is down, hung, returning an error status, or emitting malformed JSON—produces a timestamped, greppable line in the application log that names the endpoint, the port, and the specific exception. An operator investigating "why does the dashboard show zero tokens?" can immediately distinguish a connection-refused (sidecar not running) from a timeout (sidecar stuck) from a `JSONDecodeError` (protocol mismatch), reducing mean-time-to-diagnose from "unbounded guesswork" to a single `grep` of the log. The fix is a one-line addition with no behavioral change to the happy path and no new dependency.
+
+### AC-108 · Swallow subprocess exception around apply-runner.ps1 invocation
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    child_env = {**os.environ, **env_overrides}
+
+    script_path = SRC_DIR / "apply-runner.ps1"
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), "-TaskId", task_id],
+            capture_output=True, text=True, timeout=300, env=child_env, cwd=str(PACKAGE_ROOT),
+```
+
+Problem:
+The `except` block surrounding the `subprocess.run()` call to `apply-runner.ps1` catches every exception the call can raise—`subprocess.TimeoutExpired` (300 s limit), `OSError`/`FileNotFoundError` (missing `powershell.exe` or bad `script_path`), and `subprocess.SubprocessError` (killed process)—and discards them without logging, re-raising, or any other signal. In a dashboard (API-facing) context a five-minute external PowerShell invocation that fails means the task never executed, yet the caller receives only an ambiguous empty or `None` result. The operator has no way to distinguish "task succeeded with empty output" from "the process never started or timed out," and no log line exists to correlate the failure with the `task_id` argument.
+
+Solution:
+In the `except` clause, use the Python stdlib `logging` module (already the project's logging primitive) to emit an `ERROR`-level record that includes the `task_id`, the full command list (script path plus `-TaskId` argument), and the exception type and message, passing `exc_info=True` so the traceback is captured. Immediately after the log call, re-raise the exception (`raise`) so the calling code can return a proper HTTP error response to the dashboard client rather than a silent empty payload. No metrics, counters, or telemetry primitives are added—this project has none—and no new dependency is introduced.
+
+Benefits:
+Every distinct failure mode (timeout, missing binary, script crash) now produces a structured log line that an operator can grep by `task_id` and exception type, and the dashboard API returns an explicit error to the client instead of an ambiguous empty result. The incident becomes visible and debuggable in the existing log stream, and the caller regains the ability to surface a meaningful status code, all without introducing any new dependency or telemetry system.
