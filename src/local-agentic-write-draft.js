@@ -29,6 +29,7 @@ const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js'
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
+const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -168,6 +169,7 @@ function buildWriteAgenticPrompt(task) {
     '',
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
+    anchorFilesPromptBlock(task),
     priorRejectionBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
