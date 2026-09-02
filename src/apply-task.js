@@ -749,6 +749,7 @@ function main() {
     // Non-fatal -- the apply outcome itself (result, already computed above) is what
     // actually gates the caller's file-move decision; a failure to also persist the
     // history event shouldn't turn a real apply success into a reported failure.
+    console.warn(`[apply-task] snapshot persist failed: task=${task.id ?? task.name ?? 'unknown-task'} path=${taskPath} error=${e.message}${e.code ? ` code=${e.code}` : ''}`);
   }
 
   process.stdout.write(JSON.stringify(result));
