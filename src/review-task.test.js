@@ -376,6 +376,28 @@ for (const source of ['observability_review', 'performance_review']) {
     assert.equal(result.verdict, 'approved');
     assert.equal(captured.length, 1, 'a short-but-legitimate false-positive verdict must reach the real reviewer vote, not get auto-rejected before it');
   });
+
+  // 2026-09-02: an advisoryProse source's GENUINE verdict is an `### AC-NNN` candidate
+  // block whose Solution PROPOSES a name for a helper/constant a future fix should add.
+  // checkGroundedValues flagged that ALLCAPS name as "ungrounded-field" and hard-blocked
+  // before any vote -- a category error against a proposal, same as the decompose case.
+  test(`an ${source} candidate block proposing a new ALLCAPS_CONST name is NOT hard-blocked by the ungrounded-value gate`, async () => {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = {
+      id: `${source}-ungrounded-1`, domain: 'default', source,
+      title: `${source}: test finding`,
+      planResponse: 'GENUINE -- the loop awaits serially.',
+      implementResponse: 'GENUINE\n\n### AC-1 Parallelize the serial await loop\nStrength: Strong\nFiles: a.js\nProblem: the loop awaits one item at a time.\nSolution: drive it with Promise.all, gated behind a new MAX_PARALLEL_FETCHES constant following the pattern of existing limits in config.js.\nBenefits: wall-clock drops from O(n) to O(1).',
+      promptContext: { body: 'Background material with no mention of that constant at all.' },
+    };
+    const captured = [];
+    const result = await reviewTask(task, {
+      repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+    });
+    assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value', 'MAX_PARALLEL_FETCHES is a PROPOSAL, not a claim it already exists');
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'the proposal must reach the real vote, not be auto-blocked');
+  });
 }
 
 function makeFixture() {
