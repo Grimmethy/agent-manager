@@ -290,9 +290,10 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       task.status = 'approved';
       appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
       try {
-        if (moveTaskFile(file, approvedDir, name, task)) summary.confirmed += 1;
-        else summary.errors += 1;
-      } catch { summary.errors += 1; }
+        const result = moveTaskFile(file, approvedDir, name, task);
+        if (result) summary.confirmed += 1;
+        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
     } else if (vote.confident && vote.verdict === 'DENY') {
       const reason = voteReason(vote, 'DENY');
       task.autoConfirmReviewedAt = now;
