@@ -55,14 +55,19 @@ function isEnabled() {
 }
 
 // 2026-08-25, root-caused live via a real blocked adhoc task (wikilink note-graph
-// builder): the task explicitly required running `python3 -m py_compile` and a new test
-// module before finishing -- structurally impossible here too, per this file's own header
-// above ("the model NEVER gets a direct write_file/edit_file/bash-execution tool... it
-// only investigates read-only"). Same check, same reasoning, as adhoc-harness-draft.js's
-// own REQUIRES_COMMAND_EXECUTION_RE -- duplicated rather than shared (small, static,
+// builder): the task explicitly required running a new test module before finishing --
+// structurally impossible here too, per this file's own header above ("the model NEVER
+// gets a direct write_file/edit_file/bash-execution tool... it only investigates
+// read-only"). Same check, same reasoning, as adhoc-harness-draft.js's own
+// REQUIRES_COMMAND_EXECUTION_RE -- duplicated rather than shared (small, static,
 // rarely-changed literal; see local-worker.sh's own INFRA_FAILURE_PATTERN comment for the
 // precedent on why two short copies beat one shared indirection here).
-const REQUIRES_COMMAND_EXECUTION_RE = /\bpy_compile\b|\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
+//
+// 2026-09-02: `\bpy_compile\b` deliberately NOT in this list -- see the matching note in
+// adhoc-harness-draft.js. A pure syntax check is not something a slower tier can iterate
+// on, and it is ubiquitous "run these before finishing" boilerplate. Keep this list in
+// sync with that file's copy.
+const REQUIRES_COMMAND_EXECUTION_RE = /\bpytest\b|\bnpm\s+(?:test|run)\b|\bgo\s+test\b|\bcargo\s+test\b|-m\s+unittest\b|\brun\s+(?:the\s+)?(?:new\s+)?tests?\b|\brun\s+the\s+(?:new\s+)?test\s+(?:module|suite)\b/i;
 
 function requiresCommandExecution(task) {
   const rawText = (task.promptContext && task.promptContext.rawText) || '';

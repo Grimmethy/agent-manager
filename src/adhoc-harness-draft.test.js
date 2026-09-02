@@ -177,6 +177,20 @@ test('applied:false immediately, with zero local calls, when the task requires r
   });
 });
 
+// 2026-09-02: a bare `python3 -m py_compile` "verify before finishing" step is NOT a
+// reason to defer -- a blind diff either parses or is caught downstream, there is nothing
+// to iterate on, and it is boilerplate on nearly every adhoc task.
+test('a task whose only command mention is py_compile is NOT deferred', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask({
+      promptContext: { rawText: 'Add a validator and a GET /api/thing endpoint to app.py. Verify with: python3 -m py_compile python/dashboard/app.py.' },
+    });
+    const localCall = async () => ({ response: 'QUERY: thing', degenerate: null, attempts: 1 });
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.notEqual(result.reason, 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access');
+  });
+});
+
 test('applied:false immediately when the task requires pytest specifically', async () => {
   await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
     const task = makeTask({ promptContext: { rawText: 'Add a function and cover it with pytest.' } });
