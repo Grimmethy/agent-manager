@@ -2043,3 +2043,26 @@ Replace the single-line catch with a narrow handler that inspects the error. If 
 
 Benefits:
 A corrupt or unreadable worklog file no longer causes silent, unexplained loss of all prior tier entries; the operator sees exactly which task, which file, and which error triggered the reset. Permission and disk-I/O faults are surfaced at the point of failure rather than surfacing later as a confusing write error with no context. The first-write ENOENT path remains completely quiet, so normal operation produces no log noise.
+
+### AC-125 · Bare catch blocks in pruneWorkLogs swallow unexpected filesystem errors
+Strength: Strong
+Files: src/work-log.js
+Snippet:
+```
+    const dir = worklogDir(root);
+    const queueRoot = path.join(root, 'queue');
+    let files;
+    try { files = fs.readdirSync(dir); } catch { return { pruned: 0 }; }
+    let pruned = 0;
+    for (const f of files) {
+      if (!f.endsWith('.json') || f.includes('.tmp-')) continue;
+```
+
+Problem:
+Both `catch` blocks in `pruneWorkLogs` are bare and unconditional. The `readdirSync` catch (line ~151) returns `{ pruned: 0 }` for *any* error — an `ENOENT` (dir not yet created) is fine, but an `EACCES` or `EIO` is silently discarded, making the function indistinguishable from "zero worklogs to prune." Likewise the `unlinkSync` catch (line ~157) is annotated `/* raced */` but swallows every error code, not just the `ENOENT` that a genuine race would produce; a permission denial on the worklog file is equally invisible. Because this project has no metrics or telemetry stack, the only channel to surface an unexpected filesystem failure is a `console.error` line, and neither catch emits one, so an operator debugging "why are stale worklogs piling up?" has zero diagnostic signal.
+
+Solution:
+In both `catch` blocks, inspect `err.code`. If it is `ENOENT`, keep the current silent path (that is the expected "not there yet" / "already deleted" case). For any other code, emit a single `console.error` that names the function, the offending path, and the error code/message (e.g. `console.error(\`pruneWorkLogs: readdir failed for ${dir}: ${err.code}\`);` and `console.error(\`pruneWorkLogs: unlink failed for ${path.join(dir, f)}: ${err.code}\`);`). Do not rethrow — the function is documented as "safe to call every draft" and the caller treats a thrown exception as a pipeline failure, which a best-effort cleanup should not trigger. The return shape stays `{ pruned: N }` in all cases.
+
+Benefits:
+An operator who notices worklogs accumulating in the worklog directory now gets a one-line `console.error` pinpointing the exact path and errno the moment the cleanup loop hits an unexpected condition, instead of a silent `{ pruned: 0 }` that looks identical to "nothing to do." Expected races and missing directories remain quiet, so the log stays clean in normal operation, while the rare permission or I/O fault is no longer invisible.
