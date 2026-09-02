@@ -1141,13 +1141,18 @@ async function finalizeCandidateFulfillment(task, {
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
   const split = parseCandidateSplit(task.implementResponse);
   if (split) {
-    // A noCandidateSplit source's candidate is already a decomposition (pipeline_forensics_fix
-    // -- the forensic study's RECOMMENDED FOLLOW-UP FIX). The implement prompt no longer
-    // offers the split escape hatch for it, but guard the parse too: a stray {"mode":"split"}
-    // is a failed implement, not more candidates to file.
+    const pc = task.promptContext || {};
+    const atSplitCap = (pc.splitDepth || 0) >= 1;
+    // A noCandidateSplit source's candidate is already a decomposition, EXCEPT when the
+    // deterministic pre-split gate (nextCandidateFulfillmentTask) marked it too broad to
+    // land in one diff -- that split IS wanted. But a candidate already at Split-Depth >= 1
+    // is never re-split, whatever the source: the hard recursion stop.
     const entry = getRegisteredSource(resolveSourceName(task));
-    if (entry && entry.noCandidateSplit) {
-      const reason = 'implement pass tried to split a candidate that must be implemented directly (this source does not allow re-splitting) -- blocked for a human to narrow the fix';
+    const splitBlocked = atSplitCap || (entry && entry.noCandidateSplit && !pc.mustPreSplit);
+    if (splitBlocked) {
+      const reason = atSplitCap
+        ? 'implement pass tried to split a sub-candidate that is already a one-level decomposition (Split-Depth >= 1) -- blocked for a human to narrow the fix'
+        : 'implement pass tried to split a candidate that must be implemented directly (this source does not allow re-splitting) -- blocked for a human to narrow the fix';
       recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
       appendHistoryEvent(task, 'blocked', reason);
       return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
@@ -1157,7 +1162,8 @@ async function finalizeCandidateFulfillment(task, {
       appendHistoryEvent(task, 'blocked', split.reason);
       return { done: true, result: { succeeded: true, blocked: true, blockedReason: split.reason } };
     }
-    task.candidateSplitProposals = split.candidates;
+    const childDepth = (pc.splitDepth || 0) + 1;
+    task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
     recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `split into ${split.candidates.length} sub-candidate(s)` });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
     concludeDraft(task);

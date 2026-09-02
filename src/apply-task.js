@@ -113,6 +113,9 @@ function applyCandidateSplit(task, source) {
   const markdown = task.candidateSplitProposals.map((c, i) => [
     `### AC-${i + 1} · ${c.title}`,
     'Strength: Strong',
+    // Split-Depth: N -- nextCandidateFulfillmentTask refuses to pre-split a candidate at
+    // depth >= 1, the hard one-level recursion stop for the deterministic pre-split gate.
+    c.splitDepth ? `Split-Depth: ${c.splitDepth}` : '',
     c.files ? `Files: ${c.files}` : '',
     '',
     'Problem:', c.problem,

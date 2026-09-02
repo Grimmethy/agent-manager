@@ -63,6 +63,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const strengthMatch = block.match(/^Strength:\s*(.+)$/m);
       const sourceMatch = block.match(/^Source:\s*(.+)$/m);
       const filesMatch = block.match(/^Files:\s*(.+)$/m);
+      const splitDepthMatch = block.match(/^Split-Depth:\s*(\d+)\s*$/m);
       // Body is everything after the LAST metadata line present (Files:, else Source:,
       // else the heading) -- the Problem/Solution/Benefits paragraphs, kept verbatim.
       const bodyAnchor = filesMatch ? filesMatch[0] : sourceMatch ? sourceMatch[0] : headingLine;
@@ -73,6 +74,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
         strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
         source: sourceMatch ? sourceMatch[1].trim() : '',
         files: filesMatch ? filesMatch[1].trim() : '',
+        splitDepth: splitDepthMatch ? Number(splitDepthMatch[1]) : 0,
         body,
       };
     })
@@ -130,6 +132,9 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   for (const c of candidates) {
     const id = `AC-${nextAvailableCandidateId(text)}`;
     const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+    // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
+    // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
+    if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
     if (c.source) lines.push(`Source: ${c.source}`);
     if (c.files) lines.push(`Files: ${c.files}`);
     // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
