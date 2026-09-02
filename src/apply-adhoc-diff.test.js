@@ -174,39 +174,50 @@ test('applyAdhocDiff still fails (does not silently corrupt the file) when the S
   assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'the index must be fully clean after a failed apply, not left mid-conflict');
 });
 
-// 2026-08-24: applying a RESOLUTION: decompose draft queues each sub-task as a fresh
-// adhoc task in queue/adhoc/ (the same location/schema queue-adhoc-task.js already uses,
-// so nextAdhocTask() picks them up exactly like any human-queued adhoc task) instead of
-// touching git at all -- there is no diff to apply for this resolution.
-test('applyAdhocDiff queues each sub-task into queue/adhoc/ for a RESOLUTION: decompose draft, without touching git', () => {
+// 2026-08-24 / 2026-09-02: applying a RESOLUTION: decompose draft queues each sub-task as a
+// fresh adhoc task in queue/adhoc/ (the same location/schema queue-adhoc-task.js already
+// uses, so nextAdhocTask() picks them up like any human-queued adhoc task) instead of
+// touching git -- and the PARENT becomes a coordinator (result.coordinating) rather than
+// completing, carrying the sub-task checklist.
+test('applyAdhocDiff queues each sub-task and turns the parent into a coordinator for a RESOLUTION: decompose draft', () => {
   const repoDir = makeRepo();
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
   const task = {
     id: 'apply-test-decompose-1',
     rawDiff: '',
-    implementResponse: 'Too large. Split into two.',
+    implementResponse: 'Too large. Split into three.',
     adhocResolution: 'decompose',
     subTaskProposals: [
       { title: 'Piece one', rawText: 'Do the first independently-implementable piece.' },
       { title: 'Piece two', rawText: 'Do the second independently-implementable piece.' },
+      { title: 'Piece three', rawText: 'Do the third piece, which needs piece one first.', after: 0 },
     ],
   };
 
   const result = applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
 
-  assert.equal(result.skipped, true);
-  assert.match(result.reason, /Decomposed into 2 sub-task/);
+  assert.equal(result.coordinating, true);
+  assert.equal(result.skipped, undefined);
+  assert.match(result.reason, /Decomposed into 3 sub-task/);
+  assert.equal(result.subTasks.length, 3);
+  assert.deepEqual(result.subTasks.map((s) => s.status), ['pending', 'pending', 'pending']);
+  assert.ok(result.subTasks.every((s) => typeof s.id === 'string' && s.title));
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n', 'must never touch the target repo');
 
   const queued = readQueuedAdhocTasks(pipelineDir);
-  assert.equal(queued.length, 2);
-  assert.deepEqual(queued.map((t) => t.title).sort(), ['Piece one', 'Piece two']);
+  assert.equal(queued.length, 3);
+  assert.deepEqual(queued.map((t) => t.title).sort(), ['Piece one', 'Piece three', 'Piece two']);
   for (const q of queued) {
     assert.equal(q.domain, 'adhoc');
     assert.equal(q.source, 'manual');
     assert.equal(q.promptContext.decomposedFrom, 'apply-test-decompose-1');
     assert.ok(q.promptContext.rawText.length > 0);
   }
+  // `after: 0` on the third proposal -> a dependsOn edge to the first sub-task's id.
+  const third = queued.find((t) => t.title === 'Piece three');
+  const first = queued.find((t) => t.title === 'Piece one');
+  assert.deepEqual(third.dependsOn, [first.id]);
+  assert.equal(queued.find((t) => t.title === 'Piece one').dependsOn, undefined);
 });
 
 test('applyAdhocDiff returns {skipped} without queuing anything when a decompose draft has no surviving sub-task proposals', () => {

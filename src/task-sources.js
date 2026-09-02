@@ -59,7 +59,7 @@ function readIfExists(filePath) {
 // (scanning "what actually got done"); this brings the dedup check in line with that
 // instead of leaving it as the one place still blind to it.
 const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done',
-  'needs-clarification', 'awaiting-confirm'];
+  'needs-clarification', 'awaiting-confirm', 'coordinating'];
 
 // Dependency ordering for queue/adhoc/ (2026-08-22, Grimmethy: "We need some systematic
 // way to prioritize what order adhoc tasks get completed in. Those with dependencies on

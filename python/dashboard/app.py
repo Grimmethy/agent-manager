@@ -193,7 +193,7 @@ def api_alerts():
     return jsonify({"generatedAt": generated_at, "alerts": alerts})
 
 
-QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm"]
+QUEUE_STATES = ["pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm", "coordinating"]
 
 # dashboard/ -> python/ -> package root (where agent-manager.env, launch.bat, and src/ live).
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -975,6 +975,11 @@ def task_summary(data: dict, filename: str) -> dict:
         # clarification row rendering needs it to show WHICH kind of hold this is without
         # a second round-trip per row.
         "needsClarification": data.get("needsClarification"),
+        # Coordinator (decomposed parent) checklist -- a small [{id,title,status}] list plus
+        # a {done,total} rollup, stamped by coordinator-sweep.js. The Coordinating list row
+        # shows the "N of M" from `progress` without a per-row round-trip.
+        "subTasks": data.get("subTasks"),
+        "progress": data.get("progress"),
     }
 
 

@@ -387,6 +387,18 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       return { succeeded: true, doneMarker: artifact.reason };
     }
 
+    // A decomposed adhoc parent (applyAdhocDiff) does NOT complete -- it becomes a
+    // coordinator in queue/coordinating/ tracking the sub-tasks it just queued.
+    // recordApplyOutcome maps `coordinating` to its own applyStage / task.status, and
+    // apply-task.sh moves the file to queue/coordinating/.
+    if (artifact && artifact.coordinating) {
+      if (branchName) {
+        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort */ }
+      }
+      closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+      return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason };
+    }
+
     // A Group A `apply` can also return { succeeded:false, needsConfirmation:true } to
     // hold the task at queue/awaiting-confirm/ for a human before anything is written --
     // pipeline_forensics does this so its ranked report is read before a fix candidate is
@@ -519,9 +531,16 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 // comment on the apply-failed branch for why the stamping matters, not just the history
 // event.
 function recordApplyOutcome(task, result) {
-  // needsConfirmation checked first, matching apply-task.sh's own precedence: it reports
-  // succeeded:false but is a hold for a human (a delete-containing batch), not a failure.
-  const applyStage = result.needsConfirmation ? 'awaiting-confirm' : (result.succeeded ? 'applied' : 'apply-failed');
+  // Precedence matches apply-task.sh's move logic: `coordinating` (a decomposed parent
+  // that now tracks its sub-tasks) and `needsConfirmation` (a human hold) are both checked
+  // before succeeded/failed -- neither reports succeeded:true but neither is a failure.
+  const applyStage = result.coordinating ? 'coordinating'
+    : result.needsConfirmation ? 'awaiting-confirm'
+      : (result.succeeded ? 'applied' : 'apply-failed');
+  if (applyStage === 'coordinating') {
+    task.subTasks = Array.isArray(result.subTasks) ? result.subTasks : [];
+    task.progress = { done: 0, total: task.subTasks.length };
+  }
   // An apply-failed task lands in queue/blocked/ next (apply-task.sh's own move), the same
   // directory reject-retry-check.js scans for blockedStage==='review' to auto-requeue. A
   // task that reached apply (i.e. got APPROVED) can still carry a stale blockedStage:
@@ -542,7 +561,7 @@ function recordApplyOutcome(task, result) {
   // (applied -> done/, apply-failed -> blocked/, awaiting-confirm -> awaiting-confirm/) --
   // same reason review-task.js's main() now does: the dashboard list view reads task.status
   // straight through, and nothing downstream of local-draft.js was updating it.
-  task.status = { applied: 'done', 'apply-failed': 'blocked', 'awaiting-confirm': 'awaiting-confirm' }[applyStage];
+  task.status = { applied: 'done', 'apply-failed': 'blocked', 'awaiting-confirm': 'awaiting-confirm', coordinating: 'coordinating' }[applyStage];
   appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
   return applyStage;
 }
@@ -678,7 +697,7 @@ function mainBatch() {
     const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
     recordApplyOutcome(task, r);
     try { fs.writeFileSync(p, JSON.stringify(task, null, 2)); } catch { /* non-fatal, same as single path */ }
-    out.push({ taskId: task.id, path: p, succeeded: !!r.succeeded, needsConfirmation: !!r.needsConfirmation, doneMarker: r.doneMarker, reason: r.reason });
+    out.push({ taskId: task.id, path: p, succeeded: !!r.succeeded, needsConfirmation: !!r.needsConfirmation, coordinating: !!r.coordinating, doneMarker: r.doneMarker, reason: r.reason });
   }
   process.stdout.write(JSON.stringify({ batch: true, results: out }));
 }

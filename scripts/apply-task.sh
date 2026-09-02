@@ -63,6 +63,7 @@ APPROVED_DIR="${QUEUE_DIR}/approved"
 DONE_DIR="${QUEUE_DIR}/done"
 BLOCKED_DIR="${QUEUE_DIR}/blocked"
 AWAITING_CONFIRM_DIR="${QUEUE_DIR}/awaiting-confirm"
+COORDINATING_DIR="${QUEUE_DIR}/coordinating"
 
 if [[ ! -d "$APPROVED_DIR" ]]; then
   printf '[apply-task] nothing to do: %s does not exist yet.\n' "$APPROVED_DIR"
@@ -78,7 +79,7 @@ if [[ ${#files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR"
+mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR" "$COORDINATING_DIR"
 
 # Split approved tasks into directToMain triage tasks (candidate-doc appends -- batchable
 # into ONE commit+push) and everything else (per-task apply to an agent/<id> branch).
@@ -98,24 +99,27 @@ fi
 if [[ ${#direct_files[@]} -gt 0 ]]; then
   printf '[apply-task] batching %s directToMain triage task(s) into one commit...\n' "${#direct_files[@]}"
   batch_result="$(node "${REPO_DIR}/src/apply-task.js" --batch "${direct_files[@]}")"
-  # One TSV line per task: <path>\t<succeeded 1|0>\t<needsConfirmation 1|0>\t<note>
-  # needsConfirmation is checked BEFORE succeeded, exactly like the per-task path below: a
-  # directToMain source (pipeline_forensics) whose apply returns { succeeded:false,
-  # needsConfirmation:true } is a hold for a human, NOT a failure -- routing it to blocked/
-  # buries the ranked root-cause report where nobody confirms it (confirmed live 2026-09-01:
-  # the first two real forensic reports both landed in blocked/ with status awaiting-confirm,
-  # invisible to the Awaiting Confirm tab and unreachable by the confirm endpoint).
+  # One TSV line per task: <path>\t<succeeded 1|0>\t<needsConfirmation 1|0>\t<coordinating 1|0>\t<note>
+  # needsConfirmation / coordinating are checked BEFORE succeeded, exactly like the per-task
+  # path below: a directToMain source (pipeline_forensics) whose apply returns
+  # { succeeded:false, needsConfirmation:true } is a hold for a human, NOT a failure --
+  # routing it to blocked/ buries the ranked root-cause report where nobody confirms it
+  # (confirmed live 2026-09-01). `coordinating` is defensive-only here -- adhoc decompose
+  # never takes the directToMain batch path -- but the precedence must match.
   printf '%s' "$batch_result" | node -e '
     try {
       const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
       for (const r of (o.results || [])) {
-        console.log([r.path, r.succeeded ? "1" : "0", r.needsConfirmation ? "1" : "0", String(r.doneMarker || r.reason || "").replace(/\s+/g, " ")].join("\t"));
+        console.log([r.path, r.succeeded ? "1" : "0", r.needsConfirmation ? "1" : "0", r.coordinating ? "1" : "0", String(r.doneMarker || r.reason || "").replace(/\s+/g, " ")].join("\t"));
       }
     } catch (e) { /* handled below: any direct_file not printed stays in approved/ for next tick */ }
-  ' | while IFS=$'\t' read -r bpath bok bneedsconfirm bnote; do
+  ' | while IFS=$'\t' read -r bpath bok bneedsconfirm bcoordinating bnote; do
       [[ -z "$bpath" ]] && continue
       btid="$(basename "$bpath" .json)"
-      if [[ "$bneedsconfirm" == "1" ]]; then
+      if [[ "$bcoordinating" == "1" ]]; then
+        mv "$bpath" "${COORDINATING_DIR}/${btid}.json"
+        printf '[apply-task] %s: coordinating sub-tasks (triage batch) -- %s\n' "$btid" "$bnote"
+      elif [[ "$bneedsconfirm" == "1" ]]; then
         mv "$bpath" "${AWAITING_CONFIRM_DIR}/${btid}.json"
         printf '[apply-task] %s: awaiting human confirmation (triage batch) -- %s\n' "$btid" "$bnote"
       elif [[ "$bok" == "1" ]]; then
@@ -139,8 +143,15 @@ for file in "${other_files[@]}"; do
   # not a failure; routing it to blocked/ would bury it among real apply failures instead of
   # its own queue/awaiting-confirm/ stage. See apply-task.js's own gate comment.
   needs_confirmation="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsConfirmation?"true":"false")}catch(e){console.log("false")}')"
+  # A decomposed adhoc parent becomes a coordinator -- it tracks its sub-tasks in
+  # queue/coordinating/ and auto-completes (coordinator-sweep.js) once they all reach done/.
+  # Checked before succeeded/failed: it reports succeeded:false but is neither.
+  coordinating="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.coordinating?"true":"false")}catch(e){console.log("false")}')"
 
-  if [[ "$needs_confirmation" == "true" ]]; then
+  if [[ "$coordinating" == "true" ]]; then
+    mv "$file" "${COORDINATING_DIR}/${task_id}.json"
+    printf '[apply-task] %s: coordinating sub-tasks -> %s\n' "$task_id" "$result"
+  elif [[ "$needs_confirmation" == "true" ]]; then
     mv "$file" "${AWAITING_CONFIRM_DIR}/${task_id}.json"
     printf '[apply-task] %s: awaiting human confirmation (delete in batch) -> %s\n' "$task_id" "$result"
   elif [[ "$succeeded" == "true" ]]; then
