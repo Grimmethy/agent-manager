@@ -91,6 +91,15 @@ const candidateSplitInstructions = [
   'EVERY sub-candidate must be a concrete code change. NEVER emit a sub-candidate whose job is to read, inspect, confirm, document, or analyze the code first -- the full file content is already above, and the pass that implements each sub-candidate gets it too. "Understand / document the current structure", "identify the exact text", "record the current behaviour" and the like are NOT valid sub-candidates and will be rejected. If you cannot yet name the exact functions, lines, or identifiers a sub-candidate would touch, the split is not ready: output the single-diff file-change JSON below instead of a split.',
 ].join('\n');
 
+// Sources whose candidates are ALREADY a decomposition and must never be re-split (a split
+// just files more candidates of the same kind, which get re-split, forever). Reads the
+// `noCandidateSplit` flag straight off the registration -- same pattern as
+// isCandidateFulfillmentSource / isEmptyApprovalSource in local-draft.js.
+function isNoCandidateSplitSource(source) {
+  const entry = getRegisteredSource(source);
+  return !!(entry && entry.noCandidateSplit);
+}
+
 // ---- Per-source plan-prompt builders ----
 
 function troubleLogPlanPrompt(task) {
@@ -455,10 +464,15 @@ function archReviewImplementPrompt(task, planText) {
     '',
     'Ground every "find" value in the real file content shown above, character for character -- never in your own memory of the plan or candidate write-up. If the real content above does not actually contain what the plan assumed, the plan was wrong about the file\'s current state; do not force a `find` that only approximately matches.',
     '',
-    candidateSplitInstructions,
-    '',
+    // pipeline_forensics_fix candidates are ALREADY the output of a decomposition -- the
+    // forensic study's RECOMMENDED FOLLOW-UP FIX. Re-splitting one just files more forensic
+    // candidates that get re-split forever (confirmed live 2026-09-01: AC-4..AC-12, all
+    // re-decompositions of the same 3 fixes). For this source the pass must produce a real
+    // diff or output the empty string (-> blocked for a human); split is not offered.
+    isNoCandidateSplitSource(task.source) ? null : candidateSplitInstructions,
+    isNoCandidateSplitSource(task.source) ? null : '',
     groupBJsonInstructions,
-  ].join('\n');
+  ].filter((l) => l !== null).join('\n');
 }
 
 function archDiscoveryImplementPrompt(task, planText) {
