@@ -1,0 +1,24 @@
+{
+  "catalog_version": 1,
+  "generated_at": "2026-09-02T03:15:00+00:00",
+  "plugins": [
+    {
+      "id": "agent-manager-hygiene",
+      "name": "Programming Hygiene",
+      "summary": "Observability, performance, and function-length hygiene review and fix task sources for agent-manager.",
+      "description": "Adds observability, performance, and function-length review and fix task sources for agent-manager. The review tasks triage deterministically flagged issues (silent catches, unguarded loops, OTel naming; sync I/O in loops, sequential awaits, deep JSON clones; over-long functions) as genuine or false-positive, and the fix tasks consume Strong candidates into real code fixes.",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/Grimmethy/agent-manager-hygiene.git",
+        "ref": "master"
+      },
+      "version": "1.0.0",
+      "pricing": {
+        "model": "free"
+      },
+      "tags": [
+        "hygiene"
+      ]
+    }
+  ]
+}
