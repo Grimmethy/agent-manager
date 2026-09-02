@@ -268,7 +268,15 @@ def start_sampler(
 
     def _loop():
         while True:
-            record_sample(retention_hours=retention_hours)
+            try:
+                record_sample(retention_hours=retention_hours)
+            except Exception:
+                log.exception(
+                    "hardware_stats sampler tick failed "
+                    "(interval=%.1fs, retention=%.1fh)",
+                    interval_seconds,
+                    retention_hours,
+                )
             time.sleep(interval_seconds)
 
     thread = threading.Thread(target=_loop, daemon=True)
