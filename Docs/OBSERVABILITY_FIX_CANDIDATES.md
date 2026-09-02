@@ -1928,3 +1928,26 @@ In each of the three early-return paths (the `require` catch on line 133, the `!
 
 Benefits:
 Any operator or CI log consumer can immediately see that the forensic bundle was built with a degraded model-calls section and why, instead of silently shipping a bundle that reports zero calls and zero cost. The forensic record becomes trustworthy: an empty result is now either genuinely empty (no log line) or the result of a specific, logged failure. This also makes the function testable in a way that surfaces misconfiguration (wrong dbPath, missing native binding) during local development rather than only in production post-mortems.
+
+### AC-120 · Silent catch swallows forensic-collection errors with zero operator visibility
+Strength: Strong
+Files: src/forensic-bundle.js
+Snippet:
+```
+      const rows = stmt.all(id);
+      if (rows.length) result.set(id, rows);
+    }
+  } catch {
+    return result;
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+```
+
+Problem:
+The `catch` block at the bottom of the try/catch/finally (`} catch { return result; }`) silently discards any exception thrown during the `model_calls` query loop — a transient SQLite lock, a missing column, a corrupt row — and returns whatever partial `Map` was built so far. Because the function is a best-effort forensic collector, the caller receives a possibly-incomplete bundle with no indication that data was lost, no stack trace, and no log line anywhere in the project. In an incident where the forensic bundle is the primary evidence artifact, an operator has no way to distinguish "no rows matched those task_ids" from "the query blew up on the third task_id and the rest were never attempted."
+
+Solution:
+Inside the `catch` block, log the caught error to `console.error` with the function context, the list of `ids` being collected, the size of the partial `result` map, and the error's message and stack. Do not rethrow — the function's contract is best-effort and the caller already handles a partial `Map` — but do emit enough context that an operator can identify which task_ids were lost and why. Concretely, replace the bare `return result;` with a `console.error('[forensic-bundle] model_calls collection failed:', err?.message ?? String(err), '| task_ids:', ids, '| partial rows collected:', result.size, err?.stack)` followed by `return result;`.
+
+Benefits:
+An operator reviewing logs after an incident can immediately see that the forensic bundle was incomplete, which task_ids were affected, and the root cause (lock timeout, missing column, I/O error, etc.) without needing to add temporary instrumentation. The partial-result contract is preserved, so no caller code changes are required, and the single log line is all the observability this project's logging surface (console.error) supports.
