@@ -4844,7 +4844,7 @@ function renderBrainDumpEditCard(entry) {
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       ${serialBadge ? `<div class="row meta" style="margin-bottom:4px">${serialBadge}</div>` : ''}
       <div class="capture-row" style="margin-bottom:0">
-        <textarea data-edit-input="${escapeAttr(entry.id)}" rows="4" style="width:100%;white-space:pre-wrap;overflow-wrap:break-word;resize:vertical;">${escapeHtml(entry.rawText)}</textarea>
+        <textarea data-edit-input="${escapeAttr(entry.id)}" rows="10" style="width:100%;white-space:pre-wrap;overflow-wrap:break-word;resize:vertical;">${escapeHtml(entry.rawText)}</textarea>
       </div>
       <div class="row" style="margin-top:8px">
         <span></span>
