@@ -129,22 +129,79 @@ function queueDirPath(instancesDir, key) {
 // not one shared flag, so a second concurrent Discuss session's priority isn't silently
 // cleared the instant the first one gets the lock.
 const DISCUSS_PRIORITY_DIR_NAME = '.discuss-waiting';
-const DISCUSS_PRIORITY_MAX_WAIT_MS = 8000;
+// Overall backstop only -- the real gate is marker FRESHNESS (below), so an actively
+// working chat/Discuss turn keeps a lane backed off for as long as it stays fresh, while
+// a crashed waiter's abandoned marker stops mattering after DISCUSS_MARKER_FRESH_MS.
+// (Was a flat 8s wall -- far too short for a multi-turn chat turn, so a worker reclaimed
+// the GPU between the chat's tool-loop iterations and the chat starved: 2026-09-02.)
+const DISCUSS_PRIORITY_MAX_WAIT_MS = 120000;
+// A marker whose mtime is older than this is treated as abandoned -- a live waiter
+// re-touches its marker on every model call (see refreshPriorityMarker / the Chat loop).
+const DISCUSS_MARKER_FRESH_MS = 15000;
+// Sweep a marker older than this outright (a truly dead one, minutes stale).
+const DISCUSS_MARKER_STALE_MS = 5 * 60 * 1000;
 
 function priorityWaitDirPath(instancesDir) {
   return path.join(instancesDir, DISCUSS_PRIORITY_DIR_NAME);
 }
 
+// True iff some other waiter has a FRESH marker (mtime within DISCUSS_MARKER_FRESH_MS).
+// Opportunistically unlinks markers that are minutes-stale so the dir can't fill with
+// cruft from crashed callers (the 2 Aug-24 files that made this return true forever).
 function someoneIsWaiting(instancesDir) {
+  const dir = priorityWaitDirPath(instancesDir);
+  let names;
   try {
-    return fs.readdirSync(priorityWaitDirPath(instancesDir)).length > 0;
+    names = fs.readdirSync(dir);
   } catch (e) {
-    if (e.code === 'ENOENT') {
-      return false; // directory doesn't exist yet -- nobody has ever waited.
-    }
-    console.error(`[single-flight-lock] someoneIsWaiting: unexpected error reading ${priorityWaitDirPath(instancesDir)}: code=${e.code} message=${e.message}`);
+    if (e.code === 'ENOENT') return false;
+    console.error(`[single-flight-lock] someoneIsWaiting: unexpected error reading ${dir}: code=${e.code} message=${e.message}`);
     throw e;
   }
+  const now = Date.now();
+  let fresh = false;
+  for (const name of names) {
+    let mtime;
+    try {
+      mtime = fs.statSync(path.join(dir, name)).mtimeMs;
+    } catch { continue; }
+    const age = now - mtime;
+    if (age > DISCUSS_MARKER_STALE_MS) {
+      try { fs.unlinkSync(path.join(dir, name)); } catch { /* raced */ }
+    } else if (age <= DISCUSS_MARKER_FRESH_MS) {
+      fresh = true;
+    }
+  }
+  return fresh;
+}
+
+// A user-interactive caller (the Chat tool loop) drops one of these before it starts
+// competing for the GPU and re-touches it (refreshPriorityMarker) on every model call, so
+// worker lanes' acquire() keeps yielding for the whole turn -- not just the first 8s.
+function dropPriorityMarker(instancesDir) {
+  const dir = priorityWaitDirPath(instancesDir);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, `${Date.now()}.${process.pid}.${crypto.randomBytes(4).toString('hex')}`);
+    fs.writeFileSync(p, '');
+    return p;
+  } catch (e) {
+    console.error(`[single-flight-lock] dropPriorityMarker failed: ${e.message}`);
+    return null;
+  }
+}
+
+function refreshPriorityMarker(markerPath) {
+  if (!markerPath) return;
+  try {
+    const now = new Date();
+    fs.utimesSync(markerPath, now, now);
+  } catch { /* marker gone (removed / swept) -- nothing to refresh */ }
+}
+
+function removePriorityMarker(markerPath) {
+  if (!markerPath) return;
+  try { fs.unlinkSync(markerPath); } catch { /* already gone */ }
 }
 
 // 2026-08-27, root-caused live: this used to be a genuinely unbounded blocking acquire
@@ -258,11 +315,16 @@ function acquire(instancesDir, key) {
   const timeoutSecs = lockTimeoutSecs();
   const overallDeadline = Date.now() + timeoutSecs * 1000;
 
-  // Discuss priority: a user-interactive waiter (Python drops a marker in
-  // .discuss-waiting/) gets a short head start to enter the queue before this lane does.
-  const discussDeadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
-  while (someoneIsWaiting(instancesDir) && Date.now() < discussDeadline) {
-    sleepMs(1000);
+  // Discuss priority: a user-interactive waiter (the dashboard drops a fresh marker in
+  // .discuss-waiting/ for the whole Chat/Discuss turn) makes every OTHER lane yield the
+  // GPU until the marker goes stale or is removed. AGENT_MANAGER_PRIORITY_HOLDER is set on
+  // the chat turn's OWN node child -- it is the priority holder, it must never back off
+  // against its own marker (which would starve it between its tool-loop turns).
+  if (!process.env.AGENT_MANAGER_PRIORITY_HOLDER) {
+    const discussDeadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
+    while (someoneIsWaiting(instancesDir) && Date.now() < discussDeadline) {
+      sleepMs(1000);
+    }
   }
 
   // Enqueue a FIFO ticket. Name = <20-digit ms><.pid><.rand> so a plain lexical sort is
@@ -366,4 +428,8 @@ async function withLock(instancesDir, fn, key) {
 // regression, not a fix: a multi-minute adhoc draft (real Bash/Edit/Write investigation)
 // would block a live chat, or vice versa, for a resource conflict that doesn't actually
 // exist.
-module.exports = { acquire, release, withLock, lockFilePath, queueDirPath };
+module.exports = {
+  acquire, release, withLock, lockFilePath, queueDirPath,
+  dropPriorityMarker, refreshPriorityMarker, removePriorityMarker, someoneIsWaiting,
+  DISCUSS_MARKER_FRESH_MS,
+};

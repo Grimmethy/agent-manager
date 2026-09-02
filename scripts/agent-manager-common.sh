@@ -295,14 +295,26 @@ acquire_single_flight_lock() {
   local priority_dir="${INSTANCES_DIR}/.discuss-waiting"
   local timeout_secs="${SINGLE_FLIGHT_LOCK_TIMEOUT_SECS:-600}"
 
-  # Discuss-priority backoff (unchanged): a user-interactive waiter (Python drops a
-  # marker in .discuss-waiting/) gets a short head start to enter the FIFO queue below
-  # before this lane does.
-  local waited=0
-  while [[ -n "$(ls -A "$priority_dir" 2>/dev/null)" && "$waited" -lt "${DISCUSS_PRIORITY_MAX_WAIT_SEC:-8}" ]]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
+  # Discuss-priority backoff: a user-interactive waiter (the dashboard drops a FRESH marker
+  # in .discuss-waiting/ and re-touches it for the whole Chat/Discuss turn) makes this lane
+  # yield the GPU until the newest marker's mtime goes stale (>15s) or it is removed. Was a
+  # flat 8s wall -- far too short for a multi-turn chat turn (2026-09-02). AGENT_MANAGER_
+  # PRIORITY_HOLDER (set on the chat turn's own node child) skips this entirely.
+  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" ]]; then
+    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-120}"
+    while (( waited < max_wait )); do
+      local newest_age=99999 now_s f mt
+      now_s="$(date +%s)"
+      for f in "$priority_dir"/*; do
+        [[ -e "$f" ]] || continue
+        mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+        (( now_s - mt < newest_age )) && newest_age=$((now_s - mt))
+      done
+      (( newest_age > fresh_secs )) && break
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
 
   # FIFO ticket queue (2026-08-31): flock(2) has no ordering guarantee, so under
   # sustained contention a third consumer starves -- confirmed live over the entire life

@@ -6,7 +6,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { acquire, release, withLock, lockFilePath, queueDirPath } = require('./single-flight-lock.js');
+const {
+  acquire, release, withLock, lockFilePath, queueDirPath,
+  someoneIsWaiting, dropPriorityMarker, refreshPriorityMarker, removePriorityMarker,
+} = require('./single-flight-lock.js');
 
 function makeInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'single-flight-lock-test-'));
@@ -52,6 +55,77 @@ test('acquire() does not back off at all when .discuss-waiting/ is absent or emp
   const elapsedMs = Date.now() - start;
   release(fd);
   assert.ok(elapsedMs < 500, `expected no backoff with nothing waiting, took ${elapsedMs}ms`);
+});
+
+// Freshness-bounded backoff (2026-09-02): the flat 8s wall was far too short for a
+// multi-turn Chat turn, so a worker reclaimed the GPU between the chat's tool-loop
+// iterations and the chat starved. Now: back off while a marker is FRESH (mtime within
+// DISCUSS_MARKER_FRESH_MS, kept fresh by the dashboard's refresher thread), ignore a
+// stale one, sweep a minutes-old one.
+test('someoneIsWaiting: fresh marker -> true; stale marker -> false; ancient marker -> swept', () => {
+  const dir = makeInstancesDir();
+  const waitDir = path.join(dir, '.discuss-waiting');
+  fs.mkdirSync(waitDir);
+
+  const fresh = path.join(waitDir, 'fresh');
+  fs.writeFileSync(fresh, '');
+  assert.equal(someoneIsWaiting(dir), true);
+
+  const stale = path.join(waitDir, 'stale');
+  fs.writeFileSync(stale, '');
+  const t = Date.now() - 60_000; // 60s old -- past DISCUSS_MARKER_FRESH_MS (15s), not past the 5min sweep
+  fs.utimesSync(stale, new Date(t), new Date(t));
+  fs.unlinkSync(fresh);
+  assert.equal(someoneIsWaiting(dir), false, 'a 60s-old marker no longer counts as an active waiter');
+  assert.ok(fs.existsSync(stale), 'a merely-stale marker is left in place (not yet sweep-old)');
+
+  const ancient = path.join(waitDir, 'ancient');
+  fs.writeFileSync(ancient, '');
+  const old = Date.now() - 10 * 60_000; // 10 min
+  fs.utimesSync(ancient, new Date(old), new Date(old));
+  someoneIsWaiting(dir);
+  assert.equal(fs.existsSync(ancient), false, 'a 10-min-old marker is swept');
+});
+
+test('dropPriorityMarker / refreshPriorityMarker / removePriorityMarker round-trip', () => {
+  const dir = makeInstancesDir();
+  const m = dropPriorityMarker(dir);
+  assert.ok(m && fs.existsSync(m));
+  assert.equal(someoneIsWaiting(dir), true);
+
+  const before = fs.statSync(m).mtimeMs;
+  const past = Date.now() - 5000;
+  fs.utimesSync(m, new Date(past), new Date(past));
+  refreshPriorityMarker(m);
+  assert.ok(fs.statSync(m).mtimeMs > before - 1000, 'refresh bumps the mtime back to now');
+
+  removePriorityMarker(m);
+  assert.equal(fs.existsSync(m), false);
+  assert.equal(someoneIsWaiting(dir), false);
+  removePriorityMarker(m); // idempotent, no throw
+  refreshPriorityMarker(m); // gone -- no throw
+});
+
+test('acquire() with AGENT_MANAGER_PRIORITY_HOLDER set does NOT back off even with a fresh marker present', () => {
+  const dir = makeInstancesDir();
+  fs.mkdirSync(path.join(dir, '.discuss-waiting'));
+  fs.writeFileSync(path.join(dir, '.discuss-waiting', 'someone-else'), ''); // fresh
+
+  const child = require('child_process').spawn('node', ['-e', `
+    const { acquire, release } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const start = Date.now();
+    const fd = acquire(${JSON.stringify(dir)});
+    process.stdout.write(String(Date.now() - start));
+    release(fd);
+  `], { env: { ...process.env, AGENT_MANAGER_PRIORITY_HOLDER: '1' } });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  return new Promise((resolve) => {
+    child.on('exit', () => {
+      assert.ok(Number(out) < 800, `the priority holder must not back off against a marker, took ${out}ms`);
+      resolve();
+    });
+  });
 });
 
 test('lockFilePath matches the exact bash lockfile name (interop depends on this)', () => {

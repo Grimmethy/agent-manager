@@ -8,6 +8,7 @@ tool-loop logic in Python -- same "one implementation of the real thing, called 
 languages" reasoning as claude_client.py's own header.
 """
 import json
+import os
 import subprocess
 import tempfile
 import uuid
@@ -68,6 +69,7 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
             result = subprocess.run(
                 ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
                 capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
+                env={**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"},  # user-interactive: never yield the GPU to a worker lane
             )
         except subprocess.TimeoutExpired as e:
             # 2026-08-24 -- caught live: subprocess.TimeoutExpired does NOT inherit from
@@ -125,6 +127,7 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
     proc = subprocess.Popen(
         ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"},  # user-interactive: never yield the GPU to a worker lane
     )
     try:
         final = None

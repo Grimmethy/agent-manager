@@ -50,6 +50,7 @@ life fits inside one function call.
 """
 import fcntl
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -134,6 +135,45 @@ def release(fh):
         fcntl.flock(fh, fcntl.LOCK_UN)
     finally:
         fh.close()
+
+
+@contextmanager
+def priority_marker(instances_dir: Path):
+    """Drop a `.discuss-waiting/` marker and keep it FRESH (re-touched every few seconds by
+    a daemon thread) for the whole `with` block, so worker/reviewer lanes' acquire() keeps
+    yielding the GPU the entire time -- not just the first few seconds. Used by the Chat
+    turn: it must span the model call PLUS every tool-loop iteration inside the node child,
+    which is minutes, not the sub-second window acquire()'s own marker covers. A crashed
+    holder's marker stops mattering once its mtime goes stale (single-flight-lock.js's
+    DISCUSS_MARKER_FRESH_MS); the refresher is a daemon thread so a hard exit can't wedge
+    the pipeline either. Best-effort throughout -- a marker we can't create/keep is just no
+    priority boost, never an error the caller has to handle."""
+    marker = None
+    stop = threading.Event()
+    try:
+        wait_dir = instances_dir / PRIORITY_WAIT_DIR_NAME
+        wait_dir.mkdir(parents=True, exist_ok=True)
+        marker = wait_dir / uuid.uuid4().hex
+        marker.touch()
+
+        def _keep_fresh():
+            while not stop.wait(5.0):
+                try:
+                    marker.touch()
+                except OSError:
+                    return
+        threading.Thread(target=_keep_fresh, name="discuss-priority-marker", daemon=True).start()
+    except OSError:
+        marker = None
+    try:
+        yield
+    finally:
+        stop.set()
+        if marker is not None:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @contextmanager
