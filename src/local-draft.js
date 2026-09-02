@@ -50,6 +50,7 @@ const { providerFor, labelFor, resolveModelProfile } = require('./model-provider
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
+const { runDecomposePass } = require('./decompose-pass.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
 const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
@@ -425,7 +426,7 @@ function runStalenessFastpath(task, attempt) {
 // strict, line-based format; a freeform rewrite is not a safe way to edit one) -- every
 // path here returns a final draftTask result directly instead.
 async function draftAdhocBranch(task, {
-  maybeLocked, recordModelCall, attempt,
+  maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
   draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
 }) {
   // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
@@ -447,6 +448,32 @@ async function draftAdhocBranch(task, {
   // looks cut short. With main()'s persist hook each one lands on disk the moment it fires,
   // so the log shows exactly how far the draft got. (2026-08-31, Grimmethy: "the task log
   // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
+
+  // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
+  // BEFORE any agentic tier. A task that is genuinely 5 endpoints + a UI + tests wastes a
+  // full 35-turn tier-3 pass (and 2 retries) discovering that; catch it here instead. Only
+  // on a FRESH task -- a retry / re-scoped / already-decomposed task has specific feedback
+  // to act on and skips this. The decompose verdict flows straight to review -> coordinator
+  // exactly like a RESOLUTION: decompose from tier 3.
+  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
+  const isFreshAdhoc = !task.localRejectCount
+    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
+    && !task.rescopedFromDecompose
+    && !task.autoDecomposeCount
+    && task.adhocResolution !== 'decompose';
+  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
+    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
+    if (split && split.subTasks.length >= 2) {
+      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
+      task.adhocResolution = 'decompose';
+      task.subTaskProposals = split.subTasks;
+      task.rawDiff = '';
+      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.`;
+      concludeDraft(task);
+      return { succeeded: true, blocked: false };
+    }
+  }
+
   appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
   const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
   recordTier(attempt, {
@@ -1258,7 +1285,7 @@ async function runDraftPasses(task, attempt, {
       // draftTask result; nothing here calls Claude.
       if (resolveSourceName(task) === 'adhoc') {
         return await draftAdhocBranch(task, {
-          maybeLocked, recordModelCall, attempt,
+          maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
           draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
         });
       }

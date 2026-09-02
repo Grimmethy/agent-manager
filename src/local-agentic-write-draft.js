@@ -28,6 +28,13 @@ const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
+const { runDecomposePass } = require('./decompose-pass.js');
+
+// A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
+// (the preliminary check in local-draft.js should catch most of these first). Bounded: a
+// child that was auto-decomposed and STILL exhausts gets one more split, then falls
+// through to the existing retry -> escalate path.
+const MAX_AUTO_DECOMPOSE = Number(process.env.AGENT_MANAGER_MAX_AUTO_DECOMPOSE) || 2;
 
 // 2026-08-31 (bra-1788142124203): raised 20 -> 35. A real tier-3 run hit the old 20-turn
 // cap having made 13 tool calls -- all read-only orientation, zero edits -- and blocked
@@ -99,6 +106,14 @@ function isLeafTask(task) {
   return !!(ctx.decomposedFrom || (task && task.rescopedFromDecompose));
 }
 
+// A leaf is normally forbidden RESOLUTION: decompose (a prior split supposedly made it
+// atomic). But that assumption is disproven the moment the leaf blows a full 35-turn pass
+// with zero edits, or has already been auto-decomposed once -- in those cases let it split
+// again. MAX_AUTO_DECOMPOSE + review still bound runaway splitting.
+function leafDecomposeLocked(task) {
+  return isLeafTask(task) && !(task && task.autoDecomposeCount) && !(task && task.turnBudgetExhaustedBefore);
+}
+
 // A prior tier-3 (local-agentic-write) attempt on this same task that ended WITHOUT an
 // edit still produced a real final message -- often (see the /api/chat/inject forensics) an
 // accurate, detailed spec of exactly the change, it just never committed to writing it.
@@ -130,13 +145,13 @@ function priorAttemptAnalysisBlock(task) {
 
 function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
-  const leaf = isLeafTask(task);
+  const leaf = leafDecomposeLocked(task);
   const stillLostAdvice = leaf
     ? `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
     : `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
   const tooLargeClause = leaf
     ? 'This task has already been scoped by a prior decompose pass to be implementable in ONE pass. If you genuinely cannot, answer RESOLUTION: needs-human-decision with the specific blocker -- do not answer RESOLUTION: decompose and do not leave a partial edit.'
-    : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task.';
+    : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task. Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.';
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
@@ -145,7 +160,7 @@ function buildWriteAgenticPrompt(task) {
     '',
     `Title: ${task.title || ''}`,
     leaf ? 'This task is a CONFIRMED-ATOMIC LEAF: a prior decompose pass already split the larger feature and this is one indivisible piece. It MUST be implemented in this pass with edit_file / write_file. Do NOT answer RESOLUTION: decompose.' : '',
-    (leaf && ctx.decomposedFrom) ? `(decomposed from parent task ${ctx.decomposedFrom})` : '',
+    ctx.decomposedFrom ? `(decomposed from parent task ${ctx.decomposedFrom})` : '',
     '',
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
@@ -174,6 +189,7 @@ function buildWriteAgenticPrompt(task) {
     'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, in exactly this shape (a full, self-contained description for each -- someone implementing just that one piece must not need the original task):',
     '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
     'You MAY add "after": N to a sub-task, where N is the 0-based index of an EARLIER sub-task in this same array, ONLY when the piece genuinely cannot start until that earlier one is merged -- e.g. it edits a file the earlier one creates. Omit "after" for pieces that can proceed independently (the common case).',
+    'Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
     '',
     'If RESOLUTION: needs-human-decision -- follow it with the specific open question(s), plainly stated, and enough real context for a human to answer without re-investigating. Then, if the answer space is a small number of genuinely distinct choices, ALSO give 2-4 options in exactly this format:',
@@ -232,7 +248,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       // A confirmed-atomic leaf (decomposedFrom / rescopedFromDecompose) that still hasn't
       // edited a few turns after the soft nudge gets one firmer push: edit now or conclude
       // needs-human-decision -- decompose is off the table for a leaf.
-      leafMustEdit: isLeafTask(task),
+      leafMustEdit: leafDecomposeLocked(task),
     });
     modelStatsSafe(recordModelCall, {
       taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
@@ -243,10 +259,34 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   });
 
   try {
-    return await runAgenticDraftInWorktree(task, {
+    const verdict = await runAgenticDraftInWorktree(task, {
       runInWorktree: doRun,
       modelLabel: localDraftModelLabel(),
     });
+
+    // Backstop: the pass exhausted its whole turn budget without a single edit. Instead of
+    // requeueing for ANOTHER doomed 35-turn pass, run a single-call decompose pass.
+    const autoN = Number(task.autoDecomposeCount) || 0;
+    if (verdict.blocked && task.turnBudgetExhausted && autoN < MAX_AUTO_DECOMPOSE) {
+      const split = await runDecomposePass(task, {
+        mode: 'post-exhaustion',
+        priorAttemptBlock: priorAttemptAnalysisBlock(task),
+      });
+      if (split && split.subTasks.length >= 2) {
+        task.autoDecomposeCount = autoN + 1;
+        task.adhocResolution = 'decompose';
+        task.subTaskProposals = split.subTasks;
+        task.rawDiff = '';
+        task.implementResponse = `Auto-decomposed after a turn-budget-exhausted implement pass (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}`;
+        delete task.turnBudgetExhausted;
+        delete task.retryableDraftBlock;
+        return {
+          succeeded: true, blocked: false, resolution: 'decompose',
+          response: verdict.response, toolCallLog: verdict.toolCallLog, turnsUsed: verdict.turnsUsed,
+        };
+      }
+    }
+    return verdict;
   } catch (e) {
     return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
   }

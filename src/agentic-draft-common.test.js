@@ -215,6 +215,7 @@ test('resolveAgenticDraft: forcedSummary + zero edits + empty worktree -> clean 
     assert.match(out.blockedReason, /without making any edits/);
     assert.ok(!out.needsClarification);
     assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true, 'sticky flag survives reject-retry-check so a leaf may decompose on the next pass');
     assert.equal(task.retryableDraftBlock, true, 'reject-retry-check requeues this');
     assert.equal(task.adhocResolution, undefined, 'no fake needs-human-decision');
     assert.equal(task.implementResponse, undefined, 'no placeholder string written');
