@@ -222,7 +222,11 @@ def record_sample(retention_hours: float = DEFAULT_RETENTION_HOURS) -> None:
         finally:
             conn.close()
     except Exception:
-        pass
+        log.warning(
+            "Failed to persist hardware stats (sampled_at=%s)",
+            sampled_at,
+            exc_info=True,
+        )
 
 
 def get_history(hours: float = DEFAULT_RETENTION_HOURS) -> list:
