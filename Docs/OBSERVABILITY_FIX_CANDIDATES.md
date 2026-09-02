@@ -1997,3 +1997,26 @@ Replace the bare `catch { continue; }` (lines 137–139) with a catch that binds
 
 Benefits:
 Once fixed, every log file that the audit intended to scan but could not read is explicitly recorded in the `findings` output, so the report is self-describing about its own coverage. Operators reading the audit output can immediately see which files were skipped and why (permission denied, ENOENT, EACCES, etc.) rather than silently receiving a partial result that looks identical to a fully successful scan. The `console.warn` line also appears in standard output for real-time debugging, matching the project's existing `console.error` / `console.warn` logging convention.
+
+### AC-123 · Log silently-skipped corrupt draft files in reclaimOrphanedDrafts
+Strength: Strong
+Files: src/reclaim-orphaned-drafts.js
+Snippet:
+```
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      continue; // unreadable/mid-write -- leave it, next startup can try again
+    }
+
+```
+
+Problem:
+In the per-file loop (lines 57–61), the `catch {` clause discards the error object entirely and falls through to `continue` with no log output. A persistently corrupt draft file (truncated JSON, wrong encoding, a stray non-JSON artifact left in `draftingDir`) is therefore skipped on every startup with zero observable trace. This is inconsistent with the directory-read failure handler five lines above (line 51), which already emits `console.warn` with `err.code` and `err.message` before returning. An operator investigating a missing draft has no log line to follow and must manually enumerate `draftingDir` to discover the offending file.
+
+Solution:
+Bind the caught error (`catch (err)`) and emit a single `console.warn` that names the file path and the error message before the existing `continue`. The control flow is unchanged — the file is still left in place for the next scan, and the loop still proceeds to the next name. No new dependency, no metric, no rethrow; just the one `console.warn` line that the rest of this file already uses for non-fatal failures.
+
+Benefits:
+A persistently corrupt draft file now produces a visible, greppable log line on every startup that names the exact file and the parse/read error, giving an operator a direct trail from "draft X is missing from the queue" to the offending file. The log output is consistent with the directory-read warning already present in the same function, so the file's error-handling style is uniform. No behavioural change for the happy path or for genuinely transient mid-write files (they still log once and are retried next startup).
