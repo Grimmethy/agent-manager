@@ -114,6 +114,42 @@ test('resolveAgenticDraft(decompose): sets subTaskProposals, no diff', () => {
   });
 });
 
+test('resolveAgenticDraft(decompose) WITH partial worktree edits -> continuation, not a split', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'I already did half of this\n');
+    fs.writeFileSync(path.join(wt, 'new.txt'), 'a function I wrote before bailing\n');
+    const task = { id: 't2cont' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'I wrote the validators.\n\nRESOLUTION: decompose\n[{"title":"p1","rawText":"a"},{"title":"p2","rawText":"b"}]\nrest is big' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /made partial edits then chose RESOLUTION: decompose -- requeued as continuation 1\/2/);
+    assert.equal(task.isAgenticContinuation, true);
+    assert.equal(task.agenticContinuationCount, 1);
+    assert.match(task.priorPartialDiff, /new\.txt/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.ok(!task.subTaskProposals, 'the split is NOT accepted while there is unfinished partial work');
+    assert.ok(!task.adhocResolution);
+  });
+});
+
+test('resolveAgenticDraft(decompose) with partial edits AT the continuation cap -> accepts the split, notes discarded work', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial again\n');
+    const task = { id: 't2capd', agenticContinuationCount: 2 }; // MAX_AGENTIC_CONTINUATIONS
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\n[{"title":"p1","rawText":"a"},{"title":"p2","rawText":"b"}]\nstill multi-part' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(task.adhocResolution, 'decompose');
+    assert.equal(task.subTaskProposals.length, 2);
+    assert.equal(task.rawDiff, '');
+    assert.match(task.implementResponse, /partial edits before this split; they were not carried forward/);
+  });
+});
+
 test('resolveAgenticDraft(needs-human-decision): needsClarification, no diff', () => {
   withRealRepo((wt) => {
     const task = { id: 't3' };

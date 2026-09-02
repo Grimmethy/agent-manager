@@ -191,8 +191,8 @@ test('buildVerdictPrompt gives a RESOLUTION: decompose adhoc draft its own carve
   });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
   assert.match(prompt, /DECOMPOSE rather than implement directly/);
-  assert.match(prompt, /do the sub-tasks, together, actually cover everything/);
-  assert.match(prompt, /well-formed JSON array of sub-tasks/);
+  assert.match(prompt, /COVERAGE IS THE MAIN TEST/);
+  assert.match(prompt, /If even one named deliverable is not covered by any sub-task, REJECT/);
   assert.doesNotMatch(prompt, /does it contain real, complete code/i);
 });
 
@@ -213,9 +213,31 @@ test('buildVerdictPrompt gives a candidateSplitProposals draft its own carve-out
   });
   const prompt = buildVerdictPrompt(task, { flags: [] }, '');
   assert.match(prompt, /judged the original candidate too large\/risky/);
-  assert.match(prompt, /do the sub-candidates, together, actually cover/);
-  assert.match(prompt, /well-formed JSON array of sub-candidates/);
+  assert.match(prompt, /COVERAGE IS THE MAIN TEST/);
+  assert.match(prompt, /REJECT if any named deliverable/);
   assert.doesNotMatch(prompt, /does it contain real, complete code/i);
+});
+
+test('buildVerdictPrompt injects the full ORIGINAL REQUEST for a decompose proposal so coverage is checkable', () => {
+  const task = baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'decompose',
+    promptContext: { rawText: 'Add the marketplace backend: (1) a JSON schema, (2) config in app.py, (3) a GET /api/plugins/marketplace endpoint.' },
+    planResponse: '1. do it',
+    implementResponse: 'Too big.\n\n[{"title":"Add the seed file","rawText":"..."},{"title":"Add the test","rawText":"..."}]',
+  });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /ORIGINAL REQUEST \(full text/);
+  assert.match(prompt, /GET \/api\/plugins\/marketplace endpoint/);
+  assert.match(prompt, /the sub-tasks below must TOGETHER cover every concrete deliverable/);
+});
+
+test('buildVerdictPrompt does NOT inject the ORIGINAL REQUEST block for a normal implemented adhoc draft', () => {
+  const task = baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'implemented',
+    promptContext: { rawText: 'change X to Y' },
+    implementResponse: 'done\n=== DIFF ===\ndiff --git a/x b/x\nRESOLUTION: implemented',
+  });
+  assert.doesNotMatch(buildVerdictPrompt(task, { flags: [] }, ''), /ORIGINAL REQUEST \(full text/);
 });
 
 test('buildVerdictPrompt keeps the ordinary manual-source (diff-grounded) carve-out for a normal adhoc task, not the decompose one', () => {
