@@ -140,8 +140,12 @@ test('tailLogErrorSignatures finds nothing in a clean log', () => {
   assert.deepEqual(tailLogErrorSignatures(dir), []);
 });
 
-test('tailLogErrorSignatures returns an empty array, not a throw, when the log dir does not exist', () => {
-  assert.deepEqual(tailLogErrorSignatures('/nonexistent/path/xyz'), []);
+test('tailLogErrorSignatures does not throw when the log dir does not exist -- it reports the unreadable dir as a finding', () => {
+  // An observability fix (2026-09) changed this from a silent empty array to a single
+  // diagnostic finding so an operator sees WHY the log scan produced nothing.
+  const out = tailLogErrorSignatures('/nonexistent/path/xyz');
+  assert.equal(out.length, 1);
+  assert.match(out[0], /unreadable/);
 });
 
 // --- checkPipelineHealth (integration) ------------------------------------------------------
