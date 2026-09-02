@@ -132,10 +132,10 @@ function readModelCallsForTasks(dbPath, ids) {
   const result = new Map();
   if (!ids || !ids.length) return result;
   let DatabaseSync;
-  try { ({ DatabaseSync } = require('node:sqlite')); } catch { return result; }
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch (err) { console.error('[forensic-bundle] readModelCallsForTasks: node:sqlite module unavailable', err); return result; }
   if (!dbPath || !fs.existsSync(dbPath)) return result;
   let db;
-  try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch { return result; }
+  try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch (err) { console.error('[forensic-bundle] readModelCallsForTasks: failed to open database', dbPath, err); return result; }
   try {
     const present = new Set(
       db.prepare(`SELECT name FROM pragma_table_info('model_calls')`).all().map((r) => r.name),
@@ -149,7 +149,8 @@ function readModelCallsForTasks(dbPath, ids) {
       const rows = stmt.all(id);
       if (rows.length) result.set(id, rows);
     }
-  } catch {
+  } catch (err) {
+    console.error('[forensic-bundle] readModelCallsForTasks: query execution failed', dbPath, err);
     return result;
   } finally {
     try { db.close(); } catch { /* ignore */ }
