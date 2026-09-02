@@ -205,11 +205,12 @@ async function ensureGpuHeadroom({
   }
 
   const runningYieldable = statusResult.body.apps.filter((a) => yieldAppIds.includes(a.id) && a.running);
-  const yielded = [];
-  for (const app of runningYieldable) {
-    const stopResult = await fetchJsonFn(`${theAgentUrl}/api/automation/apps/${app.id}/stop`, { method: 'POST' }, 15000);
-    if (stopResult.ok) yielded.push(app.id);
-  }
+  const stopResults = await Promise.all(
+    runningYieldable.map((app) =>
+      fetchJsonFn(`${theAgentUrl}/api/automation/apps/${app.id}/stop`, { method: 'POST' }, 15000).catch(() => null),
+    ),
+  );
+  const yielded = runningYieldable.filter((app, i) => stopResults[i] && stopResults[i].ok).map((app) => app.id);
 
   const acted = [...freed.map((f) => `${f} (/free)`), ...yielded];
   return {
