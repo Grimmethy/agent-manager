@@ -230,6 +230,11 @@ padding:.3rem .7rem;text-align:left}}h1{{font-size:1.3rem}}
     return app
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def add_anthropic_routes(app: FastAPI, eng: Engine, client: httpx.AsyncClient) -> None:
     """Anthropic Messages API support: POST /v1/messages.
 
@@ -243,6 +248,7 @@ def add_anthropic_routes(app: FastAPI, eng: Engine, client: httpx.AsyncClient) -
         try:
             body = await request.json()
         except Exception:
+            logger.warning("proxy adapter: failed to parse request body", exc_info=True)
             return Response(status_code=400)
         upstream = (request.headers.get("x-tokenfold-upstream")
                     or "https://api.anthropic.com/v1").rstrip("/")
