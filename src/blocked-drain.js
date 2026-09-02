@@ -56,7 +56,8 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
       let data;
       try {
         data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      } catch {
+      } catch (err) {
+        console.warn(`[blocked-drain] skipping unreadable or malformed state file: ${filePath} -- ${err.message}`);
         continue; // an unreadable/malformed file is not this drain's problem to fix
       }
       if (!taskMatchesSignature(data, signature)) continue;
