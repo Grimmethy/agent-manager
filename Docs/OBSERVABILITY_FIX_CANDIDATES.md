@@ -2089,3 +2089,26 @@ Inside the `except OSError` block, before calling `_fallback_cache_paths`, emit 
 
 Benefits:
 An operator tailing the dashboard service log can immediately see, at the moment a read-only or permission-restricted project triggers the fallback, exactly which path failed, the OS-level reason, and where the cache actually landed. This turns an invisible, silent redirection into a one-line audit trail, eliminates the "mystery stale cache" debugging class entirely, and costs nothing at runtime on the happy path (the log line is only reached when the primary `mkdir` raises).
+
+### AC-127 · Swallowed subprocess/JSON exception in topology loader hides root cause from operators
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, list) and parsed:
+                value = parsed
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        value = None
+    if value is None:
+        value = _load_topology_fallback()
+```
+
+Problem:
+The `except (subprocess.SubprocessError, json.JSONDecodeError, OSError)` block on line 2815 catches every failure mode of the topology subprocess call and silently assigns `value = None`, then falls through to `_load_topology_fallback()`. No log statement is emitted, so an operator who notices the dashboard is serving stale or fallback topology data has zero diagnostic signal in the logs to distinguish a node crash, a malformed JSON payload, a missing binary, or a permission error. The exception object (with its traceback, stderr output, and specific error class) is discarded entirely.
+
+Solution:
+Inside the `except` clause, before setting `value = None`, emit a `logging.getLogger(__name__).warning("topology subprocess failed; falling back", exc_info=True)` (or equivalently `logger.warning(..., exc_info=True)` using whatever module-level logger the file already defines). This preserves the existing fallback behaviour and the cache-write path unchanged; it only adds the one log line that records the exception type, message, and full traceback so the specific failure (e.g. `CalledProcessError` vs `JSONDecodeError` vs `OSError`) is visible in the application log. No new dependency, no metrics, no rethrow — the caller already handles the `None`-then-fallback contract.
+
+Benefits:
+When the topology subprocess regresses (node version bump, a syntax error in `task-sources.js`, a missing `node` on PATH in a container), the application log immediately shows the exact exception and traceback at the moment the fallback was triggered, turning an hours-long "why is my topology wrong?" investigation into a one-line grep. The fallback path still works identically, so no behavioural change is introduced for callers.
