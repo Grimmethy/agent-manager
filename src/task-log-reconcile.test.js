@@ -62,12 +62,15 @@ test('reconcile does not write anything under --dry-run (state file included)', 
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'task-log-reconcile-state.json')), false);
 });
 
-test('reconcile skips a record with no applied event', () => {
+test('reconcile skips a record with no applied event AND remembers it so later ticks do not re-read it', () => {
   const dir = tmpPipeline();
   const f = writeRec(dir, '', 't5', [{ stage: 'created' }, { stage: 'blocked', detail: 'exhausted' }]);
   const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
   assert.equal(s.resolved, 0);
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.length, 2);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'task-log-reconcile-state.json'), 'utf8'));
+  assert.ok(st.resolvedIds.includes('t5'), 'a never-applied done record is remembered too');
+  assert.equal(reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] }).scanned, 0);
 });
 
 test('reconcile handles a malformed JSON record without throwing', () => {
