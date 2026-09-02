@@ -36,7 +36,12 @@ function truncate(str, max) {
 // -- it costs nothing when no compression proxy is in the path, and is the one thing that
 // actually protects this content when one is.
 function formatFileContents(files) {
-  return (files || []).map((f) => `--- ${f.path} ---\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n');
+  return (files || []).map((f) => {
+    const tag = f.context
+      ? ` ---   (shown for REFERENCE -- the candidate's prose names this file; it is not on the Files: line, so only edit it if the change genuinely requires it)`
+      : '';
+    return `--- ${f.path} ---${tag}\n\`\`\`\n${f.content}\n\`\`\``;
+  }).join('\n\n');
 }
 
 // Shared by every "real code change" source (arch_review, trouble_log, adhoc/manual): the
