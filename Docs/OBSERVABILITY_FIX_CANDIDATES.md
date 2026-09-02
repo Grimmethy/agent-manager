@@ -1836,3 +1836,26 @@ Replace the bare `pass` with a `logger.warning` call that includes the event nam
 
 Benefits:
 Once the fix is in place, any operator or on-call engineer grepping the application log will immediately see which event failed, why (the exception message and traceback via `exc_info`), and when it happened, turning an invisible, permanent data-loss path into a diagnosable, alertable warning. The existing `finally` cleanup still runs, so no temp-file leak is introduced. Because the fix uses only the stdlib `logging` module already imported in the file, it adds no new dependency and no new runtime surface.
+
+### AC-116 · Silent swallow of subprocess failure in `_run_event`
+Strength: Strong
+Files: python/dashboard/model_stats_client.py
+Snippet:
+```
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+```
+
+Problem:
+The `except (OSError, subprocess.SubprocessError): pass` block on line 31 of `_run_event` discards every failure of the Node.js stats-DB invocation with no trace. If `node` is absent from PATH, `MODEL_STATS_DB_JS` points to a missing or renamed file, the script exits non-zero, or the 15-second timeout fires, the caller (`record_call`) receives the same opaque callId as if the write succeeded, and no log line, stderr message, or other artifact records that the event was never persisted. Because the project has no metrics or telemetry system, this `pass` is the *only* place a failure could surface, and it surfaces nowhere.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that captures the exception and enough context to identify the failed event: `logging.warning("model-stats event %r failed: %s", event, exc)`. Add `import logging` at the top of the module (the project already uses the stdlib `logging` module elsewhere). Do not rethrow—`_run_event` is intentionally fire-and-forget and callers do not handle exceptions from it—but do leave a one-line warning so that a missing `node` binary, a stale `MODEL_STATS_DB_JS` path, or a script crash is visible in the application log. The `finally`-block `pass` on `unlink` can remain as-is since a leftover temp file is a minor, self-resolving concern.
+
+Benefits:
+Operators debugging "why are my model-call stats missing for the last hour?" will find a single `WARNING` line naming the event type and the underlying `OSError`/`SubprocessError` (e.g., `[Errno 2] No such file or directory: 'node'`), turning an invisible, unexplained data gap into a one-line log hit. No new dependency, no API change, no behavioral change on the happy path—just the minimum observability that the project's existing `logging` module already provides.
