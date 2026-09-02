@@ -1835,3 +1835,26 @@ Replace the bare `except Exception: continue` with a handler that logs at WARNIN
 
 Benefits:
 An operator can now `grep WARNING` in the log stream and immediately see which items are failing and why, turning a silent output-quality regression into a visible, diagnosable event. The fix is a two-line change (add a `logger.warning(...)` call before `continue`) with zero new dependencies and zero behavioral change to the happy path.
+
+### AC-103 · Silent abstractive-fold failure leaves no trace
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/folding.py
+Snippet:
+```
+                session.folds.append(Fold(start=start, end=end, summary=summary,
+                                          kind="abstractive"))
+                session.save()
+        except Exception:
+            pass                          # extractive fold remains in use
+        finally:
+            self._inflight.discard(key)
+```
+
+Problem:
+The `except Exception: pass` in the abstractive-fold creation path swallows every possible failure (LLM timeout, serialization error, disk-full, permission denied, etc.) and falls back to the extractive fold with zero diagnostic output. Because the fallback is permanent for the lifetime of that session, an operator has no way to discover that the higher-quality summarizer has been silently broken — no log line, no metric, no stderr write — until a user complains that summaries look worse. In a project with no metrics system, the absence of even a single `logger.warning` call means the degradation is completely invisible in every operational surface.
+
+Solution:
+Replace the bare `except Exception: pass` with `except Exception as exc:` followed by `logger.warning("Abstractive fold failed; falling back to extractive fold: %s", exc, exc_info=True)`, using the stdlib `logging` module (add `import logging` and `logger = logging.getLogger(__name__)` at module top if not already present). The `exc_info=True` argument captures the full traceback so the root cause — timeout, schema mismatch, I/O error — is immediately identifiable. The fallback to the extractive fold is preserved; we do not rethrow, because the caller's contract is "return a usable fold" and the extractive fold satisfies that. No new dependency is introduced.
+
+Benefits:
+Once deployed, any abstractive-fold failure produces a timestamped, level-tagged warning with full traceback in whatever log sink the process already writes to (stderr, syslog, file). An operator can grep for "Abstractive fold failed" to confirm whether the LLM endpoint is down, a model was misconfigured, or a serialization regression was introduced — turning a silent, permanent quality drop into a one-line operational signal that can be acted on within minutes rather than discovered days later through user reports.
