@@ -233,8 +233,26 @@ test('resolveAgenticDraft: RESOLUTION: decompose with no sub-task JSON -> retrya
     assert.match(out.blockedReason, /no valid JSON array of \{title, rawText\}/);
     assert.equal(task.retryableDraftBlock, true);
     assert.equal(task.turnBudgetExhausted, false, 'not a turn-budget case');
+    assert.equal(task.decomposeBlockCount, 1, 'counts toward the repeated-decompose backstop');
     assert.ok(!task.subTaskProposals);
     assert.ok(!task.rescopedFromDecompose);
+  });
+});
+
+test('resolveAgenticDraft: decomposeBlockCount accumulates across passes (malformed then re-scope) -> reaches the backstop threshold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2b2' };
+    resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\nno json here' }, worktreeDir: wt,
+    });
+    assert.equal(task.decomposeBlockCount, 1);
+    // reject-retry-check would requeue here (it does NOT reset decomposeBlockCount); next pass:
+    delete task.retryableDraftBlock;
+    resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\n[{"title":"one","rawText":"just one piece"}]\natomic' }, worktreeDir: wt,
+    });
+    assert.equal(task.decomposeBlockCount, 2, 'the local-agentic-write repeated-decompose backstop fires at 2');
+    assert.equal(task.rescopedFromDecompose, true);
   });
 });
 
@@ -250,6 +268,7 @@ test('resolveAgenticDraft: RESOLUTION: decompose into exactly ONE sub-task -> re
     assert.equal(task.retryableDraftBlock, true);
     assert.equal(task.rescopedFromDecompose, true);
     assert.equal(task.rescopedRawText, 'add POST /api/chat/inject to app.py');
+    assert.equal(task.decomposeBlockCount, 1, 'a decompose-to-one also counts toward the backstop');
     assert.ok(!task.subTaskProposals);
   });
 });

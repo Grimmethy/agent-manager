@@ -6,13 +6,17 @@
 // coordinator machinery already consumes (parseSubTaskProposals -> queueSubTasks ->
 // queue/coordinating/ -> coordinator-sweep.js).
 //
-// Two callers:
+// Three callers:
 //   - the PRELIMINARY check (local-draft.js draftAdhocBranch), run after the blind plan
 //     and BEFORE any agentic tier -- catches "this is 5 endpoints + a UI + tests" up front
 //     instead of burning a 35-turn tier-3 pass on it.
 //   - the POST-EXHAUSTION backstop (local-agentic-write-draft.js) -- a rare safety net for
 //     a task the preliminary check judged one-pass but that then blew its whole tier-3
 //     budget without a single edit.
+//   - the REPEATED-DECOMPOSE backstop (local-agentic-write-draft.js) -- the tier-3 model
+//     has answered RESOLUTION: decompose on two separate passes but never produced usable
+//     sub-task JSON. That is the same "too big for this model" signal as an exhausted
+//     budget; do the split for it in one clean call instead of requeueing to escalation.
 
 const { parseSubTaskProposals } = require('./agentic-draft-common.js');
 
@@ -48,10 +52,10 @@ function preliminaryPrompt(task) {
   ].join('\n');
 }
 
-function postExhaustionPrompt(task, priorInvestigation, priorAttempt) {
+function postExhaustionPrompt(task, priorInvestigation, priorAttempt, opener) {
   const ctx = (task && task.promptContext) || {};
   return [
-    'A full implementation attempt just exhausted its entire turn budget without making a single edit. This task IS too large for one pass -- do not second-guess that. Your job is to split it well.',
+    opener || 'A full implementation attempt just exhausted its entire turn budget without making a single edit. This task IS too large for one pass -- do not second-guess that. Your job is to split it well.',
     '',
     'TASK:',
     (ctx.rawText || task.title || '').trim(),
@@ -92,7 +96,9 @@ function extractSubTasks(text) {
   return null;
 }
 
-// task, { mode: 'preliminary' | 'post-exhaustion', call?, claudeCall?, priorAttemptBlock? }
+const REPEATED_DECOMPOSE_OPENER = 'Two separate full implementation attempts on this task both concluded it should be split (they answered RESOLUTION: decompose) but neither produced a usable list of pieces. Take that as settled: this task IS too large / too multi-part for one pass. Your only job now is to split it well.';
+
+// task, { mode: 'preliminary' | 'post-exhaustion' | 'repeated-decompose', call?, claudeCall?, priorAttemptBlock? }
 // call / claudeCall are injectable for tests; default to the real local / claude clients.
 async function runDecomposePass(task, {
   mode = 'preliminary',
@@ -106,10 +112,11 @@ async function runDecomposePass(task, {
     : call;
 
   let prompt;
-  if (mode === 'post-exhaustion') {
+  if (mode === 'post-exhaustion' || mode === 'repeated-decompose') {
     const priorInvestigation = task && typeof task._priorInvestigation === 'string' ? task._priorInvestigation.trim() : '';
     const priorAttempt = typeof priorAttemptBlock === 'string' ? priorAttemptBlock.trim() : '';
-    prompt = postExhaustionPrompt(task, priorInvestigation, priorAttempt);
+    const opener = mode === 'repeated-decompose' ? REPEATED_DECOMPOSE_OPENER : undefined;
+    prompt = postExhaustionPrompt(task, priorInvestigation, priorAttempt, opener);
   } else {
     prompt = preliminaryPrompt(task);
   }
@@ -126,4 +133,4 @@ async function runDecomposePass(task, {
   return extractSubTasks(result && result.response);
 }
 
-module.exports = { runDecomposePass, extractSubTasks, ONE_FILE_RULE };
+module.exports = { runDecomposePass, extractSubTasks, ONE_FILE_RULE, REPEATED_DECOMPOSE_OPENER };
