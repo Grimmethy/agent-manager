@@ -2250,3 +2250,26 @@ Replace the bare `catch { summary.errors += 1; }` with a catch that binds the er
 
 Benefits:
 An operator reading the batch log can immediately identify *which* task file failed, *why* (disk full, permission denied, missing directory), and *which* task was affected, turning an otherwise opaque `errors: N` counter into an actionable diagnostic. The fix costs one line of code, introduces no new dependency, preserves the existing batch-continuation semantics, and aligns with the project's established `console.error` logging convention.
+
+### AC-134 · Log swallowed moveTaskFile errors in auto-confirm batch loop
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+      try {
+        if (moveTaskFile(file, approvedDir, name, task)) summary.confirmed += 1;
+        else summary.errors += 1;
+      } catch { summary.errors += 1; }
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      const reason = voteReason(vote, 'DENY');
+      task.autoConfirmReviewedAt = now;
+```
+
+Problem:
+In the CONFIRM branch of the auto-confirm review loop (lines 288–291), both failure paths of `moveTaskFile` are silently consumed: the `else summary.errors += 1` branch (line 290) discards the falsy return value, and the bare `catch { summary.errors += 1; }` (line 291) discards the thrown error object entirely. Because the project has no metrics or telemetry system, the integer counter in `summary.errors` is the *only* record of what went wrong. An operator inspecting a batch run sees a number (e.g. `errors: 3`) with no file name, no task ID, no OS error code (ENOENT, EACCES, ENOSPC), and no stack trace, making it impossible to distinguish a single transient permission blip from a systemic disk failure without re-running the batch under `strace` or adding ad-hoc instrumentation.
+
+Solution:
+Change the bare `catch` to `catch (err)` and emit a `console.error` call that includes the file path (`file`), the task name (`name`), and the error message plus code (`err.message`, `err.code`). Apply the same treatment to the `else` branch by logging `file`, `name`, and the falsy return value. Keep the `summary.errors += 1` increment in both paths so the tally is preserved, but now each increment is accompanied by a line on stderr that identifies *which* file failed and *why*. Do not rethrow: the loop is intentionally per-item so one bad file must not abort the remaining batch, and no caller above this block can act on a single-file failure.
+
+Benefits:
+An operator running the auto-confirm batch can immediately see, on stderr, exactly which task file failed to move and the underlying OS error (e.g. `EACCES` on a read-only mount vs. `ENOENT` from a concurrent run), turning an opaque integer into an actionable diagnostic. The fix uses only `console.error`, which is already the project's logging primitive, adds no dependency, and preserves the existing batch-continuation semantics.
