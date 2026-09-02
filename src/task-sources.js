@@ -893,6 +893,30 @@ function listSecondBrainTopLevel(secondBrainDir) {
     .sort();
 }
 
+// A flat, capped list of every existing note's basename (no extension), for the classifier
+// to pick relatedNotes from (auto-wikilink on filing, 2026-09-03). Shallow-ish recursive
+// walk, skips dot-dirs and the machine-written report/benchmark trees (noise, never a
+// wikilink target). Best-effort: unreadable dir -> []. Capped for prompt size.
+const EXISTING_NOTE_NAMES_CAP = 200;
+const NOTE_WALK_SKIP = new Set(['Agent Manager Reports', 'AgentManagerReports', 'Model Benchmarks', 'ModelBenchmarks', 'StoryImages', 'node_modules']);
+function listSecondBrainNoteNames(secondBrainDir) {
+  if (!secondBrainDir) return [];
+  const out = [];
+  const walk = (abs, depth) => {
+    if (out.length >= EXISTING_NOTE_NAMES_CAP || depth > 4) return;
+    let entries;
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= EXISTING_NOTE_NAMES_CAP) return;
+      if (e.name.startsWith('.') || NOTE_WALK_SKIP.has(e.name)) continue;
+      if (e.isDirectory()) walk(path.join(abs, e.name), depth + 1);
+      else if (e.name.endsWith('.md')) out.push(e.name.replace(/\.md$/, ''));
+    }
+  };
+  walk(secondBrainDir, 0);
+  return out;
+}
+
 // Registered projects (projects.json, at the package root -- one level up from src/), used
 // so brain_dump_sort can tell the local model which tracked codebases exist. Best-effort: a
 // missing/corrupt registry just yields an empty list, same convention as
@@ -909,6 +933,18 @@ function readProjectLabels() {
   } catch {
     return [];
   }
+}
+
+// A brain-dump entry gets at most this many classification passes. Each recoverable
+// apply-skip / review exhaustion bumps entry.sortAttempt; nextBrainDumpSortTask emits the
+// task under a fresh id (…-aN) so a spent sort task sitting in queue/done/ under the old id
+// no longer buries the entry forever (the {skipped}->done dead-end, confirmed live).
+// Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS.
+const MAX_SORT_ATTEMPTS = 3;
+
+function brainDumpSortTaskId(entry) {
+  const n = entry.sortAttempt || 0;
+  return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
 }
 
 function nextBrainDumpSortTask() {
@@ -934,10 +970,12 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured' && !taskIdExistsInQueue('brain-dump-sort-' + e.id));
+  const chosen = entries.find((e) => e && e.status === 'captured'
+    && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
+    && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
   if (!chosen) return null;
 
-  const taskId = 'brain-dump-sort-' + chosen.id;
+  const taskId = brainDumpSortTaskId(chosen);
 
   return {
     id: taskId,
@@ -948,6 +986,7 @@ function nextBrainDumpSortTask() {
       brainDumpEntryId: chosen.id,
       rawText: chosen.rawText,
       existingStructure: listSecondBrainTopLevel(secondBrainDir),
+      existingNoteNames: listSecondBrainNoteNames(secondBrainDir),
       projectLabels: readProjectLabels(),
       existingQueuedTitles: existingQueuedTaskTitles(pipelineDir),
       // If this package's own source directory is ALSO one of the tracked projects (this
@@ -1275,8 +1314,18 @@ const ADHOC_DECOMPOSE_GUIDANCE = 'This is an adhoc task the drafter chose to DEC
 const ADHOC_DECOMPOSE_COMPLETENESS_QUESTION = 'Enumerate every concrete deliverable in the ORIGINAL REQUEST -- for each, which sub-task delivers it? Is any named deliverable (especially the core change the task is about, not just peripheral files/tests) left uncovered?';
 const ADHOC_NO_CHANGES_GUIDANCE = "This is an adhoc task the drafter resolved as no-changes-needed: it claims the request is ALREADY implemented and proposes no diff. Your job is a COVERAGE check, not a code review. Take the TASK's actual request and list every concrete thing it names -- each UI element, endpoint, data field, file, and observable behavior (e.g. \"tag images NSFW\", \"the NSFW checkbox\", \"hide tagged images\"). For EACH one, confirm it is actually present in the CURRENT code shown above -- \"LIVE current repo content\", the \"REQUEST OBJECTS -- current repo state\" grep block, and the draft's own \"Already covered:\" citations. REJECT if: the draft has no \"Already covered:\" block, or it is missing a line for something the request names, or a cited file:symbol does not actually do what the request asks, or the citation only covers a SUBSET / an EARLIER version / a RELATED-BUT-DIFFERENT surface (a same-named feature acting on a different object -- e.g. an \"NSFW toggle\" that gates prompt DATA when the request is about gallery IMAGES). A base feature existing is NOT the same as the requested EXTENSION existing. Approve only if every named object is genuinely, currently covered.";
 const ADHOC_NO_CHANGES_COMPLETENESS_QUESTION = 'Does the current code (LIVE content + the REQUEST OBJECTS grep block + the draft’s "Already covered:" citations) actually implement EVERY concrete object/endpoint/field/behavior the task names -- or does it only cover a subset, an earlier version, or a related-but-different surface?';
-const BRAIN_DUMP_SORT_REVIEW_GUIDANCE = 'This is a brain-dump CLASSIFICATION task, not a code-change task: the implement draft is a JSON metadata object (category/secondBrainPath/tags/actionable/rationale/belongsToProject) that files a note into a personal vault -- do not reject it for lacking implementation code or for being "just documentation," that was never the ask. secondBrainPath names the note file to create or append to; it commonly does NOT exist yet -- filing something brand new is the normal, most common, correct outcome, so a "missing-file" fact-check flag on secondBrainPath ALONE is expected and is NOT evidence of fabrication (unlike a missing-file flag on a claimed source-code reference elsewhere, which would be). Reject only if: the JSON itself is malformed or missing a required field, category is not one of task/reference/idea/journal/question, secondBrainPath is an obviously wrong or nonsensical destination given what the note is actually about, or belongsToProject names a project that plainly was not among the tracked projects listed in the PLAN above.';
-const BRAIN_DUMP_SORT_COMPLETENESS_QUESTION = 'Does it contain a complete, valid classification JSON (not a bare tool-call request, not meta-commentary, not a truncated/partial JSON fragment)?';
+// brain_dump_sort no longer uses an LLM review (2026-09-03) -- the majority vote was
+// rejecting valid classifications on folder/filename nitpicks its own guidance forbade
+// (8 permanently-blocked tasks, one reject literally quoting the guidance back). It now
+// uses deterministicReview (see the registration below + review-task.js): parse the JSON,
+// run validateSecondBrainPath, check belongsToProject is a real tracked label. That is the
+// whole gate. brainDumpSortReviewValidate wraps reviewBrainDumpSort with the live label list.
+function brainDumpSortReviewValidate(task, { secondBrainDir } = {}) {
+  return require('./brain-dump-sort-classify.js').reviewBrainDumpSort(task, {
+    secondBrainDir,
+    trackedProjectLabels: readProjectLabels(),
+  });
+}
 const DEEP_DIVE_REVIEW_GUIDANCE = 'This is a deep-dive task: reject an item only if it references a file, function, or behavior NOT present in the given community file content above, or if its Rating/Rationale plainly contradicts what the given files actually show. Do NOT reject an item merely because it is rated Ignore -- an honest "considered and does not apply, here is why" is exactly as valid an outcome as a Use or Adapt rating, same as an architecture-discovery task finding zero real issues.';
 const PROJECT_SEARCH_REVIEW_GUIDANCE = 'This is a project-search task: the drafter was told it is correct to report zero findings when none of the real, harness-fetched GitHub/HuggingFace search results were genuinely useful -- do not reject a draft merely for reporting no findings. Only reject an empty result if the draft invents a project/URL not present in the actual search results given to it, or if the search results plainly did contain something usable that the draft ignored.';
 const STALENESS_AUDIT_REVIEW_GUIDANCE = 'This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," it must EARN it, not assert it: either it names a specific commit that implemented the original request (a real hash the fact-check above confirms), OR it shows the current code covers EVERY concrete thing the original task names (each named UI element / endpoint / data field / behavior, with a real file:symbol). REJECT an "archive" that rests on loosely-related code, a same-named feature acting on a different object, or the bare fact that the pipeline could not build the task (fabrication-repeat / retries-exhausted are "stuck," not "resolved") -- reject it the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without a verifiable cited commit or a full per-object coverage match in the real evidence above.';
@@ -1351,7 +1400,7 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // profile existed, since local-draft.js's own call sites unconditionally requested
 // think:true and had no way to know this profile's model couldn't honor it).
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', reviewGuidance: BRAIN_DUMP_SORT_REVIEW_GUIDANCE, reviewCompletenessQuestion: BRAIN_DUMP_SORT_COMPLETENESS_QUESTION, reportClass: 'housekeeping' });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping' });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -2475,7 +2524,8 @@ if (require.main === module) {
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
       return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured'
-        && !taskIdExistsInQueue('brain-dump-sort-' + e.id));
+        && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
+        && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
     } catch {
       return false;
     }

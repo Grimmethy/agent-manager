@@ -66,6 +66,26 @@ function isAdhocTask(task) {
   return task.domain === 'adhoc' || task.source === 'manual';
 }
 
+// On a brain_dump_sort task exhausting its redrafts, bump the originating brain-dump
+// entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
+// (…-aN) instead of the entry being stuck 'captured' forever behind this blocked record.
+// Mirrors stampDeepDiveExhausted's "advance the source's own cursor" role.
+function stampBrainDumpSortExhausted(task, brainDumpPath) {
+  if (task.source !== 'brain_dump_sort') return;
+  const entryId = task.promptContext && task.promptContext.brainDumpEntryId;
+  if (!entryId || !brainDumpPath || !fs.existsSync(brainDumpPath)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const entry = Array.isArray(data.entries) && data.entries.find((e) => e && e.id === entryId);
+    if (entry) {
+      entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+    }
+  } catch (e) {
+    console.warn('[reject-retry-check] brain-dump sortAttempt bump failed:', e.message);
+  }
+}
+
 // The pre-filled question a human sees when an adhoc rejection has burned all its blind
 // redrafts. The commonest cause (confirmed live: the NSFW-images task) is the handler
 // deciding a request to EXTEND an existing feature is already done -- so the question
@@ -87,7 +107,7 @@ function buildExhaustedAdhocQuestion(task) {
   ].join('\n');
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
   const entries = [];
   try {
@@ -175,6 +195,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
         if (alreadyStamped) { summary.exhausted++; continue; }
         stampDeepDiveExhausted(task, deepDiveCoveragePath);
+        stampBrainDumpSortExhausted(task, brainDumpPath);
         // Persist the exhaustion itself onto the task -- previously this branch never
         // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
         // hitting the retry cap carried no record that retries were ever attempted or
@@ -258,14 +279,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
 }
 
 function main() {
-  const { pipelineDir, deepDiveCoveragePath } = getConfig();
+  const { pipelineDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
   const blockedDir = path.join(queueDir, 'blocked');
   const pendingDir = path.join(queueDir, 'pending');
   const adhocDir = path.join(queueDir, 'adhoc');
   const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath });
   process.stdout.write(JSON.stringify(summary));
 }
 

@@ -648,7 +648,7 @@ test('a research task with a real researchDoc proceeds, writes into SecondBrain,
   const task = baseTask({
     domain: 'research', source: 'research_task',
     researchDoc: '# goblinnib\n\nReal findings.',
-    promptContext: { secondBrainPath: 'references/goblinnib.md', brainDumpEntryId: 'bd-1' },
+    promptContext: { secondBrainPath: 'References/goblinnib.md', brainDumpEntryId: 'bd-1' },
   });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
 
@@ -656,7 +656,7 @@ test('a research task with a real researchDoc proceeds, writes into SecondBrain,
   assert.equal(result.needsConfirmation, undefined);
   assert.deepEqual(gitRunner.calls, [], 'research never touches git');
 
-  const noteText = fs.readFileSync(path.join(secondBrainDir, 'references/goblinnib.md'), 'utf8');
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'References/goblinnib.md'), 'utf8');
   assert.match(noteText, /Real findings\./);
 
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
@@ -736,7 +736,7 @@ test('domain brain_dump_sort never touches git -- writes the note and marks the 
     domain: 'brain_dump_sort',
     source: 'brain_dump_sort',
     promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' },
-    implementResponse: JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md', tags: [], actionable: true, rationale: 'r' }),
+    implementResponse: JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/shopping.md', tags: [], actionable: true, rationale: 'r' }),
   });
 
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, secondBrainDir, gitRunner });
@@ -746,7 +746,7 @@ test('domain brain_dump_sort never touches git -- writes the note and marks the 
 
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'sorted');
-  assert.ok(fs.existsSync(path.join(secondBrainDir, 'Errands', 'shopping.md')));
+  assert.ok(fs.existsSync(path.join(secondBrainDir, 'Ideas', 'shopping.md')));
 
   fs.rmSync(scratchDir, { recursive: true, force: true });
 });

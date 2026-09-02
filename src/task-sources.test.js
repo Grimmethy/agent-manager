@@ -336,6 +336,37 @@ test('nextBrainDumpSortTask offers the next-oldest captured entry when the oldes
   assert.equal(task.promptContext.brainDumpEntryId, 'bd-2');
 });
 
+// --- nextBrainDumpSortTask's sortAttempt counter (2026-09-03) --------------------------
+// Fixes the {skipped}->done dead-end: a sort task landing in done/ (or blocked/) under the
+// old brain-dump-sort-<id> used to bury the entry forever. Each recoverable skip / review
+// exhaustion bumps entry.sortAttempt; the next task is emitted under a fresh id.
+
+test('nextBrainDumpSortTask emits the task under a suffixed id once sortAttempt > 0, escaping a stale done/ record', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured', sortAttempt: 1 }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  // The original id sits spent in done/ -- must NOT block the bumped-attempt regeneration.
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, 'brain-dump-sort-bd-1.json'), '{}');
+
+  const task = nextBrainDumpSortTask();
+  assert.ok(task, 'a sortAttempt:1 entry must still be offered under a fresh id');
+  assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  assert.equal(task.promptContext.brainDumpEntryId, 'bd-1');
+});
+
+test('nextBrainDumpSortTask stops offering an entry once sortAttempt hits MAX_SORT_ATTEMPTS (3)', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
+    entries: [{ id: 'bd-1', rawText: 'x', status: 'captured', sortAttempt: 3 }],
+  }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+  assert.equal(nextBrainDumpSortTask(), null);
+});
+
 // --- nextBrainDumpSortTask's selfProjectLabel (2026-08-16) ------------------------------
 // Confirmed live: a real self-referential note ("brain dump entries should track an
 // interaction count") was classified actionable:false, belongsToProject:null despite

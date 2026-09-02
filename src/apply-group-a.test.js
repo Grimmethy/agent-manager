@@ -254,11 +254,11 @@ function writeBrainDump(dir, entries) {
 
 test('parseBrainDumpSortResult parses a well-formed classification object', () => {
   const result = parseBrainDumpSortResult(JSON.stringify({
-    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
+    category: 'task', secondBrainPath: 'Ideas/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
   }));
   assert.deepEqual(result, {
-    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
-    belongsToProject: null, requiresResearch: false, possibleDuplicateOf: null,
+    secondBrainPath: 'Ideas/shopping.md', tags: ['groceries'], actionable: true, rationale: 'r',
+    belongsToProject: null, requiresResearch: false, possibleDuplicateOf: null, relatedNotes: [],
   });
 });
 
@@ -272,14 +272,13 @@ test('parseBrainDumpSortResult parses a classification wrapped in a ```json fenc
   }) + '\n```';
   const result = parseBrainDumpSortResult(fenced);
   assert.ok(result, 'expected a parsed classification, got null');
-  assert.equal(result.category, 'task');
   assert.equal(result.secondBrainPath, 'Agent Manager/app-job-status.md');
   assert.equal(result.belongsToProject, 'agent-manager');
 });
 
 test('parseBrainDumpSortResult parses a belongsToProject value when present', () => {
   const result = parseBrainDumpSortResult(JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: 'agent-manager',
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'agent-manager',
   }));
   assert.equal(result.belongsToProject, 'agent-manager');
 });
@@ -299,7 +298,7 @@ test('parseBrainDumpSortResult defaults tags/actionable/rationale when absent', 
 // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before filing")
 test('parseBrainDumpSortResult parses a possibleDuplicateOf value when present', () => {
   const result = parseBrainDumpSortResult(JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', possibleDuplicateOf: 'Add authentication to the Agent Manager dashboard',
+    category: 'task', secondBrainPath: 'Ideas/x.md', possibleDuplicateOf: 'Add authentication to the Agent Manager dashboard',
   }));
   assert.equal(result.possibleDuplicateOf, 'Add authentication to the Agent Manager dashboard');
 });
@@ -314,9 +313,11 @@ test('parseBrainDumpSortResult returns null for unparseable JSON', () => {
   assert.equal(parseBrainDumpSortResult(''), null);
 });
 
-test('parseBrainDumpSortResult returns null when category or secondBrainPath is missing', () => {
-  assert.equal(parseBrainDumpSortResult(JSON.stringify({ secondBrainPath: 'x.md' })), null);
+test('parseBrainDumpSortResult returns null when secondBrainPath is missing (category is no longer required)', () => {
   assert.equal(parseBrainDumpSortResult(JSON.stringify({ category: 'idea' })), null);
+  assert.equal(parseBrainDumpSortResult(JSON.stringify({ tags: ['x'] })), null);
+  // category absent is fine as long as secondBrainPath is there
+  assert.ok(parseBrainDumpSortResult(JSON.stringify({ secondBrainPath: 'Ideas/x.md' })));
 });
 
 test('parseBrainDumpSortResult returns null for a JSON array (not the expected object shape)', () => {
@@ -330,13 +331,12 @@ test('applyBrainDumpSort files the entry, appends a dated line, and marks it sor
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'Errands/shopping.md', tags: ['groceries'], actionable: true, rationale: 'a grocery run',
+    category: 'task', secondBrainPath: 'Ideas/shopping.md', tags: ['groceries'], actionable: true, rationale: 'a grocery run',
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
 
-  assert.equal(result.category, 'task');
-  assert.equal(result.file, path.join(secondBrainDir, 'Errands', 'shopping.md'));
+  assert.equal(result.file, path.join(secondBrainDir, 'Ideas', 'shopping.md'));
 
   const noteText = fs.readFileSync(result.file, 'utf8');
   assert.match(noteText, /Buy milk/);
@@ -344,23 +344,22 @@ test('applyBrainDumpSort files the entry, appends a dated line, and marks it sor
 
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'sorted');
-  assert.equal(entries[0].sort.category, 'task');
-  assert.equal(entries[0].sort.secondBrainPath, 'Errands/shopping.md');
+  assert.equal(entries[0].sort.secondBrainPath, 'Ideas/shopping.md');
   assert.ok(entries[0].sortedAt);
 });
 
 test('applyBrainDumpSort appends to an EXISTING note instead of overwriting it', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
-  fs.mkdirSync(path.join(secondBrainDir, 'Errands'), { recursive: true });
-  fs.writeFileSync(path.join(secondBrainDir, 'Errands', 'shopping.md'), '# Shopping\n\n- existing item\n');
+  fs.mkdirSync(path.join(secondBrainDir, 'Ideas'), { recursive: true });
+  fs.writeFileSync(path.join(secondBrainDir, 'Ideas', 'shopping.md'), '# Shopping\n\n- existing item\n');
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
-  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/shopping.md' });
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
 
-  const noteText = fs.readFileSync(path.join(secondBrainDir, 'Errands', 'shopping.md'), 'utf8');
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'Ideas', 'shopping.md'), 'utf8');
   assert.match(noteText, /existing item/); // original content preserved
   assert.match(noteText, /Buy milk/); // new line appended
 });
@@ -385,7 +384,7 @@ test('applyBrainDumpSort skips cleanly when the entry no longer exists (deleted 
   const brainDumpPath = writeBrainDump(dir, []); // entry already gone
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
-  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/shopping.md' });
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
 
   assert.equal(result.skipped, true);
@@ -413,7 +412,7 @@ test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured',
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
-  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Errands/shopping.md' });
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/shopping.md' });
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: null });
 
   assert.equal(result.skipped, true);
@@ -430,7 +429,7 @@ test('applyBrainDumpSort queues a research task and marks the entry actioned whe
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'investigate goblinnib.com for our own characters' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'references/goblinnib.md', tags: ['research'], actionable: true, requiresResearch: true,
+    category: 'task', secondBrainPath: 'References/goblinnib.md', tags: ['research'], actionable: true, requiresResearch: true,
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
@@ -443,14 +442,14 @@ test('applyBrainDumpSort queues a research task and marks the entry actioned whe
   const queued = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'research', researchFiles[0]), 'utf8'));
   assert.equal(queued.domain, 'research');
   assert.equal(queued.source, 'research_task');
-  assert.equal(queued.promptContext.secondBrainPath, 'references/goblinnib.md');
+  assert.equal(queued.promptContext.secondBrainPath, 'References/goblinnib.md');
 
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'actioned');
   assert.equal(entries[0].queuedTaskId, result.queuedTaskId);
 
   // Audit-trail cross-reference line, same convention as the adhoc branch.
-  const noteText = fs.readFileSync(path.join(secondBrainDir, 'references/goblinnib.md'), 'utf8');
+  const noteText = fs.readFileSync(path.join(secondBrainDir, 'References/goblinnib.md'), 'utf8');
   assert.match(noteText, /Queued as research task/);
 });
 
@@ -461,7 +460,7 @@ test('applyBrainDumpSort skips cleanly (does not throw) when requiresResearch is
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'investigate X' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', requiresResearch: true,
+    category: 'task', secondBrainPath: 'Ideas/x.md', requiresResearch: true,
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
@@ -476,7 +475,7 @@ test('applyBrainDumpSort does NOT queue a research task when requiresResearch is
 
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
   const implementResponse = JSON.stringify({
-    category: 'reference', secondBrainPath: 'x.md', requiresResearch: false,
+    category: 'reference', secondBrainPath: 'Ideas/x.md', requiresResearch: false,
   });
 
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
@@ -491,12 +490,12 @@ test('applyResearchTask files the write-up under a dated heading at the chosen s
   const secondBrainDir = path.join(dir, 'secondbrain');
   const task = {
     researchDoc: '# goblinnib\n\nReal findings here.',
-    promptContext: { secondBrainPath: 'references/goblinnib.md' },
+    promptContext: { secondBrainPath: 'References/goblinnib.md' },
   };
 
   const result = applyResearchTask({ task, secondBrainDir });
 
-  assert.equal(result.file, path.join(secondBrainDir, 'references/goblinnib.md'));
+  assert.equal(result.file, path.join(secondBrainDir, 'References/goblinnib.md'));
   const noteText = fs.readFileSync(result.file, 'utf8');
   assert.match(noteText, /Real findings here\./);
   assert.match(noteText, /## Research --/);
@@ -504,7 +503,7 @@ test('applyResearchTask files the write-up under a dated heading at the chosen s
 
 test('applyResearchTask skips cleanly when researchDoc is empty', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-research-task-test-'));
-  const result = applyResearchTask({ task: { researchDoc: '', promptContext: { secondBrainPath: 'x.md' } }, secondBrainDir: path.join(dir, 'sb') });
+  const result = applyResearchTask({ task: { researchDoc: '', promptContext: { secondBrainPath: 'Ideas/x.md' } }, secondBrainDir: path.join(dir, 'sb') });
   assert.equal(result.skipped, true);
 });
 
@@ -515,7 +514,7 @@ test('applyResearchTask skips cleanly when promptContext has no secondBrainPath'
 });
 
 test('applyResearchTask skips cleanly when secondBrainDir is not configured', () => {
-  const result = applyResearchTask({ task: { researchDoc: 'content', promptContext: { secondBrainPath: 'x.md' } }, secondBrainDir: null });
+  const result = applyResearchTask({ task: { researchDoc: 'content', promptContext: { secondBrainPath: 'Ideas/x.md' } }, secondBrainDir: null });
   assert.equal(result.skipped, true);
 });
 
@@ -558,7 +557,7 @@ test('applyBrainDumpSort injects prefetchedPaths and queues to adhoc/ on an unam
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
@@ -588,7 +587,7 @@ test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the clas
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
     possibleDuplicateOf: 'Fix the budget guard rounding bug',
   });
 
@@ -620,7 +619,7 @@ test('applyBrainDumpSort writes NOTHING to secondBrainDir when a project matches
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
@@ -638,7 +637,7 @@ test('applyBrainDumpSort still writes to secondBrainDir for a plain note with no
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Just a journal note' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Just a journal note' } };
   const implementResponse = JSON.stringify({
-    category: 'journal', secondBrainPath: 'journal/personal-reflections.md', actionable: false, belongsToProject: null,
+    category: 'journal', secondBrainPath: 'Journal/personal-reflections.md', actionable: false, belongsToProject: null,
   });
 
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
@@ -655,7 +654,7 @@ test('applyBrainDumpSort routes to queue/needs-clarification/ (not adhoc/) when 
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Totally unrelated topic entirely' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Totally unrelated topic entirely' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
@@ -682,7 +681,7 @@ test('applyBrainDumpSort routes to queue/needs-clarification/ with candidates wh
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix the auth bug' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix the auth bug' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
@@ -702,7 +701,7 @@ test('applyBrainDumpSort queues to adhoc/ normally (no prefetchedPaths, not held
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Build a brand new feature from scratch' })]);
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Build a brand new feature from scratch' } };
   const implementResponse = JSON.stringify({
-    category: 'task', secondBrainPath: 'x.md', actionable: true, belongsToProject: label,
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
@@ -713,6 +712,69 @@ test('applyBrainDumpSort queues to adhoc/ normally (no prefetchedPaths, not held
   const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', adhocFiles[0]), 'utf8'));
   assert.equal(written.promptContext.prefetchedPaths, undefined);
   assert.equal(written.needsClarification, undefined);
+});
+
+// --- applyBrainDumpSort: always-route-to-task + recoverable-skip dead-end fix (2026-09-03) ---
+
+test('applyBrainDumpSort recovers belongsToProject for a self-referential note and queues a task -- no vault note written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-selfref-'));
+  const { pipelineDir, label } = setupMatchedProjectFixture(dir);
+  const secondBrainDir = path.join(dir, 'sb');
+  const rawText = 'The pipeline should persist a per-attempt record of every draft try';
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText })]);
+  // Classifier left belongsToProject null + actionable false -- the dominant blocked-backlog failure.
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText, selfProjectLabel: label, projectLabels: [label] } };
+  const implementResponse = JSON.stringify({ secondBrainPath: 'Ideas/x.md', actionable: false, belongsToProject: null });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.queuedProject, label);
+  assert.equal(fs.existsSync(secondBrainDir), false, 'a recovered project note becomes a task, never a passive vault note');
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'actioned');
+});
+
+test('applyBrainDumpSort bumps sortAttempt on a recoverable skip (bad path) so the entry regenerates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-recover-'));
+  const secondBrainDir = path.join(dir, 'sb');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ secondBrainPath: 'NotAFolder/x.md', actionable: false });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].sortAttempt, 1);
+  assert.equal(entries[0].status, 'captured');
+});
+
+test('applyBrainDumpSort does NOT bump sortAttempt on a terminal skip (entry gone)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-terminal-'));
+  const brainDumpPath = writeBrainDump(dir, []);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'x' } };
+  const result = applyBrainDumpSort({ implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md' }), task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, undefined);
+});
+
+test('applyBrainDumpSort appends [[wikilinks]] for resolved relatedNotes and drops unresolved ones', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-wiki-'));
+  const secondBrainDir = path.join(dir, 'sb');
+  fs.mkdirSync(path.join(secondBrainDir, 'References'), { recursive: true });
+  fs.writeFileSync(path.join(secondBrainDir, 'References', 'moe-token-output.md'), '# moe-token-output\n');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'follow-up on MoE throughput' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'follow-up on MoE throughput' } };
+  const implementResponse = JSON.stringify({
+    secondBrainPath: 'References/moe-followup.md', tags: ['moe'], actionable: false,
+    relatedNotes: ['moe-token-output', 'ghost-note-that-does-not-exist'],
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+  const noteText = fs.readFileSync(result.file, 'utf8');
+  assert.match(noteText, /-- see \[\[moe-token-output\]\]/);
+  assert.doesNotMatch(noteText, /ghost-note/);
 });
 
 test('applyVerdictOnly always returns {skipped: true} with the verdict prose as reason', () => {
