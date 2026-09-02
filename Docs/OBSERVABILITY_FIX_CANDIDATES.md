@@ -2181,3 +2181,26 @@ Capture the exception in the `except` clause (`except (OSError, json.JSONDecodeE
 
 Benefits:
 An operator watching the dashboard's log output can immediately identify the exact file path and the specific failure mode (e.g. `JSONDecodeError: Expecting ',' delimiter: line 1 column 412 (char 411)` versus `PermissionError: [Errno 13] Permission denied: '/data/qdir/drafting/abc.json'`), distinguish a transient mid-write race from a persistent corrupt artifact, and act on it (delete the file, fix permissions, investigate the writer) without needing to shell into the host and manually `cat` every file in the drafting directory. The `/api/pipeline-map` response is unchanged, so no client-side contract is affected.
+
+### AC-131 · Silent catch blocks in best-effort worktree pre-cleanup
+Strength: Strong
+Files: src/agentic-draft-common.js
+Snippet:
+```
+
+  try {
+    runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], resolvedRepoRoot);
+  } catch (e) {
+    return { ok: false, reason: `could not create adhoc scratch worktree: ${e.message}` };
+  }
+  return { ok: true };
+```
+
+Problem:
+The three best-effort cleanup calls at lines 122–124 (`worktree remove --force`, `fs.rmSync`, `branch -D`) each swallow their error in a bare `catch (e) { /* comment */ }` with no logging. The comments describe the *expected* no-op case, but they cannot distinguish that from an unexpected failure (permission denied on a subdirectory, git index corruption, disk full). The sibling function `cleanupAdhocWorktree` (lines 133–135) performs the identical two operations and *does* log via `console.warn('cleanupAdhocWorktree: failed to remove worktree', worktreeDir, e.message)`, so the project already has a pattern for exactly this situation. The create-path silently drops the diagnostic, meaning a genuinely broken pre-cleanup is invisible until (and unless) the subsequent `worktree add` fails, and even then the root cause in the cleanup step is lost.
+
+Solution:
+Replace the three empty catch bodies at lines 122–124 with `console.warn` calls that mirror the style already used in `cleanupAdhocWorktree`. Concretely: `catch (e) { console.warn('createAdhocWorktree: pre-cleanup worktree remove failed', worktreeDir, e.message); }`, `catch (e) { console.warn('createAdhocWorktree: pre-cleanup fs.rmSync failed', worktreeDir, e.message); }`, and `catch (e) { console.warn('createAdhocWorktree: pre-cleanup branch -D failed', branchName, e.message); }`. Keep the best-effort semantics intact—do not rethrow, do not return an error object—because the next `worktree add` will surface a hard failure if the resource truly could not be cleaned. No new dependency, no metric, no rethrow; only the `console.warn` primitive the file already uses.
+
+Benefits:
+An operator debugging a flaky "could not create adhoc scratch worktree" error now sees, in the same log stream, whether the pre-cleanup step hit an unexpected error (permissions, corruption) versus the normal "nothing to remove" case. The create-path and the cleanup-path become consistent in their observability, eliminating a class of silent-failure bugs where a broken pre-cleanup masks itself behind a downstream `worktree add` error that points at the wrong root cause.
