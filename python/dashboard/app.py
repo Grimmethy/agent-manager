@@ -2942,6 +2942,7 @@ def available_candidate_counts() -> dict:
         try:
             text = doc_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            logger.exception("Backlog source %r failed during aggregation", name)
             continue
         entries = parse_arch_candidates(text)
         counts[name] = sum(
