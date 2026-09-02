@@ -2135,3 +2135,26 @@ Replace the bare `pass` with a `logging.warning` call that includes the branch n
 
 Benefits:
 Any future incident where a remote branch lingers after a merge can be diagnosed from the application log in seconds instead of requiring a reproduction or a code-reading session. The warning-level log is visible in default log configurations without being alarming, and the branch/repo context makes it trivial to correlate with the surrounding `push origin main` success line. No behavioural change: the merge still succeeds, the response still reports success, and the caller's control flow is untouched.
+
+### AC-129 · Log the exception when a queue-state JSON file fails to parse or read
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        for f in state_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                bump(None, state)
+                continue
+            bump(_resolve_source_name(data), state)
+```
+
+Problem:
+In the enumeration loop over `state_dir.glob("*.json")` (lines 5819-5824), the `except (OSError, json.JSONDecodeError)` handler calls `bump(None, state)` and `continue`s, discarding the exception object entirely. The file is silently attributed to the `"(unknown)"` source bucket, so the dashboard total remains correct, but the operator receives zero diagnostic signal distinguishing a legitimately source-less item from a truncated write, a disk-full `OSError`, or a corrupt JSON payload. If a crash or I/O fault affects dozens of files, they all pile into `"(unknown)"` with no log line, no stderr write, and no re-raise—making the underlying problem invisible in any log stream.
+
+Solution:
+Add a single `logging.warning` call inside the existing `except` block, before the `bump(None, state)` line, that records the file path and the exception. Concretely, change the handler to `except (OSError, json.JSONDecodeError) as exc:` and insert `logger.warning("Skipping unreadable queue file %s: %s", f, exc)` immediately after the `except` line. The module already imports `logging` and defines a module-level `logger = logging.getLogger(__name__)` (or add those two lines at the top of `app.py` if they are not yet present). No new dependency, no metrics emission, no change to the `bump`/`continue` control flow—just one line that surfaces the file identity and the concrete error to whatever log sink the process already writes to.
+
+Benefits:
+An operator watching the log stream can immediately see which file failed and why (e.g., `OSError: [Errno 28] No space left on device` vs. `JSONDecodeError: Expecting value: line 1 column 1`), turning a silent accumulation in the `"(unknown)"` bucket into an actionable alert. The dashboard numbers remain unchanged; the fix only adds diagnostic context at the point of failure, so no caller contract or queue-state semantics are altered.
