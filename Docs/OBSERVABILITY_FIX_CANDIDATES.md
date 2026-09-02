@@ -1858,3 +1858,26 @@ Replace the bare `except Exception: pass` with `except Exception as exc:` follow
 
 Benefits:
 Once deployed, any abstractive-fold failure produces a timestamped, level-tagged warning with full traceback in whatever log sink the process already writes to (stderr, syslog, file). An operator can grep for "Abstractive fold failed" to confirm whether the LLM endpoint is down, a model was misconfigured, or a serialization regression was introduced — turning a silent, permanent quality drop into a one-line operational signal that can be acted on within minutes rather than discovered days later through user reports.
+
+### AC-104 · Silent exception swallow in best-effort mint call
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/engine.py
+Snippet:
+```
+            self._since_mint[mint_key] = 0
+            try:
+                enc.dict.mint()
+            except Exception:
+                pass
+        if cache_key and not report.fallback:
+            self.metrics.cache_put(cache_key, json.dumps(out, ensure_ascii=False),
+```
+
+Problem:
+The `try/except Exception: pass` around `enc.dict.mint()` discards every possible failure — schema drift, a missing key, a library-upgrade contract change — with zero diagnostic output. Because the surrounding logic is explicitly best-effort (the `self._since_mint[mint_key]` reset and the cache-put that follow both execute unconditionally), the caller cannot detect that the mint never happened. In a project with no metrics or telemetry system, a log line is the only channel through which this failure can surface, and right now that channel is empty. The sole symptom would be a subtle downstream behavioral difference (mints never advancing) that could take days to attribute to this single swallowed exception.
+
+Solution:
+Replace the bare `except Exception: pass` with a `logging.getLogger(__name__).warning("tokenfold mint failed for key %r: %s", mint_key, exc, exc_info=True)` (catching as `except Exception as exc`). This emits a single warning-level log line that includes the `mint_key` for identification, the exception type and message, and a full stack trace via `exc_info=True`, so an operator grepping the log can immediately see *which* mint failed, *why*, and *where*. Do not rethrow: the caller is designed to continue (the cache-put and `since_mint` reset are unconditional), so propagating the exception would change the control flow and break the best-effort contract. Add `import logging` at the top of the module if it is not already present. Note the vendored-code caveat: this patch is a stopgap; the canonical fix should be filed upstream in `tokenfold` so the next vendor sync does not clobber it.
+
+Benefits:
+Once fixed, any future regression in `enc.dict.mint()` — whether from a schema change, a missing encoding key, or a library upgrade that alters the `mint()` contract — produces an immediately visible, greppable log line with full context (key, exception, traceback) at the moment of failure. An operator or on-call engineer can diagnose the root cause in minutes rather than days of correlating downstream symptoms. The fix adds no new dependency, changes no control flow, and preserves the existing best-effort semantics while closing the only observability gap this project has for this code path.
