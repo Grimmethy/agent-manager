@@ -1789,3 +1789,26 @@ Replace the bare `pass` with a single `logging.warning` call that includes the e
 
 Benefits:
 Once the warning is emitted, any operator or developer tailing the agent-manager log immediately sees that a config file was attempted, what went wrong (e.g. `JSONDecodeError: Expecting value: line 3 column 12`), and that defaults were substituted. This converts an hour-long "why is my config ignored?" investigation into a one-line log grep. The graceful-degradation contract is preserved—no caller sees a new exception—so the fix is strictly additive in observability with zero behavioural risk.
+
+### AC-101 · Silent exception swallow in dictionary parser hides parse failures from operators
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/dictionary.py
+Snippet:
+```
+                self.aliases = {c: Alias(**a) for c, a in raw.get("aliases", {}).items()}
+                self.generations = [Generation(**g) for g in raw.get("generations", [])]
+                self.nursery = raw.get("nursery", {})
+            except Exception:
+                # corrupt dictionary must never block traffic
+                self.aliases, self.generations, self.nursery = {}, [], {}
+
+```
+
+Problem:
+The `except Exception:` block around line 71 in `dictionary.py` catches any failure while parsing a dictionary file (bad JSON, wrong schema, missing key, etc.) and silently assigns empty fallbacks (`{}`, `[]`, `{}`) for aliases, generations, and nursery. There is no `logging.error`, no `print`, no `sys.stderr.write`—the comment explains *why* the exception is not re-raised, but the operator receives zero signal that a dictionary actually failed to load. In production this manifests as "aliases are suddenly empty" with no log line anywhere to identify which dictionary, what the underlying error was, or when it started, turning a one-line config or file-corruption issue into a multi-hour investigation.
+
+Solution:
+Add `import logging` at the top of the file if it is not already present (the project's Python code uses the stdlib `logging` module; no third-party logger is in the dependency set). Inside the existing `except Exception:` block, before the fallback assignment, emit a single `logging.error("Failed to parse dictionary %r; falling back to empty aliases/generations/nursery.", getattr(self, "name", "<unknown>"), exc_info=True)` call. `exc_info=True` captures the full traceback so the operator can see the exact parse failure (JSONDecodeError, KeyError, TypeError, etc.). The dictionary's identifying name is included so that when multiple dictionaries are loaded, the operator can tell which one failed. The fail-open contract is preserved: the exception is still not re-raised, and the fallback values (`{}`, `[]`, `{}`) remain unchanged. No metric, counter, or gauge is added because the project has no metrics system.
+
+Benefits:
+Once the log line is in place, a dictionary parse failure produces an immediate, greppable log entry with the dictionary name, a human-readable summary, and the full traceback. An operator (or an on-call engineer) can go from "aliases are empty" to "dictionary 'foo' failed at line 12 with a JSONDecodeError" in seconds instead of hours. The fail-open behavior is unchanged—traffic is never blocked—so the fix adds observability without altering runtime semantics or introducing any new dependency.
