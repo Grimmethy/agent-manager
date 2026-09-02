@@ -3071,8 +3071,8 @@ def api_discovery():
             result["candidates"] = parse_arch_candidates(text)
             result["candidatesPath"] = str(cand_file)
             result["available"] = True
-        except OSError:
-            pass  # doc unreadable -- tab still renders coverage/tasks
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Failed to load arch candidates from %s: %s", cand_file, exc, exc_info=exc)
 
     return jsonify(result)
 
