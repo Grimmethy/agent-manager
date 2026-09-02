@@ -94,7 +94,12 @@ function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog, finalMessage } 
     const p = worklogPath(task.id, pipelineDir);
 
     let doc;
-    try { doc = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { doc = null; }
+    try { doc = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.warn(`[work-log] failed to read prior worklog for task ${task.id} at ${p}: ${err.message}; starting a fresh document`);
+      }
+      doc = null;
+    }
     if (!doc || typeof doc !== 'object' || !Array.isArray(doc.tiers)) doc = { taskId: task.id, tiers: [] };
     doc.taskId = task.id;
     doc.updatedAt = new Date().toISOString();
