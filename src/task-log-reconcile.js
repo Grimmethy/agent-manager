@@ -26,7 +26,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { resolveDisposition, buildShipContext, TERMINAL_STAGES } = require('./task-disposition.js');
+const { resolveDisposition, buildShipContext, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
@@ -116,10 +116,13 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
       continue;
     }
     if (!outcome) {
-      // Already carries a stable terminal event, or was never applied -- remember it so we
-      // don't re-read it every tick.
+      // Stable states that need no further work: already carries a non-pending terminal
+      // event, OR the record was never applied at all (a blocked / needs-clarification task
+      // that reached done/). Remember either so it is not re-read every tick -- without this
+      // the ~2000 never-applied done records get a full readdir+parse pass forever.
       const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
-      if (tail && TERMINAL_STAGES.has(tail.stage) && tail.stage !== 'pending-merge') {
+      const closed = tail && TERMINAL_STAGES.has(tail.stage) && tail.stage !== 'pending-merge';
+      if (closed || !lastAppliedEvent(record.history)) {
         state.resolvedIds.add(id); state.pendingIds.delete(id);
       }
       continue;
