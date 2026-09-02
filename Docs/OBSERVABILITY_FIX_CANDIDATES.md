@@ -2065,3 +2065,26 @@ Replace the bare `pass` with a `logging.warning` call that records the exception
 
 Benefits:
 An operator tailing application logs can now see, at the moment of failure, exactly which upstream URL returned unparseable JSON on the retry attempt, the full traceback, and the timestamp—turning an otherwise invisible silent skip into a diagnosable event. The fallback-to-prior-`obj` behavior is preserved unchanged, so no caller contract is altered. Because the log line includes the URL and the `exc_info` traceback, a future regression (e.g., upstream switching to a different content-type) is caught in the first occurrence rather than discovered days later as a confusing downstream `AttributeError`.
+
+### AC-113 · Silent exception swallow in folding merge-and-save path
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/folding.py
+Snippet:
+```
+                if len(cur.digest_entries) >= len(session.digest_entries):
+                    cur.digest_entries = fresh + cur.digest_entries[len(old):]
+                    cur.save()
+        except Exception:
+            pass
+        finally:
+            self._inflight.discard(key)
+```
+
+Problem:
+The `except Exception: pass` block at line 156 discards every possible failure in the merge-and-save path—`cur.save()` hitting a locked file, a `TypeError` from a shape mismatch between `fresh` and `cur.digest_entries`, a `PermissionError` on write—leaving the operator with zero signal. Because the `finally` block unconditionally discards the inflight key, the caller sees a clean return and the session continues with stale or partially-updated digest entries. Over time this degrades silently and is extremely hard to diagnose: no log line, no counter, nothing indicates that folding has been failing on every call.
+
+Solution:
+Add `import logging` at the top of the file and a module-level `_logger = logging.getLogger(__name__)` (the file currently has neither, so the import must be added explicitly). In the `except Exception` block, replace the bare `pass` with `_logger.warning("tokenfold merge-and-save failed for key=%s", key, exc_info=True)`. This preserves the existing best-effort, non-fatal semantics exactly: the exception is still caught and not re-raised, the `finally: self._inflight.discard(key)` still executes, and the caller's control flow is unchanged. The only addition is a single diagnostic log line carrying the session key and full traceback so an operator can identify which key is failing and why.
+
+Benefits:
+An operator now sees a `WARNING`-level log line with the offending key and a full traceback every time the fold/save path fails, turning an invisible, accumulating silent degradation into an immediately observable and debuggable event. The best-effort contract is preserved—no caller crash, no changed return value—so no downstream code needs modification. The fix uses only the Python stdlib `logging` module already sanctioned by the project's dependency manifest and introduces no new dependency, metric, or telemetry primitive.
