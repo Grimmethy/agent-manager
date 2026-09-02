@@ -2568,6 +2568,11 @@ def api_task_mark_done_clarification(task_id):
     return jsonify({"id": task_id, "done": True})
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 @app.route("/api/task/approved/<task_id>/apply", methods=["POST"])
 def api_task_apply(task_id):
     """Manual per-task apply (three-tier approval mode, 2026-07-26): the missing piece that
@@ -2599,8 +2604,13 @@ def api_task_apply(task_id):
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), "-TaskId", task_id],
             capture_output=True, text=True, timeout=300, env=child_env, cwd=str(PACKAGE_ROOT),
         )
-    except subprocess.TimeoutExpired:
-        return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 -TaskId did not finish within 300s (still may complete -- check the Done/Blocked tabs)"}), 504
+    except subprocess.TimeoutExpired as e:
+        logger.error(
+            "apply-runner.ps1 -TaskId %s timed out (script: %s): %s: %s",
+            task_id, str(script_path), type(e).__name__, str(e),
+            exc_info=True,
+        )
+        raise
 
     output_tail = (result.stdout or "")[-4000:]
     if result.returncode == 2:
