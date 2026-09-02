@@ -1743,3 +1743,26 @@ Import the stdlib `logging` module at the top of the file (it is already an avai
 
 Benefits:
 Once the warning is in place, the first request that hits a decoder regression produces an immediately visible, greppable log line with the full traceback, the offending session ID, and the scope header. An operator (or a log-shipping pipeline, if one is added later) can detect the silent-degradation window within seconds of the first affected request rather than waiting for a downstream consumer to file a bug. The fix is a two-line change, introduces no new dependency, preserves the existing fallback semantics, and is consistent with the project's existing use of the stdlib `logging` module in other Python files.
+
+### AC-99 · Log swallowed exception before returning 400 in proxy adapter
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/proxy.py
+Snippet:
+```
+    async def anthropic_messages(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return Response(status_code=400)
+        upstream = (request.headers.get("x-tokenfold-upstream")
+                    or "https://api.anthropic.com/v1").rstrip("/")
+```
+
+Problem:
+The `except` block that handles a malformed or unparseable request body returns `Response(status_code=400)` to the caller but performs no server-side logging. Because the project has no metrics or telemetry stack, the stdlib `logging` module is the only observability primitive available, and this code path emits nothing to it. In production, if a client sends a truncated body, a transparent proxy strips the `Content-Type` header, or an unexpected internal error is caught by the same broad `except`, the 400 is indistinguishable from a legitimate client error in any log output. Operators have no line to grep, no timestamp, no exception type or message, and no way to confirm the adapter actually hit the error path versus the request never arriving.
+
+Solution:
+At the top of the `except` block, before the `return Response(status_code=400, ...)` line, add a `logger.warning("proxy adapter: failed to parse request body", exc_info=True)` call (or `logger.error` if the project's existing log level convention in that file uses ERROR for caught-and-handled exceptions). The `exc_info=True` kwarg causes the stdlib logging module to attach the full traceback to the log record, giving operators the exception class, message, and stack frames. If the file already defines a module-level `logger = logging.getLogger(__name__)`, use it directly; otherwise add that single line at module scope. Do not change the 400 return—HTTP semantics are correct for a malformed body. Do not add a re-raise, because the caller (the HTTP framework) expects a `Response` object back, not an exception. No new dependency, no metric, no counter—just the one `logger.warning` call with `exc_info=True`.
+
+Benefits:
+Once the fix lands, every time the adapter hits the malformed-body path, a single structured line appears in the server log with a timestamp, the exception type and message, and the full traceback. An operator triaging a spike in 400s can confirm whether the adapter is the source, identify the root cause (truncated body vs. missing header vs. internal bug), and correlate the event with upstream provider billing. The change is one line, introduces no new dependency, and does not alter the HTTP contract visible to clients.
