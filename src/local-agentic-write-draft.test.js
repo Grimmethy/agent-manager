@@ -109,6 +109,37 @@ test('write tier: a confirmed-atomic leaf (decomposedFrom) is told NOT to decomp
   });
 });
 
+// 2026-09-02: a leaf is only decompose-LOCKED while it is fresh. Once it has demonstrably
+// blown a whole turn budget (turnBudgetExhaustedBefore) or already been auto-split once
+// (autoDecomposeCount), it may choose RESOLUTION: decompose again -- the MAX_AUTO_DECOMPOSE
+// cap + review still bound it.
+test('write tier: a leaf that already exhausted a budget is NOT decompose-locked', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const base = { title: 'T', promptContext: { rawText: 'add one route', decomposedFrom: 'parent-1' } };
+
+    const locked = buildWriteAgenticPrompt(base);
+    assert.match(locked, /CONFIRMED-ATOMIC LEAF/);
+
+    const unlocked = buildWriteAgenticPrompt({ ...base, turnBudgetExhaustedBefore: true });
+    assert.doesNotMatch(unlocked, /CONFIRMED-ATOMIC LEAF/);
+    assert.match(unlocked, /split it into 2-6 smaller/);
+
+    const unlocked2 = buildWriteAgenticPrompt({ ...base, autoDecomposeCount: 1 });
+    assert.doesNotMatch(unlocked2, /CONFIRMED-ATOMIC LEAF/);
+  });
+});
+
+test('write tier: the too-large + decompose guidance spells out the one-file / prefer-a-new-file rule', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'do a big thing' } });
+    // appears both in the "too large -> split" clause and in the RESOLUTION: decompose shape block
+    const hits = p.match(/strongly prefer a NEW self-contained file\/module/g) || [];
+    assert.ok(hits.length >= 2, `expected the prefer-a-new-file rule in both places, saw ${hits.length}`);
+  });
+});
+
 test('write tier: rescopedFromDecompose alone also triggers leaf mode', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();

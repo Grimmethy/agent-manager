@@ -142,8 +142,72 @@ test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls c
       },
     });
 
-    // plan + harness + read-only agentic + write agentic = 4 lock cycles, all local.
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end', 'start', 'end']);
+    // plan + preliminary decompose-check + harness + read-only agentic + write agentic
+    // = 5 lock cycles, all local. (The decompose-check returns non-JSON here so the task
+    // falls through to the tiers.)
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end', 'start', 'end', 'start', 'end']);
+  });
+});
+
+// 2026-09-02: the preliminary decompose check. A fresh adhoc task, after its blind plan
+// and BEFORE any agentic tier, gets one cheap model call that can split it. A split routes
+// straight to needs-review with adhocResolution: 'decompose' -- no tier ever runs.
+const DECOMPOSE_JSON = JSON.stringify({
+  one_pass: false,
+  subtasks: [
+    { title: 'Add catalog schema module', rawText: 'Create a new self-contained catalog schema module.' },
+    { title: 'Add GET /api/plugins', rawText: 'Add a GET /api/plugins endpoint reading the catalog.', after: 0 },
+    { title: 'Add plugins UI tab', rawText: 'Add a dashboard Plugins tab listing entries.', after: 1 },
+  ],
+});
+// localCall that answers the decompose-check prompt with a split and everything else with a plan.
+function splittingLocalCall() {
+  return async ({ prompt }) => ({
+    response: /ONLY a JSON object/.test(prompt || '') ? DECOMPOSE_JSON : PLAN_STUB,
+    degenerate: null, attempts: 1,
+  });
+}
+
+test('adhoc: the preliminary check splits a fresh task straight to decompose, no tier runs', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-predecomp', domain: 'adhoc', source: 'manual', title: 'big thing', promptContext: { rawText: 'build the plugin catalog, endpoints and UI' } };
+    let tierRan = false;
+    const markTier = async () => { tierRan = true; return { applied: false, succeeded: true, reason: 'should not be reached' }; };
+
+    const result = await draftTask(task, {
+      localCall: splittingLocalCall(),
+      withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn: markTier,
+      draftAdhocViaLocalAgenticFn: markTier,
+      draftAdhocViaLocalAgenticWriteFn: markTier,
+    });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(tierRan, false, 'no agentic tier is invoked once the task is split up front');
+    assert.equal(task.adhocResolution, 'decompose');
+    assert.equal(task.subTaskProposals.length, 3);
+    assert.equal(task.status, 'needs-review');
+    assert.ok((task.history || []).some((e) => /preliminary size check -> decompose/.test(e.detail || '')));
+  });
+});
+
+test('adhoc: the preliminary check is skipped on a retry (localRejectCount set)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-predecomp-retry', domain: 'adhoc', source: 'manual', title: 'big thing', localRejectCount: 1, promptContext: { rawText: 'build the plugin catalog, endpoints and UI' } };
+    let decomposeAsked = false;
+
+    await draftTask(task, {
+      localCall: async ({ prompt }) => {
+        if (/ONLY a JSON object/.test(prompt || '')) decomposeAsked = true;
+        return { response: PLAN_STUB, degenerate: null, attempts: 1 };
+      },
+      withLockFn: async (d, fn) => fn(),
+      ...declineLocalTiers(),
+    });
+
+    assert.equal(decomposeAsked, false, 'a retry goes straight back down the tier ladder');
+    assert.notEqual(task.adhocResolution, 'decompose');
   });
 });
 
@@ -289,9 +353,9 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, false);
     assert.equal(task.status, 'needs-review');
-    // plan pass (now local for adhoc) + the applied harness-search tier = 2 lock cycles;
-    // the read-only and write tiers are never reached.
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end']);
+    // plan pass + preliminary decompose-check + the applied harness-search tier = 3 lock
+    // cycles; the read-only and write tiers are never reached.
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end']);
   });
 });
 
@@ -1481,7 +1545,10 @@ test('runPlanPass (adhoc): a thin first plan is re-rolled once, and a substantiv
       return { response: n === 1 ? '1. lone stub' : PLAN_STUB, degenerate: null, attempts: 1 };
     };
     await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
-    assert.equal(n, 2, 'exactly one re-roll after the thin first plan (tiers are stubbed, so every localCall is a plan call)');
+    // call 1 = thin first plan, call 2 = the one re-roll, call 3 = the preliminary
+    // decompose check (returns PLAN_STUB, not JSON, so it parses to null and the task
+    // falls through to the -- stubbed/declining -- tier ladder).
+    assert.equal(n, 3, 'thin first plan + exactly one re-roll + the preliminary decompose check');
     assert.equal(task.planResponse, PLAN_STUB);
     assert.equal(task.lastGoodPlan, PLAN_STUB);
     const planDone = (task.history || []).find((e) => e.stage === 'plan-done');

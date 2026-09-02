@@ -220,6 +220,11 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       if (edits === 0 && !capturedDiff) {
         task.turnBudgetExhausted = true;
         task.retryableDraftBlock = true;
+        // Sticky (survives reject-retry-check's reset of turnBudgetExhausted): a leaf that
+        // has demonstrably blown a full budget with zero edits is NOT confirmed-atomic --
+        // local-agentic-write-draft.js's leafDecomposeLocked() reads this to let it
+        // choose RESOLUTION: decompose on the next pass.
+        task.turnBudgetExhaustedBefore = true;
         return {
           succeeded: true,
           blocked: true,
