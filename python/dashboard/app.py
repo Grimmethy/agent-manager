@@ -5834,7 +5834,8 @@ def _pipeline_live_counts(qdir) -> dict:
         for f in state_dir.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to read/parse queue state file %s: %s", f, exc)
                 bump(None, state)
                 continue
             bump(_resolve_source_name(data), state)
