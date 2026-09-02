@@ -110,6 +110,85 @@ _NEEDS_CLARIFICATION_REASON_TEXT = {
 }
 
 
+def _alert_last_seen_path() -> Path | None:
+    """Last-seen alert-ids store for the /api/alerts webhook notifier -- the same
+    pipeline-dir derivation queue_dir()/alerts_path() already use (see
+    get_pipeline_dir()), so no extra config knob: <pipeline>/alert_last_seen_ids.json."""
+    d = get_pipeline_dir()
+    return (d / "alert_last_seen_ids.json") if d else None
+
+
+def _fire_alert_webhook(alerts: list) -> None:
+    """Notify a configured webhook target about alerts not seen on the previous
+    /api/alerts response (design decision 2026-08-24: webhook, not Web Push).
+
+    Fully opt-in -- a no-op unless AGENT_MANAGER_ALERT_WEBHOOK_URL is set. The target
+    is POSTed ntfy-style (plain-text body + Title/Priority headers), which is just a
+    plain HTTP POST, so swapping to Pushover or any other endpoint is a config change,
+    not a code change. Best-effort by contract: never raises, so a notification
+    failure can never break the alert feed itself. Only successfully-delivered ids are
+    recorded as seen; undelivered ones are retried on the next poll."""
+    url = (os.environ.get("AGENT_MANAGER_ALERT_WEBHOOK_URL") or "").strip()
+    if not url:
+        return
+    p = _alert_last_seen_path()
+    if not p:
+        return
+
+    seen: list = []
+    if p.is_file():
+        data = read_json_safe(p) or {}
+        if isinstance(data, dict):
+            candidate = data.get("seen_ids")
+            if isinstance(candidate, list):
+                seen = [s for s in candidate if isinstance(s, str)]
+    seen_set = set(seen)
+
+    new = [
+        a for a in alerts
+        if isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"] not in seen_set
+    ]
+    if not new:
+        return
+
+    import urllib.request
+    delivered: list = []
+    for a in new:
+        title = (a.get("title") or "Agent Manager alert")[:200]
+        body = a.get("body") or a.get("title") or a.get("id") or ""
+        # ntfy priority mapping: error-level alerts are high, everything else default.
+        priority = "high" if a.get("level") in ("error", "critical") else "default"
+        req = urllib.request.Request(
+            url,
+            data=body.encode("utf-8"),
+            headers={"Title": title, "Priority": priority},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+            delivered.append(a["id"])
+        except Exception as exc:
+            logger.warning("Alert webhook POST failed for %s (%s): %s", a.get("id"), url, exc)
+    if not delivered:
+        return
+
+    try:
+        merged = list(dict.fromkeys(seen + delivered))[-2000:]
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(
+            json.dumps({
+                "seen_ids": merged,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(p))
+    except OSError as exc:
+        logger.warning("Alert last-seen store write failed: %s (%s)", p, exc)
+
+
 @app.route("/api/alerts")
 def api_alerts():
     """Companion app's notification-bell feed (Android: AlertPoller.kt polls this every
@@ -189,6 +268,15 @@ def api_alerts():
             logger.warning("Alert feed read failed: %s (%s)", p, exc)
         except Exception:
             logger.exception("Alert feed read failed unexpectedly: %s", p)
+
+    # Webhook notification side-effect (see _fire_alert_webhook): fires for alerts not
+    # seen on the previous call. No-op unless AGENT_MANAGER_ALERT_WEBHOOK_URL is set;
+    # it never raises by contract, this guard is belt-and-suspenders so the feed itself
+    # can't 500 over a notification bug.
+    try:
+        _fire_alert_webhook(alerts)
+    except Exception:
+        logger.exception("Alert webhook side-effect failed")
 
     return jsonify({"generatedAt": generated_at, "alerts": alerts})
 
