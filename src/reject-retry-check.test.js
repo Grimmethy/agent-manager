@@ -205,6 +205,27 @@ test('an adhoc turn-budget-exhausted block is requeued to queue/adhoc/ with an e
   assert.match(out.priorRejectionFeedback[0], /edit_file within the first few turns/);
 });
 
+test('an adhoc diff-substance block is requeued with the pointed adhocDiffSubstanceFeedback', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-ds', domain: 'adhoc', source: 'manual', retryableDraftBlock: true,
+    adhocDiffSubstanceFeedback: 'Your diff only created/edited documentation (docs/adr/0021-x.md). That is not the deliverable -- implement the actual change in python/dashboard/templates/index.html.',
+    blockedReason: 'Agentic implement pass produced a diff that is not a real implementation -- diff only touches documentation',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-ds.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-ds.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 1);
+  assert.equal(out.adhocDiffSubstanceFeedback, undefined, 'consumed on requeue');
+  assert.equal(out.priorRejectionFeedback.length, 1);
+  assert.match(out.priorRejectionFeedback[0], /only created\/edited documentation/);
+  assert.match(out.priorRejectionFeedback[0], /index\.html/);
+});
+
 test('an adhoc malformed-decompose block is requeued with a decompose-format feedback line', () => {
   const d = setupAdhocDirs();
   const task = {

@@ -194,3 +194,37 @@ test('a task that merely mentions "test" without demanding command execution is 
     assert.notEqual(result.reason, 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access');
   });
 });
+
+// 2026-09-02: the "cheap targeted edit" tier must not stamp a token gesture (an ADR
+// instead of the code, an unrequested delete, a forbidden file) as `implemented` --
+// decline so the agentic tiers, which can investigate, take over. See adhoc-diff-sanity.js.
+test('applied:false when the harness-search diff only creates a doc for a code task', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask();
+    let call = 0;
+    const localCall = async () => {
+      call++;
+      if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'create', file: 'docs/adr/0021-rate.md', content: '# ADR-0021\n\nWe will change RATE.\n' }), degenerate: null, attempts: 1 };
+    };
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /not a real implementation -- diff only touches documentation/);
+    assert.equal(task.adhocResolution, undefined);
+  });
+});
+
+test('applied:false when the harness-search diff deletes a file the task never asked to remove', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask();
+    let call = 0;
+    const localCall = async () => {
+      call++;
+      if (call === 1) return { response: 'QUERY: RATE', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'delete', file: 'src/widget.js' }), degenerate: null, attempts: 1 };
+    };
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /not a real implementation -- diff deletes src\/widget\.js/);
+  });
+});

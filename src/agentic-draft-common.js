@@ -15,6 +15,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
+const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -359,8 +360,30 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     return { succeeded: false, reason: `could not capture git diff from the worktree: ${e.message}`, ...meta };
   }
 
+  const trimmedDiff = rawDiff.trim();
+
+  // Is the diff actually the change the task asked for, or a token gesture (an ADR instead
+  // of the code, an unrequested delete, a file the task explicitly forbids)? A "valid diff
+  // that applies cleanly" is not the same as "the implementation". See adhoc-diff-sanity.js
+  // -- root-caused via three needs-clarification tasks that each burned their retry budget
+  // getting a doc / stub / off-limits diff rejected in review.
+  if (resolution === 'implemented' && trimmedDiff) {
+    const substance = adhocDiffSubstanceProblem(task, trimmedDiff);
+    if (substance) {
+      task.retryableDraftBlock = true;
+      task.adhocDiffSubstanceFeedback = substance.retryFeedback;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- ${substance.reason}`,
+        ...meta,
+        capturedDiff: trimmedDiff,
+      };
+    }
+  }
+
   task.adhocResolution = resolution;
-  task.rawDiff = rawDiff.trim();
+  task.rawDiff = trimmedDiff;
   task.implementResponse = task.rawDiff
     ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
     : summary;
