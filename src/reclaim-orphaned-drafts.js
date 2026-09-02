@@ -58,7 +58,8 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
     let task;
     try {
       task = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
+    } catch (err) {
+      console.warn(`reclaimOrphanedDrafts: skipping unreadable draft file ${filePath} -- message=${err.message}${err.code ? ` (code=${err.code})` : ''}`);
       continue; // unreadable/mid-write -- leave it, next startup can try again
     }
 
