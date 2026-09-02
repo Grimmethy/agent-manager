@@ -1951,3 +1951,26 @@ Inside the `catch` block, log the caught error to `console.error` with the funct
 
 Benefits:
 An operator reviewing logs after an incident can immediately see that the forensic bundle was incomplete, which task_ids were affected, and the root cause (lock timeout, missing column, I/O error, etc.) without needing to add temporary instrumentation. The partial-result contract is preserved, so no caller code changes are required, and the single log line is all the observability this project's logging surface (console.error) supports.
+
+### AC-121 · Silent catch swallows all readdirSync errors in forensic candidate scan
+Strength: Strong
+Files: src/forensic-bundle.js
+Snippet:
+```
+  const candidates = [];
+  for (const { dir, state } of doneDirs) {
+    let names;
+    try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { continue; }
+    for (const name of names) {
+      const task = readJson(path.join(dir, name));
+      if (!task || subjectIds.has(task.id)) continue;
+```
+
+Problem:
+Inside the `for (const { dir, state } of doneDirs)` loop, the line `try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { continue; }` catches every possible `fs.readdirSync` failure—ENOENT, EACCES, EIO, EMFILE—and discards the error with a bare `continue`. In a forensic-bundle context this means a permission-denied or I/O-error on a directory that `listArchivedMonthDirs` already confirmed exists (or on `queue/done` after it has been created) is indistinguishable from the benign "directory not yet created" case. An operator investigating why forensic candidates are missing has zero log output to point at the skipped directory or the underlying error, because the project's only available logging primitive (`console.warn` / `console.error`) is never called on this path.
+
+Solution:
+Replace the bare `catch { continue; }` with a `catch (err)` that inspects `err.code`. If the code is `'ENOENT'`, the directory is simply absent (expected for `queue/done` before the first pipeline run), so `continue` without logging is correct. For every other code (EACCES, EIO, EMFILE, etc.), emit `console.warn(\`[forensic-bundle] skipped directory ${dir} (state=${state}): ${err.code} – ${err.message}\`)` and then `continue`, so the loop still degrades gracefully but the operator gets a single, greppable line identifying exactly which directory was skipped and why. No new dependency, no metrics call—just the `console.warn` the rest of the codebase already uses.
+
+Benefits:
+A permission or I/O failure on an archived-month directory no longer vanishes silently; the operator sees one warning line naming the directory, its state (`done` vs `archived`), and the OS error code, which is enough to `chmod` or fix the mount and re-run. The benign ENOENT path stays quiet, so normal first-run or partial-pipeline scenarios produce no noise. The forensic-bundle output becomes auditable: any candidate set that looks thin can be cross-checked against the warning log to confirm whether a directory was genuinely empty or was skipped due to a transient filesystem error.
