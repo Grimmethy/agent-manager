@@ -5139,7 +5139,7 @@ function renderBrainDumpCard(entry) {
     ? `<a class="jump" data-jump="${escapeAttr(sort.secondBrainPath)}" href="#">open &rarr;</a>`
     : '';
   const meta = sort
-    ? `${escapeHtml(sort.category || '')}${sort.tags && sort.tags.length ? ' &middot; ' + escapeHtml(sort.tags.join(', ')) : ''}`
+    ? escapeHtml((sort.tags && sort.tags.length ? sort.tags.join(', ') : sort.secondBrainPath) || '')
     : new Date(entry.capturedAt).toLocaleString();
   const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span> ` : '';
   return `

@@ -14,7 +14,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test src/*.test.js src/**/*.test.js *.test.js",
+    "test": "node --test src/*.test.js src/**/*.test.js scripts/*.test.js *.test.js",
     "drift-scan": "node src/drift-scan.js"
   }
 }

@@ -58,15 +58,30 @@ require('./task-sources.js');
 
 const { reviewTask, buildVerdictPrompt } = require('./review-task.js');
 
+// A generic reviewable task that DOES go through the LLM majority vote. (brain_dump_sort
+// stopped doing that in 2026-09-03 -- it uses deterministicReview now, see
+// brainDumpSortReviewTask below and brain-dump-sort-classify.js.)
 function baseTask(overrides = {}) {
   return {
     id: 'test-task-1',
+    domain: 'default',
+    source: 'trouble_log',
+    title: 'Fix the thing',
+    planResponse: '1. Add a guard in foo.js.',
+    implementResponse: '{"mode":"edit","file":"foo.js","find":"doThing()","replace":"if (ok) doThing()"}',
+    ...overrides,
+  };
+}
+
+function brainDumpSortTask(overrides = {}) {
+  return {
+    id: 'brain-dump-sort-bd-test-1',
     domain: 'brain_dump_sort',
     source: 'brain_dump_sort',
     title: 'Sort brain dump entry: test',
-    planResponse: '1. This note is about X.\n2. actionable: false\n3. reference\n4. references/x.md\n5. none apply',
+    planResponse: '1. This note is about X.\n2. actionable: false\n3. reference\n4. References/x.md',
     implementResponse: JSON.stringify({
-      category: 'reference', secondBrainPath: 'references/x.md', tags: ['x'],
+      secondBrainPath: 'References/x.md', tags: ['x'],
       actionable: false, rationale: 'documentation', belongsToProject: null,
     }),
     ...overrides,
@@ -84,15 +99,43 @@ test('buildVerdictPrompt states the real current date so recency judgments have 
   assert.match(prompt, /do not reject a cited source, URL, or claimed date merely for being after some earlier date/);
 });
 
-test('buildVerdictPrompt gives brain_dump_sort its own carve-out, not the generic code-review framing', () => {
-  const prompt = buildVerdictPrompt(baseTask(), { flags: [] }, '');
-  assert.match(prompt, /CLASSIFICATION task, not a code-change task/);
-  assert.match(prompt, /secondBrainPath.*commonly does NOT exist yet/s);
-  // The generic phrasing must not appear anywhere for this source -- confirmed live
-  // 2026-08-16 this exact sentence, present unconditionally, contradicted the carve-out
-  // above it and was one of two compounding causes of every real rejection.
-  assert.doesNotMatch(prompt, /does it contain real, complete code/i);
-  assert.match(prompt, /complete, valid classification JSON/);
+test('brain_dump_sort takes the deterministic-review path -- a valid classification is approved with no vote', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = brainDumpSortTask();
+  let voteCalled = false;
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: async () => { voteCalled = true; throw new Error('vote must not be called for brain_dump_sort'); },
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-brain-dump-sort');
+  assert.equal(voteCalled, false);
+});
+
+test('brain_dump_sort deterministic review BLOCKS a malformed classification with a specific reason (informed retry, not a dead end)', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = brainDumpSortTask({ implementResponse: 'let me read the vault first' });
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: async () => { throw new Error('vote must not be called'); },
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /Deterministic review:/);
+});
+
+test('brain_dump_sort deterministic review BLOCKS an off-taxonomy secondBrainPath', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = brainDumpSortTask({
+    implementResponse: JSON.stringify({ secondBrainPath: 'RandomFolder/x.md', tags: [], actionable: false }),
+  });
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: async () => { throw new Error('no vote'); }, recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.match(result.blockedReason, /not one of the allowed second-brain folders/);
 });
 
 test('buildVerdictPrompt keeps the generic code-review framing for a real code-change source', () => {
@@ -422,47 +465,7 @@ test('reviewTask overwrites the stale "needs-review" status with the verdict, so
   assert.equal(blockedTask.status, 'blocked');
 });
 
-test('reviewTask fact-checks brain_dump_sort secondBrainPath against secondBrainDir, not repoRoot -- exists:true for a note that is only in the vault', async () => {
-  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
-  fs.mkdirSync(path.join(secondBrainDir, 'references'), { recursive: true });
-  fs.writeFileSync(path.join(secondBrainDir, 'references', 'x.md'), '# X\n');
-  // Deliberately NOT created under repoRoot -- proves the fact-check is really looking
-  // at secondBrainDir, not silently passing because the same relative path happens to
-  // exist under repoRoot too.
-  assert.equal(fs.existsSync(path.join(repoRoot, 'references', 'x.md')), false);
-
-  const captured = [];
-  const result = await reviewTask(baseTask(), {
-    repoRoot, secondBrainDir, domainsPath,
-    localMajorityVote: fakeApprove(captured),
-    recordModelOutcome: () => {},
-  });
-
-  assert.equal(result.succeeded, true);
-  assert.equal(result.verdict, 'approved');
-  assert.equal(captured.length, 1);
-  assert.match(captured[0], /"claimedPath":"references\/x\.md","exists":true/);
-});
-
-test('reviewTask reports exists:false (not an error) for a brand-new secondBrainPath, and the prompt tells the reviewer that is expected', async () => {
-  const { secondBrainDir, domainsPath } = makeFixture();
-  // Nothing written to secondBrainDir at all -- the common "filing something new" case.
-
-  const captured = [];
-  const result = await reviewTask(baseTask(), {
-    repoRoot: path.join(secondBrainDir, '..', 'repo'), secondBrainDir, domainsPath,
-    localMajorityVote: fakeApprove(captured),
-    recordModelOutcome: () => {},
-  });
-
-  assert.equal(result.succeeded, true);
-  assert.match(captured[0], /"claimedPath":"references\/x\.md","exists":false/);
-  // The carve-out explaining that this specific flag is expected must actually be in
-  // the same prompt the reviewer sees it alongside -- not just true in the abstract.
-  assert.match(captured[0], /missing-file.*fact-check flag on secondBrainPath ALONE is expected/s);
-});
-
-test('reviewTask still runs the deep_dive clonePath override correctly (no regression from adding the brain_dump_sort branch alongside it)', async () => {
+test('reviewTask still runs the deep_dive clonePath override correctly', async () => {
   const { secondBrainDir, domainsPath: baseDomainsPath, dir } = makeFixture();
   const domainsPath = path.join(dir, 'task-domains-dd.json');
   fs.writeFileSync(domainsPath, JSON.stringify({

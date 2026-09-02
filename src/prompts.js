@@ -13,6 +13,7 @@
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
 const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
+const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
 
 function truncate(str, max) {
@@ -179,9 +180,10 @@ function secondbrainPlanPrompt(task) {
 
 function brainDumpSortPlanPrompt(task) {
   const ctx = task.promptContext;
+  const canonicalFolders = [...CANONICAL_TOP_LEVEL, ...(ctx.projectLabels || [])];
   const structureText = ctx.existingStructure && ctx.existingStructure.length > 0
     ? ctx.existingStructure.join('\n')
-    : '(second brain is empty so far -- you are choosing the first structure)';
+    : '(no subfolders/notes yet)';
   return [
     'You are triaging one short note someone just jotted down, deciding where it belongs in their personal "second brain" note vault.',
     '',
@@ -193,10 +195,25 @@ function brainDumpSortPlanPrompt(task) {
       `IMPORTANT: "${ctx.selfProjectLabel}" (one of the tracked projects below) is THIS pipeline's own source -- the system that just processed this very note. If the note describes a desired behavior, feature, or fix for the brain-dump/second-brain/pipeline/dashboard system itself (self-referential, per the paragraph above), that is almost always a real, concrete feature/bug for "${ctx.selfProjectLabel}" specifically -- do not default to belongsToProject:null just because the note describes the tool you are running inside rather than some external target. Only leave it as none-apply if the note is genuinely just an observation/journal entry with no actual requested change.`,
       '',
     ] : []),
-    'Existing top-level folders/files already in the second brain (reuse one of these when the note fits, rather than inventing a new top-level folder for a single note):',
+    'The ONLY valid top-level folders in this vault are (copy the name EXACTLY as shown, casing included -- anything else is rejected automatically):',
+    canonicalFolders.join('\n'),
+    '  Projects  -- external projects, product plans, business notes',
+    '  Journal   -- dated personal entries, observations, reflections',
+    '  References -- external reference material (articles, docs, background reading)',
+    '  Ideas     -- undeveloped ideas and someday/maybe notes',
+    '  Research  -- topics needing web research before they can be written up',
+    '  Characters / StoryImages -- creative/storyboard assets',
+    '  (a tracked project label) -- ONLY when the note is genuinely about that project itself',
+    '',
+    'Existing subfolders/notes you may append to (secondary context -- do NOT let these override the folder list above):',
     structureText,
     '',
-    'Two naming rules, both non-negotiable: (1) if you reuse an existing top-level folder, copy its name EXACTLY as shown above, including capitalization -- "Projects" and "projects" are two different folders as far as the filesystem is concerned, and creating a case-variant of one that already exists silently splits it in two. (2) the FILE name (not the folder) must describe what the note is actually about -- never a bare generic word like "ideas.md", "notes.md", "misc.md", or "todo.md" that could just as easily be the name of every other note ever filed. "ebay-cross-post-automation.md" is a good file name; "ideas.md" is not, even inside an Ideas/ folder.',
+    'Existing notes this one might relate to (pick 0-5 for relatedNotes, exact basename):',
+    ctx.existingNoteNames && ctx.existingNoteNames.length > 0 ? ctx.existingNoteNames.map((n) => `- ${n}`).join('\n') : '(none yet)',
+    '',
+    'Naming: the FILE name (not the folder) must describe what the note is actually about -- never a bare generic word like "ideas.md", "notes.md", "misc.md", or "todo.md". "ebay-cross-post-automation.md" is a good file name; "ideas.md" is not, even inside Ideas/. Every path must be `<folder>/<descriptive-name>.md` -- at least one folder, never a bare file at the vault root.',
+    '',
+    'A note describing a concrete change/feature/bug for a tracked project (INCLUDING this pipeline itself) is a WORK TASK, not a note: set belongsToProject + actionable:true and let it become a real queued task. Passive vault notes (category reference/idea/journal, belongsToProject null) are ONLY for observations, journal entries, and external reference material -- never for "the pipeline should do X" or "fix the dashboard Y".',
     '',
     'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
     ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
@@ -211,7 +228,7 @@ function brainDumpSortPlanPrompt(task) {
     'Already-queued task titles (only relevant if THIS note plainly asks for the same thing one of these already covers -- different wording for the same underlying feature/fix still counts as a duplicate, judge by what it actually asks for, not by matching words):',
     ctx.existingQueuedTitles && ctx.existingQueuedTitles.length > 0 ? ctx.existingQueuedTitles.map((t) => `- ${t}`).join('\n') : '(nothing currently queued)',
     '',
-    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), (5) if this describes a concrete feature/bug IN one of the tracked code projects listed above (i.e. an edit to that project\'s own existing files), name which one -- otherwise say none apply, (6) if properly resolving this note means going out and finding NEW EXTERNAL information first (something on the public web -- a product, service, account, business, or public event) rather than just filing the note as stated, say so -- that makes it a real research task, independent of (5) (a research task is never a code change, and it never has real access to any tracked project\'s own repo -- see the CRITICAL note just below), and (7) does this note plainly ask for the same thing as one of the already-queued titles above -- if so, name that exact title; be conservative here, only flag a REAL match (same underlying feature/fix), not a vague topical overlap (e.g. two different tasks both mentioning "the dashboard" is not a duplicate).',
+    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), (5) if this describes a concrete feature/bug IN one of the tracked code projects listed above (i.e. an edit to that project\'s own existing files), name which one -- otherwise say none apply, (6) if properly resolving this note means going out and finding NEW EXTERNAL information first (something on the public web -- a product, service, account, business, or public event) rather than just filing the note as stated, say so -- that makes it a real research task, independent of (5) (a research task is never a code change, and it never has real access to any tracked project\'s own repo -- see the CRITICAL note just below), and (7) does this note plainly ask for the same thing as one of the already-queued titles above -- if so, name that exact title; be conservative here, only flag a REAL match (same underlying feature/fix), not a vague topical overlap (e.g. two different tasks both mentioning "the dashboard" is not a duplicate), and (8) which existing notes from the list above does this note clearly relate to (0-5, exact basenames) -- used to wikilink them together.',
     '',
     'CRITICAL distinction for (6) (confirmed live 2026-08-23, a real stuck-task incident): "investigate X" / "look into Y" is NOT automatically a research task -- a research task means the answer lives on the PUBLIC WEB. A note asking to investigate/debug/fix something about a TRACKED PROJECT ITSELF (its own code, a feature it broke, a bug in its own dashboard/pipeline/UI -- the exact self-referential case (5) above already covers) is an in-repo investigation, not a web research topic, EVEN THOUGH the note\'s own wording uses "investigate" or "look into." A research task filed for a self-referential internal bug will search the public web for a private tool\'s name, find nothing, and permanently fail -- it has no git/file access to ever actually answer it. When a note describes something broken or in need of investigation IN one of the tracked projects listed above (including this pipeline itself, per selfProjectLabel below if set), route it via (5), never (6), regardless of which investigative verb the note happens to use.',
     '',
@@ -1389,17 +1406,17 @@ function brainDumpSortImplementPrompt(task, planText) {
     'Now output ONLY a single JSON object describing your final classification -- nothing else, no explanation before or after, no markdown code fences. It must have exactly these fields:',
     '',
     '{',
-    '  "category": "task | reference | idea | journal | question (pick the closest fit)",',
-    '  "secondBrainPath": "relative/path/from/your/plan/above.md",',
+    '  "secondBrainPath": "<one of the allowed top-level folders>/<descriptive-name>.md",',
     '  "tags": ["short", "lowercase", "keywords"],',
     '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
-    '  "rationale": "one sentence explaining the category and destination",',
+    '  "rationale": "one sentence explaining the destination",',
     '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects -- null even if a tracked project\'s name appears in the note\'s own title, when the note actually describes a new standalone plugin/product idea rather than an edit to that project\'s existing files (see your plan\'s CRITICAL distinction above)",',
     '  "requiresResearch": true or false -- true only if properly resolving this note means going out and finding NEW information (web search, reading real sources) before it can be documented, not just filing the note as stated. Independent of belongsToProject -- this is never a code change, and should never be true at the same time as naming a belongsToProject.',
     '  "possibleDuplicateOf": "the exact title, copied verbatim, of an already-queued task from the list above that this note plainly asks for the same thing as -- or null if none genuinely match. Be conservative: only a real match on the underlying feature/fix, never a vague topical overlap.",',
+    '  "relatedNotes": ["existing-note-basename", ...] -- 0 to 5 existing notes this one clearly relates to, filename only without .md; [] if none. Used to wikilink the notes together.',
     '}',
     '',
-    'secondBrainPath must be the specific file path you settled on in your plan above (reusing an existing folder when one fits) -- not a bare folder name, and not something outside the second brain structure you were shown. If reusing an existing folder, its name must match the casing shown above EXACTLY. The file name itself must describe the note\'s actual subject, not a generic placeholder word (ideas/notes/misc/todo and similar are rejected automatically).',
+    'secondBrainPath must be the specific file path you settled on in your plan above -- `<folder>/<name>.md`, never a bare folder and never a bare vault-root file. Its top-level folder MUST be one of the allowed folders shown in your plan, copied with the casing EXACTLY. The file name itself must describe the note\'s actual subject, not a generic placeholder word (ideas/notes/misc/todo and similar are rejected automatically).',
   ].join('\n');
 }
 

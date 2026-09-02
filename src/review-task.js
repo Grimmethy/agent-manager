@@ -127,6 +127,14 @@ function isAdvisoryProseSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.advisoryProse);
 }
+// A source declaring deterministicReview replaces the whole LLM majority-vote path with a
+// mechanical validate function (brain_dump_sort: parse the classification JSON, check the
+// secondBrainPath taxonomy, check belongsToProject is a real label). Returns the validator
+// or null. See runReview's early branch.
+function deterministicReviewValidator(source) {
+  const entry = getRegisteredSource(source);
+  return entry && typeof entry.deterministicReviewValidate === 'function' ? entry.deterministicReviewValidate : null;
+}
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
@@ -317,6 +325,35 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
     : baseMajorityVote;
   appendHistoryEvent(task, 'review-started');
+
+  // Deterministic review (brain_dump_sort, 2026-09-03): a mechanical validate replaces the
+  // LLM majority vote entirely -- no grounding subprocess, no fact-check, no vote. The vote
+  // was rejecting valid classifications on folder/filename nitpicks its own guidance forbade
+  // (8 permanently-blocked tasks). A failure here still sets blockedStage:'review', so
+  // reject-retry-check folds the specific reason into the next draft (an informed retry).
+  const detValidate = deterministicReviewValidator(resolveSourceName(task));
+  if (detValidate) {
+    let outcome;
+    try {
+      outcome = detValidate(task, { secondBrainDir, repoRoot });
+    } catch (e) {
+      outcome = { ok: false, reason: `deterministic review validator threw: ${e.message}` };
+    }
+    if (outcome && outcome.ok) {
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-brain-dump-sort';
+      task.localVerdict = 'Auto-approved: deterministic classification validation passed (no vote).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', 'deterministic-brain-dump-sort');
+      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+    }
+    const reason = `Deterministic review: ${outcome ? outcome.reason : 'validation failed'}`;
+    task.reviewProvider = 'deterministic-brain-dump-sort';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
+  }
+
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
 
@@ -330,17 +367,6 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       const ddProj = ddCoverage.projects && ddCoverage.projects[task.promptContext.projectSlug];
       if (ddProj && ddProj.clonePath) repoRootForCheck = ddProj.clonePath;
     } catch (e) { /* fall back to workDir */ }
-  } else if (task.source === 'brain_dump_sort' && secondBrainDir) {
-    // Same reasoning as deep_dive above: brain_dump_sort's implementResponse names a
-    // secondBrainPath, which is a location under the VAULT, never under repoRoot --
-    // task-domains.json's brain_dump_sort entry has workDirKind:'repoRoot' (a domain-
-    // config default, not specific to this source), so without this override every
-    // single brain_dump_sort draft's secondBrainPath got fact-checked against the wrong
-    // directory entirely and reported "missing" regardless of whether the destination
-    // note already existed. Confirmed live 2026-08-16: this was one of two compounding
-    // causes (see buildVerdictPrompt's brain_dump_sort carve-out below for the other)
-    // behind EVERY real brain_dump_sort task getting rejected at review.
-    repoRootForCheck = secondBrainDir;
   }
 
   const taskPathForGrounding = path.join(require('os').tmpdir(), `review-grounding-${task.id}.json`);

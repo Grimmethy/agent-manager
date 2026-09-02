@@ -234,8 +234,14 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         secondBrainDir,
         pipelineDir,
       });
-      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
-      return { succeeded: true, doneMarker: `filed under "${result.category}" -> ${result.file}` };
+      if (result.skipped) {
+        // A recoverable skip already bumped the entry's sortAttempt inside applyBrainDumpSort,
+        // so nextBrainDumpSortTask regenerates it under a fresh id (…-a1) rather than the
+        // entry being dead behind this task's own record in done/.
+        return { succeeded: true, doneMarker: result.recoverable ? `sort not applied (retrying): ${result.reason}` : result.reason };
+      }
+      if (result.queuedTaskId) return { succeeded: true, doneMarker: `queued ${result.queuedTaskId}${result.queuedProject ? ` in ${result.queuedProject}` : ''} -> ${result.file}` };
+      return { succeeded: true, doneMarker: `filed -> ${result.file}` };
     }
 
     // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's

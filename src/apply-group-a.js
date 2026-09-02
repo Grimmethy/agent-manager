@@ -18,9 +18,20 @@
 const fs = require('fs');
 const path = require('path');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
-const { resolveAnchors } = require('./path-prefetch.js');
+const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const {
+  CANONICAL_TOP_LEVEL,
+  GENERIC_FILENAME_BLOCKLIST,
+  parseBrainDumpSortResult,
+  validateSecondBrainPath,
+  deriveBelongsToProject,
+} = require('./brain-dump-sort-classify.js');
+
+// brain_dump_sort entries get MAX_SORT_ATTEMPTS classification passes before the entry is
+// left 'captured' for a human -- kept in sync with task-sources.js's own constant.
+const MAX_SORT_ATTEMPTS = 3;
 
 function applySecondBrainNote({ implementResponse, notePath, secondBrainDir }) {
   const resolvedPath = path.isAbsolute(notePath) ? notePath : path.join(secondBrainDir, notePath);
@@ -219,104 +230,9 @@ const {
 // 2026-08-27) -- only arch_import ever used it. applyArchDiscoveryCandidates (re-exported
 // above) stays: core backlog_decomposition still appends AC-NNN candidates with it.
 
-// Parses brain_dump_sort's implement-pass output -- a single JSON object, not markdown
-// (see prompts.js's brainDumpSortImplementPrompt for the exact schema this must match).
-// Returns null on anything unparseable or missing a required field, rather than throwing
-// -- applyBrainDumpSort treats null as "leave the entry as captured, retry next tick,"
-// same non-fatal-skip convention every other Group A parser here uses for malformed
-// output.
-function parseBrainDumpSortResult(implementResponse) {
-  const text = (implementResponse || '').trim();
-  if (!text) return null;
-  let parsed;
-  try {
-    // Was a bare JSON.parse(text) -- threw on the extremely common case of the local model wrapping
-    // its output in a ```json fence despite the prompt asking for none, silently swallowed
-    // by the catch below, leaving the entry stuck as 'captured' forever with no automatic
-    // retry. Confirmed live 2026-07-26 on a fully-approved (3/3 APPROVE) classification for
-    // the "job status blocked -- need archive/requeue button" entry: real, valid JSON, just
-    // fenced, parsed successfully by apply-group-b.js's identical case via this same helper
-    // but never applied here because parseBrainDumpSortResult had its own unfenced JSON.parse
-    // instead of reusing it.
-    parsed = parseJsonMaybeFenced(text);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  if (!parsed.category || !parsed.secondBrainPath) return null;
-  return {
-    category: String(parsed.category).trim(),
-    // Strip a leading slash -- path.join(secondBrainDir, '/Projects/foo.md') still resolves
-    // relative to secondBrainDir on Node/POSIX, but on some platforms an absolute-looking
-    // second segment can behave surprisingly; normalizing here removes the ambiguity rather
-    // than relying on path.join's platform-specific handling.
-    secondBrainPath: String(parsed.secondBrainPath).replace(/^[/\\]+/, '').trim(),
-    tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
-    actionable: !!parsed.actionable,
-    rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
-    belongsToProject: parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null,
-    requiresResearch: !!parsed.requiresResearch,
-    // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
-    // filing") -- the classifier is shown a list of already-queued task titles and
-    // asked to flag a near-duplicate here; null/absent means it saw nothing similar.
-    possibleDuplicateOf: parsed.possibleDuplicateOf ? String(parsed.possibleDuplicateOf).trim() : null,
-  };
-}
-
-// Bare, undifferentiated filenames that give no hint what the note is actually about --
-// confirmed live 2026-08-16: the local model filed a real note (a feature idea about brain-dump
-// job context) under plain "ideas.md", indistinguishable at a glance from any other idea
-// ever captured. Checked against the FINAL path segment's stem only (no extension) --
-// a folder named e.g. "Ideas/" is fine (that's a category), a FILE named "ideas.md" is
-// not (that's the note's own name doing zero work). Deliberately short: this is a floor
-// against the worst offenders, not a style guide -- most bad names won't match this list
-// and are expected to be caught by prompts.js's instructions instead.
-const GENERIC_FILENAME_BLOCKLIST = new Set([
-  'ideas', 'idea', 'notes', 'note', 'misc', 'miscellaneous', 'stuff', 'todo', 'todos',
-  'random', 'general', 'other', 'things', 'inbox', 'info', 'information', 'data', 'new',
-  'untitled', 'temp', 'draft', 'journal', 'log',
-]);
-
-// Rejects a proposed secondBrainPath outright (returns a reason string) rather than
-// silently accepting it -- applyBrainDumpSort treats a rejection the same as unparseable
-// JSON (entry left as 'captured', retried next tick with a fresh model call), so a bad
-// name never actually lands on disk. Two checks, both about names actively working
-// against future retrieval rather than style preference:
-//   1. the file's own basename is a bare generic word (see blocklist above) -- a name
-//      that describes nothing beyond "this is a note".
-//   2. the top-level folder is a different-case duplicate of one that already exists --
-//      the exact bug that produced both "Projects/" and "projects/" in this vault
-//      (confirmed live 2026-08-16), silently splitting one category across two folders
-//      that look identical to a human skimming the sidebar.
-// Returns null when the path is fine.
-function validateSecondBrainPath(relPath, secondBrainDir) {
-  const segments = relPath.split(/[\\/]/).filter(Boolean);
-  if (segments.length === 0) return 'secondBrainPath is empty';
-
-  const baseName = segments[segments.length - 1];
-  const stem = baseName.replace(/\.[^./]+$/, '').toLowerCase().trim();
-  if (GENERIC_FILENAME_BLOCKLIST.has(stem)) {
-    return `filename "${baseName}" is too generic to find again later -- name it after the actual subject of the note (e.g. "ebay-cross-post-automation.md", not "ideas.md")`;
-  }
-
-  if (segments.length > 1 && secondBrainDir) {
-    const topLevel = segments[0];
-    let existingNames;
-    try {
-      existingNames = fs.readdirSync(secondBrainDir, { withFileTypes: true })
-        .filter((e) => !e.name.startsWith('.'))
-        .map((e) => e.name);
-    } catch {
-      existingNames = [];
-    }
-    const conflict = existingNames.find((name) => name.toLowerCase() === topLevel.toLowerCase() && name !== topLevel);
-    if (conflict) {
-      return `top-level folder "${topLevel}" is a different-case duplicate of the existing "${conflict}" -- reuse "${conflict}" exactly (same capitalization)`;
-    }
-  }
-
-  return null;
-}
+// parseBrainDumpSortResult, GENERIC_FILENAME_BLOCKLIST, validateSecondBrainPath moved to
+// src/brain-dump-sort-classify.js (2026-09-03) so task-sources.js's registration can
+// reference the validator without a require cycle. Still re-exported below for callers/tests.
 
 // Classifies one Brain Dump entry (captured by the dashboard's Brain Dump tab / POST
 // /api/brain-dump/capture) into a second-brain destination, appending a dated line to the
@@ -360,6 +276,56 @@ function readProjectRegistry() {
 // the whole file anyway), so folding both branches into one read-then-atomic-rewrite here
 // gets the append case the same crash-safety as every other writer in this file, not just
 // the create case.
+// Auto-wikilink on filing (2026-09-03): resolve the classifier's relatedNotes (and, if
+// none resolve, a cheap keyword-overlap fallback) to REAL note basenames in the vault so
+// `-- see [[a]], [[b]]` can be appended to the filed bullet -- this is how the note graph
+// (python/build_note_graph.py) actually gets edges. Case-insensitive basename match,
+// mirrors resolve_wikilink in build_note_graph.py. Best-effort: unreadable vault -> [].
+function allNoteBasenames(secondBrainDir) {
+  const names = new Set();
+  const walk = (abs, depth) => {
+    if (depth > 5) return;
+    let entries;
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (e.isDirectory()) walk(path.join(abs, e.name), depth + 1);
+      else if (e.name.endsWith('.md')) names.add(e.name.replace(/\.md$/, ''));
+    }
+  };
+  if (secondBrainDir) walk(secondBrainDir, 0);
+  return names;
+}
+
+function resolveNoteLinks(result, secondBrainDir, selfBasename) {
+  const existing = allNoteBasenames(secondBrainDir);
+  const byLower = new Map([...existing].map((n) => [n.toLowerCase(), n]));
+  const isSelf = (n) => selfBasename && n.toLowerCase() === selfBasename.toLowerCase();
+
+  const linked = [];
+  for (const raw of (result.relatedNotes || [])) {
+    const hit = byLower.get(String(raw).toLowerCase());
+    if (hit && !isSelf(hit) && !linked.includes(hit)) linked.push(hit);
+  }
+  if (linked.length > 0) return linked.slice(0, 5);
+
+  // Fallback: no explicit relatedNotes resolved -- link the 1-2 existing notes whose
+  // basename shares >= 2 distinctive tokens with this note's tags + path stem. No model call.
+  const noteTokens = new Set([
+    ...extractKeywords((result.tags || []).join(' ')),
+    ...extractKeywords(String(result.secondBrainPath || '').replace(/[/\\.]/g, ' ')),
+  ].map((k) => k.lower));
+  if (noteTokens.size === 0) return [];
+  const scored = [];
+  for (const name of existing) {
+    if (isSelf(name)) continue;
+    const overlap = extractKeywords(name.replace(/[-_]/g, ' ')).filter((k) => noteTokens.has(k.lower)).length;
+    if (overlap >= 2) scored.push({ name, overlap });
+  }
+  scored.sort((a, b) => b.overlap - a.overlap);
+  return scored.slice(0, 2).map((s) => s.name);
+}
+
 function appendMarkdownLineAtomic(fullPath, line) {
   const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : null;
   const contents = existing !== null
@@ -386,6 +352,20 @@ function findEntry(data, entryId) {
   return data.entries.find((e) => e && e.id === entryId) || null;
 }
 
+// A skip the classifier could fix on another pass (malformed JSON, off-taxonomy path,
+// entry edited mid-flight, a project config gap). Bump the entry's sortAttempt and persist,
+// so nextBrainDumpSortTask regenerates the sort under a fresh id (…-aN) instead of the
+// entry being dead behind this task's own record in queue/done/. `recoverable: true` is
+// also read by apply-task.js for the doneMarker wording.
+function recoverableSortSkip(data, entry, brainDumpPath, reason) {
+  entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+  try {
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+  } catch { /* best-effort -- reject-retry-check's exhaustion path also bumps sortAttempt */ }
+  return { skipped: true, recoverable: true, reason };
+}
+
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const { brainDumpEntryId, rawText } = task.promptContext;
 
@@ -393,6 +373,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
 
   const entry = findEntry(data, brainDumpEntryId);
   if (!entry) {
+    // Terminal: the entry is gone, there is nothing to regenerate.
     return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
   }
   // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
@@ -400,28 +381,42 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   // text into the entry's CURRENT record would silently mislabel it under a rawText it no
   // longer has. Only apply if the entry is still exactly what this task was drafted against.
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    return { skipped: true, reason: 'brain-dump entry changed since this task was drafted -- not applying a stale classification' };
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+  }
+
+  if (!secondBrainDir) {
+    // Terminal: no vault configured, no retry will help.
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
   }
 
   const result = parseBrainDumpSortResult(implementResponse);
   if (!result) {
-    return { skipped: true, reason: 'implement pass did not return a valid classification -- entry left as captured for retry' };
-  }
-  if (!secondBrainDir) {
-    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'implement pass did not return a valid classification JSON');
   }
 
-  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir);
+  const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
-    return { skipped: true, reason: `rejected secondBrainPath "${result.secondBrainPath}": ${namingError} -- entry left as captured for retry` };
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`);
+  }
+
+  // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
+  // for a note that is plainly a concrete change to this pipeline's own code (the dominant
+  // failure of the blocked backlog). May also flip actionable true.
+  {
+    const derived = deriveBelongsToProject(result, task.promptContext);
+    result.belongsToProject = derived.belongsToProject;
+    result.actionable = derived.actionable;
   }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
   // change -- "investigate X, document findings" needs real web research, not a diff
-  // against any tracked project. Checked before matchedProject below since the two
-  // outcomes are mutually exclusive (the classifier prompt already tells the model never
-  // to set both), and a research task has nothing to do with belongsToProject at all.
-  if (result.requiresResearch) {
+  // against any tracked project. Only when NO tracked project was named/recovered -- a
+  // note tied to a project routes to that project's queue below, never to research.
+  if (result.requiresResearch && !result.belongsToProject) {
     if (!pipelineDir) {
       return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
     }
@@ -451,12 +446,24 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
     writeJsonAtomicSync(brainDumpPath, data);
 
-    return { file: fullPath, category: result.category, queuedTaskId: queuedId, researchQueued: true };
+    return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
   }
 
-  const matchedProject = result.actionable && result.belongsToProject
+  // A note naming a tracked project IS work -- queue a real adhoc task in that project's
+  // own queue. The old `result.actionable &&` precondition is dropped (2026-09-03, user:
+  // "a note describing a concrete change to a tracked project always becomes a work task"):
+  // a project-labelled note the classifier forgot to mark actionable is still a task, and
+  // deriveBelongsToProject already forces actionable when it recovers a self-project label.
+  const matchedProject = result.belongsToProject
     ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
     : null;
+
+  if (result.belongsToProject && !matchedProject) {
+    // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
+    // don't silently downgrade it to a passive note -- that masks the misclassification.
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+  }
 
   if (matchedProject) {
     const validDomains = (() => {
@@ -556,23 +563,27 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
       writeJsonAtomicSync(brainDumpPath, data);
 
-      return { file: path.join(adhocDir, `${queuedId}.json`), category: result.category, queuedTaskId: queuedId, queuedProject: matchedProject.label };
+      return { file: path.join(adhocDir, `${queuedId}.json`), queuedTaskId: queuedId, queuedProject: matchedProject.label };
     }
-    // Falls through to the plain-note path below if the matched project has no 'adhoc'
-    // domain registered -- same non-fatal-skip convention as everything else here, rather
-    // than blocking the whole task over a config gap in a DIFFERENT project.
+    // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
+    // human, not a silent downgrade to a passive note.
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`);
   }
 
+  // Passive vault note -- the fallback for a genuine observation / journal / reference
+  // entry not tied to any tracked project.
   const fullPath = path.join(secondBrainDir, result.secondBrainPath);
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   const tagsSuffix = result.tags.length ? ` _(${result.tags.join(', ')})_` : '';
-  const line = `\n- **${stamp}** ${rawText}${tagsSuffix}\n`;
+  const links = resolveNoteLinks(result, secondBrainDir, path.basename(result.secondBrainPath, '.md'));
+  const wikiSuffix = links.length ? ` -- see ${links.map((n) => `[[${n}]]`).join(', ')}` : '';
+  const line = `\n- **${stamp}** ${rawText}${tagsSuffix}${wikiSuffix}\n`;
   appendMarkdownLineAtomic(fullPath, line);
 
   entry.status = 'sorted';
   entry.sort = {
-    category: result.category,
     secondBrainPath: result.secondBrainPath,
     tags: result.tags,
     actionable: result.actionable,
@@ -583,7 +594,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
   writeJsonAtomicSync(brainDumpPath, data);
 
-  return { file: fullPath, category: result.category };
+  return { file: fullPath };
 }
 
 // Shared apply for judgment-verdict-only task sources (observability_review, unused_export
