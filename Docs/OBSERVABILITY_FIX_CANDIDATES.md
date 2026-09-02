@@ -2296,3 +2296,26 @@ Bind the caught exception and emit a single `console.error` line that includes t
 
 Benefits:
 An operator tailing stderr (or a log aggregator that captures it) immediately sees which file failed, why it failed, and when, turning an otherwise invisible stuck-task scenario into a one-line diagnostic. The numeric counter is preserved for any programmatic caller, but the diagnostic information that was previously lost is now recoverable without adding a logging framework or a metrics dependency.
+
+### AC-136 · Silent `pass` on remote-branch deletion hides repeated failures from operators
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            pass
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+```
+
+Problem:
+At lines 5465–5472, the `except RuntimeError` handler for `git push origin --delete <branch>` contains only a comment and a bare `pass`. The design decision to treat a failed remote-branch deletion as non-fatal is correct—the merge to main has already succeeded and the leftover branch is harmless clutter. However, at runtime the `RuntimeError` (which carries the git stderr output explaining *why* the delete failed—network timeout, permission denied, branch locked by another process, etc.) is discarded entirely. There is no `logging.warning` or `logging.error` call, no structured field, nothing written to stderr. An operator watching the dashboard service logs will see the merge succeed and then… nothing. If the deletion fails on every subsequent merge cycle for a particular branch, the only way to discover it is to read the source code and notice the comment. The project already uses the stdlib `logging` module, so the primitive is available; it is simply not used here.
+
+Solution:
+Replace the bare `pass` inside the `except RuntimeError` block with a `logging.warning` call that records the branch name, the repo root, and the exception message (via `str(e)` or `repr(e)`). For example: `logging.warning("Non-fatal: failed to delete remote branch %r after merge to %r (repo=%s): %s", branch, main_branch, repo_root, e)`. This preserves the existing control flow exactly—the exception is still swallowed, the merge is still reported as successful, the response is still `200`—but now every occurrence is visible in the service log with enough context (branch, target, repo path, git's own error text) for an operator to decide whether the leftover branch needs manual cleanup. No rethrow, no status-code change, no new dependency; just the one `logging.warning` line where the `pass` currently sits.
+
+Benefits:
+Operators gain runtime visibility into every failed remote-branch deletion without changing any API contract or control flow. A branch that repeatedly fails to delete (e.g., due to a stale remote ref or a permissions issue) will produce a trail of `WARNING` lines in the service log, making it discoverable during routine log review or alerting on the `WARNING` level. The existing comment in the source still documents *why* the failure is tolerated for human readers of the code, while the log line documents *what* happened for humans reading the runtime output—two audiences, two complementary records, zero behavioral change.
