@@ -20,6 +20,7 @@ Persistence: one JSON file per scope under paths.dictionaries_dir().
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -70,6 +71,12 @@ class Dictionary:
                 self.nursery = raw.get("nursery", {})
             except Exception:
                 # corrupt dictionary must never block traffic
+                logging.getLogger(__name__).warning(
+                    "Failed to load dictionary for %s (path=%s); resetting to empty",
+                    getattr(self, "name", "<unknown>"),
+                    self.path,
+                    exc_info=True,
+                )
                 self.aliases, self.generations, self.nursery = {}, [], {}
 
     def save(self) -> None:
