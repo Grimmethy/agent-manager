@@ -35,6 +35,7 @@
 // this on deliberately after watching it work on some real, low-stakes tasks first.
 
 const { getConfig } = require('./config.js');
+const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { runPlanWithTools } = require('./local-tool-client.js');
 const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
 const modelStatsClient = require('./model-stats-client.js');
@@ -139,6 +140,7 @@ function buildLocalAgenticPrompt(task) {
     '',
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
+    anchorFilesPromptBlock(task),
     'You have real, read-only tools: grep_codebase (search for a term), read_file (read a real file), list_directory (list a real directory). Use them across as many turns as you need -- read a file, then based on what you saw, read a DIFFERENT file if that is what you need next. You do NOT have write/edit/bash tools -- you cannot directly change anything, only investigate.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page further -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); literal substring / all-words match, not a regex; matching lines only -- read_file around a hit for context.',
     '',

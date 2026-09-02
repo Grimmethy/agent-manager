@@ -12,6 +12,7 @@
 // effect of populating the registry with this package's 10 built-in sources.
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
 const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
+const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 require('./task-sources.js');
 
 function truncate(str, max) {
@@ -992,6 +993,7 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
     '',
     ctx.rawText || truncate(JSON.stringify(ctx), 4000),
     '',
+    anchorFilesPromptBlock(task),
     'The harness ran those searches against THIS repo\'s real, current content. Real matches:',
     '',
     hitsText,
