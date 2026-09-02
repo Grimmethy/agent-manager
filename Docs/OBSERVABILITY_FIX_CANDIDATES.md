@@ -2158,3 +2158,26 @@ Add a single `logging.warning` call inside the existing `except` block, before t
 
 Benefits:
 An operator watching the log stream can immediately see which file failed and why (e.g., `OSError: [Errno 28] No space left on device` vs. `JSONDecodeError: Expecting value: line 1 column 1`), turning a silent accumulation in the `"(unknown)"` bucket into an actionable alert. The dashboard numbers remain unchanged; the fix only adds diagnostic context at the point of failure, so no caller contract or queue-state semantics are altered.
+
+### AC-130 · Log discarded drafting-file parse errors with file path and exception detail
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        for f in drafting_files:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                bump(None, "drafting")
+                continue
+            bump(_resolve_source_name(data), "drafting")
+```
+
+Problem:
+In the drafting-directory loop (lines 5833-5838), when `json.loads(f.read_text(encoding="utf-8"))` raises either `OSError` (permission denied, mid-write truncation, file vanished) or `json.JSONDecodeError` (corrupt JSON, wrong encoding), the exception object is immediately discarded. The only observable effect is `bump(None, "drafting")`, which increments a count with a `None` source name — so the `/api/pipeline-map` dashboard shows an anonymous bump and no operator can tell *which* file failed, *what* the error was, or whether it is transient (a file being written) versus persistent (a corrupt artifact that will never recover). Because the project has no metrics system, the log line is the sole diagnostic surface; without it, a stuck corrupt file or a directory whose permissions changed is invisible until someone manually inspects the drafting directory.
+
+Solution:
+Capture the exception in the `except` clause (`except (OSError, json.JSONDecodeError) as exc:`) and emit a single `logging.warning` call that includes the offending file path (`f`), the exception type, and the exception message. For example: `logging.warning("drafting file %s failed to parse: %s: %s", f, type(exc).__name__, exc)`. Keep the existing `bump(None, "drafting")` and `continue` so the pipeline count still reflects that a file was present in the drafting directory; the log line is purely additive diagnostic context. Ensure the module already imports `logging` (add `import logging` at the top if it is not yet present) and that a module-level logger is defined (e.g. `logger = logging.getLogger(__name__)`), using `logger.warning(...)` in place of the bare `logging.warning(...)` for consistent naming.
+
+Benefits:
+An operator watching the dashboard's log output can immediately identify the exact file path and the specific failure mode (e.g. `JSONDecodeError: Expecting ',' delimiter: line 1 column 412 (char 411)` versus `PermissionError: [Errno 13] Permission denied: '/data/qdir/drafting/abc.json'`), distinguish a transient mid-write race from a persistent corrupt artifact, and act on it (delete the file, fix permissions, investigate the writer) without needing to shell into the host and manually `cat` every file in the drafting directory. The `/api/pipeline-map` response is unchanged, so no client-side contract is affected.
