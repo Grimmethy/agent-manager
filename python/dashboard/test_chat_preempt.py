@@ -49,6 +49,13 @@ class PreemptDecisionTest(unittest.TestCase):
         self.assertEqual(app._preempt_decision("worker-1", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
         self.assertEqual(app._preempt_decision("reviewer", 7, self.NOW - 9999, self.NOW, 180)[0], "spare")
 
+    def test_is_preemptable_child_pass(self):
+        for p in ("plan", "implement", "critique", "harness-search", "local-agentic",
+                  "local-agentic-write", "local-agentic-test-repo-x", "vote", "review"):
+            self.assertTrue(app._is_preemptable_child_pass(p), p)
+        for p in (None, "", "idle", "claim", "starting"):
+            self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
+
     def test_lane_sets_flip_with_the_spare_long_reasoning_env(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": ""}, clear=False):
             os.environ.pop("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING", None)
@@ -128,16 +135,20 @@ class PreemptPipelineTest(unittest.TestCase):
         self.assertEqual(actions.get("worker-1"), "killed")
         self.assertEqual(actions.get("reviewer"), "spare")
 
-    def test_worker_reasoning_is_killed_regardless_of_age(self):
-        for age_min in (0.3, 10, 90):  # 18s, 10min, 90min old -- all killed now
-            with self.subTest(age_min=age_min):
-                wr = self._spawn()
-                self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id=f"t-{age_min}")
-                self._task("worker-reasoning", f"t-{age_min}", claimed_epoch=time.time() - age_min * 60)
-                summary = app._preempt_pipeline_for_chat()
-                self.assertTrue(self._was_killed(wr), f"{age_min}min-old reasoning draft must be killed")
-                self.assertTrue((self.queue / "pending" / f"t-{age_min}.json").exists())
-                self.assertEqual({s["lane"]: s["action"] for s in summary}.get("worker-reasoning"), "killed")
+    def test_worker_reasoning_is_killed_regardless_of_age_and_agentic_tier(self):
+        # local-agentic-write (tier 3) used to be MISSING from the child-pass set, so a
+        # worker-reasoning draft in it was skipped entirely -- the live bug.
+        for pass_name in ("local-agentic", "local-agentic-write"):
+            for age_min in (0.3, 90):  # 18s and 90min -- both killed now
+                with self.subTest(pass_name=pass_name, age_min=age_min):
+                    wr = self._spawn()
+                    tid = f"t-{pass_name}-{age_min}"
+                    self._hb("worker-reasoning", status="working", pass_=pass_name, pid=wr.pid, task_id=tid)
+                    self._task("worker-reasoning", tid, claimed_epoch=time.time() - age_min * 60)
+                    summary = app._preempt_pipeline_for_chat()
+                    self.assertTrue(self._was_killed(wr), f"{pass_name} {age_min}min draft must be killed")
+                    self.assertTrue((self.queue / "pending" / f"{tid}.json").exists())
+                    self.assertEqual({s["lane"]: s["action"] for s in summary}.get("worker-reasoning"), "killed")
 
     def test_spare_long_reasoning_env_restores_the_age_gate(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": "true"}):

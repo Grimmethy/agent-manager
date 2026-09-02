@@ -3962,12 +3962,26 @@ def api_chat_inject():
 _PREEMPT_LANES_ALWAYS = ("worker-1", "worker-reasoning")
 _PREEMPT_LANES_AGE_GATED = ("reviewer",)
 # instances/<lane>.json currentPass values in which the heartbeat `pid` is the node
-# child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal.
+# child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal. The
+# `int(hb["pid"]) != daemon_pid` guard below is the real safety net; this just filters out
+# `idle`/`claim`/`starting`.
 _PREEMPT_CHILD_PASSES = frozenset({
     "plan", "implement", "implement-retry", "critique", "revise",
-    "harness-search", "local-agentic", "vote", "review",
+    "harness-search", "local-agentic", "local-agentic-write", "vote", "review",
 })
+# Prefixes for the adhoc agentic-draft family (local-draft.js's maybeLocked labels:
+# local-agentic, local-agentic-write, local-agentic-test-*). Matched by prefix so a new
+# tier label can't silently drop out of preemption again -- 2026-09-02, worker-reasoning
+# held the GPU 12 min in `local-agentic-write` (missing from the set above) while a chat
+# turn blocked, because the exact-match check skipped it entirely.
+_PREEMPT_CHILD_PASS_PREFIXES = ("local-agentic", "harness-search")
 _MODEL_INFLIGHT_STALE_S = 300  # mirrors src/model-inflight-lock.js STALE_MS
+
+
+def _is_preemptable_child_pass(pass_name) -> bool:
+    if not pass_name:
+        return False
+    return pass_name in _PREEMPT_CHILD_PASSES or pass_name.startswith(_PREEMPT_CHILD_PASS_PREFIXES)
 
 
 def _chat_preempt_enabled() -> bool:
@@ -4077,7 +4091,7 @@ def _preempt_pipeline_for_chat() -> list:
                 sdt = parse_hb_timestamp(lock.get("startedAt"))
                 started_epoch = sdt.timestamp() if sdt else None
             if kill_pid is None and hb.get("status") in ("working", "queued") \
-                    and hb.get("currentPass") in _PREEMPT_CHILD_PASSES and hb.get("pid"):
+                    and _is_preemptable_child_pass(hb.get("currentPass")) and hb.get("pid"):
                 daemon_pid = None
                 try:
                     daemon_pid = int((pids_dir / f"{lane}.pid").read_text().strip())
