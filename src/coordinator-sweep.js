@@ -112,6 +112,12 @@ function stampHubMerged(parent) {
   if (!parent.mergedAt) {
     parent.mergedAt = new Date().toISOString();
     parent.mergedAtSource = 'coordinator-hub-all-subtasks-done';
+    // Close the hub's task log with a terminal event (task-disposition.js) -- a hub has no
+    // branch of its own, so "every sub-task shipped" IS its merge.
+    if (parent.terminalDisposition !== 'merged') {
+      appendHistoryEvent(parent, 'merged', 'coordinator hub: every decomposed sub-task reached a terminal-good state');
+      parent.terminalDisposition = 'merged';
+    }
   }
 }
 

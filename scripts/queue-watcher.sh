@@ -146,6 +146,18 @@ while :; do
     coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
     printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
 
+    # Task-log reconcile: `applied` used to be the last event in a done task's history, so
+    # an update audit could not tell from the log whether a task's code actually reached
+    # origin/<main>, is still on an unmerged agent/<id> branch, or was applied to a branch
+    # that has since vanished (lost work). This resolves the true state from git and appends
+    # a terminal disposition event (merged / pending-merge / abandoned / filed / noop /
+    # applied-direct). Incremental via queue/task-log-reconcile-state.json -- one git harvest
+    # per run, then only new arrivals + the small pending-merge set are re-read, so it is
+    # cheap enough to run every tick like the sweeps above. `npm run task-log-reconcile --
+    # --report` (or -- --backfill) for the human-facing audit view.
+    task_log_result="$(node "${PACKAGE_SRC_DIR}/task-log-reconcile.js" 2>>"${HOME_LOGS}/task-log-reconcile.log")"
+    printf '[watchdog] task-log-reconcile: %s\n' "$task_log_result" >&2
+
     # Auto-confirm review: queue/awaiting-confirm/ is no longer a pure human gate. A held
     # task (a Group B delete batch, or a pipeline_forensics root-cause report) gets a small
     # local CONFIRM/DENY majority vote -- confident CONFIRM moves it back to approved/ for a
