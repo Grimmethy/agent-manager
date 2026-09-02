@@ -1,6 +1,7 @@
-"""Tests for app.py's Chat "make GPU space" preemption (brain dump #5): worker-1's
-in-flight draft is always killed for a local-provider chat turn; worker-reasoning's /
-the reviewer's only if it started < AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S ago.
+"""Tests for app.py's Chat "make GPU space" preemption (brain dump #5): for a local-provider
+chat turn BOTH worker lanes' in-flight draft are killed outright (chat precludes workers,
+2026-09-02); only the reviewer is age-gated. AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING
+opts worker-reasoning back into age-gating.
 
 Run: .venv/bin/python -m unittest python.dashboard.test_chat_preempt -v
 """
@@ -22,25 +23,38 @@ import app  # noqa: E402
 class PreemptDecisionTest(unittest.TestCase):
     NOW = 1_000_000.0
 
-    def test_worker1_with_an_inflight_call_is_always_killed(self):
-        self.assertEqual(app._preempt_decision("worker-1", 4242, None, self.NOW, 180)[0], "kill")
-        self.assertEqual(app._preempt_decision("worker-1", 4242, self.NOW - 9999, self.NOW, 180)[0], "kill")
+    def test_a_lane_marked_always_is_killed_regardless_of_age(self):
+        for age in (None, self.NOW - 30, self.NOW - 9999):
+            self.assertEqual(app._preempt_decision("worker-1", 4242, age, self.NOW, 180, always=True)[0], "kill")
+            self.assertEqual(app._preempt_decision("worker-reasoning", 4242, age, self.NOW, 180, always=True)[0], "kill")
 
     def test_no_inflight_pid_is_skipped(self):
-        self.assertEqual(app._preempt_decision("worker-1", None, None, self.NOW, 180)[0], "skip")
-        self.assertEqual(app._preempt_decision("reviewer", 0, self.NOW, self.NOW, 180)[0], "skip")
+        self.assertEqual(app._preempt_decision("worker-1", None, None, self.NOW, 180, always=True)[0], "skip")
+        self.assertEqual(app._preempt_decision("reviewer", 0, self.NOW, self.NOW, 180, always=False)[0], "skip")
 
-    def test_age_gated_lane_young_task_is_killed(self):
-        self.assertEqual(app._preempt_decision("worker-reasoning", 99, self.NOW - 30, self.NOW, 180)[0], "kill")
-        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 179, self.NOW, 180)[0], "kill")
+    def test_age_gated_lane_young_call_is_killed(self):
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 30, self.NOW, 180, always=False)[0], "kill")
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 179, self.NOW, 180, always=False)[0], "kill")
 
-    def test_age_gated_lane_old_task_is_spared(self):
-        self.assertEqual(app._preempt_decision("worker-reasoning", 99, self.NOW - 181, self.NOW, 180)[0], "spare")
-        self.assertEqual(app._preempt_decision("worker-reasoning", 99, self.NOW - 3600, self.NOW, 180)[0], "spare")
+    def test_age_gated_lane_old_call_is_spared(self):
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 181, self.NOW, 180, always=False)[0], "spare")
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 3600, self.NOW, 180, always=False)[0], "spare")
 
     def test_age_gated_lane_unknown_age_is_spared_not_killed(self):
-        # Conservative: never kill work we can't date.
-        self.assertEqual(app._preempt_decision("worker-reasoning", 99, None, self.NOW, 180)[0], "spare")
+        self.assertEqual(app._preempt_decision("reviewer", 99, None, self.NOW, 180, always=False)[0], "spare")
+
+    def test_default_always_set_now_includes_worker_reasoning(self):
+        # `always` not passed -> derived from the static _PREEMPT_LANES_ALWAYS.
+        self.assertEqual(app._preempt_decision("worker-reasoning", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
+        self.assertEqual(app._preempt_decision("worker-1", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
+        self.assertEqual(app._preempt_decision("reviewer", 7, self.NOW - 9999, self.NOW, 180)[0], "spare")
+
+    def test_lane_sets_flip_with_the_spare_long_reasoning_env(self):
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": ""}, clear=False):
+            os.environ.pop("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING", None)
+            self.assertEqual(app._preempt_lane_sets(), (("worker-1", "worker-reasoning"), ("reviewer",)))
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": "true"}):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-1",), ("worker-reasoning", "reviewer")))
 
 
 class PreemptPipelineTest(unittest.TestCase):
@@ -53,9 +67,11 @@ class PreemptPipelineTest(unittest.TestCase):
         (self.queue / "drafting" / "worker-1").mkdir(parents=True)
         (self.queue / "drafting" / "worker-reasoning").mkdir(parents=True)
         (self.queue / "pending").mkdir(parents=True)
+        os.environ.pop("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING", None)
         self._patches = [
             mock.patch.object(app, "instances_dir", return_value=self.inst),
             mock.patch.object(app, "queue_dir", return_value=self.queue),
+            mock.patch.object(app, "read_env_file", return_value={}),
         ]
         for p in self._patches:
             p.start()
@@ -79,8 +95,6 @@ class PreemptPipelineTest(unittest.TestCase):
 
     @staticmethod
     def _was_killed(pr):
-        # A SIGKILLed Popen child is a zombie (os.kill(pid,0) still succeeds) until the
-        # parent reaps it -- reap here, then check the signal-terminated return code.
         try:
             return pr.wait(timeout=2) < 0
         except subprocess.TimeoutExpired:
@@ -105,34 +119,34 @@ class PreemptPipelineTest(unittest.TestCase):
         self._hb("worker-1", status="working", pass_="implement", pid=w1.pid, task_id="t-w1")
         self._task("worker-1", "t-w1")
         self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
-        # reviewer's call has no .model-locks entry and no claimedAt -> falls back to the
-        # (nonexistent) drafting file mtime -> age unknown -> spared.
         summary = app._preempt_pipeline_for_chat()
 
         self.assertTrue(self._was_killed(w1), "worker-1 draft child was killed")
-        self.assertIsNone(rv.poll(), "reviewer was spared")
-        self.assertFalse((self.queue / "drafting" / "worker-1" / "t-w1.json").exists())
+        self.assertIsNone(rv.poll(), "reviewer was spared (age unknown)")
         self.assertTrue((self.queue / "pending" / "t-w1.json").exists(), "worker-1 task requeued to pending/")
         actions = {s["lane"]: s["action"] for s in summary}
         self.assertEqual(actions.get("worker-1"), "killed")
         self.assertEqual(actions.get("reviewer"), "spare")
 
-    def test_worker_reasoning_young_task_killed_via_claimedAt(self):
-        wr = self._spawn()
-        self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id="t-wr")
-        self._task("worker-reasoning", "t-wr", claimed_epoch=time.time() - 20)
-        summary = app._preempt_pipeline_for_chat()
-        self.assertTrue(self._was_killed(wr))
-        self.assertTrue((self.queue / "pending" / "t-wr.json").exists())
-        self.assertEqual({s["lane"]: s["action"] for s in summary}.get("worker-reasoning"), "killed")
+    def test_worker_reasoning_is_killed_regardless_of_age(self):
+        for age_min in (0.3, 10, 90):  # 18s, 10min, 90min old -- all killed now
+            with self.subTest(age_min=age_min):
+                wr = self._spawn()
+                self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id=f"t-{age_min}")
+                self._task("worker-reasoning", f"t-{age_min}", claimed_epoch=time.time() - age_min * 60)
+                summary = app._preempt_pipeline_for_chat()
+                self.assertTrue(self._was_killed(wr), f"{age_min}min-old reasoning draft must be killed")
+                self.assertTrue((self.queue / "pending" / f"t-{age_min}.json").exists())
+                self.assertEqual({s["lane"]: s["action"] for s in summary}.get("worker-reasoning"), "killed")
 
-    def test_worker_reasoning_old_task_spared_via_claimedAt(self):
-        wr = self._spawn()
-        self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id="t-old")
-        self._task("worker-reasoning", "t-old", claimed_epoch=time.time() - 600)
-        app._preempt_pipeline_for_chat()
-        self.assertIsNone(wr.poll(), "a 10-min-old reasoning task is spared")
-        self.assertTrue((self.queue / "drafting" / "worker-reasoning" / "t-old.json").exists())
+    def test_spare_long_reasoning_env_restores_the_age_gate(self):
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": "true"}):
+            wr = self._spawn()
+            self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id="t-old")
+            self._task("worker-reasoning", "t-old", claimed_epoch=time.time() - 600)
+            app._preempt_pipeline_for_chat()
+            self.assertIsNone(wr.poll(), "with the opt-in env, a 10-min-old reasoning draft is spared again")
+            self.assertTrue((self.queue / "drafting" / "worker-reasoning" / "t-old.json").exists())
 
     def test_idle_lane_and_claim_pass_are_left_alone(self):
         idle = self._spawn()
