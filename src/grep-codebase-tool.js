@@ -88,6 +88,38 @@ function grepCodebase({ query, dir, root, contextLines }) {
   const maxMatches = ctx > 0 ? MAX_MATCHES_WITH_CONTEXT : MAX_MATCHES;
   const hits = [];
 
+  // Scan one file's lines for the query. `force` bypasses the extension allowlist -- used
+  // when the caller (or the model) named a specific file, so e.g. an index.html or a
+  // .yaml the model explicitly points at is still searched.
+  function grepOneFile(fullPath, force) {
+    if (!force && !MATCH_EXTENSIONS.includes(path.extname(fullPath))) return;
+    let text;
+    try {
+      text = fs.readFileSync(fullPath, 'utf8');
+    } catch {
+      return;
+    }
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (hits.length >= maxMatches) return;
+      if (!lineMatches(lines[i], query)) continue;
+      const hit = {
+        file: path.relative(base, fullPath).replace(/\\/g, '/'),
+        line: i + 1,
+        text: lines[i].trim(),
+        // Which root `file` is relative to -- lets a multi-root caller round-trip a hit
+        // into read_file with an absolute path. Only set for an alternate root so
+        // existing single-root callers see a byte-identical shape.
+        ...(altRoot ? { root: altRoot } : {}),
+      };
+      if (ctx > 0) {
+        hit.before = lines.slice(Math.max(0, i - ctx), i);
+        hit.after = lines.slice(i + 1, i + 1 + ctx);
+      }
+      hits.push(hit);
+    }
+  }
+
   function walk(current) {
     let entries;
     try {
@@ -102,40 +134,26 @@ function grepCodebase({ query, dir, root, contextLines }) {
       if (entry.isDirectory()) {
         if (['node_modules', '.git', 'queue'].includes(entry.name)) continue;
         walk(fullPath);
-      } else if (entry.isFile() && MATCH_EXTENSIONS.includes(path.extname(entry.name))) {
-        let text;
-        try {
-          text = fs.readFileSync(fullPath, 'utf8');
-        } catch {
-          continue;
-        }
-        const lines = text.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          if (hits.length >= maxMatches) return;
-          if (lineMatches(lines[i], query)) {
-            const hit = {
-              file: path.relative(base, fullPath).replace(/\\/g, '/'),
-              line: i + 1,
-              text: lines[i].trim(),
-              // Which root `file` is relative to -- lets a multi-root caller round-trip
-              // a hit into read_file with an absolute path. Only set for an alternate
-              // root so existing single-root callers see a byte-identical shape.
-              ...(altRoot ? { root: altRoot } : {}),
-            };
-            if (ctx > 0) {
-              hit.before = lines.slice(Math.max(0, i - ctx), i);
-              hit.after = lines.slice(i + 1, i + 1 + ctx);
-            }
-            hits.push(hit);
-          }
-        }
+      } else if (entry.isFile()) {
+        grepOneFile(fullPath, false);
       }
     }
   }
 
   for (const sr of searchRoots) {
     if (hits.length >= maxMatches) break;
-    walk(sr);
+    // A search root can be a FILE, not a directory -- resolvePrimaryDirs happily returns
+    // "src/task-sources.js" for a model that passed a file as `dir` (it starts with an
+    // allowed dir). Grep it directly instead of readdirSync'ing it into an ENOTDIR skip.
+    let stat;
+    try {
+      stat = fs.statSync(sr);
+    } catch (err) {
+      console.warn(`grep-codebase: skipped ${sr}: ${err.message}`);
+      continue;
+    }
+    if (stat.isFile()) grepOneFile(sr, true);
+    else walk(sr);
   }
   return hits;
 }

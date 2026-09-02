@@ -81,6 +81,43 @@ test('grepCodebase accepts a subpath of an allowed dir', () => {
   });
 });
 
+test('grepCodebase accepts a single FILE path as `dir` -- greps it directly, no ENOTDIR', () => {
+  const dir = makeFixtureRepo();
+  withConfig(dir, 'src,python', () => {
+    const hits = grepCodebase({ query: 'draftTask', dir: 'src/worker.js' });
+    assert.ok(Array.isArray(hits));
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'src/worker.js');
+  });
+});
+
+test('grepCodebase greps a named file regardless of extension (index.html etc.)', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'src', 'page.html'), '<div>renderJobListTab</div>\n');
+  withConfig(dir, 'src,python', () => {
+    const hits = grepCodebase({ query: 'renderJobListTab', dir: 'src/page.html' });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'src/page.html');
+  });
+});
+
+test('grepCodebase: a directory walk still respects the extension allowlist (a .html inside a dir is not searched)', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'src', 'page.html'), '<div>draftTask</div>\n');
+  withConfig(dir, 'src,python', () => {
+    const hits = grepCodebase({ query: 'draftTask', dir: 'src' });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].file, 'src/worker.js', 'the .html is skipped in a dir walk, only the .js matches');
+  });
+});
+
+test('grepCodebase: a named file that does not exist returns [] (not an ENOTDIR/ENOENT crash)', () => {
+  const dir = makeFixtureRepo();
+  withConfig(dir, 'src,python', () => {
+    assert.deepEqual(grepCodebase({ query: 'x', dir: 'src/nope.js' }), []);
+  });
+});
+
 test('grepCodebase with dir "." (or omitted) searches every allowed dir', () => {
   const dir = makeFixtureRepo();
   fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'const beacon = 1;\n');
