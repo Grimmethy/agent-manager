@@ -73,10 +73,25 @@ function postExhaustionPrompt(task, priorInvestigation, priorAttempt, opener) {
   ].filter(Boolean).join('\n');
 }
 
+// Strip a qwen3-style reasoning block. Native Ollama `think` is supposed to keep it out of
+// message.content, but confirmed live 2026-09-02 (second-brain note-graph decompose): with
+// think:true the 27B leaked a `<think> ... [lists] ... </think>` prefix into the response,
+// and parseSubTaskProposals' greedy `/\[[\s\S]*\]/` then matched from the first `[` INSIDE
+// the reasoning to the last `]` of the real array -> unparseable -> null every time, while
+// the exact same prompt with think:false produced a clean, valid 3-subtask array. Belt and
+// braces alongside the think:false switch in runDecomposePass below.
+function stripReasoningBlock(text) {
+  let out = (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+  // An unclosed <think> (ran out of budget mid-reasoning) -- drop everything up to it.
+  const openIdx = out.search(/<think>/i);
+  if (openIdx !== -1) out = out.slice(0, openIdx);
+  return out.trim();
+}
+
 // Pull the JSON object OR array out of the model's answer and hand the subtask list to
 // the existing parser. Returns { subTasks } (>= 2) or null.
 function extractSubTasks(text) {
-  const raw = (text || '').trim();
+  const raw = stripReasoningBlock(text);
   // Try an object with a `subtasks` key first (preliminary mode).
   const objMatch = raw.match(/\{[\s\S]*\}/);
   if (objMatch) {
@@ -125,7 +140,14 @@ async function runDecomposePass(task, {
   try {
     result = useClaude
       ? await doCall({ prompt, maxTurns: 1, permissionMode: 'dontAsk' })
-      : await doCall({ prompt, think: true, temperature: 0.3, source: (task && task.source) || 'adhoc' });
+      // think:false, deliberately. Confirmed live 2026-09-02 (second-brain note-graph
+      // task, which had been stuck in a decompose loop for 13h): with think:true the 27B
+      // spends its generation budget on native reasoning and TRUNCATES the JSON array
+      // mid-first-subtask (~670 chars, no closing `]`) -> extractSubTasks null every time.
+      // The exact same prompt with think:false returns a complete, valid multi-subtask
+      // array in ~30s. This prompt is a bounded format-transformation, not a task that
+      // needs chain-of-thought.
+      : await doCall({ prompt, think: false, temperature: 0.3, source: (task && task.source) || 'adhoc' });
   } catch {
     return null; // a failed decompose call is non-fatal -- the caller falls back to its normal path
   }

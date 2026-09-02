@@ -220,6 +220,37 @@ test('write tier: buildWriteAgenticPrompt folds in the plan (with a blind-plan d
   });
 });
 
+// The repeated-decompose backstop: it fires on ANY give-up verdict (blocked OR
+// needsClarification), not just blocked. Confirmed live 2026-09-02: after two decompose
+// blocks the model punts pass 3 to needs-human-decision, which is blocked:false, and the
+// old `verdict.blocked && ...` gate skipped the deterministic split -> needs-clarification/
+// with a placeholder non-question.
+test('write tier: backstop runs the deterministic split when a decomposeBlockCount>=2 task punts to needsClarification', async () => {
+  await withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    delete require.cache[require.resolve('./decompose-pass.js')];
+    const adc = require('./agentic-draft-common.js');
+    const dp = require('./decompose-pass.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const realDec = dp.runDecomposePass;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    dp.runDecomposePass = async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'wbk', source: 'manual', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'big multi-part thing' } };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      assert.equal(res.resolution, 'decompose');
+      assert.equal(task.adhocResolution, 'decompose');
+      assert.equal(task.subTaskProposals.length, 2);
+      assert.equal(task.needsClarification, undefined, 'the needs-clarification routing is cleared');
+      assert.equal(task.autoDecomposeCount, 1);
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      dp.runDecomposePass = realDec;
+    }
+  });
+});
+
 test('write tier: turn cap default is 35, env override still wins', async () => {
   await withRepo(async () => {
     const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;

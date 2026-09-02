@@ -180,6 +180,38 @@ test('resolveAgenticDraft(decompose) with partial edits AT the continuation cap 
   });
 });
 
+test('resolveAgenticDraft(decompose) n===0 WITH partial worktree edits -> continuation (not a block that discards the work)', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'new.txt'), 'a helper I wrote before the malformed split\n');
+    const task = { id: 't2n0cont' };
+    const out = resolveAgenticDraft(task, {
+      // decompose, but the JSON is malformed -> parseSubTaskProposals returns 0
+      result: { response: 'I added the cache helper.\n\nRESOLUTION: decompose\n{not: valid json array}' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation 1\/2/);
+    assert.equal(task.isAgenticContinuation, true);
+    assert.equal(task.agenticContinuationCount, 1);
+    assert.match(task.priorPartialDiff, /new\.txt/);
+    assert.equal(task.decomposeBlockCount, undefined, 'partial work continues -- not counted as a failed decompose');
+  });
+});
+
+test('resolveAgenticDraft(decompose) n===0 with NO edits -> the usual malformed-JSON block, decomposeBlockCount incremented', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2n0none' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\nnope not json' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /no valid JSON array of \{title, rawText\}/);
+    assert.equal(task.decomposeBlockCount, 1);
+    assert.equal(task.retryableDraftBlock, true);
+  });
+});
+
 test('resolveAgenticDraft(needs-human-decision): needsClarification, no diff', () => {
   withRealRepo((wt) => {
     const task = { id: 't3' };
