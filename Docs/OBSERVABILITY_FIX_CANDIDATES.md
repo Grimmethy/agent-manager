@@ -1881,3 +1881,26 @@ Replace the bare `except Exception: pass` with a `logging.getLogger(__name__).wa
 
 Benefits:
 Once fixed, any future regression in `enc.dict.mint()` — whether from a schema change, a missing encoding key, or a library upgrade that alters the `mint()` contract — produces an immediately visible, greppable log line with full context (key, exception, traceback) at the moment of failure. An operator or on-call engineer can diagnose the root cause in minutes rather than days of correlating downstream symptoms. The fix adds no new dependency, changes no control flow, and preserves the existing best-effort semantics while closing the only observability gap this project has for this code path.
+
+### AC-105 · Log swallowed decode exceptions before fail-soft return
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/engine.py
+Snippet:
+```
+            return text                      # Agent Mode: stay compact
+        try:
+            return self.decoder_for(session_id, scope).decode(text)
+        except Exception:
+            return text                      # fail-soft
+
+    def stream_decoder(self, session_id: str = "", scope: str | None = None) -> StreamDecoder:
+```
+
+Problem:
+The decode path catches every exception with a bare `except Exception: return text` and discards the error entirely. If `decoder_for` or `.decode` fails due to a misconfigured codec, a missing session entry, a typo in an attribute name, or any other programming error, the system silently degrades: every subsequent call in the session hits the same failure, returns undecoded text, and produces no log line, no stack trace, and no other diagnostic signal. An operator has no way to discover that the decode path has been dead since a deploy or configuration change, and the broad `except Exception` also masks `TypeError`, `KeyError`, and `AttributeError` that should be visible during development or a canary rollout.
+
+Solution:
+Add a module-level `logger = logging.getLogger(__name__)` (stdlib `logging`, already used elsewhere in this repo) and, inside the existing `except Exception` block, emit `logger.warning("tokenfold decode failed; returning raw text (session_id=%r, scope=%r)", session_id, scope, exc_info=True)` before the `return text` fail-soft fallback. The `exc_info=True` kwarg attaches the full traceback to the log record so the root cause is recoverable from the log stream. No new dependency, no metrics emission, no change to the caller-facing contract — the function still returns the raw text on failure.
+
+Benefits:
+Once fixed, any decode failure produces a single `WARNING`-level log line carrying the session ID, the scope, and the full exception traceback, giving an operator an immediate, greppable signal that the decode path is broken and exactly why. Programming errors (`TypeError`, `KeyError`, `AttributeError`) that were previously invisible become visible during development and canary testing, shortening the time-to-detection from "indefinite silent degradation" to "first failed call." The fail-soft contract for callers is unchanged, so no downstream code needs to be updated.
