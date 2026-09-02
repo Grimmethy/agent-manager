@@ -332,8 +332,8 @@ def record_project_used(path: str):
         history.insert(0, normalized)
         history = history[:MAX_PROJECT_HISTORY]
         PROJECT_HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        logging.warning("Failed to persist project history to %s: %s", PROJECT_HISTORY_PATH, exc, exc_info=exc)
 
 
 # Live dashboard settings a user changes by clicking in the UI, not by editing
