@@ -286,10 +286,42 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
     }
 
+    // A pass that made REAL edits and then answered RESOLUTION: decompose is not "this
+    // can't be one change" -- it is "I did part of it and ran low on turns/confidence."
+    // Accepting the split here discards that partial work (rawDiff = '') AND routinely
+    // drops whatever the model already finished from the sub-task list (root-caused live
+    // 2026-09-02 via the plugins-marketplace endpoint task: tier 3 wrote the catalog
+    // validators in app.py, then split into "seed file" + "test file" and the endpoint
+    // itself -- the actual deliverable -- silently vanished). Redirect it to a CONTINUATION
+    // (finish what you started), same mechanism the needs-human-decision branch uses,
+    // bounded by MAX_AGENTIC_CONTINUATIONS. Only once that budget is spent and it STILL
+    // wants to split do we accept the decompose.
+    const decomposeDiff = bestEffortDiff();
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    if (decomposeDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = decomposeDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish before any split`,
+        ...meta,
+        capturedDiff: decomposeDiff,
+      };
+    }
+
     task.adhocResolution = resolution;
     task.subTaskProposals = subTasks;
     task.rawDiff = '';
-    task.implementResponse = summary;
+    // Keep the partial-work note visible for the sub-task drafters / a human even when the
+    // split is finally accepted -- the diff itself is not carried (the pieces re-derive it
+    // against current code), but "an earlier pass got this far" is worth stating.
+    task.implementResponse = decomposeDiff
+      ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they were not carried forward -- each sub-task starts from current \`main\`.)`
+      : summary;
     return { succeeded: true, blocked: false, ...meta };
   }
 

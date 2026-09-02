@@ -177,6 +177,21 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('The drafting model produced the plan and implementation below and cannot verify its own claims -- treat every concrete claim as UNVERIFIED.');
   lines.push('');
   lines.push(`TASK: ${task.title} (domain=${task.domain}, source=${task.source})`);
+  // A decompose / candidate-split proposal is judged on COVERAGE -- do the sub-tasks
+  // together deliver everything the original asked for? -- but the one-line title above is
+  // not enough to check that against. Inject the full original request text so the
+  // "no silently dropped requirement" guidance below has something concrete to verify.
+  // (Root-caused live 2026-09-02: a decompose that dropped the core deliverable -- an
+  // /api endpoint -- was approved 2/3 because the reviewer only ever saw the title.)
+  const isSplitProposal = !!task.candidateSplitProposals
+    || (task.source === 'manual' && task.adhocResolution === 'decompose');
+  const originalAsk = task.promptContext
+    && (task.promptContext.rawText || task.promptContext.body);
+  if (isSplitProposal && originalAsk) {
+    lines.push('');
+    lines.push('--- ORIGINAL REQUEST (full text -- the sub-tasks below must TOGETHER cover every concrete deliverable named here) ---');
+    lines.push(String(originalAsk).length > 8000 ? `${String(originalAsk).slice(0, 8000)}\n...[truncated]` : String(originalAsk));
+  }
   lines.push('');
   lines.push('--- PLAN ---');
   lines.push(task.planResponse);
@@ -220,7 +235,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     // incident/design. A split proposal deliberately has no diff, and the generic
     // "does it contain real, complete code" completeness question would reject every
     // correct split on sight for exactly that reason.
-    lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. Is it sound: do the sub-candidates, together, actually cover the FULL original candidate scope (no silently dropped requirement)? Is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
+    lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. COVERAGE IS THE MAIN TEST: enumerate every concrete deliverable in the ORIGINAL REQUEST shown above; for each, point at the sub-candidate that delivers it. REJECT if any named deliverable -- especially the core change, not just peripheral pieces -- is left uncovered by every sub-candidate. Then: is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
   } else {
     const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
