@@ -2019,3 +2019,26 @@ At the top of the module (or just above the loop), obtain a logger with `log = l
 
 Benefits:
 Once the `except` body logs, every swallowed failure produces a timestamped, source-identified traceback in the process log. An operator who sees a `None` cell in the dashboard can immediately `grep` for the source name in the log and read the exact exception and stack frame that caused it, reducing diagnosis from "which file is broken and why?" to a one-line lookup. The fault-isolation guarantee is preserved—other sources still render—so the fix adds observability without changing runtime behaviour or adding any new dependency.
+
+### AC-111 · File-serving exception swallowed by bare `abort(404)`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    root = _reports_root()
+    if not root:
+        abort(404, description="SECOND_BRAIN_DIR is not configured")
+    path = root / period / filename
+    if not path.is_file():
+        abort(404)
+    try:
+```
+
+Problem:
+The file-serving handler catches an exception (e.g. a `PermissionError`, `OSError`, or `IOError` raised while reading the requested file) and immediately calls `abort(404)`. The original exception object is never logged, so a genuine I/O or permissions failure is indistinguishable from a simple "file does not exist" case. An operator seeing a 404 in the access log has no way to tell whether the file is truly missing or whether the disk is failing, the user lacks read permission, or the path is a dangling symlink. The root-cause traceback is discarded into the void.
+
+Solution:
+In the `except` block that currently falls through to `abort(404)`, call `logging.exception("Failed to serve file %r", requested_path)` (or `logging.error(..., exc_info=True)` if the exception variable is already bound) immediately before the `abort(404)` call. Ensure `import logging` appears at the top of the module if it is not already present. The `abort(404)` response itself is unchanged so existing client-facing behaviour is preserved; the only addition is the structured log line that captures the exception class, message, and full traceback with the requested path as context. No new dependency is introduced—`logging` is the Python standard library and is the project's designated logging primitive for Python code.
+
+Benefits:
+Once deployed, any non-"not-found" failure in the file-serving path produces a single, grep-able log line containing the exception type, message, and traceback, letting an operator immediately distinguish a missing file (no log line, just the 404) from a permissions or I/O fault (log line present, 404 still returned). This eliminates the silent-failure blind spot without changing the HTTP contract, adding a new dependency, or introducing a metrics system the project does not have.
