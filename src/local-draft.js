@@ -142,6 +142,38 @@ function isCandidateFulfillmentSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.candidateFulfillment);
 }
+
+// promptContext.fetchedFiles is a snapshot taken ONCE at candidate-creation
+// (nextCandidateFulfillmentTask, task-sources.js) and, until now, never refreshed before
+// the DRAFT prompt was built -- only before review (get-grounding-source.js's
+// refreshFetchedFileContent). Confirmed live 2026-09-02: 10 blocked observability_fix
+// tasks kept re-drafting a duplicate `import logging` / a stale `except` target, because a
+// SIBLING AC on the same file (app.py, hardware_stats.py, ...) had merged its own import
+// addition in the meantime and the frozen snapshot still showed the pre-merge file. Re-read
+// each fetched path from disk here, re-windowed the same way, so plan + implement +
+// findUnverifiedEdit all see current reality. Best-effort: a deleted/moved/unreadable path
+// keeps its frozen copy (stale grounding beats none), same fallback as the review path.
+function refreshCandidateFetchedFiles(task) {
+  const pc = task && task.promptContext;
+  if (!pc || !Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
+  let repoRoot;
+  try { ({ repoRoot } = getConfig()); } catch { return; }
+  if (!repoRoot) return;
+  let windowFetchedFileContent;
+  try { ({ windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js')); } catch { return; }
+  const resolvedRoot = path.resolve(repoRoot);
+  const section = pc.body || '';
+  pc.fetchedFiles = pc.fetchedFiles.map((f) => {
+    if (!f || !f.path) return f;
+    try {
+      const full = path.resolve(resolvedRoot, f.path);
+      if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
+      return { ...f, content: windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section) };
+    } catch {
+      return f;
+    }
+  });
+}
 function isEmptyApprovalSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.emptyApproval);
@@ -1300,6 +1332,13 @@ async function runDraftPasses(task, attempt, {
   try {
     appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
 
+    // Re-ground a candidate-fulfillment task against CURRENT file content before any
+    // prompt is built (see refreshCandidateFetchedFiles) -- a sibling AC on the same file
+    // may have merged since the frozen fetchedFiles snapshot was taken.
+    if (isCandidateFulfillmentSource(resolveSourceName(task))) {
+      refreshCandidateFetchedFiles(task);
+    }
+
     // Deterministic staleness-recheck short-circuit -- see runStalenessFastpath().
     if (task.source === 'staleness_audit') {
       const fastpathResult = runStalenessFastpath(task, attempt);
@@ -1430,7 +1469,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles };
 
 if (require.main === module) {
   main();
