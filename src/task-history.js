@@ -27,6 +27,14 @@
 //           'review-voted', 'approved', 'blocked', 'requeued', 'exhausted', 'applied',
 //           'apply-failed'. ('implement-started' can appear several times in one draft --
 //           the adhoc tier ladder emits one per tier it enters; see local-draft.js.)
+//           TERMINAL disposition stages -- appended after 'applied' by task-log-reconcile.js
+//           (and by the dashboard merge button / coordinator hub), so the log CLOSES rather
+//           than ending at 'applied' with no record of whether the code shipped:
+//           'merged' (on origin/<main>), 'applied-direct' (a directToMain source committed
+//           straight to <main>), 'filed' (wrote a candidates-doc / Second Brain note),
+//           'noop' (a false-positive / empty-implement verdict), 'pending-merge' (an
+//           agent/<id> branch exists, ahead of <main>, unmerged), 'abandoned' (applied to a
+//           branch that is gone and not on <main> -- lost work). See src/task-disposition.js.
 //   at:     ISO timestamp, always new Date().toISOString() at the moment the stage
 //           actually completed (not backfilled/estimated) -- for a collapsed repeat entry
 //           (see COLLAPSIBLE_REPEAT_STAGES below), the MOST RECENT occurrence's timestamp.

@@ -5504,7 +5504,22 @@ def api_git_merge_branch(branch):
             if candidate.is_file():
                 data = read_json_safe(candidate)
                 if data is not None:
-                    data["mergedAt"] = datetime.now(timezone.utc).isoformat()
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    data["mergedAt"] = now_iso
+                    # Close the task log with a terminal disposition event (see
+                    # src/task-disposition.js) -- `mergedAt` alone is a field the dependency
+                    # gate reads; an update audit reads the history, which used to stop at
+                    # `applied`.
+                    if data.get("terminalDisposition") != "merged":
+                        hist = data.get("history")
+                        if not isinstance(hist, list):
+                            hist = data["history"] = []
+                        hist.append({
+                            "stage": "merged",
+                            "at": now_iso,
+                            "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                        })
+                        data["terminalDisposition"] = "merged"
                     try:
                         candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
                     except OSError:

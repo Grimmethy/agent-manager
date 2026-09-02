@@ -141,6 +141,12 @@ function isDependencySatisfied(pipelineDir, depId) {
       if (!data.mergedAt) {
         data.mergedAt = new Date().toISOString();
         data.mergedAtSource = 'reconciled-from-commit-trailer';
+        // Close the task log too (task-disposition.js) -- a merge detected here is a real
+        // terminal disposition, not just a field the dependency gate reads.
+        if (data.terminalDisposition !== 'merged') {
+          appendHistoryEvent(data, 'merged', `on origin/<main> (reconciled from commit trailer by the dependency gate)`);
+          data.terminalDisposition = 'merged';
+        }
         try { fs.writeFileSync(candidate, JSON.stringify(data, null, 2)); } catch { /* stamp is best-effort; the true return is what matters */ }
       }
       return true;
