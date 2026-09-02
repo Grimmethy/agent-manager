@@ -2042,3 +2042,26 @@ In the `except` block that currently falls through to `abort(404)`, call `loggin
 
 Benefits:
 Once deployed, any non-"not-found" failure in the file-serving path produces a single, grep-able log line containing the exception type, message, and traceback, letting an operator immediately distinguish a missing file (no log line, just the 404) from a permissions or I/O fault (log line present, 404 still returned). This eliminates the silent-failure blind spot without changing the HTTP contract, adding a new dependency, or introducing a metrics system the project does not have.
+
+### AC-112 · Silent `except Exception: pass` around `r2.json()` in proxy retry path
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/proxy.py
+Snippet:
+```
+                    r2 = await client.post(upstream, json=retry, headers=headers)
+                    try:
+                        obj = r2.json()
+                    except Exception:
+                        pass
+            for ch in obj.get("choices", []):
+                msg = ch.get("message", {})
+```
+
+Problem:
+Inside the retry loop, `obj = r2.json()` is wrapped in `try: … except Exception: pass`. If the upstream returns a non-JSON body (HTML error page, empty body, truncated stream, etc.), the exception is discarded without any trace. The code then falls through to `for ch in obj.get("choices", [])`, which either iterates over a stale `obj` from a prior loop iteration or raises an unhelpful `NameError`/`AttributeError` that gives no indication the real cause was a failed JSON parse on the retry response. Because the project has no metrics or telemetry stack, this silent swallow is the *only* place the failure would surface, and it surfaces nowhere.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that records the exception (via `exc_info=True`), the upstream URL, and the fact that this is the retry attempt, so the operator can correlate the event with the request. Concretely, add `import logging` at module top (or reuse an existing module-level `logger = logging.getLogger(__name__)` if one is already present in the file), then change the except body to: `logger.warning("tokenfold proxy: retry response from %s was not valid JSON; falling back to prior obj", upstream, exc_info=True)`. Do **not** re-raise: the surrounding logic intentionally proceeds to `obj.get("choices", [])` with whatever `obj` currently holds (a default or prior-iteration value), and re-raising would break that fallback path. No new dependency is introduced; only the stdlib `logging` module is used.
+
+Benefits:
+An operator tailing application logs can now see, at the moment of failure, exactly which upstream URL returned unparseable JSON on the retry attempt, the full traceback, and the timestamp—turning an otherwise invisible silent skip into a diagnosable event. The fallback-to-prior-`obj` behavior is preserved unchanged, so no caller contract is altered. Because the log line includes the URL and the `exc_info` traceback, a future regression (e.g., upstream switching to a different content-type) is caught in the first occurrence rather than discovered days later as a confusing downstream `AttributeError`.
