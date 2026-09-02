@@ -71,18 +71,18 @@ test('resolveAnchors returns greenfield when the graph has zero nodes with a sou
   assert.deepEqual(result, { status: 'greenfield' });
 });
 
-test('resolveAnchors returns no-match when a real graph exists but nothing in the task text matches any file', () => {
+test('resolveAnchors returns greenfield when a real graph exists but nothing distinctive matches (queue, do not hold)', () => {
   const repoRoot = makeRepo();
   writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/unrelated-module.ts' }]);
   const result = resolveAnchors({ repoRoot, title: 'Totally different topic entirely', rawText: 'nothing here relates' });
-  assert.deepEqual(result, { status: 'no-match' });
+  assert.deepEqual(result, { status: 'greenfield' });
 });
 
-test('resolveAnchors returns no-match when the task text has no usable keywords at all', () => {
+test('resolveAnchors returns greenfield when the task text has no usable keywords at all', () => {
   const repoRoot = makeRepo();
   writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/foo.ts' }]);
   const result = resolveAnchors({ repoRoot, title: 'a to it is', rawText: '' });
-  assert.deepEqual(result, { status: 'no-match' });
+  assert.deepEqual(result, { status: 'greenfield' });
 });
 
 test('resolveAnchors returns a clean match for an unambiguous keyword-to-file hit, validated against real files on disk', () => {
@@ -112,6 +112,39 @@ test('resolveAnchors returns ambiguous when a keyword matches more than one file
   const result = resolveAnchors({ repoRoot, title: 'Fix the auth bug', rawText: '' });
   assert.equal(result.status, 'ambiguous');
   assert.deepEqual(new Set(result.candidates.auth), new Set(['src/auth.ts', 'server/auth.ts']));
+});
+
+test('resolveAnchors drops a common word that matches more than AMBIGUOUS_MAX_HITS files -- not escalated as ambiguous', () => {
+  const repoRoot = makeRepo();
+  const files = ['a/dashboard-one.ts', 'a/dashboard-two.ts', 'a/dashboard-three.ts', 'a/dashboard-four.ts', 'a/dashboard-five.ts'];
+  files.forEach((f) => writeSourceFile(repoRoot, f));
+  writeGraph(repoRoot, files.map((f, i) => ({ id: i, community: 0, source_file: f })));
+  const result = resolveAnchors({ repoRoot, title: 'the dashboard is broken', rawText: '' });
+  assert.equal(result.status, 'greenfield', '"dashboard" matched 5 files -- a common word, dropped; nothing else anchors -> queue normally');
+});
+
+test('resolveAnchors: a clean single-file anchor WINS over a fuzzy multi-hit keyword (no human hold)', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/budget_guard.ts');
+  writeSourceFile(repoRoot, 'src/auth.ts');
+  writeSourceFile(repoRoot, 'server/auth.ts');
+  writeGraph(repoRoot, [
+    { id: 0, community: 0, source_file: 'src/budget_guard.ts' },
+    { id: 1, community: 0, source_file: 'src/auth.ts' },
+    { id: 2, community: 0, source_file: 'server/auth.ts' },
+  ]);
+  const result = resolveAnchors({ repoRoot, title: 'fix budget_guard, also touches auth', rawText: '' });
+  assert.equal(result.status, 'matched');
+  assert.deepEqual(result.paths, ['src/budget_guard.ts']);
+});
+
+test('resolveAnchors skips a 3-char plain word that substring-matches by coincidence', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/build_note_graph.ts');
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/build_note_graph.ts' }]);
+  // "not" (3 chars) would substring-match build_NOTe_graph; must be ignored.
+  const result = resolveAnchors({ repoRoot, title: 'this is not what I meant', rawText: '' });
+  assert.equal(result.status, 'greenfield');
 });
 
 test('resolveAnchors defaults to the standard file, not its .test sibling, when a keyword substring-matches both', () => {
@@ -148,7 +181,7 @@ test('resolveAnchors treats a matched-but-deleted (stale) file the same as no ma
   // renamed/deleted file since the graph was last built.
   writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
   const result = resolveAnchors({ repoRoot, title: 'Fix a bug in budget_guard', rawText: '' });
-  assert.deepEqual(result, { status: 'no-match' });
+  assert.deepEqual(result, { status: 'greenfield' });
 });
 
 test('resolveAnchors combines multiple distinct unambiguous matches into one paths list', () => {
@@ -221,7 +254,7 @@ test('resolveAnchors falls back to the configured UI hub file(s) when normal key
     rawText: 'We should reconcile the ledger totals against last month.',
     uiVocabHubFiles: ['python/dashboard/templates/index.html'],
   });
-  assert.equal(nonUiResult.status, 'no-match');
+  assert.equal(nonUiResult.status, 'greenfield');
 });
 
 test('resolveAnchors never applies the UI fallback when no hub files are configured (opt-in, not a default behavior change)', () => {
@@ -234,7 +267,7 @@ test('resolveAnchors never applies the UI fallback when no hub files are configu
     title: 'Window tabs',
     rawText: "I'd like a tooltip for each tab that activates on hover.",
   });
-  assert.equal(result.status, 'no-match');
+  assert.equal(result.status, 'greenfield');
 });
 
 test('resolveAnchors\' UI fallback only offers a hub file that actually exists on disk', () => {
@@ -248,7 +281,7 @@ test('resolveAnchors\' UI fallback only offers a hub file that actually exists o
     rawText: "I'd like a tooltip for each tab that activates on hover.",
     uiVocabHubFiles: ['python/dashboard/templates/index.html'],
   });
-  assert.equal(result.status, 'no-match');
+  assert.equal(result.status, 'greenfield');
 });
 
 test('resolveAnchors\' UI fallback never overrides a genuinely ambiguous real match', () => {

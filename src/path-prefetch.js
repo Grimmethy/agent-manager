@@ -138,6 +138,13 @@ function matchKeyword(keyword, sourceFiles) {
   const stemHits = sourceFiles.filter((f) => normalize(path.basename(f, path.extname(f))) === normalize(keyword.lower));
   if (stemHits.length > 0) return preferNonTestSibling(stemHits);
 
+  // Substring fallback: skip a 3-char plain English word ("not", "are", "can", "box",
+  // "try"). Those substring-match filenames purely by coincidence ("not" -> build_NOTe_
+  // graph.py, "box" -> sandBOX.js) and are never a real anchor. Confirmed live 2026-09-02:
+  // well-scoped brain-dump tasks held on nothing but this class of noise. 4+ char words
+  // and identifier-shaped tokens still match.
+  if (!keyword.looksLikeIdentifier && keyword.lower.length < 4) return [];
+
   return preferNonTestSibling(sourceFiles.filter((f) => f.toLowerCase().includes(keyword.lower)));
 }
 
@@ -146,24 +153,34 @@ function matchKeyword(keyword, sourceFiles) {
 // defeats the entire point (the same context-bloat problem this feature exists to fix).
 const MAX_PREFETCHED_PATHS = 12;
 
+// A keyword whose substring/stem match hits MORE than this many files is a common word
+// ("dashboard", "test", "pipeline", "session"), not an anchor -- dropped, never escalated
+// to a human as an "ambiguous" choice. Only 2..this-many hits is a real "which of these".
+const AMBIGUOUS_MAX_HITS = 4;
+
 // Resolves anchor keywords from a task's title/rawText against repoRoot's project graph
 // (graphify-out/graph.json by default, same file arch_discovery already reads -- see
 // config.js). Returns exactly one of:
 //   { status: 'greenfield' }                                -- no graph exists yet for this
 //                                                                project; NOT an error, see
 //                                                                the Discuss session note.
-//   { status: 'no-match' }                                  -- a graph exists but nothing in
-//                                                                the task text matched any
-//                                                                file in it (or the only
-//                                                                matches were stale).
-//   { status: 'ambiguous', candidates: {keyword: [f, ...]} } -- one or more keywords each
-//                                                                matched multiple files;
-//                                                                paths carries whatever
-//                                                                UNAMBIGUOUS matches were
-//                                                                also found, if any.
-//   { status: 'matched', paths: [...] }                      -- every matched keyword
+//   ('no-match' is no longer returned: a graph that exists but yields no confident anchor
+//    is treated as 'greenfield' -- queue the task, let the drafter investigate, do not
+//    hold a well-scoped task for a human just because keyword-matching came up empty.)
+//   { status: 'ambiguous', candidates: {keyword: [f, ...]} } -- the ONLY signal was a
+//                                                                distinctive keyword that
+//                                                                matched a SMALL set (2..
+//                                                                AMBIGUOUS_MAX_HITS) of
+//                                                                real files and no keyword
+//                                                                matched exactly one. A
+//                                                                genuine "which of these
+//                                                                few" for a human.
+//   { status: 'matched', paths: [...] }                      -- at least one keyword
 //                                                                resolved to exactly one
-//                                                                real, on-disk file.
+//                                                                real, on-disk file; those
+//                                                                clean anchors win and any
+//                                                                fuzzy multi-hit keywords
+//                                                                are ignored, not escalated.
 function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHubFiles = [] }) {
   const combinedText = `${title || ''} ${rawText || ''}`;
 
@@ -191,24 +208,23 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHu
   if (sourceFiles.length === 0) return { status: 'greenfield' };
 
   const keywords = extractKeywords(combinedText);
-  if (keywords.length === 0) return uiVocabFallback() || { status: 'no-match' };
+  if (keywords.length === 0) return uiVocabFallback() || { status: 'greenfield' };
 
   const matchedPaths = new Set();
   const ambiguous = {};
-  let anyMatch = false;
 
   for (const keyword of keywords) {
     const hits = matchKeyword(keyword, sourceFiles);
     if (hits.length === 0) continue;
-    anyMatch = true;
     if (hits.length === 1) {
       matchedPaths.add(hits[0]);
-    } else {
+    } else if (hits.length <= AMBIGUOUS_MAX_HITS) {
       ambiguous[keyword.token] = hits;
     }
+    // hits.length > AMBIGUOUS_MAX_HITS: a common word matching a big chunk of the tree
+    // ("dashboard", "test", "pipeline") -- not an anchor, drop it silently. It is neither
+    // a match nor a real "which of these" choice.
   }
-
-  if (!anyMatch) return uiVocabFallback() || { status: 'no-match' };
 
   // Validate every unambiguously-matched path still exists on disk -- the graph can be
   // stale (files renamed/deleted since it was last built) even when the keyword match
@@ -222,12 +238,23 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHu
     }
   });
 
-  if (Object.keys(ambiguous).length > 0) {
-    return { status: 'ambiguous', candidates: ambiguous, paths: validPaths };
+  // A clean single-file anchor is real ground to stand on -- return it and IGNORE any
+  // fuzzy multi-hit keywords. Holding a whole well-scoped task for a human just because
+  // one word also matched three files is exactly the friction this path caused live.
+  if (validPaths.length > 0) {
+    return { status: 'matched', paths: validPaths.slice(0, MAX_PREFETCHED_PATHS) };
   }
-  if (validPaths.length === 0) return uiVocabFallback() || { status: 'no-match' };
 
-  return { status: 'matched', paths: validPaths.slice(0, MAX_PREFETCHED_PATHS) };
+  // No clean anchor, but a distinctive keyword hit a small, real candidate set -- the
+  // genuine "which of these few" a human (or the LLM fallback) should pick.
+  if (Object.keys(ambiguous).length > 0) {
+    return { status: 'ambiguous', candidates: ambiguous, paths: [] };
+  }
+
+  // A graph exists but only common-word noise matched (or nothing) -- treat this like
+  // greenfield: queue the task normally with no prefetch and let the drafter's own
+  // investigation find its files, rather than holding it for a human.
+  return uiVocabFallback() || { status: 'greenfield' };
 }
 
 module.exports = { extractKeywords, resolveAnchors, looksLikeUiRequest, MAX_PREFETCHED_PATHS };

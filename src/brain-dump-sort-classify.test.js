@@ -117,6 +117,49 @@ test('deriveBelongsToProject leaves a non-self, no-project note alone', () => {
   assert.equal(r.belongsToProject, null);
 });
 
+test('deriveBelongsToProject forces null for a "New Plugin >" note even if the classifier assigned a project', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: 'agent-manager', actionable: true },
+    { ...SELF, rawText: 'New Plugin > World Simulator > Location Profiles : We create a growing world of connected locations...' },
+  );
+  assert.deepEqual(r, { belongsToProject: null, actionable: false });
+});
+
+test('deriveBelongsToProject forces null for a "Character concept >" note', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: 'agent-manager', actionable: true },
+    { ...SELF, rawText: 'Character concept > Hooble and the Dragon : Grandpa Gnome always told Hooble...' },
+  );
+  assert.equal(r.belongsToProject, null);
+});
+
+test('deriveBelongsToProject routes to an explicitly-named OTHER tracked project in the note head, not self', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: null, actionable: false },
+    { selfProjectLabel: 'agent-manager', projectLabels: ['agent-manager', 'promptforge'],
+      rawText: 'PromptForge SB Originated Characters don\'t retain the previously selected details when I switch between them.' },
+  );
+  assert.deepEqual(r, { belongsToProject: 'promptforge', actionable: true });
+});
+
+test('deriveBelongsToProject does NOT route to a project merely mentioned in the note BODY', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: null, actionable: true },
+    { selfProjectLabel: 'agent-manager', projectLabels: ['agent-manager', 'promptforge'],
+      rawText: 'agent-manager > local-draft / requeue : fix the cross-repo requeue that resets retry history. Observed while the pipeline was pointed at PromptForge.' },
+  );
+  assert.equal(r.belongsToProject, 'agent-manager', 'the head names agent-manager; the body "PromptForge" mention must not hijack it');
+  assert.notEqual(r.belongsToProject, 'promptforge');
+});
+
+test('parseBrainDumpSortResult coerces the literal string "null" / "none" to a real null', () => {
+  const r = parseBrainDumpSortResult(JSON.stringify({
+    secondBrainPath: 'Ideas/x.md', possibleDuplicateOf: 'null', belongsToProject: 'none',
+  }));
+  assert.equal(r.possibleDuplicateOf, null);
+  assert.equal(r.belongsToProject, null);
+});
+
 // --- reviewBrainDumpSort ----------------------------------------------------------
 
 test('reviewBrainDumpSort ok for a valid classification', () => {

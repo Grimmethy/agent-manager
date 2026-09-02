@@ -646,24 +646,25 @@ test('applyBrainDumpSort still writes to secondBrainDir for a plain note with no
   assert.match(fs.readFileSync(result.file, 'utf8'), /Just a journal note/);
 });
 
-test('applyBrainDumpSort routes to queue/needs-clarification/ (not adhoc/) when no anchor keyword matches', () => {
+test('applyBrainDumpSort queues to adhoc/ (NOT needs-clarification) when nothing anchors -- an un-anchorable task still gets drafted', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
   const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
-  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/unrelated.ts' }]);
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/widget.ts' }]);
 
-  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Totally unrelated topic entirely' })]);
-  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Totally unrelated topic entirely' } };
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Xyzzy plugh frobnicate quux' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Xyzzy plugh frobnicate quux' } };
   const implementResponse = JSON.stringify({
     category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
   });
 
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
 
-  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false, 'must not land in adhoc/ where the worker would silently claim it');
-  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
-  assert.equal(heldFiles.length, 1);
-  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
-  assert.equal(written.needsClarification.reason, 'no-match');
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false, 'a well-scoped task with no keyword anchor is not a human decision');
+  const queued = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  assert.equal(queued.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', queued[0]), 'utf8'));
+  assert.equal(written.needsClarification, undefined);
+  assert.equal(written.promptContext.prefetchedPaths, undefined);
 });
 
 test('applyBrainDumpSort routes to queue/needs-clarification/ with candidates when a keyword matches multiple files', () => {
