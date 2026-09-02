@@ -79,6 +79,36 @@ function withRealRepo(fn) {
   try { return fn(wt); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+test('resolveAgenticDraft(implemented): a docs-only diff for a code task -> retryable block with pointed feedback', () => {
+  withRealRepo((wt) => {
+    fs.mkdirSync(path.join(wt, 'docs', 'adr'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'docs', 'adr', '0021-thing.md'), '# ADR\n\nsome design prose\n');
+    const task = { id: 'tsub', source: 'manual', domain: 'adhoc',
+      promptContext: { rawText: 'Combine job types into expandable rows in python/dashboard/templates/index.html -- renderJobListTab().' } };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'wrote an ADR\n\nRESOLUTION: implemented\n\ndone' }, worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /not a real implementation -- diff only touches documentation/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.match(task.adhocDiffSubstanceFeedback, /only created\/edited documentation/);
+    assert.ok(!task.adhocResolution, 'not stamped as implemented');
+  });
+});
+
+test('resolveAgenticDraft(implemented): a real code diff for an adhoc task is unaffected', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+    const task = { id: 'treal', source: 'manual', domain: 'adhoc', promptContext: { rawText: 'change a.txt' } };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'did it\n\nRESOLUTION: implemented\n\ndone' }, worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(task.adhocResolution, 'implemented');
+    assert.match(task.rawDiff, /a\.txt/);
+  });
+});
+
 test('resolveAgenticDraft(implemented): stages + captures the worktree diff into task.rawDiff', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'changed\n');

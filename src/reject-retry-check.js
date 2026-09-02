@@ -192,6 +192,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         delete task.rescopedRawText; // keep rescopedFromDecompose set for the escalation cap in resolveAgenticDraft
       } else if (retryableDraftBlock && task.turnBudgetExhausted === true) {
         priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
+      } else if (retryableDraftBlock && typeof task.adhocDiffSubstanceFeedback === 'string' && task.adhocDiffSubstanceFeedback.trim()) {
+        // resolveAgenticDraft (agentic-draft-common.js) found the produced diff was a token
+        // gesture -- an ADR/doc instead of the code, an unrequested delete, or a file the
+        // task explicitly forbids. The feedback names the real target(s).
+        priorFeedback.push(task.adhocDiffSubstanceFeedback);
+        delete task.adhocDiffSubstanceFeedback;
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
       } else {

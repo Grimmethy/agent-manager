@@ -31,6 +31,7 @@ const { adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt } = requ
 const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
 const { isEffectivelyEmptyResponse } = require('./apply-group-a.js');
 const { NON_IMPL_PATTERNS } = require('./review-task.js');
+const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
 
 // Deliberately NOT model-provider.js's labelFor(task) -- adhoc is registered high-tier
 // (reasoningTier: 'high', task-sources.js), so labelFor(task) always returns "claude:..."
@@ -198,6 +199,15 @@ async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
 
   if (!rawDiff) {
     return { applied: false, succeeded: true, reason: 'harness-search draft produced no net change' };
+  }
+
+  // The diff applies cleanly and is non-empty -- but is it actually the change asked for,
+  // or a token gesture (an ADR instead of the code, an unrequested delete, a forbidden
+  // file)? This cheap tier should not stamp that as `implemented`; decline so the agentic
+  // tiers, which can investigate, take over. See adhoc-diff-sanity.js.
+  const substance = adhocDiffSubstanceProblem(task, rawDiff);
+  if (substance) {
+    return { applied: false, succeeded: true, reason: `harness-search draft is not a real implementation -- ${substance.reason}` };
   }
 
   task.adhocResolution = 'implemented';
