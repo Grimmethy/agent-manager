@@ -1927,3 +1927,26 @@ Replace the bare `pass` with a `logging.warning` call that records the exception
 
 Benefits:
 Operators can now `grep` the log for the warning and immediately see that history writes have been failing, along with the exact `OSError` reason (ENOSPC, EACCES, EROFS, etc.) and the target path, turning an invisible, multi-day data-loss window into a single, time-stamped diagnostic line. The fix costs one function call, adds no new dependency, and changes no control-flow semantics, so the dashboard continues to serve requests normally while the failure becomes observable.
+
+### AC-107 · Silent exception swallow on tokenfold stats fetch
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    import urllib.request
+
+    port = os.environ.get("TOKENFOLD_PORT", "9339")
+    try:
+        with urllib.request.urlopen(
+                f"http://localhost:{port}/tokenfold/stats", timeout=3) as r:
+            data = json.loads(r.read().decode())
+```
+
+Problem:
+The `try` block issues a best-effort `urllib.request.urlopen` GET to `http://localhost:{port}/tokenfold/stats` with a 3-second timeout and then JSON-decodes the response body. The corresponding `except` block (around line 996) catches the broad `Exception` and simply assigns a fallback value without logging, re-raising, or otherwise surfacing the failure. Because the project has no metrics or telemetry system, a log line is the only available primitive to make the failure visible. As written, connection-refused (sidecar not started), timeout (sidecar hung), non-200 HTTP status, and malformed JSON all land in the same silent bucket, leaving an operator with zero diagnostic signal when the dashboard renders empty or stale stats.
+
+Solution:
+In the `except` block, add a single `logging.warning` call that records the exception type and message along with the target host and port for context. Reuse or create a module-level `logger = logging.getLogger(__name__)` if one does not already exist in `app.py`. The fallback assignment (e.g., `data = {}`) remains so the dashboard still degrades gracefully. No re-raise is needed because the caller already handles the empty-data path; the log line is purely for operator visibility. No new dependency is introduced—only the stdlib `logging` module, which the project already permits for Python code.
+
+Benefits:
+Once the warning is in place, any failure of the stats sidecar—whether it is down, hung, returning an error status, or emitting malformed JSON—produces a timestamped, greppable line in the application log that names the endpoint, the port, and the specific exception. An operator investigating "why does the dashboard show zero tokens?" can immediately distinguish a connection-refused (sidecar not running) from a timeout (sidecar stuck) from a `JSONDecodeError` (protocol mismatch), reducing mean-time-to-diagnose from "unbounded guesswork" to a single `grep` of the log. The fix is a one-line addition with no behavioral change to the happy path and no new dependency.
