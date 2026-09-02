@@ -25,6 +25,14 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 // brainDumpSortPlanPrompt so the prompt and this validator never drift.
 const CANONICAL_TOP_LEVEL = ['Projects', 'Journal', 'References', 'Ideas', 'Research', 'Characters', 'StoryImages'];
 
+// A local model routinely writes the literal string "null" / "none" / "n/a" / "" for a
+// field that should be a JSON null. Treat all of those as absent.
+function nullishString(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s && !['null', 'none', 'n/a', 'na', 'nil', 'undefined'].includes(s.toLowerCase()) ? s : null;
+}
+
 // Bare, undifferentiated filenames that give no hint what the note is actually about --
 // confirmed live 2026-08-16: the local model filed a real note under plain "ideas.md",
 // indistinguishable at a glance from any other idea ever captured. Checked against the
@@ -64,11 +72,14 @@ function parseBrainDumpSortResult(implementResponse) {
     tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
     actionable: !!parsed.actionable,
     rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
-    belongsToProject: parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null,
+    belongsToProject: nullishString(parsed.belongsToProject),
     requiresResearch: !!parsed.requiresResearch,
     // 2026-08-24 (pipeline hardening): the classifier is shown already-queued task titles
     // and flags a near-duplicate here; null/absent means it saw nothing similar.
-    possibleDuplicateOf: parsed.possibleDuplicateOf ? String(parsed.possibleDuplicateOf).trim() : null,
+    // nullishString: the 27B routinely emits the literal STRING "null" / "none" / "N/A"
+    // instead of a JSON null -- confirmed live 2026-09-02, a real function_length_fix bug
+    // report held on `possibleDuplicateOf: "null"` treated as a real duplicate title.
+    possibleDuplicateOf: nullishString(parsed.possibleDuplicateOf),
     // 2026-09-03 (auto-wikilink on filing): 0-5 existing note basenames this note relates
     // to. Sanitized -- drop any .md suffix and path separators so it can only ever name a
     // basename, never traverse.
@@ -134,24 +145,45 @@ function validateSecondBrainPath(relPath, secondBrainDir, trackedProjectLabels =
 // with both possibly rewritten. Deterministic, not a prompt tweak the 27B keeps ignoring.
 function deriveBelongsToProject(parsed, promptContext = {}) {
   const trackedLabels = Array.isArray(promptContext.projectLabels) ? promptContext.projectLabels : [];
-  const rawLabel = parsed.belongsToProject ? String(parsed.belongsToProject).trim() : null;
+  const rawLabel = nullishString(parsed.belongsToProject);
   const actionable = !!parsed.actionable;
+  const rawText = String(promptContext.rawText || '');
+  const text = `${rawText}\n${parsed.rationale || ''}`;
+  const selfLabel = promptContext.selfProjectLabel;
+
+  // A note that is a NEW standalone product/plugin, or a pure creative/worldbuilding
+  // concept, is Second Brain content -- never a code task, even if the classifier assigned
+  // it a project. Confirmed live 2026-09-02: "New Plugin > World Simulator" and "Character
+  // concept > Hooble and the Dragon" both got routed to agent-manager as adhoc tasks.
+  const isNoteNotTask =
+    /^\s*(new\s+plugin\b|character(?:\s+concept)?\b|story\b|world[- ]?sim|worldbuilding\b|lore\b|\bnpc\b)/i.test(rawText)
+    || (/\bplugin\b/i.test(text) && /\b(new|standalone|separate|build a|create a|spin ?up|its own)\b/i.test(text));
+  if (isNoteNotTask) return { belongsToProject: null, actionable: false };
 
   // Already a real tracked label -- trust it.
   if (rawLabel && trackedLabels.includes(rawLabel)) {
     return { belongsToProject: rawLabel, actionable };
   }
 
-  const selfLabel = promptContext.selfProjectLabel;
+  // The classifier's label is bogus/null but the note's LEADING text (a breadcrumb or
+  // first sentence, first ~90 chars) explicitly names exactly one OTHER tracked project --
+  // route there rather than self-recovering. Confirmed live: "PromptForge SB Originated
+  // Characters don't retain details..." self-recovered to agent-manager on the word "SB".
+  // Head-scoped so a passing body mention ("...while the pipeline was pointed at PromptForge")
+  // does NOT hijack the routing.
+  const head = rawText.slice(0, 90);
+  const named = [...new Set(trackedLabels.filter((l) =>
+    l !== selfLabel && new RegExp(`\\b${l.replace(/-/g, '[- ]?')}\\b`, 'i').test(head)))];
+  if (named.length === 1) {
+    return { belongsToProject: named[0], actionable: true };
+  }
+
+  // Self-project recovery for a concrete change to this pipeline itself.
   if (selfLabel && !parsed.requiresResearch) {
-    const text = `${promptContext.rawText || ''}\n${parsed.rationale || ''}`;
-    const hasChangeVerb = /\b(add|fix|should|shouldn't|need|needs|make|change|changing|refactor|implement|support|remove|rename|persist|track|wire|handle|prevent|ensure|allow|expose|surface|store|stop|drop|split|guard)\b/i.test(text);
+    const hasChangeVerb = /\b(add|fix|should|shouldn't|need|needs|make|change|changing|refactor|implement|support|remove|rename|persist|track|wire|handle|prevent|ensure|allow|expose|surface|store|stop|drop|split|guard|race|reset|expand)\b/i.test(text);
     const selfSubject = (text.toLowerCase().includes(selfLabel.toLowerCase()))
       || /\b(pipeline|dashboard|brain[- ]?dump|second[- ]?brain|worker|queue|review|apply|task[- ]?source|draft(?:ing)?|adhoc|prompt|classifier|coordinat|watchdog|reject-retry)\b/i.test(text);
-    // A note proposing an entirely NEW standalone product/plugin is not a change to an
-    // existing project even if that project's name appears in it.
-    const standaloneNew = /\bplugin\b/i.test(text) && /\b(build|new|standalone|separate|create a|spin ?up|its own)\b/i.test(text);
-    if (hasChangeVerb && selfSubject && !standaloneNew) {
+    if (hasChangeVerb && selfSubject) {
       return { belongsToProject: selfLabel, actionable: true };
     }
   }
