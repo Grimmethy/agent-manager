@@ -1720,3 +1720,26 @@ Add a module-level `_logger = logging.getLogger(__name__)` (or reuse the existin
 
 Benefits:
 Operators gain a single, greppable log line per failed parse event that identifies *what* failed (exception class + message), *where* in the stream (line index), and *what the payload looked like* (truncated raw text). This turns an invisible silent-swallow into a diagnosable warning, lets on-call engineers distinguish a benign keep-alive comment from a real upstream schema change or a code defect, and preserves the existing pass-through behavior so no downstream client sees a broken stream.
+
+### AC-98 · Silent exception in proxy adapter hides decoder regression
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/proxy.py
+Snippet:
+```
+                    msg["content"] = eng.decode(raw, sid, scope=scope_hdr)
+                    eng.record_output(model, raw, msg["content"], sid, scope=scope_hdr)
+            return JSONResponse(obj, status_code=r.status_code)
+        except Exception:
+            return Response(r.content, r.status_code)
+
+    def _sse_delta(text: str) -> bytes:
+```
+
+Problem:
+The `except Exception` block surrounding the `eng.decode` / `eng.record_output` calls catches every failure and immediately returns the raw upstream body (`Response(r.content, r.status_code)`) with no log line, no stderr write, and no comment. Because the project has no metrics or telemetry stack (no OpenTelemetry, prom-client, StatsD, or Datadog dependency anywhere in the manifests), a log line is the *only* observable signal available. As written, a regression in the decoder (bad model name, schema drift, a bug in `eng.decode`) causes every request through this adapter to silently degrade to raw passthrough: the caller still receives a 200 with a body, no alert fires, no error page appears, and the problem is only discovered when a downstream consumer reports an unexpected response shape. The exception is completely invisible to operators.
+
+Solution:
+Import the stdlib `logging` module at the top of the file (it is already an available primitive per the project's Python code conventions) and create a module-level `logger = logging.getLogger(__name__)`. Inside the existing `except Exception` block, before the `return Response(r.content, r.status_code)` line, emit `logger.warning("tokenfold proxy: decode/record failed for sid=%s scope=%s; falling back to raw passthrough", sid, scope_hdr, exc_info=True)`. The `exc_info=True` keyword captures the full traceback so the root cause (which function raised, what the exception message was) is identifiable without reproducing the request. The `sid` and `scope_hdr` values let an operator correlate the warning to a specific session and scope. Do not re-raise: the raw-passthrough return *is* the recovery path, and the caller still receives a valid HTTP response. Do not add any metric, counter, gauge, or third-party logging dependency.
+
+Benefits:
+Once the warning is in place, the first request that hits a decoder regression produces an immediately visible, greppable log line with the full traceback, the offending session ID, and the scope header. An operator (or a log-shipping pipeline, if one is added later) can detect the silent-degradation window within seconds of the first affected request rather than waiting for a downstream consumer to file a bug. The fix is a two-line change, introduces no new dependency, preserves the existing fallback semantics, and is consistent with the project's existing use of the stdlib `logging` module in other Python files.
