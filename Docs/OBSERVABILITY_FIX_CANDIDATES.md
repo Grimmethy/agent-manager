@@ -1882,3 +1882,26 @@ Replace the empty `catch { continue; }` on lines 59–60 with a `catch (err) { c
 
 Benefits:
 An operator tailing stderr (or a log aggregator that captures `console.warn`) immediately sees which state file was skipped and why, turning a silent, invisible data-loss path into a one-line diagnostic. A recurring `SyntaxError` on the same file points to a writer bug; a recurring `EACCES` points to a permissions regression; a one-off `ENOENT` confirms a benign race. This is the minimum observability the project's available primitives (no metrics, no third-party logger) can provide, and it costs nothing at runtime when no error occurs.
+
+### AC-118 · Silent error swallowing in readModelCallsForTasks hides forensic data-loss
+Strength: Strong
+Files: src/forensic-bundle.js
+Snippet:
+```
+  const result = new Map();
+  if (!ids || !ids.length) return result;
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch { return result; }
+  if (!dbPath || !fs.existsSync(dbPath)) return result;
+  let db;
+  try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch { return result; }
+```
+
+Problem:
+In `readModelCallsForTasks`, three separate `try/catch` blocks — the `require('node:sqlite')` load, the `new DatabaseSync(dbPath, …)` open, and the subsequent query (the third `try` visible at line 139) — each catch their error and immediately `return result` (an empty `Map`) with no diagnostic output of any kind. The comment on line 127 ("empty Map on any failure; never throws") makes the non-throwing contract intentional, but the catches emit nothing: no `console.error`, no `console.warn`, no `process.stderr.write`. In a file whose entire purpose is assembling a forensic bundle, a corrupt DB file, a missing native `node:sqlite` binding, or a schema mismatch all produce an identical, indistinguishable empty result. An operator investigating "why is my bundle missing model-call rows" has zero log evidence that the read even attempted, let alone where it failed.
+
+Solution:
+In each of the three `catch` blocks, emit a `console.error` call that names the specific step, includes the `dbPath` (where applicable), and stringifies the caught error before returning the empty `Map`. For the module-load catch: `catch (err) { console.error('[forensic-bundle] readModelCallsForTasks: node:sqlite unavailable', err); return result; }`. For the DB-open catch: `catch (err) { console.error('[forensic-bundle] readModelCallsForTasks: failed to open', dbPath, err); return result; }`. Apply the same pattern to the query catch. This preserves the "never throws" API contract while making every failure visible on stderr using only the `console.error` primitive the project already relies on — no new dependency, no metrics system required.
+
+Benefits:
+Any operator, CI log consumer, or post-mortem investigator can immediately distinguish a legitimate "no rows for these IDs" result from a failed DB read, and can see exactly which step (module resolution, file open, or query execution) and why. The silent data-loss path becomes a diagnosable one, and the forensic bundle's integrity is no longer a black box, all without altering the function's non-throwing contract or adding any dependency the project does not already have.
