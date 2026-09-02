@@ -1974,3 +1974,26 @@ Replace the bare `catch { continue; }` with a `catch (err)` that inspects `err.c
 
 Benefits:
 A permission or I/O failure on an archived-month directory no longer vanishes silently; the operator sees one warning line naming the directory, its state (`done` vs `archived`), and the OS error code, which is enough to `chmod` or fix the mount and re-run. The benign ENOENT path stays quiet, so normal first-run or partial-pipeline scenarios produce no noise. The forensic-bundle output becomes auditable: any candidate set that looks thin can be cross-checked against the warning log to confirm whether a directory was genuinely empty or was skipped due to a transient filesystem error.
+
+### AC-122 · Silent per-file read failure in tailLogErrorSignatures
+Strength: Strong
+Files: src/pipeline-health-audit.js
+Snippet:
+```
+    let content;
+    try {
+      content = fs.readFileSync(path.join(logDir, name), 'utf8');
+    } catch {
+      continue;
+    }
+    const recentLines = content.split('\n').slice(-lines);
+```
+
+Problem:
+Inside the per-file loop (lines 134–139), the `catch` block that guards `fs.readFileSync` binds no error variable, logs nothing, pushes no finding, and simply executes `continue`. The sibling catch for `readdirSync` (lines 129–132) demonstrates the developer's own pattern for I/O failures in this function: it logs via `console.error` with the directory, message, and code, and pushes a finding into the `findings` array. The per-file catch does neither, so a permission change, a file deleted between the `readdirSync` call and the `readFileSync` call, or any transient I/O error causes that log file to be silently omitted from the audit. A caller inspecting `findings` cannot distinguish "no error signatures found" from "three of five log files were unreadable," which defeats the function's purpose of producing a complete health-audit report.
+
+Solution:
+Replace the bare `catch { continue; }` (lines 137–139) with a catch that binds the error, logs a `console.warn` line identifying the file name, the error message, and the error code (mirroring the style of the sibling `readdirSync` catch two lines above), and pushes a finding string such as `` `${name}: unreadable (${err.message} ${err.code || 'unknown'})` `` into `findings` before the `continue`. This uses only `console.warn` and the existing `findings` array—both primitives already present in the file—without introducing any new dependency or telemetry system.
+
+Benefits:
+Once fixed, every log file that the audit intended to scan but could not read is explicitly recorded in the `findings` output, so the report is self-describing about its own coverage. Operators reading the audit output can immediately see which files were skipped and why (permission denied, ENOENT, EACCES, etc.) rather than silently receiving a partial result that looks identical to a fully successful scan. The `console.warn` line also appears in standard output for real-time debugging, matching the project's existing `console.error` / `console.warn` logging convention.
