@@ -939,6 +939,38 @@ test('findUnverifiedEdit: duplicate-import -- edit re-adds an import the file al
   assert.equal(findUnverifiedEdit(rewrite, files), null);
 });
 
+test('findUnverifiedEdit: helper-not-wired -- diff defines a function nothing calls', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const files = [{ path: 'src/w.js', content: 'function draftAdhocViaLocalAgenticWrite() {\n  const r = run();\n  return r;\n}\n' }];
+  // adds finalizeResolution but never calls it (pipeline-forensics-fix-ac-6 shape)
+  const bad = JSON.stringify({ mode: 'edit', file: 'src/w.js', find: 'return r;\n}', replace: 'return r;\n}\n\nfunction finalizeResolution(s) {\n  return s.includes("RESOLUTION:") ? s : s + "\\nRESOLUTION: implemented";\n}' });
+  assert.deepEqual(findUnverifiedEdit(bad, files), { problem: 'helper-not-wired', helper: 'finalizeResolution', file: 'src/w.js' });
+
+  // wired in a second edit -> fine
+  const wired = JSON.stringify([
+    { mode: 'edit', file: 'src/w.js', find: 'return r;\n}', replace: 'return finalizeResolution(r);\n}\n\nfunction finalizeResolution(s) {\n  return s;\n}' },
+  ]);
+  assert.equal(findUnverifiedEdit(wired, files), null);
+});
+
+test('findUnverifiedEdit: files-incomplete -- a 2-file candidate whose diff only touches one', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const files = [
+    { path: 'src/a.js', content: 'const a = 1;\n' },
+    { path: 'src/b.js', content: 'const b = 2;\n' },
+  ];
+  const onlyA = JSON.stringify({ mode: 'edit', file: 'src/a.js', find: 'const a = 1;', replace: 'const a = 10;' });
+  const r = findUnverifiedEdit(onlyA, files, { declaredFiles: ['src/a.js', 'src/b.js'] });
+  assert.equal(r.problem, 'files-incomplete');
+  assert.deepEqual(r.missing, ['src/b.js']);
+
+  const both = JSON.stringify([
+    { mode: 'edit', file: 'src/a.js', find: 'const a = 1;', replace: 'const a = 10;' },
+    { mode: 'edit', file: 'src/b.js', find: 'const b = 2;', replace: 'const b = 20;' },
+  ]);
+  assert.equal(findUnverifiedEdit(both, files, { declaredFiles: ['src/a.js', 'src/b.js'] }), null);
+});
+
 test('extractCandidateSnippet pulls the Snippet: fenced block from a candidate body', () => {
   const { extractCandidateSnippet } = require('./local-draft.js');
   const body = '### AC-9 · Title\nStrength: Strong\nFiles: m.py\nSnippet:\n```python\n    except Exception:\n        pass\n```\n\nProblem:\n...';

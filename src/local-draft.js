@@ -286,11 +286,27 @@ function findEditFarFromAnchor(find, content, anchorSnippet) {
   return findIdx !== -1 && Math.abs(findIdx - anchorIdx) > 600; // ~15 lines away = a different block
 }
 
-// implementResponse + the candidate's fetched files (+ optionally the flagged code snippet)
-// -> the first problem found, or null. Verifies the SAME things apply-group-b.js will
-// eventually check, immediately after implement instead of after a wasted review cycle.
-// `problem`: 'find-missing' (default), 'wrong-block', 'duplicate-import'.
-function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '' } = {}) {
+// A `function NAME(` / `const NAME = (…) =>` / `const NAME = function` / `NAME = async` --
+// the declaration forms a candidate-fulfillment diff introduces a new helper as.
+const HELPER_DECL_RE = /(?:^|\n)\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|(?:^|\n)\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g;
+
+function helpersDeclaredIn(text) {
+  const names = new Set();
+  let m;
+  HELPER_DECL_RE.lastIndex = 0;
+  while ((m = HELPER_DECL_RE.exec(String(text || '')))) names.add(m[1] || m[2]);
+  return [...names];
+}
+
+// implementResponse + the candidate's fetched files (+ optionally the flagged code snippet,
+// the candidate's declared Files: list) -> the first problem found, or null. Verifies the
+// SAME things apply-group-b.js will eventually check PLUS the two integration failures the
+// local model repeatedly ships (helper added but never called; a multi-file candidate's
+// second file left untouched), immediately after implement instead of after a wasted
+// review cycle.
+// `problem`: 'find-missing' (default), 'wrong-block', 'duplicate-import',
+//            'helper-not-wired', 'files-incomplete'.
+function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '', declaredFiles = [] } = {}) {
   const trimmed = (implementResponse || '').trim();
   if (!trimmed || trimmed === '""' || trimmed === "''") return null; // effectively empty -- nothing to verify
   let parsed;
@@ -302,6 +318,43 @@ function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const byPath = new Map((fetchedFiles || []).map((f) => [f.path, f.content]));
   const snippet = typeof anchorSnippet === 'string' ? anchorSnippet.trim() : '';
+
+  // (a) A multi-file candidate whose declared Files: list is not fully covered by the diff
+  //     -- the local model routinely edits file 1 and silently drops file 2
+  //     (pipeline-forensics-fix-ac-1, -ac-14).
+  const editable = new Set(
+    items.filter((it) => it && (it.mode === 'edit' || it.mode === 'create' || it.mode === 'delete')).map((it) => it.file),
+  );
+  const declared = (declaredFiles || []).filter(Boolean);
+  if (declared.length >= 2) {
+    const missing = declared.filter((f) => !editable.has(f));
+    if (missing.length > 0 && missing.length < declared.length) {
+      return { problem: 'files-incomplete', missing, declared };
+    }
+  }
+
+  // (b) A helper defined by the diff that nothing in the diff calls and the file does not
+  //     already call -- "added finalizeResolution but never invoked it"
+  //     (pipeline-forensics-fix-ac-6, -ac-8, -ac-4).
+  const allAdded = items.map((it) => String(it && (it.replace ?? it.content) || '')).join('\n');
+  const allFinds = items.map((it) => String(it && it.find || '')).join('\n');
+  for (const item of items) {
+    if (!item || (item.mode !== 'edit' && item.mode !== 'create')) continue;
+    const added = String(item.replace ?? item.content ?? '');
+    const findText = String(item.find ?? '');
+    const fileContent = byPath.get(item.file) || '';
+    for (const helper of helpersDeclaredIn(added)) {
+      if (findText.includes(helper)) continue;                 // rewriting an existing decl, not adding
+      if (new RegExp(`\\b${helper}\\s*\\(`).test(fileContent)) continue; // file already calls it
+      const callRe = new RegExp(`\\b${helper}\\s*[(\`]|=\\s*${helper}\\b|\\b${helper}\\s*;`);
+      const otherRefs = (allAdded.match(new RegExp(`\\b${helper}\\b`, 'g')) || []).length;
+      const wiredElsewhere = allFinds.includes(helper) || callRe.test(allAdded.replace(added, ''));
+      if (otherRefs <= 1 && !wiredElsewhere) {
+        return { problem: 'helper-not-wired', helper, file: item.file };
+      }
+    }
+  }
+
   for (const item of items) {
     if (!item || (item.mode !== 'edit' && item.mode !== 'create')) continue;
     const content = byPath.get(item.file);
@@ -1114,11 +1167,15 @@ async function finalizeCandidateFulfillment(task, {
   const unverified = findUnverifiedEdit(
     task.implementResponse,
     task.promptContext && task.promptContext.fetchedFiles,
-    { anchorSnippet },
+    { anchorSnippet, declaredFiles: (task.promptContext && task.promptContext.files) || [] },
   );
   if (unverified) {
     let correction;
-    if (unverified.problem === 'duplicate-import') {
+    if (unverified.problem === 'files-incomplete') {
+      correction = `This candidate's "Files:" line names ${unverified.declared.length} files that all need changes: ${unverified.declared.join(', ')}. Your previous attempt only edits ${unverified.declared.filter((f) => !unverified.missing.includes(f)).join(', ') || '(none of them)'} and leaves ${unverified.missing.join(', ')} untouched. Add the edit(s) to ${unverified.missing.join(' and ')} that the Solution describes -- the change is not complete without them.`;
+    } else if (unverified.problem === 'helper-not-wired') {
+      correction = `Your previous attempt defines \`${unverified.helper}\` in ${unverified.file} but nothing ever calls it -- neither another edit in your diff nor the file's existing code. A new helper that is never invoked is a no-op. Add the edit that actually calls \`${unverified.helper}\` at the site the candidate's Solution describes (and, if the Solution says to, the edit that clears/resets any field it uses afterwards).`;
+    } else if (unverified.problem === 'duplicate-import') {
       correction = `Your previous attempt for ${unverified.file} ADDS the line \`${unverified.duplicateLine}\`, but that line ALREADY EXISTS in the file's real content shown above. Do not add it again -- reuse the existing import/logger. If a module logger genuinely does not exist yet, add ONE line at the top of the file with the other imports, never inside a function.`;
     } else if (unverified.problem === 'wrong-block') {
       correction = `Your previous "find" string for ${unverified.file} matches the file -- but a DIFFERENT block than the one this candidate flagged. The flagged code is:\n\n${unverified.anchorSnippet}\n\nYour "find" must be a verbatim substring of THAT block (or the real file text immediately around it) -- not a similar-looking try/except/catch elsewhere in the file. Copy from the flagged block above.`;
