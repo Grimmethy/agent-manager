@@ -139,11 +139,11 @@ class InstalledStatusTest(MarketplaceTestBase):
         super().setUp()
         self._write_catalog(copy.deepcopy(GOOD_CATALOG))
 
-    def _entry_for(self, name):
+    def _entry_for(self, plugin_id):
         resp = self._get_marketplace()
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        matches = [e for e in data["entries"] if e["name"] == name]
+        matches = [e for e in data["entries"] if e["id"] == plugin_id]
         self.assertEqual(len(matches), 1)
         return matches[0]
 

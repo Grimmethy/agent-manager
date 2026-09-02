@@ -6408,10 +6408,13 @@ def _version_tuple(v):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def _installed_plugin_version(manifest, name):
-    """The 'version' field of the first manifest entry whose 'name' == name, else None."""
+def _installed_plugin_version(manifest, plugin_id):
+    """The 'version' field of the first manifest entry whose 'name' == plugin_id, else
+    None. The manifest's 'name' is the plugin repo's directory slug (see
+    _plugin_name_from_path) -- the same value a catalog entry carries as 'id', NOT the
+    catalog's human-readable 'name'."""
     for entry in manifest:
-        if isinstance(entry, dict) and entry.get("name") == name:
+        if isinstance(entry, dict) and entry.get("name") == plugin_id:
             return entry.get("version")
     return None
 
@@ -6438,9 +6441,11 @@ def api_plugins_marketplace():
         if not isinstance(raw, dict):
             continue
         entry = dict(raw)
-        name = raw.get("name")
-        installed = any(isinstance(p, dict) and p.get("name") == name for p in manifest)
-        installed_version = _installed_plugin_version(manifest, name)
+        # Match on the catalog entry's 'id' (the repo slug), which is what the installed-
+        # plugins manifest stores as its 'name' -- NOT the catalog's human-readable 'name'.
+        plugin_id = raw.get("id")
+        installed = any(isinstance(p, dict) and p.get("name") == plugin_id for p in manifest)
+        installed_version = _installed_plugin_version(manifest, plugin_id)
         update_available = bool(
             installed
             and installed_version
