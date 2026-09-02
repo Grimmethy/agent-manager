@@ -2092,6 +2092,11 @@ registerTaskSource('pipeline_forensics_fix', {
     return task;
   },
   candidateFulfillment: true,
+  // A pipeline_forensics_fix candidate is already the forensic study's decomposed
+  // RECOMMENDED FOLLOW-UP FIX -- re-splitting it just files more forensic candidates that
+  // get re-split forever (confirmed live 2026-09-01: AC-4..AC-12). The pass must produce a
+  // real diff or output empty (-> blocked for a human).
+  noCandidateSplit: true,
   candidatesPath: () => getConfig().pipelineFixCandidatesPath,
   candidateDocTitle: '# Pipeline Fix Candidates',
   harnessSearch: 'archImport',

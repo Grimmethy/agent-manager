@@ -310,6 +310,18 @@ test('buildImplementPrompt tells the model to output empty rather than guess whe
   assert.doesNotMatch(prompt, /```\n  try \{/); // no stale fetched content leaking through
 });
 
+test('buildImplementPrompt offers the split escape hatch for a normal candidate-fulfillment source but NOT for a noCandidateSplit one', () => {
+  const withSplit = buildImplementPrompt(archReviewFulfillmentTask(), 'PLAN: ...');
+  assert.match(withSplit, /"mode": "split"/);
+
+  // pipeline_forensics_fix is registered noCandidateSplit:true -- its candidates are
+  // already the forensic study's decomposition, so re-splitting just files more.
+  const forensicsFix = { ...archReviewFulfillmentTask(), source: 'pipeline_forensics_fix' };
+  const noSplit = buildImplementPrompt(forensicsFix, 'PLAN: ...');
+  assert.doesNotMatch(noSplit, /"mode": "split"/);
+  assert.match(noSplit, /Ground every "find" value/); // the rest of the prompt is intact
+});
+
 test('buildImplementPrompt only flags the files that actually failed to fetch, not ones that succeeded', () => {
   const prompt = buildImplementPrompt(archReviewFulfillmentTask({
     files: ['src/apply-group-a.js', 'src/missing.js'],
