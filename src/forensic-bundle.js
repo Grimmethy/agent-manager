@@ -292,7 +292,10 @@ function selectWinners(pipelineDir, subjectRecords) {
   const candidates = [];
   for (const { dir, state } of doneDirs) {
     let names;
-    try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { continue; }
+    try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`[forensic-bundle] readdirSync failed dir=${dir} state=${state} code=${err.code} message=${err.message}`);
+      continue;
+    }
     for (const name of names) {
       const task = readJson(path.join(dir, name));
       if (!task || subjectIds.has(task.id)) continue;
