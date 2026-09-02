@@ -62,3 +62,26 @@ Replace the sequential loop body with: (1) build an array of n promise-producing
 
 Benefits:
 Reduces wall-clock latency from O(n × t) to O(t) for the voting phase, where t is a single call's latency. For the typical n=5 case this is a ~5× speedup on the LLM round-trip, which is the dominant cost in the pipeline. The change is confined to one function body in one file; no call-site changes, no new imports, no interface changes. Error semantics are preserved exactly (any single rejection aborts the whole vote), so no caller needs to change its error handling.
+
+### AC-5 · Parallelize independent GPU app-stop calls in yield loop
+Strength: Strong
+Files: src/gpu-guard.js
+Snippet:
+```
+
+  const runningYieldable = statusResult.body.apps.filter((a) => yieldAppIds.includes(a.id) && a.running);
+  const yielded = [];
+  for (const app of runningYieldable) {
+    const stopResult = await fetchJsonFn(`${theAgentUrl}/api/automation/apps/${app.id}/stop`, { method: 'POST' }, 15000);
+    if (stopResult.ok) yielded.push(app.id);
+  }
+```
+
+Problem:
+The yield path iterates over every running app that appears in the caller-supplied `yieldAppIds` list and issues a separate `POST …/api/automation/apps/<id>/stop` inside a `for…await` loop. Each call carries a 15-second timeout, and because `await` is inside the loop body, the next request is not dispatched until the previous one resolves or times out. For a multi-app workload sharing a single GPU (3–5 apps is common), this serialises 45–75 s of wall-clock latency on a path that is supposed to free the GPU quickly so downstream scheduling can proceed. The calls are fully independent—`app.id` varies per iteration and the `yielded` array is only read after the loop completes—so the serial ordering provides no correctness benefit.
+
+Solution:
+Replace the `for…await` loop with a `Promise.all` over a `.map()` of the same `fetchJsonFn` calls. Build the array of stop promises first (filtering `statusResult.body.apps` for `yieldAppIds.includes(a.id) && a.running`), then `await Promise.all(stopPromises)` once. Attach a per-promise `.catch(() => null)` so that a single network blip or 500 response does not reject the entire batch; after the await, filter out the `null` sentinels to produce the same `yielded` array the serial version produced. No new dependency is introduced—`Promise.all` and `Array.prototype.map` are built into the runtime the file already targets.
+
+Benefits:
+Total wall-clock time for the yield step drops from N × 15 s (worst case) to ≈ 15 s regardless of how many apps are yieldable, because all stop requests are in flight simultaneously. Downstream GPU scheduling no longer stalls behind the slowest single stop call multiplied by the app count. The per-promise `.catch` preserves the existing "one bad stop should not abort the batch" semantics while making failure isolation explicit rather than relying on the loop's sequential nature.
