@@ -1905,3 +1905,26 @@ In each of the three `catch` blocks, emit a `console.error` call that names the 
 
 Benefits:
 Any operator, CI log consumer, or post-mortem investigator can immediately distinguish a legitimate "no rows for these IDs" result from a failed DB read, and can see exactly which step (module resolution, file open, or query execution) and why. The silent data-loss path becomes a diagnosable one, and the forensic bundle's integrity is no longer a black box, all without altering the function's non-throwing contract or adding any dependency the project does not already have.
+
+### AC-119 · Silent SQLite failure in readModelCallsForTasks hides forensic data loss
+Strength: Strong
+Files: src/forensic-bundle.js
+Snippet:
+```
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch { return result; }
+  if (!dbPath || !fs.existsSync(dbPath)) return result;
+  let db;
+  try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch { return result; }
+  try {
+    const present = new Set(
+      db.prepare(`SELECT name FROM pragma_table_info('model_calls')`).all().map((r) => r.name),
+```
+
+Problem:
+Lines 133 and 137 each wrap a critical step (loading the `node:sqlite` module, opening the database file) in a bare `catch { return result; }` that discards the exception entirely. Line 135 similarly returns an empty Map when `dbPath` is missing without any diagnostic. Because the function's stated contract is "empty Map on any failure; never throws," the caller cannot distinguish a legitimate "no rows for these task IDs" result from a corrupt database, a missing SQLite binding, or a permissions error. In a forensic-bundle pipeline this is especially dangerous: downstream consumers will record zero model calls and zero cost for a task that actually had expensive calls, producing a silently incomplete forensic record with no trace of why.
+
+Solution:
+In each of the three early-return paths (the `require` catch on line 133, the `!dbPath || !fs.existsSync(dbPath)` guard on line 135, and the `new DatabaseSync` catch on line 137), emit a `console.error` line that includes the function name, the offending `dbPath` (or the string "module unavailable" for the require case), and the original error message (`err.message` or the reason string). Keep the `return result` so the "never throws" contract is preserved and no caller needs to change. For example, in the require catch: `console.error('[forensic-bundle] readModelCallsForTasks: node:sqlite unavailable –', err.message);` and in the open catch: `console.error('[forensic-bundle] readModelCallsForTasks: cannot open', dbPath, '–', err.message);`. No new dependency, no rethrow, no metrics primitive—just the `console.error` call the project already uses for diagnostics.
+
+Benefits:
+Any operator or CI log consumer can immediately see that the forensic bundle was built with a degraded model-calls section and why, instead of silently shipping a bundle that reports zero calls and zero cost. The forensic record becomes trustworthy: an empty result is now either genuinely empty (no log line) or the result of a specific, logged failure. This also makes the function testable in a way that surfaces misconfiguration (wrong dbPath, missing native binding) during local development rather than only in production post-mortems.
