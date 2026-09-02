@@ -28,8 +28,8 @@ def _run_event(event: str, payload: dict):
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         subprocess.run(["node", str(MODEL_STATS_DB_JS), event, str(tmp_path)],
                         capture_output=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("model-stats event %r failed: %s: %s", event, type(exc).__name__, exc, exc_info=True)
     finally:
         try:
             tmp_path.unlink()
