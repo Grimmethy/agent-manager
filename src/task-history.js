@@ -34,7 +34,9 @@
 //           straight to <main>), 'filed' (wrote a candidates-doc / Second Brain note),
 //           'noop' (a false-positive / empty-implement verdict), 'pending-merge' (an
 //           agent/<id> branch exists, ahead of <main>, unmerged), 'abandoned' (applied to a
-//           branch that is gone and not on <main> -- lost work). See src/task-disposition.js.
+//           branch that is gone and not on <main> -- lost work), 'superseded' (never merged
+//           from its own branch, but the change is already live via a later/parallel one --
+//           a human judgement, never inferred). See src/task-disposition.js.
 //   at:     ISO timestamp, always new Date().toISOString() at the moment the stage
 //           actually completed (not backfilled/estimated) -- for a collapsed repeat entry
 //           (see COLLAPSIBLE_REPEAT_STAGES below), the MOST RECENT occurrence's timestamp.

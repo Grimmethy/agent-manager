@@ -19,7 +19,7 @@ test('resolveDisposition returns null for a record that was never applied', () =
 });
 
 test('resolveDisposition returns null when a stable terminal event is already the tail', () => {
-  for (const stage of ['merged', 'filed', 'noop', 'abandoned', 'applied-direct']) {
+  for (const stage of ['merged', 'filed', 'noop', 'abandoned', 'applied-direct', 'superseded']) {
     const r = { id: 't', history: [{ stage: 'applied', detail: 'agent/t' }, { stage, detail: 'x' }] };
     assert.equal(resolveDisposition(r, { ctx: ctx() }), null, `${stage} tail must be left alone`);
   }
@@ -90,6 +90,11 @@ test('lastAppliedEvent picks the LAST applied event when a task was applied twic
   assert.equal(lastAppliedEvent(h).detail, 'second');
 });
 
+test('a superseded tail is respected as terminal -- the sweep never re-opens it', () => {
+  const r = { id: 't', history: [{ stage: 'applied', detail: 'agent/t' }, { stage: 'superseded', detail: 'fix landed via ac-121' }] };
+  assert.equal(resolveDisposition(r, { ctx: ctx() }), null, 'superseded must not be re-resolved back to abandoned');
+});
+
 test('TERMINAL_STAGES is the closed vocabulary', () => {
-  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'applied-direct', 'filed', 'merged', 'noop', 'pending-merge']);
+  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'applied-direct', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
 });

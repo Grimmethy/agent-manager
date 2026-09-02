@@ -26,7 +26,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { resolveDisposition, buildShipContext, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+const { resolveDisposition, buildShipContext, STABLE_TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
@@ -121,7 +121,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
       // that reached done/). Remember either so it is not re-read every tick -- without this
       // the ~2000 never-applied done records get a full readdir+parse pass forever.
       const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
-      const closed = tail && TERMINAL_STAGES.has(tail.stage) && tail.stage !== 'pending-merge';
+      const closed = tail && STABLE_TERMINAL_STAGES.has(tail.stage);
       if (closed || !lastAppliedEvent(record.history)) {
         state.resolvedIds.add(id); state.pendingIds.delete(id);
       }

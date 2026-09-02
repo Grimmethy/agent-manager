@@ -21,13 +21,23 @@
 //   pending-merge  -- an agent/<id> branch exists and is ahead of <main>, not yet merged
 //   abandoned      -- applied to a branch that no longer exists and is NOT on <main>: the
 //                     work was lost. This is the one an audit must never miss.
+//   superseded     -- applied, never merged from its own branch, but the change it proposed
+//                     is already live via a LATER or PARALLEL change (a sibling task, a
+//                     manual edit, a retired candidate). A human judgement, never inferred
+//                     -- the reconcile sweep only respects it, it never assigns it.
 
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 
 const TERMINAL_STAGES = new Set([
-  'merged', 'applied-direct', 'filed', 'noop', 'pending-merge', 'abandoned',
+  'merged', 'applied-direct', 'filed', 'noop', 'pending-merge', 'abandoned', 'superseded',
 ]);
+
+// Terminal states the reconcile sweep must never re-open. `pending-merge` is deliberately
+// absent -- it IS re-checked, in case the branch got merged since.
+const STABLE_TERMINAL_STAGES = new Set(
+  [...TERMINAL_STAGES].filter((s) => s !== 'pending-merge'),
+);
 
 function lastEvent(history) {
   return Array.isArray(history) && history.length ? history[history.length - 1] : null;
@@ -129,7 +139,7 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   if (!applied) return null; // never applied -- blocked/needs-clarification in done, not this sweep's job
 
   const tail = lastEvent(history);
-  if (tail && TERMINAL_STAGES.has(tail.stage) && tail.stage !== 'pending-merge') return null; // already closed
+  if (tail && STABLE_TERMINAL_STAGES.has(tail.stage)) return null; // already closed
   // A 'pending-merge' tail IS re-resolved (the branch may have been merged since).
 
   const detail = String(applied.detail || '').trim();
@@ -192,4 +202,4 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   return { stage: 'noop', detail: `apply outcome not classifiable, treated as no-op: ${detail || '(no detail)'}`.slice(0, 200) };
 }
 
-module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain };
+module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain };
