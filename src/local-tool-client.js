@@ -392,7 +392,7 @@ const TOOLS = [
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Literal substring, or several words (a line matches if it contains all of them). No regex.' },
-          dir: { type: 'string', description: 'Which subdirectory to search: one of the primary repo\'s searchable dirs (see the error message if unsure), a subpath of one (e.g. "python/dashboard"), or "." / omitted to search all of them. For another "root", any subdirectory or "." for the whole repo.' },
+          dir: { type: 'string', description: 'Where to search: one of the primary repo\'s searchable dirs (see the error message if unsure), a subpath of one (e.g. "python/dashboard"), a single file path (e.g. "src/task-sources.js" -- searched directly, any extension), or "." / omitted to search all of them. For another "root", any subdirectory, file, or "." for the whole repo.' },
           root: { type: 'string', description: 'Optional absolute path of another accessible repo to search instead of the primary one (see list_roots).' },
           contextLines: { type: 'integer', description: 'Optional 0-5: include this many lines of context before and after each hit.' },
         },
