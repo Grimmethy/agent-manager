@@ -316,7 +316,7 @@ function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
   };
 }
 
-const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 'needs-clarification', 'blocked'];
+const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 'needs-clarification', 'blocked', 'coordinating'];
 
 function oldestFileAgeSec(dir, now) {
   let entries;

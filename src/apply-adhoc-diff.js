@@ -35,20 +35,27 @@ function slugify(str) {
 // 'adhoc'/'manual' on anything it picks up from there regardless of what the file itself
 // says, so there's no need to set them here. No git branch/commit involved (same as any
 // other skipped apply) -- this is pipeline bookkeeping, not a code change.
+// Returns [{ id, title }] (2026-09-02: was [id] -- the coordinator parent needs titles for
+// its checklist). A proposal's optional `after: N` (N = index of an EARLIER sub-task, so
+// the graph is a DAG by construction) becomes a real dependsOn edge -- isDependencySatisfied
+// (task-sources.js) then holds that child in queue/adhoc/ until the earlier one is MERGED.
 function queueSubTasks(subTasks, pipelineDir, parentTaskId) {
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
+  const ids = subTasks.map((sub, i) => `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`);
   return subTasks.map((sub, i) => {
-    const id = `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`;
     const record = {
-      id,
+      id: ids[i],
       domain: 'adhoc',
       source: 'manual',
       title: sub.title,
       promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
     };
-    fs.writeFileSync(path.join(adhocDir, `${id}.json`), JSON.stringify(record, null, 2) + '\n');
-    return id;
+    if (Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i) {
+      record.dependsOn = [ids[sub.after]];
+    }
+    fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
+    return { id: ids[i], title: sub.title };
   });
 }
 
@@ -58,8 +65,15 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
     if (!subTasks.length) {
       return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
     }
-    const ids = queueSubTasks(subTasks, pipelineDir, task.id);
-    return { skipped: true, reason: `Decomposed into ${ids.length} sub-task(s), queued to queue/adhoc/: ${subTasks.map((t) => t.title).join('; ')}` };
+    const queued = queueSubTasks(subTasks, pipelineDir, task.id);
+    // The parent does NOT go to done/ -- it becomes a coordinator in queue/coordinating/,
+    // tracking its children on a checklist and auto-completing (coordinator-sweep.js) once
+    // every child reaches done/. See recordApplyOutcome + apply-task.sh for the routing.
+    return {
+      coordinating: true,
+      reason: `Decomposed into ${queued.length} sub-task(s), now coordinating: ${queued.map((t) => t.title).join('; ')}`,
+      subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
+    };
   }
 
   const rawDiff = (task && task.rawDiff) || '';

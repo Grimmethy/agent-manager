@@ -869,6 +869,28 @@ test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needs
   assert.equal(task.status, 'awaiting-confirm');
 });
 
+test('recordApplyOutcome routes a decompose parent to coordinating/, stamping the sub-task checklist and progress', () => {
+  const task = { id: 'parent-1', history: [] };
+  const result = {
+    coordinating: true,
+    reason: 'Decomposed into 3 sub-task(s), now coordinating: a; b; c',
+    subTasks: [
+      { id: 'adhoc-a-1', title: 'a', status: 'pending' },
+      { id: 'adhoc-b-2', title: 'b', status: 'pending' },
+      { id: 'adhoc-c-3', title: 'c', status: 'pending' },
+    ],
+  };
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'coordinating');
+  assert.equal(task.status, 'coordinating');
+  assert.equal(task.blockedStage, undefined);
+  assert.equal(task.subTasks.length, 3);
+  assert.deepEqual(task.progress, { done: 0, total: 3 });
+  assert.equal(task.history.at(-1).stage, 'coordinating');
+});
+
 // coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script
 // which implies that the program is inaccurately representing model used"): the
 // commit-message Co-Authored-By trailer must name the REAL model that drafted the

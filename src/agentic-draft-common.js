@@ -53,7 +53,9 @@ const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:que
 // A RESOLUTION: decompose response is expected to be followed by a JSON array of 2+
 // {title, rawText} sub-tasks. Deliberately permissive -- pulls the first bracketed JSON
 // array found anywhere after the RESOLUTION line and drops malformed entries rather than
-// failing the whole batch.
+// failing the whole batch. An optional integer `after` (0-based index of an EARLIER
+// sub-task) is preserved -- queueSubTasks turns it into a `dependsOn` edge so a piece that
+// can't start until an earlier one is merged waits for it.
 function parseSubTaskProposals(text) {
   const match = (text || '').match(/\[[\s\S]*\]/);
   if (!match) return null;
@@ -66,7 +68,11 @@ function parseSubTaskProposals(text) {
   if (!Array.isArray(parsed)) return null;
   const cleaned = parsed
     .filter((t) => t && typeof t.title === 'string' && t.title.trim() && typeof t.rawText === 'string' && t.rawText.trim())
-    .map((t) => ({ title: t.title.trim(), rawText: t.rawText.trim() }));
+    .map((t) => {
+      const out = { title: t.title.trim(), rawText: t.rawText.trim() };
+      if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
+      return out;
+    });
   return cleaned.length ? cleaned : null;
 }
 

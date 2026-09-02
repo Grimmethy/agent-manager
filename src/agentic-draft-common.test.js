@@ -24,6 +24,18 @@ test('parseSubTaskProposals pulls a 2+ {title,rawText} array out of surrounding 
   ]);
 });
 
+test('parseSubTaskProposals preserves an optional integer `after`, drops a bad one', () => {
+  assert.deepEqual(
+    parseSubTaskProposals('[{"title":"a","rawText":"x"},{"title":"b","rawText":"y","after":0}]'),
+    [{ title: 'a', rawText: 'x' }, { title: 'b', rawText: 'y', after: 0 }],
+  );
+  // non-integer / negative `after` is dropped, the entry still survives
+  assert.deepEqual(
+    parseSubTaskProposals('[{"title":"a","rawText":"x"},{"title":"b","rawText":"y","after":"nope"},{"title":"c","rawText":"z","after":-1}]'),
+    [{ title: 'a', rawText: 'x' }, { title: 'b', rawText: 'y' }, { title: 'c', rawText: 'z' }],
+  );
+});
+
 test('parseSubTaskProposals drops malformed entries but keeps the batch, returns null below 1', () => {
   assert.deepEqual(parseSubTaskProposals('[{"title":"a","rawText":"x"},{"title":"","rawText":"y"}]'), [{ title: 'a', rawText: 'x' }]);
   assert.equal(parseSubTaskProposals('[{"title":"","rawText":""}]'), null);

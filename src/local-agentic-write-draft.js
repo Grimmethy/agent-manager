@@ -173,6 +173,7 @@ function buildWriteAgenticPrompt(task) {
     '',
     'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, in exactly this shape (a full, self-contained description for each -- someone implementing just that one piece must not need the original task):',
     '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
+    'You MAY add "after": N to a sub-task, where N is the 0-based index of an EARLIER sub-task in this same array, ONLY when the piece genuinely cannot start until that earlier one is merged -- e.g. it edits a file the earlier one creates. Omit "after" for pieces that can proceed independently (the common case).',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
     '',
     'If RESOLUTION: needs-human-decision -- follow it with the specific open question(s), plainly stated, and enough real context for a human to answer without re-investigating. Then, if the answer space is a small number of genuinely distinct choices, ALSO give 2-4 options in exactly this format:',

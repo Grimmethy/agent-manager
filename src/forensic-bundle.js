@@ -41,7 +41,7 @@ const HISTORY_DETAIL_CAP = 160;
 // isDependencySatisfied candidate list + python api_task_anywhere.
 const STATE_DIRS = [
   'pending', 'review', 'approved', 'blocked', 'needs-clarification',
-  'awaiting-confirm', 'adhoc', 'research', 'done',
+  'awaiting-confirm', 'coordinating', 'adhoc', 'research', 'done',
 ];
 
 // Static map so a report can cite the real file behind each draft tier -- the model

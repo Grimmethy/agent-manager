@@ -325,6 +325,7 @@ const TABS = [
     { key: 'blocked', label: 'Blocked', description: 'Jobs that cannot proceed until something outside the pipeline is resolved.' },
     { key: 'needs-clarification', label: '⚠ Needs Clarification', description: 'Jobs paused because the agent needs a human decision or missing information before it can continue.' },
     { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm', description: 'Jobs finished and awaiting a human decision on whether to keep or discard the result.' },
+    { key: 'coordinating', label: 'Coordinating', description: 'Decomposed parent tasks that stay alive as a hub, tracking their sub-tasks on a checklist until all are done.' },
     { key: 'done', label: 'Done', description: 'Jobs that have completed the full pipeline.' },
   ] },
 ];
@@ -525,6 +526,9 @@ const TAB_COUNT_SEVERITY_THRESHOLDS = {
   // specifically, not just an ambiguous path match, so it deserves the same "don't
   // silently sit forever" urgency as blocked, any count at all.
   'awaiting-confirm': { bad: 1 },
+  // Orange -- a coordinating parent isn't stuck, it's actively tracking sub-tasks; any
+  // count means "there is multi-part work in flight worth glancing at".
+  coordinating: { warn: 1 },
   // 'adhoc' isn't in this table -- it renders two separate numbers (in-progress/
   // blocked) with their own fixed colors instead of a single severity-driven count, see
   // renderTabButton()'s own special-case for that tab.
@@ -1944,7 +1948,7 @@ async function postTaskAction(state, id, action, confirmMessage, body) {
 // refresh() poll and across tab switches (switching away and back keeps your scroll
 // depth) -- only a full page reload resets them to the first page.
 const QUEUE_PAGE_SIZE = 10;
-const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'done'];
+const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating', 'done'];
 const queueLoadedCount = {};
 const queueHasMore = {};
 let queueLoadInFlight = false;
@@ -2068,6 +2072,8 @@ async function renderQueueTab(state) {
             ? '<span style="color:var(--warn)">📋 root-cause report — confirm to file the fix candidate</span>'
           : state === 'awaiting-confirm'
             ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
+          : state === 'coordinating'
+            ? `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`
             : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
     return `
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
@@ -2399,6 +2405,38 @@ function renderEvidenceBundle(task) {
     + `<pre>${escapeHtml(ev)}</pre></details>`;
 }
 
+// Sub-task status (from coordinator-sweep.js) -> badge class + human label.
+const SUBTASK_STATUS_META = {
+  merged: ['ok', 'merged'],
+  done: ['ok', 'done — awaiting merge'],
+  gone: ['ok', 'done'],
+  abandoned: ['idle', 'abandoned'],
+  blocked: ['bad', 'blocked'],
+  'needs-clarification': ['warn', 'needs clarification'],
+  'awaiting-confirm': ['bad', 'awaiting confirm'],
+  'in-progress': ['idle', 'in progress'],
+  pending: ['idle', 'pending'],
+};
+
+// The coordinator hub: a decomposed parent's sub-task checklist + progress bar. Each row
+// links through to that sub-task's own detail modal (data-open-task-anywhere, wired at the
+// bottom of renderTaskDetailModal). Rendered near the top, above the task log.
+function renderSubTaskChecklist(task) {
+  const subs = Array.isArray(task.subTasks) ? task.subTasks : [];
+  if (!subs.length) return '';
+  const total = task.progress && task.progress.total != null ? task.progress.total : subs.length;
+  const done = task.progress && task.progress.done != null ? task.progress.done : 0;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const rows = subs.map((st) => {
+    const [cls, label] = SUBTASK_STATUS_META[st.status] || ['idle', st.status || 'pending'];
+    return `<div class="task-history-row"><span class="badge ${cls}">${escapeHtml(label)}</span> `
+      + `${taskLink(st.id)} ${escapeHtml(st.title || '')}</div>`;
+  }).join('');
+  return `<div class="field-label">Sub-tasks (${done} / ${total})</div>`
+    + `<div class="bar-track" style="margin:2px 0 8px"><div class="bar-fill" style="width:${pct}%; background:var(--ok)"></div></div>`
+    + `<div class="task-history">${rows}</div>`;
+}
+
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
@@ -2411,6 +2449,7 @@ function renderTaskDetailModal(task) {
   html += `<div style="margin:8px 0 4px"><button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button></div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  html += renderSubTaskChecklist(task);
   // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
   // bit of meta data. How much machine time was spent on the task and a list of all the
   // files it touched") -- totalLatencyMs sums real wall-clock time across every model
@@ -2580,7 +2619,7 @@ function renderTaskDetailModal(task) {
 // drafting->review->approved->done moves, so the modal keeps tracking it without a manual
 // reopen; a terminal state stops the poll.
 let taskDetailPoll = null;
-const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review']);
+const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review', 'coordinating']);
 // Sources whose real deliverable is a prose report in implementResponse (advisoryProse),
 // not a diff -- the task modal promotes it to the top under "Root-Cause Report".
 const PROSE_REPORT_SOURCES = new Set(['pipeline_forensics']);

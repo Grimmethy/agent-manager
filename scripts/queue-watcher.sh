@@ -139,6 +139,13 @@ while :; do
     apply_retry_result="$(node "${PACKAGE_SRC_DIR}/apply-retry-check.js" 2>>"${HOME_LOGS}/apply-retry-check.log")"
     printf '[watchdog] apply-retry-check: %s\n' "$apply_retry_result" >&2
 
+    # Coordinator sweep: a RESOLUTION: decompose parent lives in queue/coordinating/ with a
+    # sub-task checklist; this reconciles each child's real state onto the parent and moves
+    # the parent to done/ once every child is finished. Cheap (one small readdir), so it
+    # runs every tick like the retry checks above.
+    coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
+    printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
