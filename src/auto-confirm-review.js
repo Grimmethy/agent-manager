@@ -254,7 +254,11 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
       appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
       try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
-      catch { summary.errors += 1; }
+      catch (err) {
+        const taskId = task.id || (task.implementResponse ? task.implementResponse.slice(0, 8) : 'unknown');
+        console.error(`[auto-confirm-review] escalate write failed: file=${file} task=${taskId} code=${err.code || ''} message=${err.message}`);
+        summary.errors += 1;
+      }
       continue;
     }
 
