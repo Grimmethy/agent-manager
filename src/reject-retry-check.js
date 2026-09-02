@@ -122,8 +122,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       if (!isReviewRejection(task) && !retryableDraftBlock) continue;
 
+      // A continuation (agentic-draft-common.js: the model ran out of turns mid-
+      // implementation, no real design question) is forward progress, not a failed
+      // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
+      // not be gated by, or count against, the blind-redraft cap.
+      const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
+
       const retryCount = Number(task.localRejectCount) || 0;
-      if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
+      if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
         // An exhausted ADHOC rejection is very often a real disagreement about scope
         // ("is this already done, or a request to extend it?") that no amount of blind
         // redraft will resolve -- send it to a human instead of leaving it to rot in
@@ -161,7 +167,22 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       }
 
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-      if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
+      if (isContinuation) {
+        priorFeedback.push([
+          'This is a CONTINUATION, not a fresh start. A prior pass got partway through and ran out of turns. It reported this remaining work:',
+          '',
+          String(task.agenticContinuationNote || '').slice(0, 4000),
+          task.priorPartialDiff
+            ? `\nThe partial diff it already produced (build ON this, do not redo it):\n\n${String(task.priorPartialDiff).slice(0, 6000)}`
+            : '',
+          '',
+          'Start editing with edit_file/write_file within your first 1-2 turns from where it left off. Finish the remaining work and end with RESOLUTION: implemented.',
+        ].filter(Boolean).join('\n'));
+        delete task.agenticContinuationNote;
+        delete task.priorPartialDiff;
+        // keep task.isAgenticContinuation + task.agenticContinuationCount for the cap in
+        // agentic-draft-common.js's resolveAgenticDraft on the next pass.
+      } else if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
         // resolveAgenticDraft decided this task's real scope is exactly one sub-task the
         // model proposed. Make that the task now, and tell the next pass to implement it
         // (not decompose again).
@@ -179,7 +200,9 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       delete task.turnBudgetExhausted;
       delete task.retryableDraftBlock;
       task.priorRejectionFeedback = priorFeedback;
-      task.localRejectCount = retryCount + 1;
+      // A continuation is forward progress, not a spent redraft -- don't burn a slot of the
+      // blind-redraft budget on it (its own MAX_AGENTIC_CONTINUATIONS cap bounds it).
+      if (!isContinuation) task.localRejectCount = retryCount + 1;
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);

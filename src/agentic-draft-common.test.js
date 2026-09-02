@@ -116,6 +116,52 @@ test('resolveAgenticDraft(needs-human-decision): needsClarification, no diff', (
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision) + partial diff + "ran out of turns" -> continuation block, not a human hold', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'cont-1' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\n\nThere is no open design question -- I ran out of turns mid-implementation. A fresh pass can finish from here: still need the /api/plugins/marketplace route and the test file.' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.match(out.blockedReason, /continuation 1\/2/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.isAgenticContinuation, true);
+    assert.equal(task.agenticContinuationCount, 1);
+    assert.match(task.priorPartialDiff, /a\.txt/);
+    assert.notEqual(task.adhocResolution, 'needs-human-decision');
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): a GENUINE question still goes to a human even with partial work', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial\n');
+    const task = { id: 'cont-2' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\n\nShould the license gate call Stripe live, or stub it? I need you to decide the payment provider.' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.notEqual(task.isAgenticContinuation, true);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): once the continuation cap is hit it escalates to a human', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial\n');
+    const task = { id: 'cont-3', agenticContinuationCount: 2 };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\n\nNo design question, just ran out of turns again.' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+  });
+});
+
 test('resolveAgenticDraft: no RESOLUTION line -> blocked (terminal, not an infra failure)', () => {
   withRealRepo((wt) => {
     const out = resolveAgenticDraft({ id: 't4' }, { result: { response: 'I looked around but never concluded' }, worktreeDir: wt });

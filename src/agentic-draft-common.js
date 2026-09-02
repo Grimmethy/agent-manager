@@ -39,6 +39,17 @@ function priorRejectionBlock(task) {
 // `needs-human-decision` routes straight to queue/needs-clarification/.
 const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose|needs-human-decision)\b/i;
 
+// A multi-step adhoc task can exceed one agentic pass's turn budget even when the model
+// knows exactly what to do. When it ends `RESOLUTION: needs-human-decision` but its own
+// message says there is NO design question -- it just ran out of turns mid-implementation
+// with real partial work in the worktree -- that is a request to re-run, not a human
+// decision. Requeue it as a continuation (carrying the partial diff + the model's
+// remaining-work list) up to this many times before finally escalating. Confirmed live
+// 2026-09-02: all 6 plugin-marketplace subtasks stalled this exact way ("I ran out of
+// turns... a fresh pass can complete it in a few edits from the state I left").
+const MAX_AGENTIC_CONTINUATIONS = Number(process.env.AGENT_MANAGER_MAX_AGENTIC_CONTINUATIONS) || 2;
+const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:question|decision)\b|\b(?:ran |run )out of turns\b|\bexhausted (?:my|its|the|this) turn(?: budget)?\b|\bre-?run (?:this|the|it|me)\b|\bfresh pass (?:can|could|will) (?:complete|finish)\b|\bwhat (?:did |does )not(?: yet)? land\b/i;
+
 // A RESOLUTION: decompose response is expected to be followed by a JSON array of 2+
 // {title, rawText} sub-tasks. Deliberately permissive -- pulls the first bracketed JSON
 // array found anywhere after the RESOLUTION line and drops malformed entries rather than
@@ -264,6 +275,24 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   }
 
   if (resolution === 'needs-human-decision') {
+    const capturedDiff = bestEffortDiff();
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    // "Re-run me", not a real question -- see MAX_AGENTIC_CONTINUATIONS. Only when real
+    // partial work landed (an empty worktree here is a genuine "I could not even start").
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS && RERUN_NOT_A_QUESTION_RE.test(summary)) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass ran out of turns mid-implementation with partial work landed and no real design question -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+        ...meta,
+        capturedDiff,
+      };
+    }
     task.adhocResolution = resolution;
     task.rawDiff = '';
     task.implementResponse = summary;
