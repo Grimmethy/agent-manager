@@ -758,6 +758,22 @@ def read_env_file(env_path: Path) -> dict:
     return result
 
 
+def backfill_env_from_file(env_path: Path) -> list:
+    """os.environ.setdefault() every KEY=VALUE from agent-manager.env -- never overriding an
+    explicitly-exported value. scripts/launch.sh does `set -a; source agent-manager.env` so
+    daemons it starts inherit AGENT_MANAGER_REPO_ROOT et al, and the dashboard passes its
+    own environment straight through to the node children it shells out to
+    (local-tool-client.js for Chat, ...). Started any other way those vars are absent and
+    Chat breaks first (local-tool-client.js's getConfig() aborts, the turn comes back
+    empty -- confirmed live 2026-09-02). Returns the keys it actually filled in."""
+    filled = []
+    for k, v in read_env_file(env_path).items():
+        if v and k not in os.environ:
+            os.environ[k] = v
+            filled.append(k)
+    return filled
+
+
 def write_env_value(env_path: Path, key: str, value: str):
     """Updates one KEY=VALUE line in place if it already exists (preserving every other
     line, comments included), or appends it if not. Used by /api/pipeline/start so
@@ -6716,6 +6732,11 @@ def _is_loopback_host(host: str) -> bool:
 
 
 if __name__ == "__main__":
+    _filled = backfill_env_from_file(ENV_FILE_PATH)
+    if _filled:
+        print(f"[dashboard] backfilled {len(_filled)} env var(s) from agent-manager.env "
+              f"(not started via launch.sh): {', '.join(sorted(_filled))}", file=sys.stderr)
+
     port = int(os.environ.get("AGENT_MANAGER_DASHBOARD_PORT", "7420"))
     # Default stays loopback-only; AGENT_MANAGER_DASHBOARD_HOST=0.0.0.0 (or a specific LAN
     # IP) opts into LAN access for the companion app (see lan_mutation_gate above for what
