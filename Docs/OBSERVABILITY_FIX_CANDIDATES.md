@@ -1697,3 +1697,26 @@ Inside the existing `except Exception` block, add a single `logging.warning` cal
 
 Benefits:
 The moment a decode or record step starts failing, an operator sees a timestamped warning with the exception traceback and the affected model/request identifier in the application log. This converts an invisible, persistent format degradation into a one-line diagnostic that is searchable, attributable, and actionable within seconds of the first bad request, rather than only after a downstream consumer reports a missing `response` field. No new dependency, no new subsystem, no change to the adapter's return contract.
+
+### AC-97 · Log the swallowed parse exception in the SSE streaming proxy
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/adapters/proxy.py
+Snippet:
+```
+                        try:
+                            obj = json.loads(payload)
+                            delta = obj["choices"][0]["delta"].get("content")
+                        except Exception:
+                            yield (line + "\n\n").encode()
+                            continue
+                        if delta:
+```
+
+Problem:
+The generator that iterates over upstream SSE lines catches a bare `except Exception` when attempting to extract `choices[0].delta.content` from each JSON payload, then silently yields the raw line and `continue`s. No `logging` call, no re-raise, no diagnostic of any kind is emitted. In a proxy that relays thousands of streaming lines per request, this means that an upstream field rename, a non-JSON error envelope mid-stream, or a genuine `TypeError` from a code defect (e.g. `payload` being `None` due to an earlier logic bug) are all indistinguishable and invisible to the operator. The downstream client receives garbled text with zero log evidence that parsing was attempted and failed.
+
+Solution:
+Add a module-level `_logger = logging.getLogger(__name__)` (or reuse the existing logger if one is already defined in the file). Inside the `except Exception as exc` block, before the fallback `yield raw_line`, emit a single `logging` call at `WARNING` level that records the exception type and message, the zero-based line index within the current SSE stream, and the first 128 characters of the offending raw line (truncated with an ellipsis) so the operator can identify the payload without flooding the log with multi-kilobyte bodies. Do not re-raise: the generator has already yielded prior tokens to the downstream client, so aborting mid-stream would violate the SSE contract and discard already-delivered content; the raw pass-through fallback is the correct recovery, it simply needs an audit trail.
+
+Benefits:
+Operators gain a single, greppable log line per failed parse event that identifies *what* failed (exception class + message), *where* in the stream (line index), and *what the payload looked like* (truncated raw text). This turns an invisible silent-swallow into a diagnosable warning, lets on-call engineers distinguish a benign keep-alive comment from a real upstream schema change or a code defect, and preserves the existing pass-through behavior so no downstream client sees a broken stream.
