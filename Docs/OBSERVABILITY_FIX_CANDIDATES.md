@@ -2020,3 +2020,26 @@ Bind the caught error (`catch (err)`) and emit a single `console.warn` that name
 
 Benefits:
 A persistently corrupt draft file now produces a visible, greppable log line on every startup that names the exact file and the parse/read error, giving an operator a direct trail from "draft X is missing from the queue" to the offending file. The log output is consistent with the directory-read warning already present in the same function, so the file's error-handling style is uniform. No behavioural change for the happy path or for genuinely transient mid-write files (they still log once and are retried next startup).
+
+### AC-124 · Swallowed read/parse errors in appendTierWorkLog hide data loss and I/O faults
+Strength: Strong
+Files: src/work-log.js
+Snippet:
+```
+    const p = worklogPath(task.id, pipelineDir);
+
+    let doc;
+    try { doc = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { doc = null; }
+    if (!doc || typeof doc !== 'object' || !Array.isArray(doc.tiers)) doc = { taskId: task.id, tiers: [] };
+    doc.taskId = task.id;
+    doc.updatedAt = new Date().toISOString();
+```
+
+Problem:
+Line 97 wraps both `fs.readFileSync(p, 'utf8')` and `JSON.parse(...)` in a single blanket `try { … } catch { doc = null; }`. The ENOENT path (file does not exist yet on first write) is the expected, benign case, but the same catch also silently absorbs a corrupt-JSON `SyntaxError` (discarding every previously recorded tier entry with no signal), an `EACCES`/`EPERM` read failure, and any other I/O fault. Because the project has no logging framework, the correct primitive is a `console.warn` / `console.error` line, and none is emitted here; an operator investigating a missing or truncated worklog has zero diagnostic trail to distinguish "first write" from "file was corrupt and we dropped N prior tiers" from "disk/permission problem."
+
+Solution:
+Replace the single-line catch with a narrow handler that inspects the error. If `err.code === 'ENOENT'`, keep the existing `doc = null` fallback silently (this is the normal first-write path). For every other error — a `SyntaxError` from `JSON.parse`, or any non-ENOENT code from `readFileSync` — emit `console.warn('[work-log] Failed to read prior worklog for task %s at %s: %s; starting fresh document.', task.id, p, err.message)` before falling back to `doc = null`. This preserves the best-effort, non-throwing contract of the function while giving an operator a single grep-able line that identifies the task, the file path, and the root cause, using only the `console.warn` primitive this project already uses.
+
+Benefits:
+A corrupt or unreadable worklog file no longer causes silent, unexplained loss of all prior tier entries; the operator sees exactly which task, which file, and which error triggered the reset. Permission and disk-I/O faults are surfaced at the point of failure rather than surfacing later as a confusing write error with no context. The first-write ENOENT path remains completely quiet, so normal operation produces no log noise.
