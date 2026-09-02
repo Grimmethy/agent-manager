@@ -2204,3 +2204,26 @@ Replace the three empty catch bodies at lines 122–124 with `console.warn` call
 
 Benefits:
 An operator debugging a flaky "could not create adhoc scratch worktree" error now sees, in the same log stream, whether the pre-cleanup step hit an unexpected error (permissions, corruption) versus the normal "nothing to remove" case. The create-path and the cleanup-path become consistent in their observability, eliminating a class of silent-failure bugs where a broken pre-cleanup masks itself behind a downstream `worktree add` error that points at the wrong root cause.
+
+### AC-132 · Swallowed fs.unlinkSync error in post-failure cleanup loop
+Strength: Strong
+Files: src/apply-adhoc-diff.js
+Snippet:
+```
+            // unmerged path ("error: path is unmerged") entirely. Checking out an actual
+            // commit-ish resets both the index and working tree regardless of merge state.
+            execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+          } catch (restoreErr) {
+            // Fails for a file this patch CREATES (mode:"create" has no HEAD entry to
+            // restore from) -- the failed --3way attempt may have still written a stray
+            // file there. Best-effort remove it rather than leave a leftover conflict-
+```
+
+Problem:
+Inside the restore loop (lines 140-166), the inner `catch (_)` around `fs.unlinkSync` (line 159) discards every possible error from the unlink call indiscriminately. The accompanying comment ("nothing to remove, or already gone -- fine either way") is only correct for the ENOENT case, but the catch also swallows EACCES, EPERM, EBUSY, or the case where the path resolves to a directory — situations where a stray conflict-marker file is genuinely left behind and no one is told. Because the project has no metrics or structured-logging system, the only available channel is a console-level log, and none is emitted here, so the partial-cleanup failure is invisible to the operator who is already reading the `plainApplyErr` thrown two lines later.
+
+Solution:
+Replace `catch (_)` with `catch (unlinkErr)`. If `unlinkErr.code === 'ENOENT'`, the file was already absent — the expected "created-file" case — and no action is needed. For any other code (or a missing `code` property), emit `console.warn(\`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message}\`)` so the operator sees that best-effort cleanup did not fully succeed. Do not rethrow: the loop must continue to the next file, and the function's final `throw plainApplyErr` is the error the caller acts on; the unlink failure is diagnostic context, not a new failure to surface.
+
+Benefits:
+An operator debugging a failed ad-hoc apply who notices a leftover untracked file in the repo will now see a single, specific warning line naming the file and the OS-level reason the unlink failed, instead of a silent no-op that forces them to guess whether the cleanup ran at all. The expected ENOENT path remains quiet, so the common "created-file, nothing to restore" case adds zero log noise. The fix uses only `console.warn`, which is already the project's logging primitive, and introduces no new dependency.
