@@ -81,3 +81,14 @@ In the rejection/retry code path in local-draft.js (where a rejected draft is re
 
 Benefits:
 Rejected drafts receive targeted, specific feedback on retry instead of re-implementing blindly. This reduces repeated rejections on the same issue and improves first-pass acceptance rate on retry.
+
+### AC-13 · 3 needs-clarification tasks, same signature (manual::empty-degenerate-draft)
+Strength: Strong
+Files: src/local-agentic-write-draft.js, src/reject-retry-check.js
+
+Model confidence: Worth exploring
+Problem: The pipeline does not pre-screen tasks for external-state dependencies (network, credentials, out-of-repo resources) before entering the expensive local-agentic-write tier. The agent correctly identified the impossibility, but only after consuming 8 turns and 3 failed bash calls. The task decomposition also conflated in-repo work (schema authoring, dashboard config) with out-of-sandbox work (GitHub repo creation), making the entire subtask unshippable when only part of it was infeasible.
+Solution: Add a pre-implementation feasibility gate in `src/local-agentic-write-draft.js` that scans the task's `ask` and `plan` for markers of external dependencies (e.g., "create a repo", "host at a URL", "git remote", "credentials", "network") and, if found, either (a) splits the task into in-repo and out-of-sandbox subtasks, routing the in-repo portion to local-agentic-write and the out-of-sandbox portion to a human-decision queue, or (b) immediately returns `needs-clarification` with a structured list of the missing external facts. Acceptance check: re-run the failing task; the pipeline should produce a `needs-clarification` response within 2 turns (not 8), with the open questions explicitly listing "git source URL of agent-manager-hygiene", "current version of agent-manager-hygiene", and "where the new repo must live" as the blocking facts, and the in-repo schema/dashboard work should be separated into a new shippable subtask.
+Benefits: Tasks that require external system state (repo creation, API credentials, network access) will no longer consume the full local-agentic-write budget before failing; instead, they will be routed to human-decision quickly, and any in-repo work they contain will be extracted and shipped independently.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-empty-degenerate-draft-1788307819363
