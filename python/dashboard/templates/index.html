@@ -2403,6 +2403,14 @@ function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+  // "Send to Chat" (2026-09-17, Grimmethy: "When I look at a task in the task
+  // details, I want to be able to send that to my chat panel to investigate further")
+  // -- dumps this task's key context into the chat panel as a user message so a follow-up
+  // can be had about it. Button sits in the modal's top action area (right by the close
+  // X), same .secondary style as the Discuss/Edit/Delete buttons elsewhere. Wired below
+  // (task-send-to-chat) rather than inlined so the multi-line payload text isn't quote-
+  // escaping trouble in the onclick string.
+  html += `<div style="margin:8px 0 4px"><button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button></div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
   // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
@@ -2536,6 +2544,52 @@ function renderTaskDetailModal(task) {
     link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
   if (task.needsClarification) wireClarificationPicker(task.id);
+  // "Send to Chat" button handler (declared in the modal HTML above). Dumps this task's
+  // key context (title / source / blocked reason / request brief / plan / implement
+  // response) into the chat panel as a single user message so the user can immediately
+  // ask the chat to investigate it further. POSTs to /api/chat/inject (records the user
+  // turn, does NOT call the model -- the user then asks their own follow-up via the
+  // normal send). fetchJson is GET-only, so this uses raw fetch for the POST.
+  const taskSendToChatBtn = document.getElementById('task-send-to-chat');
+  if (taskSendToChatBtn) {
+    taskSendToChatBtn.onclick = async () => {
+      taskSendToChatBtn.disabled = true;
+      try {
+        const parts = [`# ${task.id}`];
+        if (task.title) parts.push('title: ' + task.title);
+        if (task.source) parts.push('source: ' + task.source);
+        if (task.blockedReason) parts.push('blocked: ' + task.blockedReason);
+        if (task.promptContext && task.promptContext.requestText) parts.push('request:\n' + task.promptContext.requestText);
+        if (task.planResponse) parts.push('plan:\n' + task.planResponse);
+        if (task.implementResponse) parts.push('implement:\n' + task.implementResponse);
+        const text = parts.join('\n\n');
+        const r = await fetch('/api/chat/inject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        if (!r.ok) {
+          let msg = r.status;
+          try { const j = await r.json(); msg = j.error || j.description || msg; } catch (e) { /* status code is fine */ }
+          throw new Error(String(msg));
+        }
+        const data = await r.json();
+        const sessionId = data.sessionId || (data.session && (data.session.id || data.session.session_id));
+        // Reflect the injected turn in the panel: expand it, re-load the active session
+        // (the endpoint injects into the currently-active one) and re-render.
+        chatSetCollapsed(false);
+        if (sessionId) {
+          try { chatSession = await fetchJson('/api/chat/active'); } catch (e) { /* leave as-is */ }
+        }
+        chatRender();
+        showToast('Sent to chat', 'info');
+      } catch (e) {
+        showToast('Could not send to chat: ' + e.message);
+      } finally {
+        taskSendToChatBtn.disabled = false;
+      }
+    };
+  }
   armTaskDetailAutoRefresh(task);
 }
 
