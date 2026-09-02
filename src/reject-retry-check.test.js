@@ -107,6 +107,32 @@ test('an adhoc review-rejection under the cap is requeued to queue/adhoc/, not q
   assert.deepEqual(out.priorRejectionFeedback, ['cited app.py is fabricated']);
 });
 
+test('an agentic continuation is requeued to adhoc/ even past the redraft cap, without burning a redraft slot, with a "continue from here" feedback', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-cont', domain: 'adhoc', source: 'manual',
+    retryableDraftBlock: true, isAgenticContinuation: true, agenticContinuationCount: 1,
+    agenticContinuationNote: 'ran out of turns; still need the /api/plugins/marketplace route and the test file',
+    priorPartialDiff: 'diff --git a/python/dashboard/app.py ...',
+    blockedReason: 'ran out of turns mid-implementation -- continuation 1/2',
+    localRejectCount: 2, // already at the blind-redraft cap -- must NOT block the continuation
+    history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-cont.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0, 'not treated as exhausted despite localRejectCount 2');
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-cont.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 2, 'continuation does not spend a redraft slot');
+  assert.equal(out.isAgenticContinuation, true, 'flag kept so resolveAgenticDraft can enforce the cap next pass');
+  assert.match(out.priorRejectionFeedback.join('\n'), /CONTINUATION, not a fresh start/);
+  assert.match(out.priorRejectionFeedback.join('\n'), /still need the \/api\/plugins\/marketplace route/);
+  assert.equal(out.agenticContinuationNote, undefined, 'consumed');
+  assert.equal(out.priorPartialDiff, undefined, 'consumed');
+});
+
 test('an adhoc no-changes-needed rejection that exhausts retries -> queue/needs-clarification/ with a pre-filled question', () => {
   const d = setupAdhocDirs();
   const task = {
