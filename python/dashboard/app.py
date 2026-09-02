@@ -3949,14 +3949,18 @@ def api_chat_inject():
 # busy a chat turn can sit in `flock -w 600` for many minutes. Holding the lock (the
 # Reserve feature) doesn't interrupt an in-flight call -- only killing the in-flight
 # `local-draft.js` / `review-task.js` child frees the GPU now. On every local-provider
-# chat message we: kill worker-1's draft (always), and kill worker-reasoning's / the
-# reviewer's call only if it started < AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S ago
-# (spare long-running work). A killed worker task is `mv`'d drafting/ -> pending/ first so
-# no retry budget is burnt; the daemons treat the empty child result as a retryable
-# failed call (scripts/local-worker.sh:239-434) and recover on their own next tick.
+# chat message we kill BOTH worker lanes' in-flight draft outright -- chat takes priority
+# over the pipeline, full stop (2026-09-02, Grimmethy: "Chat should preclude workers").
+# Only the `reviewer` stays age-gated (a review vote is short; and a chat turn that lands
+# just as a vote completes gains little by killing it). Set
+# AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING=true to go back to sparing a
+# worker-reasoning agentic draft older than AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S.
+# A killed worker task is `mv`'d drafting/ -> pending/ first so no retry budget is burnt;
+# the daemons treat the empty child result as a retryable failed call
+# (scripts/local-worker.sh:239-434) and recover on their own next tick.
 
-_PREEMPT_LANES_ALWAYS = ("worker-1",)
-_PREEMPT_LANES_AGE_GATED = ("worker-reasoning", "reviewer")
+_PREEMPT_LANES_ALWAYS = ("worker-1", "worker-reasoning")
+_PREEMPT_LANES_AGE_GATED = ("reviewer",)
 # instances/<lane>.json currentPass values in which the heartbeat `pid` is the node
 # child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal.
 _PREEMPT_CHILD_PASSES = frozenset({
@@ -3981,13 +3985,34 @@ def _chat_preempt_max_age_s() -> int:
         return 180
 
 
-def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s):
+def _preempt_spare_long_reasoning() -> bool:
+    """Opt back in to the old behaviour: spare a worker-reasoning agentic draft that has
+    been running longer than the max-age. Off by default -- chat precludes workers."""
+    v = (os.environ.get("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING")
+         or read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING") or "false")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _preempt_lane_sets():
+    """(always_kill, age_gated) lane tuples for this chat turn. worker-reasoning is
+    always-kill unless AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING opts it back into
+    age-gating."""
+    if _preempt_spare_long_reasoning():
+        return ("worker-1",), ("worker-reasoning", "reviewer")
+    return _PREEMPT_LANES_ALWAYS, _PREEMPT_LANES_AGE_GATED
+
+
+def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s, always=None):
     """Pure. -> (action, reason). action in {"kill", "spare", "skip"}.
     kill_pid: the resolved in-flight node child pid (or None). started_epoch: unix time
-    the call/task started (or None = age unknown)."""
+    the call/task started (or None = age unknown). `always`: whether this lane is
+    unconditionally preempted -- defaults to membership in _PREEMPT_LANES_ALWAYS (the
+    static default set) when not passed, so existing callers/tests keep working."""
+    if always is None:
+        always = lane in _PREEMPT_LANES_ALWAYS
     if not kill_pid:
         return ("skip", "no in-flight model call")
-    if lane in _PREEMPT_LANES_ALWAYS:
+    if always:
         return ("kill", "always")
     if started_epoch is None:
         return ("spare", "age unknown")
@@ -4033,10 +4058,11 @@ def _preempt_pipeline_for_chat() -> list:
     pids_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/pids"
     locks = _read_fresh_model_locks(inst_dir)
     max_age = _chat_preempt_max_age_s()
+    always_lanes, age_gated_lanes = _preempt_lane_sets()
     now = time.time()
     summary = []
 
-    for lane in (*_PREEMPT_LANES_ALWAYS, *_PREEMPT_LANES_AGE_GATED):
+    for lane in (*always_lanes, *age_gated_lanes):
         try:
             hb = read_json_safe(inst_dir / f"{lane}.json") or {}
             lock = locks.get(lane)
@@ -4063,7 +4089,7 @@ def _preempt_pipeline_for_chat() -> list:
             task_id = hb.get("currentTaskId")
             # For an age-gated lane with no fresh model-lock, fall back to the task JSON's
             # claimedAt, then its mtime (a conservative lower bound on task age).
-            if started_epoch is None and lane in _PREEMPT_LANES_AGE_GATED and task_id and qdir:
+            if started_epoch is None and lane in age_gated_lanes and task_id and qdir:
                 tf = qdir / "drafting" / lane / f"{task_id}.json"
                 try:
                     tdata = read_json_safe(tf) or {}
@@ -4072,7 +4098,8 @@ def _preempt_pipeline_for_chat() -> list:
                 except OSError:
                     pass
 
-            action, reason = _preempt_decision(lane, kill_pid, started_epoch, now, max_age)
+            action, reason = _preempt_decision(lane, kill_pid, started_epoch, now, max_age,
+                                               always=lane in always_lanes)
             age_s = int(now - started_epoch) if started_epoch else None
 
             if action != "kill":
