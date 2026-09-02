@@ -2066,3 +2066,26 @@ In both `catch` blocks, inspect `err.code`. If it is `ENOENT`, keep the current 
 
 Benefits:
 An operator who notices worklogs accumulating in the worklog directory now gets a one-line `console.error` pinpointing the exact path and errno the moment the cleanup loop hits an unexpected condition, instead of a silent `{ pruned: 0 }` that looks identical to "nothing to do." Expected races and missing directories remain quiet, so the log stays clean in normal operation, while the rare permission or I/O fault is no longer invisible.
+
+### AC-126 · Log the silent cache-path fallback in `resolve_writable_cache`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    try:
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        return cache
+    except OSError:
+        cache = _fallback_cache_paths(path_str, grep_dirs)
+        cache["dir"].mkdir(parents=True, exist_ok=True)
+        return cache
+```
+
+Problem:
+The `except OSError` handler on line 706 catches the failure to create the project-local cache directory and immediately substitutes the fallback path with no diagnostic output whatsoever. The `OSError` object (which carries the specific reason — `EACCES` on a read-only mount, `ENOSPC`, `ENOTDIR`, etc.) is discarded, the primary path that failed is never recorded, and the fallback path that is actually being used is not surfaced. An operator investigating "why is my build reading a stale graph?" or "why did the save land in `~/.dashboard-cache/` instead of the project directory?" has zero log evidence that a fallback occurred; the only way to discover it is to read the source and infer that the primary `mkdir` must have failed.
+
+Solution:
+Inside the `except OSError` block, before calling `_fallback_cache_paths`, emit a single `logging.warning` call (the stdlib `logging` module, which this file already imports or can import at module level) that includes: the caught exception (`exc_info=True` or interpolating `str(exc)`), the primary directory path that failed (`cache["dir"]` from the first `project_cache_paths` call), and the fallback directory path that is about to be used (`_fallback_cache_paths(path_str, grep_dirs)["dir"]`). The function still returns normally — the fallback is intentional and the contract is preserved — so no rethrow is needed; the operator just needs to see that the degraded path was taken and why.
+
+Benefits:
+An operator tailing the dashboard service log can immediately see, at the moment a read-only or permission-restricted project triggers the fallback, exactly which path failed, the OS-level reason, and where the cache actually landed. This turns an invisible, silent redirection into a one-line audit trail, eliminates the "mystery stale cache" debugging class entirely, and costs nothing at runtime on the happy path (the log line is only reached when the primary `mkdir` raises).
