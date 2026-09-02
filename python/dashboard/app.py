@@ -291,6 +291,12 @@ SRC_DIR = PACKAGE_ROOT / "src"
 # ensureRegistered() (JS side: src/plugins-manifest.js) and by the Plugins tab here. Lives
 # beside agent-manager.env; seeded from AGENT_MANAGER_REGISTER_PATH on first read.
 PLUGINS_MANIFEST_PATH = PACKAGE_ROOT / "plugins.json"
+# Where installed plugins live (overridable for tests), and the static marketplace
+# catalog file (plugins-catalog.json) at the package root. The dashboard only reads
+# and validates the catalog -- it never fetches or writes it.
+PLUGINS_INSTALL_DIR_ENV = "AGENT_MANAGER_PLUGINS_DIR"
+PLUGINS_INSTALL_DIR_DEFAULT = PACKAGE_ROOT / "plugins"
+PLUGIN_CATALOG_PATH = PACKAGE_ROOT / "plugins-catalog.json"
 
 # Project tab's "previously loaded projects" dropdown/search-list. Separate from
 # agent-manager.env (which only ever holds the CURRENT project) -- this is a small,
@@ -6247,6 +6253,191 @@ def api_plugins_add():
         _restart_pipeline()
         restarted = True
     return jsonify({"plugin": entry, "restarted": restarted})
+
+
+# --- Marketplace (plugin catalog) -------------------------------------------------------
+# The catalog is a static, pre-generated JSON file (plugins-catalog.json) at the package
+# root. These helpers only read and validate it, and expose it via GET
+# /api/plugins/marketplace alongside installed-plugin status. Hand-rolled strict
+# validation -- no jsonschema dependency.
+
+def _validate_catalog_source(src):
+    """Validates a catalog entry's 'source' dict. Returns an error string or None."""
+    if not isinstance(src, dict):
+        return "source must be an object"
+    unknown = set(src) - {"type", "url", "ref"}
+    if unknown:
+        return f"source has unknown key(s): {', '.join(sorted(unknown))}"
+    if src.get("type") not in ("git", "npm"):
+        return "source.type must be 'git' or 'npm'"
+    url = src.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "source.url must be a non-empty string"
+    if "ref" in src and (not isinstance(src["ref"], str) or not src["ref"].strip()):
+        return "source.ref must be a non-empty string"
+    return None
+
+
+def _validate_catalog_pricing(p):
+    """Validates a catalog entry's optional 'pricing' dict. Returns an error string or None."""
+    if not isinstance(p, dict):
+        return "pricing must be an object"
+    unknown = set(p) - {"model", "amount_cents", "currency", "interval"}
+    if unknown:
+        return f"pricing has unknown key(s): {', '.join(sorted(unknown))}"
+    model = p.get("model")
+    if model not in ("free", "one-time", "subscription"):
+        return "pricing.model must be 'free', 'one-time', or 'subscription'"
+    if model != "free":
+        amount = p.get("amount_cents")
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+            return "pricing.amount_cents must be an integer >= 0"
+        currency = p.get("currency")
+        if not isinstance(currency, str) or not currency.strip() or len(currency) != 3:
+            return "pricing.currency must be a non-empty 3-character string"
+        if "interval" in p and (not isinstance(p["interval"], str) or not p["interval"].strip()):
+            return "pricing.interval must be a non-empty string"
+    return None
+
+
+def _validate_catalog_entry(entry, index):
+    """Validates one plugins[] entry. Returns an error string or None."""
+    if not isinstance(entry, dict):
+        return f"plugins[{index}] must be an object"
+    unknown = set(entry) - {
+        "id", "name", "summary", "description", "version",
+        "source", "tags", "license", "min_agent_manager", "pricing",
+    }
+    if unknown:
+        return f"plugins[{index}] has unknown key(s): {', '.join(sorted(unknown))}"
+    for field in ("id", "name", "summary", "description", "version"):
+        val = entry.get(field)
+        if not isinstance(val, str) or not val.strip():
+            return f"plugins[{index}].{field} must be a non-empty string"
+    if not re.match(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.\-]+)?$", entry["version"]):
+        return f"plugins[{index}].version must look like X.Y.Z or X.Y.Z-prerelease"
+    src_err = _validate_catalog_source(entry.get("source"))
+    if src_err:
+        return f"plugins[{index}].{src_err}"
+    if "tags" in entry:
+        tags = entry["tags"]
+        if not isinstance(tags, list) or any(not isinstance(t, str) or not t.strip() for t in tags):
+            return f"plugins[{index}].tags must be a list of non-empty strings"
+    for opt in ("license", "min_agent_manager"):
+        if opt in entry and not isinstance(entry[opt], str):
+            return f"plugins[{index}].{opt} must be a string"
+    if "pricing" in entry:
+        p_err = _validate_catalog_pricing(entry["pricing"])
+        if p_err:
+            return f"plugins[{index}].{p_err}"
+    return None
+
+
+def validate_plugin_catalog(doc):
+    """Strict validation of the whole catalog document. Returns an error string or None."""
+    if not isinstance(doc, dict):
+        return "catalog must be a JSON object"
+    unknown = set(doc) - {"catalog_version", "generated_at", "plugins"}
+    if unknown:
+        return f"catalog has unknown key(s): {', '.join(sorted(unknown))}"
+    cv = doc.get("catalog_version")
+    if not isinstance(cv, int) or isinstance(cv, bool) or cv < 1:
+        return "catalog_version must be an integer >= 1"
+    ga = doc.get("generated_at")
+    if not isinstance(ga, str):
+        return "generated_at must be a string"
+    try:
+        datetime.fromisoformat(ga)
+    except (TypeError, ValueError):
+        return "generated_at must be a valid ISO-8601 timestamp"
+    plugins = doc.get("plugins")
+    if not isinstance(plugins, list):
+        return "plugins must be a list"
+    seen_ids = set()
+    for i, entry in enumerate(plugins):
+        err = _validate_catalog_entry(entry, i)
+        if err:
+            return err
+        if isinstance(entry, dict):
+            if entry.get("id") in seen_ids:
+                return f"duplicate plugin id '{entry.get('id')}'"
+            seen_ids.add(entry.get("id"))
+    return None
+
+
+def _read_plugin_catalog():
+    """Reads and validates PLUGIN_CATALOG_PATH. Returns (doc, None) on success,
+    ({}, reason) if the file is missing, unreadable, or fails validation."""
+    if not PLUGIN_CATALOG_PATH.is_file():
+        return {}, f"catalog file not found: {PLUGIN_CATALOG_PATH}"
+    try:
+        doc = json.loads(PLUGIN_CATALOG_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        return {}, f"failed to read catalog: {e}"
+    err = validate_plugin_catalog(doc)
+    if err:
+        return {}, err
+    return doc, None
+
+
+def _version_tuple(v):
+    """Parses 'X.Y.Z(-tail)' into a comparable tuple; returns the (0,) sentinel for
+    anything unparseable so mixed values compare safely."""
+    if not isinstance(v, str):
+        return (0,)
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.\-]+)?$", v)
+    if not m:
+        return (0,)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _installed_plugin_version(manifest, name):
+    """The 'version' field of the first manifest entry whose 'name' == name, else None."""
+    for entry in manifest:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return entry.get("version")
+    return None
+
+
+def _plugins_install_dir() -> Path:
+    """The directory plugins are installed into: $AGENT_MANAGER_PLUGINS_DIR if set and
+    non-empty, else the default <package root>/plugins."""
+    env_val = os.environ.get(PLUGINS_INSTALL_DIR_ENV, "")
+    if env_val:
+        return Path(env_val)
+    return PLUGINS_INSTALL_DIR_DEFAULT
+
+
+@app.route("/api/plugins/marketplace")
+def api_plugins_marketplace():
+    """Marketplace listing: the validated catalog entries annotated with whether each
+    plugin is installed and whether a newer version than the installed one is
+    available. Always 200 -- an unreadable/invalid catalog means entries [] with
+    catalogError set."""
+    doc, err = _read_plugin_catalog()
+    manifest = _read_plugins_manifest()
+    entries = []
+    for raw in doc.get("plugins", []):
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        name = raw.get("name")
+        installed = any(isinstance(p, dict) and p.get("name") == name for p in manifest)
+        installed_version = _installed_plugin_version(manifest, name)
+        update_available = bool(
+            installed
+            and installed_version
+            and _version_tuple(raw.get("version")) > _version_tuple(installed_version)
+        )
+        entry["installed"] = installed
+        entry["installedVersion"] = installed_version
+        entry["updateAvailable"] = update_available
+        entries.append(entry)
+    return jsonify({
+        "catalogError": err,
+        "pluginsDir": str(_plugins_install_dir()),
+        "entries": entries,
+    })
 
 
 def _stop_pipeline(force: bool = False) -> list:
