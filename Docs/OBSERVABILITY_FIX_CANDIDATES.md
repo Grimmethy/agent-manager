@@ -1766,3 +1766,26 @@ At the top of the `except` block, before the `return Response(status_code=400, .
 
 Benefits:
 Once the fix lands, every time the adapter hits the malformed-body path, a single structured line appears in the server log with a timestamp, the exception type and message, and the full traceback. An operator triaging a spike in 400s can confirm whether the adapter is the source, identify the root cause (truncated body vs. missing header vs. internal bug), and correlate the event with upstream provider billing. The change is one line, introduces no new dependency, and does not alter the HTTP contract visible to clients.
+
+### AC-100 · Silent config-load failure hides user typos and bad values
+Strength: Strong
+Files: vendor/tokenfold/core/tokenfold/core/config.py
+Snippet:
+```
+        try:
+            return Config(**{**asdict(Config()),
+                             **json.loads(p.read_text(encoding="utf-8"))}).clamp()
+        except Exception:
+            pass
+    return Config()
+
+```
+
+Problem:
+The `except Exception: pass` block in the config-loading path swallows every failure mode—missing file, malformed JSON, a type the `Config` constructor rejects, a `clamp()` violation—and returns a pristine `Config()` with zero diagnostic output. A user who edits their config file, introduces a typo or an out-of-range value, and restarts the agent-manager receives default behaviour with no `logging.warning`, no stderr line, and no other signal that their file was read and then discarded. In a long-running agent-manager process this is the classic "why is my config not taking effect?" ticket that consumes significant debugging time because the failure is completely invisible in logs.
+
+Solution:
+Replace the bare `pass` with a single `logging.warning` call that includes the exception type and message (e.g. `logging.warning("Config load failed (%s: %s); falling back to defaults", type(exc).__name__, exc)`), keeping the `return Config()` fallback intact. Import `logging` at module level if not already present. Do not re-raise: the caller's contract is "receive a valid `Config`, never raise," and it has no business handling `json.JSONDecodeError` or `FileNotFoundError`. Do not add any metrics, counters, or telemetry primitives—this project has no metrics system and the stdlib `logging` module is the correct and only available primitive.
+
+Benefits:
+Once the warning is emitted, any operator or developer tailing the agent-manager log immediately sees that a config file was attempted, what went wrong (e.g. `JSONDecodeError: Expecting value: line 3 column 12`), and that defaults were substituted. This converts an hour-long "why is my config ignored?" investigation into a one-line log grep. The graceful-degradation contract is preserved—no caller sees a new exception—so the fix is strictly additive in observability with zero behavioural risk.
