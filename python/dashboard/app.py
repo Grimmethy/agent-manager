@@ -13,6 +13,7 @@ specific LAN IP (see README's Dashboard section for the auth token this requires
 TLS options -- AGENT_MANAGER_DASHBOARD_CERT/_KEY for direct HTTPS, or a reverse proxy).
 """
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -4201,30 +4202,44 @@ def api_chat_message(session_id):
     from chat_sessions import stream_message, PROVIDER_LOCAL
     from claude_client import ClaudeClientError
     from local_tool_client import LocalToolClientError
+    import single_flight_lock
 
-    # Make GPU space for a local-provider turn: kill worker-1's in-flight draft (always)
-    # and worker-reasoning's / the reviewer's (only if < ~3 min in). Synchronous, before
-    # the SSE generator / node child runs, so the tool loop's withLock() acquires at once.
-    # Claude-provider turns don't touch the local model -- skipped.
+    is_local_turn = existing.get("provider") == PROVIDER_LOCAL
+    inst_dir = instances_dir()
+
+    # Make GPU space for a local-provider turn: kill both worker lanes' in-flight draft
+    # (chat precludes workers), the reviewer's only if < ~3 min in. Synchronous, before the
+    # SSE generator / node child runs. Claude-provider turns don't touch the local model.
     preempted = []
-    if existing.get("provider") == PROVIDER_LOCAL and _chat_preempt_enabled():
+    if is_local_turn and _chat_preempt_enabled():
         try:
             preempted = _preempt_pipeline_for_chat()
         except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
             print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
     def generate():
-        if preempted:
-            yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
-        try:
-            for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
-                yield f"data: {json.dumps(event)}\n\n"
-        except ClaudeClientError as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        except LocalToolClientError as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        except (TimeoutError, ConnectionError, OSError) as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
+        # Priority marker held for the WHOLE turn (model call + every tool-loop iteration in
+        # the node child) and kept fresh by priority_marker's own daemon thread, so worker/
+        # reviewer acquire() keeps yielding the GPU the entire time -- not just the ~8s the
+        # bare marker used to cover. Killing a worker (above) only frees the GPU for an
+        # instant; without this the worker daemon respawns and reclaims it between the
+        # chat's tool-loop turns, and the turn starves with no output (confirmed live
+        # 2026-09-02). Inside generate() so its teardown is bound to the SSE generator's
+        # lifecycle (client disconnect -> GeneratorExit -> finally).
+        marker_cm = (single_flight_lock.priority_marker(inst_dir)
+                     if (is_local_turn and inst_dir) else contextlib.nullcontext())
+        with marker_cm:
+            if preempted:
+                yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
+            try:
+                for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except ClaudeClientError as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            except LocalToolClientError as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            except (TimeoutError, ConnectionError, OSError) as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
 
     # Reserved sessions refresh their own idle clock on every real message -- same
     # liveness-refresh shape a worker instance's own heartbeat already follows.

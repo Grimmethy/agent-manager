@@ -159,5 +159,28 @@ class AcquireReleaseTest(unittest.TestCase):
         self.assertEqual(after, [], "marker cleared once acquired")
 
 
+class PriorityMarkerTest(unittest.TestCase):
+    def test_marker_present_during_block_and_kept_fresh_then_removed(self):
+        d = Path(tempfile.mkdtemp())
+        wait_dir = d / single_flight_lock.PRIORITY_WAIT_DIR_NAME
+        with single_flight_lock.priority_marker(d):
+            markers = list(wait_dir.iterdir())
+            self.assertEqual(len(markers), 1, "one marker while the with-block is open")
+            m = markers[0]
+            # backdate it, then confirm the refresher thread touches it forward
+            old = time.time() - 30
+            os.utime(m, (old, old))
+            time.sleep(6.0)
+            self.assertGreater(m.stat().st_mtime, old + 3, "the daemon thread re-touches the marker")
+        self.assertEqual(list(wait_dir.iterdir()), [], "marker removed on exit")
+
+    def test_best_effort_when_dir_cannot_be_made(self):
+        # A path whose parent is a file -> mkdir fails -> yields anyway, no raise.
+        f = Path(tempfile.mktemp())
+        f.write_text("x")
+        with single_flight_lock.priority_marker(f / "instances"):
+            pass  # just must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
