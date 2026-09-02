@@ -1659,3 +1659,46 @@ test('planIsThin: a real plan whose steps are markdown headings ("## 1.") is not
   assert.ok(headingPlan.length >= 200);
   assert.equal(planIsThin(headingPlan), false);
 });
+
+// 2026-09-02: promptContext.fetchedFiles is frozen at candidate-creation; a sibling AC on
+// the same file merging in the meantime left blocked observability_fix tasks re-drafting a
+// stale view (duplicate `import logging`). refreshCandidateFetchedFiles re-reads from disk.
+test('refreshCandidateFetchedFiles re-reads each fetched path from the current repoRoot, re-windowed', () => {
+  const { refreshCandidateFetchedFiles } = require('./local-draft.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-refresh-'));
+  fs.writeFileSync(path.join(dir, 'a.py'), 'import logging\nlog = logging.getLogger(__name__)\n\ndef f():\n    return 1\n');
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  delete require.cache[require.resolve('./config.js')];
+  try {
+    const task = {
+      source: 'observability_fix',
+      promptContext: {
+        body: '### AC-1\nSnippet:\n```\ndef f():\n    return 1\n```\n',
+        fetchedFiles: [
+          { path: 'a.py', content: 'def f():\n    return 1\n' }, // STALE: no import
+          { path: 'gone.py', content: 'frozen fallback' },        // deleted -> keep frozen
+        ],
+      },
+    };
+    refreshCandidateFetchedFiles(task);
+    const a = task.promptContext.fetchedFiles.find((f) => f.path === 'a.py');
+    assert.match(a.content, /import logging/, 'refreshed from disk -- now shows the real import');
+    const gone = task.promptContext.fetchedFiles.find((f) => f.path === 'gone.py');
+    assert.equal(gone.content, 'frozen fallback', 'a missing path keeps its frozen snapshot');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT;
+    else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('./config.js')];
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('refreshCandidateFetchedFiles is a no-op when there are no fetchedFiles / no path-jail escape', () => {
+  const { refreshCandidateFetchedFiles } = require('./local-draft.js');
+  const t1 = { source: 'observability_fix', promptContext: {} };
+  refreshCandidateFetchedFiles(t1); // must not throw
+  const t2 = { source: 'observability_fix', promptContext: { fetchedFiles: [{ path: '../../etc/passwd', content: 'x' }] } };
+  refreshCandidateFetchedFiles(t2);
+  assert.equal(t2.promptContext.fetchedFiles[0].content, 'x', 'a path outside repoRoot is left untouched');
+});
