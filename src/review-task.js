@@ -430,8 +430,21 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // sub-candidates, which routinely names config/field values a future drafting pass
   // should create, not a claim that something already exists. Same carve-out, same
   // "still checked, just not auto-blocked" scoping.
+  //
+  // 2026-09-02: the same category error for an advisoryProse candidate-generating review
+  // source (function_length_review / performance_review / observability_review). Their
+  // deliverable is a `### AC-NNN` candidate block whose Solution paragraph PROPOSES names
+  // for helpers/constants a FUTURE fix pass should introduce ("extract into a
+  // RETRYABLE_WITH_BACKOFF branch", "compute START_MS once outside the loop") -- never a
+  // claim that RETRYABLE_WITH_BACKOFF / START_MS already exists. checkGroundedValues'
+  // premise ("a value cited as already-real that appears nowhere is fabricated") is a
+  // category error against a proposal, exactly like the decompose case above. Confirmed
+  // live: function-length-...reject-retry-check-js-90 (RETRYABLE_WITH_BACKOFF),
+  // performance-...uptime-log-js-58 (START_MS). Still handed to the vote via
+  // buildVerdictPrompt -- just not an automatic no-review block.
   const isDecomposeProposal = (task.source === 'manual' && task.adhocResolution === 'decompose') || !!task.candidateSplitProposals;
-  const highPrecisionFlags = isDecomposeProposal
+  const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
+  const highPrecisionFlags = isProposalNotClaim
     ? []
     : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
   if (highPrecisionFlags.length > 0) {
