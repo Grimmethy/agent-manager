@@ -1973,3 +1973,26 @@ In the `except` clause, use the Python stdlib `logging` module (already the proj
 
 Benefits:
 Every distinct failure mode (timeout, missing binary, script crash) now produces a structured log line that an operator can grep by `task_id` and exception type, and the dashboard API returns an explicit error to the client instead of an ambiguous empty result. The incident becomes visible and debuggable in the existing log stream, and the caller regains the ability to surface a meaningful status code, all without introducing any new dependency or telemetry system.
+
+### AC-109 · Log the swallowed parse/read failure in the optional arch-candidates path
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+    cand_file = arch_candidates_path()
+    if cand_file and cand_file.is_file():
+        try:
+            text = cand_file.read_text(encoding="utf-8", errors="replace")
+            result["candidates"] = parse_arch_candidates(text)
+            result["candidatesPath"] = str(cand_file)
+```
+
+Problem:
+The `except` block that guards the best-effort read and parse of `arch_candidates` contains only a bare `pass` (or a comment). The control-flow intent is correct — a missing or corrupt auxiliary file should not 500 the entire dashboard — but the silent swallow means that a corrupted candidates file, a regression in `parse_arch_candidates`, or a transient I/O race produces zero diagnostic signal. An operator staring at a dashboard that silently lacks the candidates enrichment has no log line, no stack trace, and no way to distinguish "file legitimately absent" from "file present but unparseable."
+
+Solution:
+Replace the bare `pass` with a `logging.getLogger(__name__).warning(...)` call that includes the offending file path, the exception type, and the exception message (e.g. `logger.warning("Failed to load arch candidates from %s: %s", cand_file, exc, exc_info=exc)`). Keep the `pass` semantics — do **not** re-raise — because the caller treats candidates as optional enrichment and a re-raise would propagate a 500 to the entire dashboard response. No metric or counter is emitted because this project has no telemetry system; the stdlib `logging` module (already the project's Python logging primitive) is the sole observability channel available.
+
+Benefits:
+Once the warning is in place, any future corruption of the candidates file, a bug introduced in `parse_arch_candidates`, or a race where the file is deleted between the `is_file()` check and the `open()` call will produce a single, greppable log line that names the exact file and the exact exception. On-call engineers can confirm within seconds whether the missing enrichment is expected (file genuinely absent, which the guard already handles before the `try`) or a real fault, eliminating the current "silent data loss" failure mode without changing any runtime behaviour or adding a new dependency.
