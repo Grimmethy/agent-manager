@@ -2227,3 +2227,26 @@ Replace `catch (_)` with `catch (unlinkErr)`. If `unlinkErr.code === 'ENOENT'`, 
 
 Benefits:
 An operator debugging a failed ad-hoc apply who notices a leftover untracked file in the repo will now see a single, specific warning line naming the file and the OS-level reason the unlink failed, instead of a silent no-op that forces them to guess whether the cleanup ran at all. The expected ENOENT path remains quiet, so the common "created-file, nothing to restore" case adds zero log noise. The fix uses only `console.warn`, which is already the project's logging primitive, and introduces no new dependency.
+
+### AC-133 · Escalate-path write failure silently discards error context
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+      continue;
+    }
+
+```
+
+Problem:
+In the "unrecognised hold" branch (lines 255–258), the `catch { summary.errors += 1; }` clause swallows the exception from `fs.writeFileSync(file, JSON.stringify(task, null, 2))` without recording *what* failed. The operator sees only an opaque integer in `summary.errors` at the end of the batch; the error object (message, `err.code` such as `ENOSPC`/`EACCES`/`ENOENT`, stack) is discarded, and there is no correlation to the specific `file` path or `task` identity that triggered the write. In a loop that may escalate dozens of tasks per tick, a final `errors: 3` with zero context is undiagnosable, and because the project has no metrics or third-party logging framework, `console.error` is the only available surface.
+
+Solution:
+Replace the bare `catch { summary.errors += 1; }` with a catch that binds the error and emits a single `console.error` line containing the file path, a stable task identifier (e.g. `task.id` or the first 8 chars of `task.implementResponse` if no explicit id exists), and the error's message and code. Concretely: `catch (err) { console.error(\`[auto-confirm-review] escalate write failed for ${file} (task ${task.id ?? 'unknown'}): ${err.code ?? ''} ${err.message}\`); summary.errors += 1; }`. Do **not** rethrow — the subsequent `continue` is the correct control-flow choice (one bad write must not abort the remaining escalations in the batch), and no caller above this loop can act on a per-file write failure. No new dependency or metrics primitive is introduced; the fix uses only `console.error`, which the project already relies on for Node-side diagnostics.
+
+Benefits:
+An operator reading the batch log can immediately identify *which* task file failed, *why* (disk full, permission denied, missing directory), and *which* task was affected, turning an otherwise opaque `errors: N` counter into an actionable diagnostic. The fix costs one line of code, introduces no new dependency, preserves the existing batch-continuation semantics, and aligns with the project's established `console.error` logging convention.
