@@ -5865,7 +5865,8 @@ def _pipeline_live_counts(qdir) -> dict:
         for f in drafting_files:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to read/parse drafting file %s: %s", f, exc)
                 bump(None, "drafting")
                 continue
             bump(_resolve_source_name(data), "drafting")
