@@ -218,7 +218,47 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
 // null if every edit-mode item's find string genuinely appears in its named file's
 // fetched content (a `create` item, or a file fetchedFiles doesn't have -- fetch failed,
 // or it's a legitimate new file -- is not checked here; only a verifiable claim is).
-function findUnverifiedEdit(implementResponse, fetchedFiles) {
+// A candidate-fulfillment task's promptContext.body carries the flagged code as a
+// `Snippet:` fenced block (observability_* / performance_* / function_length_* candidates).
+// Pull it out so the implement-verify step can check the model edited THAT block.
+function extractCandidateSnippet(body) {
+  const m = /(?:^|\n)\s*Snippet:\s*```[\w-]*\n([\s\S]*?)```/i.exec(String(body || ''));
+  return m ? m[1].replace(/\s+$/, '') : '';
+}
+
+// An import/logger line an `_fix` edit routinely re-adds even when the file already has it
+// (observed live: 5 blocked observability_fix tasks -- "duplicate import logging").
+const REDUNDANT_LINE_RE = /^\s*(?:import logging|from logging import|(?:logger|log|_log|LOG|LOGGER)\s*=\s*logging\.getLogger\([^)]*\))\s*$/;
+
+// The most distinctive single line of a snippet (longest non-trivial, non-comment line) --
+// used to locate the flagged block inside the real file even when leading/trailing lines
+// of the snippet were paraphrased or reindented.
+function distinctiveLine(snippet) {
+  return (snippet || '').split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 12 && !/^(#|\/\/|\*|"""|''')/.test(l))
+    .sort((a, b) => b.length - a.length)[0] || '';
+}
+
+// 2026-09-02: a candidate-fulfillment edit whose `find` string is a real substring of the
+// file but sits far from the block the candidate actually flagged (observed live: 8 blocked
+// observability_fix tasks -- the model targeted `except OSError:` when the flag was
+// `except Exception:`, an `except` that returns a 504, a catch that already had logging).
+function findEditFarFromAnchor(find, content, anchorSnippet) {
+  const anchor = distinctiveLine(anchorSnippet);
+  if (anchor.length < 12) return false;                 // no usable anchor
+  if (anchorSnippet.replace(/\s+/g, ' ').includes(find.replace(/\s+/g, ' ').trim())) return false; // find IS in the snippet -- correct block
+  const anchorIdx = content.indexOf(anchor);
+  if (anchorIdx === -1) return false;                   // snippet stale/paraphrased -- can't judge, don't false-positive
+  const findIdx = content.indexOf(find);
+  return findIdx !== -1 && Math.abs(findIdx - anchorIdx) > 600; // ~15 lines away = a different block
+}
+
+// implementResponse + the candidate's fetched files (+ optionally the flagged code snippet)
+// -> the first problem found, or null. Verifies the SAME things apply-group-b.js will
+// eventually check, immediately after implement instead of after a wasted review cycle.
+// `problem`: 'find-missing' (default), 'wrong-block', 'duplicate-import'.
+function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '' } = {}) {
   const trimmed = (implementResponse || '').trim();
   if (!trimmed || trimmed === '""' || trimmed === "''") return null; // effectively empty -- nothing to verify
   let parsed;
@@ -229,12 +269,32 @@ function findUnverifiedEdit(implementResponse, fetchedFiles) {
   }
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const byPath = new Map((fetchedFiles || []).map((f) => [f.path, f.content]));
+  const snippet = typeof anchorSnippet === 'string' ? anchorSnippet.trim() : '';
   for (const item of items) {
-    if (!item || item.mode !== 'edit' || typeof item.find !== 'string' || !item.find) continue;
+    if (!item || (item.mode !== 'edit' && item.mode !== 'create')) continue;
     const content = byPath.get(item.file);
+
+    // Re-adding an import/logger line the file already has.
+    const added = String(item.replace ?? item.content ?? '');
+    const findText = String(item.find ?? '');
+    if (content != null && added) {
+      for (const line of added.split('\n')) {
+        if (!REDUNDANT_LINE_RE.test(line)) continue;
+        const t = line.trim();
+        if (findText.includes(t)) continue; // the model is rewriting that exact line, not adding a second
+        if (content.split('\n').some((cl) => cl.trim() === t)) {
+          return { file: item.file, problem: 'duplicate-import', duplicateLine: t };
+        }
+      }
+    }
+
+    if (item.mode !== 'edit' || !findText) continue;
     if (content == null) continue; // no fetched content to verify against -- not this check's job
-    if (!content.includes(item.find)) {
-      return { file: item.file, find: item.find };
+    if (!content.includes(findText)) {
+      return { file: item.file, find: findText, problem: 'find-missing' };
+    }
+    if (snippet && findEditFarFromAnchor(findText, content, snippet)) {
+      return { file: item.file, find: findText, problem: 'wrong-block', anchorSnippet: snippet };
     }
   }
   return null;
@@ -1018,15 +1078,29 @@ async function finalizeCandidateFulfillment(task, {
     concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
   }
-  const unverified = findUnverifiedEdit(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
+  const anchorSnippet = extractCandidateSnippet(task.promptContext && task.promptContext.body);
+  const unverified = findUnverifiedEdit(
+    task.implementResponse,
+    task.promptContext && task.promptContext.fetchedFiles,
+    { anchorSnippet },
+  );
   if (unverified) {
-    const retryPrompt = `${implPrompt}\n\nYour previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
+    let correction;
+    if (unverified.problem === 'duplicate-import') {
+      correction = `Your previous attempt for ${unverified.file} ADDS the line \`${unverified.duplicateLine}\`, but that line ALREADY EXISTS in the file's real content shown above. Do not add it again -- reuse the existing import/logger. If a module logger genuinely does not exist yet, add ONE line at the top of the file with the other imports, never inside a function.`;
+    } else if (unverified.problem === 'wrong-block') {
+      correction = `Your previous "find" string for ${unverified.file} matches the file -- but a DIFFERENT block than the one this candidate flagged. The flagged code is:\n\n${unverified.anchorSnippet}\n\nYour "find" must be a verbatim substring of THAT block (or the real file text immediately around it) -- not a similar-looking try/except/catch elsewhere in the file. Copy from the flagged block above.`;
+    } else {
+      correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
+    }
+    const retryPrompt = `${implPrompt}\n\n${correction}`;
     const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
-    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `retried once (find "${unverified.find.slice(0, 80)}" did not verify)` });
-    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (retried once: find "${unverified.find.slice(0, 80)}" did not verify against real file content)`);
+    const note = `retried once (${unverified.problem})`;
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (${note})`);
   } else {
     recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
@@ -1356,7 +1430,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan };
 
 if (require.main === module) {
   main();

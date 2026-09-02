@@ -897,10 +897,53 @@ test('findUnverifiedEdit catches a find string that does not appear in the fetch
   const fetchedFiles = [{ path: 'src/task-sources.js', content: 'function real() {\n  return 1;\n}\n' }];
 
   const bad = JSON.stringify({ mode: 'edit', file: 'src/task-sources.js', find: 'this text is not in the file', replace: 'x' });
-  assert.deepEqual(findUnverifiedEdit(bad, fetchedFiles), { file: 'src/task-sources.js', find: 'this text is not in the file' });
+  assert.deepEqual(findUnverifiedEdit(bad, fetchedFiles), { file: 'src/task-sources.js', find: 'this text is not in the file', problem: 'find-missing' });
 
   const good = JSON.stringify({ mode: 'edit', file: 'src/task-sources.js', find: 'return 1;', replace: 'return 2;' });
   assert.equal(findUnverifiedEdit(good, fetchedFiles), null);
+});
+
+test('findUnverifiedEdit: wrong-block -- find is real but far from the flagged snippet', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const content = [
+    'def a():', '    try:', '        x()', '    except OSError:', '        pass   # block A',
+    ...Array(30).fill('    filler_line_that_is_long_enough_to_push_offset()'),
+    'def b():', '    try:', '        y()', '    except Exception:', '        return None   # block B (the flagged one)',
+  ].join('\n');
+  const files = [{ path: 'm.py', content }];
+  const snippet = '    except Exception:\n        return None   # block B (the flagged one)';
+  const wrong = JSON.stringify({ mode: 'edit', file: 'm.py', find: '    except OSError:\n        pass   # block A', replace: 'x' });
+  const r = findUnverifiedEdit(wrong, files, { anchorSnippet: snippet });
+  assert.equal(r.problem, 'wrong-block');
+  assert.equal(r.anchorSnippet, snippet.trim());
+
+  const right = JSON.stringify({ mode: 'edit', file: 'm.py', find: '        return None   # block B (the flagged one)', replace: 'x' });
+  assert.equal(findUnverifiedEdit(right, files, { anchorSnippet: snippet }), null);
+});
+
+test('findUnverifiedEdit: wrong-block check is skipped when the snippet cannot be located (no false positive)', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const files = [{ path: 'm.py', content: 'def a():\n    try:\n        x()\n    except OSError:\n        pass\n' }];
+  const wrong = JSON.stringify({ mode: 'edit', file: 'm.py', find: '    except OSError:\n        pass', replace: 'x' });
+  assert.equal(findUnverifiedEdit(wrong, files, { anchorSnippet: 'some paraphrased snippet not literally in the file at all' }), null);
+});
+
+test('findUnverifiedEdit: duplicate-import -- edit re-adds an import the file already has', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const files = [{ path: 'm.py', content: 'import os\nimport logging\n\ndef f():\n    try:\n        g()\n    except Exception:\n        pass\n' }];
+  const dup = JSON.stringify({ mode: 'edit', file: 'm.py', find: '        pass', replace: 'import logging\n        logging.getLogger(__name__).warning("x")' });
+  assert.equal(findUnverifiedEdit(dup, files).problem, 'duplicate-import');
+
+  // rewriting the existing import line is fine (not a second copy)
+  const rewrite = JSON.stringify({ mode: 'edit', file: 'm.py', find: 'import logging', replace: 'import logging  # noqa' });
+  assert.equal(findUnverifiedEdit(rewrite, files), null);
+});
+
+test('extractCandidateSnippet pulls the Snippet: fenced block from a candidate body', () => {
+  const { extractCandidateSnippet } = require('./local-draft.js');
+  const body = '### AC-9 · Title\nStrength: Strong\nFiles: m.py\nSnippet:\n```python\n    except Exception:\n        pass\n```\n\nProblem:\n...';
+  assert.equal(extractCandidateSnippet(body), '    except Exception:\n        pass');
+  assert.equal(extractCandidateSnippet('no snippet here'), '');
 });
 
 test('findUnverifiedEdit does not flag effectively-empty, malformed JSON, create-mode, or files with no fetched content', () => {
