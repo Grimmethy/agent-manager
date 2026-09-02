@@ -156,7 +156,11 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
             // marker file sitting in the repo untracked; per-file (not a blanket git
             // clean) so an unrelated pre-existing untracked file elsewhere is never
             // touched.
-            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (_) { /* nothing to remove, or already gone -- fine either way */ }
+            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (unlinkErr) {
+              if (unlinkErr.code !== 'ENOENT') {
+                console.warn(`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`);
+              }
+            }
           }
         }
         // Surface the PLAIN apply's error (what a human/redraft decision should
