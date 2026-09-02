@@ -66,6 +66,7 @@ def _cpu_temperature_celsius() -> float | None:
     try:
         sensors = psutil.sensors_temperatures()
     except Exception:
+        log.debug("sensor read (CPU temperature) failed; returning None", exc_info=True)
         return None
     if not sensors:
         return None
