@@ -1859,3 +1859,26 @@ Replace the bare `pass` with a `logging.warning` call that captures the exceptio
 
 Benefits:
 Operators debugging "why are my model-call stats missing for the last hour?" will find a single `WARNING` line naming the event type and the underlying `OSError`/`SubprocessError` (e.g., `[Errno 2] No such file or directory: 'node'`), turning an invisible, unexplained data gap into a one-line log hit. No new dependency, no API change, no behavioral change on the happy path—just the minimum observability that the project's existing `logging` module already provides.
+
+### AC-117 · Swallow JSON-parse/read error in blocked-drain loop
+Strength: Strong
+Files: src/blocked-drain.js
+Snippet:
+```
+      let data;
+      try {
+        data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch {
+        continue; // an unreadable/malformed file is not this drain's problem to fix
+      }
+      if (!taskMatchesSignature(data, signature)) continue;
+```
+
+Problem:
+In the per-file drain loop (lines 57–61), a failure of `fs.readFileSync` or `JSON.parse` is caught and silently discarded with a bare `continue`. Because the file was literally listed by `readdirSync` two lines earlier, a read or parse failure here is genuinely unexpected—it signals a race (file deleted between listing and read), a permissions regression, or a malformed/partial JSON write from an upstream producer. As written, the operator has zero signal that a state file was skipped: no log line, no stderr output, no metric. In a production drain that runs on a schedule, a persistent permissions issue or a writer bug that emits truncated JSON would silently accumulate undrained state files indefinitely, and the only way to discover it would be to notice tasks never unblock.
+
+Solution:
+Replace the empty `catch { continue; }` on lines 59–60 with a `catch (err) { console.warn('[blocked-drain] skipping unreadable/malformed state file', filePath, err.message); continue; }`. This uses only `console.warn` (Node stdlib, consistent with the project's existing logging approach) and includes the full `filePath` so the operator can identify exactly which file failed, plus the error message to distinguish a `ENOENT` race from a `SyntaxError` (malformed JSON) from an `EACCES` permissions problem. The `continue` is preserved because this is a batch loop over many files and one bad file should not abort the entire drain. No rethrow is appropriate here: the caller is the for-loop itself, and there is no higher-level handler that could act on a single-file failure.
+
+Benefits:
+An operator tailing stderr (or a log aggregator that captures `console.warn`) immediately sees which state file was skipped and why, turning a silent, invisible data-loss path into a one-line diagnostic. A recurring `SyntaxError` on the same file points to a writer bug; a recurring `EACCES` points to a permissions regression; a one-off `ENOENT` confirms a benign race. This is the minimum observability the project's available primitives (no metrics, no third-party logger) can provide, and it costs nothing at runtime when no error occurs.
