@@ -1904,3 +1904,26 @@ Add a module-level `logger = logging.getLogger(__name__)` (stdlib `logging`, alr
 
 Benefits:
 Once fixed, any decode failure produces a single `WARNING`-level log line carrying the session ID, the scope, and the full exception traceback, giving an operator an immediate, greppable signal that the decode path is broken and exactly why. Programming errors (`TypeError`, `KeyError`, `AttributeError`) that were previously invisible become visible during development and canary testing, shortening the time-to-detection from "indefinite silent degradation" to "first failed call." The fail-soft contract for callers is unchanged, so no downstream code needs to be updated.
+
+### AC-106 · Silent OSError swallow on project-history write loses all diagnostic trace
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        history.insert(0, normalized)
+        history = history[:MAX_PROJECT_HISTORY]
+        PROJECT_HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+```
+
+Problem:
+The `except OSError: pass` block that guards `PROJECT_HISTORY_PATH.write_text(...)` discards every write failure with zero diagnostic output. Because the in-memory history list continues to mutate on each subsequent request, the application appears healthy to the user while the on-disk JSON file silently stops updating. A disk-full condition, a permission change, or a read-only remount will therefore produce a gradual, undetectable divergence between what the user sees in the current session and what persists across restarts, with no log line, comment, or counter to explain the gap when the data is finally noticed missing.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that records the exception type, the target path, and the original exception message (e.g. `logging.warning("Failed to persist project history to %s: %s", PROJECT_HISTORY_PATH, exc, exc_info=exc)`). Keep the control flow as a non-raising catch — the dashboard must not 500 because a best-effort cache file is momentarily unwritable — but ensure the failure is at least one greppable line in the application log. No new dependency is introduced; the stdlib `logging` module is already the project's Python logging primitive.
+
+Benefits:
+Operators can now `grep` the log for the warning and immediately see that history writes have been failing, along with the exact `OSError` reason (ENOSPC, EACCES, EROFS, etc.) and the target path, turning an invisible, multi-day data-loss window into a single, time-stamped diagnostic line. The fix costs one function call, adds no new dependency, and changes no control-flow semantics, so the dashboard continues to serve requests normally while the failure becomes observable.
