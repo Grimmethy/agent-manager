@@ -120,9 +120,9 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
     return { ok: false, reason: `could not fetch origin/${mainBranch} before starting adhoc worktree: ${e.message}` };
   }
 
-  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { /* no stale worktree registered */ }
-  try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { /* nothing left to remove */ }
-  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { /* no stale branch */ }
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup worktree remove failed', worktreeDir, e.message); }
+  try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup fs.rmSync failed', worktreeDir, e.message); }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup branch -D failed', branchName, e.message); }
 
   try {
     runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], resolvedRepoRoot);
