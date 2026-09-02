@@ -759,3 +759,51 @@ Extract three small, clearly-named helpers that `main()` calls in sequence. Firs
 
 Benefits:
 Each extracted helper is independently unit-testable (feed a fake `argv`, a stubbed `getConfig`, or a synthetic `pc` object without invoking the full CLI path), the fail-open policy becomes a one-line call whose contract is documented at the helper's JSDoc rather than hidden in a mid-function comment, and future additions to the prompt-context rules (new `pc` fields, new conditional branches) are localized to `buildPromptContext` with zero risk of accidentally reordering the config-resolution or argument-parsing steps. Review diffs for any single concern become smaller and easier to verify, and the function's overall shape—parse, resolve, build, compute—reads as a table of contents rather than a wall of interleaved logic.
+
+### AC-18 · Decompose runPlanWithTools into orchestrator + focused helpers
+Strength: Strong
+Files: src/local-tool-client.js
+Snippet:
+```
+
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false }) {
+  const { pipelineDir, repoRoot } = getConfig();
+  // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
+  // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
+  const killSwitchPath = path.join(pipelineDir, 'queue',
+    allowWrite ? '.chat-write-tools-disabled' : '.arch-discovery-tools-disabled');
+  if (fs.existsSync(killSwitchPath)) {
+    return runWithoutToolsFallback(prompt, pipelineDir);
+  }
+
+  // Multi-root (2026-08-31, system-wide Chat panel): the caller may thread its own
+  // primary root + a list of additional accessible repo roots. Every non-chat caller
+  // passes neither, so allowedRoots is just [repoRoot] and every tool behaves exactly
+  // as it did before. Deduped on realpath, primary first.
+  const rawRoots = [primaryRoot || repoRoot, ...(Array.isArray(extraRoots) ? extraRoots : [])];
+  const seen = new Set();
+  const allowedRoots = [];
+  for (const r of rawRoots) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
+  }
+  if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+
+  const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
+  const toolHandlers = allowWrite
+    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
+    : buildToolHandlers(allowedRoots);
+  // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
+  // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
+  // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
+```
+
+Problem:
+The ~202-line body of `runPlanWithTools` interleaves at least five independently-testable responsibilities—kill-switch gating, multi-root resolution and deduplication, tool/handler assembly, the multi-turn LLM agent loop, and three flag-driven behavioural modifiers (`forceSummaryOnCap`, `nudgeToEditEarly`, `leafMustEdit`)—into a single function with an 11-parameter destructured signature. Because the conditional axes (`allowWrite`, kill-switch state, root count, each behavioural flag) multiply the effective path count and the stateful loop makes operation ordering significant, a change to any one concern (e.g., adding a new root-resolution edge case or tweaking the summary-on-cap policy) forces the reviewer to trace the entire 202-line body, raising the risk of unintended interaction with the other concerns.
+
+Solution:
+Extract four focused helpers and reduce the original to a thin orchestrator. First, `resolveAllowedRoots(primaryRoot, extraRoots, repoRoot)` encapsulates the `rawRoots → realpath → Set → allowedRoots` pipeline including the empty-result fallback, making it a pure, trivially unit-testable function. Second, `buildToolSet(allowWrite, allowedRoots)` returns the correct `TOOLS`/`WRITE_TOOLS` spread plus the two `build*ToolHandlers` results. Third, `checkKillSwitch(allowWrite, pipelineDir)` returns a boolean so the early-return policy is a one-liner in the orchestrator. Fourth, `executeAgentLoop({ prompt, messages, maxTurns, tools, toolHandlers, onChunk, forceSummaryOnCap, nudgeToEditEarly, leafMustEdit, source })` contains the actual LLM-call → parse-tool-calls → execute → append-messages → repeat cycle, with the three flag modifiers applied as small per-turn policy functions (`applySummaryOnCap`, `applyNudgeToEdit`, `applyLeafMustEdit`) called at the appropriate point in the loop. The orchestrator `runPlanWithTools` then shrinks to roughly 30–40 lines: destructure params, call the three setup helpers, and delegate to `executeAgentLoop`.
+
+Benefits:
+Each extracted function can be unit-tested in isolation—feed `resolveAllowedRoots` unresolvable or duplicate paths, toggle `allowWrite` in `buildToolSet`, or simulate a malformed tool-call JSON in `executeAgentLoop`—without spinning up the full agent loop or mocking the LLM transport. Code review becomes tractable because a PR touching root-resolution logic no longer requires reading the 170-line loop body, and vice versa. The 11-parameter "god entry point" smell is reduced to a short orchestrator that reads as a table of contents, making it obvious which concern owns which parameter and where a new flag should be threaded through.
