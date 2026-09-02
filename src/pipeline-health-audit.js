@@ -135,7 +135,9 @@ function tailLogErrorSignatures(logDir, lines = 200) {
     let content;
     try {
       content = fs.readFileSync(path.join(logDir, name), 'utf8');
-    } catch {
+    } catch (err) {
+      console.warn(`tailLogErrorSignatures: failed to read "${name}": ${err.message} (${err.code || 'unknown'})`);
+      findings.push(`${name}: unreadable (${err.message} ${err.code || 'unknown'})`);
       continue;
     }
     const recentLines = content.split('\n').slice(-lines);
