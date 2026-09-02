@@ -2273,3 +2273,26 @@ Change the bare `catch` to `catch (err)` and emit a `console.error` call that in
 
 Benefits:
 An operator running the auto-confirm batch can immediately see, on stderr, exactly which task file failed to move and the underlying OS error (e.g. `EACCES` on a read-only mount vs. `ENOENT` from a concurrent run), turning an opaque integer into an actionable diagnostic. The fix uses only `console.error`, which is already the project's logging primitive, adds no dependency, and preserves the existing batch-continuation semantics.
+
+### AC-135 · Coordinator sweep silently discards write-failure context
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+      try {
+        fs.writeFileSync(file, JSON.stringify(parent, null, 2));
+        summary.updated += 1;
+      } catch {
+        summary.errors += 1;
+      }
+    }
+```
+
+Problem:
+In the `else` branch (lines 93–98), when `fs.writeFileSync(file, JSON.stringify(parent, null, 2))` throws, the bare `catch { summary.errors += 1; }` increments a numeric counter and then discards the exception entirely. The file path (`file`), the sub-task name (`name`), and the OS-level error (ENOSPC, EACCES, ENOENT, a race with another process) are all in scope but never recorded. Because the coordinator sweep runs repeatedly to advance parent tasks toward `done`, a persistent write failure leaves the parent's in-memory mutations (status, doneMarker, history) un-persisted; the next sweep re-reads the stale file and the task is stuck indefinitely. The only trace in the entire process is an integer in a returned summary object that may never be inspected, with no `console.error`, no stderr line, and nothing an operator can grep.
+
+Solution:
+Bind the caught exception and emit a single `console.error` line that includes the file path and the error's message (which carries the OS-level reason such as `ENOSPC: no space left on device, write`). Keep the existing `summary.errors += 1` so any caller that aggregates the summary still sees the count. Concretely, replace the bare `catch {` with `catch (err) {`, add `console.error(\`coordinator-sweep: failed to write ${file}: ${err.message}\`);` before the counter increment, and leave `summary.errors += 1;` unchanged. No new dependency, no rethrow (the loop must continue to the next sub-task), and the logging channel is `console.error` which is the project's established Node logging primitive.
+
+Benefits:
+An operator tailing stderr (or a log aggregator that captures it) immediately sees which file failed, why it failed, and when, turning an otherwise invisible stuck-task scenario into a one-line diagnostic. The numeric counter is preserved for any programmatic caller, but the diagnostic information that was previously lost is now recoverable without adding a logging framework or a metrics dependency.
