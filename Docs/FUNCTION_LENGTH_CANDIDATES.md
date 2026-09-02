@@ -711,3 +711,51 @@ Define a new function `selectNextCandidate(sections, deps)` immediately above `n
 
 Benefits:
 The selection/assembly logic is now independently testable with a fixed `sections` array and stubbed `deps` (no fs, no require). The main function becomes a thin 5-line orchestrator: read file → parse sections → select → return. The `deps` injection makes it trivial to test the placeholder-rejection, queue-dedup, and fetchedFiles paths without a real repo. Pure extraction—zero behavior change.
+
+### AC-17 · Decompose get-grounding-source main() into input, config, and context builders
+Strength: Strong
+Files: src/get-grounding-source.js
+Snippet:
+```
+
+function main() {
+  const taskPath = process.argv[2];
+  const task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
+  const pc = task.promptContext;
+  const parts = [];
+
+  // Resolved once, used both to refresh fetchedFiles below and for the adhoc live-fetch
+  // block further down. Fails open (getConfig() can throw if AGENT_MANAGER_REPO_ROOT is
+  // unset -- a context/test-environment gap, not a reason to fail this whole grounding
+  // assembly) same as reasoningTierFor()'s own established try/catch treatment of the
+  // identical getConfig() call.
+  let repoRoot = null;
+  try {
+    ({ repoRoot } = getConfig());
+  } catch (e) {
+    console.warn(`[get-grounding-source] getConfig() failed, repoRoot will remain null: ${e?.message ?? e}`);
+  }
+
+  if (pc) {
+    if (pc.existingStub) parts.push(String(pc.existingStub));
+    if (pc.siblingExample && pc.siblingExample.content) parts.push(String(pc.siblingExample.content));
+    if (pc.goalMdFull) parts.push(String(pc.goalMdFull));
+    if (pc.csvRow) parts.push(JSON.stringify(pc.csvRow));
+    if (pc.body) parts.push(String(pc.body));
+    if (pc.noteContent) parts.push(String(pc.noteContent));
+    if (pc.files) {
+      for (const f of [].concat(pc.files)) {
+        if (f.content) parts.push(String(f.content));
+      }
+    }
+    // 2026-08-27, root-caused live via 3 real blocked observability_fix candidates
+```
+
+Problem:
+The 111-line `main()` in `src/get-grounding-source.js` interleaves at least four distinct responsibilities—CLI argument and JSON-file parsing, config resolution with a documented fail-open policy (the `try { ({repoRoot} = getConfig()) } catch {…}` block and its six-line explanatory comment), static `promptContext` assembly (the `if (pc.existingStub) parts.push(…)` / `if (pc.files) { for … }` block spanning roughly fifteen lines of parallel conditional pushes), and the core grounding-source computation itself. Because these concerns are sequenced inline in one function, a reader must track local-variable lifetimes across all four phases, the fail-open policy is buried mid-function rather than visible at the call site, and any change to the context-assembly rules (e.g., adding a new `pc` field) requires editing the same block that also owns argument validation, making the diff surface larger and the review harder than the logical change warrants.
+
+Solution:
+Extract three small, clearly-named helpers that `main()` calls in sequence. First, `readGroundingRequest(argv)` encapsulates `process.argv[2]` handling, the `fs.readFileSync` + `JSON.parse` call, and basic shape validation, returning a plain request object. Second, `resolveRepoRoot()` wraps the `getConfig()` call in its own `try/catch`, owns the six-line comment explaining the fail-open rationale and its mirror of `reasoningTierFor()`, and returns either the resolved root or a sentinel (e.g., `null`) that the caller can branch on. Third, `buildPromptContext(pc, repoRoot)` takes the parsed `pc` field and the resolved root and returns the fully-assembled `parts` array, keeping all the `if (pc.existingStub)` / `if (pc.files)` / loop logic in one place. `main()` then shrinks to roughly twenty lines: call the three helpers, perform the actual grounding-source work, and emit the result.
+
+Benefits:
+Each extracted helper is independently unit-testable (feed a fake `argv`, a stubbed `getConfig`, or a synthetic `pc` object without invoking the full CLI path), the fail-open policy becomes a one-line call whose contract is documented at the helper's JSDoc rather than hidden in a mid-function comment, and future additions to the prompt-context rules (new `pc` fields, new conditional branches) are localized to `buildPromptContext` with zero risk of accidentally reordering the config-resolution or argument-parsing steps. Review diffs for any single concern become smaller and easier to verify, and the function's overall shape—parse, resolve, build, compute—reads as a table of contents rather than a wall of interleaved logic.
