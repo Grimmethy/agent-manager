@@ -2112,3 +2112,26 @@ Inside the `except` clause, before setting `value = None`, emit a `logging.getLo
 
 Benefits:
 When the topology subprocess regresses (node version bump, a syntax error in `task-sources.js`, a missing `node` on PATH in a container), the application log immediately shows the exact exception and traceback at the moment the fallback was triggered, turning an hours-long "why is my topology wrong?" investigation into a one-line grep. The fallback path still works identically, so no behavioural change is introduced for callers.
+
+### AC-128 · Swallowed branch-deletion error leaves no trace in logs
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            pass
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+```
+
+Problem:
+At lines 5455-5461 the `except RuntimeError` handler around `_run_git(["push", "origin", "--delete", branch], repo_root)` executes a bare `pass`. The comment correctly justifies that a failed remote-branch deletion is non-fatal (the merge to `main` already succeeded), but the exception object `e` is never logged, never attached to any response, and never written to stderr. If the deletion fails for a reason other than "branch already gone" — a transient network timeout, a permissions drift on the remote, a git-server hiccup — there is zero record that the attempt was even made, let alone why it failed. An operator investigating "why is this merged branch still visible in the remote?" has no log line to find.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that includes the branch name, the repo root, and the exception message (or `repr(e)`), e.g. `logging.warning("Non-fatal: failed to delete remote branch %r in %s: %s", branch, repo_root, e)`. This uses the stdlib `logging` module already available to the file, requires no new dependency, preserves the existing non-fatal control flow (the exception is still not re-raised), and gives a single greppable line in production logs identifying exactly which branch deletion was attempted and why it failed.
+
+Benefits:
+Any future incident where a remote branch lingers after a merge can be diagnosed from the application log in seconds instead of requiring a reproduction or a code-reading session. The warning-level log is visible in default log configurations without being alarming, and the branch/repo context makes it trivial to correlate with the surrounding `push origin main` success line. No behavioural change: the merge still succeeds, the response still reports success, and the caller's control flow is untouched.
