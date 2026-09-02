@@ -127,6 +127,11 @@ test('write tier: a leaf that already exhausted a budget is NOT decompose-locked
 
     const unlocked2 = buildWriteAgenticPrompt({ ...base, autoDecomposeCount: 1 });
     assert.doesNotMatch(unlocked2, /CONFIRMED-ATOMIC LEAF/);
+
+    // a leaf that already tried to decompose on a prior pass is likewise no longer locked
+    const unlocked3 = buildWriteAgenticPrompt({ ...base, decomposeBlockCount: 1 });
+    assert.doesNotMatch(unlocked3, /CONFIRMED-ATOMIC LEAF/);
+    assert.match(unlocked3, /split it into 2-6 smaller/);
   });
 });
 

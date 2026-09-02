@@ -6,7 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { runDecomposePass, extractSubTasks, ONE_FILE_RULE } = require('./decompose-pass.js');
+const { runDecomposePass, extractSubTasks, ONE_FILE_RULE, REPEATED_DECOMPOSE_OPENER } = require('./decompose-pass.js');
 
 const THREE = JSON.stringify({
   one_pass: false,
@@ -70,6 +70,22 @@ test('the preliminary prompt spells out the one-file / prefer-a-new-file rule', 
   );
   assert.ok(seenPrompt.includes(ONE_FILE_RULE));
   assert.match(seenPrompt, /NEW self-contained file/);
+});
+
+test('runDecomposePass (repeated-decompose): uses the repeated-decompose opener, still accepts a bare array', async () => {
+  let seenPrompt = '';
+  const arr = JSON.stringify([
+    { title: 'piece one', rawText: 'do part one in its own file' },
+    { title: 'piece two', rawText: 'do part two in its own file' },
+  ]);
+  const out = await runDecomposePass(
+    { promptContext: { rawText: 'x' } },
+    { mode: 'repeated-decompose', call: async ({ prompt }) => { seenPrompt = prompt; return { response: arr }; } },
+  );
+  assert.equal(out.subTasks.length, 2);
+  assert.ok(seenPrompt.startsWith(REPEATED_DECOMPOSE_OPENER));
+  assert.match(seenPrompt, /two separate full implementation attempts/i);
+  assert.ok(seenPrompt.includes(ONE_FILE_RULE));
 });
 
 test('extractSubTasks is directly usable and mirrors runDecomposePass parsing', () => {

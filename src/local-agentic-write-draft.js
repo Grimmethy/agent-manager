@@ -108,10 +108,14 @@ function isLeafTask(task) {
 
 // A leaf is normally forbidden RESOLUTION: decompose (a prior split supposedly made it
 // atomic). But that assumption is disproven the moment the leaf blows a full 35-turn pass
-// with zero edits, or has already been auto-decomposed once -- in those cases let it split
-// again. MAX_AUTO_DECOMPOSE + review still bound runaway splitting.
+// with zero edits, has already tried to decompose on a prior pass, or has already been
+// auto-decomposed once -- in those cases let it split again. MAX_AUTO_DECOMPOSE + review
+// still bound runaway splitting.
 function leafDecomposeLocked(task) {
-  return isLeafTask(task) && !(task && task.autoDecomposeCount) && !(task && task.turnBudgetExhaustedBefore);
+  return isLeafTask(task)
+    && !(task && task.autoDecomposeCount)
+    && !(task && task.turnBudgetExhaustedBefore)
+    && !(task && Number(task.decomposeBlockCount) > 0);
 }
 
 // A prior tier-3 (local-agentic-write) attempt on this same task that ended WITHOUT an
@@ -264,12 +268,17 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       modelLabel: localDraftModelLabel(),
     });
 
-    // Backstop: the pass exhausted its whole turn budget without a single edit. Instead of
-    // requeueing for ANOTHER doomed 35-turn pass, run a single-call decompose pass.
+    // Backstop: instead of requeueing for ANOTHER doomed 35-turn pass, run a single-call
+    // decompose pass. Two triggers, both meaning "this model cannot land this in one pass":
+    //   - turnBudgetExhausted: a pass burned its whole budget without a single edit.
+    //   - decomposeBlockCount >= 2: the model answered RESOLUTION: decompose on two separate
+    //     passes but never produced usable sub-task JSON (agentic-draft-common.js counts it).
     const autoN = Number(task.autoDecomposeCount) || 0;
-    if (verdict.blocked && task.turnBudgetExhausted && autoN < MAX_AUTO_DECOMPOSE) {
+    const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
+    if (verdict.blocked && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
+      const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
       const split = await runDecomposePass(task, {
-        mode: 'post-exhaustion',
+        mode,
         priorAttemptBlock: priorAttemptAnalysisBlock(task),
       });
       if (split && split.subTasks.length >= 2) {
@@ -277,9 +286,13 @@ async function draftAdhocViaLocalAgenticWrite(task, {
         task.adhocResolution = 'decompose';
         task.subTaskProposals = split.subTasks;
         task.rawDiff = '';
-        task.implementResponse = `Auto-decomposed after a turn-budget-exhausted implement pass (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}`;
+        const why = task.turnBudgetExhausted
+          ? 'a turn-budget-exhausted implement pass'
+          : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
+        task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}`;
         delete task.turnBudgetExhausted;
         delete task.retryableDraftBlock;
+        delete task.rescopedRawText;
         return {
           succeeded: true, blocked: false, resolution: 'decompose',
           response: verdict.response, toolCallLog: verdict.toolCallLog, turnsUsed: verdict.turnsUsed,

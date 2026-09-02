@@ -256,6 +256,11 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       // The model reached a conclusion ("this is too big, split it") but produced no
       // usable sub-task JSON at all. A redraft can plausibly fix that (emit valid JSON,
       // or just do the change directly) -- redraft-eligible with a format reminder.
+      // Sticky count of "said decompose, gave nothing usable" passes: local-agentic-write-
+      // draft.js's repeated-decompose backstop fires once this reaches 2 (do the split in a
+      // single clean call rather than requeue toward escalation). reject-retry-check.js does
+      // not reset it.
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
       task.retryableDraftBlock = true;
       return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
     }
@@ -274,6 +279,9 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       }
       task.rescopedFromDecompose = true;
       task.rescopedRawText = subTasks[0].rawText;
+      // Also a "said decompose, not implementable as given" pass -- counts toward the
+      // repeated-decompose backstop (see the n === 0 branch).
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
       task.retryableDraftBlock = true;
       return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
     }
