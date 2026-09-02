@@ -33,6 +33,22 @@ const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
 const MAX_FETCHED_FILE_CHARS = 8000;
 
+// Multi-region grounding (2026-09-02). A single 8000-char window centred on whichever
+// symbol the candidate happened to name FIRST left the drafter blind to every other edit
+// site a multi-part candidate needs -- root-caused live across the pipeline_forensics_fix
+// blocked backlog: "defined the `finalizeResolution` helper but never called it" (ac-6),
+// "added `rejectionFeedbackBlock` after `ensureRegistered();` but never wired it into the
+// retry path" (ac-8) -- in both the helper-insertion point was in the window and the
+// call/teardown site was not. Fix: window EVERY distinct location a candidate points at
+// (its Snippet, every backtick-quoted symbol AND all of that symbol's occurrences, a
+// cited line), merge overlaps, and emit them in file order joined by `...[gap]...`,
+// under a shared total budget so a chatty candidate can't blow the prompt.
+const MAX_FETCHED_FILE_TOTAL_CHARS = 22000;
+const MIN_REGION_CHARS = 1400;
+const MAX_ANCHOR_REGIONS = 5;
+const MAX_ANCHOR_OCCURRENCES = 5; // a symbol appearing more than this is too generic to anchor on
+const MIN_ANCHOR_SYMBOL_CHARS = 4;
+
 // Backtick-quoted spans in a candidate's Problem/Solution prose -- review-task.js's own
 // blockedReason prose already leans on this exact "`identifier`" convention (see
 // app.py's _quoted_symbols, same idea, JS side), and arch_review/observability_fix
@@ -158,27 +174,44 @@ function windowAroundIndex(content, idx, matchLen, maxChars) {
 // drifted by more than half of MAX_FETCHED_FILE_CHARS from current reality is a real,
 // accepted gap for (2)/(3), not something worth chasing with an ever-larger window at the
 // cost of every other candidate's prompt size.
-function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
-  if (content.length <= maxChars) return content;
+// Every distinct index in `content` the candidate `section` points at, strongest anchor
+// first: (0) a Snippet: field's fuzzy match; (1) each backtick-quoted prose symbol, at
+// EVERY one of its occurrences (a helper name sits at its definition AND its call sites --
+// a multi-part candidate needs all of them), unless the symbol is so common it is noise;
+// (2) a cited line number. De-duped to one hit per ~200-char neighbourhood.
+function collectAnchorHits(content, section) {
+  const hits = [];
+  const seen = new Set();
+  const push = (index, length, rank) => {
+    if (index == null || index < 0) return;
+    const bucket = Math.round(index / 200);
+    if (seen.has(bucket)) return;
+    seen.add(bucket);
+    hits.push({ index, length: Math.max(length || 0, 1), rank });
+  };
 
   const snippet = snippetFromSection(section);
   if (snippet) {
     const match = findFuzzyMatch(content, snippet);
-    if (match) return windowAroundIndex(content, match.index, match.length, maxChars);
+    if (match) push(match.index, match.length, 0);
   }
 
-  // The fenced Snippet: block's own triple backticks otherwise confuse
-  // QUOTED_SYMBOL_RE's single-backtick pairing (a real bug, caught by direct test: it
-  // matched STARTING from the fence's third backtick THROUGH the next real prose
-  // backtick, swallowing an actual `quoted symbol` whole instead of finding it) -- prose
-  // fallbacks below only ever look for material outside the fence anyway, so stripping
-  // it first is correct, not just a workaround.
+  // The fenced Snippet: block's own triple backticks otherwise confuse QUOTED_SYMBOL_RE's
+  // single-backtick pairing (a real bug, caught by direct test) -- strip it first.
   const prose = (section || '').replace(SNIPPET_FIELD_RE, '');
 
   for (const symbol of quotedSymbolsFromSection(prose)) {
-    const idx = content.indexOf(symbol);
-    if (idx === -1) continue;
-    return windowAroundIndex(content, idx, symbol.length, maxChars);
+    if (symbol.length < MIN_ANCHOR_SYMBOL_CHARS) continue;
+    const occ = [];
+    let from = 0;
+    for (;;) {
+      const i = content.indexOf(symbol, from);
+      if (i === -1 || occ.length > MAX_ANCHOR_OCCURRENCES) break;
+      occ.push(i);
+      from = i + symbol.length;
+    }
+    if (occ.length === 0 || occ.length > MAX_ANCHOR_OCCURRENCES) continue;
+    for (const i of occ) push(i, symbol.length, 1);
   }
 
   const lineMatch = prose.match(LINE_CITATION_RE);
@@ -187,11 +220,49 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
     const lines = content.split('\n');
     if (lineNum >= 1 && lineNum <= lines.length) {
       const idx = lines.slice(0, lineNum - 1).join('\n').length + (lineNum > 1 ? 1 : 0);
-      return windowAroundIndex(content, idx, 0, maxChars);
+      push(idx, 0, 2);
     }
   }
 
-  return `${content.slice(0, maxChars)}\n...[truncated]`;
+  return hits.sort((a, b) => a.rank - b.rank || a.index - b.index);
+}
+
+function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
+  if (content.length <= maxChars) return content;
+
+  const hits = collectAnchorHits(content, section).slice(0, MAX_ANCHOR_REGIONS);
+  if (hits.length === 0) {
+    return `${content.slice(0, maxChars)}\n...[truncated]`;
+  }
+  if (hits.length === 1) {
+    return windowAroundIndex(content, hits[0].index, hits[0].length, maxChars);
+  }
+
+  // Equal share of a shared budget, capped at the single-window size, floored so each
+  // window is still worth showing.
+  const totalBudget = Math.min(MAX_FETCHED_FILE_TOTAL_CHARS, Math.max(maxChars, content.length));
+  const perRegion = Math.max(MIN_REGION_CHARS, Math.min(maxChars, Math.floor(totalBudget / hits.length)));
+  const half = Math.floor(perRegion / 2);
+
+  const ranges = hits
+    .map((h) => ({ from: Math.max(0, h.index - half), to: Math.min(content.length, h.index + h.length + half) }))
+    .sort((a, b) => a.from - b.from);
+
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r.from <= last.to + 40) last.to = Math.max(last.to, r.to);
+    else merged.push({ ...r });
+  }
+
+  const out = [];
+  if (merged[0].from > 0) out.push('...[truncated]...');
+  merged.forEach((r, i) => {
+    out.push(content.slice(r.from, r.to));
+    if (i < merged.length - 1) out.push('...[gap]...');
+    else if (r.to < content.length) out.push('...[truncated]');
+  });
+  return out.join('\n');
 }
 
 // Shared by arch_review (candidatesPath=archReviewCandidatesPath) and arch_import_review
@@ -276,6 +347,17 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
       filesArray = filesMatch[1].split(',').map((f) => f.trim());
     }
 
+    // 2026-09-02: the `Files:` line is frequently incomplete -- a candidate whose Solution
+    // says "call `buildPlanPrompt` with a second arg" needs prompts.js in view to see that
+    // function's real signature, but only lists local-draft.js (pipeline-forensics-fix-ac-7
+    // /-ac-14). Also read any repo-relative source path the Problem/Solution prose names
+    // into fetchedFiles (NOT into `files` -- those stay the candidate's declared edit
+    // targets, which the review/decompose gates count against), so the drafter can ground
+    // a cross-file change instead of editing blind or refusing.
+    const contextFiles = [...new Set(
+      [...section.matchAll(/(?<![\w/.-])((?:src|python|scripts|lib)\/[\w./-]+\.(?:js|ts|py|mjs|cjs))\b/g)].map((m) => m[1]),
+    )].filter((p) => !filesArray.includes(p)).slice(0, 3);
+
     // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
     // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing
     // in the real file, because this candidate's own implement pass was never shown real
@@ -292,18 +374,21 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // error -- see fetchedFiles' own promptContext field, which the implement prompt is
     // told explicitly means "ground a create, or flag the mismatch, don't invent content."
     const { repoRoot } = getConfig();
-    const fetchedFiles = filesArray
-      .map((relPath) => {
-        try {
-          const full = path.resolve(repoRoot, relPath);
-          if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
-          const content = fs.readFileSync(full, 'utf8');
-          return { path: relPath, content: windowFetchedFileContent(content, section) };
-        } catch {
-          return null; // doesn't exist / unreadable -- not an error, see comment above
-        }
-      })
-      .filter(Boolean);
+    const readWindowed = (relPath, isContext) => {
+      try {
+        const full = path.resolve(repoRoot, relPath);
+        if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
+        const content = fs.readFileSync(full, 'utf8');
+        const entry = { path: relPath, content: windowFetchedFileContent(content, section) };
+        if (isContext) entry.context = true; // referenced in prose, not a declared edit target
+        return entry;
+      } catch {
+        return null; // doesn't exist / unreadable -- not an error, see comment above
+      }
+    };
+    const declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
+    const contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
+    const fetchedFiles = [...declaredFetched, ...contextFetched];
 
     // Path-hallucination guard (2026-08-26, Grimmethy: "Can we answer why it didn't get
     // correct files to begin with?" -- arch-review-ac-7 investigation). Same shape as the
@@ -323,7 +408,7 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // the mismatch"). Multiple listed files where NONE resolve is a much stronger signal --
     // no real architectural finding proposes touching several already-existing-sounding
     // files that are ALL, simultaneously, brand new.
-    if (filesArray.length >= 2 && fetchedFiles.length === 0) continue;
+    if (filesArray.length >= 2 && declaredFetched.length === 0) continue;
 
     return {
       id: taskId,
@@ -350,6 +435,7 @@ module.exports = {
   // lower-level helpers, exported for the plugin's own grounding tests
   findFuzzyMatch,
   windowAroundIndex,
+  collectAnchorHits,
   snippetFromSection,
   quotedSymbolsFromSection,
   MAX_FETCHED_FILE_CHARS,

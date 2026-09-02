@@ -1577,6 +1577,49 @@ test('windowFetchedFileContent returns content unchanged when it is already unde
   assert.equal(windowFetchedFileContent(content, 'Problem:\n`whatever`', 2000), content);
 });
 
+// Multi-region, 2026-09-02: a candidate that names a helper to ADD and a call site to
+// WIRE it into needs BOTH in the window -- the old first-match-wins single window centred
+// on whichever it mentioned first, so the drafter added the helper and never called it
+// (pipeline-forensics-fix-ac-6/-ac-8).
+test('windowFetchedFileContent windows every distinct symbol a multi-part candidate names, joined by a gap marker', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const pad = 'x'.repeat(6000);
+  const content = `${pad}\nfunction wireSiteHere() { /* call site */ }\n${pad}\nconst helperInsertPoint = 1;\n${pad}`;
+  const section = 'Problem:\nThe `helperInsertPoint` area needs a new helper.\n\nSolution:\nAdd it, then call it from `wireSiteHere`.';
+
+  const windowed = windowFetchedFileContent(content, section, 4000);
+
+  assert.match(windowed, /helperInsertPoint/, 'the insertion-point anchor must be in the window');
+  assert.match(windowed, /wireSiteHere/, 'the call-site anchor must ALSO be in the window');
+  assert.match(windowed, /\[gap\]/, 'the two regions are joined by an explicit gap marker');
+});
+
+test('windowFetchedFileContent windows all occurrences of a repeated helper name (definition + call sites)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { windowFetchedFileContent } = freshTaskSources(dir);
+
+  const pad = 'y'.repeat(5000);
+  const content = `function makeThing() {}\n${pad}\nconst a = makeThing();\n${pad}\nreturn makeThing;\n${pad}`;
+  const section = 'Solution:\nChange what `makeThing` returns everywhere it is used.';
+
+  const windowed = windowFetchedFileContent(content, section, 3000);
+  // all three occurrences land in their own (merged) regions
+  assert.equal((windowed.match(/makeThing/g) || []).length >= 3, true);
+});
+
+test('windowFetchedFileContent skips a backtick symbol that is too generic (appears everywhere) as an anchor', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
+  const { collectAnchorHits } = require('./sdk/candidate-fulfillment.js');
+  freshTaskSources(dir);
+  const content = Array.from({ length: 30 }, () => 'const result = get();').join('\n') + '\nfunction theOneThing() {}\n';
+  const hits = collectAnchorHits(content, 'Solution:\nfix `result` handling in `theOneThing`.');
+  // `result` occurs 30x -> dropped; `theOneThing` occurs once -> kept
+  assert.equal(hits.some((h) => content.slice(h.index).startsWith('theOneThing')), true);
+  assert.equal(hits.length <= 2, true, '`result` (30 occurrences) must not have produced 30 anchor hits');
+});
+
 // CLI/round-trip: confirms nextCandidateFulfillmentTask actually wires the windowing in,
 // not just the unit-level helper -- the exact observability-fix-ac-9 shape (candidate
 // names a symbol deep in a large file, past where flat truncation used to cut off).
@@ -1597,6 +1640,32 @@ test('nextCandidateFulfillmentTask centers a large fetched file\'s window on the
   const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
 
   assert.match(task.promptContext.fetchedFiles[0].content, /realTargetSymbol/, 'the real target symbol must survive truncation, not just the file\'s first bytes');
+});
+
+// 2026-09-02: the Files: line is often incomplete -- a candidate that must change a caller
+// in one file and its callee's signature in another only lists the caller. Pull any
+// repo-relative source path the prose names into fetchedFiles as context (not as a
+// declared edit target).
+test('nextCandidateFulfillmentTask also fetches a src/ file named only in the candidate prose, flagged as context', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/local-draft.js'), 'function draft() {}\n');
+  fs.writeFileSync(path.join(dir, 'src/prompts.js'), 'function buildPlanPrompt(ctx) { return ctx; }\n');
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-1 · Retry once on empty plan response',
+    'Strength: Strong',
+    'Files: src/local-draft.js',
+    '',
+    'Problem:\nNo retry on an empty plan.\n\nSolution:\nCall `buildPlanPrompt` (in `src/prompts.js`) with a second retry arg.\n\nBenefits:\nFewer spurious blocks.',
+  ].join('\n'));
+
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'pipeline_forensics_fix');
+  const paths = task.promptContext.fetchedFiles.map((f) => f.path);
+  assert.deepEqual(task.promptContext.files, ['src/local-draft.js'], 'the declared edit target list is unchanged');
+  assert.ok(paths.includes('src/prompts.js'), 'the prose-named file is fetched too');
+  assert.equal(task.promptContext.fetchedFiles.find((f) => f.path === 'src/prompts.js').context, true);
 });
 
 // Round-trip: applyArchDiscoveryCandidates (the writer, apply-group-a.js) through
