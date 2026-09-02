@@ -2826,6 +2826,7 @@ def load_topology() -> list[dict]:
             if isinstance(parsed, list) and parsed:
                 value = parsed
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        logger.warning("topology subprocess failed; falling back to static data", exc_info=True)
         value = None
     if value is None:
         value = _load_topology_fallback()
