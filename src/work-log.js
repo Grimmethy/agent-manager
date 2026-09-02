@@ -154,13 +154,13 @@ function pruneWorkLogs(pipelineDir) {
     const dir = worklogDir(root);
     const queueRoot = path.join(root, 'queue');
     let files;
-    try { files = fs.readdirSync(dir); } catch { return { pruned: 0 }; }
+    try { files = fs.readdirSync(dir); } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: readdir failed for ${dir} [${err.code}]: ${err.message}`); return { pruned: 0 }; }
     let pruned = 0;
     for (const f of files) {
       if (!f.endsWith('.json') || f.includes('.tmp-')) continue;
       const id = f.slice(0, -5);
       if (!taskIsLive(queueRoot, id)) {
-        try { fs.unlinkSync(path.join(dir, f)); pruned += 1; } catch { /* raced */ }
+        try { fs.unlinkSync(path.join(dir, f)); pruned += 1; } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: unlink failed for ${path.join(dir, f)} [${err.code}]: ${err.message}`); }
       }
     }
     return { pruned };
