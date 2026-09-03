@@ -29,6 +29,14 @@ forensics-coverage.json
 function-length-coverage.json
 done-archive-state.json
 job-type-counters.json
+# Scanner false-positive / inconclusive-review ledgers (agent-manager-hygiene's
+# suppression-store.js). When pipelineDir == repoRoot (the self-hosting pipeline) these
+# land at repo root, where git-runner.js's `git stash push -u` before every resetToMain()
+# was sweeping them into an abandoned stash -- 13 correctly-recorded false-positive
+# suppressions lost that way over 3 days, so the scanner kept re-flagging the same
+# constructs forever. Ignoring them keeps `stash -u` off them (it skips ignored files).
+scanner-suppressions.json
+scanner-review-attempts.json
 dashboard.pid
 .claude/
 brain-dump.json
