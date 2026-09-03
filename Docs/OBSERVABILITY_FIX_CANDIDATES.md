@@ -2491,3 +2491,26 @@ Add a `logging.getLogger(__name__)` at module scope (or reuse one already presen
 
 Benefits:
 An operator investigating a missing priority marker or a stalled discussion queue will now see a single `WARNING` line in the application log naming the exact operation that failed and the underlying OS error, turning an invisible silent-exit into a searchable, attributable event. The keep-fresh thread's early termination—previously the hardest failure mode to diagnose because the thread simply stops—becomes visible immediately, and the setup-path failure is no longer confused with a normal "no marker" state.
+
+### AC-144 · Silent catch swallows brain-dump read/parse errors with zero log
+Strength: Strong
+Files: scripts/migrate-brain-dump-sort-backlog.js
+Snippet:
+```
+  }
+
+  const bd = (() => {
+    try { return JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')); } catch { return { entries: [] }; }
+  })();
+  const entriesById = new Map((bd.entries || []).map((e) => [e && e.id, e]));
+
+```
+
+Problem:
+Lines 32-34 wrap the read-and-parse of `brainDumpPath` in a bare `try { … } catch { return { entries: [] }; }`. Unlike the `blockedDir` catch two lines above (line 27) which at least emits a `console.log`, this catch is completely silent. A missing file on first run is a legitimate "start empty" case, but the same catch also swallows a corrupted JSON file, a permission error, or a transient disk I/O failure — in every one of those situations the script proceeds with an empty `entriesById` map and the loop below will move backlog files to `queue/pending` without ever matching them against real brain-dump entries. The operator gets no signal that the brain dump was unreadable; the migration either silently no-ops or silently mis-migrates, and the only way to discover the problem is to notice missing entries later.
+
+Solution:
+Replace the bare `catch { return { entries: [] }; }` on line 33 with `catch (err) { console.error('migrate-brain-dump-sort-backlog: failed to read brain dump at ' + brainDumpPath + ': ' + err.message); return { entries: [] }; }`. This preserves the graceful-degradation behavior (a genuinely absent file on first run still yields an empty map and the script continues), but every other failure mode — corrupt JSON, EACCES, ENOENT on a path that *should* exist, EIO — now leaves a single `console.error` line in the operator's terminal or CI log that names the file path and the underlying error, making the root cause immediately identifiable without re-running the script with a debugger.
+
+Benefits:
+An operator running the migration (or a CI job that invokes it) now sees a one-line diagnostic the moment the brain-dump file is unreadable or malformed, instead of a silent no-op that looks identical to a successful first-run. This eliminates the class of "why did the migration move files but none matched?" post-mortems, and the log line is sufficient to distinguish a benign first-run (ENOENT on a not-yet-created file) from a real corruption or permission problem without any additional tooling.
