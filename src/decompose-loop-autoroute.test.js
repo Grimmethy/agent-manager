@@ -63,6 +63,14 @@ test('sweep: a decompose-loop task on an oversized file gets a file-decompose re
   assert.equal(req.moves.length, 2);
   assert.equal(req.autoAuthored, true);
 
+  // The hub is materialised IN THIS TICK -- no dangling reference for coordinator-sweep to
+  // misclassify as `gone` on the next tick.
+  const hubFile = path.join(dir, 'queue', 'coordinating', `file-decompose-hub-${req.id}.json`);
+  assert.equal(fs.existsSync(hubFile), true, 'decompose hub exists immediately after routing');
+  const hub = r(hubFile);
+  assert.equal(hub.mode, 'stacked');
+  assert.equal(hub.subTasks.length, 3); // 2 moves + wiring
+
   // stuck task moved to pending/, now depends on the decompose hub
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', `${STUCK().id}.json`)), false);
   const moved = r(path.join(dir, 'queue', 'pending', `${STUCK().id}.json`));
