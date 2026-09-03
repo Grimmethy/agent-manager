@@ -2514,3 +2514,26 @@ Replace the bare `catch { return { entries: [] }; }` on line 33 with `catch (err
 
 Benefits:
 An operator running the migration (or a CI job that invokes it) now sees a one-line diagnostic the moment the brain-dump file is unreadable or malformed, instead of a silent no-op that looks identical to a successful first-run. This eliminates the class of "why did the migration move files but none matched?" post-mortems, and the log line is sufficient to distinguish a benign first-run (ENOENT on a not-yet-created file) from a real corruption or permission problem without any additional tooling.
+
+### AC-145 · Silent catch swallows coverage-file read/parse errors with no diagnostic
+Strength: Strong
+Files: src/apply-group-a.js
+Snippet:
+```
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.existsSync(coveragePath) ? fs.readFileSync(coveragePath, 'utf8') : '{"projects":{}}');
+  } catch {
+    coverage = { projects: {} };
+  }
+  if (!coverage.projects) coverage.projects = {};
+```
+
+Problem:
+In `applyDeepDiveFindings`, the `try/catch` around the coverage-file read (lines 159-163) catches every exception from `fs.readFileSync` or `JSON.parse` and silently substitutes `{ projects: {} }` without capturing the error object or emitting any diagnostic. If the coverage file exists but contains truncated or malformed JSON, or if a transient I/O error (permission, disk full, race with a concurrent writer) occurs, the previous coverage entries for every project are silently discarded and the operator has no log line, no stderr output, and no way to distinguish "file legitimately absent" from "file was corrupt and we lost prior state." The `catch` clause has no binding (`catch {`), so the error is not even available for inspection.
+
+Solution:
+Change the catch clause to `catch (err) { console.error(`[applyDeepDiveFindings] Failed to read coverage file ${coveragePath}: ${err.message}; starting with empty coverage.`, err.stack); coverage = { projects: {} }; }`. This preserves the existing recovery semantics (fall back to an empty tracker so the pipeline can continue) while emitting a single `console.error` line that names the function, the exact path that failed, the underlying error message, and the stack trace. No new dependency is introduced; `console.error` is the project's established Node-side logging primitive. The fallback assignment stays, so callers that pass a non-existent `coveragePath` (the normal first-run case) still get the same empty object with no behavioural change.
+
+Benefits:
+An operator or on-call engineer can now see, in the same log stream as the rest of the pipeline, exactly when and why a coverage file was unreadable, which project slug was being processed, and whether the loss was a missing file (expected) or a parse/IO failure (unexpected). This turns an invisible data-loss event into a greppable, attributable log line, making it possible to detect repeated corruption, a bad writer upstream, or a permission regression without having to diff the coverage file against a backup.
