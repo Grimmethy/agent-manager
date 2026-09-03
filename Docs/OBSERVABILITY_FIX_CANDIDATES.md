@@ -2583,3 +2583,26 @@ Replace the bare `catch { summary.errors += 1; }` on line 308 with the same bind
 
 Benefits:
 An operator debugging a batch where several tasks errored can now see exactly which task name, which file path, and which exception message triggered the failure in the DENY path, and can distinguish it from the CONFIRM-path log by the `(DENY)` tag. The soft-failure path (line 307, where `moveTaskFile` returns falsy) remains unlogged by design, but the hard-throw path is no longer indistinguishable from it. The fix is a one-line change that mirrors the pattern already established in the same function, so it is trivially reviewable and introduces no new surface area.
+
+### AC-148 · Log swallowed error in auto-confirm archive catch
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+    }
+  }
+
+```
+
+Problem:
+In the auto-confirm review loop (lines 304-322), the `catch { summary.errors += 1; }` on line 309 binds no error variable, so the thrown `Error` object—its message, stack trace, and any `cause`—is silently discarded. If `moveTaskFile` fails due to a permission denial, a missing archive directory, a file-system race, or an internal bug, the operator sees only a bare integer increment in `summary.errors` with zero information about *which* task file, *which* archive path, or *why* the move failed. The same pattern repeats on line 317 for the `fs.writeFileSync` escalation path. In a batch that processes many tasks, a single silent failure is indistinguishable from any other, making post-hoc diagnosis impossible without reproducing the exact file-system state.
+
+Solution:
+Bind the caught error and log it with `console.error` (the project's existing logging primitive—no third-party logger is in the dependency manifest) before incrementing the counter. For line 309, change `catch { summary.errors += 1; }` to `catch (err) { console.error(`[auto-confirm] failed to archive task "${name}" → "${archiveDir}": ${err.message}`, err.stack); summary.errors += 1; }`. Apply the same pattern to the `fs.writeFileSync` catch on line 317, logging the target `file` path and the error. Do not rethrow: the surrounding loop is a best-effort batch over many tasks, and the `summary` object is the designed aggregation channel; aborting the entire batch on one file-system hiccup would be a regression in behaviour.
+
+Benefits:
+An operator running the auto-confirm pass in production (or in a cron job whose stdout/stderr is captured) can now see, in the log stream, exactly which task file failed to move or write, the archive destination, and the underlying OS-level reason (e.g. `EACCES`, `ENOENT`, `EBUSY`). This turns an opaque `summary.errors: 3` into an actionable diagnostic without requiring a debugger session or a reproduction of the file-system state, and it costs zero new dependencies.
