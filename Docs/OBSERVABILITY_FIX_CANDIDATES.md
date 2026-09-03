@@ -2698,3 +2698,26 @@ In the `catch` block on line 629, replace the bare `catch (_)` with `catch (err)
 
 Benefits:
 A persistent or intermittent `writeTaskJson` failure (bad path, ENOSPC, EACCES) becomes immediately visible in the process's stderr stream instead of being invisible until a human notices missing history. Because the line includes the concrete `taskPath`, it is trivially greppable and distinguishable from other stderr output. The fix costs one line, introduces no new dependency, preserves the existing "don't crash the main flow" semantics, and closes the only observability gap in this block.
+
+### AC-153 · Over-broad catch swallows real filesystem errors in coordinatorSweep
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no coordinating/ dir yet -- nothing to sweep
+  }
+
+```
+
+Problem:
+In `coordinatorSweep` (line 82-85), the `try/catch` around `fs.readdirSync(coordDir)` uses a bare `catch` with no error binding and no errno inspection. The comment says "no coordinating/ dir yet -- nothing to sweep," which is the correct response to ENOENT, but the catch also silently absorbs EACCES, ENOTDIR, EIO, and any other `readdirSync` failure. In every one of those cases the function returns the all-zero `summary` object (`{ checked: 0, updated: 0, completed: 0, errors: 0 }`) with no log line, no increment of `summary.errors`, and no rethrow. A permission misconfiguration, a path that is a file rather than a directory, or a disk I/O fault would be indistinguishable from "the directory simply hasn't been created yet," making the sweep appear to have run successfully and found nothing when it actually could not open the directory at all.
+
+Solution:
+Bind the caught error (`catch (err)`), check `err.code === 'ENOENT'` to preserve the existing early-return for the not-yet-created directory, and for every other code increment `summary.errors` by 1 and emit a `console.error` line that includes the resolved `coordDir` path, the errno code, and the message (e.g. `[coordinator-sweep] readdirSync(<path>) failed: EACCES – <msg>`). Then return the summary so the caller still receives a well-formed object with a non-zero `errors` count. No new dependency is introduced; the fix uses only `console.error` and the existing `summary` object, both of which the file already relies on.
+
+Benefits:
+Operators can now distinguish "nothing to sweep yet" (ENOENT, silent, `errors: 0`) from a genuine filesystem or permission problem (non-ENOENT, logged to stderr with the offending path and errno, `errors ≥ 1`). The sweep's return value becomes a reliable signal: an all-zero summary truly means "no work," while a non-zero `errors` field tells the caller (or a wrapper script) that the directory could not be read and the sweep did not inspect any files. This closes a silent-failure gap that would otherwise hide a broken deployment or a corrupted volume until something else downstream fails.
