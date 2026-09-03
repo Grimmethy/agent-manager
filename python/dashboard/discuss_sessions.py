@@ -297,7 +297,10 @@ def _read_sessions(storage_dir: Path) -> dict:
         return {}
     try:
         sessions = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        return {}
+    except json.JSONDecodeError as exc:
+        logging.warning("Corrupt discuss-sessions file %s: %s", p, exc, exc_info=True)
         return {}
     # One-time migration: sessions written before 2026-08-16 (brain-dump-only, this
     # module's original scope) used "entryId" -- renamed to the generic "subjectId" once
