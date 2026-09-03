@@ -1577,3 +1577,191 @@ Extract the preliminary decompose pre-flight into a `maybePreliminaryDecompose(t
 
 Benefits:
 Each extracted helper has a single, nameable contract and a small, self-contained mutation surface, so a reviewer can verify the decompose gate's early-return logic without scanning 120+ lines of unrelated branching. Unit tests can exercise `maybePreliminaryDecompose` with a stub `task` and assert the four field writes and the history append in isolation, and can test `buildSubTaskProposals` against a fixed diff without needing the full env-flag and freshness setup. The top-level function shrinks to roughly 15–20 lines of sequencing, making the overall control flow (decompose-or-fall-through → propose → commit) immediately legible and reducing the blast radius of any future edit to a single helper.
+
+### AC-24 · Decompose reject-retry-check into discovery, exhaustion, and feedback stages
+Strength: Strong
+Files: src/reject-retry-check.js
+Snippet:
+```
+}
+
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
+  const entries = [];
+  try {
+    for (const n of fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'))) {
+      entries.push({ dir: blockedDir, name: n });
+    }
+  } catch (e) {
+    // blocked/ doesn't exist yet -- fall through, the adhoc/ scan below may still have work.
+  }
+  // An adhoc tier draft-stage block writes the task file back IN PLACE in queue/adhoc/ --
+  // it never moves to blocked/. So a genuinely blocked adhoc task (retry cap hit, a
+  // real review rejection, ...) that happens to still be sitting in adhoc/ is invisible
+  // to this sweep: no blind retry, no needs-clarification escalation, forever. Confirmed
+  // live 2026-09-02: adhoc-...-plugins-install-...-1, blockedStage 'review',
+  // localRejectCount 2/2, stranded in queue/adhoc/. Pick those up here too -- everything
+  // downstream already keys off isAdhocTask(task) and the per-entry source dir.
+  try {
+    for (const n of fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'))) {
+      try {
+        const t = JSON.parse(fs.readFileSync(path.join(adhocDir, n), 'utf8'));
+        if (t && t.status === 'blocked') entries.push({ dir: adhocDir, name: n });
+      } catch { /* unparseable -- not this sweep's problem */ }
+    }
+  } catch { /* no adhoc/ dir -- fine */ }
+
+  if (entries.length === 0) return summary;
+
+  for (const { dir: sourceDir, name } of entries) {
+    const filePath = path.join(sourceDir, name);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw) continue;
+      const task = JSON.parse(raw);
+      summary.checked++;
+
+      // Only a genuine review-stage rejection is eligible -- never an apply-stage failure
+      // that happens to still carry localVotes from an earlier, unrelated successful
+      // review (redrafting can't fix that; see agent-manager-common.sh's
+      // test_review_rejection, the bash equivalent of this exact check).
+      //
+      // 2026-09-01: also eligible -- an adhoc tier-3 draft-stage block that a redraft could
+      // plausibly fix (resolveAgenticDraft sets task.retryableDraftBlock):
+      //   - the model exhausted its turn budget without making a single edit
+      //     (task.turnBudgetExhausted) -- the redraft is NOT blind: plan + tier-2
+      //     investigation are folded into the prompt and the feedback below says "edit early".
+      //   - the model chose RESOLUTION: decompose but botched the sub-task JSON -- a redraft
+      //     can emit valid JSON or just implement the change; the feedback reminds it of the
+      //     format.
+      // Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the same
+      // adhoc -> needs-clarification escalation as a stuck review rejection.
+      const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
+      if (!isReviewRejection(task) && !retryableDraftBlock) continue;
+
+      // A continuation (agentic-draft-common.js: the model ran out of turns mid-
+      // implementation, no real design question) is forward progress, not a failed
+      // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
+      // not be gated by, or count against, the blind-redraft cap.
+      const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
+
+      const retryCount = Number(task.localRejectCount) || 0;
+      if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
+        // An exhausted ADHOC rejection is very often a real disagreement about scope
+        // ("is this already done, or a request to extend it?") that no amount of blind
+        // redraft will resolve -- send it to a human instead of leaving it to rot in
+        // blocked/ forever. (Non-adhoc keeps the original "stamp once, stay in blocked"
+        // behaviour.)
+        if (isAdhocTask(task) && needsClarificationDir) {
+          const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+          if (alreadyEscalated) { summary.exhausted++; continue; }
+          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedAdhocQuestion(task) };
+          appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
+          appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+        // Already stamped on a prior tick -- an exhausted task stays in blocked/
+        // permanently (nothing here ever moves or deletes it), so without this guard this
+        // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
+        // real exhausted task accumulated 20+ duplicate 'exhausted' history entries (one
+        // per ~30s tick) over about 12 minutes before this was caught, unbounded growth
+        // for as long as the task sits there -- which, being exhausted, is indefinitely.
+        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
+        if (alreadyStamped) { summary.exhausted++; continue; }
+        stampDeepDiveExhausted(task, deepDiveCoveragePath);
+        stampBrainDumpSortExhausted(task, brainDumpPath);
+        // Persist the exhaustion itself onto the task -- previously this branch never
+        // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
+        // hitting the retry cap carried no record that retries were ever attempted or
+        // exhausted; only localRejectCount (no timestamp) hinted at it.
+        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
+        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        summary.exhausted++;
+        continue;
+      }
+
+      const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      if (isContinuation) {
+        priorFeedback.push([
+          'This is a CONTINUATION, not a fresh start. A prior pass got partway through and ran out of turns. It reported this remaining work:',
+          '',
+          String(task.agenticContinuationNote || '').slice(0, 4000),
+          task.priorPartialDiff
+            ? `\nThe partial diff it already produced (build ON this, do not redo it):\n\n${String(task.priorPartialDiff).slice(0, 6000)}`
+            : '',
+          '',
+          'Start editing with edit_file/write_file within your first 1-2 turns from where it left off. Finish the remaining work and end with RESOLUTION: implemented.',
+        ].filter(Boolean).join('\n'));
+        delete task.agenticContinuationNote;
+        delete task.priorPartialDiff;
+        // keep task.isAgenticContinuation + task.agenticContinuationCount for the cap in
+        // agentic-draft-common.js's resolveAgenticDraft on the next pass.
+      } else if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
+        // resolveAgenticDraft decided this task's real scope is exactly one sub-task the
+        // model proposed. Make that the task now, and tell the next pass to implement it
+        // (not decompose again).
+        task.promptContext = task.promptContext || {};
+        task.promptContext.rawText = task.rescopedRawText;
+        priorFeedback.push(`A prior pass decided this task's real scope is exactly: ${task.rescopedRawText}\nThat is the task now. Implement THAT with edit_file/write_file in this pass. Do not decompose again.`);
+        delete task.rescopedRawText; // keep rescopedFromDecompose set for the escalation cap in resolveAgenticDraft
+      } else if (retryableDraftBlock && task.turnBudgetExhausted === true) {
+        priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
+      } else if (retryableDraftBlock && typeof task.adhocDiffSubstanceFeedback === 'string' && task.adhocDiffSubstanceFeedback.trim()) {
+        // resolveAgenticDraft (agentic-draft-common.js) found the produced diff was a token
+        // gesture -- an ADR/doc instead of the code, an unrequested delete, or a file the
+        // task explicitly forbids. The feedback names the real target(s).
+        priorFeedback.push(task.adhocDiffSubstanceFeedback);
+        delete task.adhocDiffSubstanceFeedback;
+      } else if (retryableDraftBlock) {
+        priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
+      } else {
+        priorFeedback.push(String(task.blockedReason || ''));
+      }
+      delete task.turnBudgetExhausted;
+      delete task.retryableDraftBlock;
+      // Clear the terminal block state -- otherwise a task requeued into queue/adhoc/ still
+      // reads status:'blocked' and this sweep's adhoc/ scan re-requeues it every tick until
+      // the cap. blockedStage/blockedReason are left for priorRejectionFeedback's history.
+      if (task.status === 'blocked') task.status = 'pending';
+      task.priorRejectionFeedback = priorFeedback;
+      // A continuation is forward progress, not a spent redraft -- don't burn a slot of the
+      // blind-redraft budget on it (its own MAX_AGENTIC_CONTINUATIONS cap bounds it).
+      if (!isContinuation) task.localRejectCount = retryCount + 1;
+
+      recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
+      appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
+
+      // nextAdhocTask() only scans queue/adhoc/ -- an adhoc task requeued to pending/ is
+      // only picked up by a general worker, never re-drafted through draftAdhocBranch's
+      // tiers. Match python/dashboard/app.py's own adhoc-requeue destination.
+      const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+      const newPath = path.join(destDir, name);
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+      // A task picked up from queue/adhoc/ requeues back to queue/adhoc/ -- same path.
+      // Only unlink when the source and destination genuinely differ, or we'd delete the
+      // file we just wrote.
+      if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+      summary.requeued++;
+    } catch (e) {
+      console.warn('[reject-retry-check] requeue failed for', filePath, e.message, e.code);
+      summary.errors++;
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The function interleaves three semantically distinct responsibilities—entry discovery (two directory scans with different filter semantics), exhaustion handling (two sub-paths with independent idempotency guards for adhoc escalation vs. deep-dive stamping), and feedback construction (a six-branch state-to-string mapping)—into a single mutable scope. The exhaustion sub-procedure is the highest-risk logic (it caused the 2026-08-17 duplicate-history bug and the 2026-09-02 adhoc-stranding bug), yet it is entangled with the requeue path and the feedback chain, making it impossible to reason about, test, or review in isolation. The feedback chain is effectively a pure function of (task, isContinuation, retryableDraftBlock) → string, but it is buried inside mutation code, so adding a new retryableDraftBlock subtype requires navigating the entire function to confirm no side-effect ordering is broken.
+
+Solution:
+Extract three named helpers scoped to this file: (1) discoverBlockedEntries() returning a normalized array of {source, task, meta} from the two directory scans; (2) handleExhaustion(entry, ctx) encapsulating both the adhoc→needs-clarification escalation path and the non-adhoc deep-dive/brain-dump stamping path, each with its own idempotency guard, returning a small result object ({action, payload}); (3) buildFeedbackString(task, isContinuation, retryableDraftBlock) as a pure function that maps the six state branches to the injected prompt string. The top-level function then becomes a short orchestration loop: discover → for each entry, if exhausted call handleExhaustion, else call buildFeedbackString and enqueue—roughly 15–20 lines of glue.
+
+Benefits:
+Each extracted helper becomes independently unit-testable: the exhaustion guards can be tested against fixture histories without mocking directory I/O, and the feedback mapping can be table-tested across all six branches without executing any mutation. Code review of a new retryableDraftBlock subtype now touches only buildFeedbackString, and the 2026-08-17 / 2026-09-02 class of bugs (guard ordering, duplicate stamps) becomes visible as a single function's contract rather than a side effect buried in a 100-line body. The top-level orchestrator reads as a three-line pipeline, making the overall control flow auditable at a glance.
