@@ -45,13 +45,87 @@ test('sweep reconciles a mixed checklist onto the parent without completing it',
   write(dir, 'blocked', { id: 'c-c', blockedReason: 'stuck' });
 
   const summary = coordinatorSweep({ pipelineDir: dir });
-  assert.deepEqual(summary, { checked: 1, updated: 1, completed: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 1, updated: 1, completed: 0, errors: 0, blocked: 1 });
 
   const parent = readParent(dir, 'coordinating', 'parent-1');
   assert.deepEqual(parent.subTasks.map((s) => s.status), ['merged', 'done', 'blocked']);
   assert.deepEqual(parent.progress, { done: 2, total: 3 });
   assert.ok(parent.lastReconciledAt);
+  // c-c is blocked -> hub is flagged stuck, stays in coordinating/, gets a blockedReason
+  assert.ok(parent.coordinatorBlocked);
+  assert.match(parent.blockedReason, /c-c/);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'parent-1.json')), false, 'not completed while a child is blocked');
+});
+
+test('stuck detection: a child waiting on a needs-clarification sibling flags the hub, and clears when the sibling recovers', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'hub-dep', status: 'coordinating', history: [],
+    subTasks: [
+      { id: 'x-0', title: 'first', status: 'pending' },
+      { id: 'x-1', title: 'second', status: 'pending' },
+    ],
+  });
+  write(dir, 'needs-clarification', { id: 'x-0' });
+  write(dir, 'adhoc', { id: 'x-1', dependsOn: ['x-0'] });
+
+  let summary = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(summary.blocked, 1);
+  let hub = readParent(dir, 'coordinating', 'hub-dep');
+  assert.ok(hub.coordinatorBlocked);
+  assert.match(hub.blockedReason, /x-0.*never clear|x-1.*x-0/);
+  const evts1 = hub.history.filter((h) => h.stage === 'blocked').length;
+
+  // second sweep: same signature -> no new history event, still stays put
+  summary = coordinatorSweep({ pipelineDir: dir });
+  hub = readParent(dir, 'coordinating', 'hub-dep');
+  assert.equal(hub.history.filter((h) => h.stage === 'blocked').length, evts1, 'idempotent -- no duplicate blocked event');
+
+  // x-0 recovers (merged); re-run
+  fs.unlinkSync(path.join(dir, 'queue', 'needs-clarification', 'x-0.json'));
+  write(dir, 'done', { id: 'x-0', mergedAt: 'x' });
+  summary = coordinatorSweep({ pipelineDir: dir });
+  hub = readParent(dir, 'coordinating', 'hub-dep');
+  assert.equal(hub.coordinatorBlocked, undefined, 'cleared once the sibling recovered');
+  assert.equal(hub.blockedReason, undefined);
+  assert.equal(summary.unblocked, 1);
+});
+
+test('stuck detection: escalates (flag + history) after the grace period, still stays in coordinating/', () => {
+  const dir = makePipeline();
+  const oldSince = new Date(Date.now() - 5 * 86400000).toISOString();
+  write(dir, 'coordinating', {
+    id: 'hub-esc', status: 'coordinating', history: [{ stage: 'blocked', at: oldSince, detail: 'coordinator stuck: y-0 -- child is in needs-clarification' }],
+    coordinatorBlocked: { signature: 'y-0:child is in needs-clarification', since: oldSince, children: [{ id: 'y-0', why: 'child is in needs-clarification' }], escalated: false },
+    subTasks: [{ id: 'y-0', title: 'only', status: 'needs-clarification' }],
+  });
+  write(dir, 'needs-clarification', { id: 'y-0' });
+
+  const summary = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(summary.escalated, 1);
+  const hub = readParent(dir, 'coordinating', 'hub-esc');
+  assert.equal(hub.coordinatorBlocked.escalated, true);
+  assert.ok(hub.coordinatorBlocked.escalatedAt);
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'hub-esc.json')), 'stays in coordinating/, not moved');
+});
+
+test('AGENT_MANAGER_COORDINATOR_STUCK_ESCALATE_DAYS=0 disables escalation (flag only)', () => {
+  const dir = makePipeline();
+  const oldSince = new Date(Date.now() - 30 * 86400000).toISOString();
+  write(dir, 'coordinating', {
+    id: 'hub-noesc', status: 'coordinating', history: [],
+    coordinatorBlocked: { signature: 'z-0:child is in blocked', since: oldSince, children: [{ id: 'z-0', why: 'child is in blocked' }], escalated: false },
+    subTasks: [{ id: 'z-0', title: 'only', status: 'blocked' }],
+  });
+  write(dir, 'blocked', { id: 'z-0' });
+  process.env.AGENT_MANAGER_COORDINATOR_STUCK_ESCALATE_DAYS = '0';
+  try {
+    const summary = coordinatorSweep({ pipelineDir: dir });
+    assert.equal(summary.escalated, undefined);
+    assert.equal(readParent(dir, 'coordinating', 'hub-noesc').coordinatorBlocked.escalated, false);
+  } finally {
+    delete process.env.AGENT_MANAGER_COORDINATOR_STUCK_ESCALATE_DAYS;
+  }
 });
 
 test('sweep moves the parent to done/ once every child is terminal-good (done / merged / gone / abandoned)', () => {
