@@ -2629,3 +2629,26 @@ In each of the three `catch` blocks, emit a `console.warn` that includes the ope
 
 Benefits:
 An operator debugging a repeat of the 2026-09-02 starvation incident will see, in the process stderr, exactly which refresh tick failed, against which directory, and with what error — turning an invisible silent-failure loop into a one-line diagnostic. The expected "marker gone" case still produces only a single warning (not an error), so log volume stays bounded, while any *unexpected* failure (permissions, bug, disk) becomes immediately visible and attributable.
+
+### AC-150 · Log swallowed ticket-write failure in gpu-arbiter
+Strength: Strong
+Files: src/gpu-arbiter.js
+Snippet:
+```
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin fallback if SharedArrayBuffer is unavailable */ }
+  }
+```
+
+Problem:
+On line 148 the atomic ticket-file write is wrapped in `try { writeTicketAtomic(fp, { ...cur, ...patch }); } catch { /* best-effort */ }`. The empty catch body discards the exception entirely: no `console.warn`, no `process.stderr.write`, no reference to the file path or the ticket payload. In a GPU-arbiter deployment a persistent I/O failure (disk full, read-only mount, NFS timeout, permission change) would silently stop persisting ticket state for every subsequent update, and the operator would have no log line, no metric, and no signal to distinguish "arbiter is healthy" from "arbiter is healthy but its on-disk coordination file is stale." Because this project has no metrics or third-party logging stack, the only available channel is the process's own stderr.
+
+Solution:
+Replace the bare `catch { /* best-effort */ }` with a catch that logs a single `console.warn` line containing the file path (`fp`), a truncated JSON snapshot of the ticket state being written (`JSON.stringify({ ...cur, ...patch }).slice(0, 200)`), and the error message (`err.message`), then continues without rethrowing. Concretely: `catch (err) { console.warn(\`[gpu-arbiter] ticket write failed (best-effort, continuing): fp=${fp} state=${JSON.stringify({ ...cur, ...patch }).slice(0, 200)} err=${err.message}\`); }`. No rethrow is appropriate here because the caller's contract is "the arbiter must not crash on a secondary persistence hiccup," and the in-memory state remains the source of truth; the caller cannot meaningfully act on the error.
+
+Benefits:
+An operator tailing `stderr` (or a container log driver) will immediately see repeated `[gpu-arbiter] ticket write failed` lines the moment the underlying filesystem goes bad, including the exact path and a sample of the ticket payload, enabling rapid diagnosis (disk full, NFS, permissions) without attaching a debugger or adding a new logging dependency. The arbiter's blocking loop and in-memory coordination continue unaffected, preserving the original best-effort contract while closing the silent-failure observability gap.
