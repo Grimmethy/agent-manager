@@ -2411,3 +2411,37 @@ Replace the bare `pass` with a `logging.warning` call that includes the PID, the
 
 Benefits:
 An operator who sees the pipeline still reporting as running after a stop now has a single grep-able log line naming the exact PID and instance file whose kill timed out or failed, turning an otherwise invisible race into a one-line diagnosis. The `stopped` list returned to the caller remains unchanged (best-effort semantics preserved), but the log record closes the gap between "we asked Windows to kill it" and "it is actually dead," which is the exact window the 20-minute heartbeat-stale bug described in the adjacent comment exploits.
+
+### AC-141 · Silent swallow of subprocess launch failure in `_stop_pipeline`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                    # period -- the toggle button's second click (force) needs to reach the
+                    # server promptly, not queue behind this one.
+                    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+
+    return stopped
+```
+
+Problem:
+The `except (OSError, subprocess.SubprocessError, ValueError): pass` block at lines 6648–6649 catches every failure to launch the stop subprocess (missing binary, permission denied, invalid argument, etc.) and discards the exception entirely. Control then falls through to `return stopped`, where `stopped` was assigned to a success value before the `try` block. The caller therefore receives the same response it would get if the process had already exited cleanly, making a "stop command never executed" failure indistinguishable from a benign no-op. Because the project has no metrics or telemetry system, the only available observability primitive is the stdlib `logging` module, and the current code emits nothing.
+
+Solution:
+Replace the bare `pass` with a `logging.getLogger(__name__).error(...)` call that includes the exception type, the exception message, the `args` list that was being executed, and the `force` flag so an operator can tell which code path failed. After logging, set `stopped = False` (or return a dict/flag that the caller already interprets as failure) so the function no longer reports success. Concretely:
+
+```python
+except (OSError, subprocess.SubprocessError, ValueError) as exc:
+    logging.getLogger(__name__).error(
+        "Failed to launch pipeline stop command (force=%s, args=%s): %s: %s",
+        force, args, type(exc).__name__, exc,
+    )
+    stopped = False
+```
+
+No new dependency is introduced; `logging` is already the project's Python logging mechanism. The caller's existing check on the returned value now correctly sees a failure instead of a false success.
+
+Benefits:
+An operator who clicks "Stop" (or "Force Stop") in the dashboard and the pipeline is still running will now see a clear, timestamped log line identifying the exact command, the exception type, and the root cause (e.g. `FileNotFoundError: /opt/pipeline/bin/stop.sh`). The UI/caller receives a failure signal instead of a silent success, so it can surface an error to the user or retry. The observability gap is closed using only primitives the project already has, with no new dependency and no fabricated telemetry system.
