@@ -158,10 +158,10 @@ function refreshCandidateFetchedFiles(task) {
   const pc = task && task.promptContext;
   if (!pc || !Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
   let repoRoot;
-  try { ({ repoRoot } = getConfig()); } catch { return; }
+  try { ({ repoRoot } = getConfig()); } catch (err) { console.warn('[local-draft] getConfig failed:', err.message); return; }
   if (!repoRoot) return;
   let windowFetchedFileContent;
-  try { ({ windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js')); } catch { return; }
+  try { ({ windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js')); } catch (err) { console.warn('[local-draft] candidate-fulfillment require failed:', err.message); return; }
   const resolvedRoot = path.resolve(repoRoot);
   const section = pc.body || '';
   pc.fetchedFiles = pc.fetchedFiles.map((f) => {
@@ -170,7 +170,8 @@ function refreshCandidateFetchedFiles(task) {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
       return { ...f, content: windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section) };
-    } catch {
+    } catch (err) {
+      console.warn('[local-draft] file enrich failed:', full, err.message);
       return f;
     }
   });
