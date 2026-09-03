@@ -85,3 +85,26 @@ Replace the `for…await` loop with a `Promise.all` over a `.map()` of the same 
 
 Benefits:
 Total wall-clock time for the yield step drops from N × 15 s (worst case) to ≈ 15 s regardless of how many apps are yieldable, because all stop requests are in flight simultaneously. Downstream GPU scheduling no longer stalls behind the slowest single stop call multiplied by the app count. The per-promise `.catch` preserves the existing "one bad stop should not abort the batch" semantics while making failure isolation explicit rather than relying on the loop's sequential nature.
+
+### AC-6 · Parallelize independent LLM vote calls in majorityVote
+Strength: Strong
+Files: src/claude-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1);
+```
+
+Problem:
+The `majorityVote` function issues `n` (default 3) independent LLM API calls inside a sequential `for`-loop, each gated by `await`. Every iteration receives the identical `prompt`, `temperature`, `model`, `effort`, and `timeoutMs`; there is no data dependency between iteration *i* and iteration *i+1*. Each `call(...)` is a network round-trip to an LLM endpoint (realistically 2–30 s), so the three calls serialize to roughly 3× the latency of a single call (≈ 24 s at ~8 s each) when they could complete in ≈ 8 s if dispatched concurrently. This is a hot classification/voting path likely invoked per-request or per-agent-turn, making the unnecessary serialization a meaningful wall-clock cost on every invocation.
+
+Solution:
+Replace the sequential `for`-loop with a single `Promise.allSettled` over an array of `n` pre-built promise tasks. Each task is the existing `call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1)` wrapped in `.then(...)` / `.catch(...)` to produce the same `{ status: 'fulfilled', value }` / `{ status: 'rejected', reason }` shape the current `try/catch`-per-iteration already yields. After `await Promise.allSettled(tasks)`, iterate the settled array once to partition into the `votes` and `voteErrors` arrays exactly as before; the downstream majority-counting and `minAgreeing` logic is untouched. `Promise.allSettled` is a native ECMAScript 2021 / Node ≥ 12.9 primitive — no new dependency, no metrics library, no external helper. If the LLM provider enforces a per-key concurrency cap, the caller can lower `n` or wrap the call site with a small semaphore; the function itself should not artificially serialize independent network I/O.
+
+Benefits:
+Wall-clock latency for a default 3-vote majority call drops from the sum of three sequential round-trips to the maximum of the three concurrent round-trips (≈ 3× faster at typical LLM latencies). Error semantics are preserved: a single rejected vote is still captured individually in `voteErrors` without aborting the other two, matching the original per-iteration `try/catch` behavior. No new dependency is introduced, the public signature and return shape are unchanged, and the fix is a local refactor of one function body in `src/claude-client.js`.
