@@ -2652,3 +2652,26 @@ Replace the bare `catch { /* best-effort */ }` with a catch that logs a single `
 
 Benefits:
 An operator tailing `stderr` (or a container log driver) will immediately see repeated `[gpu-arbiter] ticket write failed` lines the moment the underlying filesystem goes bad, including the exact path and a sample of the ticket payload, enabling rapid diagnosis (disk full, NFS, permissions) without attaching a debugger or adding a new logging dependency. The arbiter's blocking loop and in-memory coordination continue unaffected, preserving the original best-effort contract while closing the silent-failure observability gap.
+
+### AC-151 · Silent error swallowing in local-draft file enrichment
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+      const full = path.resolve(resolvedRoot, f.path);
+      if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
+      return { ...f, content: windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section) };
+    } catch {
+      return f;
+    }
+  });
+```
+
+Problem:
+Three `catch` blocks in the flagged region (lines 161, 164, and 175) discard the caught error object entirely and provide no diagnostic output. The first two (`catch { return; }`) abort the entire `fetchedFiles` enrichment with zero indication of *why*—a `getConfig()` failure or a missing `candidate-fulfillment.js` module would be indistinguishable from a normal no-op in any log, making production debugging of "why did my draft not get enriched" nearly impossible. The third (`catch { return f; }` inside the `.map`) tolerates a per-file failure (reasonable for batch resilience) but likewise swallows the error, so a persistent `fs.readFileSync` permission problem or a `windowFetchedFileContent` runtime exception on one path would go completely unrecorded.
+
+Solution:
+In each of the three `catch` blocks, capture the error (`catch (err)`) and emit a `console.warn` (matching the project's existing Node logging convention) that includes a short, stable tag identifying the block (e.g. `"local-draft: getConfig failed"`, `"local-draft: candidate-fulfillment require failed"`, `"local-draft: file enrich failed"`), the offending file path for the inner catch, and `err.message`. Keep the existing control flow (early `return` for the top two, `return f` for the inner one) so the enrichment remains best-effort and a single bad file does not abort the batch—only add the diagnostic line before the return. No new dependency, no rethrow, no metrics primitive.
+
+Benefits:
+Operators can now see in stdout/stderr exactly which enrichment step failed and why, turning an invisible silent no-op into a one-line warning that is grep-able and correlates with the request that triggered it. The per-file catch additionally surfaces the specific path that could not be read, distinguishing a transient I/O hiccup from a systemic permission or path-resolution bug, without changing the function's best-effort contract.
