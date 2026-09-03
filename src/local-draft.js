@@ -171,7 +171,7 @@ function refreshCandidateFetchedFiles(task) {
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
       return { ...f, content: windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section) };
     } catch (err) {
-      console.warn('[local-draft] file enrich failed:', full, err.message);
+      console.warn('[local-draft] file enrich failed:', f.path, err.message);
       return f;
     }
   });
