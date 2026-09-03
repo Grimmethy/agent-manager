@@ -153,8 +153,9 @@ def _fire_alert_webhook(alerts: list) -> None:
         return
 
     import urllib.request
-    delivered: list = []
-    for a in new:
+    import concurrent.futures
+
+    def _post_one(a: dict) -> tuple:
         title = (a.get("title") or "Agent Manager alert")[:200]
         body = a.get("body") or a.get("title") or a.get("id") or ""
         # ntfy priority mapping: error-level alerts are high, everything else default.
@@ -168,9 +169,23 @@ def _fire_alert_webhook(alerts: list) -> None:
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 resp.read()
-            delivered.append(a["id"])
+            return (a["id"], True, None)
         except Exception as exc:
             logger.warning("Alert webhook POST failed for %s (%s): %s", a.get("id"), url, exc)
+            return (a.get("id"), False, str(exc))
+
+    delivered: list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(new), 8)) as pool:
+        futures = [pool.submit(_post_one, a) for a in new]
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=10):
+                alert_id, ok, _err = fut.result()
+                if ok:
+                    delivered.append(alert_id)
+        except concurrent.futures.TimeoutError:
+            logger.warning("Alert webhook: some alerts not confirmed delivered within 10s")
+            for fut in futures:
+                fut.cancel()
     if not delivered:
         return
 
