@@ -5611,12 +5611,12 @@ def api_git_merge_branch(branch):
         _run_git(["push", "origin", main_branch], repo_root)
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
-        except RuntimeError:
+        except RuntimeError as e:
             # Non-fatal -- the merge to main already succeeded and is the part that
             # matters; a leftover now-fully-merged remote branch is harmless clutter
             # (next list will filter it out via the ahead==0 check) rather than a real
             # failure worth reporting as one.
-            pass
+            logger.warning("Non-fatal: could not delete remote branch %r (repo: %s): %s", branch, repo_root, e)
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
     finally:
