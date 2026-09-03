@@ -131,3 +131,26 @@ Convert the enclosing function to `async` and replace the synchronous loop with 
 
 Benefits:
 The event loop is no longer held hostage for the duration of N sequential disk reads; instead the kernel services the reads concurrently and the process remains responsive to timers, API handlers, and child-process stdio throughout the sweep. Wall-clock time for the sweep drops from the sum of individual read latencies to roughly the slowest single read (plus a small scheduling overhead), eliminating the periodic latency spikes that scale linearly with the number of tracked instances. The change is a local refactor of one loop body — no new dependency, no new API surface, no change to the sweep's semantics or failure modes.
+
+### AC-8 · Parallelize per-alert ntfy POSTs with ThreadPoolExecutor
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+    import urllib.request
+    delivered: list = []
+    for a in new:
+        title = (a.get("title") or "Agent Manager alert")[:200]
+        body = a.get("body") or a.get("title") or a.get("id") or ""
+        # ntfy priority mapping: error-level alerts are high, everything else default.
+```
+
+Problem:
+The loop at line 157 issues a synchronous `urllib.request.urlopen` POST to the ntfy endpoint once per alert in `new`. Each call blocks the calling thread for a full TCP + TLS + HTTP round-trip (typically 50–300 ms, longer on a degraded network). With *k* alerts the total wall-time is *k* × RTT, so a burst of 20 alerts serialises to roughly 1–6 s of pure I/O wait on a single thread, stalling any other work the dashboard process is doing (polling, rendering, etc.) for the entire duration.
+
+Solution:
+Replace the sequential for-loop with a `concurrent.futures.ThreadPoolExecutor` (stdlib, no new dependency). Wrap the single-POST body (building the `urllib.request.Request` with the ntfy topic, priority header, and message body, then calling `urlopen` and reading the response) into a small helper function. Inside the loop, submit that helper for every alert in `new` via `executor.submit(...)`, collect the returned `Future` objects, and after the loop call `concurrent.futures.as_completed(futures, timeout=10)` to surface any individual failures through the existing `logging` call while bounding total wait. Cap the pool size at `min(len(new), 8)` so a very large burst does not open dozens of simultaneous TLS connections to the ntfy host. The rest of the surrounding logic (priority mapping, error logging) stays unchanged.
+
+Benefits:
+Wall-time for a burst of *k* alerts drops from *k* × RTT to roughly ⌈k / 8⌉ × RTT (bounded by the pool width), cutting the 20-alert case from ~1–6 s to ~150 ms–750 ms. The dashboard thread is no longer held hostage by sequential network latency, so polling cycles and UI updates proceed with far less jitter during alert storms. Because the fix uses only `concurrent.futures` and `urllib.request`—both already in the stdlib and already imported or importable in this file—no new dependency, configuration knob, or external service is introduced.
