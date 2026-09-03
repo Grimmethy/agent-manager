@@ -2468,3 +2468,26 @@ Replace the bare `pass` on line 6731 with a single `logger.debug` call that reco
 
 Benefits:
 A persistent `PermissionError` or a misconfigured `AGENT_MANAGER_COMFY_LEASE_PATH` becomes visible in debug logs within seconds of the first failed launch, rather than remaining an invisible, unexplained GPU-starvation symptom. The fix costs one line, introduces no new dependency, and preserves the existing best-effort semantics (the exception is still not re-raised, so the pipeline launch is unaffected).
+
+### AC-143 · Silently swallowed OSError in priority-marker keep-fresh thread and setup path
+Strength: Strong
+Files: python/dashboard/single_flight_lock.py
+Snippet:
+```
+                except OSError:
+                    return
+        threading.Thread(target=_keep_fresh, name="discuss-priority-marker", daemon=True).start()
+    except OSError:
+        marker = None
+    try:
+        yield
+```
+
+Problem:
+Two `except OSError` handlers in this block discard the exception without any log output. Inside `_keep_fresh`, the `except OSError: return` (line ~165) means that if `marker.touch()` fails—disk full, permissions revoked, file unlinked by another process—the daemon thread exits silently and the priority marker simply vanishes, leaving no trace in any log for an operator to find. The outer `except OSError: marker = None` (line ~170) has the same problem: if `wait_dir.mkdir` or `marker.touch` fails during setup, the code proceeds as though no marker was ever created, again with zero diagnostic output. In both cases the only observable symptom is a missing marker file, which is indistinguishable from "the lock was never acquired."
+
+Solution:
+Add a `logging.getLogger(__name__)` at module scope (or reuse one already present in the file). In `_keep_fresh`, replace the bare `except OSError: return` with `except OSError as exc: logger.warning("discuss-priority-marker: touch failed, stopping keep-fresh loop: %s", exc); return`. In the outer setup path, replace `except OSError: marker = None` with `except OSError as exc: logger.warning("discuss-priority-marker: failed to create wait marker: %s", exc); marker = None`. No rethrow is warranted in either case because the code already degrades gracefully (the marker is optional; the lock still functions without it), so logging the context and continuing is the correct response.
+
+Benefits:
+An operator investigating a missing priority marker or a stalled discussion queue will now see a single `WARNING` line in the application log naming the exact operation that failed and the underlying OS error, turning an invisible silent-exit into a searchable, attributable event. The keep-fresh thread's early termination—previously the hardest failure mode to diagnose because the thread simply stops—becomes visible immediately, and the setup-path failure is no longer confused with a normal "no marker" state.
