@@ -164,7 +164,7 @@ function pruneWorkLogs(pipelineDir) {
       }
     }
     return { pruned };
-  } catch { return { pruned: 0 }; }
+  } catch (err) { console.error(`pruneWorkLogs: unexpected error: ${err.message}`, err.stack); return { pruned: 0 }; }
 }
 
 module.exports = { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogDir, worklogPath };
