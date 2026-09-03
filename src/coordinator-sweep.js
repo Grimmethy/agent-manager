@@ -17,6 +17,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { findTaskRecordById } = require('./forensic-bundle.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { runIntegrationGate } = require('./decompose-integration-gate.js');
 
 // findTaskRecordById state -> the status shown on the parent's checklist.
 function classifyChildStatus(rec) {
@@ -74,9 +75,30 @@ function findStuckChildren(subTasks, recById) {
   return out;
 }
 
-function coordinatorSweep({ pipelineDir }) {
+// Stacked file-decompose hub: all children have committed to the shared branch, but a
+// per-file py_compile and three diff-reading votes never actually imported the app. Run
+// the real integration gate (decompose-integration-gate.js) ONCE, on the transition to
+// all-children-done, before the hub is marked merged. Pass fails -> hub stays in
+// coordinating/ with a blockedReason naming the failing check; a human requeues the wiring
+// child with the detail as feedback. Set AGENT_MANAGER_DECOMPOSE_INTEGRATION_GATE=false to
+// skip (the branch then merges on review alone, the pre-stacked behaviour).
+function runStackedGate(parent, repoRoot) {
+  if (process.env.AGENT_MANAGER_DECOMPOSE_INTEGRATION_GATE === 'false') return { ok: true, skipped: true };
+  if (!repoRoot || !parent.branch || !parent.sourceFile) return { ok: true, skipped: true };
+  let mainBranch = 'master';
+  try { ({ mainBranch } = require('./git-runner.js').createRealGitRunner(repoRoot)); } catch { /* default */ }
+  try {
+    return runIntegrationGate({ repoRoot, branch: parent.branch, mainBranch, sourceFile: parent.sourceFile });
+  } catch (e) {
+    return { ok: false, errored: true, checks: [{ name: 'gate', status: 'fail', detail: e.message }] };
+  }
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate } = {}) {
   const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
   const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
 
   let names;
@@ -156,7 +178,53 @@ function coordinatorSweep({ pipelineDir }) {
       }
     }
 
-    if (doneCount === parent.subTasks.length) {
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    // A child went back to work (e.g. a human requeued the wiring step after a gate
+    // failure) -- re-arm the gate so the next all-done transition re-checks the branch.
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    // Stacked decompose hub: children done is necessary but not sufficient -- the shared
+    // branch must actually import and keep its route table. Gate runs once; its result is
+    // cached on the hub so a quiet every-tick sweep never re-runs a worktree build.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.integrationGate
+        && parent.integrationGate.status === 'pending') {
+      const res = runGate(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res.skipped) {
+        parent.integrationGate = { status: 'skipped', at: now };
+      } else if (res.ok) {
+        parent.integrationGate = { status: 'passed', at: now, checks: res.checks || [] };
+        appendHistoryEvent(parent, 'advisory', `integration gate passed on ${parent.branch} -- ${(res.checks || []).map((c) => `${c.name}:${c.status}`).join(' ')}`);
+        summary.gatePassed = (summary.gatePassed || 0) + 1;
+      } else {
+        const failing = (res.checks || []).filter((c) => c.status === 'fail');
+        parent.integrationGate = { status: res.errored ? 'errored' : 'failed', at: now, checks: res.checks || [] };
+        parent.blockedReason = `decompose integration gate ${res.errored ? 'errored' : 'failed'} on ${parent.branch}: ${failing.map((c) => `${c.name} -- ${c.detail}`).join(' | ')}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: `integration-gate:${failing.map((c) => c.name).sort().join(',')}`,
+          since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: `integration gate failed: ${failing.map((c) => c.name).join(', ')}` }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.gateFailed = (summary.gateFailed || 0) + 1;
+        // errored (not failed) -> let a later tick retry the gate itself.
+        if (res.errored) parent.integrationGate.status = 'pending';
+        try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+        catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+        continue;
+      }
+    }
+
+    const gateClear = !(parent.mode === 'stacked' && parent.integrationGate
+      && ['failed', 'pending'].includes(parent.integrationGate.status) && allChildrenDone);
+
+    if (allChildrenDone && gateClear) {
       parent.status = 'done';
       parent.doneMarker = `coordinator complete: all ${parent.subTasks.length} sub-task(s) done`;
       stampHubMerged(parent);
@@ -211,6 +279,6 @@ function moveToDone(srcFile, doneDir, name, parent) {
 module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD };
 
 if (require.main === module) {
-  const { pipelineDir } = getConfig();
-  process.stdout.write(JSON.stringify(coordinatorSweep({ pipelineDir })));
+  const { pipelineDir, repoRoot } = getConfig();
+  process.stdout.write(JSON.stringify(coordinatorSweep({ pipelineDir, repoRoot })));
 }
