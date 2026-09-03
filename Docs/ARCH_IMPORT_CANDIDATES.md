@@ -69,3 +69,17 @@ Add test cases to model-provider.test.js, using the file's existing freshModelPr
 
 Benefits:
 Ensures the new endpoint-resolution behavior is verified against the same precedence and edge-case rules as the rest of model-provider.js's routing logic, using established test conventions already in the file, with no risk of accidentally exporting new public API surface.
+
+### AC-6 · Scheme guard on the shared `fetchJson` wrapper in gpu-guard.js
+Strength: Worth exploring
+Source: deepset-ai-haystack — "http/https-only URL scheme guard for LLM-sourced URLs"
+Files: src/gpu-guard.js, src/gpu-guard.test.js
+
+Problem:
+`src/gpu-guard.js` defines a generic `fetchJson(url, options, timeoutMs)` helper (line 123) that passes its `url` argument straight into the global `fetch` (line 127). Today every call-site in the file constructs the URL from a configuration constant (`OLLAMA_URL`, `theAgentUrl`) or appends a server-returned `app.id`, so the scheme is always `http`/`https` in practice. However, `fetchJson` is a reusable utility (it is even injected as `fetchJsonFn` in tests at `src/gpu-guard.test.js:47`), meaning any future caller—especially one that forwards a task description, worker output, or tool-parameter string into the URL slot—would bypass any scheme check and hand a potentially LLM-hallucinated `file:///etc/passwd`, `gopher://…`, or bare-domain string directly to `fetch`. There is no validation layer between the `url` parameter and the network call.
+
+Solution:
+Add a three-line scheme guard at the top of `fetchJson` (and, for symmetry, at the top of `readOllamaVramMb` before it delegates to `fetchJsonFn`): parse the incoming URL with `new URL(url)` and reject any `protocol` not in the set `['http:', 'https:']`, throwing a descriptive `Error` (or returning a typed rejection) before the request is issued. This mirrors the Haystack finding's policy—hard-code the allowed scheme set to exactly `["http", "https"]`—but is implemented inside agent-manager's own `fetchJson` utility rather than imported from another package. The guard is scheme-level, not host-level, so it does not interfere with the existing `OLLAMA_URL` / `theAgentUrl` configuration flow; it simply makes the contract explicit: "this function only talks to http/https endpoints."
+
+Benefits:
+Any present or future code path that inadvertently (or adversarially) routes an LLM-generated string into `fetchJson` is stopped at a single choke point rather than requiring every caller to remember to validate. The guard is testable in isolation via the existing `fetchJsonFn` mock pattern in `src/gpu-guard.test.js`, and it converts a silent, potentially dangerous network call into a loud, logged rejection—reducing the blast radius of a hallucinated `file://` or `gopher://` URL from "attempted side-channel read" to "immediate error in the task log."
