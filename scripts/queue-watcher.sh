@@ -185,6 +185,24 @@ while :; do
     spec_hub_result="$(node "${PACKAGE_SRC_DIR}/product-spec-to-hub.js" 2>>"${HOME_LOGS}/product-spec-to-hub.log")"
     printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
 
+    # file-decompose-to-hub: a human-authored decomposition plan in
+    # queue/file-decompose-requests/ (module boundaries for an oversized file) becomes a
+    # coordinator hub of small, bounded "move these named symbols verbatim" tasks the local
+    # model CAN do, plus a final wiring task. Disable with AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB=false.
+    file_decompose_result="$(node "${PACKAGE_SRC_DIR}/file-decompose-to-hub.js" 2>>"${HOME_LOGS}/file-decompose-to-hub.log")"
+    printf '[watchdog] file-decompose-to-hub: %s\n' "$file_decompose_result" >&2
+
+    # file-length-scan (agent-manager-hygiene): advisory only -- refreshes
+    # queue/file-length-flags.json with every tracked source file over AGENT_MANAGER_MAX_FILE_LINES
+    # (500). No task generation, no apply gate. Skipped if the hygiene plugin isn't installed.
+    if [[ -n "${AGENT_MANAGER_REGISTER_PATH:-}" ]]; then
+      _fl_scan="$(dirname "${AGENT_MANAGER_REGISTER_PATH%%,*}")/src/file-length-scan.js"
+      if [[ -f "$_fl_scan" ]] && [[ "${AGENT_MANAGER_FILE_LENGTH_SCAN:-}" != "false" ]]; then
+        fl_scan_result="$(node "$_fl_scan" 2>>"${HOME_LOGS}/file-length-scan.log")"
+        printf '[watchdog] file-length-scan: %s\n' "$fl_scan_result" >&2
+      fi
+    fi
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
