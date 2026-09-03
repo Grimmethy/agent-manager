@@ -192,6 +192,15 @@ while :; do
     file_decompose_result="$(node "${PACKAGE_SRC_DIR}/file-decompose-to-hub.js" 2>>"${HOME_LOGS}/file-decompose-to-hub.log")"
     printf '[watchdog] file-decompose-to-hub: %s\n' "$file_decompose_result" >&2
 
+    # decompose-loop autoroute: a task stuck in needs-clarification/blocked with a
+    # `decompose-loop` staleness flag (every draft chose "decompose", never produced pieces)
+    # whose target is an OVERSIZED FILE gets an auto-authored moves[] plan (deterministic
+    # symbol extraction -> the model only groups names), filed as a file-decompose request;
+    # the stuck task is re-pointed at the resulting hub. One local model call per newly
+    # stuck task. Disable with AGENT_MANAGER_DECOMPOSE_LOOP_AUTOROUTE=false.
+    autoroute_result="$(node "${PACKAGE_SRC_DIR}/decompose-loop-autoroute.js" 2>>"${HOME_LOGS}/decompose-loop-autoroute.log")"
+    printf '[watchdog] decompose-loop-autoroute: %s\n' "$autoroute_result" >&2
+
     # file-length-scan (agent-manager-hygiene): advisory only -- refreshes
     # queue/file-length-flags.json with every tracked source file over AGENT_MANAGER_MAX_FILE_LINES
     # (500). No task generation, no apply gate. Skipped if the hygiene plugin isn't installed.
