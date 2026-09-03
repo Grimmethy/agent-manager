@@ -35,6 +35,45 @@ function classifyChildStatus(rec) {
 // not hold the parent open forever.
 const TERMINAL_GOOD = new Set(['done', 'merged', 'gone', 'abandoned']);
 
+// A child in one of these cannot progress on its own -- the pipeline has given up on it and
+// is waiting for a human. If a sibling `dependsOn` one of these, that sibling is frozen
+// forever (isDependencySatisfied never clears for a needs-clarification / blocked task, and
+// an `abandoned` one has no branch on master either). Without this the hub just sits at
+// partial progress silently -- caught live 2026-09-03: two coordinator hubs stuck at 0/2
+// and 2/4 for days, every runnable child behind a sibling that had died in
+// needs-clarification, while the workers ran observability tasks "instead".
+const STUCK_STATES = new Set(['needs-clarification', 'blocked']);
+const DEP_UNCLEARABLE = new Set(['needs-clarification', 'blocked', 'abandoned']);
+
+function stuckEscalateMs() {
+  const raw = process.env.AGENT_MANAGER_COORDINATOR_STUCK_ESCALATE_DAYS;
+  const days = raw == null || raw === '' ? 3 : Number(raw);
+  if (!Number.isFinite(days) || days < 0) return 3 * 86400000;
+  return days * 86400000; // 0 -> never escalate (only stamp blockedReason)
+}
+
+// { subTasks:[{id,status}], recById: Map<id, rec|null> } -> [{ id, why }] for every
+// non-terminal child that can't proceed: it is itself stuck, OR it depends on a sibling
+// whose state can never clear.
+function findStuckChildren(subTasks, recById) {
+  const statusById = new Map(subTasks.map((st) => [st.id, st.status]));
+  const out = [];
+  for (const st of subTasks) {
+    if (TERMINAL_GOOD.has(st.status)) continue;
+    if (STUCK_STATES.has(st.status)) {
+      out.push({ id: st.id, why: `child is in ${st.status}` });
+      continue;
+    }
+    const rec = recById.get(st.id);
+    const deps = (rec && rec.task && Array.isArray(rec.task.dependsOn)) ? rec.task.dependsOn : [];
+    const badDeps = deps.filter((d) => DEP_UNCLEARABLE.has(statusById.get(d)));
+    if (badDeps.length > 0) {
+      out.push({ id: st.id, why: `waiting on ${badDeps.join(', ')} (state can never clear)` });
+    }
+  }
+  return out;
+}
+
 function coordinatorSweep({ pipelineDir }) {
   const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
@@ -71,13 +110,48 @@ function coordinatorSweep({ pipelineDir }) {
 
     summary.checked += 1;
     let doneCount = 0;
+    const recById = new Map();
     for (const st of parent.subTasks) {
       const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+      recById.set(st && st.id, rec);
       st.status = classifyChildStatus(rec);
       if (TERMINAL_GOOD.has(st.status)) doneCount += 1;
     }
     parent.progress = { done: doneCount, total: parent.subTasks.length };
     parent.lastReconciledAt = new Date().toISOString();
+
+    // Stuck-chain detection: surface a hub that can never complete on its own instead of
+    // leaving it frozen at partial progress. The hub STAYS in coordinating/ so the sweep
+    // keeps reconciling it (and auto-clears / auto-completes if the children get unstuck);
+    // what changes is a `coordinatorBlocked` marker + a `blockedReason` the dashboard
+    // renders, and after a grace period an `escalated` flag + a louder history event.
+    if (doneCount < parent.subTasks.length) {
+      const stuck = findStuckChildren(parent.subTasks, recById);
+      const now = new Date().toISOString();
+      if (stuck.length > 0) {
+        const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+        if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+          parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+          appendHistoryEvent(parent, 'blocked', `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+          summary.blocked = (summary.blocked || 0) + 1;
+        }
+        parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+        const escalateMs = stuckEscalateMs();
+        const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+        if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+          parent.coordinatorBlocked.escalated = true;
+          parent.coordinatorBlocked.escalatedAt = now;
+          appendHistoryEvent(parent, 'advisory',
+            `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+          summary.escalated = (summary.escalated || 0) + 1;
+        }
+      } else if (parent.coordinatorBlocked) {
+        delete parent.coordinatorBlocked;
+        delete parent.blockedReason;
+        appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+        summary.unblocked = (summary.unblocked || 0) + 1;
+      }
+    }
 
     if (doneCount === parent.subTasks.length) {
       parent.status = 'done';
@@ -131,7 +205,7 @@ function moveToDone(srcFile, doneDir, name, parent) {
   } catch { /* best-effort -- next tick retries */ }
 }
 
-module.exports = { coordinatorSweep, classifyChildStatus, TERMINAL_GOOD };
+module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD };
 
 if (require.main === module) {
   const { pipelineDir } = getConfig();

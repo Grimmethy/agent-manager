@@ -2073,7 +2073,9 @@ async function renderQueueTab(state) {
           : state === 'awaiting-confirm'
             ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
           : state === 'coordinating'
-            ? `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`
+            ? (t.coordinatorBlocked
+              ? `<span style="color:var(--bad)" title="${escapeAttr(t.blockedReason || '')}">⛔ stuck ${t.progress ? `at ${t.progress.done}/${t.progress.total}` : ''}${t.coordinatorBlocked.escalated ? ' — needs a human' : ''}: ${escapeHtml((t.blockedReason || '').slice(0, 90))}</span>`
+              : `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`)
             : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
     // Dead-adhoc-task flag (adhoc-staleness-flag.js). Chip + evidence tooltip; the
     // retire action is the row's existing Archive/Reject button, plus a Keep to dismiss.

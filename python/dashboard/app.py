@@ -1102,6 +1102,10 @@ def task_summary(data: dict, filename: str) -> dict:
         # shows the "N of M" from `progress` without a per-row round-trip.
         "subTasks": data.get("subTasks"),
         "progress": data.get("progress"),
+        # coordinator-sweep.js stamps this on a hub whose remaining sub-tasks can't proceed
+        # (a child stuck in needs-clarification/blocked, or a sibling waiting on one). The
+        # Coordinating row shows ⛔ + the reason instead of the plain progress count.
+        "coordinatorBlocked": data.get("coordinatorBlocked"),
     }
 
 
