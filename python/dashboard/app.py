@@ -5368,7 +5368,8 @@ def _list_unmerged_branches_uncached():
         try:
             ahead_raw = _run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root)
             ahead = int(ahead_raw.strip() or "0")
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("Skipping branch %s: failed to compute ahead-count (%s: %s)", full_ref, type(exc).__name__, exc)
             continue
         if ahead == 0:
             # Already fully merged (e.g. landed by hand, or a stale ref pending prune on
