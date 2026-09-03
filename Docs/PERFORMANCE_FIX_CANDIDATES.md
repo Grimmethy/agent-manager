@@ -177,3 +177,26 @@ Replace the `for(;;)` spin with a promise-based FIFO queue. Maintain a plain `Ma
 
 Benefits:
 Waiters no longer consume CPU while blocked; the event loop is free to service other I/O, timers, and microtasks during the wait window. Under N concurrent callers on the same key, total CPU work drops from O(N × wait_duration) spinning iterations to O(N) trivial resolver calls. Latency for unrelated event-loop work (HTTP responses, DNS lookups, `setImmediate` callbacks) is no longer inflated by the lock holder's waiters, and the single-flight guarantee (first caller executes, rest get the same result in order) is preserved exactly.
+
+### AC-10 · Per-file taskIsLive check performs one filesystem lookup per iteration
+Strength: Strong
+Files: src/work-log.js
+Snippet:
+```
+    let files;
+    try { files = fs.readdirSync(dir); } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: readdir failed for ${dir} [${err.code}]: ${err.message}`); return { pruned: 0 }; }
+    let pruned = 0;
+    for (const f of files) {
+      if (!f.endsWith('.json') || f.includes('.tmp-')) continue;
+      const id = f.slice(0, -5);
+      if (!taskIsLive(queueRoot, id)) {
+```
+
+Problem:
+When the code enumerates filenames in `dir` and, for each one, calls `taskIsLive(queueRoot, id)` to decide whether the task is still live, every iteration triggers a separate synchronous filesystem operation (a stat or access probe) against `queueRoot`. Because `id` is derived from a filename in `dir` while the liveness check targets a different directory (`queueRoot`), the kernel cannot amortize these lookups; with N entries in `dir` the process performs N independent syscalls back-to-back, blocking the event loop for the duration of the entire scan. On a queue root with thousands of task entries this becomes a measurable stall, especially under concurrent load where other I/O is queued behind it.
+
+Solution:
+Replace the per-iteration `taskIsLive(queueRoot, id)` call with a single up-front `fs.readdirSync(queueRoot)` (or `fs.readdirSync` wrapped in the same sync style the file already uses) to build a `Set` of live task identifiers. The loop over `dir` then performs an O(1) `Set.has(id)` membership test instead of a filesystem probe. If `taskIsLive` also checks a status file or timestamp, batch those reads into one `fs.readdirSync` of the relevant subdirectory and a single `fs.statSync` per entry only when the Set membership is positive, reducing the common "not live" path to zero syscalls. No new dependency is introduced; `fs.readdirSync` and `Set` are already available in the Node runtime this file targets.
+
+Benefits:
+The N-syscall loop collapses to one directory read plus N in-memory hash lookups, cutting the synchronous I/O time from O(N) kernel round-trips to O(1). The event loop is unblocked for the duration of the scan, reducing tail latency for concurrent requests. The change is local to the enumeration loop, requires no API additions, and preserves the existing sync coding style and logging conventions (`console.error` on unexpected read failures) already present in the file.
