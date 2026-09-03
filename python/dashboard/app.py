@@ -6681,8 +6681,12 @@ def _stop_pipeline(force: bool = False) -> list:
                     # period -- the toggle button's second click (force) needs to reach the
                     # server promptly, not queue behind this one.
                     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                logger.error(
+                    "Failed to launch pipeline stop command (force=%s, args=%s): %s: %s",
+                    force, args, type(exc).__name__, exc,
+                )
+                stopped = False
 
     return stopped
 
