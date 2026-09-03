@@ -305,7 +305,7 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       try {
         if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
         else summary.errors += 1;
-      } catch { summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
     } else {
       // No confident majority -- leave for a human.
       task.autoConfirmReviewedAt = now;
