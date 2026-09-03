@@ -2744,3 +2744,26 @@ Replace the bare `pass` with a `logging.warning` call that includes the branch n
 
 Benefits:
 An operator investigating a stale remote branch, a CI pipeline that depends on branch cleanup, or a post-incident review can now find a single grep-able log line identifying exactly which branch, which repo, and which error caused the deletion to fail, without having to reproduce the failure or add ad-hoc debug prints. The fix is a one-line change that adds observability without altering control flow or introducing any new dependency.
+
+### AC-155 · Preserve full error context in catch block of local-draft pipeline
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+    concludeDraft(task);
+
+    return { succeeded: true, blocked: false };
+  } catch (e) {
+    return { succeeded: false, reason: e.message };
+  }
+}
+```
+
+Problem:
+In `src/local-draft.js` (lines 1503-1505), the catch block around the draft-pipeline body does `return { succeeded: false, reason: e.message };`. This surfaces only the single-line `message` string to the caller (`main()`), which then serialises the object to stdout as JSON. The full error object—its `name`, `stack`, `cause`, and any attached properties—is silently discarded. Because the project has no third-party logger and the only available stderr primitive is `console.error` / `process.stderr.write`, and neither is called anywhere in this catch path, a CI runner that captures only stdout (a common configuration) permanently loses the stack trace. A `TypeError`, a `RangeError`, and a custom `DraftValidationError` become indistinguishable if their messages happen to be similar, making post-hoc diagnosis of pipeline failures nearly impossible.
+
+Solution:
+In the `catch (e)` block at line 1503, add a `console.error` call that writes the full error to stderr before the return statement. Specifically, log `e.stack` (which includes the message, name, and full call stack) and, if `e.cause` exists, log that as well, so the complete forensic record is preserved on the stderr stream. The structured return value `{ succeeded: false, reason: e.message }` stays unchanged to preserve the existing JSON API contract for `main()`. No new dependency is introduced; `console.error` is the project's established stderr primitive. The change is two lines: `console.error(e.stack || String(e));` and, conditionally, `if (e.cause) console.error('cause:', e.cause.stack || String(e.cause));`.
+
+Benefits:
+Once fixed, any CI runner or local developer who captures stderr (or runs the script in a terminal where stderr is visible by default) will see the full stack trace, error name, and cause chain, making it straightforward to identify which line threw, what type of error occurred, and what upstream condition triggered it. The stdout JSON contract remains unchanged, so downstream consumers of the pipeline result are unaffected. The fix costs two lines of code, introduces no new dependency, and converts a silent forensic gap into a standard "log to stderr, return structured result" pattern that matches the rest of the project's error-handling style.
