@@ -102,3 +102,31 @@ Solution: In src/prompts.js, add a strict instruction to the implement stage: "Y
 Benefits: Eliminates the class of failures where LLMs generate non-actionable prose instead of code or definitive verdicts, reducing review rejections and blocking.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-observability-review-3-00-est-api-cost-7-benefit-0-shipped-over-7d-1788329292571
+
+### AC-15 · Add strict-output and FALSE POSITIVE escape instructions to groupBJsonInstructions
+Strength: Strong
+Split-Depth: 1
+Files: src/prompts.js
+
+Problem:
+The groupBJsonInstructions array (the shared implement-stage prompt for arch_review, trouble_log, adhoc/manual sources) has no explicit prohibition on meta-commentary or hedging prose, and no FALSE POSITIVE escape token. When the local model is uncertain or the finding is a false positive, it falls back to prose, which breaks the downstream JSON parse (parseJsonMaybeFenced in local-draft.js) and the draft gets blocked or wastes review votes. This is the primary contributor to the 0-shipped-over-7d metric on AC-14 observability_review.
+
+Solution:
+In the groupBJsonInstructions array, insert two new string elements immediately before the closing ].join('\n');. The first new element is a blank string '' for spacing. The second new element is the string: 'If the finding is a false positive (the code is already correct, the concern is not actionable, or the change would be a no-op), do NOT output a file-change JSON object. Output exactly this single line instead: FALSE POSITIVE -- <one-line justification>. Do NOT output meta-commentary, hedging, or prose descriptions of code in place of the JSON; the only valid outputs are the file-change JSON described above or the FALSE POSITIVE line.' The find target is the last existing array element followed by the join: the line starting with '"find" must be an EXACT substring that appears in the real current file content shown in your plan above' through the closing ].join('\n');. Insert the two new elements between that last element and the ].join('\n'); closing. Do not modify any other prompt stage, any other array, or any other function in this file.
+
+Benefits:
+Gives the model a valid, parseable output path for false positives (eliminating the prose-fallback that breaks parseJsonMaybeFenced), and explicitly forbids the meta-commentary and hedging that currently cause 0-shipped drafts. No other prompt stage is modified; the change is additive to one existing array.
+
+### AC-16 · Add pre-critique structural gate for implement output compliance
+Strength: Strong
+Split-Depth: 1
+Files: src/local-draft.js
+
+Problem:
+After the implement step returns its raw output string, there is no validation gate before the output is handed to the critique step. Non-compliant outputs (prose, hedging, missing JSON, missing FALSE POSITIVE token) flow straight into critique and review, wasting the review-vote budget and contributing to the 0-shipped-over-7d metric. Sub-candidate 1 (src/prompts.js, applied first) adds the FALSE POSITIVE escape token to the implement prompt; this gate enforces it structurally at the code level so a non-compliant output is caught and retried rather than forwarded.
+
+Solution:
+In the code path in local-draft.js where the implement step's raw output string is about to be passed to the critique step (the section that calls buildCritiquePrompt and runs the critique model call), insert a validation check immediately before that hand-off. The check works as follows: (a) test whether the raw output string, after trimming whitespace, yields a non-null result when passed through parseJsonMaybeFenced (already imported from ./json-fence.js at the top of this file); (b) test whether the trimmed string contains the exact case-sensitive token 'FALSE POSITIVE'. If NEITHER (a) nor (b) is satisfied, the output is non-compliant: do NOT forward it to the critique step; instead, re-run the implement step using the existing retry/re-run mechanism already present in this file for the implement stage (the same path that handles a degenerate implement response), passing the same prompt (which now includes the FALSE POSITIVE instruction added by sub-candidate 1). Log a structured warning via console.warn containing the task's subject/ID and the reason string 'missing JSON and missing FALSE POSITIVE token' so the 0-shipped-over-7d metric can be correlated. If the output IS compliant (parseJsonMaybeFenced returned non-null, OR the string contains 'FALSE POSITIVE'), allow it to proceed to the critique step unchanged. Do not modify the critique, revision, or review-voting logic itself; the gate is a single insertion point between implement and critique.
+
+Benefits:
+Catches non-compliant implement outputs before they consume critique and review-vote budget, triggers an immediate retry with the strengthened prompt (from sub-candidate 1) rather than silently blocking or wasting a review cycle, and produces a structured log line that can be correlated with the 0-shipped-over-7d metric for observability. The gate is a single insertion point and does not restructure existing flow.
