@@ -2537,3 +2537,26 @@ Change the catch clause to `catch (err) { console.error(`[applyDeepDiveFindings]
 
 Benefits:
 An operator or on-call engineer can now see, in the same log stream as the rest of the pipeline, exactly when and why a coverage file was unreadable, which project slug was being processed, and whether the loss was a missing file (expected) or a parse/IO failure (unexpected). This turns an invisible data-loss event into a greppable, attributable log line, making it possible to detect repeated corruption, a bad writer upstream, or a permission regression without having to diff the coverage file against a backup.
+
+### AC-146 · Silent JSON-parse failure in loadBrainDump
+Strength: Strong
+Files: src/apply-group-a.js
+Snippet:
+```
+  let data;
+  try {
+    data = JSON.parse(fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '{"entries":[]}');
+  } catch {
+    data = { entries: [] };
+  }
+  if (!Array.isArray(data.entries)) data.entries = [];
+```
+
+Problem:
+The `catch` block in `loadBrainDump` (the line `data = { entries: [] };` inside `catch { }`) swallows every error thrown by `JSON.parse` or `fs.readFileSync` without emitting any diagnostic. A corrupt brain-dump file, a permission error on an existing file, or a disk I/O failure all produce the exact same silent empty store, indistinguishable from the legitimate "file not yet created" path handled by the `fs.existsSync` ternary. Because the project has no metrics or telemetry system, the only channel available to surface this is the process's stderr, and currently nothing is written there.
+
+Solution:
+Inside the `catch` block, before assigning the fallback, emit a `console.error` call that includes the offending `filePath`, the caught error's message (and stack if present), and a short note that the store is being reset to an empty one. For example: `console.error(\`[loadBrainDump] Failed to load brain-dump at ${filePath}: ${err.message}; returning empty store\`);` followed by the existing `data = { entries: [] };` assignment. Do not rethrow — the function's documented contract (per the comment directly above it) is to return a normalized object rather than throw, and callers rely on that. The log line gives an operator enough context (path + underlying error) to locate and repair the corrupt file without changing the function's return-type contract.
+
+Benefits:
+Corrupt or unreadable brain-dump files become visible in operational logs the moment they occur, instead of silently degrading to an empty store that looks identical to a fresh install. An operator can grep for the `[loadBrainDump]` tag, see the exact path and parse error, and fix the file without needing to reproduce the failure or add temporary instrumentation. The function's public contract (always returns a normalized object) is preserved, so no caller changes are required.
