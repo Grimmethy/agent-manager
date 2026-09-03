@@ -82,8 +82,11 @@ function coordinatorSweep({ pipelineDir }) {
   let names;
   try {
     names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return summary; // no coordinating/ dir yet -- nothing to sweep
+  } catch (err) {
+    if (err.code === 'ENOENT') return summary; // no coordinating/ dir yet -- nothing to sweep
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
   }
 
   for (const name of names) {
