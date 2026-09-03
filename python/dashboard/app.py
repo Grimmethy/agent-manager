@@ -5337,6 +5337,129 @@ def _describe_change(data: dict) -> str | None:
     return None
 
 
+# Every apply-task.js commit body carries a `Task: <id> (<domain>/<source>)` trailer (see
+# its commitMessage). That id is the join key back to the task's real pipeline log.
+_TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
+
+# Task states a hub child is "finished" in, for progress + readiness (mirrors
+# coordinator-sweep.js's TERMINAL_GOOD).
+_HUB_CHILD_DONE = {"done", "merged", "gone", "abandoned"}
+
+
+def _find_task_record_anywhere(qdir, task_id):
+    """(data, state) for a task id across every queue location a branch's task could be
+    sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the
+    per-worker drafting subfolders -- or (None, None). Same coverage as _task_state_index,
+    plus queue/done/_superseded/ (file-decompose re-file supersessions)."""
+    if not qdir or not task_id:
+        return None, None
+    for state in QUEUE_STATES:
+        d = read_json_safe(qdir / state / f"{task_id}.json")
+        if d:
+            return d, state
+    for sub, label in (("_archived_no_action", "archived"), ("_superseded", "superseded")):
+        d = read_json_safe(qdir / "done" / sub / f"{task_id}.json")
+        if d:
+            return d, label
+    dated = qdir / "done" / "_archived"
+    if dated.is_dir():
+        for month_dir in dated.iterdir():
+            if month_dir.is_dir():
+                d = read_json_safe(month_dir / f"{task_id}.json")
+                if d:
+                    return d, "archived"
+    drafting = qdir / "drafting"
+    if drafting.is_dir():
+        for sub in drafting.iterdir():
+            if sub.is_dir():
+                d = read_json_safe(sub / f"{task_id}.json")
+                if d:
+                    return d, "drafting"
+    return None, None
+
+
+def _summarize_task_record(data, state):
+    """Compact pipeline log for one task, for the Unmerged Branches detail modal: the
+    full `history[]` (created -> plan -> implement tiers -> review votes -> applied ->
+    disposition), plus the fields that say what it did and where it stands."""
+    history = data.get("history") or []
+    review_votes = None
+    for e in reversed(history):
+        if (e.get("stage") or e.get("status")) == "approved" and e.get("detail"):
+            review_votes = e.get("detail")
+            break
+    return {
+        "id": data.get("id"),
+        "title": data.get("title"),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "state": state,
+        "terminalDisposition": data.get("terminalDisposition"),
+        "adhocResolution": data.get("adhocResolution"),
+        "description": _describe_change(data),
+        "reviewVotes": review_votes,
+        "decomposedFrom": (data.get("promptContext") or {}).get("decomposedFrom"),
+        "history": [
+            {"stage": e.get("stage") or e.get("status"), "at": e.get("at"), "detail": e.get("detail")}
+            for e in history
+        ],
+    }
+
+
+def _summarize_hub(data, state):
+    subs = data.get("subTasks") or []
+    done_n = sum(1 for st in subs if isinstance(st, dict) and st.get("status") in _HUB_CHILD_DONE)
+    gate = data.get("integrationGate") or {}
+    all_children_done = len(subs) > 0 and done_n == len(subs)
+    gate_clear = gate.get("status") in (None, "passed", "skipped")
+    return {
+        "id": data.get("id"),
+        "title": data.get("title"),
+        "mode": data.get("mode"),
+        "branch": data.get("branch"),
+        "state": state,
+        "progress": {"done": done_n, "total": len(subs)},
+        "subTasks": [
+            {"id": st.get("id"), "title": st.get("title"), "status": st.get("status")}
+            for st in subs if isinstance(st, dict)
+        ],
+        "integrationGate": {"status": gate.get("status"), "checks": gate.get("checks")},
+        "blockedReason": data.get("blockedReason"),
+        # A stacked hub is only safe to merge once every child is done AND the integration
+        # gate has actually passed (or was skipped). A hub already in done/ shipped.
+        "readyToMerge": bool(state == "done" or (all_children_done and gate_clear)),
+    }
+
+
+def _hub_for_branch(qdir, branch, commit_task_ids):
+    """The coordinator hub that owns this branch, if any -- matched by its own `branch`
+    field (stacked file-decompose hub) or by containing one of the branch's commit tasks
+    in its subTasks. Returns a _summarize_hub dict or None."""
+    if not qdir:
+        return None
+    task_set = set(commit_task_ids or [])
+    seen = []
+    coord = qdir / "coordinating"
+    if coord.is_dir():
+        seen.extend((p, "coordinating") for p in coord.glob("*.json"))
+    done = qdir / "done"
+    if done.is_dir():
+        seen.extend((p, "done") for p in list(done.glob("*-hub-*.json")) + list(done.glob("file-decompose-hub-*.json")))
+    sup = qdir / "done" / "_superseded"
+    if sup.is_dir():
+        seen.extend((p, "superseded") for p in sup.glob("*hub*.json"))
+    for path, hstate in seen:
+        d = read_json_safe(path)
+        if not d:
+            continue
+        if d.get("branch") == branch:
+            return _summarize_hub(d, hstate)
+        sub_ids = {st.get("id") for st in (d.get("subTasks") or []) if isinstance(st, dict)}
+        if task_set & sub_ids:
+            return _summarize_hub(d, hstate)
+    return None
+
+
 def _label_for_branch(task_id, pipeline_dir, subject):
     """Best-effort human label: the originating task's own title/domain/source (plus a
     plain-English description of what it actually changed, see _describe_change) if a
@@ -5356,6 +5479,24 @@ def _label_for_branch(task_id, pipeline_dir, subject):
                     "matchedTaskState": state,
                     "description": _describe_change(data),
                 }
+        # A stacked file-decompose branch (agent/decompose-<slug>) carries N tasks, not
+        # one -- `task_id` here is "decompose-<slug>", which is no task's id. Its owning
+        # coordinator hub IS findable, and is the right label + status source.
+        hub = _hub_for_branch(qdir, f"agent/{task_id}", [])
+        if hub:
+            prog = hub["progress"]
+            gate = hub["integrationGate"]["status"]
+            return {
+                "title": hub["title"] or subject or task_id,
+                "domain": "adhoc",
+                "source": "decompose-hub",
+                "matchedTaskState": hub["state"],
+                "description": (
+                    f"Coordinator hub: {prog['done']}/{prog['total']} task(s) done"
+                    + (f", integration gate {gate}" if gate else "")
+                    + ("" if hub["readyToMerge"] else " -- not ready to merge")
+                ),
+            }
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
@@ -5404,6 +5545,8 @@ def _list_unmerged_branches_uncached():
         conflict = _check_merge_conflict(repo_root, main_branch, branch)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip())
+        qdir = (pipeline_dir / "queue") if pipeline_dir else None
+        hub = _hub_for_branch(qdir, branch, [task_id])
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -5419,6 +5562,11 @@ def _list_unmerged_branches_uncached():
             "mainBranch": main_branch,
             "willConflict": conflict["willConflict"],
             "conflictFiles": conflict["conflictFiles"],
+            # Present only when a coordinator hub owns this branch -- carries progress +
+            # integration-gate status + a `readyToMerge` flag the UI uses to warn before a
+            # premature merge (a stacked file-decompose branch merged before its wiring
+            # task 404s the moved routes).
+            "hub": hub,
         })
 
     branches.sort(key=lambda b: b["pushedAt"])
@@ -5578,7 +5726,27 @@ def api_git_branch_commits(branch):
             "subject": subject,
             "body": body.strip("\n"),
         })
-    return jsonify({"branch": branch, "mainBranch": main_branch, "commits": commits})
+
+    # Join each commit back to its originating task's REAL pipeline log via the
+    # `Task: <id>` trailer -- the commit body alone is just the final message, not the
+    # plan / draft tiers / review votes / disposition the operator actually wants when
+    # deciding whether to merge. Plus the owning coordinator hub, if any.
+    pd = get_pipeline_dir()
+    qdir = (pd / "queue") if pd else None
+    commit_task_ids = []
+    for c in commits:
+        m = _TASK_TRAILER_RE.search(c["body"] or "")
+        tid = m.group(1) if m else None
+        c["taskId"] = tid
+        c["task"] = None
+        if tid:
+            if tid not in commit_task_ids:
+                commit_task_ids.append(tid)
+            data, state = _find_task_record_anywhere(qdir, tid)
+            if data:
+                c["task"] = _summarize_task_record(data, state)
+    hub = _hub_for_branch(qdir, branch, commit_task_ids)
+    return jsonify({"branch": branch, "mainBranch": main_branch, "commits": commits, "hub": hub})
 
 
 @app.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
@@ -5596,6 +5764,24 @@ def api_git_merge_branch(branch):
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    # A branch owned by a coordinator hub that hasn't finished (a stacked file-decompose
+    # branch still missing its wiring commit + integration-gate pass) is not safe to merge
+    # -- doing so 404s the moved routes. Block it unless the caller explicitly forces.
+    hub = match.get("hub")
+    if hub and not hub.get("readyToMerge") and not (request.get_json(silent=True) or {}).get("force"):
+        prog = hub.get("progress") or {}
+        gate = (hub.get("integrationGate") or {}).get("status")
+        return jsonify({
+            "succeeded": False,
+            "reason": (
+                f"'{branch}' belongs to coordinator hub {hub.get('id')} which is not finished "
+                f"({prog.get('done')}/{prog.get('total')} task(s) done"
+                + (f", integration gate {gate}" if gate else "")
+                + "). Merging now would ship an incomplete decomposition. Re-send with "
+                '{"force": true} only if you have verified the branch is actually complete.'
+            ),
+        }), 409
 
     lock_fd = _acquire_apply_lock()
     if lock_fd is None:

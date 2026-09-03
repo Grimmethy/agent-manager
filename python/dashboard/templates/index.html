@@ -3039,11 +3039,21 @@ async function renderBranchesTab() {
     const behindBadge = typeof b.behind === 'number' && b.behind > 0
       ? `<span class="badge" style="background:var(--panel);color:var(--muted)" title="master has moved ${b.behind} commit${b.behind === 1 ? '' : 's'} since this branch was forked -- git's 3-way merge still only applies this branch's OWN changes, so being behind alone is not itself dangerous.">${b.behind} behind</span>`
       : '';
+    // A branch owned by an unfinished coordinator hub (a stacked file-decompose branch
+    // still missing its wiring commit + gate pass) -- merging it now ships an incomplete
+    // decomposition. The merge endpoint 409s it without {force:true}.
+    const hubMidFlight = b.hub && !b.hub.readyToMerge;
+    const hubBadge = b.hub
+      ? (hubMidFlight
+        ? `<span class="badge bad" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''}">⚠ hub mid-flight</span>`
+        : `<span class="badge ok" title="Coordinator hub complete">✓ hub complete</span>`)
+      : '';
     return `
     <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
       <div class="row">
         <span class="id">${escapeHtml(b.title)}</span>
         <div class="badge-col">
+          ${hubBadge}
           ${conflictBadge}
           <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
           ${behindBadge}
@@ -3057,7 +3067,7 @@ async function renderBranchesTab() {
       ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
-        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
       </div>
     </div>
   `;
@@ -3077,14 +3087,21 @@ async function renderBranchesTab() {
     btn.onclick = async (e) => {
       e.stopPropagation();
       const branch = btn.dataset.mergeBranch;
+      const midFlight = btn.dataset.hubMidflight === 'true';
       const confirmMsg = btn.dataset.willConflict === 'true'
         ? `"${branch}" is flagged as WILL CONFLICT with master on: ${btn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
-        : `Merge "${branch}" into master and sync the live dashboard?`;
+        : midFlight
+          ? `"${branch}" belongs to a coordinator hub that is NOT finished (${btn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
+          : `Merge "${branch}" into master and sync the live dashboard?`;
       if (!confirm(confirmMsg)) return;
       btn.disabled = true;
       btn.textContent = 'Merging...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, { method: 'POST' });
+        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, {
+          method: 'POST',
+          headers: midFlight ? { 'Content-Type': 'application/json' } : {},
+          body: midFlight ? JSON.stringify({ force: true }) : undefined,
+        });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
         if (result.liveSync && result.liveSync.restartTriggered) {
@@ -3125,18 +3142,67 @@ async function renderBranchDetailModal(b) {
   html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
+
+  // Coordinator hub status -- a stacked file-decompose branch is a slice of a multi-task
+  // hub, not a finished unit. Show where the hub stands and whether it's safe to merge.
+  const hub = data.hub;
+  if (hub) {
+    const p = hub.progress || {};
+    const gate = (hub.integrationGate || {}).status;
+    html += `<div class="field-label">Coordinator hub</div>`;
+    html += `<div class="worker-card" style="margin:4px 0">`;
+    if (!hub.readyToMerge) {
+      html += `<div class="badge bad" style="margin-bottom:6px">⚠ mid-flight — not ready to merge</div>`;
+    } else {
+      html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
+    }
+    html += `<div class="meta">${escapeHtml(hub.title || hub.id)} · ${p.done}/${p.total} task(s) done`
+      + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
+    if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtml(hub.blockedReason)}</div>`;
+    html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
+      `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(st.title || st.id)}</span> `
+      + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span></div>`
+    ).join('') + `</div>`;
+    const checks = (hub.integrationGate || {}).checks;
+    if (checks && checks.length) {
+      html += `<div class="task-history" style="margin-top:4px">` + checks.map((ck) =>
+        `<div class="task-history-row"><span class="task-history-stage">gate: ${escapeHtml(ck.name)}</span> `
+        + `<span class="badge ${ck.status === 'pass' ? 'ok' : ck.status === 'fail' ? 'bad' : ''}">${escapeHtml(ck.status)}</span>`
+        + (ck.detail ? `<pre>${escapeHtml(ck.detail)}</pre>` : '') + `</div>`
+      ).join('') + `</div>`;
+    }
+    html += `</div>`;
+  }
+
   html += `<div class="field-label">Commits (${data.commits.length}, newest first)</div>`;
   if (!data.commits.length) {
     html += `<div class="meta">No commits found ahead of ${escapeHtml(b.mainBranch)}.</div>`;
   } else {
-    html += `<div class="task-history">` + data.commits.map((c) => {
+    html += data.commits.map((c) => {
       const when = c.date ? new Date(c.date).toLocaleString() : '';
-      return `<div class="task-history-row">`
-        + `<span class="task-history-stage">${escapeHtml(c.subject)}</span> `
-        + `<span class="meta">${escapeHtml(c.author)} · ${escapeHtml(when)} · <code>${escapeHtml(c.sha.slice(0, 8))}</code></span>`
-        + (c.body ? `<pre>${escapeHtml(c.body)}</pre>` : '')
-        + `</div>`;
-    }).join('') + `</div>`;
+      let row = `<div class="worker-card" style="margin:4px 0">`
+        + `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(c.subject)}</span> `
+        + `<span class="meta">${escapeHtml(c.author)} · ${escapeHtml(when)} · <code>${escapeHtml(c.sha.slice(0, 8))}</code></span></div>`;
+      // The commit's own message body -- and, when the Task: trailer resolves, that
+      // task's REAL pipeline log (plan → implement tiers → review votes → disposition).
+      if (c.task) {
+        const t = c.task;
+        row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
+          + (t.terminalDisposition ? ` · ${escapeHtml(t.terminalDisposition)}` : '')
+          + (t.reviewVotes ? ` · review ${escapeHtml(t.reviewVotes)}` : '') + `</div>`;
+        if (t.description) row += `<div style="font-size:12px;margin-top:4px">${escapeHtml(t.description)}</div>`;
+        row += `<div class="task-history" style="margin-top:6px">` + (t.history || []).map((e) => {
+          const eWhen = e.at ? new Date(e.at).toLocaleTimeString() : '';
+          return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(e.stage || '?')}</span> `
+            + `<span class="meta">${escapeHtml(eWhen)}</span>`
+            + (e.detail ? ` <span style="font-size:12px">${escapeHtml(e.detail)}</span>` : '') + `</div>`;
+        }).join('') + `</div>`;
+      } else {
+        if (c.taskId) row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
+        if (c.body) row += `<pre>${escapeHtml(c.body)}</pre>`;
+      }
+      return row + `</div>`;
+    }).join('');
   }
   content.innerHTML = html;
 }
