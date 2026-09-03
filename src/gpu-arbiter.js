@@ -145,7 +145,7 @@ function touch(fp) {
 function patchTicket(fp, patch) {
   const cur = readTicket(fp);
   if (!cur) return;
-  try { writeTicketAtomic(fp, { ...cur, ...patch }); } catch { /* best-effort */ }
+  try { writeTicketAtomic(fp, { ...cur, ...patch }); } catch (err) { console.warn(`[gpu-arbiter] ticket write failed (best-effort, continuing) fp=${fp} state=${JSON.stringify({ ...cur, ...patch }).slice(0, 200)} err=${err.message}`); }
 }
 
 function nowIso() { return new Date().toISOString(); }
