@@ -181,7 +181,7 @@ def _local_harness_context(subject_text: str, transcript: list, repo_root: str, 
             proposal = ollama_client.generate(
                 _build_search_proposal_prompt(subject_text, transcript), think=False, temperature=0.2, num_predict=120,
             )
-    except Exception:
+    except Exception as exc:
         # 2026-08-24 -- caught live BEFORE the _maybe_locked() coordination above existed:
         # with no lock, this call queued behind an actively-drafting worker and blew
         # ollama_client.py's own 240s timeout outright. The lock now makes that the common
@@ -192,6 +192,7 @@ def _local_harness_context(subject_text: str, transcript: list, repo_root: str, 
         # failure here (a slow Ollama, a real timeout even with the lock held, a
         # connection error) turned a graceful "no extra context this turn" into a hard 500
         # for the whole Discuss session instead.
+        logging.warning("Ollama proposal call failed (non-fatal, continuing without search context): %s", exc, exc_info=True)
         return None
     model_stats_client.record_call("discuss-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="discuss-harness-search", result=proposal)
