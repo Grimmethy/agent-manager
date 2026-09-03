@@ -154,3 +154,26 @@ Replace the sequential for-loop with a `concurrent.futures.ThreadPoolExecutor` (
 
 Benefits:
 Wall-time for a burst of *k* alerts drops from *k* × RTT to roughly ⌈k / 8⌉ × RTT (bounded by the pool width), cutting the 20-alert case from ~1–6 s to ~150 ms–750 ms. The dashboard thread is no longer held hostage by sequential network latency, so polling cycles and UI updates proceed with far less jitter during alert storms. Because the fix uses only `concurrent.futures` and `urllib.request`—both already in the stdlib and already imported or importable in this file—no new dependency, configuration knob, or external service is introduced.
+
+### AC-9 · Replace busy-wait `for(;;)` spin loop with promise-based FIFO queue in single-flight lock
+Strength: Strong
+Files: src/single-flight-lock.js
+Snippet:
+```
+
+  const staleMs = timeoutSecs * 1000 * 2;
+  try {
+    for (;;) {
+      if (Date.now() >= overallDeadline) {
+        throw makeTimeoutError(key, timeoutSecs, 'never reached the head of the single-flight FIFO queue');
+      }
+```
+
+Problem:
+The single-flight lock at line 343 uses a `for(;;)` loop to wait for the in-flight operation to complete. In Node.js this is a tight spin-wait: the caller repeatedly checks a flag or queue length without yielding to the event loop, burning CPU cycles on every iteration and—critically—blocking the event loop so that no other I/O callbacks, timers, or microtasks can run while the lock is held. Under concurrent load (multiple callers hitting the same key), every additional waiter adds another spinning context, and the event loop starvation compounds, inflating latency for unrelated work and wasting core time that would otherwise be idle.
+
+Solution:
+Replace the `for(;;)` spin with a promise-based FIFO queue. Maintain a plain `Map<string, Array<() => void>>` of resolver callbacks keyed by the lock key. When a caller finds the key already in-flight, it pushes its resolver onto that array and returns a `Promise` that resolves when the lock is released. The lock holder, upon finishing the in-flight operation, iterates the resolver array in insertion order (FIFO), calls each resolver, and clears the entry. No polling, no spin, no new dependency—just `Promise`, `Map`, and array methods already available in the Node.js runtime.
+
+Benefits:
+Waiters no longer consume CPU while blocked; the event loop is free to service other I/O, timers, and microtasks during the wait window. Under N concurrent callers on the same key, total CPU work drops from O(N × wait_duration) spinning iterations to O(N) trivial resolver calls. Latency for unrelated event-loop work (HTTP responses, DNS lookups, `setImmediate` callbacks) is no longer inflated by the lock holder's waiters, and the single-flight guarantee (first caller executes, rest get the same result in order) is preserved exactly.
