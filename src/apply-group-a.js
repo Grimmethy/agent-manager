@@ -469,7 +469,9 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     const validDomains = (() => {
       try {
         return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
-      } catch {
+      } catch (err) {
+        const reason = err && err.message ? err.message : String(err);
+        process.stderr.write(`[apply-group-a] failed to read domains from ${matchedProject.domainsPath}: ${reason}\n`);
         return [];
       }
     })();
