@@ -341,7 +341,6 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
     // then write the artifact, so the change lands on the new branch, never on main.
     gitRunner.fetchMain();
-    gitRunner.resetToMain();
 
     // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) and
     // commit straight to main -- see the `directToMain` header comment above. Everything
@@ -349,8 +348,42 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // registration, so an out-of-tree plugin's source opts in without editing this file.
     const registered = getRegisteredSource(resolveSourceName(task));
     const commitsDirectlyToMain = !!(registered && registered.directToMain === true);
-    const branchName = commitsDirectlyToMain ? null : `agent/${task.id}`;
-    if (branchName) {
+
+    // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): every
+    // move + the wiring step commits onto ONE shared branch, in sequence. Step 1 creates
+    // it off main; step N>1 rides on top of what step N-1 committed -- so it must NOT
+    // resetToMain() (that would throw the prior steps away). isDependencySatisfied() has
+    // already confirmed step N-1 reached queue/done/ before this task was claimed.
+    const stacked = task.stacked && task.stacked.branch && !commitsDirectlyToMain ? task.stacked : null;
+    if (stacked) {
+      const b = stacked.branch;
+      gitRunner.fetchBranch(b);
+      if (stacked.seq > 1) {
+        if (gitRunner.branchExists(b)) gitRunner.checkoutBranch(b);
+        else gitRunner.checkoutTracking(b); // local ref missing/stale -- take origin's copy
+      } else {
+        gitRunner.resetToMain();
+        try { gitRunner.deleteBranch(b); } catch (_) { /* no stale branch */ }
+        gitRunner.createBranch(b);
+      }
+    } else {
+      gitRunner.resetToMain();
+    }
+
+    const branchName = commitsDirectlyToMain ? null : (stacked ? stacked.branch : `agent/${task.id}`);
+
+    // Abandon this apply's branch checkout on an early-return path. For a normal throwaway
+    // agent/<id> branch that means delete it. For a STACKED decompose branch it does NOT:
+    // the branch carries the prior steps' committed + pushed work, so we only step off it.
+    const abandonBranch = () => {
+      if (!branchName) return;
+      try {
+        gitRunner.checkoutMain();
+        if (!stacked) gitRunner.deleteBranch(branchName);
+      } catch (_) { /* best-effort cleanup */ }
+    };
+
+    if (branchName && !stacked) {
       // Defensive pre-cleanup (2026-08-25 -- same fix, same root cause, as adhoc-agentic-
       // draft.js's own scratch-worktree branch: confirmed live via apply-task-loop.log,
       // "fatal: a branch named 'agent/adhoc-add-a-hardware-tab-...' already exists" on
@@ -378,7 +411,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       // it reaches here -- this block is not, and was never sufficient as, the only
       // guarantee against a partial multi-file write surviving a mid-batch failure.
       if (branchName) {
-        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort cleanup */ }
+        abandonBranch();
       } else {
         // No branch to abandon -- just discard whatever partial write landed on main's
         // own working tree so it can't ride along uncommitted into a later, unrelated apply.
@@ -388,10 +421,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     }
 
     if (artifact && artifact.skipped) {
-      if (branchName) {
-        gitRunner.checkoutMain();
-        gitRunner.deleteBranch(branchName);
-      }
+      abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { succeeded: true, doneMarker: artifact.reason };
     }
@@ -401,9 +431,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // recordApplyOutcome maps `coordinating` to its own applyStage / task.status, and
     // apply-task.sh moves the file to queue/coordinating/.
     if (artifact && artifact.coordinating) {
-      if (branchName) {
-        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort */ }
-      }
+      abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason };
     }
@@ -417,9 +445,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // needsConfirmation gate above only covers usesGroupB tasks; this is its Group A
     // counterpart. recordApplyOutcome routes `needsConfirmation` to awaiting-confirm/.
     if (artifact && artifact.needsConfirmation) {
-      if (branchName) {
-        try { gitRunner.checkoutMain(); gitRunner.deleteBranch(branchName); } catch (_) { /* best-effort */ }
-      }
+      abandonBranch();
       return artifact;
     }
 

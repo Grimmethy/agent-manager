@@ -996,3 +996,47 @@ test('a Group-A apply returning needsConfirmation holds at awaiting-confirm with
   // recordApplyOutcome routes it to awaiting-confirm/
   assert.equal(recordApplyOutcome(task, result), 'awaiting-confirm');
 });
+
+// --- stacked file-decompose child branches (file-decompose-to-hub.js `mode: stacked`) ---
+
+test('stacked seq 1: creates the shared decompose branch off main (reset first)', () => {
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-01-a', stacked: { branch: 'agent/decompose-x', seq: 1 } }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  assert.equal(result.branch, 'agent/decompose-x');
+  assert.deepEqual(gitRunner.calls.map((c) => c.name),
+    ['fetchMain', 'fetchBranch', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+});
+
+test('stacked seq 2: rides on top of the existing shared branch -- never resets it away', () => {
+  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'] });
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'fetchBranch', 'branchExists', 'checkoutBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.ok(!names.includes('resetToMain'), 'must not reset -- prior steps live on this branch');
+  assert.ok(!names.includes('deleteBranch'), 'must not delete the shared branch');
+});
+
+test('stacked seq 2 with no local ref: takes origin/<branch> via checkoutTracking', () => {
+  const gitRunner = createFakeGitRunner({ existingBranches: [] });
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(gitRunner.calls.map((c) => c.name),
+    ['fetchMain', 'fetchBranch', 'branchExists', 'checkoutTracking', 'add', 'commit', 'push', 'checkoutMain']);
+});
+
+test('stacked child: a write failure steps off the branch but does NOT delete it', () => {
+  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'] });
+  const result = applyTask(
+    baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 },
+      implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'NOPE', replace: 'b' }) }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, false);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('checkoutMain'));
+  assert.ok(!names.includes('deleteBranch'), 'the shared branch carries committed prior steps -- never delete on cleanup');
+});
