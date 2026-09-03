@@ -962,7 +962,8 @@ def discover_github_repos() -> list[dict]:
     an empty list rather than a 500."""
     try:
         candidates = sorted(GITHUB_PROJECTS_ROOT.iterdir(), key=lambda p: p.name.lower())
-    except OSError:
+    except OSError as exc:
+        logger.warning("Failed to list GitHub projects root %s: %s", GITHUB_PROJECTS_ROOT, exc)
         return []
     repos = []
     for child in candidates:
