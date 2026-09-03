@@ -6727,8 +6727,8 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     )
     try:
         _comfy_lease.unlink(missing_ok=True)
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
 
     if os.name != "nt":
         import platform, subprocess as sp, shlex
