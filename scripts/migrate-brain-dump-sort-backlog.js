@@ -32,7 +32,7 @@ function main() {
   }
 
   const bd = (() => {
-    try { return JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')); } catch { return { entries: [] }; }
+    try { return JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')); } catch (err) { console.error(`migrate-brain-dump-sort-backlog: failed to read/parse brain dump at ${brainDumpPath}: ${err.message}`); return { entries: [] }; }
   })();
   const entriesById = new Map((bd.entries || []).map((e) => [e && e.id, e]));
 
