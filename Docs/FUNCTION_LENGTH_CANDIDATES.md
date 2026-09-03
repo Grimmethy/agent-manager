@@ -1416,3 +1416,164 @@ Extract two focused helpers, leaving the ticket-registration preamble and the fi
 
 Benefits:
 Each extracted helper is independently unit-testable: `waitForTurn` can be tested with a fake ticket store and a controllable clock to exercise all five exit paths without touching the filesystem flock, and `acquireFlockWithCompat` can be tested against a real temp directory to verify the marker-creation/removal invariant under both success and failure. Code review becomes a matter of checking that the outer function's linear sequence calls the helpers in the right order and handles the result, rather than tracing 30 lines of nested `for(;;)` / `continue` logic. The compat-marker ordering bug class—marker created after flock, or not removed on a new failure path—becomes structurally impossible to introduce from outside the helper, because the invariant is now local to a 12-line function whose sole job is that pairing.
+
+### AC-23 · draftAdhocBranch: extract decompose pre-flight and resolution sub-paths
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+// strict, line-based format; a freeform rewrite is not a safe way to edit one) -- every
+// path here returns a final draftTask result directly instead.
+async function draftAdhocBranch(task, {
+  maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
+  draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+}) {
+  // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
+  // through qwen. Claude needs to be removed as a dependency from that system"). Every
+  // tier runs the local model against an isolated worktree:
+  //   1. harness-search  -- cheap, single-shot, grep-grounded blind diff (proven).
+  //   2. local-agentic   -- multi-turn, READ-ONLY tools, emits a Group-B diff (opt-in).
+  //   3. local-agentic-WRITE -- multi-turn with real edit/write/run_bash in a worktree
+  //      (default-on; this is what the deleted Claude adhoc-agentic-draft.js used to do).
+  // Tiers 1-2 return {applied, succeeded, reason?}: applied -> done; declined -> next
+  // tier. Tier 3 returns a terminal draftTask-shaped verdict (implemented / blocked /
+  // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
+  // fallback. All tiers are unconditionally lock-wrapped (always local).
+  //
+  // Each tier is bracketed with an 'implement-started' checkpoint. The ladder emits no
+  // other history until a tier resolves, and tier 3 is a multi-turn agentic pass that
+  // routinely runs for many minutes -- so without these, a task killed mid-ladder (or one
+  // that keeps dying in tier 3) shows only '... -> plan-done' and the Pipeline History
+  // looks cut short. With main()'s persist hook each one lands on disk the moment it fires,
+  // so the log shows exactly how far the draft got. (2026-08-31, Grimmethy: "the task log
+  // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
+
+  // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
+  // BEFORE any agentic tier. A task that is genuinely 5 endpoints + a UI + tests wastes a
+  // full 35-turn tier-3 pass (and 2 retries) discovering that; catch it here instead. Only
+  // on a FRESH task -- a retry / re-scoped / already-decomposed task has specific feedback
+  // to act on and skips this. The decompose verdict flows straight to review -> coordinator
+  // exactly like a RESOLUTION: decompose from tier 3.
+  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
+  const isFreshAdhoc = !task.localRejectCount
+    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
+    && !task.rescopedFromDecompose
+    && !task.autoDecomposeCount
+    && task.adhocResolution !== 'decompose';
+  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
+    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
+    if (split && split.subTasks.length >= 2) {
+      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
+      task.adhocResolution = 'decompose';
+      task.subTaskProposals = split.subTasks;
+      task.rawDiff = '';
+      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.`;
+      concludeDraft(task);
+      return { succeeded: true, blocked: false };
+    }
+  }
+
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
+  const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
+  recordTier(attempt, {
+    tier: 'harness-search', applied: harnessResult.applied, reason: harnessResult.reason,
+    response: harnessResult.applied ? task.implementResponse : undefined,
+    rawDiff: harnessResult.applied ? task.rawDiff : undefined,
+  });
+  if (!harnessResult.applied && harnessResult.succeeded === false) {
+    return { succeeded: false, reason: harnessResult.reason };
+  }
+
+  let localTierApplied = harnessResult.applied;
+  // Carried from a declined tier 2 into the tier-3 write prompt (see the tier-3 call
+  // below) so tier 3 starts from the read-only pass's map instead of re-orienting from
+  // cold and running out of turns before it edits anything.
+  let priorInvestigation = null;
+  if (!localTierApplied) {
+    appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
+    const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
+    recordTier(attempt, {
+      tier: 'local-agentic', applied: localAgenticResult.applied, reason: localAgenticResult.reason,
+      response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
+      toolCallLog: localAgenticResult.toolCallLog,
+    });
+    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog, finalMessage: localAgenticResult.response });
+    if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
+      return { succeeded: false, reason: localAgenticResult.reason };
+    }
+    if (!localAgenticResult.applied && localAgenticResult.investigationSummary) {
+      priorInvestigation = localAgenticResult.investigationSummary;
+    }
+    localTierApplied = localAgenticResult.applied;
+  }
+
+  if (localTierApplied) {
+    const appliedTier = harnessResult.applied ? 'harness-search' : 'local-agentic (read-only)';
+    appendHistoryEvent(task, 'implement-done', `${appliedTier} tier applied, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
+    concludeDraft(task);
+    return { succeeded: true, blocked: false };
+  }
+
+  // Tier 3: local write-agentic. Returns the same verdict shape the Claude tier did
+  // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
+  // genuine infra error (retry), everything else is terminal.
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
+  // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
+  // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
+  // task (same pattern as runPlanPass's task._seedPlan).
+  if (priorInvestigation) task._priorInvestigation = priorInvestigation;
+  const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
+  delete task._priorInvestigation;
+  recordTier(attempt, {
+    tier: 'local-agentic-write',
+    resolution: agenticResult.resolution || task.adhocResolution,
+    blocked: agenticResult.blocked,
+    reason: agenticResult.reason || agenticResult.blockedReason,
+    response: agenticResult.response,
+    rawDiff: agenticResult.capturedDiff || (agenticResult.blocked ? undefined : task.rawDiff),
+    turnsUsed: agenticResult.turnsUsed,
+    toolCallLog: agenticResult.toolCallLog,
+  });
+  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog, finalMessage: agenticResult.response });
+  if (!agenticResult.succeeded) {
+    return { succeeded: false, reason: agenticResult.reason };
+  }
+  if (agenticResult.blocked) {
+    appendHistoryEvent(task, 'blocked', agenticResult.blockedReason);
+    return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
+  }
+  // 2026-08-24 (RESOLUTION: needs-human-decision, adhoc-agentic-draft.js): a real
+  // open product/design question, not a diff or a sub-task list -- nothing here for
+  // an automatic reviewer to verify against real repo state, so this skips review-
+  // task.js/apply-task.js entirely and goes straight to queue/needs-clarification/
+  // (local-worker.sh's own move-destination branch) for a human to actually answer.
+  // Reuses `needsClarification`'s FIELD NAME (not path_prefetch_resolve's specific
+  // shape) so the dashboard's existing "does this task have needsClarification"
+  // check and Discuss button pick it up; `reason: 'design-decision'` is what
+  // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
+  // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
+  if (agenticResult.needsClarification) {
+    // 2026-08-24 (Grimmethy: multiple-choice shortcut) -- options is undefined
+    // (never a key at all, not even null) when the model didn't offer a clean
+    // 2+ option OPTIONS block, so the dashboard's existing `nc.options` check
+    // stays a plain truthy test either way.
+    const options = parseClarificationOptions(task.implementResponse);
+    task.needsClarification = {
+      reason: 'design-decision', openQuestions: task.implementResponse,
+      ...(options ? { options } : {}),
+    };
+    appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+    appendHistoryEvent(task, 'needs-clarification');
+    return { succeeded: true, blocked: false, needsClarification: true };
+  }
+  appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+```
+
+Problem:
+`draftAdhocBranch` spans 143 lines and is not a single linear pipeline; it is at least four logically distinct units (a decompose pre-flight gate, a resolution/branching core, a sub-task-proposal assembly, and a final task-field commit) that share only a mutable `task` object as their coupling point. The pre-flight alone carries its own early-return, its own history-event append, and its own set of `task` field mutations (`adhocResolution`, `subTaskProposals`, `rawDiff`, `implementResponse`), making it independently testable yet inseparable in the current body. Because every unit mutates the same `task` reference and the function has no intermediate return boundaries, a reader must hold the full 143-line state in working memory to reason about any single branch, and a regression in one unit (e.g., a missing `rawDiff` write in the decompose path) can silently corrupt a downstream unit that assumes the field was set.
+
+Solution:
+Extract the preliminary decompose pre-flight into a `maybePreliminaryDecompose(task, { maybeLocked, resolvedLocalCall, resolvedCallIsLocal })` helper that returns either a decompose verdict object (triggering the caller's early return) or `null` to signal fall-through; internally it owns the env-flag check, freshness predicates, the `runDecomposePass` call, the history-event append, and the four `task` field writes. Next, pull the sub-task-proposal assembly (the block that builds `subTaskProposals` from the diff and local-call context) into `buildSubTaskProposals(task, diff)` so its branching on call locality is isolated. Finally, wrap the terminal commit sequence (setting `implementResponse`, appending the final history event, and returning the resolution) into `commitAdhocResolution(task)`. The top-level `draftAdhocBranch` then reduces to a short orchestration: call the pre-flight, bail if it returns a verdict, otherwise call the proposal builder, then the commit helper, and return.
+
+Benefits:
+Each extracted helper has a single, nameable contract and a small, self-contained mutation surface, so a reviewer can verify the decompose gate's early-return logic without scanning 120+ lines of unrelated branching. Unit tests can exercise `maybePreliminaryDecompose` with a stub `task` and assert the four field writes and the history append in isolation, and can test `buildSubTaskProposals` against a fixed diff without needing the full env-flag and freshness setup. The top-level function shrinks to roughly 15–20 lines of sequencing, making the overall control flow (decompose-or-fall-through → propose → commit) immediately legible and reducing the blast radius of any future edit to a single helper.
