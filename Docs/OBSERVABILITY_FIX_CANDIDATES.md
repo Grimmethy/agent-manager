@@ -2365,3 +2365,26 @@ Replace the bare `except OSError: pass` with a handler that (1) logs the failure
 
 Benefits:
 Once fixed, a failed disk write produces an immediate, attributable ERROR log line naming the branch, the file path, and the OS-level cause (disk full, permission denied, NFS timeout), giving an operator a concrete breadcrumb within seconds. The API caller receives a 500 instead of a misleading 200, so the dashboard can surface the failure to the user and the branch remains visible in the "Unmerged" list, preventing the silent divergence between UI state and on-disk state that currently goes unnoticed until the next manual inspection.
+
+### AC-139 · Silently swallowed OSError in domain-defaults persistence
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    try:
+        domains_path.parent.mkdir(parents=True, exist_ok=True)
+        domains_path.write_text(json.dumps(domains, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+```
+
+Problem:
+The `_ensure_domain_defaults` helper (lines 5892–5911) mutates the in-memory `domains` dict and then attempts to persist it via `domains_path.write_text(...)`. The surrounding `try` block (lines 5901–5905) catches `OSError` and executes a bare `pass`, discarding every possible failure mode—permission denied, disk full, path-is-a-directory, read-only filesystem, `mkdir` race. The function returns `None` on every code path (success, early-return at 5893/5899, and the except branch), so the caller has no return value to inspect, no log line to grep, and no exception to catch. The entire purpose of the call—persisting new domain defaults to disk—is silently unmet, and no downstream code will retry or compensate.
+
+Solution:
+Replace the bare `except OSError: pass` with `except OSError as exc:` followed by a `logging.getLogger(__name__).error("Failed to persist domain defaults to %s: %s", domains_path, exc, exc_info=True)` call. The `logging` module is already available in this Python file (stdlib, no new dependency). The log message includes the target path so an operator can immediately identify which file failed, and `exc_info=True` captures the full traceback for post-hoc debugging. Do not re-raise: the caller is a best-effort "ensure defaults exist" helper invoked during dashboard request setup, and re-raising would turn a missing-defaults situation into a hard 500 for the entire request. Do not add a metric or counter—the project has no metrics system.
+
+Benefits:
+An operator can now see, in the application log, exactly when and why a domain-defaults write failed (path, OS error, full stack trace), turning an invisible data-loss event into a greppable, actionable signal. The dashboard request still completes normally (the in-memory mutation is already applied for the current process lifetime), so user-facing behavior is unchanged, but the silent divergence between in-memory state and on-disk state is no longer hidden. Future debugging of "why are my defaults missing after a restart?" becomes a one-line log search instead of a blind guess.
