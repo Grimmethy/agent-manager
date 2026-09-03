@@ -155,11 +155,27 @@ function pruneWorkLogs(pipelineDir) {
     const queueRoot = path.join(root, 'queue');
     let files;
     try { files = fs.readdirSync(dir); } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: readdir failed for ${dir} [${err.code}]: ${err.message}`); return { pruned: 0 }; }
+    const liveSet = new Set();
+    for (const d of LIVE_QUEUE_DIRS) {
+      try {
+        for (const entry of fs.readdirSync(path.join(queueRoot, d))) {
+          if (entry.endsWith('.json')) liveSet.add(entry.slice(0, -5));
+        }
+      } catch { /* dir may not exist */ }
+    }
+    try {
+      const draftingRoot = path.join(queueRoot, 'drafting');
+      for (const sub of fs.readdirSync(draftingRoot)) {
+        for (const entry of fs.readdirSync(path.join(draftingRoot, sub))) {
+          if (entry.endsWith('.json')) liveSet.add(entry.slice(0, -5));
+        }
+      }
+    } catch { /* no drafting/ dir */ }
     let pruned = 0;
     for (const f of files) {
       if (!f.endsWith('.json') || f.includes('.tmp-')) continue;
       const id = f.slice(0, -5);
-      if (!taskIsLive(queueRoot, id)) {
+      if (!liveSet.has(id)) {
         try { fs.unlinkSync(path.join(dir, f)); pruned += 1; } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: unlink failed for ${path.join(dir, f)} [${err.code}]: ${err.message}`); }
       }
     }
