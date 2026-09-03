@@ -2790,3 +2790,36 @@ Bind the caught error and log it via `console.error`—the same primitive alread
 
 Benefits:
 Any unexpected exception in the outer `try` scope (bad `root` argument, `taskIsLive` internal error, or any future code added inside the block) now produces a single identifiable stderr line that an operator or log-aggregator can grep. The tick script still completes without crashing, so a single bad tick does not cascade. The distinction between "nothing to prune" and "pruning failed" becomes observable, turning a silent production blind spot into a one-line diagnostic.
+
+### AC-157 · Log the swallowed remote-branch-deletion failure instead of silently passing
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            pass
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+```
+
+Problem:
+In `python/dashboard/app.py` lines 5627–5634, the `except RuntimeError` handler for the best-effort `git push origin --delete <branch>` call executes a bare `pass`. The comment correctly justifies *why* the request should not fail (the merge to main already succeeded), but the exception object itself is discarded: no log line is emitted, no context is preserved, and the caller receives no indication that the remote branch was left behind. If the remote's delete permission is revoked, the remote URL changes, or the branch is in a state where deletion is refused, every subsequent merge will silently accumulate stale remote branches with zero trace in any log, making the problem invisible until someone manually inspects the remote.
+
+Solution:
+Replace the bare `pass` with a `logging.getLogger(__name__).warning(...)` call that captures the exception (via `exc_info=True` or by interpolating `str(e)`), the branch name, and the repo root, so the operator can see exactly which deletion failed and why. The handler must still *not* re-raise: the merge to main has already succeeded and the outer `except RuntimeError` on line 5635 is the correct 500 path for genuine failures, so the control-flow decision to treat this as non-fatal is preserved. Concretely, the block becomes:
+
+```python
+except RuntimeError as e:
+    logging.getLogger(__name__).warning(
+        "Non-fatal: could not delete remote branch %r in %s: %s",
+        branch, repo_root, e,
+    )
+```
+
+No new dependency is introduced; `logging` is the stdlib module the project already uses for Python-side diagnostics.
+
+Benefits:
+An operator reviewing server logs will immediately see a timestamped, branch-specific warning whenever a remote-branch deletion fails, turning an invisible, accumulating problem into a one-line diagnostic. The warning level (not error) correctly signals "expected best-effort path, not a request failure," so alerting on ERROR/CRITICAL is not triggered while the signal is still present for log-search and post-incident review. The merge-to-main success path and the outer 500 handler are untouched, so no behavioural change is introduced beyond observability.
