@@ -70,6 +70,115 @@ test('an oversized file is windowed around the distinctive identifiers the task 
   assert.match(files[0].content, /chars before this window/);
 });
 
+// --- line-anchored windowing (harnessHits / path:line refs / tail heuristic) ---
+
+// A file well over any maxCharsPerFile: N numbered lines so a "line M" assertion is real.
+function bigNumberedFile(nLines, marker, markerLine) {
+  const lines = [];
+  for (let i = 1; i <= nLines; i += 1) {
+    lines.push(i === markerLine ? `line ${i} ${marker}` : `line ${i} filler filler filler filler filler`);
+  }
+  return lines.join('\n');
+}
+
+test('harnessHits window an oversized file with no matching identifiers', () => {
+  const dir = makeRepo({ 'python/dashboard/app.py': bigNumberedFile(1200, 'INSERT_ROUTE_HERE', 300) });
+  const t = adhoc('Add POST /api/plugins/install to python/dashboard/app.py.', {
+    prefetchedPaths: ['python/dashboard/app.py'],
+    harnessHits: [{ file: 'python/dashboard/app.py', line: 300, query: 'x', text: 'y' }],
+  });
+  const files = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.equal(files.length, 1);
+  assert.match(files[0].content, /INSERT_ROUTE_HERE/);
+  assert.match(files[0].content, /showing lines \d+-\d+, around grep hit\(s\) at line\(s\) 300/);
+  assert.doesNotMatch(files[0].content, /head shown/);
+  assert.equal(files[0].windowed, true);
+  assert.deepEqual(files[0].anchoredOnLines, [300]);
+});
+
+test('two far-apart hit clusters each get a window', () => {
+  let content = bigNumberedFile(1200, 'ZZZ', 0);
+  content = content.split('\n');
+  content[119] = 'line 120 FIRST_REGION_MARKER';
+  content[899] = 'line 900 SECOND_REGION_MARKER';
+  const dir = makeRepo({ 'python/dashboard/app.py': content.join('\n') });
+  const t = adhoc('Edit python/dashboard/app.py.', {
+    prefetchedPaths: ['python/dashboard/app.py'],
+    harnessHits: [
+      { file: 'python/dashboard/app.py', line: 120, query: 'a', text: 'b' },
+      { file: 'python/dashboard/app.py', line: 900, query: 'c', text: 'd' },
+    ],
+  });
+  const [f] = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.match(f.content, /FIRST_REGION_MARKER/);
+  assert.match(f.content, /SECOND_REGION_MARKER/);
+  assert.match(f.content, /lines between windows/);
+  assert.doesNotMatch(f.content, /line 500 filler/);
+});
+
+test('harnessHits take priority over an identifier match', () => {
+  const content = bigNumberedFile(1000, 'HIT_REGION', 800)
+    .split('\n')
+    .map((l, i) => (i === 49 ? 'line 50 distinctiveIdentifierToken' : l))
+    .join('\n');
+  const dir = makeRepo({ 'src/big.js': content });
+  const t = adhoc('Change distinctiveIdentifierToken in src/big.js.', {
+    prefetchedPaths: ['src/big.js'],
+    harnessHits: [{ file: 'src/big.js', line: 800, query: 'x', text: 'y' }],
+  });
+  const [f] = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.match(f.content, /HIT_REGION/);
+  assert.match(f.content, /around grep hit\(s\) at line\(s\) 800/);
+});
+
+test('a path:line ref in the task text windows the file, no harnessHits needed', () => {
+  const dir = makeRepo({ 'python/dashboard/app.py': bigNumberedFile(7000, 'THE_INSERTION_POINT', 6645) });
+  const long = taskAnchorFiles(adhoc('Insert the handler at python/dashboard/app.py:6645, mirroring api_plugins_add.'), dir, { maxCharsPerFile: 8000 });
+  assert.match(long[0].content, /THE_INSERTION_POINT/);
+  assert.match(long[0].content, /around grep hit\(s\) at line\(s\) 6645/);
+  const bare = taskAnchorFiles(adhoc('Insert the handler at app.py:6645.', { prefetchedPaths: ['python/dashboard/app.py'] }), dir, { maxCharsPerFile: 8000 });
+  assert.match(bare[0].content, /THE_INSERTION_POINT/);
+});
+
+test('tail heuristic: "at the bottom of the file" shows the end, not the head', () => {
+  const dir = makeRepo({ 'python/dashboard/app.py': `${bigNumberedFile(1200, 'nope', 0)}\nLAST_LINE_BLUEPRINT_SPOT` });
+  const t = adhoc('Register the dashboard_api blueprint at the bottom of python/dashboard/app.py.', {
+    prefetchedPaths: ['python/dashboard/app.py'],
+  });
+  const [f] = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.match(f.content, /LAST_LINE_BLUEPRINT_SPOT/);
+  assert.match(f.content, /END of the file/);
+  assert.doesNotMatch(f.content, /head shown/);
+});
+
+test('no hits, no idents, no tail cue still head-truncates (regression guard)', () => {
+  const dir = makeRepo({ 'src/big.js': 'q'.repeat(40000) });
+  const [f] = taskAnchorFiles(adhoc('Do something in src/big.js.', { prefetchedPaths: ['src/big.js'] }), dir, { maxCharsPerFile: 8000 });
+  assert.match(f.content, /head shown/);
+});
+
+test('a small file is returned verbatim even when hitLines are present', () => {
+  const dir = makeRepo({ 'src/small.js': 'line 1\nline 2\nline 3\n' });
+  const t = adhoc('Edit src/small.js.', {
+    prefetchedPaths: ['src/small.js'],
+    harnessHits: [{ file: 'src/small.js', line: 2, query: 'x', text: 'y' }],
+  });
+  const [f] = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.equal(f.content, 'line 1\nline 2\nline 3\n');
+  assert.equal(f.windowed, false);
+});
+
+test('a harnessHit for a different file does not move this file\'s window', () => {
+  const dir = makeRepo({ 'python/dashboard/app.py': bigNumberedFile(1200, 'IDENT_REGION', 60) });
+  const t = adhoc('Change theIdentRegionThing in python/dashboard/app.py.', {
+    prefetchedPaths: ['python/dashboard/app.py'],
+    harnessHits: [{ file: 'python/dashboard/other.py', line: 900, query: 'x', text: 'y' }],
+  });
+  const [f] = taskAnchorFiles(t, dir, { maxCharsPerFile: 8000 });
+  assert.deepEqual(f.anchoredOnLines, []);
+  assert.doesNotMatch(f.content, /around grep hit/);
+});
+
 test('non-adhoc tasks and empty rawText yield nothing', () => {
   const dir = makeRepo({ 'src/x.js': 'a\n' });
   assert.deepEqual(taskAnchorFiles({ source: 'observability_fix', promptContext: { rawText: 'touch src/x.js' } }, dir), []);
