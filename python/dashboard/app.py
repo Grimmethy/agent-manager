@@ -5658,8 +5658,9 @@ def api_git_merge_branch(branch):
                         data["terminalDisposition"] = "merged"
                     try:
                         candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
+                        raise
                 break
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
