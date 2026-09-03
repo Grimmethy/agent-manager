@@ -253,6 +253,7 @@ def get_history(hours: float = DEFAULT_RETENTION_HOURS) -> list:
         finally:
             conn.close()
     except Exception:
+        log.exception("Failed to fetch hardware history rows; returning empty list")
         return []
     return [_row_to_history_entry(row) for row in rows]
 
