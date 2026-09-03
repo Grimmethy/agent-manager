@@ -2445,3 +2445,26 @@ No new dependency is introduced; `logging` is already the project's Python loggi
 
 Benefits:
 An operator who clicks "Stop" (or "Force Stop") in the dashboard and the pipeline is still running will now see a clear, timestamped log line identifying the exact command, the exception type, and the root cause (e.g. `FileNotFoundError: /opt/pipeline/bin/stop.sh`). The UI/caller receives a failure signal instead of a silent success, so it can surface an error to the user or retry. The observability gap is closed using only primitives the project already has, with no new dependency and no fabricated telemetry system.
+
+### AC-142 · Silently swallowed OSError on ComfyUI lease unlink
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    )
+    try:
+        _comfy_lease.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    if os.name != "nt":
+```
+
+Problem:
+Lines 6728–6731 wrap `Path.unlink(missing_ok=True)` in `except OSError: pass`. While `missing_ok=True` correctly absorbs the expected "file not present" case, the bare `pass` still silently discards every other `OSError` subtype that can reach this line — `PermissionError` on a misconfigured home directory, `IsADirectoryError` if the env var `AGENT_MANAGER_COMFY_LEASE_PATH` points at a directory, or a transient I/O fault on a network-mounted volume. Because the project's only logging primitive is the stdlib `logging` module (already imported elsewhere in this file), there is zero trace in any log, stderr, or diagnostic output that the lease file survived. If the lease persists, the local-model daemons will keep yielding GPU ticks to a stale generation indefinitely, and no operator will have a log line to point at when debugging why the pipeline is starved.
+
+Solution:
+Replace the bare `pass` on line 6731 with a single `logger.debug` call that records the lease path and the full exception, e.g. `logger.debug("ComfyUI lease unlink failed (non-critical): %s", exc, exc_info=True)`. This uses only the stdlib `logging` module already present in the file, adds no new dependency, and does not alter control flow — the pipeline launch on line 6733 onward still proceeds unconditionally. The `exc_info=True` keyword ensures the traceback is captured at debug level for post-incident diagnosis without polluting warning-level output in normal operation.
+
+Benefits:
+A persistent `PermissionError` or a misconfigured `AGENT_MANAGER_COMFY_LEASE_PATH` becomes visible in debug logs within seconds of the first failed launch, rather than remaining an invisible, unexplained GPU-starvation symptom. The fix costs one line, introduces no new dependency, and preserves the existing best-effort semantics (the exception is still not re-raised, so the pipeline launch is unaffected).
