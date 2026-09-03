@@ -1765,3 +1765,222 @@ Extract three named helpers scoped to this file: (1) discoverBlockedEntries() re
 
 Benefits:
 Each extracted helper becomes independently unit-testable: the exhaustion guards can be tested against fixture histories without mocking directory I/O, and the feedback mapping can be table-tested across all six branches without executing any mutation. Code review of a new retryableDraftBlock subtype now touches only buildFeedbackString, and the 2026-08-17 / 2026-09-02 class of bugs (guard ordering, duplicate stamps) becomes visible as a single function's contract rather than a side effect buried in a 100-line body. The top-level orchestrator reads as a three-line pipeline, making the overall control flow auditable at a glance.
+
+### AC-25 · Decompose the review-task orchestrator into per-gate evaluators
+Strength: Strong
+Files: src/review-task.js
+Snippet:
+```
+ * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
+ */
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+  // Resolved here rather than as a static default param, same reasoning as
+  // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
+  // tier, only known once the task object is in hand. Passing the whole task (not just
+  // task.source) lets a per-instance task.reasoningTier override take effect. An explicit
+  // caller override always wins.
+  // 2026-08-24 (model-profile-registry.js): same pattern as local-draft.js's own
+  // resolvedLocalCall wrapping -- when the task's own source declares a modelProfile,
+  // its overrides become defaults spread BEFORE the real majorityVote() call below (opts
+  // spread after wins, though the one real call site doesn't set model/numCtx/numPredict/
+  // effort/timeoutMs itself today, so the profile's values reliably take effect). Passing
+  // both local-only (numCtx/numPredict) and claude-only (effort/timeoutMs) keys
+  // unconditionally is safe -- whichever backend's majorityVote() runs only destructures
+  // the params it recognizes, ignoring the rest. Skipped for an injected
+  // localMajorityVote (test/caller override), same as local-draft.js.
+  const modelProfile = resolveModelProfile(task);
+  const profileOverrides = modelProfile
+    ? {
+      model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict,
+      effort: modelProfile.effort, timeoutMs: modelProfile.timeoutMs,
+    }
+    : null;
+  // 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
+  // the local model to review them" -- ALWAYS the local backend, never providerFor(task)
+  // (which would route a high-reasoning-tier task to Claude). Root-caused live: this
+  // review call had, in practice, ALREADY always run local regardless of tier -- nothing
+  // in review-task.js's own require graph ever loaded task-sources.js, so
+  // providerFor()'s tier lookup silently saw an empty registry and defaulted to local
+  // every time -- but review-runner.sh's separate bash-side pre-check DID load that
+  // registry (to compute its own Claude-budget gate), correctly saw a high-tier task,
+  // and skipped it whenever Claude was paused/rate-limited: a real task that would have
+  // reviewed successfully in seconds sat unreviewed for hours, purely because of a
+  // mismatch between what the pre-check assumed would happen and what actually would
+  // have. Making this the real, intentional behavior (not an accidental side effect of
+  // a missing require) instead of just deleting review-runner.sh's now-dead gate --
+  // review-runner.sh's own header already documented the intent ("Reviewer is always
+  // Ornith (never Claude)"), this just makes the code match it for real.
+  const baseMajorityVote = localMajorityVote || localMajorityVoteBackend;
+  const resolvedMajorityVote = profileOverrides && !localMajorityVote
+    ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
+    : baseMajorityVote;
+  appendHistoryEvent(task, 'review-started');
+
+  // Deterministic review (brain_dump_sort, 2026-09-03): a mechanical validate replaces the
+  // LLM majority vote entirely -- no grounding subprocess, no fact-check, no vote. The vote
+  // was rejecting valid classifications on folder/filename nitpicks its own guidance forbade
+  // (8 permanently-blocked tasks). A failure here still sets blockedStage:'review', so
+  // reject-retry-check folds the specific reason into the next draft (an informed retry).
+  const detValidate = deterministicReviewValidator(resolveSourceName(task));
+  if (detValidate) {
+    let outcome;
+    try {
+      outcome = detValidate(task, { secondBrainDir, repoRoot });
+    } catch (e) {
+      outcome = { ok: false, reason: `deterministic review validator threw: ${e.message}` };
+    }
+    if (outcome && outcome.ok) {
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-brain-dump-sort';
+      task.localVerdict = 'Auto-approved: deterministic classification validation passed (no vote).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', 'deterministic-brain-dump-sort');
+      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+    }
+    const reason = `Deterministic review: ${outcome ? outcome.reason : 'validation failed'}`;
+    task.reviewProvider = 'deterministic-brain-dump-sort';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
+  }
+
+  const domainCfg = getDomainConfig(domainsPath, task.domain);
+  const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
+
+  // fact-check: deep_dive's real "repo root" for this purpose is the cloned external
+  // project (looked up by promptContext.projectSlug), not agent-manager's own repo --
+  // otherwise every referenced file reports as missing.
+  let repoRootForCheck = workDir;
+  if (task.source === 'deep_dive' && deepDiveCoveragePath && fs.existsSync(deepDiveCoveragePath)) {
+    try {
+      const ddCoverage = JSON.parse(fs.readFileSync(deepDiveCoveragePath, 'utf8'));
+      const ddProj = ddCoverage.projects && ddCoverage.projects[task.promptContext.projectSlug];
+      if (ddProj && ddProj.clonePath) repoRootForCheck = ddProj.clonePath;
+    } catch (e) { /* fall back to workDir */ }
+  }
+
+  const taskPathForGrounding = path.join(require('os').tmpdir(), `review-grounding-${task.id}.json`);
+  let groundingText = '';
+  try {
+    fs.writeFileSync(taskPathForGrounding, JSON.stringify(task));
+    groundingText = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPathForGrounding], { encoding: 'utf8' });
+  } catch (e) {
+    console.error(`[review-task] grounding-source generation failed for ${taskPathForGrounding}: ${e.stack || e.message || String(e)}`);
+    groundingText = '';
+  } finally {
+    try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
+  }
+
+  // Feed the consumer's configured code dirs (AGENT_MANAGER_GREP_DIRS) as extraRoots so
+  // resolveAgainstRepo can turn a bare `app.py` into `server/app.py` instead of reporting
+  // it "missing" -> "fabricated". Only meaningful when the fact-check runs against
+  // agent-manager's OWN repoRoot (the default); for a deep_dive external clone or the
+  // second-brain vault, these dirs don't apply and simply won't match -- harmless.
+  const factCheckExtraRoots = (repoRootForCheck === workDir)
+    ? (() => { try { return getConfig().grepAllowedDirs; } catch { return []; } })()
+    : [];
+  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots);
+  // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
+  // it must not by itself flip the verdict label to "flagged".
+  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';
+
+  // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
+  // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
+  // across this project's Linux port): fact-checker.js's own comments call ungrounded-url
+  // and ungrounded-field "almost never a false positive" -- checkGroundedValues() only
+  // ever flags a value when there IS real grounding source text to compare against and
+  // the value appears NOWHERE in it, placeholders already exempted. That precision was
+  // being wasted as advisory context a review vote could (and did) simply ignore, the
+  // same "known-bad signal, only advisory" shape every OTHER deterministic gate in this
+  // function already treats as disqualifying. Hard-blocks before spending a review call,
+  // same as the empty-response/non-implementation/fixed-literals gates below.
+  // 2026-08-25, root-caused live via a real blocked adhoc task (second-brain review
+  // sweep): RESOLUTION: decompose (adhoc-agentic-draft.js's "task judged too large,
+  // propose sub-tasks instead of a diff" outcome, carved out in buildVerdictPrompt below
+  // -- see its own comment) got hard-blocked here anyway, before ever reaching that
+  // carve-out, because a decompose proposal's sub-task rawText routinely SUGGESTS names
+  // for config/paths a FUTURE sub-task should create (e.g. "add
+  // AGENT_MANAGER_SECOND_BRAIN_REVIEW_COVERAGE_PATH, following the pattern of
+  // stalenessAuditCoveragePath" -- explicitly marked as a proposal, "e.g.", never a claim
+  // that it already exists). checkGroundedValues' whole premise is "a value cited as
+  // already-real that appears nowhere in the grounding source is fabricated" -- a
+  // category error against text that is deliberately proposing something new, the exact
+  // same "new declaration, not a claimed-existing value" distinction NEW_DECLARATION_RE
+  // already carves out for a real diff's own `+const NAME = ...` line, just for a
+  // decompose proposal's prose instead of a diff. Scoped ONLY to the two high-precision
+  // flags that hard-block with no review call at all -- factCheck's OTHER checks (missing-
+  // file, fabricated-commit-reference, unconfirmed-relationship) still run and still hard-
+  // block a decompose response exactly as before: those check "does this cite something
+  // that claims to already exist," which stays a real fabrication signal even in a
+  // decompose proposal's prose. And the full factCheck (including these two flags) is
+  // still handed to the reviewer model via buildVerdictPrompt below regardless -- this
+  // only removes the automatic no-review-call block, not the information itself.
+  // 2026-08-26: a `{"mode": "split"}` proposal (see candidateSplitInstructions) is the
+  // exact same category as a decompose proposal above -- prose describing FUTURE
+  // sub-candidates, which routinely names config/field values a future drafting pass
+  // should create, not a claim that something already exists. Same carve-out, same
+  // "still checked, just not auto-blocked" scoping.
+  //
+  // 2026-09-02: the same category error for an advisoryProse candidate-generating review
+  // source (function_length_review / performance_review / observability_review). Their
+  // deliverable is a `### AC-NNN` candidate block whose Solution paragraph PROPOSES names
+  // for helpers/constants a FUTURE fix pass should introduce ("extract into a
+  // RETRYABLE_WITH_BACKOFF branch", "compute START_MS once outside the loop") -- never a
+  // claim that RETRYABLE_WITH_BACKOFF / START_MS already exists. checkGroundedValues'
+  // premise ("a value cited as already-real that appears nowhere is fabricated") is a
+  // category error against a proposal, exactly like the decompose case above. Confirmed
+  // live: function-length-...reject-retry-check-js-90 (RETRYABLE_WITH_BACKOFF),
+  // performance-...uptime-log-js-58 (START_MS). Still handed to the vote via
+  // buildVerdictPrompt -- just not an automatic no-review block.
+  const isDecomposeProposal = (task.source === 'manual' && task.adhocResolution === 'decompose') || !!task.candidateSplitProposals;
+  const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
+  const highPrecisionFlags = isProposalNotClaim
+    ? []
+    : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
+  if (highPrecisionFlags.length > 0) {
+    const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
+    const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
+    task.reviewProvider = 'deterministic-ungrounded-value';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
+  const trimmedImplResponse = (task.implementResponse || '').trim();
+  const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
+
+  if (isEmptyApprovalSource(task.source) && effectivelyEmpty) {
+    task.reviewedAt = new Date().toISOString();
+    task.reviewProvider = 'deterministic-empty-approve';
+    task.localVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no local-model review call spent -- this is deterministic, not a judgment call)`;
+    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+    appendHistoryEvent(task, 'approved', 'deterministic-empty-approve');
+    return { succeeded: true, verdict: 'approved', factCheckVerdict };
+  }
+
+  let isNonImplementation = false;
+  if (!effectivelyEmpty) {
+    isNonImplementation = NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));
+    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')) {
+      isNonImplementation = true;
+    }
+  }
+  if (isNonImplementation && !isEmptyApprovalSource(task.source) && !isAdvisoryProseSource(task.source)) {
+    const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no local-model review call spent (mechanically detectable, not a judgment call).';
+    task.reviewProvider = 'deterministic-non-implementation';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
+// ... [truncated for review: this function continues for 108 more line(s) not shown]
+```
+
+Problem:
+The 308-line function is not one cohesive algorithm; it is a single entry point that sequentially runs six or seven independently authored gate subsystems (each stamped with a different date from 2026-08-24 through 09-03), interleaves their results, and folds them into a final verdict. Because every gate's logic—its inputs, its pass/fail criteria, its side-effects on shared mutable state—lives inline in the same scope, a change to one gate (say, the 09-02 policy check) forces the reader to hold the other six in working memory to confirm no variable is clobbered or an early-return path is missed. The accumulated length is therefore not "verbose" but structurally monolithic: there is no seam at which a reviewer can isolate one gate's behavior, and the function's cyclomatic complexity grows linearly with every new gate that gets appended.
+
+Solution:
+Extract each dated gate into its own named function (e.g., `evaluateBaselineGate`, `evaluatePolicyGate`, `evaluateRecencyGate`, `evaluateScopeGate`, `evaluateComplianceGate`, `evaluateFinalityGate`), each accepting a narrow, explicitly-typed context object and returning a small `{ pass, reason, metadata }` result. The top-level orchestrator then becomes a thin loop that builds the shared context once, calls each gate in a documented order, collects the result array, and applies the final aggregation rule. Any gate that mutates shared state should instead read from and write to the context object, making data flow visible in the signature rather than implicit in variable scope.
+
+Benefits:
+Each extracted gate becomes independently unit-testable with a minimal fixture, so a regression in the 09-02 policy check no longer requires exercising the full 308-line path. Code review shrinks from "read 308 lines and trace six interleaved state machines" to "read one 30–50 line function with a two-field input and a three-field output." Adding a seventh or eighth gate in the future becomes a new file (or a new function in the same file) plus one line in the orchestrator's call list, rather than another 40-line block spliced into an already-crowded scope, which directly reduces the probability of the variable-shadowing and early-exit bugs that monolithic gate chains are prone to.
