@@ -340,7 +340,8 @@ function loadBrainDump(filePath) {
   let data;
   try {
     data = JSON.parse(fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '{"entries":[]}');
-  } catch {
+  } catch (err) {
+    console.error(`[loadBrainDump] ${filePath}: ${err.message}${err.stack ? `\n${err.stack}` : ''} — returning empty store`);
     data = { entries: [] };
   }
   if (!Array.isArray(data.entries)) data.entries = [];
