@@ -66,6 +66,16 @@ function createRealGitRunner(repoRoot) {
     // needed. A stash failure (e.g. an in-progress merge/rebase) must not silently fall
     // through to the destructive reset below, so it's re-thrown with context rather than
     // swallowed.
+    //
+    // HAZARD (2026-09-03): this stash is never popped -- it is a graveyard, not a
+    // round-trip. That is fine for the "human left debris in the tree" case it exists
+    // for, but it means ANY untracked, NON-git-ignored file inside repoRoot is swept
+    // here and silently lost (the writer just recreates an empty one). When
+    // pipelineDir === repoRoot, every pipeline runtime-state file lands inside repoRoot,
+    // so every one of them MUST be in .gitignore -- `git stash -u` skips ignored files.
+    // 90 scanner false-positive suppressions were lost this way over 3 days before the
+    // ledgers were ignored. src/pipeline-state-gitignored.test.js enforces the invariant
+    // against every getConfig() path.
     resetToMain: () => {
       try {
         run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);

@@ -17,6 +17,12 @@ queue/
 graphify-out/
 model-stats.db
 hardware-stats.db
+# SQLite side-car files -- transient, but resetToMain()'s `git stash -u` was sweeping
+# them (found in 11 abandoned stashes 2026-09-03). Losing a -journal/-wal mid-write can
+# leave the .db needing recovery on next open.
+*.db-journal
+*.db-wal
+*.db-shm
 community-coverage.json
 task-domains.json
 deep-dive-coverage.json
