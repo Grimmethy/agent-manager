@@ -2,6 +2,26 @@
 
 Repo-specific guidance for coding agents working in `agent-manager`.
 
+## First principle: build the mechanism, don't hand-fix the instance
+
+`agent-manager` is a system for making a pipeline do work autonomously. When you find a
+task, a hub, or a queue that is stuck, the job is **almost never** to unstick that one
+item by hand — it is to build (or extend) the pipeline mechanism that unsticks it and
+every future item like it, then let the pipeline run.
+
+- A stuck coordinator hub → a watchdog sweep that detects and re-routes that failure
+  class (see `coordinator-sweep.js`, `blocked-drain.js`, `decompose-loop-autoroute.js`),
+  not a manual requeue.
+- A task the local model can't land → a routing rule (`decompose-pass.js`,
+  `file-decompose-plan-pass.js`, product_spec), not you writing the code.
+- A bad prompt / missing grounding → fix where `promptContext` is built, not the one task.
+
+Only act on a single item directly when the user **explicitly asks** for that item to be
+handled (and even then, prefer routing it through a dashboard `/api/task/...` endpoint or
+an existing sweep). Hand-editing `queue/` or committing a fix straight to a stuck task's
+branch is the exception that needs a stated reason, not the default move. If no mechanism
+fits, the deliverable is a proposal for one — surface it, don't paper over it.
+
 ## Agent skills
 
 ### Issue tracker
