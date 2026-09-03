@@ -51,6 +51,7 @@ def _ram() -> dict | None:
         vm = psutil.virtual_memory()
         return {"usedBytes": vm.used, "totalBytes": vm.total}
     except Exception:
+        log.warning("Failed to read virtual memory stats via psutil", exc_info=True)
         return None
 
 
