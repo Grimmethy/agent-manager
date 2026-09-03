@@ -36,13 +36,28 @@ const sfl = require('./single-flight-lock.js');
 // waiter. Until the reviewer moves onto the arbiter, an `interactive`-class ticket also
 // drops one of those markers so that check keeps working with no bash change. Remove this
 // shim (and the bash check) in the stage that migrates the reviewer.
+//
+// The marker MUST be re-touched well inside single-flight-lock.js's DISCUSS_MARKER_FRESH_MS
+// (15s) window, or the bash lane sees it go stale between touches and grabs the lock anyway
+// -- caught live 2026-09-02: a REFRESH_MS (20s) re-touch left a 5s stale gap every cycle and
+// the looping reviewer escaped through it, starving the chat turn. Own a dedicated 5s
+// refresher here (matching single_flight_lock.py's priority_marker thread) rather than
+// riding the caller's slower ticket-touch interval.
+const COMPAT_REFRESH_MS = 5_000;
 function interactiveCompatMarker(instancesDir, cls) {
   if (cls !== 'interactive') return { refresh() {}, remove() {} };
   let m = null;
   try { m = sfl.dropPriorityMarker(instancesDir); } catch { m = null; }
+  const iv = m ? setInterval(() => {
+    try { sfl.refreshPriorityMarker(m); } catch { /* gone */ }
+  }, COMPAT_REFRESH_MS) : null;
+  if (iv && typeof iv.unref === 'function') iv.unref();
   return {
     refresh() { try { if (m) sfl.refreshPriorityMarker(m); } catch { /* gone */ } },
-    remove() { try { if (m) sfl.removePriorityMarker(m); } catch { /* gone */ } },
+    remove() {
+      if (iv) clearInterval(iv);
+      try { if (m) sfl.removePriorityMarker(m); } catch { /* gone */ }
+    },
   };
 }
 
