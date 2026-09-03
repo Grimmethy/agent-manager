@@ -2721,3 +2721,26 @@ Bind the caught error (`catch (err)`), check `err.code === 'ENOENT'` to preserve
 
 Benefits:
 Operators can now distinguish "nothing to sweep yet" (ENOENT, silent, `errors: 0`) from a genuine filesystem or permission problem (non-ENOENT, logged to stderr with the offending path and errno, `errors ≥ 1`). The sweep's return value becomes a reliable signal: an all-zero summary truly means "no work," while a non-zero `errors` field tells the caller (or a wrapper script) that the directory could not be read and the sweep did not inspect any files. This closes a silent-failure gap that would otherwise hide a broken deployment or a corrupted volume until something else downstream fails.
+
+### AC-154 · Silent swallow of remote-branch deletion failure
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            pass
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+```
+
+Problem:
+When `_run_git(["push", "origin", "--delete", branch], repo_root)` raises a `RuntimeError`, the `except` clause (lines 5612–5616) executes a bare `pass` with only a code comment explaining why the failure is non-fatal. No log record is emitted to any sink. If the deletion fails due to a transient network issue, a remote-side lock, or a permission problem, the operator has zero trace in any log to explain why a now-merged remote branch persists. The surrounding code already surfaces errors for the critical path (the merge push at line 5610, the outer `except RuntimeError` at line 5617 that returns a 500), so this silent `pass` is the sole unobservable step in an otherwise logged sequence.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that includes the branch name, the repo root, and the exception's string representation. Concretely, change `except RuntimeError:` to `except RuntimeError as e:` and replace `pass` with `logging.warning("Non-fatal: failed to delete remote branch %r in %s: %s", branch, repo_root, e)`. This uses the stdlib `logging` module already available in the project, requires no new dependency, and preserves the non-fatal semantics (the exception is still not re-raised; the merge result is still returned as success).
+
+Benefits:
+An operator investigating a stale remote branch, a CI pipeline that depends on branch cleanup, or a post-incident review can now find a single grep-able log line identifying exactly which branch, which repo, and which error caused the deletion to fail, without having to reproduce the failure or add ad-hoc debug prints. The fix is a one-line change that adds observability without altering control flow or introducing any new dependency.
