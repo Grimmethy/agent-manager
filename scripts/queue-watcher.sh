@@ -177,6 +177,14 @@ while :; do
     adhoc_stale_result="$(node "${PACKAGE_SRC_DIR}/adhoc-staleness-flag.js" 2>>"${HOME_LOGS}/adhoc-staleness-flag.log")"
     printf '[watchdog] adhoc-staleness-flag: %s\n' "$adhoc_stale_result" >&2
 
+    # product_spec -> coordinator-hub bridge: brownfield product_spec only writes spec DOCS
+    # (Docs/PRODUCT_SPEC.md sections). For a request that sets `buildHub: true`, once every
+    # section is filled this files a coordinator hub + one child adhoc task per section so
+    # the pieces actually get built. Cheap (one file read + a regex). Disable with
+    # AGENT_MANAGER_PRODUCT_SPEC_TO_HUB=false.
+    spec_hub_result="$(node "${PACKAGE_SRC_DIR}/product-spec-to-hub.js" 2>>"${HOME_LOGS}/product-spec-to-hub.log")"
+    printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
