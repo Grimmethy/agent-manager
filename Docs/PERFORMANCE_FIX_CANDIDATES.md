@@ -108,3 +108,26 @@ Replace the sequential `for`-loop with a single `Promise.allSettled` over an arr
 
 Benefits:
 Wall-clock latency for a default 3-vote majority call drops from the sum of three sequential round-trips to the maximum of the three concurrent round-trips (≈ 3× faster at typical LLM latencies). Error semantics are preserved: a single rejected vote is still captured individually in `voteErrors` without aborting the other two, matching the original per-iteration `try/catch` behavior. No new dependency is introduced, the public signature and return shape are unchanged, and the fix is a local refactor of one function body in `src/claude-client.js`.
+
+### AC-7 · Replace synchronous per-iteration file reads with parallel async reads in dead-process sweep
+Strength: Strong
+Files: src/dead-process-check.js
+Snippet:
+```
+  const cooldowns = readCooldowns(cooldownPath);
+  let cooldownsChanged = false;
+
+  for (const name of names) {
+    try {
+      const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, name), 'utf8'));
+      if (hb.instanceId === 'queue-watchdog') continue; // never watch ourselves.
+```
+
+Problem:
+Inside the periodic dead-process sweep, the loop `for (const name of names)` calls `fs.readFileSync(path.join(instancesDir, name), 'utf8')` on every iteration. Each call blocks the Node event loop for the duration of a disk read; because the iterations are sequential, the total blocking time is the sum of all individual read latencies. On a warm local filesystem a single small JSON heartbeat read is sub-millisecond, but with 50–500 tracked instances the cumulative block per sweep reaches tens of milliseconds during which no other callback, timer, or I/O in the process can progress. Because this code runs on every watchdog tick (evidenced by the `cooldowns` / `cooldownsChanged` bookkeeping and the "never watch ourselves" guard), the cost is paid repeatedly rather than once at startup, producing periodic latency spikes for any concurrent work the process handles.
+
+Solution:
+Convert the enclosing function to `async` and replace the synchronous loop with a batch of independent async reads. Concretely, build an array of promises — `names.map(name => fs.promises.readFile(path.join(instancesDir, name), 'utf8'))` — and `await Promise.all(...)` to obtain all heartbeat contents in parallel. The `fs.promises` API is part of Node's built-in `fs` module, so no new dependency is introduced. Wrap the `Promise.all` in a `try/catch` (or let the caller handle rejection) so that a single unreadable file does not abort the entire sweep; on individual failure, log via `console.warn` (matching the file's existing logging style) and treat that instance as "no heartbeat" rather than crashing the loop. The rest of the sweep logic (cooldown checks, "never watch ourselves" guard, kill decisions) operates on the resolved array exactly as it does today, so no downstream code changes are required beyond awaiting the now-async function at its call site.
+
+Benefits:
+The event loop is no longer held hostage for the duration of N sequential disk reads; instead the kernel services the reads concurrently and the process remains responsive to timers, API handlers, and child-process stdio throughout the sweep. Wall-clock time for the sweep drops from the sum of individual read latencies to roughly the slowest single read (plus a small scheduling overhead), eliminating the periodic latency spikes that scale linearly with the number of tracked instances. The change is a local refactor of one loop body — no new dependency, no new API surface, no change to the sweep's semantics or failure modes.
