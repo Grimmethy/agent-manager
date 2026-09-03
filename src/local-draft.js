@@ -49,6 +49,7 @@ const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
+const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
@@ -500,13 +501,20 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // comment) -- best-effort no-op when absent (e.g. a direct CLI/test invocation with no
   // real daemon wrapper) rather than a hard requirement.
   const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID;
+  // Route the real GPU wait through the arbiter (priority class 'draft' -- below an
+  // interactive chat/Discuss turn and below a reviewer vote), unless a test injected its
+  // own withLockFn spy. gpu-arbiter.js wraps single-flight-lock.js's flock and adds the
+  // cross-lane priority ordering + cancellation this used to lack.
+  const usingInjectedLock = withLockFn !== defaultWithLock;
   const maybeLocked = (isLocal, fn, pass) => {
     if (!isLocal) return fn();
     if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', resolvedLabel, task.id, pass);
-    return withLockFn(instancesDir, () => {
+    const run = () => {
       if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'working', resolvedLabel, task.id, pass);
       return fn();
-    }, resolvedLabel);
+    };
+    if (usingInjectedLock) return withLockFn(instancesDir, run, resolvedLabel);
+    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: resolvedLabel, taskId: task.id, phase: pass }, run);
   };
 
   return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked };

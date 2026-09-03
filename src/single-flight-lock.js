@@ -302,7 +302,7 @@ const FLOCK_ATTEMPT_SECS = 30; // per-attempt cap while at the head of the queue
 // handle to pass to release(): a real fd (number) for the outermost holder, or an opaque
 // reentrant token if this process already holds the same key. Callers must not inspect
 // the handle -- just pass it back to release().
-function acquire(instancesDir, key) {
+function acquire(instancesDir, key, opts = {}) {
   const lp = lockFilePath(instancesDir, key);
 
   // Reentrant fast path -- this process already holds it (see header bug (1)).
@@ -317,10 +317,13 @@ function acquire(instancesDir, key) {
 
   // Discuss priority: a user-interactive waiter (the dashboard drops a fresh marker in
   // .discuss-waiting/ for the whole Chat/Discuss turn) makes every OTHER lane yield the
-  // GPU until the marker goes stale or is removed. AGENT_MANAGER_PRIORITY_HOLDER is set on
-  // the chat turn's OWN node child -- it is the priority holder, it must never back off
-  // against its own marker (which would starve it between its tool-loop turns).
-  if (!process.env.AGENT_MANAGER_PRIORITY_HOLDER) {
+  // GPU until the marker goes stale or is removed. Skipped when:
+  //   - opts.skipPriorityBackoff -- the caller is gpu-arbiter.js, which is ITSELF the
+  //     priority mechanism now and drops that marker; backing off here would make the
+  //     arbiter wait on its own marker.
+  //   - AGENT_MANAGER_PRIORITY_HOLDER -- legacy: the chat turn's own node child, the
+  //     priority holder, must not back off against its own marker between tool-loop turns.
+  if (!opts.skipPriorityBackoff && !process.env.AGENT_MANAGER_PRIORITY_HOLDER) {
     const discussDeadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
     while (someoneIsWaiting(instancesDir) && Date.now() < discussDeadline) {
       sleepMs(1000);

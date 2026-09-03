@@ -15,6 +15,7 @@ const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { withLock } = require('./single-flight-lock.js');
+const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
@@ -369,6 +370,20 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // LOCAL_MODEL now surfaces as a real Ollama "model not found" error, not a guessed name.
 const MODEL = process.env.LOCAL_MODEL;
 
+// A user-interactive chat/Discuss turn (local_tool_client.py sets AGENT_MANAGER_PRIORITY_
+// HOLDER on this node child) takes the GPU at the 'interactive' priority class via the
+// arbiter -- ahead of every worker draft and reviewer vote, with the whole run holding a
+// place ticket (see the CLI entry). Any other caller of runPlanWithTools (an in-worker
+// agentic draft) keeps the plain reentrant flock; it is already inside the worker's own
+// 'draft' arbiter ticket.
+const CHAT_IS_INTERACTIVE = !!process.env.AGENT_MANAGER_PRIORITY_HOLDER;
+function turnLock(instancesDir, fn) {
+  if (CHAT_IS_INTERACTIVE) {
+    return gpuArbiter.withGpu(instancesDir, { cls: 'interactive', model: MODEL, phase: 'chat' }, fn);
+  }
+  return withLock(instancesDir, fn, MODEL);
+}
+
 // Matches local-client.js's REQUEST_TIMEOUT_MS exactly -- was 1_800_000 (30 min) under the
 // reasoning that a tool-calling turn can legitimately run longer than a plain generation
 // call. That reasoning turned out to be actively harmful, not just generous: this exact
@@ -642,7 +657,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
-        const turnRes = await withLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }), MODEL);
+        const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         message = turnRes.message;
         usage = turnRes.usage;
         attemptErr = null;
@@ -953,6 +968,13 @@ if (require.main === module) {
   // {"type":"final", ...same shape runPlanWithTools always returns}. Non-streaming
   // callers (arch_discovery, local-agentic-draft.js's one-shot drafts) are completely
   // unaffected -- this branch only exists when the request explicitly opts in.
+  // An interactive turn holds ONE 'interactive' place ticket for its whole run, so a
+  // worker that spawns between this run's per-turn model calls still sees an interactive
+  // waiter and yields the GPU -- the per-turn turnLock() acquires fast because this pid
+  // already holds the place (see gpu-arbiter.js holdPlace / the holdsPlace fast path).
+  const _arbPlace = CHAT_IS_INTERACTIVE
+    ? gpuArbiter.holdPlace(path.join(getConfig().pipelineDir, 'instances'), { cls: 'interactive', model: MODEL, phase: 'chat' })
+    : null;
   (async () => {
     try {
       if (req.stream) {
@@ -976,7 +998,9 @@ if (require.main === module) {
       }
     } catch (err) {
       console.error(err.message);
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      if (_arbPlace) _arbPlace.release();
     }
   })();
 }

@@ -4061,24 +4061,51 @@ def _read_fresh_model_locks(inst_dir: Path) -> dict:
     return out
 
 
+def _arbiter_cancel_below(cls: str = "interactive") -> list:
+    """Ask the GPU arbiter (src/gpu-arbiter.js, via its CLI) to cancel every ticket below
+    `cls` -- the worker draft lanes. The arbiter marks each cancelRequested and SIGKILLs
+    any active holder; the worker daemon requeues its task. Replaces the old
+    heartbeat/pidfile/mtime reconstruction for the worker lanes. Best-effort."""
+    cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
+    if not cli.is_file():
+        return []
+    try:
+        cp = subprocess.run(
+            ["node", str(cli), "cancel-below", "--cls", cls],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        rows = json.loads((cp.stdout or "[]").strip() or "[]")
+        return [{"lane": r.get("cls"), "action": r.get("action"),
+                 "taskId": r.get("taskId"), "ageSeconds": None} for r in rows]
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block a chat turn
+        print(f"[chat-preempt] arbiter cancel-below failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        return []
+
+
 def _preempt_pipeline_for_chat() -> list:
-    """Kill in-flight worker/reviewer model calls to free the local model for a chat turn.
-    Best-effort: every failure is swallowed (gpu-guard's 'log and move on' rule). Returns
-    a summary list [{lane, action, taskId, ageSeconds}]."""
+    """Free the local model for a chat turn. Worker draft lanes go through the GPU arbiter
+    now -- one cancel-below call. The reviewer is not on the arbiter yet, so it keeps the
+    age-gated legacy kill below. Best-effort throughout. Returns [{lane, action, taskId,
+    ageSeconds}]."""
     if os.name == "nt":
         return []
     inst_dir = instances_dir()
     qdir = queue_dir()
     if not inst_dir or not inst_dir.is_dir():
         return []
+
+    summary = _arbiter_cancel_below("interactive")
+
     pids_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/pids"
     locks = _read_fresh_model_locks(inst_dir)
     max_age = _chat_preempt_max_age_s()
-    always_lanes, age_gated_lanes = _preempt_lane_sets()
+    _, age_gated_lanes = _preempt_lane_sets()
     now = time.time()
-    summary = []
 
-    for lane in (*always_lanes, *age_gated_lanes):
+    # Only the reviewer stays on this legacy heartbeat-based path -- the worker draft lanes
+    # were handled by _arbiter_cancel_below above. (age_gated_lanes is ('reviewer',).)
+    for lane in age_gated_lanes:
         try:
             hb = read_json_safe(inst_dir / f"{lane}.json") or {}
             lock = locks.get(lane)
@@ -4115,7 +4142,7 @@ def _preempt_pipeline_for_chat() -> list:
                     pass
 
             action, reason = _preempt_decision(lane, kill_pid, started_epoch, now, max_age,
-                                               always=lane in always_lanes)
+                                               always=False)  # reviewer only -- always age-gated
             age_s = int(now - started_epoch) if started_epoch else None
 
             if action != "kill":

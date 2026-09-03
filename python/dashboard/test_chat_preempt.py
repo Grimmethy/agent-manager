@@ -73,6 +73,7 @@ class PreemptPipelineTest(unittest.TestCase):
         (self.inst / ".model-locks").mkdir(parents=True)
         (self.queue / "drafting" / "worker-1").mkdir(parents=True)
         (self.queue / "drafting" / "worker-reasoning").mkdir(parents=True)
+        (self.queue / "drafting" / "reviewer").mkdir(parents=True)
         (self.queue / "pending").mkdir(parents=True)
         os.environ.pop("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING", None)
         self._patches = [
@@ -120,54 +121,35 @@ class PreemptPipelineTest(unittest.TestCase):
             obj["claimedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(claimed_epoch))
         (self.queue / "drafting" / lane / f"{task_id}.json").write_text(json.dumps(obj), encoding="utf-8")
 
-    def test_worker1_draft_is_killed_and_requeued_reviewer_spared_when_old(self):
-        w1 = self._spawn()
-        rv = self._spawn()
-        self._hb("worker-1", status="working", pass_="implement", pid=w1.pid, task_id="t-w1")
-        self._task("worker-1", "t-w1")
-        self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
-        summary = app._preempt_pipeline_for_chat()
+    # Worker draft lanes moved onto the GPU arbiter (2026-09-02): _preempt_pipeline_for_chat
+    # cancels them via _arbiter_cancel_below (mocked here); only the reviewer stays on this
+    # legacy heartbeat path. The arbiter cancel path is covered by test_gpu_arbiter_cli.py.
 
-        self.assertTrue(self._was_killed(w1), "worker-1 draft child was killed")
-        self.assertIsNone(rv.poll(), "reviewer was spared (age unknown)")
-        self.assertTrue((self.queue / "pending" / "t-w1.json").exists(), "worker-1 task requeued to pending/")
-        actions = {s["lane"]: s["action"] for s in summary}
-        self.assertEqual(actions.get("worker-1"), "killed")
-        self.assertEqual(actions.get("reviewer"), "spare")
+    def test_calls_the_arbiter_for_worker_lanes_and_folds_its_summary_in(self):
+        with mock.patch.object(app, "_arbiter_cancel_below",
+                               return_value=[{"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}]) as m:
+            self._hb("reviewer", status="idle", pass_="idle", pid=self._spawn().pid, task_id=None)
+            summary = app._preempt_pipeline_for_chat()
+            m.assert_called_once_with("interactive")
+            self.assertIn({"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}, summary)
 
-    def test_worker_reasoning_is_killed_regardless_of_age_and_agentic_tier(self):
-        # local-agentic-write (tier 3) used to be MISSING from the child-pass set, so a
-        # worker-reasoning draft in it was skipped entirely -- the live bug.
-        for pass_name in ("local-agentic", "local-agentic-write"):
-            for age_min in (0.3, 90):  # 18s and 90min -- both killed now
-                with self.subTest(pass_name=pass_name, age_min=age_min):
-                    wr = self._spawn()
-                    tid = f"t-{pass_name}-{age_min}"
-                    self._hb("worker-reasoning", status="working", pass_=pass_name, pid=wr.pid, task_id=tid)
-                    self._task("worker-reasoning", tid, claimed_epoch=time.time() - age_min * 60)
-                    summary = app._preempt_pipeline_for_chat()
-                    self.assertTrue(self._was_killed(wr), f"{pass_name} {age_min}min draft must be killed")
-                    self.assertTrue((self.queue / "pending" / f"{tid}.json").exists())
-                    self.assertEqual({s["lane"]: s["action"] for s in summary}.get("worker-reasoning"), "killed")
+    def test_reviewer_still_uses_the_legacy_age_gated_kill(self):
+        with mock.patch.object(app, "_arbiter_cancel_below", return_value=[]):
+            rv = self._spawn()
+            self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
+            self._task("reviewer", "t-rv", claimed_epoch=time.time() - 5)  # young -> killed
+            summary = app._preempt_pipeline_for_chat()
+            self.assertTrue(self._was_killed(rv))
+            self.assertEqual({s["lane"]: s["action"] for s in summary}.get("reviewer"), "killed")
 
-    def test_spare_long_reasoning_env_restores_the_age_gate(self):
-        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": "true"}):
-            wr = self._spawn()
-            self._hb("worker-reasoning", status="working", pass_="local-agentic", pid=wr.pid, task_id="t-old")
-            self._task("worker-reasoning", "t-old", claimed_epoch=time.time() - 600)
-            app._preempt_pipeline_for_chat()
-            self.assertIsNone(wr.poll(), "with the opt-in env, a 10-min-old reasoning draft is spared again")
-            self.assertTrue((self.queue / "drafting" / "worker-reasoning" / "t-old.json").exists())
-
-    def test_idle_lane_and_claim_pass_are_left_alone(self):
-        idle = self._spawn()
-        claiming = self._spawn()
-        self._hb("worker-1", status="idle", pass_="idle", pid=idle.pid, task_id=None)
-        self._hb("worker-reasoning", status="working", pass_="claim", pid=claiming.pid, task_id="t-c")
-        summary = app._preempt_pipeline_for_chat()
-        self.assertEqual(summary, [])
-        self.assertIsNone(idle.poll())
-        self.assertIsNone(claiming.poll())
+    def test_reviewer_old_call_is_spared(self):
+        with mock.patch.object(app, "_arbiter_cancel_below", return_value=[]):
+            rv = self._spawn()
+            self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
+            self._task("reviewer", "t-rv", claimed_epoch=time.time() - 600)  # >180s -> spared
+            summary = app._preempt_pipeline_for_chat()
+            self.assertIsNone(rv.poll())
+            self.assertEqual({s["lane"]: s["action"] for s in summary}.get("reviewer"), "spare")
 
 
 if __name__ == "__main__":
