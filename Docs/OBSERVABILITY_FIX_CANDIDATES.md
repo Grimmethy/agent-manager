@@ -2560,3 +2560,26 @@ Inside the `catch` block, before assigning the fallback, emit a `console.error` 
 
 Benefits:
 Corrupt or unreadable brain-dump files become visible in operational logs the moment they occur, instead of silently degrading to an empty store that looks identical to a fresh install. An operator can grep for the `[loadBrainDump]` tag, see the exact path and parse error, and fix the file without needing to reproduce the failure or add temporary instrumentation. The function's public contract (always returns a normalized object) is preserved, so no caller changes are required.
+
+### AC-147 · DENY-branch catch swallows exception without logging
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+      try {
+        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+        else summary.errors += 1;
+      } catch { summary.errors += 1; }
+    } else {
+      // No confident majority -- leave for a human.
+      task.autoConfirmReviewedAt = now;
+```
+
+Problem:
+In the `DENY` branch of the auto-confirm review loop (line 308), the `catch` clause is written as a bare `catch { summary.errors += 1; }` — it neither binds the thrown exception to a variable nor logs it. The sibling `catch` in the `CONFIRM` branch twelve lines above (line 296) follows the project's established pattern: it binds `err`, calls `console.error` with the task name, file, and exception message, and only then increments `summary.errors`. Because the DENY-branch catch discards the exception entirely, an operator who sees `summary.errors` incremented in a batch has no way to distinguish a hard throw (e.g., a filesystem error in `moveTaskFile`) from the soft-failure `else summary.errors += 1` path on line 307, and has no clue which task, file, or error message was involved.
+
+Solution:
+Replace the bare `catch { summary.errors += 1; }` on line 308 with the same bind-and-log pattern already used on line 296, adding a `(DENY)` tag to the message for disambiguation: `} catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }`. This uses only `console.error` (already present in the same file) and the local variables `name` and `file` that are in scope. No new dependency or primitive is introduced.
+
+Benefits:
+An operator debugging a batch where several tasks errored can now see exactly which task name, which file path, and which exception message triggered the failure in the DENY path, and can distinguish it from the CONFIRM-path log by the `(DENY)` tag. The soft-failure path (line 307, where `moveTaskFile` returns falsy) remains unlogged by design, but the hard-throw path is no longer indistinguishable from it. The fix is a one-line change that mirrors the pattern already established in the same function, so it is trivially reviewable and introduces no new surface area.
