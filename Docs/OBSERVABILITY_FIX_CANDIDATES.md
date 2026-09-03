@@ -2319,3 +2319,26 @@ Replace the bare `pass` inside the `except RuntimeError` block with a `logging.w
 
 Benefits:
 Operators gain runtime visibility into every failed remote-branch deletion without changing any API contract or control flow. A branch that repeatedly fails to delete (e.g., due to a stale remote ref or a permissions issue) will produce a trail of `WARNING` lines in the service log, making it discoverable during routine log review or alerting on the `WARNING` level. The existing comment in the source still documents *why* the failure is tolerated for human readers of the code, while the log line documents *what* happened for humans reading the runtime output—two audiences, two complementary records, zero behavioral change.
+
+### AC-137 · Log the per-entry OSError that the loop silently skips
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        try:
+            if child.is_dir() and (child / ".git").exists():
+                repos.append({"name": child.name, "path": str(child)})
+        except OSError:
+            continue
+    return repos
+
+```
+
+Problem:
+Inside `github_projects_list` (lines 961-980), the root-level `OSError` handler on line 965 correctly logs a warning and returns an empty list, establishing the function's observability contract. However, the per-child `except OSError: continue` on lines 972-973 discards the exception without binding it, without logging, and without any comment. If a single directory entry is unreadable (permissions, race with a concurrent `git` operation, NFS hiccup), the caller receives a silently shortened list with zero diagnostic trail, making the omission indistinguishable from "that project simply wasn't there."
+
+Solution:
+Replace the bare `except OSError: continue` with `except OSError as exc: logger.warning("Skipping unreadable entry %s under %s: %s", child, GITHUB_PROJECTS_ROOT, exc)` followed by `continue`. This mirrors the logging pattern already used six lines above in the same function, uses the stdlib `logging` module the file already imports, and preserves the best-effort "return a partial list rather than 500" semantics documented in the docstring. No rethrow is warranted because the caller explicitly expects a best-effort list and a single unreadable entry should not abort the remaining iterations.
+
+Benefits:
+An operator troubleshooting a missing project in the dashboard can now see, in the application log, exactly which path failed and why (e.g., `Permission denied` vs. `Stale file handle`), turning an invisible data gap into a one-line, greppable warning. The fix is a two-line change, introduces no new dependency, and keeps the function's return contract identical.
