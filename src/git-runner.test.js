@@ -185,3 +185,37 @@ test('resetToMain still lands on a real, clean checkout of the default branch', 
   const status = git(['status', '--porcelain'], repoDir);
   assert.equal(status.trim(), '');
 });
+
+// --- stacked file-decompose helpers (apply-task.js stacked branch path) ---------------
+
+test('branchExists / checkoutBranch / checkoutTracking round-trip against a real repo', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+
+  assert.equal(runner.branchExists('agent/decompose-x'), false);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  runner.checkoutMain();
+
+  assert.equal(runner.branchExists('agent/decompose-x'), true);
+  assert.doesNotThrow(() => runner.checkoutBranch('agent/decompose-x'));
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/decompose-x');
+  assert.equal(fs.existsSync(path.join(repoDir, 'step1.txt')), true);
+
+  // Local ref gone but origin still has it -> checkoutTracking rebuilds it from origin.
+  runner.checkoutMain();
+  git(['branch', '-D', 'agent/decompose-x'], repoDir);
+  assert.equal(runner.branchExists('agent/decompose-x'), false);
+  runner.fetchBranch('agent/decompose-x');
+  assert.doesNotThrow(() => runner.checkoutTracking('agent/decompose-x'));
+  assert.equal(fs.readFileSync(path.join(repoDir, 'step1.txt'), 'utf8'), 'move 1\n');
+});
+
+test('fetchBranch never throws for an unknown branch', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  assert.doesNotThrow(() => runner.fetchBranch('agent/decompose-does-not-exist'));
+});

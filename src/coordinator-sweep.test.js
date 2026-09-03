@@ -192,3 +192,70 @@ test('sweep skips a malformed parent file, counting it as an error, not a crash'
   assert.equal(summary.errors, 1);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'bad.json')), true);
 });
+
+// --- stacked file-decompose hub: integration gate --------------------------------------
+
+function stackedHub(dir, extra = {}) {
+  write(dir, 'coordinating', {
+    id: 'file-decompose-hub-x', status: 'coordinating', history: [],
+    mode: 'stacked', branch: 'agent/decompose-x', sourceFile: 'python/dashboard/app.py',
+    integrationGate: { status: 'pending' },
+    subTasks: [
+      { id: 'adhoc-decompose-x-01-a', title: 'move a', status: 'pending' },
+      { id: 'adhoc-decompose-x-99-wiring', title: 'wire', status: 'pending' },
+    ],
+    ...extra,
+  });
+  write(dir, 'done', { id: 'adhoc-decompose-x-01-a', stacked: { branch: 'agent/decompose-x' } });
+  write(dir, 'done', { id: 'adhoc-decompose-x-99-wiring', stacked: { branch: 'agent/decompose-x' } });
+}
+
+test('stacked hub: all children done + gate passes -> hub completes and is stamped merged', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: null, runGate: () => ({ ok: true, checks: [{ name: 'import', status: 'pass' }] }) });
+  assert.equal(summary.completed, 1);
+  assert.equal(summary.gatePassed, 1);
+  const parent = readParent(dir, 'done', 'file-decompose-hub-x');
+  assert.equal(parent.integrationGate.status, 'passed');
+  assert.ok(parent.mergedAt);
+  assert.equal(parent.terminalDisposition, 'merged');
+});
+
+test('stacked hub: gate fails -> hub stays in coordinating/ with a blockedReason naming the check', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  const summary = coordinatorSweep({
+    pipelineDir: dir, repoRoot: null,
+    runGate: () => ({ ok: false, checks: [{ name: 'import', status: 'fail', detail: 'circular import' }] }),
+  });
+  assert.equal(summary.completed, 0);
+  assert.equal(summary.gateFailed, 1);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'file-decompose-hub-x.json')), false);
+  const parent = readParent(dir, 'coordinating', 'file-decompose-hub-x');
+  assert.equal(parent.integrationGate.status, 'failed');
+  assert.match(parent.blockedReason, /integration gate failed.*import -- circular import/);
+});
+
+test('stacked hub: gate is not re-run once it has a verdict (cheap every-tick sweep)', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  let calls = 0;
+  const runGate = () => { calls += 1; return { ok: true, checks: [] }; };
+  coordinatorSweep({ pipelineDir: dir, repoRoot: null, runGate });
+  // hub moved to done/ on the first pass; a second sweep sees nothing to do.
+  coordinatorSweep({ pipelineDir: dir, repoRoot: null, runGate });
+  assert.equal(calls, 1);
+});
+
+test('stacked hub: a re-queued wiring child re-arms the gate', () => {
+  const dir = makePipeline();
+  stackedHub(dir, { integrationGate: { status: 'failed', checks: [] }, blockedReason: 'old', coordinatorBlocked: { since: 'x' } });
+  // wiring child pulled back to adhoc/ for a retry
+  fs.unlinkSync(path.join(dir, 'queue', 'done', 'adhoc-decompose-x-99-wiring.json'));
+  write(dir, 'adhoc', { id: 'adhoc-decompose-x-99-wiring', stacked: { branch: 'agent/decompose-x' } });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: null, runGate: () => ({ ok: true, checks: [] }) });
+  const parent = readParent(dir, 'coordinating', 'file-decompose-hub-x');
+  assert.equal(parent.integrationGate.status, 'pending');
+  assert.equal(parent.blockedReason, undefined);
+});
