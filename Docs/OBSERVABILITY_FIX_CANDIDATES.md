@@ -2388,3 +2388,26 @@ Replace the bare `except OSError: pass` with `except OSError as exc:` followed b
 
 Benefits:
 An operator can now see, in the application log, exactly when and why a domain-defaults write failed (path, OS error, full stack trace), turning an invisible data-loss event into a greppable, actionable signal. The dashboard request still completes normally (the in-memory mutation is already applied for the current process lifetime), so user-facing behavior is unchanged, but the silent divergence between in-memory state and on-disk state is no longer hidden. Future debugging of "why are my defaults missing after a restart?" becomes a one-line log search instead of a blind guess.
+
+### AC-140 · Silent taskkill failure hides a still-alive pipeline process
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                if pid:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            # Confirmed live (2026-07-22): without this, _pipeline_running()'s worker-1
+            # heartbeat check kept reporting the pipeline as running for up to
+```
+
+Problem:
+In the Windows stop-instance loop (lines 6612-6617), the `except (OSError, subprocess.SubprocessError): pass` block swallows every failure of the `taskkill` invocation with zero diagnostic output. A `TimeoutExpired` (a `SubprocessError` subclass) means the process was still alive after 10 seconds yet the loop moves on; an `OSError` means the kill binary was unreachable or the spawn itself failed. In both cases the instance ID has already been appended to `stopped` (line 6610), so the caller receives a "stopped" list that includes a process that is demonstrably *not* stopped, and the operator has no log line to explain why the subsequent heartbeat cleanup (referenced in the comment at line 6618) is racing against a live worker. Because the project has no metrics system, the only available signal is a log record, and none is emitted.
+
+Solution:
+Replace the bare `pass` with a `logging.warning` call that includes the PID, the instance file path (`f`), and the exception text, e.g. `logging.warning("taskkill failed for pid %s (%s): %s", pid, f, exc)`. Keep the `except` clause catching the same two exception types so the loop still continues to the next instance file (best-effort shutdown semantics are preserved), but ensure the failure is visible in the application log. No new dependency, no metric, no rethrow—just the one `logging.warning` line using the stdlib `logging` module the file already imports.
+
+Benefits:
+An operator who sees the pipeline still reporting as running after a stop now has a single grep-able log line naming the exact PID and instance file whose kill timed out or failed, turning an otherwise invisible race into a one-line diagnosis. The `stopped` list returned to the caller remains unchanged (best-effort semantics preserved), but the log record closes the gap between "we asked Windows to kill it" and "it is actually dead," which is the exact window the 20-minute heartbeat-stale bug described in the adjacent comment exploits.
