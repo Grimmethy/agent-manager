@@ -102,3 +102,31 @@ Solution: In src/prompts.js, add a strict instruction to the implement stage: "Y
 Benefits: Eliminates the class of failures where LLMs generate non-actionable prose instead of code or definitive verdicts, reducing review rejections and blocking.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-observability-review-3-00-est-api-cost-7-benefit-0-shipped-over-7d-1788329292571
+
+### AC-15 · Post-loop terminal-escalation detection in local-tool-client.js
+Strength: Strong
+Split-Depth: 1
+Files: src/local-tool-client.js
+
+Problem:
+When the agentic write tier's model concludes that a requested feature is absent from the codebase AND explicitly asks a human for direction (the 'botched-decompose' / terminal-escalation signature), the current code path in runPlanWithTools treats it identically to any other final no-tool-calls message: it returns `{ response: content, toolCallLog, turnsUsed, toolsDisabled: false }` with no distinguishing signal. The caller (draftAdhocViaLocalAgenticWrite → runAgenticDraftInWorktree) then has no way to tell this apart from a generic 'no RESOLUTION line' hard-block, so the task gets stamped `retryableDraftBlock: true` and blind-retried up to MAX_LOCAL_REJECT_RETRIES times before it finally lands in needs-clarification/. The detection should fire immediately, on the first pass, saving two wasted model generations.
+
+Solution:
+After the turn-loop in runPlanWithTools terminates (both the voluntary-stop branch at `if (toolCalls.length === 0)` and the cap-exhaustion branch after the `for` loop), inspect the final assistant message content for the terminal-escalation conjunction: (a) a statement that the target code/feature/UI element is absent (e.g. 'does not exist', 'not present', 'no such', 'absent'), AND (b) an explicit request for human input or an open question directed at a human (e.g. 'Open question(s) for a human', 'I need clarification', 'which file', 'should I'). When both signals are present, add a boolean field `terminalEscalation: true` to the object returned by withUsage(...) alongside the existing `response`, `toolCallLog`, `turnsUsed`, `toolsDisabled` keys. When either signal is absent, omit the field (or set it to false) so all existing callers see an unchanged shape. The detection is a small set of case-insensitive substring/regex checks on the final message string—no new dependencies, no structured-payload assumption. Place the check in both exit paths (voluntary-stop at ~line where `return withUsage({ response: content, ... })` appears, and the post-loop cap path at the final `return withUsage({ response: (lastMessage && lastMessage.content) || '', ... })`) so it fires regardless of how the loop ended.
+
+Benefits:
+The downstream draft layer can immediately recognise a terminal-escalation verdict and set `task.needsClarification` on the first pass instead of burning two blind-redraft slots. No change to the existing return shape for non-escalation runs (the new field is additive), so the Chat-panel CLI path, arch_discovery, and all other callers of runPlanWithTools are unaffected. Keeps the detection co-located with the turn-loop that produced the message, where the full conversation context is available.
+
+### AC-16 · Immediate needs-clarification routing for terminalEscalation tasks in reject-retry-check.js
+Strength: Strong
+Split-Depth: 1
+Files: src/reject-retry-check.js
+
+Problem:
+rejectRetryCheck currently only routes an adhoc task to needs-clarification/ after it has exhausted MAX_LOCAL_REJECT_RETRIES blind-redraft attempts (the `if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation)` branch). A task that carries the new `terminalEscalation: true` flag (set by the tool-client detection in the companion change) still sits in blocked/ or adhoc/ with `status: 'blocked'` and gets swept into the blind-retry path: it consumes a retry slot, gets requeued to adhoc/, runs another full model pass, and only after the second exhaustion does it finally reach the human. For a genuine 'this feature does not exist, I need a human to tell me what to build' verdict, that is two wasted model generations and ~2 minutes of latency before the human ever sees the question.
+
+Solution:
+In the per-entry loop of rejectRetryCheck, immediately after the `retryableDraftBlock` eligibility check and before the `retryCount >= MAX_LOCAL_REJECT_RETRIES` gate, add a branch: if `task.terminalEscalation === true` AND `isAdhocTask(task)` AND `needsClarificationDir` is provided, route the task directly to needs-clarification/ without incrementing `localRejectCount`. Concretely: (1) guard against double-escalation with the same `alreadyEscalated` history check already used in the exhaustion branch; (2) set `task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedAdhocQuestion(task) }` (reuse the existing helper—it already formats priorRejectionFeedback + blockedReason into a legible question list); (3) append the two history events ('exhausted' with a note like 'terminal-escalation signature detected, skipping blind retry', then 'needs-clarification'); (4) mkdir + write to needsClarificationDir, unlink from source dir; (5) `summary.exhausted++; continue;`. For non-adhoc tasks carrying the flag, fall through to the existing non-adhoc exhaustion stamp (no behavioural change there). This branch must appear BEFORE the `retryCount >= MAX_LOCAL_REJECT_RETRIES` check so it fires on the very first sweep tick, not after retries are spent.
+
+Benefits:
+A terminal-escalation task reaches the human on the first sweep tick (≤30 s) instead of after two full model passes (~2 min + two GPU slots). The blind-redraft budget is preserved for cases where a redraft could genuinely help (botched JSON, partial edit). Reuses the existing buildExhaustedAdhocQuestion helper and the alreadyEscalated guard, so no new state or new directory is introduced. Non-adhoc and non-escalation tasks are completely unaffected (the new branch is gated on `task.terminalEscalation === true && isAdhocTask(task)`).
