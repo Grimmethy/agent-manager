@@ -2675,3 +2675,26 @@ In each of the three `catch` blocks, capture the error (`catch (err)`) and emit 
 
 Benefits:
 Operators can now see in stdout/stderr exactly which enrichment step failed and why, turning an invisible silent no-op into a one-line warning that is grep-able and correlates with the request that triggered it. The per-file catch additionally surfaces the specific path that could not be read, distinguishing a transient I/O hiccup from a systemic permission or path-resolution bug, without changing the function's best-effort contract.
+
+### AC-152 · Silently swallowed writeTaskJson error in history-persist hook
+Strength: Strong
+Files: src/review-task.js
+Snippet:
+```
+  let result;
+  try {
+    result = await reviewTask(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath });
+  } catch (e) {
+    process.stdout.write(JSON.stringify({ succeeded: false, reason: e.message }));
+    return;
+  }
+```
+
+Problem:
+Inside the `setHistoryPersistHook` callback (line 629), the `catch (_)` block on the `writeTaskJson(taskPath, task)` call discards the error entirely with only a `/* best-effort */` comment. The surrounding prose (lines 626-627) makes clear the intent is "don't crash the main flow; the authoritative write runs later," but it provides zero signal when the write actually fails. If `writeTaskJson` begins failing repeatedly — disk full, permissions revoked, a stale `taskPath` — the operator has no log line, no stderr output, nothing to grep for. The only way to discover the problem is to notice a missing history entry downstream, which is indirect and easy to miss. The project has no metrics system, but it does have `console.error` / `process.stderr.write` available, and the file already uses `process.stdout.write` for its own output, so a one-line diagnostic is trivially in scope.
+
+Solution:
+In the `catch` block on line 629, replace the bare `catch (_)` with `catch (err)` and emit a single `process.stderr.write` (or `console.error`) line that includes the task path and the error message, e.g. `process.stderr.write(\`[review-task] history-persist hook: writeTaskJson failed for ${taskPath}: ${err.message}\\n\`)`. Do not rethrow — the "best-effort, additive" contract is correct and the authoritative write below still runs. The only change is that the swallowed error now leaves a one-line trace in stderr so an operator can correlate repeated failures with a root cause.
+
+Benefits:
+A persistent or intermittent `writeTaskJson` failure (bad path, ENOSPC, EACCES) becomes immediately visible in the process's stderr stream instead of being invisible until a human notices missing history. Because the line includes the concrete `taskPath`, it is trivially greppable and distinguishable from other stderr output. The fix costs one line, introduces no new dependency, preserves the existing "don't crash the main flow" semantics, and closes the only observability gap in this block.
