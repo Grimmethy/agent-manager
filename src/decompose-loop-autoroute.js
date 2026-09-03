@@ -29,6 +29,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
+const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification'];
 const MIN_RETRY_MS = 6 * 60 * 60 * 1000; // don't re-attempt the plan pass more often than this
@@ -162,9 +163,21 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           }, null, 2)}\n`);
         }
 
-        // Re-point the stuck task at the (soon-to-exist) decompose hub and send it back to
-        // pending so it re-drafts once the file is split. isDependencySatisfied() gates it
-        // until the hub is stamped merged.
+        // Materialise the hub NOW, in this same tick, before re-pointing the parent at it.
+        // Otherwise coordinator-sweep runs first on the next tick and classifies the
+        // not-yet-created `${hubId}` as `gone` -- which counts as terminal-good and can
+        // prematurely complete the parent (caught live 2026-09-03, a 1-tick window).
+        if (!fs.existsSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`))) {
+          try {
+            fileDecomposeToHubSweep({ pipelineDir, repoRoot: resolvedRepoRoot, now });
+          } catch (e) {
+            console.error(`[decompose-loop-autoroute] inline hub materialise failed for ${requestId}: ${e && e.message}`);
+          }
+        }
+
+        // Re-point the stuck task at the decompose hub and send it back to pending so it
+        // re-drafts once the file is split. isDependencySatisfied() gates it until the hub
+        // is stamped merged.
         const rerouted = {
           id: task.id, domain: task.domain, source: task.source, title: task.title,
           promptContext: task.promptContext,
