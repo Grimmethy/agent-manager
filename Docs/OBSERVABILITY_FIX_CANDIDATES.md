@@ -2767,3 +2767,26 @@ In the `catch (e)` block at line 1503, add a `console.error` call that writes th
 
 Benefits:
 Once fixed, any CI runner or local developer who captures stderr (or runs the script in a terminal where stderr is visible by default) will see the full stack trace, error name, and cause chain, making it straightforward to identify which line threw, what type of error occurred, and what upstream condition triggered it. The stdout JSON contract remains unchanged, so downstream consumers of the pipeline result are unaffected. The fix costs two lines of code, introduces no new dependency, and converts a silent forensic gap into a standard "log to stderr, return structured result" pattern that matches the rest of the project's error-handling style.
+
+### AC-156 · Outer catch in pruneWorkLogs silently swallows all unexpected errors
+Strength: Strong
+Files: src/work-log.js
+Snippet:
+```
+      }
+    }
+    return { pruned };
+  } catch { return { pruned: 0 }; }
+}
+
+module.exports = { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogDir, worklogPath };
+```
+
+Problem:
+The outermost `catch` on line 167 (`} catch { return { pruned: 0 }; }`) binds no error parameter, writes nothing to stderr, and returns a value byte-for-byte identical to the "nothing needed pruning" success path. The outer `try` block encloses statements beyond the two inner `try`/`catch` pairs: `path.join(root, 'queue')` (line 155), the `taskIsLive(queueRoot, id)` call (line 163), and the `f.slice(0, -5)` / bookkeeping logic. Any `TypeError` from a `null`/`undefined` `root`, an internal throw inside `taskIsLive` (malformed queue entry, race condition), or any other unexpected exception lands in this bare catch and vanishes. The caller (`scripts/apply-task.sh`, invoked once per tick) receives `{ pruned: 0 }`, sees no stderr output, and continues as if pruning succeeded. A persistent bug or misconfiguration would be completely invisible in production logs.
+
+Solution:
+Bind the caught error and log it via `console.error`—the same primitive already used on lines 157 and 163 of this file—then still return `{ pruned: 0 }` to preserve the function's contract of never crashing the tick script. Concretely, replace line 167 with: `} catch (err) { console.error(`pruneWorkLogs: unexpected error: ${err.message}`); return { pruned: 0 }; }`. This is a one-line change, introduces no new dependency, matches the existing `console.error` logging style in the file, and keeps the graceful-degradation behavior intact.
+
+Benefits:
+Any unexpected exception in the outer `try` scope (bad `root` argument, `taskIsLive` internal error, or any future code added inside the block) now produces a single identifiable stderr line that an operator or log-aggregator can grep. The tick script still completes without crashing, so a single bad tick does not cascade. The distinction between "nothing to prune" and "pruning failed" becomes observable, turning a silent production blind spot into a one-line diagnostic.
