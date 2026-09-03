@@ -2606,3 +2606,26 @@ Bind the caught error and log it with `console.error` (the project's existing lo
 
 Benefits:
 An operator running the auto-confirm pass in production (or in a cron job whose stdout/stderr is captured) can now see, in the log stream, exactly which task file failed to move or write, the archive destination, and the underlying OS-level reason (e.g. `EACCES`, `ENOENT`, `EBUSY`). This turns an opaque `summary.errors: 3` into an actionable diagnostic without requiring a debugger session or a reproduction of the file-system state, and it costs zero new dependencies.
+
+### AC-149 · Silent catch blocks in interactiveCompatMarker hide unexpected refresh failures
+Strength: Strong
+Files: src/gpu-arbiter.js
+Snippet:
+```
+function interactiveCompatMarker(instancesDir, cls) {
+  if (cls !== 'interactive') return { refresh() {}, remove() {} };
+  let m = null;
+  try { m = sfl.dropPriorityMarker(instancesDir); } catch { m = null; }
+  const iv = m ? setInterval(() => {
+    try { sfl.refreshPriorityMarker(m); } catch { /* gone */ }
+  }, COMPAT_REFRESH_MS) : null;
+```
+
+Problem:
+The three `catch` blocks in `interactiveCompatMarker` (the `dropPriorityMarker` call, the `setInterval` refresh tick, and the returned `refresh()` method) all swallow every exception unconditionally, annotated only with `/* gone */`. The comment implies the developer anticipated a single benign case — the marker file was deleted out from under us — but the catch is unqualified: a `TypeError` from a bug in `sfl.refreshPriorityMarker`, an `EACCES`/`EPERM` from a permissions change on `instancesDir`, or a `RangeError` from a bad path all land in the same silent void. Given the incident described in the comment block (a 5 s stale gap on 2026-09-02 that starved the chat turn), the marker's freshness is load-bearing; if a refresh silently fails for any reason other than "marker already gone," the lock will go stale and the same starvation recurs with zero diagnostic trail.
+
+Solution:
+In each of the three `catch` blocks, emit a `console.warn` that includes the operation name, the `instancesDir` value, and the caught error's message and stack (e.g. `console.warn(\`[gpu-arbiter] interactiveCompatMarker: refreshPriorityMarker failed for ${instancesDir}: ${err?.message ?? err}\`, err?.stack)`). Do the same for the `dropPriorityMarker` catch, logging before assigning `m = null`. Do not rethrow: the `setInterval` tick should keep retrying on the next 5 s cycle, and the returned `refresh()` is called by a caller that has already committed to the interactive path — throwing would escalate a transient file-system hiccup into a hard crash. The `unref()` guard and the `m ? … : null` guard already handle the "marker truly gone" case gracefully; the log line simply distinguishes that expected path from every other failure mode.
+
+Benefits:
+An operator debugging a repeat of the 2026-09-02 starvation incident will see, in the process stderr, exactly which refresh tick failed, against which directory, and with what error — turning an invisible silent-failure loop into a one-line diagnostic. The expected "marker gone" case still produces only a single warning (not an error), so log volume stays bounded, while any *unexpected* failure (permissions, bug, disk) becomes immediately visible and attributable.
