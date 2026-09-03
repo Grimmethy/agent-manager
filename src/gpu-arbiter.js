@@ -47,13 +47,13 @@ const COMPAT_REFRESH_MS = 5_000;
 function interactiveCompatMarker(instancesDir, cls) {
   if (cls !== 'interactive') return { refresh() {}, remove() {} };
   let m = null;
-  try { m = sfl.dropPriorityMarker(instancesDir); } catch { m = null; }
+  try { m = sfl.dropPriorityMarker(instancesDir); } catch (err) { console.warn('interactiveCompatMarker: dropPriorityMarker failed:', err); m = null; }
   const iv = m ? setInterval(() => {
-    try { sfl.refreshPriorityMarker(m); } catch { /* gone */ }
+    try { sfl.refreshPriorityMarker(m); } catch (err) { console.warn('interactiveCompatMarker: refreshPriorityMarker (interval) failed:', err); }
   }, COMPAT_REFRESH_MS) : null;
   if (iv && typeof iv.unref === 'function') iv.unref();
   return {
-    refresh() { try { if (m) sfl.refreshPriorityMarker(m); } catch { /* gone */ } },
+    refresh() { try { if (m) sfl.refreshPriorityMarker(m); } catch (err) { console.warn('interactiveCompatMarker: refreshPriorityMarker (refresh) failed:', err); } },
     remove() {
       if (iv) clearInterval(iv);
       try { if (m) sfl.removePriorityMarker(m); } catch { /* gone */ }
