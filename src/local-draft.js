@@ -614,6 +614,7 @@ async function draftAdhocBranch(task, {
     && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
     && !task.rescopedFromDecompose
     && !task.autoDecomposeCount
+    && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
     && task.adhocResolution !== 'decompose';
   if (preliminaryDecomposeEnabled && isFreshAdhoc) {
     const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');

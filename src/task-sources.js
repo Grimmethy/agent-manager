@@ -120,6 +120,12 @@ function isDependencySatisfied(pipelineDir, depId) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       if (data && data.mergedAt) return true;
+      // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): the
+      // whole stack commits onto ONE shared branch and merges to main as a single unit
+      // later, so a per-step merge to main is NEVER the release signal for the next step.
+      // Reaching queue/done/ means this move's diff is committed on the shared branch --
+      // that IS "the previous step is done", which is all the next step waits on.
+      if (data && data.stacked && data.stacked.branch) return true;
     } catch {
       // not found here, or unparseable -- try the next candidate location / fall through
     }

@@ -284,7 +284,10 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     const autoN = Number(task.autoDecomposeCount) || 0;
     const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
     const gaveUp = verdict.blocked || verdict.needsClarification;
-    if (gaveUp && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
+    // A file-decompose child is already a single verbatim move -- splitting it again just
+    // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
+    // another decompose pass.
+    if (!task.atomic && gaveUp && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
       const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
       const split = await runDecomposePass(task, {
         mode,

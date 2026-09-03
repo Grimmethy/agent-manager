@@ -131,6 +131,21 @@ function createRealGitRunner(repoRoot) {
     },
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
+    // Checkout an EXISTING branch (stacked file-decompose: move N+1 rides on top of the
+    // branch move N already committed to, so it must not reset it away).
+    checkoutBranch: (name) => run(['checkout', name]),
+    branchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; }
+      catch { return false; }
+    },
+    // Best-effort fetch of one non-main branch (stacked decompose: pick up a prior step's
+    // commit if this host's local ref is behind or missing). A failure is non-fatal.
+    fetchBranch: (name) => {
+      try { return run(['fetch', 'origin', name]); } catch { return ''; }
+    },
+    // Reset-or-create a local branch to track origin/<name> exactly (stacked decompose,
+    // when the local ref is missing or stale but origin has the prior step's commit).
+    checkoutTracking: (name) => run(['checkout', '-B', name, `origin/${name}`]),
     deleteBranch: (name) => run(['branch', '-D', name]),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
@@ -169,6 +184,13 @@ function createFakeGitRunner(opts = {}) {
     resetToMain: () => record('resetToMain'),
     createBranch: (name) => record('createBranch', name),
     checkoutMain: () => record('checkoutMain'),
+    checkoutBranch: (name) => record('checkoutBranch', name),
+    branchExists: (name) => {
+      record('branchExists', name);
+      return (opts.existingBranches || []).includes(name);
+    },
+    fetchBranch: (name) => record('fetchBranch', name),
+    checkoutTracking: (name) => record('checkoutTracking', name),
     deleteBranch: (name) => record('deleteBranch', name),
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
