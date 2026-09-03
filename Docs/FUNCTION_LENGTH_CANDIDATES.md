@@ -807,3 +807,222 @@ Extract four focused helpers and reduce the original to a thin orchestrator. Fir
 
 Benefits:
 Each extracted function can be unit-tested in isolation—feed `resolveAllowedRoots` unresolvable or duplicate paths, toggle `allowWrite` in `buildToolSet`, or simulate a malformed tool-call JSON in `executeAgentLoop`—without spinning up the full agent loop or mocking the LLM transport. Code review becomes tractable because a PR touching root-resolution logic no longer requires reading the 170-line loop body, and vice versa. The 11-parameter "god entry point" smell is reduced to a short orchestrator that reads as a table of contents, making it obvious which concern owns which parameter and where a new flag should be threaded through.
+
+### AC-19 · Decompose the multi-branch task-queue dispatcher in apply-group-a.js
+Strength: Strong
+Files: src/apply-group-a.js
+Snippet:
+```
+}
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+
+  const data = loadBrainDump(brainDumpPath);
+
+  const entry = findEntry(data, brainDumpEntryId);
+  if (!entry) {
+    // Terminal: the entry is gone, there is nothing to regenerate.
+    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+  }
+  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
+  // a text change) or otherwise changed since this task was drafted -- classifying stale
+  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
+  // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.status !== 'captured' || entry.rawText !== rawText) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+  }
+
+  if (!secondBrainDir) {
+    // Terminal: no vault configured, no retry will help.
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const result = parseBrainDumpSortResult(implementResponse);
+  if (!result) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'implement pass did not return a valid classification JSON');
+  }
+
+  const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
+  if (namingError) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`);
+  }
+
+  // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
+  // for a note that is plainly a concrete change to this pipeline's own code (the dominant
+  // failure of the blocked backlog). May also flip actionable true.
+  {
+    const derived = deriveBelongsToProject(result, task.promptContext);
+    result.belongsToProject = derived.belongsToProject;
+    result.actionable = derived.actionable;
+  }
+
+  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
+  // change -- "investigate X, document findings" needs real web research, not a diff
+  // against any tracked project. Only when NO tracked project was named/recovered -- a
+  // note tied to a project routes to that project's queue below, never to research.
+  if (result.requiresResearch && !result.belongsToProject) {
+    if (!pipelineDir) {
+      return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
+    }
+    const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+    const researchTask = {
+      id: queuedId,
+      domain: 'research',
+      source: 'research_task',
+      title: rawText.slice(0, 120),
+      promptContext: { rawText, brainDumpEntryId, secondBrainPath: result.secondBrainPath, tags: result.tags },
+    };
+    const researchDir = path.join(pipelineDir, 'queue', 'research');
+    fs.mkdirSync(researchDir, { recursive: true });
+    writeJsonAtomicSync(path.join(researchDir, `${queuedId}.json`), researchTask);
+
+    // Same audit-trail cross-reference convention the adhoc branch below already uses --
+    // an entry findable in the note it will eventually gain real content in, not the
+    // record of truth (brain-dump.json's queuedTaskId/queuedAt is that).
+    const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 10);
+    appendMarkdownLineAtomic(fullPath, `\n- **${stamp}** Queued as research task \`${queuedId}\` -- ${rawText}\n`);
+
+    entry.status = 'actioned';
+    entry.queuedTaskId = queuedId;
+    entry.queuedAt = new Date().toISOString();
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+
+    return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
+  }
+
+  // A note naming a tracked project IS work -- queue a real adhoc task in that project's
+  // own queue. The old `result.actionable &&` precondition is dropped (2026-09-03, user:
+  // "a note describing a concrete change to a tracked project always becomes a work task"):
+  // a project-labelled note the classifier forgot to mark actionable is still a task, and
+  // deriveBelongsToProject already forces actionable when it recovers a self-project label.
+  const matchedProject = result.belongsToProject
+    ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
+    : null;
+
+  if (result.belongsToProject && !matchedProject) {
+    // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
+    // don't silently downgrade it to a passive note -- that masks the misclassification.
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+  }
+
+  if (matchedProject) {
+    const validDomains = (() => {
+      try {
+        return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
+      } catch {
+        return [];
+      }
+    })();
+
+    if (validDomains.includes('adhoc')) {
+      const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+      const adhocTask = {
+        id: queuedId,
+        domain: 'adhoc',
+        source: 'brain_dump',
+        title: rawText.slice(0, 120),
+        promptContext: { rawText, brainDumpEntryId },
+      };
+
+      // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
+      // anchor keywords from this task's title/rawText against the target project's own
+      // dependency graph BEFORE it's ever claimed for drafting, so the plan/implement
+      // passes already have real, validated file paths in promptContext instead of the
+      // model searching for them (or worse, inventing them) from scratch on every call.
+      // 'greenfield' (no graph built yet for this project) is explicitly NOT an error --
+      // per the Discuss session's own note, that's just "nothing to prefetch," and the
+      // task queues normally. 'no-match'/'ambiguous' are the two cases the Grill Me/
+      // Discuss sessions asked to be held for a human rather than silently guessed at:
+      // written to queue/needs-clarification/ instead of queue/adhoc/, invisible to
+      // nextAdhocTask() (which only ever scans queue/adhoc/) until a human resolves it
+      // via the dashboard.
+      // graphPathOverride via config.js's resolveGraphPath() (not path-prefetch.js's own
+      // graphify-out/graph.json default) -- confirmed live 2026-08-16: the dashboard's
+      // Build Graph button writes to .agent-manager-cache/, not graphify-out/, so without
+      // this override every real project's graph looked absent ('greenfield') even after
+      // a real build, and this fast path silently never matched anything.
+      const anchorResult = resolveAnchors({
+        repoRoot: matchedProject.repoRoot,
+        title: adhocTask.title,
+        rawText,
+        graphPathOverride: resolveGraphPath(matchedProject.repoRoot),
+        // uiVocabHubFiles (2026-08-20, see path-prefetch.js's UI_VOCAB header): opt-in
+        // per project in projects.json -- a project with no UI hub file(s) declared here
+        // simply never triggers the fallback, same behavior as before this existed.
+        uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
+      });
+      let adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      if (anchorResult.status === 'matched') {
+        adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+      } else if (anchorResult.status === 'no-match') {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        adhocTask.needsClarification = { reason: 'no-match' };
+      } else if (anchorResult.status === 'ambiguous') {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
+        if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+      }
+      // 'greenfield': adhocTask left exactly as constructed above, queues normally with
+      // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
+
+      // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
+      // filing") -- brainDumpSortPlanPrompt/ImplementPrompt already showed the classifier
+      // every currently-queued task title and asked it to flag a real match. Overrides
+      // whatever the anchor-resolution logic above decided (even a confident path match
+      // isn't worth drafting if the whole task is a duplicate) -- held for a human via the
+      // SAME multiple-choice/free-text picker the "needs a human decision" adhoc path
+      // already uses (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision), not a
+      // new UI: no structured options here since this is really a binary "is this real"
+      // call the existing generic Archive button on every needs-clarification row (for
+      // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
+      // fully cover.
+      if (result.possibleDuplicateOf) {
+        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+        adhocTask.needsClarification = {
+          reason: 'design-decision',
+          openQuestions: (
+            `This brain-dump note was flagged as a possible duplicate of an already-` +
+            `queued task:\n\n  "${result.possibleDuplicateOf}"\n\n` +
+            `NOTE (this task's own text): ${rawText}\n\n` +
+            'If this genuinely is the same underlying feature/fix, use the Archive ' +
+            'button on this row instead of answering below. If it is NOT actually a ' +
+            'duplicate (different scope, different project, coincidental overlap), ' +
+            'explain why in the box below and submit to send it to drafting.'
+          ),
+        };
+      }
+
+      adhocTask.generatedForRepoRoot = matchedProject.repoRoot;
+
+      fs.mkdirSync(adhocDir, { recursive: true });
+      writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
+
+      entry.status = 'actioned';
+      entry.queuedTaskId = queuedId;
+      entry.queuedAt = new Date().toISOString();
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+
+      return { file: path.join(adhocDir, `${queuedId}.json`), queuedTaskId: queuedId, queuedProject: matchedProject.label };
+    }
+    // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
+// ... [truncated for review: this function continues for 30 more line(s) not shown]
+```
+
+Problem:
+The function is roughly 230 lines and inlines three to four complete mini-pipelines—guard/validation preamble, a research-task enqueue path, an adhoc-project-task enqueue path (itself containing a four-way `resolveAnchors` status switch plus a duplicate-detection override), and a fallback/passive-note tail—each with its own validation, I/O, data-shaping, and distinct return shape. A reader must hold the shared preamble variables, the branch-specific object construction, the atomic-write sequences, and the divergent return contracts all in working memory at once; the adhoc branch alone nests a `matched` / `no-match` / `ambiguous` / `greenfield` decision tree inside an `if (matchedProject)` block, making it the single hardest section to review or test in isolation.
+
+Solution:
+Extract four clearly-named helpers that sit alongside the dispatcher: (1) `validateAndLoadEntry(entryPath)` returning the parsed entry, config, and derived `belongsToProject` (the ~30-line preamble); (2) `enqueueResearchTask(entry, config, dataDir)` encapsulating the `researchTask` construction, `mkdirSync`, `writeJsonAtomicSync`, `appendMarkdownLineAtomic`, entry mutation, and the `{file, queuedTaskId, researchQueued}` return; (3) `enqueueAdhocProjectTask(entry, matchedProject, config, dataDir)` containing the domain-list validation, the `resolveAnchors` four-status switch, the duplicate-detection override, task write, entry mutation, and the `{file, queuedTaskId, queuedProject}` return; and (4) `handleFallbackOrPassiveNote(entry, config, dataDir)` for the truncated tail. The top-level function then shrinks to a thin dispatch: call the validator, branch on the entry's task type, delegate to the appropriate helper, and return its result.
+
+Benefits:
+Each extracted helper has a single, nameable responsibility and a uniform input/output contract, so unit tests can exercise the adhoc four-way anchor logic, the duplicate-override edge case, and the research-task write sequence independently without stubbing the other branches. Code review becomes a matter of reading one 20–40-line function at a time rather than tracking shared mutable state across 230 lines. The top-level dispatcher drops to roughly 20–30 lines of pure routing, making it trivial to verify that every branch is reached and that no branch accidentally falls through to the wrong return shape.
