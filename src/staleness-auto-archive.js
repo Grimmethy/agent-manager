@@ -163,14 +163,41 @@ function holdForHumanReview(pipelineDir, originalTaskId, stalenessAuditTaskId, r
   return originalTaskId;
 }
 
+// 2026-09-03 (Grimmethy: "deleting an ad hoc task definitely needs to have a human
+// gate"): a RECOMMENDATION: archive verdict no longer MOVES anything. It stamps a
+// `stalenessFlag` on the original task -- exactly the shape adhoc-staleness-flag.js
+// writes -- and leaves it in place. A human retires it from the dashboard (the Archive
+// button) or dismisses it (Keep). Confidence is `high` only with a verifiable resolution
+// signal (a cited commit that exists, or a possibly-resolved marker); otherwise `medium`.
+function stampFlagOnOriginal(pipelineDir, originalTaskId, flag) {
+  if (!originalTaskId) return null;
+  const queueDir = path.join(pipelineDir, 'queue');
+  for (const dirName of ['blocked', 'needs-clarification']) {
+    const p = path.join(queueDir, dirName, `${originalTaskId}.json`);
+    let data;
+    try { data = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { continue; }
+    data.stalenessFlag = {
+      reason: flag.reason,
+      disposition: 'retire',
+      confidence: flag.confidence,
+      evidence: flag.evidence,
+      flaggedAt: new Date().toISOString(),
+      votedAt: null,
+      voteResult: null,
+    };
+    appendHistoryEvent(data, 'advisory',
+      `staleness flag: ${flag.reason} (${flag.confidence}) -- from staleness_audit ${flag.auditId}: ${(flag.evidence[0] || '').slice(0, 240)}`);
+    fs.writeFileSync(p, JSON.stringify(data, null, 2));
+    return originalTaskId;
+  }
+  return null;
+}
+
 /**
- * Registered as staleness_audit's `apply` (task-sources.js) in place of the generic
- * applyVerdictOnly every other verdict-only source uses -- same {skipped, reason} return
- * shape apply-task.js's writeArtifact() already expects (this source never produces a
- * diff, so it always "skips" its OWN branch/commit step regardless of what happens here),
- * with a real side effect layered on top: an explicit archive recommendation either moves
- * the ORIGINAL flagged task out of the live queue (when there's a verifiable resolution
- * signal) or escalates it to needs-clarification for a human (when there isn't).
+ * Registered as staleness_audit's `apply` (task-sources.js). This source never produces a
+ * diff, so it always "skips" its own branch/commit step; the real effect is a
+ * `stalenessFlag` stamped on the ORIGINAL task when the verdict recommends archiving.
+ * NOTHING is moved or deleted automatically -- a human acts on the flag.
  */
 function applyStalenessAuditVerdict({ implementResponse, pipelineDir, task }) {
   const text = (implementResponse || '').trim();
@@ -182,35 +209,32 @@ function applyStalenessAuditVerdict({ implementResponse, pipelineDir, task }) {
   }
 
   const originalTaskId = task && task.promptContext && task.promptContext.originalTaskId;
+  const verified = hasResolutionSignal(task, text);
+  const flag = {
+    reason: 'recheck-verdict-archive',
+    confidence: verified ? 'high' : 'medium',
+    auditId: task && task.id,
+    evidence: [
+      `staleness_audit's harness-grounded recheck recommends retiring this task${verified ? ' (verifiable resolution signal present)' : ' (no verifiable commit cited -- a human should confirm)'}`,
+      text.slice(0, 400),
+    ],
+  };
 
-  if (!hasResolutionSignal(task, text)) {
-    let heldId = null;
-    try {
-      heldId = holdForHumanReview(pipelineDir, originalTaskId, task && task.id, text);
-    } catch (e) {
-      return { skipped: true, reason: `recommended archive without a verifiable signal; the hold-for-human attempt failed: ${e.message}` };
-    }
-    return {
-      skipped: true,
-      reason: heldId
-        ? `recommended archive without a verifiable resolution signal (no possibly-resolved flag, no cited commit that exists) -- routed "${heldId}" to needs-clarification for a human instead of archiving`
-        : `recommended archive without a verifiable resolution signal, but original task "${originalTaskId}" was no longer in blocked/needs-clarification`,
-    };
-  }
-
-  let archivedId = null;
+  let stampedId = null;
   try {
-    archivedId = archiveOriginalTask(pipelineDir, originalTaskId, task && task.id, text);
+    stampedId = stampFlagOnOriginal(pipelineDir, originalTaskId, flag);
   } catch (e) {
-    // Best-effort -- a failed archive attempt must not turn a real, successful review
-    // outcome for the staleness_audit task itself into a reported apply failure.
-    return { skipped: true, reason: `recommended archive, but the archive attempt failed: ${e.message}` };
+    return { skipped: true, reason: `recommended archive; stamping the flag on "${originalTaskId}" failed: ${e.message}` };
   }
-
-  const reason = archivedId
-    ? `auto-archived original task "${archivedId}" per staleness_audit's own recommendation: ${text.slice(0, 300)}`
-    : `recommended archive, but original task "${originalTaskId}" was no longer in blocked/needs-clarification (already archived, or requeued/resolved by other means)`;
-  return { skipped: true, reason };
+  return {
+    skipped: true,
+    reason: stampedId
+      ? `flagged original task "${stampedId}" for human-gated retirement (${flag.confidence}): ${text.slice(0, 240)}`
+      : `recommended archive, but original task "${originalTaskId}" was no longer in blocked/needs-clarification`,
+  };
 }
 
-module.exports = { applyStalenessAuditVerdict, parseStalenessRecommendation, archiveOriginalTask, holdForHumanReview, hasResolutionSignal };
+module.exports = {
+  applyStalenessAuditVerdict, parseStalenessRecommendation,
+  archiveOriginalTask, holdForHumanReview, hasResolutionSignal, stampFlagOnOriginal,
+};

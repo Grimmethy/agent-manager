@@ -134,13 +134,17 @@ const GIT_LOG_TIMEOUT_MS = 15_000;
 // second, possibly-inconsistent implementation. Pulls from every place a task's own
 // concern is described in free text: the original request, the title, the reason it got
 // blocked, and any accumulated rejection feedback.
+// Generated / append-only docs that virtually every task "names" and that the triage
+// batch commits touch constantly -- a commit to one is not evidence anything was resolved.
+const GENERATED_DOC_RE = /(_CANDIDATES\.md$|PRODUCT_SPEC(_OUTLINE)?\.md$|TROUBLE_LOG\.md$|BACKLOG_CANDIDATES\.md$)/;
+
 function candidateFilePaths(task) {
   const ctx = task.promptContext || {};
   const feedback = Array.isArray(task.priorRejectionFeedback)
     ? task.priorRejectionFeedback.join(' ')
     : (task.priorRejectionFeedback || '');
   const text = [ctx.rawText, task.title, task.blockedReason, feedback].filter(Boolean).join('\n');
-  return extractFilePaths(text);
+  return extractFilePaths(text).filter((p) => !GENERATED_DOC_RE.test(p));
 }
 
 // Fourth criterion, added 2026-08-23 (Grimmethy: "What really makes a task stale is if
@@ -162,29 +166,227 @@ function candidateFilePaths(task) {
 // any git failure (not a real repo, a file genuinely untracked, git itself unavailable)
 // is non-fatal, same philosophy every other git call in this pipeline already follows --
 // returns {touched: false, files: []} rather than throwing.
-function findFilesTouchedSince(repoRoot, task) {
+function prefileGraceDays() {
+  return envDays('AGENT_MANAGER_STALENESS_PREFILE_GRACE_DAYS', 21);
+}
+
+// Default behavior unchanged: commits to a named file STRICTLY AFTER the task was created
+// -> `possibly-resolved`. Options (2026-09-03), used only by alreadyImplementedSignal:
+//   graceDays      -- also look back this many days before createdAt
+//   strictlyBefore -- ...and ONLY the window [createdAt - graceDays, createdAt), so it
+//                     never overlaps the default `possibly-resolved` window.
+function findFilesTouchedSince(repoRoot, task, { graceDays = 0, strictlyBefore = false } = {}) {
   const createdAtIso = task.createdAt;
   if (!repoRoot || !createdAtIso || Number.isNaN(Date.parse(createdAtIso))) {
     return { touched: false, files: [] };
   }
+  const createdMs = Date.parse(createdAtIso);
+  const sinceIso = new Date(createdMs - graceDays * MS_PER_DAY).toISOString();
+  const range = strictlyBefore
+    ? [`--since=${sinceIso}`, `--until=${createdAtIso}`]
+    : [`--since=${graceDays > 0 ? sinceIso : createdAtIso}`];
 
   const claimedPaths = candidateFilePaths(task);
   const touchedFiles = [];
+  const commits = [];
   for (const claimed of claimedPaths) {
     const resolved = resolveAgainstRepo(repoRoot, claimed);
     if (!resolved) continue; // not a real file in this repo -- nothing to check against
     const relPath = path.relative(repoRoot, resolved);
     try {
       const out = execFileSync(
-        'git', ['log', `--since=${createdAtIso}`, '--oneline', '-1', '--', relPath],
+        'git', ['log', ...range, '--pretty=%h %s', '-1', '--', relPath],
         { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
       );
-      if (out.trim()) touchedFiles.push(relPath);
+      if (out.trim()) {
+        touchedFiles.push(relPath);
+        commits.push(`${relPath}: ${out.trim()}`);
+      }
     } catch (e) {
       // best-effort -- one file's git error must not abort checking the rest
     }
   }
-  return { touched: touchedFiles.length > 0, files: touchedFiles };
+  return { touched: touchedFiles.length > 0, files: touchedFiles, commits };
+}
+
+// --- "the thing this task asks to CREATE already exists" -----------------------------
+// The other criteria are proxies for "the pipeline gave up." This is the direct check for
+// "there is nothing left to do." Extract identifiers the task's own text pairs with a
+// create/add verb (`create \`X.js\``, "add a function `fooBar`", "new module `y`"), then
+// see whether that file already exists or that symbol is already defined in the repo.
+const CREATE_VERB_RE = /\b(create|add|introduce|implement|build|write|new)\b[^.\n]{0,60}?`([A-Za-z0-9_./-]{3,})`/gi;
+const BACKTICK_IDENT_RE = /`([A-Za-z_][A-Za-z0-9_]{2,})`/g;
+
+function extractCreatedSymbols(text) {
+  const out = new Set();
+  const s = String(text || '');
+  let m;
+  CREATE_VERB_RE.lastIndex = 0;
+  while ((m = CREATE_VERB_RE.exec(s))) {
+    const tok = m[2];
+    if (/[./]/.test(tok)) out.add(tok);           // a path
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) out.add(tok); // an identifier
+  }
+  return [...out];
+}
+
+function symbolDefinedInRepo(repoRoot, symbol) {
+  if (!repoRoot || !symbol) return null;
+  // A DEFINITION, not any mention -- function/const/let/class/def, JS or Python.
+  const pattern = `(function|class|const|let|var|def)\\s+${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`;
+  try {
+    const out = execFileSync(
+      'git', ['grep', '-l', '-E', pattern, '--', 'src', 'python', 'scripts'],
+      { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const first = out.split('\n').map((x) => x.trim()).filter(Boolean)[0];
+    return first || null;
+  } catch (e) {
+    return null; // git grep exits 1 on no match -> not defined
+  }
+}
+
+// Distinctive 2-3 word phrases from the task's title/first line -- what the task is
+// actually ABOUT, e.g. "FIFO ticket lock", "per-attempt record". Drops the
+// `<project> > <area> :` prefix and any n-gram without a real (>=5-char, non-stopword)
+// content word, so a grep for it means something.
+const TITLE_PREFIX_RE = /^[^:>]*[>:]\s*/;
+function distinctivePhrases(task) {
+  const line = String((task.promptContext && task.promptContext.rawText) || task.title || '')
+    .split('\n')[0].replace(TITLE_PREFIX_RE, '').toLowerCase();
+  const words = line.replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+  const phrases = new Set();
+  for (let n = 3; n >= 2; n -= 1) {
+    for (let i = 0; i + n <= words.length; i += 1) {
+      const gram = words.slice(i, i + n);
+      const contentful = gram.filter((w) => w.length >= 5 && !DUP_STOPWORDS.has(w));
+      if (contentful.length >= 1 && gram.join(' ').length >= 8) phrases.add(gram.join(' '));
+    }
+  }
+  return [...phrases].slice(0, 8);
+}
+
+// Returns { strong, strongEvidence[], phraseHits[] }.
+//   strong: the task asks to CREATE a file/symbol that ALREADY EXISTS -- near-certain
+//           "nothing to do", zero-false-positive by construction. -> high confidence.
+//   phraseHits: a distinctive phrase from the task's own first line appears verbatim in a
+//           file the task itself names. NOT a standalone flag reason (too noisy -- a
+//           comment can just quote the task); only ever attached as extra context for the
+//           medium-confidence vote to weigh, alongside another real candidate signal.
+function alreadyImplementedSignal(repoRoot, task) {
+  if (!repoRoot) return { strong: false, strongEvidence: [], phraseHits: [] };
+  const strongEvidence = [];
+  const ctx = task.promptContext || {};
+  const text = [ctx.rawText, task.title].filter(Boolean).join('\n');
+
+  for (const sym of extractCreatedSymbols(text)) {
+    if (/[./]/.test(sym)) {
+      const resolved = resolveAgainstRepo(repoRoot, sym);
+      if (resolved) strongEvidence.push(`asks to create \`${sym}\` -- but ${path.relative(repoRoot, resolved)} already exists`);
+    } else {
+      const where = symbolDefinedInRepo(repoRoot, sym);
+      if (where) strongEvidence.push(`asks to add \`${sym}\` -- but it is already defined in ${where}`);
+    }
+  }
+
+  const phraseHits = [];
+  const namedFiles = candidateFilePaths(task)
+    .map((p) => resolveAgainstRepo(repoRoot, p)).filter(Boolean)
+    .map((abs) => path.relative(repoRoot, abs));
+  if (namedFiles.length > 0 && namedFiles.length <= 12) {
+    for (const phrase of distinctivePhrases(task)) {
+      try {
+        const line = execFileSync(
+          'git', ['grep', '-n', '-F', '-i', '--', phrase, ...namedFiles],
+          { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
+        ).split('\n').map((x) => x.trim()).filter(Boolean)[0];
+        // Skip a line that is itself just quoting the brain-dump / this task.
+        if (line && !/brain[- ]?dump|see task|the task's|rawText/i.test(line)) {
+          phraseHits.push(`grep for the task's phrase "${phrase}" -> ${line.slice(0, 160)}`);
+        }
+      } catch (e) { /* git grep exit 1 = no match */ }
+    }
+  }
+
+  return { strong: strongEvidence.length > 0, strongEvidence, phraseHits };
+}
+
+// The inverse: the task is concrete about file paths and NONE of them resolve to a real
+// file. "The premise contradicts the codebase." Only fires when there is at least one
+// named path and every one is absent -- otherwise silent (a task naming zero paths, or a
+// mix, is not evidence of an invalid premise).
+function invalidPremiseSignal(repoRoot, task) {
+  if (!repoRoot) return { hit: false, evidence: [] };
+  const named = candidateFilePaths(task);
+  if (named.length === 0) return { hit: false, evidence: [] };
+  const missing = named.filter((p) => !resolveAgainstRepo(repoRoot, p));
+  if (missing.length !== named.length) return { hit: false, evidence: [] };
+  return { hit: true, evidence: [`every file this task names is absent from the repo: ${missing.join(', ')}`] };
+}
+
+// --- duplicate detection -----------------------------------------------------------
+const DUP_STOPWORDS = new Set(('a an the and or of to in for on with is are be it this that '
+  + 'add fix agent manager we i need should must task').split(' '));
+
+function normalizeTaskTokens(task) {
+  const ctx = task.promptContext || {};
+  const text = `${task.title || ''} ${(ctx.rawText || '').slice(0, 600)}`.toLowerCase();
+  return new Set(
+    text.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+      .filter((w) => w.length > 2 && !DUP_STOPWORDS.has(w)),
+  );
+}
+
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter += 1;
+  return inter / (a.size + b.size - inter);
+}
+
+function dupSimilarityThreshold() {
+  const raw = Number(process.env.AGENT_MANAGER_STALENESS_DUP_SIMILARITY);
+  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.6;
+}
+
+function bdLineage(id) {
+  const m = String(id || '').match(/bd-(\d{10,})/);
+  return m ? m[1] : null;
+}
+
+// corpus: [{ id, state, ... }] -- every OTHER task (queue + recent done). Returns the
+// best match above threshold, or null. Excludes the brain-dump-sort task that SPAWNED
+// this one (same bd-<id> lineage) and any *_sort / *_outline task -- those legitimately
+// share almost all their text with the task they produced; that is not duplication.
+function findDuplicateTask(task, corpus) {
+  const mine = normalizeTaskTokens(task);
+  if (mine.size < 4) return null;
+  const myLineage = bdLineage(task.id);
+  const threshold = dupSimilarityThreshold();
+  let best = null;
+  for (const other of corpus || []) {
+    if (!other || !other.id || other.id === task.id) continue;
+    if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;
+    if (myLineage && bdLineage(other.id) === myLineage) continue; // same lineage, not a dup
+    const sim = jaccard(mine, normalizeTaskTokens(other));
+    if (sim >= threshold && (!best || sim > best.sim)) {
+      best = { id: other.id, state: other.state || other.status || null, sim: Number(sim.toFixed(2)) };
+    }
+  }
+  return best;
+}
+
+// Every draft attempt chose to decompose and the task is exhausted -- the pipeline didn't
+// fail to BUILD it, it failed to BREAK IT DOWN. A distinct disposition from retries-
+// exhausted (a re-scope, not an archive candidate).
+function isDecomposeLoop(task) {
+  const attempts = Array.isArray(task.draftAttempts) ? task.draftAttempts : [];
+  if (attempts.length < 2) return false;
+  const allDecompose = attempts.every((a) => {
+    const r = `${a.adhocResolution || ''} ${a.resolution || ''} ${(a.outcome && a.outcome.resolution) || ''}`.toLowerCase();
+    return r.includes('decompose');
+  });
+  return allDecompose && hasExhaustedRetries(task);
 }
 
 // One entry per task that survives ANY condition -- reasons records which one(s) fired
@@ -209,7 +411,7 @@ function findFilesTouchedSince(repoRoot, task) {
 // here to answer, deterministically or otherwise.
 const SELF_AUDIT_SOURCES = new Set(['staleness_audit', 'pipeline_self_audit']);
 
-function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot } = {}) {
+function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot, corpusTasks } = {}) {
   const threshold = stalenessThresholdMs();
   const cooldown = cooldownMs();
   const candidates = [];
@@ -217,9 +419,12 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoR
     if (!task || !task.id) continue;
     if (SELF_AUDIT_SOURCES.has(task.source)) continue;
     const reasons = [];
+    const evidence = [];
     if (isStaleByAge(task, now, threshold)) reasons.push('stale-age');
     if (isFabricationRepeat(task)) reasons.push('fabrication-repeat');
     if (hasExhaustedRetries(task)) reasons.push('retries-exhausted');
+    if (isDecomposeLoop(task)) reasons.push('decompose-loop');
+
     let touchedFiles = [];
     if (repoRoot) {
       const gitCheck = findFilesTouchedSince(repoRoot, task);
@@ -227,7 +432,22 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoR
         reasons.push('possibly-resolved');
         touchedFiles = gitCheck.files;
       }
+      const impl = alreadyImplementedSignal(repoRoot, task);
+      if (impl.strong) { reasons.push('already-implemented-strong'); evidence.push(...impl.strongEvidence); }
+      if (impl.phraseHits.length > 0 && reasons.length > 0) {
+        // only meaningful alongside another real signal -- attach as vote context, not a reason
+        evidence.push(...impl.phraseHits);
+      }
+      const bad = invalidPremiseSignal(repoRoot, task);
+      if (bad.hit) { reasons.push('invalid-premise'); evidence.push(...bad.evidence); }
     }
+
+    const dup = corpusTasks ? findDuplicateTask(task, corpusTasks) : null;
+    if (dup) {
+      reasons.push('duplicate-of');
+      evidence.push(`~${Math.round(dup.sim * 100)}% token overlap with ${dup.id}${dup.state ? ` (${dup.state})` : ''}`);
+    }
+
     if (reasons.length === 0) continue;
 
     const covered = coverage[task.id];
@@ -236,7 +456,7 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoR
       if (Number.isFinite(reportedMs) && now - reportedMs < cooldown) continue;
     }
 
-    candidates.push({ task, reasons, lastActivityTs: lastActivityTs(task), touchedFiles });
+    candidates.push({ task, reasons, evidence, duplicateOf: dup, lastActivityTs: lastActivityTs(task), touchedFiles });
   }
   // Oldest last-activity first -- the longest-neglected task is the most overdue for a
   // human's attention, same "most-evidenced first" intent pipeline-self-audit.js's own
@@ -386,6 +606,13 @@ module.exports = {
   hasExhaustedRetries,
   candidateFilePaths,
   findFilesTouchedSince,
+  extractCreatedSymbols,
+  symbolDefinedInRepo,
+  alreadyImplementedSignal,
+  invalidPremiseSignal,
+  normalizeTaskTokens,
+  findDuplicateTask,
+  isDecomposeLoop,
   findStalenessCandidates,
   SELF_AUDIT_SOURCES,
   buildStalenessEvidenceText,

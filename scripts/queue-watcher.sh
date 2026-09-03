@@ -167,6 +167,16 @@ while :; do
     auto_confirm_result="$(node "${PACKAGE_SRC_DIR}/auto-confirm-review.js" 2>>"${HOME_LOGS}/auto-confirm-review.log")"
     printf '[watchdog] auto-confirm-review: %s\n' "$auto_confirm_result" >&2
 
+    # Adhoc staleness flag: scans queue/blocked/ + queue/needs-clarification/ for adhoc /
+    # brain-dump tasks that are DEAD (work already shipped, a duplicate, an invalid premise,
+    # a decompose-loop, or a hard capability ceiling) and stamps a `stalenessFlag` on the
+    # task -- it never moves or deletes anything. High-confidence deterministic hits flag
+    # directly; medium ones get a local CONFIRM/DENY vote. A human retires or keeps it from
+    # the dashboard. Cheap unless something actually trips a criterion. Disable with
+    # AGENT_MANAGER_ADHOC_STALENESS_FLAG=false.
+    adhoc_stale_result="$(node "${PACKAGE_SRC_DIR}/adhoc-staleness-flag.js" 2>>"${HOME_LOGS}/adhoc-staleness-flag.log")"
+    printf '[watchdog] adhoc-staleness-flag: %s\n' "$adhoc_stale_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the

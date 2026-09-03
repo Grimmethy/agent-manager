@@ -2075,20 +2075,35 @@ async function renderQueueTab(state) {
           : state === 'coordinating'
             ? `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`
             : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
+    // Dead-adhoc-task flag (adhoc-staleness-flag.js). Chip + evidence tooltip; the
+    // retire action is the row's existing Archive/Reject button, plus a Keep to dismiss.
+    const sf = t.stalenessFlag;
+    const staleChip = sf ? (() => {
+      const label = { 'already-implemented': '🪦 already implemented', 'duplicate-of': '👯 duplicate',
+        'invalid-premise': '❓ invalid premise', 'decompose-loop': '♻️ can\'t decompose — re-scope',
+        'retries-exhausted': '🧗 capability ceiling', 'fabrication-repeat': '🧗 capability ceiling',
+        'recheck-verdict-archive': '🪦 recheck: retire' }[sf.reason] || `⚑ ${sf.reason}`;
+      const tip = escapeAttr(((sf.evidence || []).join(' • ')).slice(0, 400) + `  [${sf.confidence}${sf.voteResult ? ', ' + sf.voteResult : ''}]`);
+      const col = sf.confidence === 'high' ? 'var(--bad)' : 'var(--warn)';
+      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">${label}</span><br>`;
+    })() : '';
+    const keepBtn = sf ? `<button type="button" class="secondary task-staleness-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays and is not re-flagged for a while">Keep</button>` : '';
     return `
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       <td>${t.id}</td>
       <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
-      <td>${detailCell}</td>
+      <td>${staleChip}${detailCell}</td>
       ${showArchiveRequeue ? `<td>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
+        ${keepBtn}
       </td>` : ''}
       ${showArchiveOnly ? `<td>
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
         <button type="button" class="secondary task-discuss-btn" data-id="${escapeAttr(t.id)}">Discuss</button>
+        ${keepBtn}
       </td>` : ''}
       ${showConfirmDeny ? `<td>
         <button type="button" class="secondary task-confirm-delete-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}" data-research="${isResearchConfirm}" data-forensics="${isForensicsConfirm}">${isAdhocConfirm ? 'Confirm & Apply' : isResearchConfirm ? 'Confirm & File' : isForensicsConfirm ? 'Confirm & File Fix Candidate' : 'Confirm Delete'}</button>
@@ -2137,6 +2152,13 @@ async function renderQueueTab(state) {
       e.stopPropagation();
       await openDetail(state, btn.dataset.id);
       clarifyDiscussStart(btn.dataset.id);
+    };
+  });
+  main.querySelectorAll('.task-staleness-keep-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      postTaskAction(state, btn.dataset.id, 'staleness-keep',
+        `Dismiss the staleness flag on '${btn.dataset.id}'? The task stays where it is and won't be re-flagged for a while.`);
     };
   });
   main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {
