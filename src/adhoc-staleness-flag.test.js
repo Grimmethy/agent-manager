@@ -101,29 +101,38 @@ test('sweep is idempotent -- a second run does not re-stamp or duplicate history
   assert.equal(after2.history.length, hist1, 'no new history event on the second run');
 });
 
-test('vote DENY drops the flag and sets a Keep cooldown that suppresses re-flagging', async () => {
+test('vote is OFF by default -- a medium candidate is stamped directly, no majorityVote call', async () => {
   const dir = tmpPipeline();
-  writeTask(dir, 'blocked', exhaustedTask('keep-1'));
-  const deny = async () => ({ confident: true, verdict: 'DENY', realVoteCount: 3, requestedVotes: 3 });
-  await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: deny, now: Date.now() });
-  const t = readTask(dir, 'blocked', 'keep-1');
-  assert.equal(t.stalenessFlag, undefined);
-  assert.ok(t.stalenessKeep && Date.parse(t.stalenessKeep.until) > Date.now());
-
-  // next sweep must skip it
-  const boom = () => { throw new Error('should not vote a cooled-down task'); };
-  const s2 = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: boom, now: Date.now() });
-  assert.equal(s2.flagged, 0);
+  writeTask(dir, 'blocked', exhaustedTask('nov-1'));
+  const boom = () => { throw new Error('vote must not run unless AGENT_MANAGER_ADHOC_STALENESS_VOTE=true'); };
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: boom, now: Date.now() });
+  assert.equal(s.voted, 0);
+  assert.equal(readTask(dir, 'blocked', 'nov-1').stalenessFlag.confidence, 'medium');
 });
 
-test('vote CONFIRM promotes a medium flag to high', async () => {
-  const dir = tmpPipeline();
-  writeTask(dir, 'blocked', exhaustedTask('conf-1'));
-  const confirm = async () => ({ confident: true, verdict: 'CONFIRM', realVoteCount: 3, requestedVotes: 3 });
-  await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: confirm, now: Date.now() });
-  const t = readTask(dir, 'blocked', 'conf-1');
-  assert.equal(t.stalenessFlag.confidence, 'high');
-  assert.match(t.stalenessFlag.voteResult, /CONFIRM/);
+test('with the vote enabled: DENY drops the flag + Keep cooldown; CONFIRM promotes to high', async () => {
+  process.env.AGENT_MANAGER_ADHOC_STALENESS_VOTE = 'true';
+  delete require.cache[require.resolve('./adhoc-staleness-flag.js')];
+  const { sweep: voteSweep } = require('./adhoc-staleness-flag.js');
+  try {
+    const dir = tmpPipeline();
+    writeTask(dir, 'blocked', exhaustedTask('keep-1'));
+    await voteSweep({ pipelineDir: dir, repoRoot: null, majorityVote: async () => ({ confident: true, verdict: 'DENY', realVoteCount: 3, requestedVotes: 3 }), now: Date.now() });
+    const t = readTask(dir, 'blocked', 'keep-1');
+    assert.equal(t.stalenessFlag, undefined);
+    assert.ok(Date.parse(t.stalenessKeep.until) > Date.now());
+    const boom = () => { throw new Error('should not vote a cooled-down task'); };
+    const s2 = await voteSweep({ pipelineDir: dir, repoRoot: null, majorityVote: boom, now: Date.now() });
+    assert.equal(s2.flagged, 0);
+
+    const dir2 = tmpPipeline();
+    writeTask(dir2, 'blocked', exhaustedTask('conf-1'));
+    await voteSweep({ pipelineDir: dir2, repoRoot: null, majorityVote: async () => ({ confident: true, verdict: 'CONFIRM', realVoteCount: 3, requestedVotes: 3 }), now: Date.now() });
+    assert.equal(readTask(dir2, 'blocked', 'conf-1').stalenessFlag.confidence, 'high');
+  } finally {
+    delete process.env.AGENT_MANAGER_ADHOC_STALENESS_VOTE;
+    delete require.cache[require.resolve('./adhoc-staleness-flag.js')];
+  }
 });
 
 test('kill switch disables the sweep entirely', async () => {

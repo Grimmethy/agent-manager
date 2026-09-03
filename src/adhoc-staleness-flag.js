@@ -36,6 +36,14 @@ const KEEP_COOLDOWN_MS = 21 * 24 * 60 * 60 * 1000;  // "Keep" suppresses re-flag
 const RECENT_DONE_LIMIT = 400;
 const VOTES = Number(process.env.AGENT_MANAGER_ADHOC_STALENESS_VOTES) || 3;
 const MIN_AGREEING = Number(process.env.AGENT_MANAGER_ADHOC_STALENESS_MIN_AGREEING) || 2;
+// The medium-confidence CONFIRM/DENY vote is OFF by default: each candidate is 3 local
+// 27B calls that contend on the GPU single-flight lock with the workers, and a sweep with
+// 7 candidates blocked the whole watchdog loop for ~6 minutes a tick (caught live
+// 2026-09-03). A medium flag + its evidence is already enough for the human to act on.
+// Turn the vote on with AGENT_MANAGER_ADHOC_STALENESS_VOTE=true; even then it is capped
+// at MAX_VOTES_PER_SWEEP per tick (unvoted mediums stamp directly and get a turn later).
+const VOTE_ENABLED = process.env.AGENT_MANAGER_ADHOC_STALENESS_VOTE === 'true';
+const MAX_VOTES_PER_SWEEP = Number(process.env.AGENT_MANAGER_ADHOC_STALENESS_MAX_VOTES_PER_SWEEP) || 2;
 
 // --- classification -----------------------------------------------------------------
 
@@ -251,8 +259,10 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
         summary.flagged += 1; summary.highConfidence += 1;
         continue;
       }
-      // medium -> vote
-      if (!majorityVote) { writeFlag(filePath, task, flag, now); summary.flagged += 1; continue; }
+      // medium -> optionally a capped CONFIRM/DENY vote; otherwise stamp directly.
+      if (!VOTE_ENABLED || !majorityVote || summary.voted >= MAX_VOTES_PER_SWEEP) {
+        writeFlag(filePath, task, flag, now); summary.flagged += 1; continue;
+      }
       summary.voted += 1;
       let vote;
       try {
