@@ -970,7 +970,8 @@ def discover_github_repos() -> list[dict]:
         try:
             if child.is_dir() and (child / ".git").exists():
                 repos.append({"name": child.name, "path": str(child)})
-        except OSError:
+        except OSError as exc:
+            logger.warning("Skipping unreadable entry %s under %s: %s", child, GITHUB_PROJECTS_ROOT, exc)
             continue
     return repos
 
