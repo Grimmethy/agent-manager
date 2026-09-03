@@ -2342,3 +2342,26 @@ Replace the bare `except OSError: continue` with `except OSError as exc: logger.
 
 Benefits:
 An operator troubleshooting a missing project in the dashboard can now see, in the application log, exactly which path failed and why (e.g., `Permission denied` vs. `Stale file handle`), turning an invisible data gap into a one-line, greppable warning. The fix is a two-line change, introduces no new dependency, and keeps the function's return contract identical.
+
+### AC-138 · Swallowed OSError on final persistence of merge-state write returns false success
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                        data["terminalDisposition"] = "merged"
+                    try:
+                        candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
+                break
+
+```
+
+Problem:
+At lines 5623-5625 the handler catches `OSError` from `candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")` and executes a bare `pass`. This is the sole persistence step for the mutation the user just requested (appending a `"merged"` history entry and setting `terminalDisposition` to `"merged"`). Because the exception is discarded, execution falls through to line 5628 where the handler returns `jsonify({"succeeded": True, ...})` with an implicit 200. The in-memory `data` dict was updated but never reached disk, so the next read still shows the branch as unmerged, the dashboard shows a success toast, and there is no log line, no re-raise, and no error field in the response body to explain the discrepancy.
+
+Solution:
+Replace the bare `except OSError: pass` with a handler that (1) logs the failure at `ERROR` level via the stdlib `logging` module already used elsewhere in this file, including the branch name, the target path (`candidate`), and the exception message so an operator can identify which write failed and why, and (2) re-raises the exception so Flask's default error handler returns a 500 to the caller. Concretely, add `import logging` and `logger = logging.getLogger(__name__)` at module scope if not already present, then change the except block to `except OSError as exc: logger.error("Failed to persist merge state for branch %r to %s: %s", branch, candidate, exc); raise`. No new dependency is introduced; the fix uses only the stdlib `logging` module that the project already relies on.
+
+Benefits:
+Once fixed, a failed disk write produces an immediate, attributable ERROR log line naming the branch, the file path, and the OS-level cause (disk full, permission denied, NFS timeout), giving an operator a concrete breadcrumb within seconds. The API caller receives a 500 instead of a misleading 200, so the dashboard can surface the failure to the user and the branch remains visible in the "Unmerged" list, preventing the silent divergence between UI state and on-disk state that currently goes unnoticed until the next manual inspection.
