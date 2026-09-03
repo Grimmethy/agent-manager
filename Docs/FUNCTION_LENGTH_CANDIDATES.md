@@ -1295,3 +1295,124 @@ Extract each outcome branch into its own small, clearly-named function—`handle
 
 Benefits:
 Each handler becomes independently unit-testable (mock the file-system and history-event calls, assert the exact stamped fields and target path for that outcome), so a regression in one branch is caught without exercising the other two. Code review diff size shrinks because a change to the DENY path no longer sits adjacent to CONFIRM and inconclusive logic, reducing the chance of a reviewer's eye skipping a parallel edit. The shared four-step pattern is now visible in three small, identically-shaped functions, making it trivial to spot when one diverges (a missing field, a wrong directory constant) and straightforward to later consolidate into a shared helper if the pattern stabilises.
+
+### AC-22 · Extract priority-wait loop and flock/compat lifecycle from GPU slot acquisition
+Strength: Strong
+Files: src/gpu-arbiter.js
+Snippet:
+```
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin fallback if SharedArrayBuffer is unavailable */ }
+  }
+}
+
+// ---- the primary API --------------------------------------------------------------------
+
+// Register a ticket and block (busy-wait with sleeps, like single-flight-lock.js -- this
+// whole module blocks the calling process by design) until this ticket may proceed:
+// no higher-priority-class ticket exists, and this is the earliest ticket of its own
+// class. Then acquire the underlying flock. Returns a handle:
+//   { release(), cancelled: () => boolean }
+// The caller MUST call handle.release() (use withGpu() to make that automatic). While
+// holding, a background interval re-touches the ticket and, if cancelRequested lands,
+// invokes onCancel() exactly once -- the caller wires that to abort its model call.
+function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phase = null, onCancel = null } = {}) {
+  const dir = ticketsDir(instancesDir, model);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const myRank = classRank(cls);
+  const seq = String(Date.now()).padStart(16, '0');
+  const name = `${seq}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.json`;
+  const fp = path.join(dir, name);
+  const mySeqNum = Number(seq);
+
+  writeTicketAtomic(fp, {
+    pid: process.pid, cls, taskId, phase,
+    startedAt: nowIso(), holding: false, cancelRequested: false,
+  });
+
+  // If this pid already holds a place ticket (holdPlace) of equal-or-higher priority for
+  // this model, FIFO position is already reserved -- an inner per-turn acquire must not
+  // re-queue behind peers that arrived AFTER the place (that would deadlock: the place
+  // blocks those peers, and those peers would block this turn). Skip the wait loop; the
+  // real flock still serialises the actual model call.
+  const holdsPlace = liveTickets(instancesDir, model).some(
+    (t) => t.pid === process.pid && t.place && classRank(t.cls) <= myRank,
+  );
+
+  const deadline = Date.now() + overallTimeoutMs();
+
+  try {
+    for (;;) {
+      if (holdsPlace) break;
+      if (Date.now() >= deadline) {
+        safeUnlink(fp);
+        throw new Error(`gpu-arbiter: '${cls}' ticket for model '${model || '(default)'}' timed out waiting to reach the head of the queue`);
+      }
+      touch(fp);
+      const tickets = liveTickets(instancesDir, model);
+      const mine = tickets.find((t) => t._name === name);
+      if (!mine) {
+        // our ticket was swept (we were too slow to re-touch, or a clock jump) -- re-add.
+        writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, startedAt: nowIso(), holding: false, cancelRequested: false });
+        continue;
+      }
+      if (mine.cancelRequested) {
+        safeUnlink(fp);
+        const err = new Error('gpu-arbiter: cancelled while waiting');
+        err.gpuArbiterCancelled = true;
+        throw err;
+      }
+      const higherExists = tickets.some((t) => t._name !== name && t.pid !== process.pid && classRank(t.cls) < myRank);
+      // A ticket owned by THIS pid at our own class (typically a holdPlace() place-holder
+      // for a chat tool loop, or a re-added ticket after a sweep) is not a competitor --
+      // this process already has its spot.
+      const earlierPeer = tickets.some((t) => t._name !== name && t.pid !== process.pid
+        && classRank(t.cls) === myRank && t._seq < mySeqNum);
+      if (!higherExists && !earlierPeer) break;
+      sleepSync(POLL_MS);
+    }
+  } catch (err) {
+    safeUnlink(fp);
+    throw err;
+  }
+
+  // At the head -- take the real mutex. skipPriorityBackoff: the ARBITER is the priority
+  // mechanism now; sfl's own .discuss-waiting backoff would just make us wait on the
+  // compat marker the arbiter itself drops for interactive tickets.
+  const compat = interactiveCompatMarker(instancesDir, cls);
+  let flockHandle;
+  try {
+    flockHandle = sfl.acquire(instancesDir, model, { skipPriorityBackoff: true });
+  } catch (err) {
+    compat.remove();
+    safeUnlink(fp);
+    throw err;
+  }
+  patchTicket(fp, { holding: true });
+
+  let cancelled = false;
+  let released = false;
+  const watcher = setInterval(() => {
+    if (released) return;
+    touch(fp);
+    compat.refresh();
+    const cur = readTicket(fp);
+    if (cur && cur.cancelRequested && !cancelled) {
+      cancelled = true;
+      if (typeof onCancel === 'function') {
+        try { onCancel(); } catch { /* best-effort */ }
+      }
+    }
+```
+
+Problem:
+The 103-line function interleaves four phases, but the real maintenance cost concentrates in two of them. The priority/FIFO wait loop (~30 lines) carries five distinct exit or continue paths—holdsPlace, timeout, ticket-swept re-add, cancelRequested, and the higher-priority/earlier-peer check—plus a `for(;;)` whose `continue` re-enters after mutating shared state, making it hard to verify that no path skips a cleanup or double-removes the ticket. The flock-acquisition block is shorter but has a fragile ordering constraint: the compat marker must be created *before* the flock and removed *only* on the failure path, a coupling that is easy to break when someone edits the surrounding logic. Because both of these blocks sit inline in the same function body, a reviewer must hold the entire 103-line sequence in working memory to confirm that, say, the timeout path does not accidentally leave the compat marker behind, or that the ticket-swept re-add does not re-enter the loop with a stale priority value.
+
+Solution:
+Extract two focused helpers, leaving the ticket-registration preamble and the final execution/cleanup tail inline. First, pull the entire priority/FIFO wait loop into a function like `waitForTurn(ticketId, priority, deadline, signal)` that returns a small result object (`{ status: 'acquired' | 'timeout' | 'cancelled' | 'swept' }`) and encapsulates all five exit/continue branches behind that contract. Second, pull the flock acquisition plus compat-marker create/remove into `acquireFlockWithCompat(lockPath)` that returns the fd on success and throws (or returns a typed error) on failure, with the marker cleanup guaranteed inside that single function so the ordering invariant lives in one place. The outer function then reads as a short sequence: register ticket → wait for turn → acquire flock → do work → release, with each step delegating to a named helper whose name states its contract.
+
+Benefits:
+Each extracted helper is independently unit-testable: `waitForTurn` can be tested with a fake ticket store and a controllable clock to exercise all five exit paths without touching the filesystem flock, and `acquireFlockWithCompat` can be tested against a real temp directory to verify the marker-creation/removal invariant under both success and failure. Code review becomes a matter of checking that the outer function's linear sequence calls the helpers in the right order and handles the result, rather than tracing 30 lines of nested `for(;;)` / `continue` logic. The compat-marker ordering bug class—marker created after flock, or not removed on a new failure path—becomes structurally impossible to introduce from outside the helper, because the invariant is now local to a 12-line function whose sole job is that pairing.
