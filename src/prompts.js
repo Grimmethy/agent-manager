@@ -66,6 +66,8 @@ const groupBJsonInstructions = [
   '  [{"mode": "create", "file": "backend/utils/shared.js", "content": "..."}, {"mode": "edit", "file": "backend/utils/caller.js", "find": "...", "replace": "..."}]',
   '',
   '"find" must be an EXACT substring that appears in the real current file content shown in your plan above -- copy it character for character, do not paraphrase or reformat it, or the edit will fail to apply. "file" must be a real path relative to the repository root. Stay inside exactly the files and scope the plan named -- do not touch anything the plan did not call out, even if it looks related.',
+  '',
+  'If the finding is a false positive (the code is already correct, the concern is not actionable, or the change would be a no-op), do NOT output a file-change JSON object. Output exactly this single line instead: FALSE POSITIVE -- <one-line justification>. Do NOT output meta-commentary, hedging, or prose descriptions of code in place of the JSON; the only valid outputs are the file-change JSON described above or the FALSE POSITIVE line.',
 ].join('\n');
 
 // 2026-08-26, Grimmethy: "how do we make that split happen the moment it realizes the
