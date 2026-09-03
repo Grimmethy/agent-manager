@@ -5901,8 +5901,8 @@ def _ensure_task_domains(child_env: dict, raw_path: str, task_sources: list):
     try:
         domains_path.parent.mkdir(parents=True, exist_ok=True)
         domains_path.write_text(json.dumps(domains, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.error("Failed to persist domain defaults to %s: %s", domains_path, exc, exc_info=True)
 
 
 def _resolve_source_name(data: dict) -> str | None:
