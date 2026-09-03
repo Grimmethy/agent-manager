@@ -87,6 +87,11 @@ def _lock_name(key: str | None) -> str:
     return f".pipeline-single-flight.{safe_key}.lock"
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def acquire(instances_dir: Path, key: str | None = None):
     """Blocking, exclusive acquire, bounded by SINGLE_FLIGHT_LOCK_TIMEOUT_SECS (default
     600) -- parity with single-flight-lock.js / agent-manager-common.sh's `flock -w`.
@@ -160,10 +165,12 @@ def priority_marker(instances_dir: Path):
             while not stop.wait(5.0):
                 try:
                     marker.touch()
-                except OSError:
+                except OSError as exc:
+                    logger.warning("discuss-priority-marker: keep-fresh touch failed, stopping loop: %s", exc)
                     return
         threading.Thread(target=_keep_fresh, name="discuss-priority-marker", daemon=True).start()
-    except OSError:
+    except OSError as exc:
+        logger.warning("discuss-priority-marker: marker creation failed: %s", exc)
         marker = None
     try:
         yield
