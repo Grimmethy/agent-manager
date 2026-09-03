@@ -1164,3 +1164,134 @@ Extract the decompose branch into a standalone function, e.g. `buildDecomposedPl
 
 Benefits:
 The main function drops to roughly 85–90 lines, well under the threshold, and each half can be unit-tested in isolation: `buildDecomposedPlan` can be tested with pure diff fixtures and no filesystem mocks, while the apply path continues to use its existing integration harness. Code review diffs for coordination-policy changes will no longer include the apply sequence, reducing reviewer cognitive load and the chance of an accidental edit to the git-staging logic.
+
+### AC-21 · Extract per-outcome handlers from the review loop body
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+}
+
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const approvedDir = path.join(pipelineDir, 'queue', 'approved');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  const fixCandidatesPath = candidatesPath || (getConfig().pipelineFixCandidatesPath);
+
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no awaiting-confirm/ dir -- nothing to do
+  }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+    if (task.autoConfirmReviewedAt) continue; // already reviewed once -- left for a human
+
+    summary.checked += 1;
+    const isForensics = task.source === 'pipeline_forensics';
+    const deleteItems = isForensics ? [] : parseDeleteItems(task.implementResponse);
+
+    let prompt;
+    let gateStamp;
+    if (isForensics) {
+      prompt = buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath));
+      gateStamp = 'forensicsReportConfirmedAt';
+    } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file));
+      prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
+      gateStamp = 'deleteConfirmedAt';
+    } else {
+      // A hold we don't recognise -- don't guess. Leave it for a human, but stamp so we
+      // don't re-check every tick.
+      task.autoConfirmReviewedAt = new Date().toISOString();
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) {
+        const taskId = task.id || (task.implementResponse ? task.implementResponse.slice(0, 8) : 'unknown');
+        console.error(`[auto-confirm-review] escalate write failed: file=${file} task=${taskId} code=${err.code || ''} message=${err.message}`);
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt,
+        classify: classifyVote(['CONFIRM', 'DENY'], 15),
+        n: AUTO_CONFIRM_VOTES,
+        minAgreeing: AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source: task.source,
+      });
+    } catch (e) {
+      // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
+      appendHistoryEvent(task, 'advisory', `auto-confirm review could not run (${(e && e.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    if (vote.confident && vote.verdict === 'CONFIRM') {
+      const reason = voteReason(vote, 'CONFIRM');
+      task[gateStamp] = now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'confirm';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'approved';
+      appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        const result = moveTaskFile(file, approvedDir, name, task);
+        if (result) summary.confirmed += 1;
+        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      const reason = voteReason(vote, 'DENY');
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'deny';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'done';
+      task.doneMarker = `auto-denied at confirm gate: ${reason}`;
+      appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+        else summary.errors += 1;
+      } catch { summary.errors += 1; }
+    } else {
+      // No confident majority -- leave for a human.
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The 113-line loop body inlines three structurally parallel outcome handlers (CONFIRM, DENY, inconclusive) plus a classification sub-branch, each repeating the same four-step pattern—stamp review fields, call appendHistoryEvent, write or move the record file into an outcome-specific directory, and increment a summary counter—but with different field names, target paths, and error strings. Because the three blocks are "same shape, different values," a reader must hold all three in working memory simultaneously to verify that no field is missed in one branch when editing another, and a future edit that touches the shared pattern (e.g., adding a new stamped field) must be replicated across three near-identical blocks with a high chance of a silent omission in one.
+
+Solution:
+Extract each outcome branch into its own small, clearly-named function—`handleConfirmOutcome(record, ctx)`, `handleDenyOutcome(record, ctx)`, and `handleInconclusiveOutcome(record, ctx)`—each owning its field-stamping, history-event call, file write/move, and counter bump. Additionally, pull the classification sub-branch into a `classifyOutcome(record)` helper that returns a discriminator the loop body can switch on. The loop body then reduces to: classify → dispatch to the matching handler → continue, dropping from ~113 lines to roughly 25–30 lines of orchestration while each handler stays under 30 lines.
+
+Benefits:
+Each handler becomes independently unit-testable (mock the file-system and history-event calls, assert the exact stamped fields and target path for that outcome), so a regression in one branch is caught without exercising the other two. Code review diff size shrinks because a change to the DENY path no longer sits adjacent to CONFIRM and inconclusive logic, reducing the chance of a reviewer's eye skipping a parallel edit. The shared four-step pattern is now visible in three small, identically-shaped functions, making it trivial to spot when one diverges (a missing field, a wrong directory constant) and straightforward to later consolidate into a shared helper if the pattern stabilises.
