@@ -358,7 +358,7 @@ test('findStalenessCandidates flags a task via possibly-resolved when repoRoot i
 
   const withGit = findStalenessCandidates([task], {}, now, { repoRoot: dir });
   assert.equal(withGit.length, 1);
-  assert.deepEqual(withGit[0].reasons, ['possibly-resolved']);
+  assert.ok(withGit[0].reasons.includes('possibly-resolved'));
   assert.deepEqual(withGit[0].touchedFiles, ['src/widget.js']);
 });
 

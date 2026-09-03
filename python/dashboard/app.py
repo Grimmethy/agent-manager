@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, abort, request, Response, stream_with_context
@@ -1092,6 +1092,10 @@ def task_summary(data: dict, filename: str) -> dict:
         # clarification row rendering needs it to show WHICH kind of hold this is without
         # a second round-trip per row.
         "needsClarification": data.get("needsClarification"),
+        # Small {reason,disposition,confidence,evidence[],flaggedAt} object stamped by
+        # adhoc-staleness-flag.js / staleness-auto-archive.js -- the row shows a chip +
+        # Archive/Keep buttons so a human can retire a dead adhoc task without opening it.
+        "stalenessFlag": data.get("stalenessFlag"),
         # Coordinator (decomposed parent) checklist -- a small [{id,title,status}] list plus
         # a {done,total} rollup, stamped by coordinator-sweep.js. The Coordinating list row
         # shows the "N of M" from `progress` without a per-row round-trip.
@@ -2275,6 +2279,36 @@ def api_task_archive(state, task_id):
         abort(409, description=f"an archived copy of '{task_id}' already exists")
     shutil.move(str(src), str(dest))
     return jsonify({"id": task_id, "archived": True})
+
+
+@app.route("/api/task/<state>/<task_id>/staleness-keep", methods=["POST"])
+def api_task_staleness_keep(state, task_id):
+    """Dismiss a stalenessFlag (adhoc-staleness-flag.js): the human looked and decided the
+    task is still valid. Clears the flag and writes a `stalenessKeep` cooldown so the sweep
+    does not re-flag it for AGENT_MANAGER_STALENESS_COOLDOWN_DAYS (default 21). The task
+    stays exactly where it is -- this only affects the flag."""
+    if state not in ("blocked", "needs-clarification"):
+        abort(400, description="staleness flags only exist on blocked / needs-clarification tasks")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / state / f"{task_id}.json"
+    if not src.is_file():
+        abort(404)
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        abort(500, description="could not read the task file")
+    data.pop("stalenessFlag", None)
+    cooldown_days = int(os.environ.get("AGENT_MANAGER_STALENESS_COOLDOWN_DAYS") or 21)
+    until = datetime.now(timezone.utc) + timedelta(days=cooldown_days)
+    data["stalenessKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}",
+    })
+    src.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
 
 
 @app.route("/api/task/awaiting-confirm/<task_id>/confirm", methods=["POST"])

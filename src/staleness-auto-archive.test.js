@@ -88,7 +88,7 @@ test('archiveOriginalTask returns null and does not clobber an already-archived 
   assert.equal(stillThere.preExisting, true);
 });
 
-test('applyStalenessAuditVerdict archives the original task on archive + a resolution signal (possibly-resolved flag)', () => {
+test('applyStalenessAuditVerdict FLAGS (never moves) the original on archive + a resolution signal -> high confidence', () => {
   const dir = makeFixtureDir();
   writeOriginalTask(dir, 'blocked', 'orig-4');
   const task = { id: 'staleness-audit-orig-4-1', promptContext: { originalTaskId: 'orig-4', reasons: ['possibly-resolved'] } };
@@ -99,9 +99,13 @@ test('applyStalenessAuditVerdict archives the original task on archive + a resol
   });
 
   assert.equal(result.skipped, true);
-  assert.match(result.reason, /auto-archived original task "orig-4"/);
-  assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-4.json')), false);
-  assert.ok(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-4.json')));
+  assert.match(result.reason, /flagged original task "orig-4" for human-gated retirement \(high\)/);
+  // file stays exactly where it was -- nothing archived
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-4.json')));
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-4.json')), false);
+  const flagged = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'blocked', 'orig-4.json'), 'utf8'));
+  assert.equal(flagged.stalenessFlag.confidence, 'high');
+  assert.equal(flagged.stalenessFlag.disposition, 'retire');
 });
 
 test('applyStalenessAuditVerdict takes NO action when the report recommends a fresh investigation', () => {
@@ -145,7 +149,7 @@ test('applyStalenessAuditVerdict degrades gracefully (does not throw) if origina
 const { holdForHumanReview, hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { execFileSync } = require('child_process');
 
-test('archive + NO signal (fabrication-repeat / retries-exhausted only) -> original routed to needs-clarification, not archived', () => {
+test('archive + NO signal (fabrication-repeat / retries-exhausted only) -> flagged in place at MEDIUM confidence, not moved', () => {
   const dir = makeFixtureDir();
   writeOriginalTask(dir, 'blocked', 'orig-nc', { history: [{ stage: 'blocked', at: 'x' }] });
   const task = { id: 'sa-nc-1', promptContext: { originalTaskId: 'orig-nc', reasons: ['fabrication-repeat', 'retries-exhausted'] } };
@@ -155,18 +159,15 @@ test('archive + NO signal (fabrication-repeat / retries-exhausted only) -> origi
     pipelineDir: dir, task,
   });
 
-  assert.match(result.reason, /routed "orig-nc" to needs-clarification/);
-  assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-nc.json')), false, 'gone from blocked/');
+  assert.match(result.reason, /flagged original task "orig-nc" for human-gated retirement \(medium\)/);
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-nc.json')), 'stays in blocked/');
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-nc.json')), false, 'NOT archived');
-  const nc = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'needs-clarification', 'orig-nc.json'), 'utf8'));
-  assert.equal(nc.needsClarification.reason, 'design-decision');
-  assert.match(nc.needsClarification.openQuestions, /already resolved/);
-  assert.match(nc.needsClarification.openQuestions, /no verifiable evidence/);
-  assert.equal(nc.status, 'needs-clarification');
-  assert.ok(nc.history.some((h) => h.stage === 'needs-clarification'));
+  const t = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'blocked', 'orig-nc.json'), 'utf8'));
+  assert.equal(t.stalenessFlag.confidence, 'medium');
+  assert.equal(t.status, undefined); // status untouched -- the sweep never changes queue state
 });
 
-test('archive + a cited commit that actually exists -> archived', () => {
+test('archive + a cited commit that actually exists -> flagged HIGH, still not moved', () => {
   const dir = makeFixtureDir();
   // a real git repo so checkCommitClaims can resolve the hash
   execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -185,8 +186,9 @@ test('archive + a cited commit that actually exists -> archived', () => {
       implementResponse: `1. Yes, resolved.\n3. RECOMMENDATION: archive -- implemented in commit ${realHash}.`,
       pipelineDir: dir, task: { id: 'sa-c-1', promptContext: { originalTaskId: 'orig-commit', reasons: ['stale-age'] } },
     });
-    assert.match(result.reason, /auto-archived original task "orig-commit"/);
-    assert.ok(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-commit.json')));
+    assert.match(result.reason, /flagged original task "orig-commit" for human-gated retirement \(high\)/);
+    assert.ok(fs.existsSync(path.join(dir, 'queue', 'blocked', 'orig-commit.json')), 'still in blocked/');
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'orig-commit.json')), false);
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
   }
