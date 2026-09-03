@@ -160,7 +160,8 @@ function applyDeepDiveFindings({ implementResponse, task, analysisDir, coverageP
   let coverage;
   try {
     coverage = JSON.parse(fs.existsSync(coveragePath) ? fs.readFileSync(coveragePath, 'utf8') : '{"projects":{}}');
-  } catch {
+  } catch (err) {
+    console.error(`applyDeepDiveFindings: failed to read/parse coverage file at ${coveragePath}: ${err.message}\n${err.stack}`);
     coverage = { projects: {} };
   }
   if (!coverage.projects) coverage.projects = {};
