@@ -6612,8 +6612,8 @@ def _stop_pipeline(force: bool = False) -> list:
                 if pid:
                     try:
                         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
-                    except (OSError, subprocess.SubprocessError):
-                        pass
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        logger.warning("taskkill failed for PID %s (instance: %s): %s", pid, f, exc)
             # Confirmed live (2026-07-22): without this, _pipeline_running()'s worker-1
             # heartbeat check kept reporting the pipeline as running for up to
             # WORKING_STALE_SECONDS (20 min) after a real, successful stop -- the killed
