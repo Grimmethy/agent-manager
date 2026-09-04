@@ -2915,3 +2915,26 @@ Replace the bare `catch { /* default */ }` on line 89 with a catch that (1) logs
 
 Benefits:
 An operator running the coordinator sweep will now see a single, clearly-labelled `console.error` line naming the failing `repoRoot` and the underlying git-runner exception the moment initialization fails, instead of discovering the problem indirectly through a confusing gate result or a silent no-op. This turns an invisible, unattributable failure into a one-line diagnostic that points directly at the git-runner module and the specific repo path, cutting mean-time-to-diagnosis for sweep anomalies from "which of many things broke?" to "git-runner init for /path/to/repo threw <msg>."
+
+### AC-162 · Silent catch on best-effort parent-state write loses all I/O failure signal
+Strength: Strong
+Files: src/decompose-loop-autoroute.js
+Snippet:
+```
+  if (process.env.AGENT_MANAGER_DECOMPOSE_LOOP_AUTOROUTE === 'false') return summary;
+
+  let resolvedRepoRoot = repoRoot;
+  if (!resolvedRepoRoot) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+
+  const oversized = oversizedFiles(pipelineDir);
+  if (oversized.size === 0) return summary;
+```
+
+Problem:
+Line 108 wraps `fs.writeFileSync(file, JSON.stringify(parent, null, 2))` in a `try/catch` whose body is only the comment `/* best-effort */`. The catch swallows the error entirely—no `console.warn`, no `console.error`, no rethrow, no counter. If the target path is missing, the disk is full, or permissions are revoked, every subsequent call to this function will silently fail to persist the parent's JSON state, and the state will be lost on the next process restart with zero trace in any log. The surrounding `sweep` function (line 113) already tracks an `errors` counter in its summary object, confirming the project's own convention is to surface I/O failures; this lone catch block is the one place that violates it.
+
+Solution:
+Replace the bare `catch { /* best-effort */ }` with `catch (err) { console.warn('[decompose-loop-autoroute] best-effort write failed for ' + file + ': ' + err.message); }`. This preserves the best-effort contract—the function still returns `parent.id` and the caller's control flow is unchanged—while emitting a single warn-level line to stderr that names the file path and the underlying OS error (ENOENT, EACCES, ENOSPC, etc.). No new dependency, no metrics primitive, no rethrow; `console.warn` is the logging primitive this project already uses.
+
+Benefits:
+An operator watching stdout/stderr (or a log aggregator tailing the process) will immediately see which parent's state failed to persist and why, turning an invisible, accumulating data-loss risk into a single actionable log line. The best-effort semantics are preserved—no caller contract changes, no new exception path—so the fix is drop-in safe.
