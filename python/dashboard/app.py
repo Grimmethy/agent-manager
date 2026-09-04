@@ -6637,6 +6637,101 @@ def api_plugins_add():
     return jsonify({"plugin": entry, "restarted": restarted})
 
 
+@app.route("/api/plugins/install", methods=["POST"])
+def api_plugins_install():
+    """Installs a free plugin from the catalog: fetches the source (git clone or
+    npm install) into the plugins dir, runs npm install inside the plugin dir, and
+    registers the resulting register.js in the plugins manifest. Paid catalog entries
+    are rejected with 402 before anything is written."""
+
+    class _InstallError(Exception):
+        def __init__(self, message, stderr=None):
+            super().__init__(message)
+            self.stderr = stderr
+
+    body = request.get_json(silent=True) or {}
+    plugin_id = (body.get("id") or "").strip()
+    if not plugin_id:
+        abort(400, description="id is required")
+
+    doc, err = _read_plugin_catalog()
+    if err is not None:
+        abort(500, description=err)
+
+    entry = next(
+        (e for e in doc.get("plugins", []) if isinstance(e, dict) and e.get("id") == plugin_id),
+        None,
+    )
+    if entry is None:
+        abort(404, description=f"catalog entry '{plugin_id}' not found")
+
+    pricing = entry.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+    if pricing.get("model", "free") != "free":
+        return jsonify({"error": "Paid plugins are not available yet."}), 402
+
+    manifest = _read_plugins_manifest()
+    if any(isinstance(p, dict) and p.get("name") == entry["id"] for p in manifest):
+        abort(409, description=f"a plugin named '{entry['id']}' is already registered")
+
+    plugin_dir = _plugins_install_dir() / entry["id"]
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run(cmd, label, cwd=None):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise _InstallError(f"{label} failed: {exc}", None) from exc
+        if r.returncode != 0:
+            raise _InstallError(f"{label} failed with exit code {r.returncode}", r.stderr or "")
+        return r
+
+    source = entry.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    try:
+        if source.get("type") == "git":
+            cmd = ["git", "clone"]
+            if source.get("ref"):
+                cmd += ["--branch", source["ref"]]
+            cmd += [source["url"], str(plugin_dir)]
+            _run(cmd, "git clone")
+        elif source.get("type") == "npm":
+            pkg = source.get("url", "")
+            version = source.get("ref") or "latest"
+            _run(["npm", "install", f"{pkg}@{version}"], "npm install (fetch)", cwd=str(plugin_dir))
+        else:
+            raise _InstallError(f"unknown source type: {source.get('type')!r}")
+        # Creates node_modules symlinks the plugin contract expects.
+        _run(["npm", "install"], "npm install", cwd=str(plugin_dir))
+    except _InstallError as exc:
+        return jsonify({"error": str(exc), "stderr": exc.stderr}), 500
+
+    register_js = plugin_dir / "register.js"
+    if not register_js.is_file():
+        candidate = plugin_dir / "src" / "register.js"
+        if candidate.is_file():
+            register_js = candidate
+        else:
+            return jsonify({"error": "install failed: no register.js found in the plugin directory", "stderr": ""}), 500
+
+    manifest.append({
+        "name": entry["id"],
+        "registerPath": str(register_js),
+        "enabled": True,
+        "description": entry.get("description", ""),
+        "version": entry["version"],
+        "source": entry["source"],
+    })
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({"installed": True, "name": entry["id"], "version": entry["version"], "restarted": restarted})
+
+
 # --- Marketplace (plugin catalog) -------------------------------------------------------
 # The catalog is a static, pre-generated JSON file (plugins-catalog.json) at the package
 # root. These helpers only read and validate it, and expose it via GET
