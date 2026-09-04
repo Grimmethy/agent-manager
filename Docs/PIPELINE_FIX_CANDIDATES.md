@@ -186,3 +186,13 @@ In the code path in local-draft.js where the implement step's raw output string 
 
 Benefits:
 Catches non-compliant implement outputs before they consume critique and review-vote budget, triggers an immediate retry with the strengthened prompt (from sub-candidate 1) rather than silently blocking or wasting a review cycle, and produces a structured log line that can be correlated with the 0-shipped-over-7d metric for observability. The gate is a single insertion point and does not restructure existing flow.
+
+### AC-21 · 3 needs-clarification tasks, same signature (manual::fabricated-ungrounded-claim)
+Strength: Strong
+Files: src/fact-checker.js
+
+Problem: The `ungrounded-field` check (src/fact-checker.js:464) flags any identifier absent from the grounding source, with no exclusion for (a) tokens the draft itself introduced in a new-file `content` field, or (b) tokens that are the output of a verification command the model ran and echoed (e.g. `COMPILE_OK` from `echo`). This turns a correct, compile-verified draft into a disqualifying block, as seen in subject 1.
+Solution: In the `ungrounded-field` branch of src/fact-checker.js, before pushing the flag, skip any `field` that (1) appears verbatim in any `content` value of the draft's own create-file entries, or (2) matches a token produced by a `run_bash` command in the worklog (i.e. appears in a `run_bash` command string or its captured output). Acceptance check: add a unit test in src/fact-checker.test.js mirroring the existing `FCV_CUR` cases (src/fact-checker.test.js:379/394/424) where the draft's new-file content contains the identifier `COMPILE_OK` and a `run_bash` worklog entry echoes it; assert `flags` is empty (no `ungrounded-field`), while a control case where `COMPILE_OK` appears only in prose with no new-file content and no `run_bash` source still flags it.
+Benefits: The class of "create-new-module + verify-by-compile" adhoc tasks (blueprint extraction, new-file scaffolding) stops failing on a self-generated verification token, while genuine fabrication (identifiers with no source anywhere in the draft or worklog) is still caught.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-fabricated-ungrounded-claim-1788486413899
