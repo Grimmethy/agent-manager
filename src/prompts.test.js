@@ -393,6 +393,17 @@ test('adhocPlanPrompt: a _seedPlan is embedded as a trailing "improve this" bloc
   assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('PRIOR attempt'), 'seed block trails the stable instruction text');
 });
 
+test('adhocPlanPrompt: _planGrounding is embedded as a trailing block with the "ground every path" instruction', () => {
+  const { planGroundingBlock } = require('./prompts.js');
+  assert.deepEqual(planGroundingBlock({ promptContext: {} }), []);
+  const g = '--- src/a.js ---\n```\nfunction foo() {}\n```';
+  const task = { domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'edit foo' }, _planGrounding: g };
+  const prompt = buildPlanPrompt(task);
+  assert.ok(prompt.includes(g), 'grounding text verbatim');
+  assert.match(prompt, /Ground every file path, function name and line number/);
+  assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('REAL REPOSITORY CONTENT'), 'grounding block trails the stable instructions');
+});
+
 // --- pipeline_forensics -----------------------------------------------------------
 
 test('pipelineForensicsPlanPrompt emits QUERY: lines and carries the evidence + subject', () => {
