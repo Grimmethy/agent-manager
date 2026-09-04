@@ -323,6 +323,7 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
 module.exports = {
   autoConfirmReview,
   classifyVote,
+  clip,
   buildForensicsConfirmPrompt,
   buildDeleteConfirmPrompt,
   parseDeleteItems,
