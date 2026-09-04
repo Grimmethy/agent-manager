@@ -3030,3 +3030,26 @@ Bind the caught error to a variable (`catch (err)`), then branch on `err.code ==
 
 Benefits:
 An operator running the triage step will now see a clear, path-qualified error line on stderr whenever a non-ENOENT filesystem fault occurs, and the returned summary's `errors` counter will be non-zero, distinguishing a real I/O or permissions problem from the expected "directory not yet created" case. This eliminates a silent-failure mode where a broken mount, a wrong file at the queue path, or a permission regression would produce an indistinguishable all-zero summary and go unnoticed until downstream tasks stall.
+
+### AC-167 · Narrow the bare catch in needs-clarification triage to ENOENT only
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Snippet:
+```
+
+  const writeInPlace = (file, task) => {
+    if (DRY_RUN) return;
+    try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch (e) {
+      log(`write failed ${path.basename(file)}: ${e.message}`); summary.errors += 1;
+    }
+  };
+```
+
+Problem:
+Lines 122-127 wrap `fs.readdirSync(ncDir)` in a `try/catch` with no error binding and no code check. The comment says "no needs-clarification/ dir," revealing the intent is to handle the expected `ENOENT` case. But because the `catch` is unqualified, every other failure—`EACCES`, `ENOTDIR`, `EMFILE`, `ENFILE`—is silently swallowed: the function returns `summary` with `errors: 0` and emits no log line, making a misconfigured path or a permission regression indistinguishable from "zero tasks to triage." The surrounding code (the `writeInPlace` helper at lines 131-135) already demonstrates the project's pattern of logging via `log(...)` and incrementing `summary.errors` on I/O failure, so the omission here is an inconsistency, not a design choice.
+
+Solution:
+Bind the error (`catch (e)`) and branch on `e.code`. If `e.code === 'ENOENT'`, keep the existing early-return of the empty `summary` (the directory genuinely doesn't exist yet). For any other code, call `log(\`readdir failed ${ncDir}: ${e.code} ${e.message}\`)`, increment `summary.errors += 1`, and then return `summary`. This reuses the `log` helper and `summary.errors` counter already present in the same function, adds no new dependency, and ensures the caller's summary reflects that an I/O problem occurred rather than that the directory was legitimately empty.
+
+Benefits:
+A misconfigured `ncDir` (pointing at a file), a lost read permission, or transient fd exhaustion will now produce a visible log line identifying the path and the OS error code, and the caller's `summary.errors` count will be non-zero so downstream reporting or alerting can distinguish "no tasks" from "could not read tasks." The intended `ENOENT` fast-path is preserved unchanged, so first-run behavior is unaffected.
