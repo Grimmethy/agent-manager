@@ -41,12 +41,13 @@ const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisio
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
 const { runOrientPass } = require('./orient-pass.js');
+const { runPlanCritique } = require('./plan-critique.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const {
-  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordTier, finalizeDraftAttempt,
+  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordTier, finalizeDraftAttempt,
 } = require('./draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
@@ -521,7 +522,21 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
     return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: resolvedLabel, taskId: task.id, phase: pass }, run);
   };
 
-  return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked };
+  // Same as maybeLocked but keyed on an EXPLICIT model tag, so a sub-call on a different
+  // model (e.g. the plan-critique's qwen2.5:3b) takes its OWN single-flight lock and runs
+  // in parallel with a main-model draft instead of queueing behind it.
+  const maybeLockedOn = (model, fn, pass) => {
+    const key = model || resolvedLabel;
+    if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', key, task.id, pass);
+    const run = () => {
+      if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'working', key, task.id, pass);
+      return fn();
+    };
+    if (usingInjectedLock) return withLockFn(instancesDir, run, key);
+    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: key, taskId: task.id, phase: pass }, run);
+  };
+
+  return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn };
 }
 
 // Deterministic staleness-recheck short-circuit (2026-08-23, Grimmethy: "How do we
@@ -621,6 +636,7 @@ async function draftAdhocBranch(task, {
     && task.adhocResolution !== 'decompose';
   if (preliminaryDecomposeEnabled && isFreshAdhoc) {
     const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
+    delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
     if (split && split.subTasks.length >= 2) {
       appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
       task.adhocResolution = 'decompose';
@@ -1458,9 +1474,9 @@ async function runDraftPasses(task, attempt, {
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
   draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
   draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
-  isClaudePausedFn = isClaudePaused, runOrientPassFn = runOrientPass,
+  isClaudePausedFn = isClaudePaused, runOrientPassFn = runOrientPass, runPlanCritiqueFn = runPlanCritique,
 } = {}) {
-  const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked } =
+  const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn } =
     resolveDraftContext(task, { localCall, withLockFn });
 
   try {
@@ -1525,6 +1541,34 @@ async function runDraftPasses(task, attempt, {
 
       const literalEditResult = tryDeterministicLiteralEdit(task, attempt);
       if (literalEditResult) return literalEditResult;
+
+      // Plan critique (component 4): check the grounded plan for mechanical gaps before the
+      // implement ladder burns turns. A deterministic pre-filter does the high-value checks;
+      // a small qwen2.5:3b call on its own lock key is the semantic fallback. Advisory --
+      // "gaps" triggers exactly one bounded re-plan. Default OFF (=== 'true' to enable).
+      if (resolveSourceName(task) === 'adhoc'
+          && process.env.AGENT_MANAGER_ADHOC_PLAN_CRITIQUE === 'true'
+          && !task._planCritiqueRevised) {
+        try {
+          const critique = await runPlanCritiqueFn(task, { maybeLockedOn });
+          recordPlanCritique(attempt, { verdict: critique.verdict, gapCount: critique.gaps.length, viaModel: critique.viaModel });
+          appendHistoryEvent(task, 'plan-critique-done', critique.verdict === 'ok' ? 'ok' : `${critique.gaps.length} gap(s): ${critique.gaps.map((g) => g.split(' ')[0]).join(',')}`);
+          if (critique.verdict === 'gaps') {
+            task._planCritiqueFeedback = critique.gaps;
+            task._planCritiqueRevised = true;
+            if (critique.gaps.some((g) => g.startsWith('SCOPE_TOO_BIG'))) {
+              task._decomposeHint = critique.gaps.find((g) => g.startsWith('SCOPE_TOO_BIG'));
+            }
+            const rePlan = await runPlanPass(task, {
+              maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
+            });
+            delete task._planCritiqueFeedback;
+            if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason };
+          }
+        } catch (e) {
+          appendHistoryEvent(task, 'advisory', `plan-critique errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
+        }
+      }
 
       // adhoc-shaped tasks implement via a tiered LOCAL agentic ladder (harness-search ->
       // read-only agentic -> write agentic in an isolated worktree) instead of the blind

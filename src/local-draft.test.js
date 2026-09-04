@@ -337,6 +337,43 @@ test('adhoc: AGENT_MANAGER_ADHOC_ORIENT=false disables the orient pass entirely'
   });
 });
 
+test('adhoc: plan-critique (flag on) runs once, a "gaps" verdict triggers exactly one bounded re-plan', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    seedWidget(dir);
+    process.env.AGENT_MANAGER_ADHOC_PLAN_CRITIQUE = 'true';
+    try {
+      let planCalls = 0; let critiqueCalls = 0;
+      const task = { id: 'adhoc-critique', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'change updateWidgetCache in src/widget.js' } };
+      await draftTask(task, {
+        localCall: async ({ prompt }) => { if (/numbered, actionable PLAN/.test(prompt)) planCalls += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; },
+        ...spyLock(),
+        runOrientPassFn: async () => ({ notes: '', turnsUsed: 0, skipped: true }),
+        runPlanCritiqueFn: async () => { critiqueCalls += 1; return { verdict: 'gaps', gaps: ['MISSING_REQUIREMENT no widget', 'SCOPE_TOO_BIG spans many files'], viaModel: true }; },
+        ...declineLocalTiers(),
+      });
+      assert.equal(critiqueCalls, 1, 'critique runs once');
+      assert.equal(planCalls, 2, 'one initial plan + one re-plan');
+      assert.ok((task.history || []).some((h) => h.stage === 'plan-critique-done'));
+      assert.equal(task._planCritiqueFeedback, undefined, 'transient feedback cleared');
+    } finally { delete process.env.AGENT_MANAGER_ADHOC_PLAN_CRITIQUE; }
+  });
+});
+
+test('adhoc: plan-critique is OFF by default (no flag) -- runPlanCritiqueFn never called', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    seedWidget(dir);
+    let called = false;
+    const task = { id: 'adhoc-nocritique', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'change updateWidgetCache in src/widget.js' } };
+    await draftTask(task, {
+      localCall: fakeLocalCall(PLAN_STUB), ...spyLock(),
+      runOrientPassFn: async () => ({ notes: '', turnsUsed: 0, skipped: true }),
+      runPlanCritiqueFn: async () => { called = true; return { verdict: 'ok', gaps: [] }; },
+      ...declineLocalTiers(),
+    });
+    assert.equal(called, false);
+  });
+});
+
 test('adhoc: tier 3 gets no _priorInvestigation when tier 2 produced no investigation summary', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
