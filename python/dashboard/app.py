@@ -5674,7 +5674,10 @@ def _sync_live_checkout(main_branch):
             os.utime(Path(__file__), None)
             restart_triggered = True
         except OSError:
-            pass
+            logger.error(
+                "Failed to trigger reloader restart via os.utime after dashboard sync",
+                exc_info=True,
+            )
     return {"synced": True, "changed": True, "changedFiles": changed_files, "restartTriggered": restart_triggered}
 
 
