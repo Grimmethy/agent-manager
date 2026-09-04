@@ -1224,7 +1224,7 @@ function computeImplementBudget(task, implPrompt) {
 // task (a valid split, or a blocked invalid split), else { done: false } so the caller
 // falls through to critique.
 async function finalizeCandidateFulfillment(task, {
-  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+  maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
   const split = parseCandidateSplit(task.implementResponse);
   if (split) {
@@ -1236,6 +1236,27 @@ async function finalizeCandidateFulfillment(task, {
     // is never re-split, whatever the source: the hard recursion stop.
     const entry = getRegisteredSource(resolveSourceName(task));
     const splitBlocked = atSplitCap || (entry && entry.noCandidateSplit && !pc.mustPreSplit);
+    // A source can register a `premiseCheck(task, {call, maybeLockedOn})` -- generic,
+    // source-agnostic hook, same convention as `noCandidateSplit` above -- run BEFORE a
+    // split is honored, never after: this is the fan-out point, so it's the cheapest place
+    // to stop a candidate whose Problem statement makes a checkable claim about the
+    // codebase that the fetched content contradicts (arch-import-premise-check.js in the
+    // hygiene plugin; see AC-8, which split into 3 children before anyone checked its
+    // premise was false). Skipped once splitBlocked is already true -- cheapest check first.
+    if (!splitBlocked && entry && typeof entry.premiseCheck === 'function') {
+      let premise;
+      try {
+        premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
+      } catch (e) {
+        premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
+      }
+      if (premise && premise.verdict === 'invalid-premise') {
+        const reason = `Invalid premise: ${String(premise.reason || '(no detail)')}`.slice(0, 500);
+        recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
+        appendHistoryEvent(task, 'blocked', reason);
+        return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
+      }
+    }
     if (splitBlocked) {
       const reason = atSplitCap
         ? 'implement pass tried to split a sub-candidate that is already a one-level decomposition (Split-Depth >= 1) -- blocked for a human to narrow the fix'
