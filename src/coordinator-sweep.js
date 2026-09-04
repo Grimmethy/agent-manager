@@ -17,7 +17,8 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { findTaskRecordById } = require('./forensic-bundle.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { runIntegrationGate } = require('./decompose-integration-gate.js');
+const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
+const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 
 // findTaskRecordById state -> the status shown on the parent's checklist.
 function classifyChildStatus(rec) {
@@ -94,7 +95,26 @@ function runStackedGate(parent, repoRoot) {
   }
 }
 
-function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate } = {}) {
+// Deterministic blueprint wiring (wire-decomposed-blueprints.js). Runs once, on the
+// transition to all-move-children-done, BEFORE the integration gate: splices the
+// `register_blueprint` block onto the shared branch so the gate has something to verify.
+// Only fires for hubs `fileHub()` stamped `wiringPending` + `wiringMoves` (all-blueprint
+// decompositions); a mixed decomposition still has an LLM wiring child in its subTasks.
+function runStackedWiring(parent, repoRoot) {
+  if (!repoRoot || !parent.branch || !parent.sourceFile || !Array.isArray(parent.wiringMoves)) {
+    return { ok: false, detail: 'missing repoRoot/branch/sourceFile/wiringMoves' };
+  }
+  try {
+    return wireDecomposedBlueprints({
+      repoRoot, branch: parent.branch, sourceFile: parent.sourceFile,
+      moves: parent.wiringMoves, exec: realExec,
+    });
+  } catch (e) {
+    return { ok: false, detail: e && e.message ? e.message : String(e) };
+  }
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring } = {}) {
   const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
   let resolvedRepoRoot = repoRoot;
@@ -187,6 +207,35 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate } = 
       parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
       delete parent.blockedReason;
       delete parent.coordinatorBlocked;
+    }
+
+    // Stacked all-blueprint decompose hub: every move child committed its Blueprint module
+    // to the branch, but nothing registered them yet. Do the `register_blueprint` splice
+    // deterministically now, before the gate. On failure the hub stays in coordinating/
+    // with a blockedReason; on success wiringPending clears and the next tick runs the gate
+    // against the wired branch.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending')) {
+      const res = runWiring(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res && res.ok) {
+        parent.wiringPending = false;
+        appendHistoryEvent(parent, 'advisory', res.skipped
+          ? `blueprint wiring already present on ${parent.branch}`
+          : `wired ${res.registered} blueprint(s) onto ${parent.branch}${res.sha ? ` @ ${res.sha.slice(0, 10)}` : ''}`);
+        summary.wired = (summary.wired || 0) + 1;
+      } else {
+        parent.blockedReason = `deterministic blueprint wiring failed on ${parent.branch}: ${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: 'blueprint-wiring:failed', since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: (res && res.detail) || 'wiring failed' }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+      }
+      try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+      catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+      continue;
     }
 
     // Stacked decompose hub: children done is necessary but not sufficient -- the shared
