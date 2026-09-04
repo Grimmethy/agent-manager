@@ -29,6 +29,7 @@ const CONTRACT = {
     other: { groupBJsonInstructions: 'string', candidateSplitInstructions: 'string' },
   },
   './atomic-write.js': { functions: ['writeAtomicSync', 'writeJsonAtomicSync'] },
+  './git-runner.js': { functions: ['detectDefaultBranch'] },
   './deterministic-recheck-registry.js': { functions: ['registerDeterministicRecheck', 'getDeterministicRecheck', 'getRecheckSources', 'clearDeterministicRecheckRegistry'] },
   './model-profile-registry.js': { functions: ['clearModelProfileRegistry'] },
 };

@@ -174,6 +174,20 @@ function getConfig() {
   // line points at this pipeline's OWN src/.
   const pipelineFixCandidatesPath = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH
     || path.join(repoRoot, 'Docs', 'PIPELINE_FIX_CANDIDATES.md');
+  // change_review (agent-manager-hygiene, 2026-09-04) -- diff-scoped correctness review of
+  // each unit merged to the main branch. Confirmed regressions land here as `### AC-NNN`
+  // candidates (same format as PIPELINE_FIX_CANDIDATES.md) and change_review_fix turns them
+  // into real diffs. repoRoot/Docs so the candidate doc travels with the reviewed repo's
+  // own history, like archReviewCandidatesPath.
+  const changeReviewCandidatesPath = process.env.AGENT_MANAGER_CHANGE_REVIEW_CANDIDATES_PATH
+    || path.join(repoRoot, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md');
+  // The SHA cursor for change_review's commit walk -- { lastReviewedSha, updatedAt }. Only
+  // ever advanced over commits whose review task is already queued/done (taskIdExistsInQueue),
+  // so it is a pure optimization, not the idempotency key (the sha is in the task id). Lives
+  // in pipelineDir with the other cross-run state files; must be gitignored when
+  // pipelineDir === repoRoot, same as forensics-coverage.json.
+  const changeReviewCursorPath = process.env.AGENT_MANAGER_CHANGE_REVIEW_CURSOR_PATH
+    || path.join(pipelineDir, 'change-review-cursor.json');
   // job-type-counters.js (Job List tab, 2026-08-23: "we should add a field that tracks how
   // many times each job type has been performed") -- a long-term debugging counter, per
   // source name, that survives independently of any individual task record's lifecycle
@@ -303,6 +317,7 @@ function getConfig() {
     stalenessAuditCoveragePath,
     forensicsCoveragePath,
     pipelineFixCandidatesPath,
+    changeReviewCandidatesPath, changeReviewCursorPath,
     jobTypeCountersPath,
     performanceCoveragePath,
     productSpecPath,
