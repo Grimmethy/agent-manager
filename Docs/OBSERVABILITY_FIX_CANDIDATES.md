@@ -2892,3 +2892,26 @@ In the timeout branch (the `if time.time() >= deadline:` block, currently lines 
 
 Benefits:
 Every lock-timeout event now leaves a timestamped, greppable line in the dashboard log identifying the lock path, the wait duration, and the probable competing process, turning an invisible race-condition failure into a diagnosable one. Raising `RuntimeError` additionally prevents a caller from accidentally treating the `None` return as a benign "skip" and ensures the merge UI can show the user a concrete "lock busy, try again in a few seconds" message instead of a silent no-op.
+
+### AC-161 · Empty catch swallows git-runner init failure with no diagnostic
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  let names;
+```
+
+Problem:
+Line 89 wraps the `createRealGitRunner(repoRoot)` call in `try { … } catch { /* default */ }`. The catch block is completely empty — no `console.error`, no rethrow, no fallback assignment to `mainBranch`. If the git runner throws (bad `repoRoot`, missing git binary, permission error, etc.), `mainBranch` silently remains `undefined` and execution falls straight into `runIntegrationGate({ …, mainBranch, … })` on line 92, passing an undefined branch name into the gate. The operator sees either a confusing downstream failure inside the gate or a silent pass with no branch context, and there is zero log line tying the symptom back to the git-runner initialization that actually failed. The comment `/* default */` is misleading because no default value is assigned.
+
+Solution:
+Replace the bare `catch { /* default */ }` on line 89 with a catch that (1) logs the failure via `console.error` including the `repoRoot` value and the exception message so the operator can identify which repo and which git-runner call broke, and (2) explicitly sets `mainBranch = undefined` (or a project-appropriate sentinel) so the intent is visible, then lets execution continue to the gate call which already handles its own errors structurally. Concretely: `catch (e) { console.error('[coordinator-sweep] git-runner init failed for repoRoot=' + repoRoot + ': ' + (e && e.message || e)); }`. No rethrow is needed here because the very next `try/catch` around `runIntegrationGate` already captures and reports gate-level failures, and the caller of this function expects a structured result object rather than a thrown exception.
+
+Benefits:
+An operator running the coordinator sweep will now see a single, clearly-labelled `console.error` line naming the failing `repoRoot` and the underlying git-runner exception the moment initialization fails, instead of discovering the problem indirectly through a confusing gate result or a silent no-op. This turns an invisible, unattributable failure into a one-line diagnostic that points directly at the git-runner module and the specific repo path, cutting mean-time-to-diagnosis for sweep anomalies from "which of many things broke?" to "git-runner init for /path/to/repo threw <msg>."
