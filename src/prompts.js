@@ -330,6 +330,20 @@ function planGroundingBlock(task) {
   ];
 }
 
+function statedAcceptanceBlock(task) {
+  const ctx = (task && task.promptContext) || {};
+  const raw = ctx.acceptanceCriteria;
+  if (raw == null) return [];
+  const items = Array.isArray(raw) ? raw : String(raw).split('\n');
+  const bullets = items.map((s) => String(s || '').replace(/^\s*(?:[-*]|\d+[.)])\s*/, '').trim()).filter(Boolean);
+  if (!bullets.length) return [];
+  return [
+    '',
+    'THE TASK STATES THESE ACCEPTANCE CRITERIA (restate them verbatim as your CRITERIA: bullets):',
+    ...bullets.map((b, i) => `${i + 1}. ${b}`),
+  ];
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -341,6 +355,9 @@ function adhocPlanPrompt(task) {
     '',
     'Write a numbered, actionable PLAN.',
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
+    ...statedAcceptanceBlock(task),
+    '',
+    'End your PLAN with a line "CRITERIA:" followed by 2-5 bullets, each a concrete, checkable definition of done for this task (a command that would pass, a file that would contain X, an endpoint that would return Y). These are what the implementation and the review will be held to.',
     ...seedPlanBlock(task),
     ...planGroundingBlock(task),
   ].join('\n');
