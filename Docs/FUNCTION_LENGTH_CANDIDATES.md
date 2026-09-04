@@ -2416,3 +2416,131 @@ Extract four named helpers from the body, keeping the outer function as a thin o
 
 Benefits:
 Each extracted helper can be unit-tested in isolation with a stubbed file system or in-memory record map, without exercising the full I/O path. Code review becomes tractable because a diff touching escalation logic no longer sits inside a 150-line hunk that also touches JSON parsing. New contributors can understand the sweep pipeline by reading the orchestrator's five sequential calls rather than tracing a single dense block, and the mutable shared state (`coordinatorBlocked`, `recById`) is now explicitly passed and returned, making data flow visible at the call sites rather than implicit through a shared local scope.
+
+### AC-29 · Decompose runIntegrationGate into per-check and lifecycle helpers
+Strength: Strong
+Files: src/decompose-integration-gate.js
+Snippet:
+```
+// -- only for a setup failure it genuinely can't proceed past (e.g. cannot create the
+// worktree), which the caller treats as an errored (not failed) gate and retries later.
+function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFile, routes = [], exec = realExec } = {}) {
+  const checks = [];
+  const srcDir = path.dirname(sourceFile);
+  const srcModule = path.basename(sourceFile).replace(/\.py$/, '');
+  const isPy = /\.py$/.test(sourceFile);
+  const wtBase = fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-gate-'));
+  const branchWt = path.join(wtBase, 'branch');
+  const mainWt = path.join(wtBase, 'main');
+  const cleanup = [];
+
+  const record = (name, status, detail) => checks.push({ name, status, detail: String(detail || '').slice(0, 2000) });
+  const done = () => {
+    for (const wt of cleanup) {
+      try { exec('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot }); } catch { /* best-effort */ }
+    }
+    try { fs.rmSync(wtBase, { recursive: true, force: true }); } catch { /* best-effort */ }
+    const failed = checks.filter((c) => c.status === 'fail');
+    return { ok: failed.length === 0, checks, branch };
+  };
+
+  try {
+    exec('git', ['worktree', 'add', '--detach', branchWt, branch], { cwd: repoRoot });
+    cleanup.push(branchWt);
+  } catch (e) {
+    record('setup', 'fail', `could not create worktree for ${branch}: ${e.message}`);
+    return { ...done(), errored: true };
+  }
+
+  if (!isPy) {
+    record('language', 'skip', `integration gate only covers Python decompositions; ${sourceFile} left to review`);
+    return done();
+  }
+
+  // 1. py_compile every changed / new .py file on the branch.
+  let changed = [];
+  try {
+    const out = exec('git', ['diff', '--name-only', `${mainBranch}...${branch}`], { cwd: repoRoot });
+    changed = out.split('\n').map((s) => s.trim()).filter((s) => s.endsWith('.py'));
+  } catch (e) {
+    record('py_compile', 'skip', `could not list changed files: ${e.message}`);
+  }
+  const toCompile = Array.from(new Set([sourceFile, ...changed])).filter((f) => fs.existsSync(path.join(branchWt, f)));
+  if (toCompile.length) {
+    try {
+      exec('python3', ['-m', 'py_compile', ...toCompile], { cwd: branchWt });
+      record('py_compile', 'pass', `${toCompile.length} file(s): ${toCompile.join(', ')}`);
+    } catch (e) {
+      record('py_compile', 'fail', `${(e.stderr || e.stdout || e.message)}`);
+      return done();
+    }
+  }
+
+  // 2. import the source module -- catches the circular import the isolated compile can't.
+  try {
+    exec('python3', ['-c', `import ${srcModule}`], { cwd: path.join(branchWt, srcDir), timeout: 30_000 });
+    record('import', 'pass', `import ${srcModule} from ${srcDir} exits 0`);
+  } catch (e) {
+    const msg = String(e.stderr || e.stdout || e.message);
+    // A bare ModuleNotFoundError for a third-party dep means this environment can't import
+    // the app at all -- not the branch's fault. A circular import / NameError / ImportError
+    // for a first-party name IS the branch's fault.
+    if (/ModuleNotFoundError: No module named '(flask|werkzeug|jinja2)'/.test(msg) && !/circular|partially initialized/.test(msg)) {
+      record('import', 'skip', `app dependencies not installed here: ${msg.split('\n').pop()}`);
+      return done();
+    }
+    record('import', 'fail', msg);
+    return done();
+  }
+
+  // 3. url_map invariant: identical route table on main and on the branch.
+  try {
+    exec('git', ['worktree', 'add', '--detach', mainWt, mainBranch], { cwd: repoRoot });
+    cleanup.push(mainWt);
+  } catch (e) {
+    record('url_map', 'skip', `could not create ${mainBranch} worktree: ${e.message}`);
+    return done();
+  }
+  const dump = (wt) => {
+    const p = path.join(wt, srcDir, '.decompose_url_dump.py');
+    fs.writeFileSync(p, URL_MAP_DUMP);
+    try { return exec('python3', ['.decompose_url_dump.py'], { cwd: path.join(wt, srcDir), timeout: 30_000 }); }
+    finally { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  };
+  let mainRules; let branchRules;
+  try { mainRules = dump(mainWt).trim(); branchRules = dump(branchWt).trim(); } catch (e) {
+    record('url_map', 'skip', `route dump failed: ${String(e.stderr || e.message).split('\n').pop()}`);
+    return done();
+  }
+  if (mainRules.startsWith('IMPORT_ERROR') || branchRules.startsWith('IMPORT_ERROR')) {
+    record('url_map', 'fail', `route dump import error -- main: ${mainRules.slice(0, 300)} | branch: ${branchRules.slice(0, 300)}`);
+    return done();
+  }
+  let cmp;
+  try { cmp = diffRouteTables(mainRules, branchRules); } catch {
+    record('url_map', 'skip', 'route dump was not JSON'); return done();
+  }
+  if (!cmp.ok) {
+    record('url_map', 'fail',
+      `route table changed -- a pure relocation must not. Dropped: ${cmp.droppedRules.join(' | ') || 'none'}. Added: ${cmp.addedRules.join(' | ') || 'none'}.`);
+    return done();
+  }
+  record('url_map', 'pass', `${cmp.count} routes, rule table unchanged (endpoints re-homed as expected)`);
+
+  // 4. boot smoke -- opt-in (needs a runnable app + a free port).
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BOOT_SMOKE === 'true' && routes.length) {
+    record('boot', 'skip', 'boot smoke requested but not implemented in this build -- import + url_map cover the crash modes');
+  }
+
+  return done();
+}
+```
+
+Problem:
+`runIntegrationGate` spans roughly 110 lines and interweaves three distinct responsibilities—worktree lifecycle management (create, exec, cleanup, teardown), per-check error-interpretation logic (distinguishing missing third-party deps from circular imports via regex over stderr, handling `IMPORT_ERROR` sentinels and JSON-parse failures in the `url_map` check), and result aggregation via the `done()` closure that captures `checks`, `cleanup`, `wtBase`, and `branch` from the outer scope. Because the worktree teardown (`cleanup.push(...)`, `done()`) is threaded through the body of each check rather than isolated, a reader must track which worktree is alive and who owns its cleanup across the entire span. The per-check logic (e.g., the import check's stderr regex, the `url_map` check's structural diff) is only exercisable today by spinning up two git worktrees, writing a temp `.py` file, and exec-ing `python3`, which makes unit-testing each decision path impractical and pushes all verification into slow integration tests.
+
+Solution:
+Extract the worktree setup and teardown into a `setupWorktrees(repoRoot, branch, mainBranch)` helper that returns `{ branchWt, mainWt, cleanup }`, and a `teardownWorktrees(cleanup)` wrapper that runs all pushed cleanup steps and unlinks temp files. Extract each numbered check into its own small, clearly-named function—`checkPyCompile(ctx)`, `checkImportResolution(ctx)`, `checkUrlMap(ctx)`, `checkRuntimeBehavior(ctx)`—where `ctx` is a plain object carrying `branchWt`, `mainWt`, `sourceFile`, `exec`, and a `record(result)` callback. Each check function returns a `CheckResult` and owns its own error-interpretation logic (the stderr regex, the sentinel handling, the JSON diff) without touching worktree lifecycle. The top-level `runIntegrationGate` then shrinks to a ~20-line orchestration: call `setupWorktrees`, run the four checks in order via a small loop or explicit sequence, call `teardownWorktrees`, and aggregate results.
+
+Benefits:
+Each per-check function becomes independently unit-testable by passing a mock `ctx` with a stubbed `exec` that returns canned stderr or JSON, eliminating the need for real worktrees in most test cases. The worktree lifecycle is visible in exactly one place, so a reviewer can verify cleanup correctness (no leaked worktrees, no missing `unlink` calls) in a single 15-line function rather than scanning 110 lines for interleaved `cleanup.push` calls. The `done()` closure's implicit captured state disappears; the orchestration function's data flow is explicit—inputs in, `CheckResult[]` out—making the contract obvious in code review and in the function's type signature.
