@@ -1166,43 +1166,6 @@ def api_scriptforge_config():
     return jsonify({"url": os.environ.get("SCRIPTFORGE_URL", "http://localhost:7432")})
 
 
-def _hardware_history_averages(history: list) -> dict:
-    """Current-vs-average is computed here rather than in hardware_stats.py -- that
-    module only knows about individual samples, "average over the retention window" is
-    a view concern for this endpoint's caller (the hardware graph), not something the
-    collector itself needs. None (not 0) when a field has no samples yet, same
-    fail-open convention as every field in hardware_stats.get_snapshot()."""
-
-    def avg(get):
-        values = [v for v in (get(entry) for entry in history) if v is not None]
-        return sum(values) / len(values) if values else None
-
-    return {
-        "cpuPercent": avg(lambda e: e["cpuPercent"]),
-        "cpuTemperatureCelsius": avg(lambda e: e["cpuTemperatureCelsius"]),
-        "ramUsedBytes": avg(lambda e: e["ram"]["usedBytes"] if e["ram"] else None),
-        "diskUsedBytes": avg(lambda e: e["disk"]["usedBytes"] if e["disk"] else None),
-        "gpuUtilizationPercent": avg(lambda e: e["gpu"]["utilizationPercent"] if e["gpu"] else None),
-        "gpuVramUsedMiB": avg(lambda e: e["gpu"]["vramUsedMiB"] if e["gpu"] else None),
-        "gpuTemperatureCelsius": avg(lambda e: e["gpu"]["temperatureCelsius"] if e["gpu"] else None),
-    }
-
-
-@app.route("/api/hardware/stats")
-def api_hardware_stats():
-    # hardware_stats' own functions never raise (see that module's fail-open docstring --
-    # every field independently degrades to None instead), so there's no try/except here:
-    # a fresh dashboard with an empty/nonexistent hardware-stats.db and no GPU still
-    # returns 200 with "history": [] and "gpu"/averages fields as None, never an error.
-    snapshot = hardware_stats.get_snapshot()
-    history = hardware_stats.get_history()
-    return jsonify({
-        "current": snapshot,
-        "history": history,
-        "averages": _hardware_history_averages(history),
-    })
-
-
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -1878,77 +1841,6 @@ def api_benchmark_response(run_id, response_id):
 
 
 _REPORT_PERIODS = ("hourly", "daily", "weekly")
-
-
-def _reports_root() -> Path | None:
-    """Where system-report.js (src/system-report.js) writes its scheduled Markdown
-    reports -- SECOND_BRAIN_DIR/Agent Manager Reports/<period>/<filename>.md, same
-    'SECOND_BRAIN_DIR is the durable store, dashboard just reads it' shape as the
-    benchmark endpoints above."""
-    sb = second_brain_dir()
-    return (sb / "Agent Manager Reports") if sb else None
-
-
-def _safe_report_period(period: str) -> str:
-    if period not in _REPORT_PERIODS:
-        abort(400, description="invalid report period")
-    return period
-
-
-def _safe_report_filename(filename: str) -> str:
-    """Reports are only ever named by system-report.js's own reportFilename() (a
-    YYYY-MM-DD / YYYY-MM-DDThh style stem plus '.md') -- reject anything else rather than
-    trust a client-supplied path segment (path traversal via '../' in the URL)."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.md", filename or ""):
-        abort(400, description="invalid report filename")
-    return filename
-
-
-@app.route("/api/reports")
-def api_reports():
-    """Every generated report across all three periods, newest first -- the Time Tracking
-    tab's list view. Empty (not an error) if SECOND_BRAIN_DIR isn't configured or no
-    report has been generated yet, same shape every other SECOND_BRAIN_DIR-gated endpoint
-    here uses."""
-    root = _reports_root()
-    if not root or not root.is_dir():
-        return jsonify([])
-    reports = []
-    for period in _REPORT_PERIODS:
-        period_dir = root / period
-        if not period_dir.is_dir():
-            continue
-        for entry in period_dir.iterdir():
-            if not entry.is_file() or entry.suffix != ".md":
-                continue
-            try:
-                stat = entry.stat()
-            except OSError:
-                continue
-            reports.append({
-                "period": period,
-                "filename": entry.name,
-                "generatedAt": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-            })
-    reports.sort(key=lambda r: r["generatedAt"], reverse=True)
-    return jsonify(reports)
-
-
-@app.route("/api/reports/<period>/<filename>")
-def api_report_detail(period, filename):
-    period = _safe_report_period(period)
-    filename = _safe_report_filename(filename)
-    root = _reports_root()
-    if not root:
-        abort(404, description="SECOND_BRAIN_DIR is not configured")
-    path = root / period / filename
-    if not path.is_file():
-        abort(404)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError:
-        abort(404)
-    return jsonify({"period": period, "filename": filename, "content": content})
 
 
 @app.route("/api/queue/<state>")
@@ -7277,6 +7169,14 @@ def api_pipeline_stop():
 
 def _is_loopback_host(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
+
+
+# --- Decomposed route blueprints (file-decompose) ---
+from routes.hardware import hardware_bp  # noqa: E402
+from routes.reports import reports_bp  # noqa: E402
+
+app.register_blueprint(hardware_bp)
+app.register_blueprint(reports_bp)
 
 
 if __name__ == "__main__":
