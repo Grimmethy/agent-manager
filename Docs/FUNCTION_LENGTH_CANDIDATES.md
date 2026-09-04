@@ -2544,3 +2544,124 @@ Extract the worktree setup and teardown into a `setupWorktrees(repoRoot, branch,
 
 Benefits:
 Each per-check function becomes independently unit-testable by passing a mock `ctx` with a stubbed `exec` that returns canned stderr or JSON, eliminating the need for real worktrees in most test cases. The worktree lifecycle is visible in exactly one place, so a reviewer can verify cleanup correctness (no leaked worktrees, no missing `unlink` calls) in a single 15-line function rather than scanning 110 lines for interleaved `cleanup.push` calls. The `done()` closure's implicit captured state disappears; the orchestration function's data flow is explicit—inputs in, `CheckResult[]` out—making the contract obvious in code review and in the function's type signature.
+
+### AC-30 · Decompose the five-phase `acquire()` protocol into named sub-functions
+Strength: Strong
+Files: src/gpu-arbiter.js
+Snippet:
+```
+// holding, a background interval re-touches the ticket and, if cancelRequested lands,
+// invokes onCancel() exactly once -- the caller wires that to abort its model call.
+function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phase = null, onCancel = null } = {}) {
+  const dir = ticketsDir(instancesDir, model);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const myRank = classRank(cls);
+  const seq = String(Date.now()).padStart(16, '0');
+  const name = `${seq}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.json`;
+  const fp = path.join(dir, name);
+  const mySeqNum = Number(seq);
+
+  writeTicketAtomic(fp, {
+    pid: process.pid, cls, taskId, phase,
+    startedAt: nowIso(), holding: false, cancelRequested: false,
+  });
+
+  // If this pid already holds a place ticket (holdPlace) of equal-or-higher priority for
+  // this model, FIFO position is already reserved -- an inner per-turn acquire must not
+  // re-queue behind peers that arrived AFTER the place (that would deadlock: the place
+  // blocks those peers, and those peers would block this turn). Skip the wait loop; the
+  // real flock still serialises the actual model call.
+  const holdsPlace = liveTickets(instancesDir, model).some(
+    (t) => t.pid === process.pid && t.place && classRank(t.cls) <= myRank,
+  );
+
+  const deadline = Date.now() + overallTimeoutMs();
+
+  try {
+    for (;;) {
+      if (holdsPlace) break;
+      if (Date.now() >= deadline) {
+        safeUnlink(fp);
+        throw new Error(`gpu-arbiter: '${cls}' ticket for model '${model || '(default)'}' timed out waiting to reach the head of the queue`);
+      }
+      touch(fp);
+      const tickets = liveTickets(instancesDir, model);
+      const mine = tickets.find((t) => t._name === name);
+      if (!mine) {
+        // our ticket was swept (we were too slow to re-touch, or a clock jump) -- re-add.
+        writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, startedAt: nowIso(), holding: false, cancelRequested: false });
+        continue;
+      }
+      if (mine.cancelRequested) {
+        safeUnlink(fp);
+        const err = new Error('gpu-arbiter: cancelled while waiting');
+        err.gpuArbiterCancelled = true;
+        throw err;
+      }
+      const higherExists = tickets.some((t) => t._name !== name && t.pid !== process.pid && classRank(t.cls) < myRank);
+      // A ticket owned by THIS pid at our own class (typically a holdPlace() place-holder
+      // for a chat tool loop, or a re-added ticket after a sweep) is not a competitor --
+      // this process already has its spot.
+      const earlierPeer = tickets.some((t) => t._name !== name && t.pid !== process.pid
+        && classRank(t.cls) === myRank && t._seq < mySeqNum);
+      if (!higherExists && !earlierPeer) break;
+      sleepSync(POLL_MS);
+    }
+  } catch (err) {
+    safeUnlink(fp);
+    throw err;
+  }
+
+  // At the head -- take the real mutex. skipPriorityBackoff: the ARBITER is the priority
+  // mechanism now; sfl's own .discuss-waiting backoff would just make us wait on the
+  // compat marker the arbiter itself drops for interactive tickets.
+  const compat = interactiveCompatMarker(instancesDir, cls);
+  let flockHandle;
+  try {
+    flockHandle = sfl.acquire(instancesDir, model, { skipPriorityBackoff: true });
+  } catch (err) {
+    compat.remove();
+    safeUnlink(fp);
+    throw err;
+  }
+  patchTicket(fp, { holding: true });
+
+  let cancelled = false;
+  let released = false;
+  const watcher = setInterval(() => {
+    if (released) return;
+    touch(fp);
+    compat.refresh();
+    const cur = readTicket(fp);
+    if (cur && cur.cancelRequested && !cancelled) {
+      cancelled = true;
+      if (typeof onCancel === 'function') {
+        try { onCancel(); } catch { /* best-effort */ }
+      }
+    }
+  }, REFRESH_MS);
+  if (typeof watcher.unref === 'function') watcher.unref();
+
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      clearInterval(watcher);
+      try { sfl.release(flockHandle); } catch { /* already released */ }
+      compat.remove();
+      safeUnlink(fp);
+    },
+    cancelled: () => cancelled,
+  };
+}
+```
+
+Problem:
+The `acquire()` function at roughly 103 lines is not merely padded with long string literals or a flat config table; it is a five-phase protocol (ticket creation, place-holder shortcut, polling wait loop, real mutex acquisition, and background watcher setup) in which at least two phases carry non-trivial branching logic. Phase 3 (the polling loop, ~35 lines) contains four distinct edge-case branches—sweep recovery, cancellation detection, higher-priority peer exists, earlier-peer exists—that a reader must hold simultaneously in working memory to verify any single one. Phase 5 (~30 lines) introduces a mutable `cancelled`/`released` pair and a `setInterval` closure that outlives the call, making the function's lifetime semantics opaque. Because all five phases are inlined in one procedural body, a unit test author cannot exercise the arbitration logic or the watcher lifecycle in isolation without also exercising filesystem setup and mutex acquisition, and a reviewer must track state mutations across the entire span to confirm no phase clobbers another's invariants.
+
+Solution:
+Extract four named helpers that each own one or two phases, leaving `acquire()` as a thin orchestrator of roughly 20–25 lines. (1) `createTicket(instancesDir, opts)` – phase 1: unique-name generation, directory setup, atomic write. (2) `shouldSkipWait(ticket, instancesDir)` – phase 2: the place-holder shortcut check returning a boolean. (3) `waitForSlot(ticket, instancesDir, opts)` – phase 3: the polling loop with its four branches (sweep recovery, cancel, higher-priority, earlier-peer), returning either a resolved slot or a rejection reason. (4) `attachWatcher(ticket, instancesDir, opts)` – phase 5: the `setInterval` re-touch, cancel callback wiring, and the `release()` closure, returning the handle object. Phase 4 (real `sfl.acquire` + `patchTicket`) is short enough (~15 lines) to remain inline in the orchestrator or to fold into `waitForSlot`'s tail. Each helper takes only the data it needs, so the orchestrator reads top-to-bottom as a checklist of the protocol's steps.
+
+Benefits:
+Each extracted helper has a single, nameable responsibility that maps directly to a unit test: `shouldSkipWait` can be tested with a mocked filesystem in two lines, `waitForSlot` can be tested with a fake clock and a stubbed peer list without touching `sfl.acquire`, and `attachWatcher` can be tested for correct interval cleanup and cancel propagation in isolation. Code review becomes phase-scoped—a reviewer checking the arbitration logic reads only `waitForSlot` and its four branches rather than scanning 103 lines for the relevant block. The orchestrator's short body also makes it immediately obvious at a glance which phases exist and in what order, reducing the cognitive load on anyone onboarding to the arbiter.
