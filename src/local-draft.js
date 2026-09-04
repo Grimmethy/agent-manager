@@ -44,6 +44,7 @@ const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
+const { resolveAccessibleRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const {
@@ -205,7 +206,7 @@ function parseHarnessQueries(planResponse) {
   return [...(planResponse || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
 }
 
-async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch }) {
+async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch, roots }) {
   const queries = parseHarnessQueries(task.planResponse);
   if (kind === 'projectSearch') {
     let searchResults = [];
@@ -223,14 +224,16 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
     return;
   }
   // 'archImport' -- also pipeline_self_audit / pipeline_health_audit / ui_visibility_audit /
-  // staleness_audit: literally the same archImportFetch of agent-manager's own repo, the
+  // staleness_audit / pipeline_forensics(_fix) / product_spec_outline/section: literally
+  // the same archImportFetch of agent-manager's own repo (PLUS any loaded plugin repo,
+  // 2026-09-04 -- see accessible-roots.js's own header for the incident this closes), the
   // only difference being what promptContext text the implement prompt renders around the
   // hits (which lives in the prompt, not this step).
   let harnessHits = [];
   let harnessFiles = [];
   if (queries.length > 0) {
     try {
-      const result = archImportFetch(queries);
+      const result = archImportFetch(queries, { roots });
       harnessHits = result.hits || [];
       harnessFiles = result.files || [];
     } catch (e) {
@@ -989,7 +992,12 @@ async function runPlanPass(task, {
   // staleness_audit).
   const harnessKind = getRegisteredSource(resolveSourceName(task))?.harnessSearch;
   if (harnessKind) {
-    await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch });
+    // Cross-repo (2026-09-04): every 'archImport'-kind source is fundamentally "what does
+    // this pipeline's own code do" -- collapses to [repoRoot] with zero plugins loaded, so
+    // this is additive only (see accessible-roots.js's own header for the incident this
+    // closes). 'projectSearch' ignores `roots` entirely (external API, not a repo grep).
+    const roots = resolveAccessibleRoots();
+    await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch, roots });
   }
   return { blocked: false };
 }
