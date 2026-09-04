@@ -125,7 +125,7 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
   try {
     names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
   } catch (err) {
-    if (err.code === 'ENOENT') return summary; // no coordinating/ dir yet -- nothing to sweep
+    if (err.code === 'ENOENT') { console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`); return summary; }
     summary.errors += 1;
     console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
     return summary;
