@@ -4,8 +4,8 @@
 `src/config.js`'s `ensureRegistered()` `require()`s once, for the side effect of calling
 `registerTaskSource` / `updateTaskSource` on the shared registry. An out-of-tree plugin
 (e.g. **agent-manager-hygiene**, which owns the `observability_*` / `performance_*` /
-`function_length_*` / `arch_*` / `unused_export` sources) reaches back into
-`agent-manager/src/*` for the helpers below.
+`function_length_*` / `arch_*` / `unused_export` / `change_review` / `change_review_fix`
+sources) reaches back into `agent-manager/src/*` for the helpers below.
 
 `agent-manager` has no `package.json` `exports` map, so a plugin *can* `require` any file.
 **This document is the contract of what it may rely on.** `src/plugin-api.test.js` imports
@@ -27,6 +27,7 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 | `apply-group-a.js` | `applyVerdictOnly` | shared with core `staleness_audit` — a plain prose verdict is a documented no-op at apply. |
 | `prompts.js` | `groupBJsonInstructions`, `candidateSplitInstructions`, `formatFileContents`, `archReviewPlanPrompt`, `archReviewImplementPrompt`, `archDiscoveryPlanPrompt`, `archDiscoveryImplementPrompt`, `archImportPlanPrompt`, `archImportImplementPrompt`, `unusedExportPlanPrompt` | the arch/unused prompt-builder *bodies* stay here (core `backlog_fulfillment` still reuses `archReview*`); the plugin does their `updateTaskSource` wiring itself. |
 | `atomic-write.js` | `writeAtomicSync`, `writeJsonAtomicSync` | dependency-free; safe. |
+| `git-runner.js` | `detectDefaultBranch` | main-branch resolution (`AGENT_MANAGER_MAIN_BRANCH` → `origin/main` → `origin/master`, no network). `change_review`'s merged-commit enumeration uses it; core's own apply path and `task-disposition.js` ship-context sweep use the rest of the module. |
 | `deterministic-recheck-registry.js` | `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry` | ADR-0022 Stage B. The plugin registers `{ perFileRules, repoWideRules }` per `originalSource`; core's `staleness-fastpath.js` looks them up with zero source-name knowledge. `clear` / `get*` are for the plugin's own tests. The deterministic scanner rule functions themselves live in the plugin (ADR-0022 Stage C) — core imports nothing from `src/maintenance/` any more; that directory is gone. |
 | `model-profile-registry.js` | `clearModelProfileRegistry` | plugin tests only (fresh-registry setup). |
 
