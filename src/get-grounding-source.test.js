@@ -393,3 +393,73 @@ test('the REQUEST OBJECTS block is NOT added for an ordinary implemented adhoc t
   });
   assert.doesNotMatch(stdout, /REQUEST OBJECTS/);
 });
+
+// --- generic source.groundingFields consumer, end-to-end via main() -------------------
+// Every existing CLI-end-to-end test above spawns a bare `node get-grounding-source.js`
+// subprocess with no AGENT_MANAGER_REGISTER_PATH set, so `getRegisteredSource(sourceName)`
+// only ever resolves a CORE source (task-sources.js's own registrations, none of which
+// declare groundingFields today -- that's a hygiene-plugin-only pattern: observability_
+// review/performance_review/function_length_review/arch_import_review). So nothing here
+// actually exercised the generic `source.groundingFields` -> promptContext.<field> loop
+// itself (only register.test.js, in the plugin, asserts a source DECLARES the right
+// fields -- nothing proves the consumer actually threads them into the grounding text).
+// Close that gap with a throwaway, source-agnostic fake registration, in-process (no
+// subprocess needed for this one -- main() is exported).
+test('the generic source.groundingFields consumer threads promptContext.<field> into the grounding text for ANY registered source', () => {
+  const { registerTaskSource } = require('./task-source-registry.js');
+  registerTaskSource('grounding_fields_e2e_fake_source', { priority: 1, next: () => null, groundingFields: ['myGroundingField'] });
+
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-fields-e2e-'));
+  const task = {
+    domain: 'default', source: 'grounding_fields_e2e_fake_source',
+    promptContext: { myGroundingField: 'UNIQUE_MARKER_GROUNDING_TEXT_9f3a', unrelatedField: 'must not appear' },
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const prevArgv2 = process.argv[2];
+  const chunks = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
+  try {
+    process.argv[2] = taskPath;
+    delete require.cache[require.resolve('./get-grounding-source.js')];
+    require('./get-grounding-source.js').main();
+  } finally {
+    process.stdout.write = realWrite;
+    process.argv[2] = prevArgv2;
+  }
+
+  const out = chunks.join('');
+  assert.match(out, /UNIQUE_MARKER_GROUNDING_TEXT_9f3a/, 'promptContext.myGroundingField must reach the grounding text via source.groundingFields');
+});
+
+test('the generic source.groundingFields consumer skips an undeclared promptContext field', () => {
+  const { registerTaskSource } = require('./task-source-registry.js');
+  registerTaskSource('grounding_fields_e2e_narrow_source', { priority: 1, next: () => null, groundingFields: ['onlyThisOne'] });
+
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-fields-e2e-narrow-'));
+  const task = {
+    domain: 'default', source: 'grounding_fields_e2e_narrow_source',
+    promptContext: { onlyThisOne: 'INCLUDED_MARKER_7c1e', notDeclared: 'EXCLUDED_MARKER_b2d4' },
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const prevArgv2 = process.argv[2];
+  const chunks = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
+  try {
+    process.argv[2] = taskPath;
+    delete require.cache[require.resolve('./get-grounding-source.js')];
+    require('./get-grounding-source.js').main();
+  } finally {
+    process.stdout.write = realWrite;
+    process.argv[2] = prevArgv2;
+  }
+
+  const out = chunks.join('');
+  assert.match(out, /INCLUDED_MARKER_7c1e/);
+  assert.doesNotMatch(out, /EXCLUDED_MARKER_b2d4/, 'a field not listed in groundingFields must not leak into the grounding text via this path');
+});
