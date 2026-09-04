@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE } = require('./needs-clarification-triage.js');
+const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE } = require('./needs-clarification-triage.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-test-'));
@@ -254,4 +254,88 @@ test('no needs-clarification/ dir -> empty summary, no throw', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-nodir-'));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.checked, 0);
+});
+
+// --- Bucket D: false completion-claim signature (2026-09-04) -----------------------
+
+const REAL_TEST_COUNT_CLAIM = 'The draft\'s RESOLUTION claims to have "implemented" the task and "verif[ies] the '
+  + 'per-process reentrancy fix already present in src/single-flight-lock.js," but the diff only adds a test file '
+  + 'and makes zero changes to the actual source files required to implement the fix.';
+const REAL_FILE_CLAIM = 'The implement draft claims to have created the file `queue/research/x.json`, but the '
+  + 'deterministic fact-check confirms this file does not exist and it is not marked as a create target.';
+
+test('regexes: FALSE_CLAIM_RE matches real corpus blockedReason text, not a plain design question', () => {
+  assert.ok(FALSE_CLAIM_RE.test(REAL_TEST_COUNT_CLAIM));
+  assert.ok(FALSE_CLAIM_RE.test(REAL_FILE_CLAIM));
+  assert.ok(FALSE_CLAIM_RE.test('Agentic implement pass resolved no-changes-needed but no "Already covered:" block at all'));
+  assert.ok(!FALSE_CLAIM_RE.test('Should the widget default to on or off? I need you to decide the product behaviour.'));
+});
+
+test('bucket D: false completion-claim signature in blockedReason -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('td1', {
+    blockedReason: REAL_TEST_COUNT_CLAIM,
+    needsClarification: { reason: 'design-decision', openQuestions: 'could not get this past review after 3 attempts' },
+    stalenessFlag: { reason: 'retries-exhausted', confidence: 'medium' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'td1.json')));
+  const moved = read(at(dir, 'adhoc', 'td1.json'));
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /false completion-claim signature/.test(h.detail)));
+});
+
+test('bucket D: previously stamped leave-for-human is NOT frozen against the new signature', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('td2', {
+    blockedReason: REAL_FILE_CLAIM,
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-03T00:00:00Z',
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'td2.json'));
+  assert.equal(moved.ncTriageDecision, undefined, 'stale leave-for-human stamp cleared on requeue');
+});
+
+test('bucket D: a plain leave-for-human task with no matching signature stays skipped (checked stays 0)', async () => {
+  // Regression guard: bucket D must not change the pre-existing idempotency behavior for
+  // tasks that don't match its own new signature.
+  const dir = makePipeline();
+  held(dir, baseTask('td3', { ncTriageDecision: 'leave-for-human' }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 0);
+  assert.equal(s.requeued, 0);
+});
+
+test('bucket D: already at MAX_REQUEUES -> falls through to leave-for-human, not re-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('td4', { blockedReason: REAL_TEST_COUNT_CLAIM, ncTriageAttempts: 1 }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'td4.json')));
+});
+
+test('bucket D: adhoc/<id>.json already exists -> left in place, not double-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('td5', { blockedReason: REAL_TEST_COUNT_CLAIM }));
+  fs.writeFileSync(at(dir, 'adhoc', 'td5.json'), '{"id":"td5"}');
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'td5.json')));
+});
+
+test('bucket D: DRY_RUN=1 reports but does not move the file', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('td6', { blockedReason: REAL_FILE_CLAIM }));
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try {
+    const s = await needsClarificationTriage(args(dir));
+    assert.equal(s.requeued, 1);
+    assert.ok(exists(at(dir, 'needs-clarification', 'td6.json')));
+    assert.ok(!exists(at(dir, 'adhoc', 'td6.json')));
+  } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
 });
