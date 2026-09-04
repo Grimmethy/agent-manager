@@ -92,6 +92,16 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+test('write tier: blindPlanBlock softens its "could NOT read any files" language when task.planWasGrounded', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const base = { title: 'T', promptContext: { rawText: 'the ask' }, planResponse: '1. do a thing\n2. do another' };
+    assert.match(buildWriteAgenticPrompt(base), /could NOT read any files/);
+    assert.match(buildWriteAgenticPrompt({ ...base, planWasGrounded: true }), /LIMITED file access/);
+    assert.doesNotMatch(buildWriteAgenticPrompt({ ...base, planWasGrounded: true }), /could NOT read any files/);
+  });
+});
+
 test('write tier: a confirmed-atomic leaf (decomposedFrom) is told NOT to decompose and loses the "split into 2-6" clause', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
