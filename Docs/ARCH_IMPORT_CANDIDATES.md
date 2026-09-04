@@ -111,3 +111,45 @@ Adopt the three-kind span taxonomy (AGENT / TOOL / GUARDRAIL) from the omnigent 
 
 Benefits:
 Downstream consumers stop inventing parallel field names: a SQLite `WHERE span_kind='GUARDRAIL' AND policy_action='deny'` query works uniformly across `deep_dive`, `project_search`, `arch_discovery`, and any future source without per-domain schema knowledge. Alerting on gate denials (e.g., "more than 3 blocks in 10 minutes → something is systematically failing the gate") becomes a one-line filter rather than a grep across heterogeneous JSON shapes. Because the vocabulary is three attributes and one label, the adoption cost in `review-runner.sh` is a few lines of field naming, not a new library or middleware layer, and it keeps agent-manager's "deterministic, no-LLM" core (per ADR-0022) free of any additional runtime dependency.
+
+### AC-9 · Emit GUARDRAIL span vocabulary in review-runner.sh verdict JSON
+Strength: Strong
+Split-Depth: 1
+Files: scripts/review-runner.sh
+
+Problem:
+The review daemon's main polling loop serializes a per-task verdict to JSON and writes it to the queue, but the decision and reason fields use ad-hoc key names with no standardized vocabulary. AC-8 requires the emitted verdict to carry the GUARDRAIL span vocabulary so that downstream consumers (dashboard, SQLite viewer, MLflow) can uniformly identify and filter guardrail verdicts without parsing bespoke field names. The visible portion of the script (setup, heartbeat, trap, log-file wiring) ends just before the `while :` loop where the verdict is actually assembled and written; the implementing pass will see the full file and locate the `jq -n` / `echo` / `printf` block that builds the verdict JSON object.
+
+Solution:
+In the main polling loop, at the exact point where the per-task verdict JSON is assembled and written to the queue file (the `jq -n` invocation, heredoc, or `printf` that constructs the object containing the approve/block decision and the one-line reason), add five new keys to that JSON object: `"span": {"kind": "GUARDRAIL"}`, `"policy": {"name": "majority-vote", "phase": "review", "action": "allow" or "deny", "reason": "<existing reason string>"}`. Map the existing approve/block value to `policy.action` (approve → "allow", block → "deny"). Retain all pre-existing keys unchanged for backward compatibility; the new keys are additive. If the script delegates the JSON write entirely to `review-task.js` and only relays an exit code, add the five fields in the shell-side wrapper that stamps the final queue file, using `jq '. + {span:{kind:"GUARDRAIL"}, policy:{name:"majority-vote",phase:"review",action:(if .approved then "allow" else "deny" end), reason:(.reason // "")}}'` (or equivalent) on the JSON before writing.
+
+Benefits:
+Downstream consumers receive a uniform, self-describing GUARDRAIL span on every review-gate verdict; the review gate's output is now identifiable by vocabulary rather than by ad-hoc key names; the change is additive so no existing consumer breaks.
+
+### AC-10 · Reference GUARDRAIL span vocabulary in ADR-0019 review-gate paragraph
+Strength: Strong
+Split-Depth: 1
+Files: docs/adr/0019-deep-dive-pipeline.md
+
+Problem:
+ADR-0019's 'Context pre-fetch, output shape, and review' section states that `review-runner.ps1`'s majority-vote gate reviews the output, but does not specify the shape of the verdict record the gate produces. After the code change in `scripts/review-runner.sh` (sub-candidate 1), the gate emits GUARDRAIL span vocabulary fields. The ADR should name those fields so that anyone implementing the `deep_dive` prompt branch or debugging a blocked verdict knows the exact keys to expect in the queue file. This sub-candidate depends on sub-candidate 1 being landed first so the ADR documents reality, not aspiration.
+
+Solution:
+In the paragraph beginning 'Same ~60,000-character budget, same descending-link-degree file selection…', immediately after the sentence that ends with 'so it inherits the same gate, not a lighter one.', insert one sentence: 'The gate's verdict record carries the GUARDRAIL span vocabulary (`span.kind`, `policy.name`, `policy.phase`, `policy.action`, `policy.reason`) defined by AC-8, so a blocked `deep_dive` item is distinguishable in the queue by `policy.action: "deny"` rather than by an ad-hoc status string.'
+
+Benefits:
+The ADR stays accurate to the post-AC-8 code; implementers of the deep_dive branch and operators reading blocked items know the exact field names without opening the shell script.
+
+### AC-11 · Record GUARDRAIL span vocabulary in ADR-0022 platform contract
+Strength: Strong
+Split-Depth: 1
+Files: docs/adr/0022-core-is-a-platform-plugins-define-the-work.md
+
+Problem:
+ADR-0022's Decision section lists 'the majority-vote review gate' among core's platform responsibilities but treats it as an opaque black box. After AC-8, the gate's output contract includes the GUARDRAIL span vocabulary, which is part of the platform surface that plugins must interop with (a plugin's `reviewGuidance` field feeds the gate, and the gate's verdict is what the plugin's `apply` step reads). The ADR should make this output contract explicit so plugin authors know the verdict shape without reading `review-runner.sh`. This sub-candidate depends on sub-candidate 1 being landed first.
+
+Solution:
+In the Decision section, in the sentence 'Core is the platform: the queue state machine, worker/instance management, the Plan→Draft→Review→Apply loop, the majority-vote review gate, the deterministic (no-LLM) apply step…', expand 'the majority-vote review gate' to 'the majority-vote review gate (emitting verdicts in the GUARDRAIL span vocabulary: `span.kind`, `policy.name`, `policy.phase`, `policy.action`, `policy.reason`)', and add a short follow-on sentence: 'This vocabulary is part of the platform's output contract; plugins consume it in their `apply` step and must not assume ad-hoc key names.'
+
+Benefits:
+The platform contract is explicit in the ADR; plugin authors and SDK consumers know the review gate's output shape from the design doc alone; the GUARDRAIL vocabulary is anchored in the architecture narrative, not just in code.
