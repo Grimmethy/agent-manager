@@ -177,6 +177,16 @@ while :; do
     adhoc_stale_result="$(node "${PACKAGE_SRC_DIR}/adhoc-staleness-flag.js" 2>>"${HOME_LOGS}/adhoc-staleness-flag.log")"
     printf '[watchdog] adhoc-staleness-flag: %s\n' "$adhoc_stale_result" >&2
 
+    # needs-clarification triage: churns stuck reason:'design-decision' tasks -- clean-state
+    # requeues a degenerate "no prior context" draft (local-model forced-summary flake, not
+    # a real question), archives an invalid-premise / already-done task behind a resolution-
+    # signal bar (or a confident cheap-local vote), and stamps everything else for a human.
+    # Runs AFTER adhoc-staleness-flag (so the flag is fresh) and skips the decompose-loop
+    # subset (autoroute below owns it) + the exhausted subset (blocked-drain owns it).
+    # Disable with AGENT_MANAGER_NC_TRIAGE=false.
+    nc_triage_result="$(node "${PACKAGE_SRC_DIR}/needs-clarification-triage.js" 2>>"${HOME_LOGS}/needs-clarification-triage.log")"
+    printf '[watchdog] needs-clarification-triage: %s\n' "$nc_triage_result" >&2
+
     # product_spec -> coordinator-hub bridge: brownfield product_spec only writes spec DOCS
     # (Docs/PRODUCT_SPEC.md sections). For a request that sets `buildHub: true`, once every
     # section is filled this files a coordinator hub + one child adhoc task per section so
