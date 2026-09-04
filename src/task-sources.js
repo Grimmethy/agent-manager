@@ -1362,6 +1362,11 @@ function adhocReviewGuidance(task) {
 function adhocReviewCompletenessQuestion(task) {
   if (task.adhocResolution === 'decompose') return ADHOC_DECOMPOSE_COMPLETENESS_QUESTION;
   if (task.adhocResolution === 'no-changes-needed') return ADHOC_NO_CHANGES_COMPLETENESS_QUESTION;
+  const ac = Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [];
+  if (ac.length) {
+    return `This task's acceptance criteria are:\n${ac.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n`
+      + 'Does the IMPLEMENT diff satisfy EVERY criterion, and does the draft\'s "Acceptance:" block cite a real, concrete check (a command / grep / test with actual output) for each -- not a bare assertion? Reject if a criterion is left unmet or its check is hand-waved.';
+  }
   return null;
 }
 

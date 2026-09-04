@@ -524,6 +524,23 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // Component 2 (2026-09-04): an adhoc task with acceptance criteria whose implement draft
+  // produced NO "Acceptance:" block reporting a check for each -- block before spending a
+  // vote, same discipline as the fixedLiterals / unaddressed-critique gates above. Kill
+  // switch AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE=false (keeps the review-question folding, drops
+  // this hard gate -- the advisory-first rollout step).
+  if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length
+      && !(Array.isArray(task.acceptanceResults) && task.acceptanceResults.length)) {
+    const reason = `Deterministic gate: this task has ${task.acceptanceCriteria.length} acceptance criteria but the implement draft produced no "Acceptance:" block reporting a check for each -- no local-model review call spent on a draft that skipped its own definition of done.`;
+    task.reviewProvider = 'deterministic-missing-acceptance';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
