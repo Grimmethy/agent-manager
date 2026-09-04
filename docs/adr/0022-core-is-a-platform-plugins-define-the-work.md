@@ -43,8 +43,8 @@ story about itself.
 **Agent Manager's job is to manage agents — keep them working — not to define the work.**
 
 Core is the platform: the queue state machine, worker/instance management, the
-Plan→Draft→Review→Apply loop, the majority-vote review gate, the deterministic (no-LLM)
-apply step, the GPU / budget / heartbeat guards, the dashboard, and a **task-source SDK**.
+Plan→Draft→Review→Apply loop, the majority-vote review gate (emitting verdicts in the GUARDRAIL span vocabulary: `span.kind`, `policy.name`, `policy.phase`, `policy.action`, `policy.reason`), the deterministic (no-LLM)
+apply step, the GPU / budget / heartbeat guards, the dashboard, and a **task-source SDK**. This vocabulary is part of the platform's output contract; plugins consume it in their `apply` step and must not assume ad-hoc key names.
 
 Core contains **no `registerTaskSource` call and no task-source name string** in `src/*.js`
 or `python/dashboard/*.py`. Every definition of *what work agents do* lives in a plugin
