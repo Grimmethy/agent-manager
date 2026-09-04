@@ -38,6 +38,7 @@
 const fs = require('fs');
 const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
+const { buildPlanGrounding } = require('./plan-grounding.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
@@ -677,7 +678,18 @@ async function draftAdhocBranch(task, {
   // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
   // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
   // task (same pattern as runPlanPass's task._seedPlan).
-  if (priorInvestigation) task._priorInvestigation = priorInvestigation;
+  if (priorInvestigation) {
+    task._priorInvestigation = priorInvestigation;
+  } else if (task.planWasGrounded && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
+    // No agentic tier-2 investigation ran, but the plan pass built deterministic grounding.
+    // Rebuild it (cheap, no LLM) so tier 3 starts from verified file content instead of a
+    // blind re-grep. A real investigationSummary always wins -- it also carries grep-MISSED
+    // and tool-error signal -- so this is only the fallback.
+    try {
+      const g = buildPlanGrounding(task);
+      if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
+    } catch { /* non-fatal */ }
+  }
   const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
   delete task._priorInvestigation;
   recordTier(attempt, {
@@ -849,9 +861,22 @@ async function runPlanPass(task, {
   const substanceGated = resolveSourceName(task) === 'adhoc';
   const seedPlan = substanceGated ? bestPriorPlan(task) : null;
 
+  // Grounded plan (2026-09-04): give the adhoc plan pass real repo content -- the files the
+  // task names + a grep on its identifiers -- so it stops inventing paths/symbols.
+  // Deterministic, no LLM. Kill switch AGENT_MANAGER_ADHOC_PLAN_GROUNDING=false.
+  let grounding = null;
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
+    try { grounding = buildPlanGrounding(task); } catch { grounding = null; }
+    if (grounding) {
+      task._planGrounding = grounding.text;
+      task.planWasGrounded = true;
+    }
+  }
+
   if (seedPlan) task._seedPlan = seedPlan;
   const planPrompt = buildPlanPrompt(task);
   delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
+  delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
 
   const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
@@ -895,6 +920,7 @@ async function runPlanPass(task, {
       ...(reRolled ? { reRolled: true } : {}),
       ...(seedPlan ? { seededFromPrior: true } : {}),
       ...(stillThin ? { thin: true } : {}),
+      ...(grounding ? { grounded: true, groundingChars: grounding.text.length, anchorPaths: grounding.anchorPaths } : {}),
     });
     const notes = [
       seedPlan ? 'seeded from a prior plan' : null,

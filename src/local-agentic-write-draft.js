@@ -74,12 +74,10 @@ function localDraftModelLabel() {
 function blindPlanBlock(task) {
   const plan = task && typeof task.planResponse === 'string' ? task.planResponse.trim() : '';
   if (!plan) return '';
-  return [
-    'A PLAN for this task was drafted earlier by a separate pass that could NOT read any files. Use it as a map of intent and rough shape -- but every path, line number, function name and "already exists / does not exist" claim in it is UNVERIFIED. Confirm each against the real code with read_file / grep_codebase before you rely on it; where the plan and the real code disagree, the real code wins.',
-    '',
-    plan,
-    '',
-  ].join('\n');
+  const lead = task && task.planWasGrounded
+    ? 'A PLAN for this task was drafted earlier with LIMITED file access -- a deterministic grep plus the specific files the task names. The paths and symbols it cites are likely real, but line numbers may be stale and anything beyond the shown files is unverified. Confirm with read_file / grep_codebase before you rely on it; where the plan and the real code disagree, the real code wins.'
+    : 'A PLAN for this task was drafted earlier by a separate pass that could NOT read any files. Use it as a map of intent and rough shape -- but every path, line number, function name and "already exists / does not exist" claim in it is UNVERIFIED. Confirm each against the real code with read_file / grep_codebase before you rely on it; where the plan and the real code disagree, the real code wins.';
+  return [lead, '', plan, ''].join('\n');
 }
 
 // The read-only investigation tier 2 already did (task._priorInvestigation, built by

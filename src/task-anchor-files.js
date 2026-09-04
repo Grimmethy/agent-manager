@@ -298,4 +298,4 @@ function anchorFilesPromptBlock(task) {
   ].join('\n');
 }
 
-module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename };
+module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename, taskIdentifiers };
