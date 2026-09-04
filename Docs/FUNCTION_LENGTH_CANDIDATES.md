@@ -2248,3 +2248,171 @@ Extract four small, clearly-named helpers that the top-level handler calls in se
 
 Benefits:
 A reviewer scanning the diff for a change to the GPU-lease logic now sees a one-line call to `_acquire_gpu_lease()` instead of hunting through 30 lines of registry code; a developer adding a new pre-launch side-effect has an obvious place to insert a new helper call. Each extracted function can be unit-tested independently (e.g., verify that `_persist_launch_env` writes the correct `.env` keys without actually spawning a process), which is currently impossible because the launch step is in the same scope. The `os.name` platform branch, which is the most likely site for future OS-specific tweaks, becomes a self-contained function whose signature makes its inputs (`child_env`, `pipeline_dir`) explicit rather than implicit closures over the outer scope.
+
+### AC-28 · Decompose coordinator sweep into per-concern helpers
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate } = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return summary; // no coordinating/ dir yet -- nothing to sweep
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try {
+      parent = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue; // a malformed coordinating file is not this sweep's problem to fix
+    }
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      // A coordinating parent with no checklist is a bug upstream -- complete it out so it
+      // does not sit here forever.
+      parent.status = 'done';
+      parent.doneMarker = 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      moveToDone(file, doneDir, name, parent);
+      summary.checked += 1;
+      summary.completed += 1;
+      continue;
+    }
+
+    summary.checked += 1;
+    let doneCount = 0;
+    const recById = new Map();
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+      recById.set(st && st.id, rec);
+      st.status = classifyChildStatus(rec);
+      if (TERMINAL_GOOD.has(st.status)) doneCount += 1;
+    }
+    parent.progress = { done: doneCount, total: parent.subTasks.length };
+    parent.lastReconciledAt = new Date().toISOString();
+
+    // Stuck-chain detection: surface a hub that can never complete on its own instead of
+    // leaving it frozen at partial progress. The hub STAYS in coordinating/ so the sweep
+    // keeps reconciling it (and auto-clears / auto-completes if the children get unstuck);
+    // what changes is a `coordinatorBlocked` marker + a `blockedReason` the dashboard
+    // renders, and after a grace period an `escalated` flag + a louder history event.
+    if (doneCount < parent.subTasks.length) {
+      const stuck = findStuckChildren(parent.subTasks, recById);
+      const now = new Date().toISOString();
+      if (stuck.length > 0) {
+        const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+        if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+          parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+          appendHistoryEvent(parent, 'blocked', `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+          summary.blocked = (summary.blocked || 0) + 1;
+        }
+        parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+        const escalateMs = stuckEscalateMs();
+        const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+        if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+          parent.coordinatorBlocked.escalated = true;
+          parent.coordinatorBlocked.escalatedAt = now;
+          appendHistoryEvent(parent, 'advisory',
+            `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+          summary.escalated = (summary.escalated || 0) + 1;
+        }
+      } else if (parent.coordinatorBlocked) {
+        delete parent.coordinatorBlocked;
+        delete parent.blockedReason;
+        appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+        summary.unblocked = (summary.unblocked || 0) + 1;
+      }
+    }
+
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    // A child went back to work (e.g. a human requeued the wiring step after a gate
+    // failure) -- re-arm the gate so the next all-done transition re-checks the branch.
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    // Stacked decompose hub: children done is necessary but not sufficient -- the shared
+    // branch must actually import and keep its route table. Gate runs once; its result is
+    // cached on the hub so a quiet every-tick sweep never re-runs a worktree build.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.integrationGate
+        && parent.integrationGate.status === 'pending') {
+      const res = runGate(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res.skipped) {
+        parent.integrationGate = { status: 'skipped', at: now };
+      } else if (res.ok) {
+        parent.integrationGate = { status: 'passed', at: now, checks: res.checks || [] };
+        appendHistoryEvent(parent, 'advisory', `integration gate passed on ${parent.branch} -- ${(res.checks || []).map((c) => `${c.name}:${c.status}`).join(' ')}`);
+        summary.gatePassed = (summary.gatePassed || 0) + 1;
+      } else {
+        const failing = (res.checks || []).filter((c) => c.status === 'fail');
+        parent.integrationGate = { status: res.errored ? 'errored' : 'failed', at: now, checks: res.checks || [] };
+        parent.blockedReason = `decompose integration gate ${res.errored ? 'errored' : 'failed'} on ${parent.branch}: ${failing.map((c) => `${c.name} -- ${c.detail}`).join(' | ')}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: `integration-gate:${failing.map((c) => c.name).sort().join(',')}`,
+          since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: `integration gate failed: ${failing.map((c) => c.name).join(', ')}` }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.gateFailed = (summary.gateFailed || 0) + 1;
+        // errored (not failed) -> let a later tick retry the gate itself.
+        if (res.errored) parent.integrationGate.status = 'pending';
+        try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+        catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+        continue;
+      }
+    }
+
+    const gateClear = !(parent.mode === 'stacked' && parent.integrationGate
+      && ['failed', 'pending'].includes(parent.integrationGate.status) && allChildrenDone);
+
+    if (allChildrenDone && gateClear) {
+      parent.status = 'done';
+      parent.doneMarker = `coordinator complete: all ${parent.subTasks.length} sub-task(s) done`;
+      stampHubMerged(parent);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      moveToDone(file, doneDir, name, parent);
+      summary.completed += 1;
+    } else {
+      try {
+        fs.writeFileSync(file, JSON.stringify(parent, null, 2));
+        summary.updated += 1;
+      } catch (err) {
+        console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`);
+        summary.errors += 1;
+      }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The sweep function packs five logically independent concerns into a single 150-line body: directory bootstrap and ENOENT guarding, per-file JSON parsing with a "no subTasks" fast-path, child-status reconciliation (classifying each subTask and writing back `st.status` / `parent.progress`), stuck-chain detection with its own mini state-machine (coordinatorBlocked set/clear, signature comparison, grace-period escalation, `blockedReason` string assembly), and gate re-arming when a child returns to work. Each concern has its own branching, side-effects, and failure modes, yet they are interleaved in one linear flow. A developer fixing the escalation grace-period logic must scroll past unrelated I/O and reconciliation code to find the relevant lines, and a change to the JSON-parse guard risks inadvertently touching the stuck-chain state transitions because they share the same local scope and mutable variables.
+
+Solution:
+Extract four named helpers from the body, keeping the outer function as a thin orchestrator that calls them in sequence. First, `resolveSweepDirs(config)` handles directory resolution, the ENOENT guard, and the directory scan, returning an array of file paths or an empty list. Second, `loadSubTasks(filePath)` encapsulates the per-file JSON parse, the "no subTasks" fast-path, and returns a normalized record or null. Third, `reconcileChildStatuses(subTasks, recById)` performs the classification loop and writes `st.status` / `parent.progress`, returning the updated `recById` map. Fourth, `detectAndEscalateStuckChains(recById, coordinatorBlocked)` owns the signature comparison, grace-period check, `blockedReason` construction, and the set/clear of `coordinatorBlocked`, returning any unblock actions to apply. The residual gate re-arming (a few lines) can stay inline in the orchestrator or become a tiny `rearmGate(child)` call. The outer function shrinks to roughly 25–30 lines of sequencing and logging.
+
+Benefits:
+Each extracted helper can be unit-tested in isolation with a stubbed file system or in-memory record map, without exercising the full I/O path. Code review becomes tractable because a diff touching escalation logic no longer sits inside a 150-line hunk that also touches JSON parsing. New contributors can understand the sweep pipeline by reading the orchestrator's five sequential calls rather than tracing a single dense block, and the mutable shared state (`coordinatorBlocked`, `recById`) is now explicitly passed and returned, making data flow visible at the call sites rather than implicit through a shared local scope.
