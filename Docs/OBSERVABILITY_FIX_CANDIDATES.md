@@ -2961,3 +2961,26 @@ Inside the `catch (err)` block (line 127 onward), before incrementing `summary.e
 
 Benefits:
 An operator tailing `stderr` (or a log aggregator that already captures `console.error`/`console.warn`) immediately sees which path failed, the OS-level reason, and can distinguish a benign missing-directory from a real permission or disk fault. The `summary.errors` counter remains the programmatic signal for the caller, while the log line provides the human-readable context that the counter alone cannot supply. No new dependency is introduced; the fix uses only `console.error` / `console.warn`, which the project already relies on for all other Node-side logging.
+
+### AC-164 · Bare catch in queue-scan loop swallows non-ENOENT filesystem errors
+Strength: Strong
+Files: src/decompose-loop-autoroute.js
+Snippet:
+```
+
+  for (const dir of SCAN_DIRS) {
+    let names;
+    try { names = fs.readdirSync(path.join(pipelineDir, 'queue', dir)).filter((n) => n.endsWith('.json')); } catch { continue; }
+    for (const name of names) {
+      const file = path.join(pipelineDir, 'queue', dir, name);
+      const task = readJson(file);
+```
+
+Problem:
+On line 129 the `try { names = fs.readdirSync(...) } catch { continue; }` binds no error variable, so every exception thrown by `readdirSync` is silently discarded. The intent is to skip directories that the pipeline has not yet created (ENOENT), but the bare `catch` also swallows `EACCES`, `EPERM`, `EIO`, and any other unexpected failure. In those cases the directory exists and contains pending decompose-request JSON files, yet the loop silently skips them with no log line, no rethrow, and no change to the process exit code — the tasks become invisible to the operator and are never processed.
+
+Solution:
+Replace the bare `catch { continue; }` with a named catch that inspects `err.code`. If `err.code === 'ENOENT'`, keep the existing `continue` (the directory simply hasn't been created yet). For every other code, emit a `console.error` line that includes the full directory path, the error code, and the error message (e.g. `console.error(\`decompose-loop-autoroute: cannot read queue dir ${dirPath}: [${err.code}] ${err.message}\`)`), then `throw err` so the caller's error handling (or the process exit code) surfaces the failure. This uses only `console.error`, which is the logging primitive this file and project already rely on, and introduces no new dependency.
+
+Benefits:
+An operator running the decompose loop will immediately see a stderr line identifying which queue directory failed, why (permission denied, I/O fault, etc.), and the process will exit non-zero rather than silently reporting zero pending tasks. The ENOENT fast-path is preserved, so normal first-run or partial-pipeline scenarios still skip cleanly without noise. The silent-data-loss path for EACCES/EIO is eliminated.
