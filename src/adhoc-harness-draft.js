@@ -221,7 +221,7 @@ async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
   // or a token gesture (an ADR instead of the code, an unrequested delete, a forbidden
   // file)? This cheap tier should not stamp that as `implemented`; decline so the agentic
   // tiers, which can investigate, take over. See adhoc-diff-sanity.js.
-  const substance = adhocDiffSubstanceProblem(task, rawDiff);
+  const substance = adhocDiffSubstanceProblem(task, rawDiff, responseText);
   if (substance) {
     return { applied: false, succeeded: true, reason: `harness-search draft is not a real implementation -- ${substance.reason}` };
   }

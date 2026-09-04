@@ -49,27 +49,13 @@ const LIVE_FETCH_MAX_CHARS_PER_FILE = 4000;
 // candidate "objects" out of the raw request text and grep each against the real repo NOW,
 // so the vote sees "what the repo actually has for `gallery` / `image` / `nsfw`" rather
 // than only whatever the drafter's own summary chose to cite. Deterministic, bounded.
-const REQUEST_OBJECT_STOPWORDS = new Set([
-  'should', 'shall', 'when', 'with', 'that', 'this', 'from', 'have', 'into', 'their', 'them',
-  'then', 'they', 'will', 'would', 'could', 'being', 'such', 'also', 'only', 'each', 'both',
-  'some', 'more', 'most', 'other', 'while', 'where', 'what', 'your', 'about', 'after', 'before',
-  'tagged', 'selected', 'checkbox', 'check', 'these', 'those', 'here', 'there', 'been', 'does',
-  'hide', 'show', 'make', 'like', 'need', 'want', 'note', 'used', 'uses', 'able', 'must',
-]);
-const MAX_REQUEST_OBJECT_TOKENS = 8;
+//
+// extractRequestObjectTokens lives in request-object-tokens.js (extracted 2026-09-04) so
+// adhoc-diff-sanity.js -- a dependency-free hot-path module loaded by every adhoc draft
+// tier -- can reuse it without pulling in this file's own heavy require chain
+// (task-sources.js + ensureRegistered()).
+const { extractRequestObjectTokens } = require('./request-object-tokens.js');
 const MAX_HITS_PER_OBJECT = 4;
-
-function extractRequestObjectTokens(rawText) {
-  const text = String(rawText || '');
-  const tokens = new Set();
-  for (const m of text.matchAll(/\/[A-Za-z][\w/-]{2,}/g)) tokens.add(m[0]);                 // /api/... paths
-  for (const m of text.matchAll(/["'`]([^"'`]{3,40})["'`]/g)) tokens.add(m[1].trim());       // "quoted phrases"
-  for (const m of text.matchAll(/\b[A-Za-z_][A-Za-z0-9]*(?:[_][A-Za-z0-9]+|[A-Z][a-z0-9]+)+\b/g)) tokens.add(m[0]); // camelCase / snake_case
-  for (const m of text.matchAll(/\b[A-Za-z]{4,}\b/g)) {                                      // plain content words
-    if (!REQUEST_OBJECT_STOPWORDS.has(m[0].toLowerCase())) tokens.add(m[0]);
-  }
-  return [...tokens].slice(0, MAX_REQUEST_OBJECT_TOKENS);
-}
 
 function buildRequestObjectGrounding(rawText) {
   const tokens = extractRequestObjectTokens(rawText);

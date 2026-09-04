@@ -96,6 +96,40 @@ test('resolveAgenticDraft(implemented): a docs-only diff for a code task -> retr
   });
 });
 
+// --- resolveAgenticDraft(no-changes-needed) -- adhocNoChangesClaimProblem (2026-09-04) ---
+
+test('resolveAgenticDraft(no-changes-needed): no "Already covered:" block -> retryable block with pointed feedback', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'tnc1', source: 'manual', domain: 'adhoc',
+      promptContext: { rawText: 'Add a lightweight checker script that validates the second-brain vault.' } };
+    const out = resolveAgenticDraft(task, {
+      result: { response: "I'm not making code changes here.\n\nRESOLUTION: no-changes-needed" }, worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /no "Already covered:" block/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.match(task.adhocNoChangesClaimFeedback, /Already covered/);
+    assert.ok(!task.adhocResolution, 'not stamped as no-changes-needed');
+  });
+});
+
+test('resolveAgenticDraft(no-changes-needed): a full, real citation block is accepted', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'tnc2', source: 'manual', domain: 'adhoc',
+      promptContext: { rawText: 'Add a lightweight checker script that validates the second-brain vault.' } };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'Already exists.\n\nAlready covered:\n- checker script -- src/second-brain-checker.js:validateVault\n'
+          + '- second-brain vault -- src/second-brain-checker.js:VAULT_DIR\n\nRESOLUTION: no-changes-needed',
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, false);
+    assert.equal(task.adhocResolution, 'no-changes-needed');
+    assert.equal(task.rawDiff, '');
+  });
+});
+
 test('resolveAgenticDraft(implemented): a real code diff for an adhoc task is unaffected', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');

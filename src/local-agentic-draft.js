@@ -39,6 +39,7 @@ const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { runPlanWithTools } = require('./local-tool-client.js');
 const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
 const modelStatsClient = require('./model-stats-client.js');
+const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 
 // Deliberately smaller than adhoc-agentic-draft.js's own ADHOC_MAX_TURNS (30) -- this
 // engine's own REQUEST_TIMEOUT_MS=240s-per-turn ceiling (local-tool-client.js) is not
@@ -241,6 +242,14 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   }
 
   if (resolution === 'no-changes-needed') {
+    // This no-tools tier has no way to investigate further if its claim is wrong --
+    // decline and fall through to tier 3 (which has real tools) rather than confidently
+    // stamping an unverified claim that would otherwise spend a full review round-trip
+    // just to get rejected. See adhoc-diff-sanity.js.
+    const claim = adhocNoChangesClaimProblem(task, responseText);
+    if (claim) {
+      return { applied: false, succeeded: true, reason: `local agentic no-changes-needed claim is unverified -- ${claim.reason}`, ...modelMeta };
+    }
     task.adhocResolution = 'no-changes-needed';
     task.rawDiff = '';
     task.implementResponse = responseText;
@@ -264,6 +273,11 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
 
   if (!rawDiff) {
     return { applied: false, succeeded: true, reason: 'local agentic draft produced no net change', ...modelMeta };
+  }
+
+  const substance = adhocDiffSubstanceProblem(task, rawDiff, responseText);
+  if (substance) {
+    return { applied: false, succeeded: true, reason: `local agentic draft is not a real implementation -- ${substance.reason}`, ...modelMeta };
   }
 
   task.adhocResolution = 'implemented';

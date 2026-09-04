@@ -82,11 +82,31 @@ test('applied:true, resolution=no-changes-needed', async () => {
   process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC = 'true';
   await withFixtureRepo(async (mod) => {
     const task = makeTask();
-    const runPlan = async () => ({ response: 'Checked, already fixed.\n\nRESOLUTION: no-changes-needed', toolCallLog: [], turnsUsed: 1 });
+    // adhocNoChangesClaimProblem (2026-09-04) requires a real "Already covered:" citation
+    // block before accepting no-changes-needed -- a bare "already fixed" with no coverage
+    // breakdown is exactly the shape it's designed to decline.
+    const runPlan = async () => ({
+      response: 'Checked, already fixed.\n\nAlready covered:\n- the thing -- already correct as-is\n\nRESOLUTION: no-changes-needed',
+      toolCallLog: [],
+      turnsUsed: 1,
+    });
     const result = await mod.draftAdhocViaLocalAgentic(task, { runPlan });
     assert.equal(result.applied, true);
     assert.equal(task.adhocResolution, 'no-changes-needed');
     assert.equal(task.rawDiff, '');
+  });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
+});
+
+test('applied:false, resolution=no-changes-needed with no "Already covered:" block -- declines rather than stamping an unverified claim', async () => {
+  process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC = 'true';
+  await withFixtureRepo(async (mod) => {
+    const task = makeTask();
+    const runPlan = async () => ({ response: 'Checked, already fixed.\n\nRESOLUTION: no-changes-needed', toolCallLog: [], turnsUsed: 1 });
+    const result = await mod.draftAdhocViaLocalAgentic(task, { runPlan });
+    assert.equal(result.applied, false);
+    assert.match(result.reason, /no-changes-needed claim is unverified/);
+    assert.equal(task.adhocResolution, undefined);
   });
   delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_ADHOC;
 });

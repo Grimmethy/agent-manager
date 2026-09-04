@@ -267,6 +267,26 @@ test('an adhoc diff-substance block is requeued with the pointed adhocDiffSubsta
   assert.match(out.priorRejectionFeedback[0], /index\.html/);
 });
 
+test('an adhoc no-changes-needed claim block is requeued with the pointed adhocNoChangesClaimFeedback', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-ncc', domain: 'adhoc', source: 'manual', retryableDraftBlock: true,
+    adhocNoChangesClaimFeedback: 'You answered RESOLUTION: no-changes-needed but gave no "Already covered:" block. List every concrete object the request names with a real file:symbol citation.',
+    blockedReason: 'Agentic implement pass resolved no-changes-needed but no "Already covered:" block at all',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-ncc.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-ncc.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 1);
+  assert.equal(out.adhocNoChangesClaimFeedback, undefined, 'consumed on requeue');
+  assert.equal(out.priorRejectionFeedback.length, 1);
+  assert.match(out.priorRejectionFeedback[0], /Already covered/);
+});
+
 test('an adhoc malformed-decompose block is requeued with a decompose-format feedback line', () => {
   const d = setupAdhocDirs();
   const task = {
