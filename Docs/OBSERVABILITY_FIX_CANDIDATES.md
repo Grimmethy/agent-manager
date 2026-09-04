@@ -2869,3 +2869,26 @@ Replace the bare `pass` with a `logging.error` call that records the exception, 
 
 Benefits:
 An operator or on-call engineer who sees `restartTriggered: False` in the sync response can now correlate a timestamped, exception-bearing log line to confirm whether the cause was "nothing to restart" or "restart attempt failed." The failure mode that caused the original incident (stale template served silently) becomes visible in the log within seconds of occurrence rather than remaining invisible until someone manually inspects the process, closing the observability gap the feature was built to prevent.
+
+### AC-160 · Silent lock-acquisition timeout in `_acquire_apply_lock`
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_dir / "apply-task.lock", "w")
+    deadline = time.time() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_fd
+```
+
+Problem:
+When the `fcntl.flock` retry loop in `_acquire_apply_lock` exhausts its `timeout_seconds` deadline (the `if time.time() >= deadline` branch around line 5622), the function closes `lock_fd` and falls off the end of the body, returning an implicit `None`. No `logging.warning` or `logging.error` call is emitted on that path, so a merge click that loses the race against `apply-task.sh`'s ~30-second loop produces zero log output. An operator troubleshooting a failed merge has no trace in the dashboard log to distinguish "lock was held by apply-task.sh" from any other `None`-returning failure, and the caller must silently inspect the return value with no contextual clue about *why* it was `None`.
+
+Solution:
+In the timeout branch (the `if time.time() >= deadline:` block, currently lines 5622-5623), before closing `lock_fd`, emit a `logging.warning` that names the lock file path, the timeout duration, and the fact that `apply-task.sh` is the likely holder, e.g. `logging.warning("apply-task lock %s still held after %ss; merge aborted (apply-task.sh likely mid-apply)", lock_dir / "apply-task.lock", timeout_seconds)`. Then, instead of falling through to an implicit `None` return, raise a `RuntimeError` carrying the same message so the caller's `except` path (or `try/except` around the call site) surfaces the failure explicitly and the caller can present a user-facing "please retry" rather than silently no-op'ing on a `None` check.
+
+Benefits:
+Every lock-timeout event now leaves a timestamped, greppable line in the dashboard log identifying the lock path, the wait duration, and the probable competing process, turning an invisible race-condition failure into a diagnosable one. Raising `RuntimeError` additionally prevents a caller from accidentally treating the `None` return as a benign "skip" and ensures the merge UI can show the user a concrete "lock busy, try again in a few seconds" message instead of a silent no-op.
