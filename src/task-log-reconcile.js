@@ -15,11 +15,16 @@
 // (buildShipContext) so there are zero per-record git calls.
 //
 // Flags:
-//   --report    print the pending-merge and abandoned lists to stderr (for a human audit)
-//   --backfill  ignore the state file, walk every record including the dated
-//               queue/done/_archived/<YYYY-MM>/ buckets, and `git fetch origin` first
-//   --fetch     `git fetch origin` before resolving (default off -- trusts local refs)
-//   --dry-run   resolve and report, write nothing (state file included)
+//   --report     print the pending-merge and abandoned lists to stderr (for a human audit)
+//   --backfill   ignore the state file, walk every record including the dated
+//                queue/done/_archived/<YYYY-MM>/ buckets, and `git fetch origin` first
+//   --fetch      `git fetch origin` before resolving (default off -- trusts local refs)
+//   --dry-run    resolve and report, write nothing (state file included)
+//   --reclassify one-shot: re-resolve records ALREADY closed as `noop`, so a review that was
+//                a clean FALSE-POSITIVE dismissal (recorded before the `dismissed` stage
+//                existed) is split back out. Implies --backfill enumeration. Idempotent: a
+//                second run finds nothing left to move. Run once, after the plugin that
+//                stamps record.reviewDisposition is deployed.
 
 const fs = require('fs');
 const path = require('path');
@@ -86,10 +91,14 @@ function candidateRecords(doneDir, { backfill, state }) {
 
 function reconcile({ pipelineDir, repoRoot, argv = [] }) {
   const report = argv.includes('--report');
-  const backfill = argv.includes('--backfill');
+  const reclassify = argv.includes('--reclassify');
+  const backfill = argv.includes('--backfill') || reclassify;
   const dryRun = argv.includes('--dry-run');
   const doFetch = backfill || argv.includes('--fetch');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
+  // Under --reclassify, records already closed as `noop` are re-resolved (a FALSE-POSITIVE
+  // dismissal recorded before the `dismissed` stage existed). Nothing else re-opens.
+  const allowReopenFrom = reclassify ? new Set(['noop']) : undefined;
 
   if (doFetch && repoRoot) {
     try { execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }); } catch { /* offline -- use local refs */ }
@@ -98,7 +107,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
   const state = loadState(pipelineDir);
   const ctx = repoRoot ? buildShipContext(repoRoot) : null;
 
-  const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
+  const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
   const pendingList = [];
   const abandonedList = [];
 
@@ -109,7 +118,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
 
     let outcome;
     try {
-      outcome = resolveDisposition(record, { repoRoot, ctx });
+      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom });
     } catch (err) {
       console.error(`task-log-reconcile: resolve failed for ${id}: ${err.message}`);
       summary.errors += 1;
@@ -129,8 +138,11 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
     }
 
     const tail = record.history[record.history.length - 1];
-    const alreadyPending = tail && tail.stage === 'pending-merge' && outcome.stage === 'pending-merge';
-    if (!alreadyPending && !dryRun) {
+    // Nothing to append when the resolved stage already IS the tail: the pending-merge
+    // re-check, and (under --reclassify) a noop record that stays noop because its verdict
+    // was inconclusive, not a false positive.
+    const tailUnchanged = tail && tail.stage === outcome.stage;
+    if (!tailUnchanged && !dryRun) {
       appendHistoryEvent(record, outcome.stage, outcome.detail);
       record.terminalDisposition = outcome.stage;
       if (outcome.stage === 'merged' && !record.mergedAt) {
@@ -146,7 +158,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [] }) {
       }
     }
 
-    if (!alreadyPending) { summary.resolved += 1; summary[outcome.stage] = (summary[outcome.stage] || 0) + 1; }
+    if (!tailUnchanged) { summary.resolved += 1; summary[outcome.stage] = (summary[outcome.stage] || 0) + 1; }
     if (outcome.stage === 'pending-merge') {
       state.pendingIds.add(id); state.resolvedIds.delete(id);
       pendingList.push(`${record.id} -- ${outcome.detail}`);

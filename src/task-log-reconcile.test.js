@@ -79,3 +79,59 @@ test('reconcile handles a malformed JSON record without throwing', () => {
   const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
   assert.equal(s.errors, 1);
 });
+
+test('reconcile: a review with reviewDisposition:"dismissed" closes as dismissed and is counted', () => {
+  const dir = tmpPipeline();
+  const f = writeRec(dir, '', 'obs-r', [{ stage: 'created' }, { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' }],
+    { source: 'observability_review', reviewDisposition: 'dismissed' });
+  const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
+  assert.equal(s.dismissed, 1);
+  assert.equal(tail(f).stage, 'dismissed');
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).terminalDisposition, 'dismissed');
+});
+
+test('reconcile --reclassify: flips a historical FALSE-POSITIVE noop record to dismissed; a plain run does not', () => {
+  const dir = tmpPipeline();
+  const hist = [
+    { stage: 'created' },
+    { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
+    { stage: 'noop', detail: 'no-op apply: no candidates in implement response -- nothing to apply' },
+  ];
+  const f = writeRec(dir, '', 'obs-hist', hist, {
+    source: 'observability_review', terminalDisposition: 'noop',
+    implementResponse: 'FALSE POSITIVE. The except binds the exception and the function returns a documented default.',
+  });
+
+  // a normal run leaves the closed noop alone
+  const s0 = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
+  assert.equal(s0.dismissed, 0);
+  assert.equal(tail(f).stage, 'noop');
+
+  // --reclassify re-resolves it
+  const s1 = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.equal(s1.dismissed, 1);
+  assert.equal(tail(f).stage, 'dismissed');
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).terminalDisposition, 'dismissed');
+
+  // idempotent: a second --reclassify finds nothing to move
+  const s2 = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.equal(s2.dismissed, 0);
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.filter((e) => e.stage === 'dismissed').length, 1);
+});
+
+test('reconcile --reclassify: an inconclusive noop (no FP verdict) stays noop, no duplicate event', () => {
+  const dir = tmpPipeline();
+  const hist = [
+    { stage: 'created' },
+    { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
+    { stage: 'noop', detail: 'no-op apply' },
+  ];
+  const f = writeRec(dir, '', 'obs-incon', hist, {
+    source: 'observability_review', terminalDisposition: 'noop',
+    implementResponse: 'GENUINE issue but I could not determine a safe fix from the shown code.',
+  });
+  const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.equal(s.dismissed, 0);
+  assert.equal(tail(f).stage, 'noop');
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.filter((e) => e.stage === 'noop').length, 1, 'no duplicate noop event');
+});

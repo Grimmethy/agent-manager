@@ -17,7 +17,14 @@
 //   applied-direct -- a directToMain source committed straight to <main> (the apply detail
 //                     says so) but no locatable trailer -- treated as shipped
 //   filed          -- the apply wrote a candidates-doc / Second Brain note, nothing to merge
-//   noop           -- the apply was a no-op verdict (false positive, empty, "no code change")
+//   dismissed      -- a *_review triage verdict correctly dismissed a scanner false positive
+//                     (the scanner was wrong; the review did its job). Split out of `noop` so
+//                     "the scanner emitted noise, caught" is countable separately from "the
+//                     pipeline applied something and produced nothing". Set from the
+//                     structured record.reviewDisposition the review source stamps, with a
+//                     detail-string regex fallback for older records.
+//   noop           -- the apply produced no change and it was NOT a clean false-positive
+//                     dismissal: an inconclusive verdict, an empty implement, "no code change"
 //   pending-merge  -- an agent/<id> branch exists and is ahead of <main>, not yet merged
 //   abandoned      -- applied to a branch that no longer exists and is NOT on <main>: the
 //                     work was lost. This is the one an audit must never miss.
@@ -30,7 +37,7 @@ const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 
 const TERMINAL_STAGES = new Set([
-  'merged', 'applied-direct', 'filed', 'noop', 'pending-merge', 'abandoned', 'superseded',
+  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded',
 ]);
 
 // Terminal states the reconcile sweep must never re-open. `pending-merge` is deliberately
@@ -122,6 +129,7 @@ function branchAheadCount(git, repoRoot, mainBranch, branch) {
 }
 
 const FILED_RE = /filed under|->\s*\/|→\s*\/|appended|candidate\(s\)|wrote .*\.md/i;
+const DISMISSED_RE = /\bfalse[\s-]?positive\b/i;
 const NOOP_RE = /no candidates|no code change|degenerate|false positive|empty implement|no-op|suggested 0|nothing to (apply|do)|skipped/i;
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;
 const BRANCH_DETAIL_RE = /^agent\//;
@@ -132,19 +140,34 @@ const BRANCH_DETAIL_RE = /^agent\//;
 // Pass a `ctx` from buildShipContext() to resolve a whole sweep with zero per-record git
 // calls (the fast path). Without it, falls back to a direct git probe per id (fine for a
 // single record, e.g. from the dashboard right after a merge).
-function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx } = {}) {
+function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx, allowReopenFrom } = {}) {
   if (!record || typeof record !== 'object') return null;
   const history = record.history;
   const applied = lastAppliedEvent(history);
   if (!applied) return null; // never applied -- blocked/needs-clarification in done, not this sweep's job
 
   const tail = lastEvent(history);
-  if (tail && STABLE_TERMINAL_STAGES.has(tail.stage)) return null; // already closed
+  if (tail && STABLE_TERMINAL_STAGES.has(tail.stage)
+      && !(allowReopenFrom && allowReopenFrom.has(tail.stage))) {
+    return null; // already closed (unless the caller explicitly asked to re-resolve this stage)
+  }
   // A 'pending-merge' tail IS re-resolved (the branch may have been merged since).
 
   const detail = String(applied.detail || '').trim();
   const taskId = record.id || '';
   const mainBranch = (ctx && ctx.mainBranch) || mainOverride || (repoRoot ? detectDefaultBranch(repoRoot) : 'master');
+
+  // 0. Structured triage outcome, stamped by a *_review source's apply(). The authoritative
+  //    signal -- a dismissed review never has code on <main>, so this wins over every git
+  //    check below. `genuine` deliberately falls through (a candidate was filed; it becomes
+  //    `merged`/`filed`/`applied-direct` by the normal path, and can still ship later).
+  const rd = String(record.reviewDisposition || '').trim();
+  if (rd === 'dismissed') {
+    return { stage: 'dismissed', detail: `review dismissed a scanner false positive${detail ? `: ${detail}` : ''}`.slice(0, 200) };
+  }
+  if (rd === 'inconclusive') {
+    return { stage: 'noop', detail: `review reached a verdict but produced nothing: ${detail || '(no detail)'}`.slice(0, 200) };
+  }
 
   // 1. Definitively on origin/<main>?
   if (taskId) {
@@ -183,6 +206,20 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   // 4. The apply wrote a doc / note -- nothing to merge.
   if (FILED_RE.test(detail)) {
     return { stage: 'filed', detail: `apply wrote a doc/note: ${detail}`.slice(0, 200) };
+  }
+
+  // 4b. Records with no structured reviewDisposition (older plugin build, or a historical
+  //     backfill): a *_review whose verdict text reads "FALSE POSITIVE" is a clean dismissal,
+  //     not a bare no-op. For these records the verdict lives in implementResponse/
+  //     planResponse, not the apply detail (which is a generic "no candidates ..."). Gated to
+  //     triage-review sources so a stray "not a false positive" in some adhoc diff can't trip
+  //     it. Must run BEFORE NOOP_RE -- NOOP_RE also matches "false positive".
+  const isReviewSource = /_review(_digest)?$/.test(String(record.source || ''));
+  if (isReviewSource) {
+    const verdictText = `${detail}\n${record.implementResponse || ''}\n${record.planResponse || record.lastGoodPlan || ''}`;
+    if (DISMISSED_RE.test(verdictText)) {
+      return { stage: 'dismissed', detail: `${record.source} verdict: false-positive dismissal`.slice(0, 200) };
+    }
   }
 
   // 5. The apply was an explicit no-op verdict.
