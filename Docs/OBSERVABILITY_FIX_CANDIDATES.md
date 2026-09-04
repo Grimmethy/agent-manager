@@ -2938,3 +2938,26 @@ Replace the bare `catch { /* best-effort */ }` with `catch (err) { console.warn(
 
 Benefits:
 An operator watching stdout/stderr (or a log aggregator tailing the process) will immediately see which parent's state failed to persist and why, turning an invisible, accumulating data-loss risk into a single actionable log line. The best-effort semantics are preserved—no caller contract changes, no new exception path—so the fix is drop-in safe.
+
+### AC-163 · coordinatorSweep swallows readdirSync failure with no log line
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  let names;
+```
+
+Problem:
+The `try` block at line 125–126 calls `fs.readdirSync(coordDir)` to enumerate the coordinating-queue directory, and the `catch (err)` at line 127 is the only place that error is handled. Because the project has no metrics or telemetry stack, the sole observability channel is a `console.error` / `console.warn` call. If the catch body simply increments `summary.errors` and returns the all-zero summary (the pattern the surrounding `summary` object and early-return style strongly imply), the operator gets no log line at all: a missing directory (ENOENT), a permission failure (EACCES), and a transient I/O error (EIO) all collapse into an indistinguishable `{ checked: 0, updated: 0, completed: 0, errors: 1 }` with no message, no path, and no stack. The caller of `coordinatorSweep` has no way to tell "queue dir was never created" from "queue dir is unreadable" without adding its own instrumentation.
+
+Solution:
+Inside the `catch (err)` block (line 127 onward), before incrementing `summary.errors` and returning, emit a single `console.error` call that includes the resolved `coordDir` path, the error code (`err.code`), and the error message (`err.message`). For the common ENOENT case (directory not yet created), use `console.warn` instead so it does not page on-call for a benign "nothing to sweep yet" condition; for all other codes (EACCES, EIO, etc.) use `console.error`. The shape is: `console.error(\`coordinatorSweep: readdirSync(${coordDir}) failed [${err.code}]: ${err.message}\`)` (or the `console.warn` variant for ENOENT). Do not rethrow—the sweep is a periodic best-effort pass and the caller already handles the `summary` return value; the log line is the observability fix.
+
+Benefits:
+An operator tailing `stderr` (or a log aggregator that already captures `console.error`/`console.warn`) immediately sees which path failed, the OS-level reason, and can distinguish a benign missing-directory from a real permission or disk fault. The `summary.errors` counter remains the programmatic signal for the caller, while the log line provides the human-readable context that the counter alone cannot supply. No new dependency is introduced; the fix uses only `console.error` / `console.warn`, which the project already relies on for all other Node-side logging.
