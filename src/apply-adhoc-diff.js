@@ -59,7 +59,9 @@ function queueSubTasks(subTasks, pipelineDir, parentTaskId) {
   });
 }
 
-function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
+const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
+
+function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   if (task && task.adhocResolution === 'decompose') {
     const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
     if (!subTasks.length) {
@@ -171,8 +173,24 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir }) {
       }
     }
 
+    // Component 2 opt-in acceptance gate: the patch is now applied to repoRoot (which
+    // apply-task.js has already branched to agent/<id>); run the task-authored command
+    // against that state BEFORE apply-task.js commits. A failure throws -- same terminal
+    // shape as a failed git apply, so the task goes to blocked/ with the branch left for
+    // inspection. Only fires when the task supplies acceptanceCommand AND the flag is on.
+    const acceptanceCommand = task && task.promptContext && task.promptContext.acceptanceCommand;
+    if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_COMMAND === 'true'
+        && typeof acceptanceCommand === 'string' && acceptanceCommand.trim()) {
+      const gate = runAcceptanceCommand({ repoRoot, command: acceptanceCommand, exec });
+      if (!gate.ok) {
+        const detail = (gate.checks[0] && gate.checks[0].detail) || 'no output';
+        throw new Error(`acceptance command failed after apply -- branch left for inspection: ${detail}`);
+      }
+    }
+
     return { files };
   } catch (e) {
+    if (/^acceptance command failed/.test(e.message || '')) throw e;
     const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
     throw new Error(`git apply failed: ${detail}`);
   } finally {

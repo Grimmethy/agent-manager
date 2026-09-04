@@ -84,6 +84,20 @@ function blindPlanBlock(task) {
 // draftAdhocBranch from the declined tier-2 result). Tier 2 spends real turns reading files
 // and grepping; without this, tier 3 repeats all of that from scratch and runs out of
 // budget before it edits anything. Returns '' when tier 2 produced nothing worth carrying.
+// The task's stated definition of done (acceptance-criteria.js). Tier 3 must check each and
+// report it in an "Acceptance:" block (parsed by agentic-draft-common.js). '' when none.
+function acceptanceCriteriaBlock(task) {
+  const ac = task && Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [];
+  if (!ac.length) return '';
+  return [
+    'ACCEPTANCE CRITERIA -- the change is NOT done until every item below is satisfied:',
+    ...ac.map((c, i) => `${i + 1}. ${c}`),
+    '',
+    'Before you finish, run a concrete check for EACH item (a command, a grep, a test) and note its real result. You will report these in an "Acceptance:" block (see the RESOLUTION: implemented contract below).',
+    '',
+  ].join('\n');
+}
+
 function priorInvestigationBlock(task) {
   const inv = task && typeof task._priorInvestigation === 'string' ? task._priorInvestigation.trim() : '';
   if (!inv) return '';
@@ -171,6 +185,7 @@ function buildWriteAgenticPrompt(task) {
     priorRejectionBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
+    acceptanceCriteriaBlock(task),
     priorAttemptAnalysisBlock(task),
     'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or ask, per below).',
     '',
@@ -187,6 +202,9 @@ function buildWriteAgenticPrompt(task) {
     'RESOLUTION: needs-human-decision',
     '',
     'If RESOLUTION: implemented -- follow with a short (2-4 sentence) plain-English summary of what you did.',
+    ...(Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length ? [
+      'Then, because this task has ACCEPTANCE CRITERIA, add an "Acceptance:" block after the summary: one line per criterion, as `<criterion> -- <the check you ran> -- <PASS or FAIL + a short real output snippet>`. Every criterion needs a real check with a real result; if you genuinely could not check one, write `-- could not check --` and say why on that line.',
+    ] : []),
     '',
     'If RESOLUTION: no-changes-needed -- follow with a short summary, then an "Already covered:" block: one line per concrete object the request names, as `<object> -- <path>:<symbol>`. If you cannot fill in a real file:symbol for every object, it is NOT no-changes-needed.',
     '',
@@ -327,5 +345,5 @@ function modelStatsSafe(fn, args) {
 
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
-  isLeafTask, priorAttemptAnalysisBlock,
+  isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
 };

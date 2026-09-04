@@ -404,6 +404,25 @@ test('adhocPlanPrompt: _planGrounding is embedded as a trailing block with the "
   assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('REAL REPOSITORY CONTENT'), 'grounding block trails the stable instructions');
 });
 
+test('adhocPlanPrompt asks for a trailing CRITERIA: block; echoes stated criteria verbatim', () => {
+  const bare = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' } });
+  assert.match(bare, /End your PLAN with a line "CRITERIA:"/);
+  const stated = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing', acceptanceCriteria: ['GET /x returns 200', 'pytest test_x passes'] } });
+  assert.match(stated, /THE TASK STATES THESE ACCEPTANCE CRITERIA/);
+  assert.match(stated, /1\. GET \/x returns 200/);
+});
+
+test('buildWriteAgenticPrompt: acceptanceCriteriaBlock + Acceptance: contract only when criteria present', async () => {
+  const { buildWriteAgenticPrompt } = require('./local-agentic-write-draft.js');
+  const withAc = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' }, acceptanceCriteria: ['pytest passes', 'route returns 201'] });
+  assert.match(withAc, /ACCEPTANCE CRITERIA -- the change is NOT done/);
+  assert.match(withAc, /add an "Acceptance:" block/);
+  assert.match(withAc, /1\. pytest passes/);
+  const noAc = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'x' } });
+  assert.doesNotMatch(noAc, /ACCEPTANCE CRITERIA/);
+  assert.doesNotMatch(noAc, /add an "Acceptance:" block/);
+});
+
 // --- pipeline_forensics -----------------------------------------------------------
 
 test('pipelineForensicsPlanPrompt emits QUERY: lines and carries the evidence + subject', () => {

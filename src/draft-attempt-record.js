@@ -227,6 +227,15 @@ function finalizeDraftAttempt(task, attempt, result, { emitHistory } = {}) {
   if (r.blockedReason) attempt.blockedReason = String(r.blockedReason);
   if (r.reason) attempt.reason = String(r.reason);
   if (task && task.adhocResolution) attempt.adhocResolution = task.adhocResolution;
+  if (task && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length) {
+    const results = Array.isArray(task.acceptanceResults) ? task.acceptanceResults : [];
+    attempt.acceptance = {
+      criteriaCount: task.acceptanceCriteria.length,
+      resultCount: results.length,
+      passCount: results.filter((x) => x && x.pass).length,
+      source: task.acceptanceCriteriaSource || null,
+    };
+  }
   attempt.finishedAt = new Date().toISOString();
 
   if (!task) return;

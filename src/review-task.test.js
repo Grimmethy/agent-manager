@@ -541,6 +541,55 @@ test('reviewTask deterministically rejects a draft whose own critique flagged is
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known, unaddressed critique');
 });
 
+test('reviewTask deterministically rejects an adhoc "implemented" draft with acceptance criteria but no Acceptance: block -- no vote spent', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'implemented',
+    acceptanceCriteria: ['pytest test_plugins.py passes', 'POST /api/plugins/install returns 201'],
+    acceptanceResults: [],
+    rawDiff: 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-missing-acceptance');
+  assert.match(result.blockedReason, /2 acceptance criteria but the implement draft produced no "Acceptance:" block/);
+  assert.equal(captured.length, 0);
+});
+
+test('reviewTask reaches the vote when the acceptance criteria draft DID report results', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'implemented',
+    acceptanceCriteria: ['x passes'],
+    acceptanceResults: [{ criterion: 'x passes', check: 'pytest', result: 'PASS', pass: true }],
+    rawDiff: 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-acceptance');
+  assert.equal(captured.length, 1);
+});
+
+test('the acceptance pre-vote gate is skipped when AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE=false', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE = 'false';
+  try {
+    const task = baseTask({
+      domain: 'default', source: 'manual', adhocResolution: 'implemented',
+      acceptanceCriteria: ['x passes'], acceptanceResults: [],
+      rawDiff: 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n',
+    });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.notEqual(task.reviewProvider, 'deterministic-missing-acceptance');
+  } finally { delete process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE; }
+});
+
 test('reviewTask reaches the real vote (does not auto-reject) when critique flagged issues but a revision was successfully applied', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = baseTask({
