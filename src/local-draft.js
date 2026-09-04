@@ -40,12 +40,13 @@ const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+const { runOrientPass } = require('./orient-pass.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const {
-  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordTier, finalizeDraftAttempt,
+  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordTier, finalizeDraftAttempt,
 } = require('./draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
@@ -681,11 +682,13 @@ async function draftAdhocBranch(task, {
   // task (same pattern as runPlanPass's task._seedPlan).
   if (priorInvestigation) {
     task._priorInvestigation = priorInvestigation;
+  } else if (typeof task.orientNotes === 'string' && task.orientNotes.trim()) {
+    // The pre-plan orient pass (component 3) already mapped this task -- feed its report to
+    // tier 3 so it starts from confirmed findings instead of a blind re-grep.
+    task._priorInvestigation = `Pre-plan orientation report (read-only pass, before the plan):\n\n${task.orientNotes.trim()}`;
   } else if (task.planWasGrounded && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
-    // No agentic tier-2 investigation ran, but the plan pass built deterministic grounding.
-    // Rebuild it (cheap, no LLM) so tier 3 starts from verified file content instead of a
-    // blind re-grep. A real investigationSummary always wins -- it also carries grep-MISSED
-    // and tool-error signal -- so this is only the fallback.
+    // No agentic exploration ran, but the plan pass built deterministic grounding. Rebuild
+    // it (cheap, no LLM) so tier 3 starts from verified file content instead of a blind re-grep.
     try {
       const g = buildPlanGrounding(task);
       if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
@@ -815,6 +818,7 @@ function bestPriorPlan(task) {
 // prior plan to fall back on), else { blocked: false }.
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
+  runOrientPassFn = runOrientPass,
 }) {
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
@@ -871,6 +875,26 @@ async function runPlanPass(task, {
     if (grounding) {
       task._planGrounding = grounding.text;
       task.planWasGrounded = true;
+    }
+  }
+
+  // Agentic orient pass (component 3): when the task names something concrete but the
+  // deterministic grounding did NOT already fully cover it, read the surrounding code with
+  // read-only tools before planning. runOrientPass skips itself (0 GPU) when grounding
+  // already covers the task or when there's nothing concrete to orient on. Kill switch
+  // AGENT_MANAGER_ADHOC_ORIENT=false.
+  if (substanceGated && grounding && process.env.AGENT_MANAGER_ADHOC_ORIENT !== 'false') {
+    try {
+      const orient = await runOrientPassFn(task, { grounding, maybeLocked });
+      recordOrient(attempt, { turnsUsed: orient.turnsUsed, skipped: orient.skipped });
+      appendHistoryEvent(task, 'orient-done', orient.skipped ? 'skipped (grep-covered)' : `${orient.turnsUsed} turn(s)`);
+      if (!orient.skipped && orient.notes) {
+        task._planGrounding = orient.notes;   // richer than the deterministic text
+        task.orientNotes = orient.notes;      // persisted -- fed to tier 3, visible for debugging
+        task.oriented = true;
+      }
+    } catch (e) {
+      appendHistoryEvent(task, 'advisory', `orient pass errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
     }
   }
 
@@ -1434,7 +1458,7 @@ async function runDraftPasses(task, attempt, {
   draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
   draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
   draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
-  isClaudePausedFn = isClaudePaused,
+  isClaudePausedFn = isClaudePaused, runOrientPassFn = runOrientPass,
 } = {}) {
   const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked } =
     resolveDraftContext(task, { localCall, withLockFn });
@@ -1493,7 +1517,7 @@ async function runDraftPasses(task, attempt, {
       }
 
       const planOutcome = await runPlanPass(task, {
-        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
+        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
       });
       if (planOutcome.blocked) {
         return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason };

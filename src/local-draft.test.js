@@ -274,6 +274,69 @@ test('adhoc: a declined tier-2 investigationSummary reaches tier 3 as task._prio
   });
 });
 
+function seedWidget(dir) {
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'widget.js'), 'function updateWidgetCache() { return WIDGET_CACHE; }\n');
+  process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+}
+
+test('adhoc: the orient pass runs, stamps orientNotes + oriented + orient-done history, and feeds tier 3', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    seedWidget(dir);
+    const { withLockFn } = spyLock();
+    const task = { id: 'adhoc-orient', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'change updateWidgetCache in src/widget.js' } };
+    let seenAtTier3;
+    await draftTask(task, {
+      localCall: fakeLocalCall(PLAN_STUB),
+      withLockFn,
+      runOrientPassFn: async () => ({ notes: 'CURRENT STATE: widget.js has a cache\nEDIT LOCATION: src/widget.js:40', turnsUsed: 4, skipped: false }),
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => { seenAtTier3 = t._priorInvestigation; t.adhocResolution = 'implemented'; t.implementResponse = 'RESOLUTION: implemented\ndone'; return { succeeded: true, blocked: false }; },
+    });
+    assert.equal(task.oriented, true);
+    assert.match(task.orientNotes, /CURRENT STATE: widget\.js has a cache/);
+    assert.ok((task.history || []).some((h) => h.stage === 'orient-done'));
+    assert.match(seenAtTier3, /Pre-plan orientation report/);
+    assert.match(seenAtTier3, /EDIT LOCATION: src\/widget\.js:40/);
+  });
+});
+
+test('adhoc: a skipped orient pass records orient-done "skipped" and does NOT set oriented/orientNotes', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    seedWidget(dir);
+    const { withLockFn } = spyLock();
+    const task = { id: 'adhoc-orient-skip', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'tweak updateWidgetCache in src/widget.js' } };
+    await draftTask(task, {
+      localCall: fakeLocalCall(PLAN_STUB), withLockFn,
+      runOrientPassFn: async () => ({ notes: 'grep text', turnsUsed: 0, skipped: true }),
+      ...declineLocalTiers(),
+    });
+    assert.notEqual(task.oriented, true);
+    assert.equal(task.orientNotes, undefined);
+    assert.ok((task.history || []).some((h) => h.stage === 'orient-done' && /skipped/.test(h.detail || '')));
+  });
+});
+
+test('adhoc: AGENT_MANAGER_ADHOC_ORIENT=false disables the orient pass entirely', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    seedWidget(dir);
+    process.env.AGENT_MANAGER_ADHOC_ORIENT = 'false';
+    try {
+      const { withLockFn } = spyLock();
+      const task = { id: 'adhoc-orient-off', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'edit updateWidgetCache in src/widget.js' } };
+      let ran = false;
+      await draftTask(task, {
+        localCall: fakeLocalCall(PLAN_STUB), withLockFn,
+        runOrientPassFn: async () => { ran = true; return { notes: '', turnsUsed: 0, skipped: true }; },
+        ...declineLocalTiers(),
+      });
+      assert.equal(ran, false);
+      assert.ok(!(task.history || []).some((h) => h.stage === 'orient-done'));
+    } finally { delete process.env.AGENT_MANAGER_ADHOC_ORIENT; }
+  });
+});
+
 test('adhoc: tier 3 gets no _priorInvestigation when tier 2 produced no investigation summary', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
