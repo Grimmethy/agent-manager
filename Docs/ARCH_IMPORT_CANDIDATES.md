@@ -153,3 +153,17 @@ In the Decision section, in the sentence 'Core is the platform: the queue state 
 
 Benefits:
 The platform contract is explicit in the ADR; plugin authors and SDK consumers know the review gate's output shape from the design doc alone; the GUARDRAIL vocabulary is anchored in the architecture narrative, not just in code.
+
+### AC-12 · Pin the clock in staleness-sweep tests and expose a seam in the browser-side staleness label
+Strength: Worth exploring
+Source: omnigent-ai-omnigent — "Injectable `nowMs` parameter for deterministic testing"
+Files: src/adhoc-staleness-flag.js, src/adhoc-staleness-flag.test.js, python/visualize_assets/node-detail.js
+
+Problem:
+`adhoc-staleness-flag.js` already accepts an injectable `now` parameter (line 217: `now = Date.now()`), so the seam exists in production code. However, the test file `adhoc-staleness-flag.test.js` never actually exploits it: every call to `sweep()` passes `now: Date.now()` (lines 83, 96, 99, 108, 120, 123), and the `exhaustedTask` helper computes `createdAt` relative to the real clock (`new Date(Date.now() - 2 * 86400000)`). This means any future assertion on exact age thresholds (e.g., "a task exactly at the 7-day boundary is flagged, one one millisecond under is not") would be inherently racy. Separately, `python/visualize_assets/node-detail.js` computes a "Reviewed N days ago" label via a bare `Date.now()` call inside `formatStaleness()` with no injection point, making that display logic untestable in isolation.
+
+Solution:
+In `adhoc-staleness-flag.test.js`, replace the `Date.now()` calls with a fixed epoch constant (e.g., `const FIXED_NOW = 1700000000000`) and construct `exhaustedTask`'s `createdAt` relative to that same constant, so every assertion is deterministic. For `node-detail.js`, refactor `formatStaleness(lastReviewedAt, nowMs = Date.now())` to accept an optional clock parameter, mirroring the pattern already in `sweep()`. Because this is browser-side code loaded by the Python visualizer, the parameter can default to `Date.now()` in production while a small Node-based smoke test (or a jsdom harness) can call it with a pinned value to assert the exact "N days ago" string.
+
+Benefits:
+Tests become immune to wall-clock drift, CI timezone shifts, and the rare sub-millisecond race between `createdAt` computation and the `now` argument. The `node-detail.js` helper gains a one-line testable seam without changing its runtime behaviour, and the codebase converges on a single, already-proven injection pattern (`now = Date.now()`) rather than ad-hoc `Date.now()` calls scattered across display and logic layers.
