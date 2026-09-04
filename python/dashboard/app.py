@@ -7171,6 +7171,14 @@ def _is_loopback_host(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+# --- Decomposed route blueprints (file-decompose) ---
+from routes.hardware import hardware_bp  # noqa: E402
+from routes.reports import reports_bp  # noqa: E402
+
+app.register_blueprint(hardware_bp)
+app.register_blueprint(reports_bp)
+
+
 if __name__ == "__main__":
     _filled = backfill_env_from_file(ENV_FILE_PATH)
     if _filled:
