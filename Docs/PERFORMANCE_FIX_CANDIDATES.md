@@ -200,3 +200,26 @@ Replace the per-iteration `taskIsLive(queueRoot, id)` call with a single up-fron
 
 Benefits:
 The N-syscall loop collapses to one directory read plus N in-memory hash lookups, cutting the synchronous I/O time from O(N) kernel round-trips to O(1). The event loop is unblocked for the duration of the scan, reducing tail latency for concurrent requests. The change is local to the enumeration loop, requires no API additions, and preserves the existing sync coding style and logging conventions (`console.error` on unexpected read failures) already present in the file.
+
+### AC-11 · Synchronous directory I/O blocks the event loop in staleness-flag path
+Strength: Strong
+Files: src/adhoc-staleness-flag.js
+Snippet:
+```
+
+function readTasks(pipelineDir, dirNames) {
+  const out = [];
+  for (const d of dirNames) {
+    const dir = path.join(pipelineDir, 'queue', d);
+    let names;
+    try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+```
+
+Problem:
+The function iterates over `dirNames` and performs synchronous filesystem calls (e.g. `fs.statSync` / `fs.readdirSync`) inside the loop. Each call blocks the Node.js event loop for the duration of the kernel I/O round-trip. When `dirNames` contains more than a handful of entries, or when the underlying filesystem is a network mount or a slow disk, the cumulative blocking time grows linearly and starves every other I/O-bound or timer-driven callback on the same process. Because the project has no metrics or telemetry layer, there is no built-in signal that this path is "cold" or low-volume; the code as written offers no guard against a large or frequently-invoked caller.
+
+Solution:
+Replace the per-entry synchronous calls with their `fs.promises` equivalents (`fs.promises.stat`, `fs.promises.readdir`) and `await` them inside an `async` function, or—if the caller is already synchronous and cannot be made async—batch all directory lookups into a single `Promise.all` over the mapped async calls and resolve the loop in one microtask turn. Memoize the per-directory result in a module-level `Map` keyed by the directory path plus a short TTL (e.g. 5 s) so that repeated calls within the same tick or a tight retry loop do not re-issue the syscall. Both `fs.promises` and `Map` are Node.js stdlib; no new dependency is introduced.
+
+Benefits:
+The event loop is no longer held hostage for the full duration of N sequential syscalls; concurrent requests, timers, and other I/O callbacks can interleave during the await windows. The TTL memo removes redundant stat/readdir work for callers that poll the staleness flag in a tight loop, cutting syscall count by the repetition factor. Because the change is confined to the I/O calls inside the existing function, the public API and return shape are unchanged, so no caller needs modification.
