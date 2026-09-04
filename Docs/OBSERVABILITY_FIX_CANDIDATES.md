@@ -3007,3 +3007,26 @@ Replace the bare `catch` with a named binding and emit a `console.error` call be
 
 Benefits:
 An operator or on-call engineer reading stderr or a CI log will immediately see that `getConfig()` failed, the exact exception message and stack trace, and which fallback value was used. This converts an invisible silent mis-routing of pipeline artifacts into a one-line diagnostic that points directly at the root cause, eliminating the "why are my hub files in the wrong directory?" class of incident and making the fallback path auditable in post-mortems.
+
+### AC-166 · Narrow the bare catch in needs-clarification triage to ENOENT only
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Snippet:
+```
+  let names;
+  try {
+    names = fs.readdirSync(ncDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no needs-clarification/ dir
+  }
+
+```
+
+Problem:
+The bare `catch { return summary; }` at lines 125–127 treats every `fs.readdirSync` failure as "directory not yet created." In practice `readdirSync` can also throw EACCES (permission denied), ENOTDIR (a file or symlink occupies the path), EIO, or EMFILE. When any of those occurs the function silently returns an all-zero summary identical to the benign first-run case, so an operator inspecting the triage output sees `errors: 0` and no log line, making a real filesystem or permissions fault invisible. The summary object already carries an `errors` counter (line 113) that is never incremented for this path, confirming the developer intended error accounting but the bare catch bypasses it.
+
+Solution:
+Bind the caught error to a variable (`catch (err)`), then branch on `err.code === 'ENOENT'`. In the ENOENT arm, keep the existing early return (the directory genuinely hasn't been created yet). In the fall-through arm, call `console.error('[needs-clarification-triage] readdirSync failed on', ncDir, err)` to surface the non-ENOENT failure with the full path and original error, increment `summary.errors` so the returned summary reflects the anomaly, and then return `summary` so the caller's contract (a summary object, not a thrown exception) is preserved. No new dependency or telemetry primitive is introduced; the fix uses only `console.error` and the existing `summary.errors` field already present in the file.
+
+Benefits:
+An operator running the triage step will now see a clear, path-qualified error line on stderr whenever a non-ENOENT filesystem fault occurs, and the returned summary's `errors` counter will be non-zero, distinguishing a real I/O or permissions problem from the expected "directory not yet created" case. This eliminates a silent-failure mode where a broken mount, a wrong file at the queue path, or a permission regression would produce an indistinguishable all-zero summary and go unnoticed until downstream tasks stall.
