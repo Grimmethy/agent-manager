@@ -15,7 +15,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
-const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
+const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -420,7 +420,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   // -- root-caused via three needs-clarification tasks that each burned their retry budget
   // getting a doc / stub / off-limits diff rejected in review.
   if (resolution === 'implemented' && trimmedDiff) {
-    const substance = adhocDiffSubstanceProblem(task, trimmedDiff);
+    const substance = adhocDiffSubstanceProblem(task, trimmedDiff, summary);
     if (substance) {
       task.retryableDraftBlock = true;
       task.adhocDiffSubstanceFeedback = substance.retryFeedback;
@@ -430,6 +430,24 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
         blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- ${substance.reason}`,
         ...meta,
         capturedDiff: trimmedDiff,
+      };
+    }
+  } else if (resolution === 'no-changes-needed') {
+    // Sibling of the check above: an empty diff sailed past adhocDiffSubstanceProblem
+    // entirely (it early-returns on an empty diff) with zero verification, landing only on
+    // an LLM review round-trip -- root-caused 2026-09-04 via a corpus of 96 historically-
+    // stuck adhoc tasks, ~43% of which show exactly this shape (a false "already covered"/
+    // refusal claim). See adhoc-diff-sanity.js.
+    const claim = adhocNoChangesClaimProblem(task, summary);
+    if (claim) {
+      task.retryableDraftBlock = true;
+      task.adhocNoChangesClaimFeedback = claim.retryFeedback;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass resolved no-changes-needed but ${claim.reason}`,
+        ...meta,
+        capturedDiff: trimmedDiff || undefined,
       };
     }
   }
