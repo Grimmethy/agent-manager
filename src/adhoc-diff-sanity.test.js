@@ -2,7 +2,23 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { adhocDiffSubstanceProblem, parseChangedFiles, extractForbiddenPaths } = require('./adhoc-diff-sanity.js');
+const {
+  adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
+} = require('./adhoc-diff-sanity.js');
+
+// Stubs arch-import-fetch.js's fetchForQueries for the duration of fn(), via require-cache
+// substitution (adhocNoChangesClaimProblem requires it lazily, inside the function, so this
+// is the only way to control its grep result without a real repo/grep call).
+function withStubbedFetchForQueries(hits, fn) {
+  const key = require.resolve('./arch-import-fetch.js');
+  const real = require.cache[key];
+  require.cache[key] = { id: key, filename: key, loaded: true, exports: { fetchForQueries: () => ({ hits }) } };
+  try {
+    return fn();
+  } finally {
+    if (real) require.cache[key] = real; else delete require.cache[key];
+  }
+}
 
 const editDiff = (p) => `diff --git a/${p} b/${p}\nindex 1a2b3c..4d5e6f 100644\n--- a/${p}\n+++ b/${p}\n@@ -1 +1,2 @@\n x\n+y\n`;
 const createDiff = (p) => `diff --git a/${p} b/${p}\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1 @@\n+content\n`;
@@ -72,4 +88,79 @@ test('non-adhoc tasks and empty diffs are never gated', () => {
   assert.equal(adhocDiffSubstanceProblem({ source: 'observability_fix', promptContext: { rawText: 'x' } }, createDiff('docs/x.md')), null);
   assert.equal(adhocDiffSubstanceProblem(adhoc('implement the thing in src/x.js'), ''), null);
   assert.equal(adhocDiffSubstanceProblem(adhoc('implement the thing in src/x.js'), '   '), null);
+});
+
+// --- checks 4-5: false completion claims (2026-09-04) ----------------------
+
+const editWithTestDefs = (p, n) => {
+  const defs = Array.from({ length: n }, (_, i) => `+def test_case_${i}():\n+    assert True\n`).join('');
+  return `diff --git a/${p} b/${p}\nindex 1a2b3c..4d5e6f 100644\n--- a/${p}\n+++ b/${p}\n@@ -1 +1,${n + 1} @@\n x\n${defs}`;
+};
+
+test('false-test-count-claim: summary claims more tests than the diff actually adds', () => {
+  const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
+  const p = adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 1), 'Implemented. All 3 tests pass.');
+  assert.equal(p.code, 'false-test-count-claim');
+  assert.match(p.reason, /claims 3 tests but the diff only adds 1/);
+});
+
+test('false-test-count-claim: a matching count is not flagged', () => {
+  const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
+  assert.equal(adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 3), 'Implemented. All 3 tests pass.'), null);
+});
+
+test('false-test-count-claim: no test-count claim in the summary is never checked', () => {
+  const t = adhoc('Add a health-check endpoint to python/dashboard/app.py.');
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('python/dashboard/app.py'), 'Implemented the endpoint.'), null);
+});
+
+test('false-file-creation-claim: summary claims a file the diff never creates', () => {
+  const t = adhoc('Add a new task source in src/task-sources.js.');
+  const p = adhocDiffSubstanceProblem(t, editDiff('src/task-sources.js'), 'Implemented. This creates the file `src/new-source.js` with the handler.');
+  assert.equal(p.code, 'false-file-creation-claim');
+  assert.match(p.reason, /claims it creates `src\/new-source\.js`/);
+});
+
+test('false-file-creation-claim: a matching creation is not flagged', () => {
+  const t = adhoc('Add a new task source in src/task-sources.js.');
+  const diff = editDiff('src/task-sources.js') + createDiff('src/new-source.js');
+  assert.equal(adhocDiffSubstanceProblem(t, diff, 'Implemented. This creates the file `src/new-source.js`.'), null);
+});
+
+// --- adhocNoChangesClaimProblem (2026-09-04) --------------------------------
+
+test('adhocNoChangesClaimProblem: no "Already covered:" block at all is flagged', () => {
+  const t = adhoc('Add a lightweight checker script that validates the second-brain vault.');
+  const p = adhocNoChangesClaimProblem(t, "I'm not making code changes here.");
+  assert.equal(p.code, 'missing-citation-block');
+  assert.match(p.retryFeedback, /Already covered/);
+});
+
+test('adhocNoChangesClaimProblem: a full, real citation block passes', () => {
+  const t = adhoc('Add a lightweight checker script that validates the second-brain vault.');
+  const summary = 'Already covered:\n- checker script -- src/second-brain-checker.js:validateVault\n- second-brain vault -- src/second-brain-checker.js:VAULT_DIR';
+  assert.equal(adhocNoChangesClaimProblem(t, summary), null);
+});
+
+test('adhocNoChangesClaimProblem: a named object absent from citations AND ungrounded in the repo is flagged', () => {
+  const t = adhoc('Render a sparkline for CPU history in the Hardware tab.');
+  const summary = 'Already covered:\n- CPU history -- python/dashboard/hardware_stats.py:get_history';
+  const p = withStubbedFetchForQueries([], () => adhocNoChangesClaimProblem(t, summary));
+  assert.equal(p.code, 'ungrounded-named-object');
+  assert.match(p.reason, /sparkline/i);
+});
+
+test('adhocNoChangesClaimProblem: a named object absent from citations but grep-findable is NOT flagged', () => {
+  const t = adhoc('Render a sparkline for CPU history in the Hardware tab.');
+  const summary = 'Already covered:\n- CPU history -- python/dashboard/hardware_stats.py:get_history';
+  const p = withStubbedFetchForQueries(
+    [{ file: 'templates/index.html', line: 42, query: 'sparkline' }, { file: 'src/x.js', line: 1, query: 'Render' }],
+    () => adhocNoChangesClaimProblem(t, summary),
+  );
+  assert.equal(p, null);
+});
+
+test('adhocNoChangesClaimProblem: non-adhoc tasks and empty summaries are never gated', () => {
+  assert.equal(adhocNoChangesClaimProblem({ source: 'observability_fix', promptContext: { rawText: 'x' } }, 'no citations here'), null);
+  assert.equal(adhocNoChangesClaimProblem(adhoc('do the thing'), ''), null);
 });

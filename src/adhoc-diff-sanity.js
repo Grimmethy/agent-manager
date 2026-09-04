@@ -9,10 +9,27 @@
 // `adhocResolution: 'implemented'` because their quality bar only checks "valid diff,
 // applies cleanly, non-empty" and never "is this actually the change?".
 //
-// Three deterministic checks. Used by:
+// Five deterministic checks (1-3 original, 4-5 added 2026-09-04). Used by:
 //   - adhoc-harness-draft.js (tier 1): a hit -> decline, fall through to the agentic tiers.
+//   - local-agentic-draft.js (tier 2): a hit -> decline, fall through to tier 3.
 //   - agentic-draft-common.js resolveAgenticDraft (tier 3 implemented branch): a hit ->
 //     retryable block carrying pointed feedback, instead of a wasted review round-trip.
+//
+// 2026-09-04 (corpus investigation of 96 historically-stuck adhoc tasks): this file's own
+// substance check only ever ran for `resolution === 'implemented'` with a non-empty diff --
+// a `no-changes-needed` resolution (empty diff, by definition) sailed past it entirely, and
+// a FALSE-but-checkable completion claim inside an `implemented` diff's own summary (a test
+// count, a "created file X") was never cross-checked against the diff either. Both shapes
+// accounted for ~43% of the historically-stuck corpus, caught only after a full review
+// round-trip (sometimes several). `adhocNoChangesClaimProblem` (below) is the
+// `no-changes-needed` sibling of `adhocDiffSubstanceProblem`; checks 4-5 extend
+// `adhocDiffSubstanceProblem` itself with the false-completion-claim checks. Both reuse
+// `extractRequestObjectTokens` (request-object-tokens.js) and `fetchForQueries`
+// (arch-import-fetch.js) -- the same primitives get-grounding-source.js's
+// `buildRequestObjectGrounding` already uses at REVIEW time -- moved earlier, to draft
+// time, so the round-trip closes instead of just getting detected after the fact.
+
+const { extractRequestObjectTokens } = require('./request-object-tokens.js');
 
 // --- diff parsing -----------------------------------------------------------
 
@@ -96,9 +113,53 @@ function isAdhoc(task) {
 
 const PLAN_TARGETS_HINT = 'Implement the actual change in the file(s) the plan/task names';
 
+// --- false-completion-claim helpers (checks 4-5) ---------------------------
+
+// "all 14 tests pass" / "all 24 tests" / "12 tests added" / "8 tests passing" -- the
+// specific phrasing corpus incidents actually used. Deliberately narrow (a claim this
+// check can't parse just isn't checked, never blocks).
+const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
+const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
+
+function extractClaimedTestCount(summary) {
+  const m = ALL_N_TESTS_RE.exec(summary) || N_TESTS_CLAIM_RE.exec(summary);
+  return m ? Number(m[1]) : null;
+}
+
+// Counts distinct test definitions ADDED by the diff (Python def test_..., JS it()/test()).
+// Line-level, not AST -- consistent with this file's existing diff-parsing style.
+function countAddedTestDefs(diff) {
+  let n = 0;
+  for (const line of String(diff || '').split('\n')) {
+    if (!line.startsWith('+') || line.startsWith('+++')) continue;
+    if (/\bdef\s+test_\w+\s*\(/.test(line) || /\b(?:it|test)\(\s*['"`]/.test(line)) n++;
+  }
+  return n;
+}
+
+// "creates the file `x.py`" / "created file 'x.js'" -- checked against parseChangedFiles'
+// own `create`-kind entries.
+const CREATES_FILE_RE = /creat(?:e|ed|es)\s+(?:the\s+|a\s+)?(?:new\s+)?file\s+[`'"]([^`'"]+)[`'"]/i;
+
+function extractClaimedCreatedFile(summary) {
+  const m = CREATES_FILE_RE.exec(summary);
+  return m ? m[1].trim() : null;
+}
+
+// --- no-changes-needed claim helpers (adhocNoChangesClaimProblem) ----------
+
+const ALREADY_COVERED_RE = /already covered:/i;
+
+// Every line under "Already covered:" (or anywhere else in the summary -- a citation
+// written in prose still counts), so a token that appears ANYWHERE in the response text
+// is treated as covered, not just inside the literal header block.
+function tokenMentioned(token, summary) {
+  return summary.toLowerCase().includes(String(token).toLowerCase());
+}
+
 // Returns null if the diff looks like a real, on-task implementation, else
 // { code, reason, retryFeedback }.
-function adhocDiffSubstanceProblem(task, rawDiff) {
+function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   if (!isAdhoc(task) || !String(rawDiff || '').trim()) return null;
   const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '';
   const planText = task.planResponse || task.lastGoodPlan || '';
@@ -141,7 +202,91 @@ function adhocDiffSubstanceProblem(task, rawDiff) {
     };
   }
 
+  // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.
+  const claimedTests = extractClaimedTestCount(summary);
+  if (claimedTests !== null) {
+    const actualTests = countAddedTestDefs(rawDiff);
+    if (actualTests < claimedTests) {
+      return {
+        code: 'false-test-count-claim',
+        reason: `summary claims ${claimedTests} tests but the diff only adds ${actualTests} test definition(s)`,
+        retryFeedback: `Your summary claims ${claimedTests} tests, but the diff you produced only adds ${actualTests} test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff.`,
+      };
+    }
+  }
+
+  // 5. A checkable "creates the file X" claim contradicted by the diff's own file list.
+  const claimedFile = extractClaimedCreatedFile(summary);
+  if (claimedFile) {
+    const created = files.some((f) => f.kind === 'create' && (f.path === claimedFile || f.path.endsWith(`/${claimedFile}`) || claimedFile.endsWith(f.path)));
+    if (!created) {
+      return {
+        code: 'false-file-creation-claim',
+        reason: `summary claims it creates \`${claimedFile}\` but the diff has no "new file" entry for that path`,
+        retryFeedback: `Your summary claims you created \`${claimedFile}\`, but your diff has no "new file" entry for that path. Either actually create it in the diff, or correct the summary -- do not claim a file exists that your own diff doesn't create.`,
+      };
+    }
+  }
+
   return null;
 }
 
-module.exports = { adhocDiffSubstanceProblem, parseChangedFiles, extractForbiddenPaths };
+// The no-changes-needed sibling of adhocDiffSubstanceProblem. Returns null if the claim
+// looks genuinely grounded, else { code, reason, retryFeedback }.
+function adhocNoChangesClaimProblem(task, summary) {
+  if (!isAdhoc(task)) return null;
+  const text = String(summary || '');
+  if (!text.trim()) return null; // an empty response is handled elsewhere (turn-budget path)
+
+  // Check A: no "Already covered:" block at all -- the single most common shape in the
+  // corpus (a bare refusal or meta-commentary response with no coverage breakdown).
+  if (!ALREADY_COVERED_RE.test(text)) {
+    return {
+      code: 'missing-citation-block',
+      reason: 'no "Already covered:" block at all',
+      retryFeedback: 'You answered RESOLUTION: no-changes-needed but gave no "Already covered:" block. Before that resolution is valid, you MUST list every concrete object/endpoint/field the request names, one line each, as `<object> -- <path>:<symbol>`, pointing at the REAL current file:symbol that covers it. If you cannot fill in a real file:symbol for every object the request names, it is NOT no-changes-needed -- implement the missing part instead.',
+    };
+  }
+
+  // Check B: a distinctive named object is neither mentioned anywhere in the response NOR
+  // findable anywhere in the live repo -- a double-negative confirmation the "already
+  // covered" claim is false for that specific object.
+  const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '';
+  const tokens = extractRequestObjectTokens(rawText).filter((tok) => !tokenMentioned(tok, text));
+  if (tokens.length === 0) return null;
+
+  let fetchForQueries;
+  try {
+    ({ fetchForQueries } = require('./arch-import-fetch.js'));
+  } catch {
+    return null; // can't verify -- don't block on this check
+  }
+  const variantToTok = new Map();
+  const queries = [];
+  for (const tok of tokens) {
+    for (const v of new Set([tok, tok.toLowerCase(), tok.toUpperCase()])) {
+      if (!variantToTok.has(v)) { variantToTok.set(v, tok); queries.push(v); }
+    }
+  }
+  let hits = [];
+  try {
+    hits = fetchForQueries(queries).hits || [];
+  } catch {
+    return null; // grep failed -- don't block on this check
+  }
+  const hasHit = new Set();
+  for (const h of hits) { const tok = variantToTok.get(h.query); if (tok) hasHit.add(tok); }
+  const ungrounded = tokens.filter((tok) => !hasHit.has(tok));
+  if (ungrounded.length === 0) return null;
+
+  const list = ungrounded.map((t) => `"${t}"`).join(', ');
+  return {
+    code: 'ungrounded-named-object',
+    reason: `the request names ${list}, which appears in neither your "Already covered:" citations nor anywhere in the current repo`,
+    retryFeedback: `The request names ${list}. Your response doesn't cite it, and a search of the current repo found no trace of it either -- that is a strong signal it is NOT already covered. For each of these, either point at the real file:symbol that implements it, or implement the missing piece. Do not answer no-changes-needed while any of these remain unaccounted for.`,
+  };
+}
+
+module.exports = {
+  adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
+};
