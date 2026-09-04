@@ -30,6 +30,20 @@
 // Cheap by construction: readdirSync of a small dir; LLM votes only in bucket B, capped
 // per sweep. Runs unconditionally on the watchdog tick, same discipline as
 // auto-confirm-review.js. Kill switch: AGENT_MANAGER_NC_TRIAGE=false.
+//
+//   D. FALSE COMPLETION-CLAIM SIGNATURE (2026-09-04) -- the draft asserted something
+//      checkable and false about its own output ("claims to have implemented X" while the
+//      diff only touches an unrelated file; "claims to have created file Y" while the
+//      fact-check confirms it doesn't exist) and review had to catch it by judgment, each
+//      time, until retries ran out. adhoc-diff-sanity.js's adhocNoChangesClaimProblem and
+//      the false-test-count/false-file-creation checks now catch this class at DRAFT time,
+//      before it ever reaches review -- so a task stuck on this exact signature deserves
+//      one more, now-gated attempt rather than staying frozen for a human forever.
+//      Checked BEFORE the "already reviewed" skip below (unlike A/B/C): this detector did
+//      not exist when older tasks were first triaged, so a stale `leave-for-human` stamp
+//      must not shield them from a fix built specifically for this shape. Bounded by the
+//      same MAX_REQUEUES/ncTriageAttempts counter bucket A uses -- one clean retry, then
+//      it falls back to the normal leave-for-human path like everything else.
 
 const fs = require('fs');
 const path = require('path');
@@ -68,6 +82,16 @@ const INVALID_PREMISE_RE = /\bpremise (?:of this task )?(?:is|appears|seems)[^.]
 // signal drops the task straight to bucket C.
 const CREATE_TASK_RE = /\b(?:create|add|write|build|implement|scaffold|extract|introduce)\b[^.\n]{0,70}\b(?:new )?(?:file|module|script|component|endpoint|route|blueprint|source|helper)\b/i;
 const IN_PROGRESS_RE = /\bgot close\b|\bverified facts\b|\bfor the next pass\b|\bran out of turns\b|working (?:\w+ )?script exists|\bstate so far\b|\bpartial (?:work|implementation) (?:landed|exists)\b/i;
+
+// Bucket D signature: a draft's own text (or review's account of it) asserted a checkable
+// completion claim that is contradicted by the diff/repo -- the exact shape
+// adhoc-diff-sanity.js's adhocNoChangesClaimProblem and the false-test-count/
+// false-file-creation checks (2026-09-04) now catch at draft time. Matches both the older
+// review-time phrasing ("claims to have implemented...but the diff only...", "claims to
+// have created the file...but the deterministic fact-check...") and the new gate's own
+// blockedReason wording ("resolved no-changes-needed but...", "no \"Already covered:\"
+// block", "summary claims N tests").
+const FALSE_CLAIM_RE = /\bclaims? (?:to have )?"?(?:implement|creat|verif)\w*\b|\bresolved no-changes-needed but\b|\bno "Already covered:" block\b|\bdeterministic fact-check (?:confirms|flags)\b|\bsummary claims\b/i;
 
 const REQUEUE_STRIP_FIELDS = [
   'needsClarification', 'localRejectCount', 'retryableDraftBlock', 'turnBudgetExhausted',
@@ -155,6 +179,45 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     if (nc.reason !== 'design-decision') continue;                       // not ours
     if (task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop') continue; // autoroute owns it
     if (task.stalenessKeep && task.stalenessKeep.until && task.stalenessKeep.until > now) continue; // human said Keep
+
+    // --- Bucket D: false completion-claim signature -> clean-state requeue -----------
+    // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
+    // toward `checked`) when the signature actually matches; otherwise falls through to
+    // the pre-existing flow unchanged.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const sig = FALSE_CLAIM_RE.test(String(task.blockedReason || '')) || FALSE_CLAIM_RE.test(String(nc.openQuestions || ''));
+      if (sig && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket D but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket D (false completion-claim signature) -> requeue ${attempt}/${MAX_REQUEUES}, now caught earlier by the draft-time verification gate`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: false completion-claim signature (draft asserted something the diff/repo contradicts) -- now caught at draft time by adhoc-diff-sanity.js, clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
     if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
 
     summary.checked += 1;
@@ -286,6 +349,7 @@ module.exports = {
   buildInvalidPremisePrompt,
   DEGENERATE_RE,
   INVALID_PREMISE_RE,
+  FALSE_CLAIM_RE,
 };
 
 if (require.main === module) {
