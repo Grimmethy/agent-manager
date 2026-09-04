@@ -135,6 +135,10 @@ test('stacked wiring prompt: bottom-of-file placement when a new module imports 
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
   const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('-01-'))), 'utf8'));
   assert.match(move.promptContext.rawText, /reads these names defined in .* that are NOT being moved: `second_brain_dir`/);
+  // must tell the model to import the back-reference LAZILY (a module-top `from app import`
+  // is the circular import that crashed the dashboard -- PR #86)
+  assert.match(move.promptContext.rawText, /Do NOT add a top-level `from app import/);
+  assert.match(move.promptContext.rawText, /import them LAZILY/i);
 
   const wiring = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('wiring'))), 'utf8'));
   assert.match(wiring.promptContext.rawText, /at the very BOTTOM of/);
