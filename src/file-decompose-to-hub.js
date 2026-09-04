@@ -377,7 +377,7 @@ function sweep({ pipelineDir, repoRoot, force = false, now = Date.now() } = {}) 
   const requestsDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
   let resolvedRepoRoot = repoRoot;
   if (!resolvedRepoRoot) {
-    try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = pipelineDir; }
+    try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch (err) { console.error(`[file-decompose-to-hub] sweep: getConfig() failed; falling back to pipelineDir as repoRoot: ${err.message}`, err.stack); resolvedRepoRoot = pipelineDir; }
   }
 
   for (const { full, request } of readRequests(requestsDir)) {
