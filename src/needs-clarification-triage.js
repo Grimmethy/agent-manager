@@ -223,7 +223,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       };
 
       let resolved = false;
-      try { resolved = hasResolutionSignal(task, oq); } catch { resolved = false; }
+      try { resolved = hasResolutionSignal(task, oq); } catch (e) { log(`${id}: hasResolutionSignal threw: ${e.message} -- treating as unresolved`); resolved = false; }
       if (resolved) { archive('verified resolution signal'); continue; }
 
       if (VOTE_ENABLED && typeof majorityVote === 'function' && votesUsed < MAX_VOTES) {
