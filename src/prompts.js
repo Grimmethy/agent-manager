@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 // Builds the actual prompt text handed to the local model for each task domain/source.
 // Kept in Node (not shell string interpolation) deliberately: prompts embed raw file
 // content of unknown shape, and shell here-string interpolation/delimiter rules are the
@@ -37,10 +39,19 @@ function truncate(str, max) {
 // actually protects this content when one is.
 function formatFileContents(files) {
   return (files || []).map((f) => {
-    const tag = f.context
+    const contextTag = f.context
       ? ` ---   (shown for REFERENCE -- the candidate's prose names this file; it is not on the Files: line, so only edit it if the change genuinely requires it)`
       : '';
-    return `--- ${f.path} ---${tag}\n\`\`\`\n${f.content}\n\`\`\``;
+    // Cross-repo (2026-09-04): a fetchForQueries/buildPlanGrounding hit from a loaded
+    // plugin repo (accessible-roots.js) carries `root`, the absolute path of that OTHER
+    // repo -- root-caused via a stuck adhoc task whose real fix lived entirely in
+    // agent-manager-hygiene: the model was never told the file it was shown lives in a
+    // repo this task's diff cannot reach, so it hallucinated an edit to a same-named path
+    // in its own repo instead. Say so explicitly, every place file content is rendered.
+    const repoTag = f.root
+      ? ` ---   (repo: ${path.basename(f.root)} -- a DIFFERENT repo from the one this task's diff can edit. Do NOT propose a diff against this path or any same-named path in your own repo; if the real fix belongs here, describe the exact change needed in prose and say this task cannot complete it directly.)`
+      : '';
+    return `--- ${f.path} ---${contextTag}${repoTag}\n\`\`\`\n${f.content}\n\`\`\``;
   }).join('\n\n');
 }
 
@@ -1039,7 +1050,7 @@ function adhocHarnessSearchPlanPrompt(task) {
     '',
     ctx.rawText || truncate(JSON.stringify(ctx), 4000),
     '',
-    'Before anything else, propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the exact code this task is about in THIS repo -- think about which file(s) the task\'s own wording points at.',
+    'Before anything else, propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the exact code this task is about -- think about which file(s) the task\'s own wording points at. The harness searches this repo AND any loaded plugin repo (e.g. agent-manager-hygiene), so a task about the pipeline\'s own behavior may point at code that lives in either.',
     '',
     'Output EXACTLY this format, one query per line, nothing else:',
     'QUERY: <search terms>',
@@ -1052,8 +1063,8 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
   const hits = ctx.harnessHits || [];
   const files = ctx.harnessFiles || [];
   const hitsText = hits.length > 0
-    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
-    : '(no matches -- the searches found nothing in this repo)';
+    ? hits.map((h) => `- ${h.root ? `[${path.basename(h.root)}] ` : ''}${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing in this repo or any loaded plugin repo)';
   const filesText = files.length > 0
     ? formatFileContents(files)
     : '(no file content fetched)';
@@ -1067,7 +1078,7 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
     ctx.rawText || truncate(JSON.stringify(ctx), 4000),
     '',
     anchorFilesPromptBlock(task),
-    'The harness ran those searches against THIS repo\'s real, current content. Real matches:',
+    'The harness ran those searches against this repo\'s real, current content, AND any loaded plugin repo\'s (e.g. agent-manager-hygiene) -- a hit tagged `[repo-name]` is from that OTHER repo, not this one; see the note on any such file below before proposing a diff. Real matches:',
     '',
     hitsText,
     '',

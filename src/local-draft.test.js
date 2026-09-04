@@ -832,6 +832,52 @@ test('draftTask runs harness search iff the source declares harnessSearch, and p
   });
 });
 
+// Cross-repo (2026-09-04): an 'archImport'-kind source's harness search must ALSO reach a
+// loaded plugin repo -- root-caused via a stuck adhoc task whose real fix site lived
+// entirely in agent-manager-hygiene. Real fetch (not faked, unlike projectSearchFetch
+// above) so this actually exercises resolveAccessibleRoots() -> archImportFetch wiring.
+test('draftTask (archImport-kind source) also finds a real match in a loaded plugin repo', async () => {
+  // The plugins.json manifest must be in place BEFORE local-draft.js (and the
+  // accessible-roots.js it requires) load fresh inside withFixtureRepo -- plugins-
+  // manifest.js resolves its path from AGENT_MANAGER_PLUGINS_MANIFEST at module load, so
+  // setting the env var / clearing caches AFTER local-draft.js is already loaded would
+  // leave it holding a stale resolveAccessibleRoots reference.
+  const pluginRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'local-draft-plugin-'));
+  fs.mkdirSync(path.join(pluginRepo, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(pluginRepo, 'src', 'function-length-review.js'), 'function registerFunctionLengthFix() {}\n');
+  const manifestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-draft-manifest-'));
+  const manifestPath = path.join(manifestDir, 'plugins.json');
+  fs.writeFileSync(manifestPath, JSON.stringify([{ name: 'plugin', registerPath: path.join(pluginRepo, 'register.js'), enabled: true }]));
+  process.env.AGENT_MANAGER_PLUGINS_MANIFEST = manifestPath;
+  delete require.cache[require.resolve('./plugins-manifest.js')];
+  delete require.cache[require.resolve('./accessible-roots.js')];
+
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+      const p = require('./prompts.js');
+      registerTaskSource('sa4_probe_archimport', { priority: 80, next: () => null, emptyApproval: true, harnessSearch: 'archImport' });
+      updateTaskSource('sa4_probe_archimport', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'unrelated.js'), 'const nothing = 1;\n');
+      process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+
+      const localCall = async () => ({ response: 'QUERY: registerFunctionLengthFix', degenerate: null, attempts: 1 });
+      const task = { id: 'sa4-archimport', domain: 'default', source: 'sa4_probe_archimport', title: 't', promptContext: {} };
+      await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+
+      assert.ok(task.promptContext.harnessHits.some((h) => h.file === 'src/function-length-review.js' && h.root === fs.realpathSync(pluginRepo)));
+      assert.ok(task.promptContext.harnessFiles.some((f) => f.path === 'src/function-length-review.js' && f.root === fs.realpathSync(pluginRepo)));
+    });
+  } finally {
+    delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
+    delete require.cache[require.resolve('./plugins-manifest.js')];
+    delete require.cache[require.resolve('./accessible-roots.js')];
+    delete require.cache[require.resolve('./local-draft.js')]; // undo the plugin-aware local-draft.js this test forced -- later tests must get a fresh, non-plugin-aware one
+  }
+});
+
 test('draftTask runs NO harness search for a source without harnessSearch (searchResults/harnessHits stay unset)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const localCall = async () => ({ response: 'QUERY: this must be ignored', degenerate: null, attempts: 1 });

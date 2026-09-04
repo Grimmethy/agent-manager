@@ -107,3 +107,46 @@ test('groundingCovers: false when a named identifier has no hit anywhere', () =>
   // missing_other_helper is nowhere -> not covered
   assert.equal(groundingCovers(t, g), false);
 });
+
+// --- multi-repo (2026-09-04): also grep a loaded plugin's own repo -----------------------
+
+function withPluginManifest(pluginRegisterPath, fn) {
+  const manifestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-grounding-manifest-'));
+  const manifestPath = path.join(manifestDir, 'plugins.json');
+  fs.writeFileSync(manifestPath, JSON.stringify([{ name: 'plugin', registerPath: pluginRegisterPath, enabled: true }]));
+  const prev = process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
+  process.env.AGENT_MANAGER_PLUGINS_MANIFEST = manifestPath;
+  delete require.cache[require.resolve('./plugins-manifest.js')];
+  delete require.cache[require.resolve('./accessible-roots.js')];
+  delete require.cache[require.resolve('./plan-grounding.js')];
+  try {
+    return fn(require('./plan-grounding.js'));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST; else process.env.AGENT_MANAGER_PLUGINS_MANIFEST = prev;
+    delete require.cache[require.resolve('./plugins-manifest.js')];
+    delete require.cache[require.resolve('./accessible-roots.js')];
+    delete require.cache[require.resolve('./plan-grounding.js')];
+  }
+}
+
+test('buildPlanGrounding surfaces a hit from a loaded plugin repo, tagged with its name', () => {
+  const primary = makeRepo({ 'src/a.js': 'const unrelated = 1;\n' });
+  const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-grounding-plugin-'));
+  fs.mkdirSync(path.join(plugin, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(plugin, 'src', 'function-length-review.js'), 'function registerFunctionLengthFix() {}\n');
+
+  withPluginManifest(path.join(plugin, 'register.js'), ({ buildPlanGrounding: bpg }) => {
+    const g = bpg(adhoc('fix registerFunctionLengthFix so it stops recursively splitting'), { repoRoot: primary });
+    assert.ok(g, 'expected real grounding to be produced');
+    const pluginTag = path.basename(fs.realpathSync(plugin));
+    assert.match(g.text, new RegExp(`\\[${pluginTag}\\] src/function-length-review\\.js`));
+    assert.ok(g.grepHits.some((h) => h.root && h.file === 'src/function-length-review.js'));
+  });
+});
+
+test('buildPlanGrounding: zero plugins loaded is unaffected (no manifest -> primary repo only)', () => {
+  const primary = makeRepo({ 'src/a.js': 'function widgetHelper() {}\n' });
+  const g = buildPlanGrounding(adhoc('fix widgetHelper'), { repoRoot: primary });
+  assert.ok(g);
+  assert.doesNotMatch(g.text, /^\[/m, 'no repo tag should appear when nothing but the primary repo was searched');
+});
