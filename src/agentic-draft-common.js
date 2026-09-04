@@ -352,6 +352,35 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   if (resolution === 'needs-human-decision') {
     const capturedDiff = bestEffortDiff();
     const continuations = Number(task.agenticContinuationCount) || 0;
+
+    // Zero edits, empty worktree, forced final turn, and the summary itself says "re-run
+    // me / ran out of turns / no design question": this is turn-budget exhaustion on
+    // orientation dressed up as a clarification, NOT a real open question. The `!resolution`
+    // branch above already treats the identical state (forcedSummary + edits===0 +
+    // !capturedDiff) as a clean retryable block; a polite `RESOLUTION: needs-human-decision`
+    // on the forced turn must not route it to a human instead. Same three flags, so
+    // reject-retry-check.js requeues it (bounded by MAX_LOCAL_REJECT_RETRIES) with the
+    // "use the plan, get to edit_file fast, decompose if genuinely too big" grounding,
+    // and turnBudgetExhaustedBefore unlocks RESOLUTION: decompose for a leaf that keeps
+    // stalling -- instead of dead-ending in needs-clarification/ where nothing retries a
+    // reason:'design-decision' hold. Root-caused live via the POST /api/plugins/install
+    // task (7137-line app.py, 0 edits across attempts, "No design decisions remain").
+    const editCalls = ((result && result.toolCallLog) || [])
+      .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+    if (result && result.forcedSummary && editCalls === 0 && !capturedDiff
+        && RERUN_NOT_A_QUESTION_RE.test(summary)) {
+      task.turnBudgetExhausted = true;
+      task.retryableDraftBlock = true;
+      task.turnBudgetExhaustedBefore = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: 'Agentic implement pass ended RESOLUTION: needs-human-decision with zero edits and a re-run request -- exhausted its turn budget on orientation, not a real design question',
+        ...meta,
+        capturedDiff: undefined,
+      };
+    }
+
     // "Re-run me", not a real question -- see MAX_AGENTIC_CONTINUATIONS. Only when real
     // partial work landed (an empty worktree here is a genuine "I could not even start").
     if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS && RERUN_NOT_A_QUESTION_RE.test(summary)) {

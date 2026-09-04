@@ -272,6 +272,63 @@ test('resolveAgenticDraft(needs-human-decision): once the continuation cap is hi
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision): forcedSummary + zero edits + empty worktree + "ran out of turns" -> retryable turn-budget BLOCK, not a human hold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'tbx-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'I completed full orientation but exhausted my turn budget before writing any edits. No design decisions remain -- please re-run the implementation pass.\n\nRESOLUTION: needs-human-decision\nThe pass ran out of its turn budget; re-run it.',
+        forcedSummary: true,
+        turnsUsed: 35,
+        toolCallLog: [{ tool: 'grep_codebase' }, { tool: 'read_file' }, { tool: 'read_file' }, { tool: 'list_directory' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true);
+    assert.equal(task.adhocResolution, undefined, 'no fake needs-human-decision');
+    assert.match(out.blockedReason, /exhausted its turn budget on orientation/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): forcedSummary + zero edits but a GENUINE question still goes to a human', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'tbx-2' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nShould the install endpoint 402 or 403 for paid plugins? I could not determine the convention.',
+        forcedSummary: true,
+        turnsUsed: 35,
+        toolCallLog: [{ tool: 'grep_codebase' }, { tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.notEqual(task.turnBudgetExhausted, true);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): "re-run me" text but an edit_file call landed -> stays the human/continuation path, not a turn-budget block', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial\n');
+    const task = { id: 'tbx-3' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nNo open design question, just ran out of turns -- re-run me.',
+        forcedSummary: true,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.notEqual(task.turnBudgetExhausted, true);
+    assert.equal(task.isAgenticContinuation, true);
+  });
+});
+
 test('resolveAgenticDraft: no RESOLUTION line -> blocked (terminal, not an infra failure)', () => {
   withRealRepo((wt) => {
     const out = resolveAgenticDraft({ id: 't4' }, { result: { response: 'I looked around but never concluded' }, worktreeDir: wt });
