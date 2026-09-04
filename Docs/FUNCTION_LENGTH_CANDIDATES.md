@@ -2122,3 +2122,129 @@ Extract four private helpers, each taking only the data it needs and returning a
 
 Benefits:
 Each helper can be unit-tested in isolation with fakes (a mock git repo for B, a temp directory for D, a stubbed cache for C) without standing up the full HTTP layer or the other three concerns. Code review becomes targeted: a PR that changes the task schema touches only `_record_merge_in_task_file`, and the reviewer can verify the git-transaction block is byte-identical by diffing a single 35-line function rather than scrolling through 120 interleaved lines. The four helpers also make it trivial to add cross-cutting concerns—retry logic around the git transaction, structured logging around file I/O, or an audit hook after authorization—without risking accidental reordering of unrelated steps. Finally, the thin orchestrator makes the *intended* execution order and the error-mapping policy visible at a glance, which is the primary readability win for a new maintainer.
+
+### AC-27 · Decompose pipeline-launch orchestrator into named sub-tasks
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    record_project_used(raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_INCLUDE_APPLY", "true" if include_apply else "false")
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_SKIP_PUSH", "true" if skip_push else "false")
+
+    # Fix, 2026-07-26 (Grimmethy: "I keep setting the Project tab's path to TaxHarvest,
+    # but it doesn't stick -- navigating away and back reverts to agent-manager"):
+    # get_active_repo_root() checks os.environ FIRST, only falling back to the .env FILE
+    # if unset -- by design, so a project pre-configured via launch.bat's own env vars
+    # wins at startup rather than a stale leftover .env value silently overriding it. But
+    # writing the new path to the file above was never reflected back into THIS already-
+    # running dashboard process's own os.environ, so get_active_repo_root() kept
+    # returning whatever the dashboard happened to be launched with, forever -- no
+    # dashboard restart, no amount of clicking Start Pipeline, would ever change what it
+    # reported as active. Mutating os.environ here keeps the original precedence (an
+    # externally-set env var still wins at the NEXT dashboard restart) while making an
+    # in-dashboard project switch actually take effect and persist for the rest of this
+    # process's lifetime, matching what the Project tab visibly promises.
+    os.environ["AGENT_MANAGER_REPO_ROOT"] = raw_path
+
+    # Fix, 2026-08-20 (Grimmethy: "I'm still only seeing the agent manager and it's clone
+    # [in the Project tab] -- we should be able to select from any of the projects"):
+    # AGENT_MANAGER_PIPELINE_DIR/AGENT_MANAGER_DOMAINS_PATH were NEVER written here at
+    # all -- only REPO_ROOT/INCLUDE_APPLY/SKIP_PUSH were -- so switching to a project with
+    # its own dedicated pipeline dir (several new plugin repos this session each got one,
+    # separate from repoRoot so pipeline internals don't land inside the tracked git repo)
+    # silently kept whatever pipelineDir the PREVIOUSLY active project left behind in the
+    # shared .env, real risk of one project's tasks landing in a completely different
+    # project's live queue. If this repoRoot was already registered (via a prior Start
+    # Pipeline, or set up directly -- see record_project_registry_entry), honor ITS
+    # pipelineDir/domainsPath instead of leaving the stale previous value in place; a
+    # genuinely first-time repo still falls through to the old raw_path-based default
+    # below, unchanged.
+    normalized_raw_path = os.path.normpath(raw_path)
+    existing_registration = next(
+        (e for e in read_project_registry() if os.path.normpath(e.get("repoRoot", "")) == normalized_raw_path),
+        None,
+    )
+    if existing_registration and existing_registration.get("pipelineDir"):
+        write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_PIPELINE_DIR", existing_registration["pipelineDir"])
+        os.environ["AGENT_MANAGER_PIPELINE_DIR"] = existing_registration["pipelineDir"]
+        if existing_registration.get("domainsPath"):
+            write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_DOMAINS_PATH", existing_registration["domainsPath"])
+            os.environ["AGENT_MANAGER_DOMAINS_PATH"] = existing_registration["domainsPath"]
+
+    env_overrides = read_env_file(ENV_FILE_PATH)
+    env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
+    child_env = {**os.environ, **env_overrides}
+
+    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
+
+    # Same pipelineDir/domainsPath resolution _ensure_task_domains just used above --
+    # recorded here so a later brain-dump routing decision can locate THIS project's
+    # queue even after a different project becomes active (project-history.json alone
+    # only ever stored the bare repoRoot).
+    pipeline_dir_for_registry = child_env.get("AGENT_MANAGER_PIPELINE_DIR") or raw_path
+    domains_path_for_registry = child_env.get("AGENT_MANAGER_DOMAINS_PATH") or str(Path(pipeline_dir_for_registry) / "task-domains.json")
+    record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
+
+    # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
+    # PromptForge left behind so the local-model daemons don't yield their ticks to a
+    # generation that isn't the priority anymore (see comfyui_lease_held in
+    # agent-manager-common.sh). scripts/launch.sh does the same on the Linux path; this
+    # also covers the Windows .ps1 path below.
+    _comfy_lease = Path(
+        os.environ.get("AGENT_MANAGER_COMFY_LEASE_PATH")
+        or (Path(os.environ.get("HOME") or "~").expanduser()
+            / ".local/state/agent-manager/comfyui-lease.json")
+    )
+    try:
+        _comfy_lease.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
+
+    if os.name != "nt":
+        import platform, subprocess as sp, shlex
+        LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+        launch_py = str(PACKAGE_ROOT / 'scripts' / 'launch.sh')
+        if not Path(launch_py).is_file():
+            return {"started": False, "reason": f"{launch_py} missing; cannot start daemons on Linux without a working launch script."}
+        subprocess.Popen(
+            ["bash", launch_py],
+            env=child_env,
+            cwd=str(PACKAGE_ROOT),
+            stdout=(LOG_DIR / 'launch-python.log').open('a'),
+            stderr=sp.STDOUT,
+            start_new_session=True,
+        )
+        return {"started": True, "repoRoot": raw_path}
+
+    creationflags = subprocess.CREATE_NEW_CONSOLE
+    scripts = [
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "local-worker.ps1"), "-InstanceId", "worker-1"], "Local Worker 1"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Local Review Runner"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
+    ]
+    if include_apply:
+        scripts.insert(2, (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"))
+
+    for args, _label in scripts:
+        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
+
+    return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+```
+
+Problem:
+The launch handler is ~108 lines (≈80 executable after the two multi-line fix-comment blocks) and interleaves six distinct responsibilities in a single linear body: (1) persisting the chosen path/toggles to `.env` and mirroring them into `os.environ`, (2) resolving `pipelineDir`/`domainsPath` from the project registry and writing them back, (3) building the merged `child_env` dict and calling `_ensure_task_domains`, (4) recording a new or updated project-registry entry, (5) stomping the ComfyUI GPU lease file, and (6) the platform branch that spawns `launch.sh` on Linux or four-to-five PowerShell console windows on Windows. None of these steps is individually complex, but a reader who wants to understand "where does the GPU lease get cleared?" must wade through the registry and env-file bookkeeping above it, and a reviewer adding a new pre-launch side-effect has no obvious insertion point. Each sub-task also has its own failure mode (file-write I/O, registry lookup miss, subprocess spawn error) that is currently entangled in one try/except scope, making targeted error handling and unit testing awkward.
+
+Solution:
+Extract four small, clearly-named helpers that the top-level handler calls in sequence: `_persist_launch_env(path, toggles)` for responsibility 1 (write `.env` + mirror `os.environ`); `_resolve_and_register_project(project_id)` for responsibilities 2 and 4 (look up or create the registry entry, write `pipelineDir`/`domainsPath` back to `.env`/`os.environ`, and return the resolved paths); `_acquire_gpu_lease()` for responsibility 5 (stomp the lease file, with its own narrow try/except); and `_spawn_pipeline(child_env, pipeline_dir)` for responsibility 6 (the `os.name` branch that launches `launch.sh` or the PowerShell windows). The top-level handler then reads as a short, readable pipeline: persist env → resolve project → acquire lease → spawn, with the `child_env` construction (responsibility 3) left inline since it is a two-line dict merge that glues the pieces together. Each helper is 10–30 lines, has a single return type, and can be tested in isolation with a mocked filesystem or `os.environ`.
+
+Benefits:
+A reviewer scanning the diff for a change to the GPU-lease logic now sees a one-line call to `_acquire_gpu_lease()` instead of hunting through 30 lines of registry code; a developer adding a new pre-launch side-effect has an obvious place to insert a new helper call. Each extracted function can be unit-tested independently (e.g., verify that `_persist_launch_env` writes the correct `.env` keys without actually spawning a process), which is currently impossible because the launch step is in the same scope. The `os.name` platform branch, which is the most likely site for future OS-specific tweaks, becomes a self-contained function whose signature makes its inputs (`child_env`, `pipeline_dir`) explicit rather than implicit closures over the outer scope.
