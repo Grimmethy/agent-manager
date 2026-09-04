@@ -176,4 +176,4 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
   return done();
 }
 
-module.exports = { runIntegrationGate, diffRouteTables, URL_MAP_DUMP };
+module.exports = { runIntegrationGate, diffRouteTables, URL_MAP_DUMP, realExec };
