@@ -4,7 +4,12 @@ import re
 
 from flask import Blueprint, abort, jsonify
 
-from app import _REPORT_PERIODS, second_brain_dir
+# NOTE: `_REPORT_PERIODS` / `second_brain_dir` live in app.py, which imports this module to
+# register the blueprint -- importing them at module top is a circular import that only
+# fails when app.py is the entrypoint (`python app.py`, i.e. how the dashboard actually
+# runs), because then `from app import ...` here triggers a *second*, re-entrant import of
+# app.py. Pull them in lazily inside each function instead: by the time any view or helper
+# runs, app.py is fully initialised and `from app import ...` is just a dict lookup.
 
 reports_bp = Blueprint("reports-bp", __name__)
 
@@ -14,11 +19,13 @@ def _reports_root() -> Path | None:
     reports -- SECOND_BRAIN_DIR/Agent Manager Reports/<period>/<filename>.md, same
     'SECOND_BRAIN_DIR is the durable store, dashboard just reads it' shape as the
     benchmark endpoints above."""
+    from app import second_brain_dir
     sb = second_brain_dir()
     return (sb / "Agent Manager Reports") if sb else None
 
 
 def _safe_report_period(period: str) -> str:
+    from app import _REPORT_PERIODS
     if period not in _REPORT_PERIODS:
         abort(400, description="invalid report period")
     return period
@@ -39,6 +46,7 @@ def api_reports():
     tab's list view. Empty (not an error) if SECOND_BRAIN_DIR isn't configured or no
     report has been generated yet, same shape every other SECOND_BRAIN_DIR-gated endpoint
     here uses."""
+    from app import _REPORT_PERIODS
     root = _reports_root()
     if not root or not root.is_dir():
         return jsonify([])
