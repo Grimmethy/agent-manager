@@ -15,6 +15,18 @@
 // model's context window the same way deep_dive's uncapped community content once did
 // (see task-sources.js's DEEP_DIVE_CONTEXT_BUDGET_CHARS fix, 2026-07-21) -- fixed from the
 // start here instead of needing the same incident to happen twice.
+//
+// Multi-repo (2026-09-04): `fetchForQueries(queries, { roots })` optionally also searches
+// each additional repo in `roots` (see accessible-roots.js) -- a loaded
+// AGENT_MANAGER_REGISTER_PATH plugin's own repo, not just this one. Root-caused via a stuck
+// adhoc task ("function_length_fix recursively splits") whose real fix site,
+// function-length-review.js, lives entirely in agent-manager-hygiene: every caller of this
+// function searched agent-manager's own repo only, so the model never saw the file it was
+// told to edit and hallucinated a change to an unrelated one instead. `roots` omitted (every
+// pre-existing caller) is byte-identical to the old single-repo behavior. A hit/file from a
+// non-primary root carries `root` (the absolute repo path) so callers can label it -- see
+// prompts.js's formatFileContents, which refuses to let a cross-repo file look locally
+// editable.
 
 const fs = require('fs');
 const path = require('path');
@@ -30,10 +42,22 @@ const MAX_HITS_PER_QUERY = 8;
 // way deep_dive's budget did.
 const MAX_CONTENT_CHARS = 12000;
 
-function fetchForQueries(queries) {
+// roots: optional string[] of additional repo roots to ALSO search (accessible-roots.js) --
+// roots[0], if given, must be the primary repo (repoRoot); anything after it is an extra
+// accessible repo (a loaded plugin, see AGENT_MANAGER_REGISTER_PATH). Omitted entirely,
+// this is byte-identical to the pre-2026-09-04 single-repo behavior. The primary repo keeps
+// its existing per-dir loop (AGENT_MANAGER_GREP_DIRS); an extra root gets ONE whole-repo
+// grepCodebase call per query -- it has no per-repo dirs allowlist of its own (see
+// grep-codebase-tool.js's own comment on an alternate root skipping AGENT_MANAGER_GREP_DIRS),
+// so multiplying by a dirs list that doesn't apply there would be meaningless, not more
+// thorough.
+function fetchForQueries(queries, { roots } = {}) {
   const { repoRoot, grepAllowedDirs } = getConfig();
+  const extraRoots = (Array.isArray(roots) ? roots : [repoRoot]).slice(1);
   const hits = [];
-  const matchedFiles = new Set();
+  // Keyed by `${root||''}::${file}` so two repos with the same relative path (e.g. both
+  // happen to have a src/config.js) are never conflated into one fetched-content entry.
+  const matchedFiles = new Map();
 
   for (const query of queries) {
     for (const dir of grepAllowedDirs) {
@@ -41,27 +65,35 @@ function fetchForQueries(queries) {
       const results = (Array.isArray(raw) ? raw : []).slice(0, MAX_HITS_PER_QUERY);
       for (const r of results) {
         hits.push({ ...r, query });
-        matchedFiles.add(r.file);
+        matchedFiles.set(`${r.root || ''}::${r.file}`, { file: r.file, root: r.root || null });
+      }
+    }
+    for (const root of extraRoots) {
+      const raw = grepCodebase({ query, root });
+      const results = (Array.isArray(raw) ? raw : []).slice(0, MAX_HITS_PER_QUERY);
+      for (const r of results) {
+        hits.push({ ...r, query });
+        matchedFiles.set(`${r.root || root}::${r.file}`, { file: r.file, root: r.root || root });
       }
     }
   }
 
   const files = [];
   let budgetUsed = 0;
-  // Files most-matched-first isn't tracked separately from hit order above, but Set
+  // Files most-matched-first isn't tracked separately from hit order above, but Map
   // insertion order already roughly reflects match density (files that matched more
   // queries/hits appear earlier via repeated hits) -- good enough for a budget cutoff,
   // no need for a second ranking pass.
-  for (const relPath of matchedFiles) {
+  for (const { file: relPath, root } of matchedFiles.values()) {
     if (budgetUsed >= MAX_CONTENT_CHARS) break;
     let content;
     try {
-      content = fs.readFileSync(path.join(repoRoot, relPath), 'utf8');
+      content = fs.readFileSync(path.join(root || repoRoot, relPath), 'utf8');
     } catch {
       continue;
     }
     if (budgetUsed + content.length > MAX_CONTENT_CHARS) continue;
-    files.push({ path: relPath, content });
+    files.push(root ? { path: relPath, root, content } : { path: relPath, content });
     budgetUsed += content.length;
   }
 

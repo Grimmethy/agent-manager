@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const fs = require('fs');
 const path = require('path');
-const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt, formatFileContents } = require('./prompts.js');
+const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt, formatFileContents, adhocHarnessSearchImplementPrompt } = require('./prompts.js');
 
 // arch_review / arch_import moved to the agent-manager-hygiene plugin (2026-08-27), so
 // requiring ./prompts.js no longer wires their builders. These tests exercise
@@ -272,6 +272,39 @@ test('formatFileContents joins multiple files with a blank line between them, ea
 test('formatFileContents returns an empty string for no files, not a throw', () => {
   assert.equal(formatFileContents([]), '');
   assert.equal(formatFileContents(undefined), '');
+});
+
+// Cross-repo (2026-09-04): a fetchForQueries/buildPlanGrounding hit tagged with `root`
+// (accessible-roots.js) must never look like a locally-editable file -- root-caused via a
+// stuck adhoc task that hallucinated an edit to the wrong repo because nothing said the
+// real file it was shown lived somewhere else.
+test('formatFileContents tags a cross-repo file (root set) as not locally editable', () => {
+  const out = formatFileContents([{ path: 'src/function-length-review.js', root: '/media/model-cache/github/agent-manager-hygiene', content: 'x' }]);
+  assert.match(out, /--- src\/function-length-review\.js --- ---   \(repo: agent-manager-hygiene -- a DIFFERENT repo/);
+  assert.match(out, /Do NOT propose a diff against this path/);
+});
+
+test('formatFileContents leaves a same-repo file (no root) unchanged from the plain fence', () => {
+  const out = formatFileContents([{ path: 'src/foo.js', content: 'const x = 1;' }]);
+  assert.equal(out, '--- src/foo.js ---\n```\nconst x = 1;\n```', 'no root -> byte-identical to the pre-existing shape');
+  assert.doesNotMatch(out, /DIFFERENT repo/);
+});
+
+test('adhocHarnessSearchImplementPrompt tags a cross-repo hit line with [repo-name]', () => {
+  const task = {
+    title: 'fix function_length_fix',
+    promptContext: {
+      rawText: 'fix function_length_fix',
+      harnessHits: [
+        { file: 'src/function-length-review.js', line: 12, query: 'function_length_fix', text: 'registerTaskSource(...)', root: '/media/model-cache/github/agent-manager-hygiene' },
+        { file: 'src/apply-task.js', line: 5, query: 'apply', text: 'function applyTask() {}' },
+      ],
+      harnessFiles: [],
+    },
+  };
+  const out = adhocHarnessSearchImplementPrompt(task, 'QUERY: function_length_fix');
+  assert.match(out, /\[agent-manager-hygiene\] src\/function-length-review\.js:12/);
+  assert.match(out, /^- src\/apply-task\.js:5/m, 'same-repo hit line has no repo tag prefix');
 });
 
 test('buildImplementPrompt fences the current spec doc for product_spec, since its own edit mode depends on exact substring matches against it', () => {

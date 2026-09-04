@@ -242,3 +242,71 @@ test('applied:false when the harness-search diff deletes a file the task never a
     assert.match(result.reason, /not a real implementation -- diff deletes src\/widget\.js/);
   });
 });
+
+// --- cross-repo grounding (2026-09-04) --------------------------------------------------
+// Root incident this closes: an adhoc task named `function-length-review.js` as the fix
+// site, but that file lives entirely in agent-manager-hygiene (a loaded plugin repo), so
+// this tier's harness search found nothing, the implement pass hallucinated an edit to an
+// unrelated file instead, and three attempts were rejected before the task escalated.
+
+function withFixtureRepoAndPlugin(pluginFiles, fn) {
+  const { repoDir } = makeRepoWithOrigin();
+  const pluginRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'adhoc-harness-test-plugin-'));
+  for (const [rel, content] of Object.entries(pluginFiles)) {
+    const full = path.join(pluginRepo, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  }
+  const manifestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adhoc-harness-test-manifest-'));
+  const manifestPath = path.join(manifestDir, 'plugins.json');
+  fs.writeFileSync(manifestPath, JSON.stringify([{ name: 'plugin', registerPath: path.join(pluginRepo, 'register.js'), enabled: true }]));
+
+  process.env.AGENT_MANAGER_REPO_ROOT = repoDir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = repoDir;
+  process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+  process.env.LOCAL_MODEL = 'test-local-model';
+  process.env.AGENT_MANAGER_PLUGINS_MANIFEST = manifestPath;
+  for (const m of ['./config.js', './adhoc-harness-draft.js', './plugins-manifest.js', './accessible-roots.js']) {
+    delete require.cache[require.resolve(m)];
+  }
+  const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
+  try {
+    return fn(draftAdhocViaHarnessSearch, repoDir, pluginRepo);
+  } finally {
+    delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
+  }
+}
+
+test('harness-search finds a real match in a loaded plugin repo the primary repo does not have, and tags it', async () => {
+  await withFixtureRepoAndPlugin(
+    { 'src/function-length-review.js': 'function registerFunctionLengthFix() { return true; }\n' },
+    async (draftAdhocViaHarnessSearch, repoDir, pluginRepo) => {
+      const task = makeTask({ promptContext: { rawText: 'fix registerFunctionLengthFix so it stops recursively splitting' } });
+      let call = 0;
+      let implementPrompt = null;
+      const localCall = async (args) => {
+        call++;
+        if (call === 1) return { response: 'QUERY: registerFunctionLengthFix', degenerate: null, attempts: 1 };
+        implementPrompt = args.prompt;
+        return { response: '', degenerate: null, attempts: 1 }; // a well-behaved decline
+      };
+      const result = await draftAdhocViaHarnessSearch(task, { localCall });
+
+      assert.ok(task.promptContext.harnessHits.some((h) => h.file === 'src/function-length-review.js' && h.root === fs.realpathSync(pluginRepo)));
+      assert.ok(task.promptContext.harnessFiles.some((f) => f.path === 'src/function-length-review.js' && f.root === fs.realpathSync(pluginRepo)));
+      assert.match(implementPrompt, /a DIFFERENT repo from the one this task's diff can edit/, 'the implement prompt must warn about the cross-repo file');
+      assert.equal(result.applied, false, 'declining (empty response) after seeing the cross-repo warning falls through, same as any other empty response');
+    },
+  );
+});
+
+test('harness-search cross-repo lookup is a no-op when no plugin is loaded (regression guard)', async () => {
+  await withFixtureRepo(async (draftAdhocViaHarnessSearch) => {
+    const task = makeTask();
+    const localCall = async () => ({ response: 'QUERY: RATE', degenerate: null, attempts: 1 });
+    // Same zero-plugin behavior as every pre-existing test in this file -- no throw, no
+    // change in shape; a real hit still resolves from the primary repo alone.
+    const result = await draftAdhocViaHarnessSearch(task, { localCall });
+    assert.equal(result.applied, false); // the plan's only query never reaches implement (empty second call not supplied)
+  });
+});

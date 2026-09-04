@@ -74,3 +74,93 @@ test('CLI entry point still works normally for a real array of queries', () => {
     fs.rmSync(REPO_ROOT, { recursive: true, force: true });
   }
 });
+
+// --- in-process fetchForQueries(queries, { roots }) -- multi-repo (2026-09-04) -----------
+// First in-process tests of fetchForQueries itself (previously exercised only via the CLI
+// subprocess above). Mirrors grep-codebase-tool.test.js's two-fixture-repo pattern for its
+// own `root` param tests.
+
+const { fetchForQueries } = require('./arch-import-fetch.js');
+
+function makeRepo(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-import-fetch-inproc-'));
+  for (const [rel, content] of Object.entries(files)) {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  }
+  return dir;
+}
+
+function withRepoConfig(repoRoot, grepDirs, fn) {
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  const prevDirs = process.env.AGENT_MANAGER_GREP_DIRS;
+  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
+  process.env.AGENT_MANAGER_GREP_DIRS = grepDirs;
+  try {
+    return fn();
+  } finally {
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    if (prevDirs === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = prevDirs;
+  }
+}
+
+test('fetchForQueries without roots is byte-identical to the old single-repo behavior', () => {
+  const primary = makeRepo({ 'src/a.js': 'function needleFn() { return 1; }\n' });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['needleFn']);
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].file, 'src/a.js');
+    assert.equal(result.hits[0].root, undefined, 'primary-repo hits carry no root field');
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].root, undefined);
+  });
+});
+
+test('fetchForQueries({ roots }): a term only findable in the second root surfaces there, tagged', () => {
+  const primary = makeRepo({ 'src/a.js': 'const unrelated = 1;\n' });
+  const plugin = makeRepo({ 'src/function-length-review.js': 'function registerFunctionLengthFix() { return true; }\n' });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['registerFunctionLengthFix'], { roots: [primary, plugin] });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].file, 'src/function-length-review.js');
+    assert.equal(result.hits[0].root, fs.realpathSync(plugin));
+
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].path, 'src/function-length-review.js');
+    assert.equal(result.files[0].root, fs.realpathSync(plugin));
+    assert.match(result.files[0].content, /registerFunctionLengthFix/);
+  });
+});
+
+test('fetchForQueries({ roots }): the primary root still uses its own grepAllowedDirs loop unchanged', () => {
+  const primary = makeRepo({ 'src/a.js': 'const sharedTerm = 1;\n', 'docs/x.md': 'sharedTerm mentioned here too' });
+  const plugin = makeRepo({});
+  withRepoConfig(primary, 'src', () => { // "docs" NOT allowlisted for the primary repo
+    const result = fetchForQueries(['sharedTerm'], { roots: [primary, plugin] });
+    assert.deepEqual(result.hits.map((h) => h.file), ['src/a.js']);
+  });
+});
+
+test('fetchForQueries({ roots }): an extra root has no dirs allowlist -- searches the whole repo', () => {
+  const primary = makeRepo({ 'src/a.js': 'x' });
+  const plugin = makeRepo({ 'python/deep/nested.py': 'plugin_only_term = 1\n' });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['plugin_only_term'], { roots: [primary, plugin] });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].file, 'python/deep/nested.py');
+  });
+});
+
+test('fetchForQueries({ roots }): a same-named file in two repos is kept as two distinct fetched entries', () => {
+  const primary = makeRepo({ 'src/shared.js': 'const primaryVersion = "PRIMARY_MARKER";\n' });
+  const plugin = makeRepo({ 'src/shared.js': 'const pluginVersion = "PLUGIN_MARKER";\n' });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['MARKER'], { roots: [primary, plugin] });
+    assert.equal(result.files.length, 2);
+    const contents = result.files.map((f) => f.content).sort();
+    assert.match(contents[0], /PLUGIN_MARKER|PRIMARY_MARKER/);
+    assert.ok(contents.some((c) => c.includes('PRIMARY_MARKER')));
+    assert.ok(contents.some((c) => c.includes('PLUGIN_MARKER')));
+  });
+});
