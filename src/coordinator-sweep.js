@@ -86,7 +86,7 @@ function runStackedGate(parent, repoRoot) {
   if (process.env.AGENT_MANAGER_DECOMPOSE_INTEGRATION_GATE === 'false') return { ok: true, skipped: true };
   if (!repoRoot || !parent.branch || !parent.sourceFile) return { ok: true, skipped: true };
   let mainBranch = 'master';
-  try { ({ mainBranch } = require('./git-runner.js').createRealGitRunner(repoRoot)); } catch { /* default */ }
+  try { ({ mainBranch } = require('./git-runner.js').createRealGitRunner(repoRoot)); } catch (e) { console.error(`[coordinator-sweep] createRealGitRunner() failed, falling back to default: ${e.message}`); }
   try {
     return runIntegrationGate({ repoRoot, branch: parent.branch, mainBranch, sourceFile: parent.sourceFile });
   } catch (e) {
