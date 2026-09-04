@@ -2846,3 +2846,26 @@ Split the single `except` into two. For `ProcessLookupError`, keep the current `
 
 Benefits:
 An operator tailing stderr or querying the requeue summary can immediately distinguish a benign race (process already exited) from a real failure (insufficient privileges, e.g. running as a non-root user in a container). The misleading "killed" label disappears from the PermissionError path, eliminating a class of silent resource-leak incidents where a zombie model process holds GPU memory while the system believes it was reclaimed.
+
+### AC-159 · Silent OSError swallow hides failed restart trigger
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+        try:
+            os.utime(Path(__file__), None)
+            restart_triggered = True
+        except OSError:
+            pass
+    return {"synced": True, "changed": True, "changedFiles": changed_files, "restartTriggered": restart_triggered}
+
+```
+
+Problem:
+Inside the `try/except` at lines 5678-5681, a failure of `os.utime(Path(__file__), None)` is caught as `OSError` and discarded with a bare `pass`. The surrounding comment (lines 5666-5673) makes explicit that the entire purpose of this call is to force a Werkzeug reloader restart so a template-only change is not silently served stale. When `os.utime` raises—read-only filesystem, missing file, permission denial—the restart never happens, yet the function still returns `"synced": True` (line 5683) and the only differentiator is `restartTriggered: False`, which is indistinguishable from the legitimate "no dashboard file was touched" path. No log line is emitted, so an operator inspecting the response or the server logs has zero signal that the restart mechanism failed; the exact "looks synced, isn't" gap the comment describes reappears with no diagnostic trail.
+
+Solution:
+Replace the bare `pass` with a `logging.error` call that records the exception, the target path (`Path(__file__)`), and the intended action ("force reloader restart after dashboard sync"), e.g. `logging.error("Failed to trigger reloader restart via os.utime(%s): %s", Path(__file__), exc, exc_info=True)`. Keep `restart_triggered` at `False` (already correct) and keep the return shape unchanged so existing callers are not broken; the log line is the new observable signal. No new dependency is introduced—only the stdlib `logging` module the project already uses.
+
+Benefits:
+An operator or on-call engineer who sees `restartTriggered: False` in the sync response can now correlate a timestamped, exception-bearing log line to confirm whether the cause was "nothing to restart" or "restart attempt failed." The failure mode that caused the original incident (stale template served silently) becomes visible in the log within seconds of occurrence rather than remaining invisible until someone manually inspects the process, closing the observability gap the feature was built to prevent.
