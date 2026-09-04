@@ -152,6 +152,11 @@ function recordCritique(attempt, info = {}) {
   attempt.critique = { outcome: info.outcome || null, revised: !!info.revised };
 }
 
+function recordOrient(attempt, info = {}) {
+  if (!attempt) return;
+  attempt.orient = { skipped: !!info.skipped, turnsUsed: Number(info.turnsUsed) || 0 };
+}
+
 // One rung of the adhoc implement ladder (harness-search / local-agentic /
 // local-agentic-write / a deterministic short-circuit / agentic-research). `info`:
 //   { tier, applied?, resolution?, blocked?, reason?, blockedReason?,
@@ -260,6 +265,7 @@ module.exports = {
   recordPlan,
   recordImplement,
   recordCritique,
+  recordOrient,
   recordTier,
   finalizeDraftAttempt,
   collapseOldAttempts,
