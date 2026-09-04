@@ -27,6 +27,7 @@
 
 const { getConfig } = require('./config.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
+const { resolveAccessibleRoots } = require('./accessible-roots.js');
 const { adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt } = require('./prompts.js');
 const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
 const { isEffectivelyEmptyResponse } = require('./apply-group-a.js');
@@ -125,7 +126,13 @@ async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
   let files = [];
   if (queries.length > 0) {
     try {
-      const result = archImportFetch(queries);
+      // Cross-repo (2026-09-04): also search each loaded plugin's own repo
+      // (accessible-roots.js) -- root-caused via this exact tier failing to ground a stuck
+      // adhoc task ("function_length_fix recursively splits") whose real fix site lived
+      // entirely in agent-manager-hygiene. Collapses to [repoRoot] with zero plugins
+      // loaded, byte-identical to the pre-2026-09-04 single-repo call.
+      const roots = resolveAccessibleRoots({ repoRoot });
+      const result = archImportFetch(queries, { roots });
       hits = result.hits || [];
       files = result.files || [];
     } catch (e) {
@@ -143,7 +150,7 @@ async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
   // skip straight to the next tier rather than spend a real implement call likely to
   // either hallucinate or (best case) just say the same "nothing found" thing itself.
   if (hits.length === 0) {
-    return { applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo' };
+    return { applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo or any loaded plugin repo' };
   }
 
   task.promptContext = task.promptContext || {};
