@@ -122,8 +122,13 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
   let names;
   try {
     names = fs.readdirSync(ncDir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return summary; // no needs-clarification/ dir
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return summary; // no needs-clarification/ dir
+    }
+    console.error('[needs-clarification-triage] readdirSync failed on', ncDir, err);
+    summary.errors += 1;
+    return summary;
   }
 
   const now = new Date().toISOString();
