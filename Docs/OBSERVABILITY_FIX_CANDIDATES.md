@@ -3053,3 +3053,26 @@ Bind the error (`catch (e)`) and branch on `e.code`. If `e.code === 'ENOENT'`, k
 
 Benefits:
 A misconfigured `ncDir` (pointing at a file), a lost read permission, or transient fd exhaustion will now produce a visible log line identifying the path and the OS error code, and the caller's `summary.errors` count will be non-zero so downstream reporting or alerting can distinguish "no tasks" from "could not read tasks." The intended `ENOENT` fast-path is preserved unchanged, so first-run behavior is unaffected.
+
+### AC-168 · Silent swallow of hasResolutionSignal exception
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Snippet:
+```
+      };
+
+      let resolved = false;
+      try { resolved = hasResolutionSignal(task, oq); } catch { resolved = false; }
+      if (resolved) { archive('verified resolution signal'); continue; }
+
+      if (VOTE_ENABLED && typeof majorityVote === 'function' && votesUsed < MAX_VOTES) {
+```
+
+Problem:
+Line 224 (`try { resolved = hasResolutionSignal(task, oq); } catch { resolved = false; }`) catches every exception thrown by `hasResolutionSignal` and discards it with a bare `catch` that has no binding, no log call, and no context. If the function throws because of a malformed task shape, a missing field, or an internal bug, the task is silently treated as "not resolved" and falls through to the voting path or is left unarchived — and no operator, log line, or summary counter records that an exception occurred. This contrasts sharply with the `archive` catch block just above (line 219), which at least calls `log(...)` with the task id and `e.message`. The bare catch here makes any regression in `hasResolutionSignal` completely invisible in production.
+
+Solution:
+Replace the bare `catch { resolved = false; }` with `catch (e) { log(`${id}: hasResolutionSignal threw: ${e.message} -- treating as unresolved`); resolved = false; }`. This uses the same `log()` helper already used throughout the function (lines 214, 219) and the same `${id}` context pattern, so no new dependency or primitive is introduced. The task is still treated as unresolved (preserving the existing control-flow intent), but the operator now has a single grep-able line identifying which task id triggered the exception and what the error message was.
+
+Benefits:
+Any future regression or data-shape mismatch in `hasResolutionSignal` becomes immediately visible in the triage log instead of silently misclassifying tasks as unresolved. Operators can correlate the log line with the task id to inspect the offending record, and the distinction between "genuinely no resolution signal" and "signal check crashed" is no longer lost. No behavioral change to the happy path; the only addition is one log line on the error path.
