@@ -314,6 +314,22 @@ function seedPlanBlock(task) {
   ];
 }
 
+// Real repo content for the adhoc plan pass (2026-09-04) -- the files the task names plus a
+// grep on its identifiers, built deterministically by plan-grounding.js. Trailing, like
+// seedPlanBlock, so the stable instruction prefix is never displaced. [] when ungrounded.
+function planGroundingBlock(task) {
+  const g = task && typeof task._planGrounding === 'string' ? task._planGrounding.trim() : '';
+  if (!g) return [];
+  return [
+    '',
+    'REAL REPOSITORY CONTENT for this task (read/greped from the repo just now — this pass has NO tools, this is the only file content you get):',
+    '',
+    g,
+    '',
+    'Ground every file path, function name and line number in your PLAN in the content above. Cite `path:line` where the content shows the relevant code. Where you extrapolate beyond what is shown, say so explicitly ("assuming X — verify"). Do NOT name a path or symbol that does not appear above unless the step is to CREATE it.',
+  ];
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -326,6 +342,7 @@ function adhocPlanPrompt(task) {
     'Write a numbered, actionable PLAN.',
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...seedPlanBlock(task),
+    ...planGroundingBlock(task),
   ].join('\n');
 }
 
@@ -1597,7 +1614,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
-  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.

@@ -122,6 +122,11 @@ function recordPlan(attempt, info = {}) {
   if (info.reRolled) plan.reRolled = true;
   if (info.seededFromPrior) plan.seededFromPrior = true;
   if (info.thin) plan.thin = true;
+  if (info.grounded) {
+    plan.grounded = true;
+    if (info.groundingChars != null) plan.groundingChars = info.groundingChars;
+    if (Array.isArray(info.anchorPaths) && info.anchorPaths.length) plan.anchorPaths = info.anchorPaths.slice(0, 6);
+  }
   attempt.plan = plan;
 }
 
@@ -199,6 +204,7 @@ function collapseOldAttempts(attempts) {
       ...(a.blockedReason ? { blockedReason: a.blockedReason } : {}),
       planChars: a.plan ? (a.plan.chars || 0) : 0,
       ...(a.plan && a.plan.degenerate ? { planDegenerate: a.plan.degenerate } : {}),
+      ...(a.plan && a.plan.grounded ? { planGrounded: true } : {}),
       tiers: Array.isArray(a.tiers) ? a.tiers.map(slimTier) : [],
       collapsed: true,
     };
