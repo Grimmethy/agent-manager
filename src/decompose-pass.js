@@ -33,9 +33,12 @@ function preliminaryPrompt(task) {
     'TASK:',
     (ctx.rawText || task.title || '').trim(),
     '',
-    'A rough (unverified, blind) plan for it:',
+    'A plan for it:',
     (task.planResponse || '(none)').trim(),
     '',
+    ...(task && typeof task._decomposeHint === 'string' && task._decomposeHint.trim()
+      ? ['A plan reviewer suspected this is too large to land in one pass:', task._decomposeHint.trim(), '']
+      : []),
     'Decide: is this ONE atomic change that a single focused implementation pass can land,',
     'or does it span multiple INDEPENDENT files / subsystems / deliverables that should',
     'each be their own piece? Touching 2-3 spots in ONE file is still ONE pass -- only split',

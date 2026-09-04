@@ -344,6 +344,18 @@ function statedAcceptanceBlock(task) {
   ];
 }
 
+// Gaps a plan-critique pass flagged in the PREVIOUS plan (component 4). Trailing, like
+// seedPlanBlock. [] when there's no critique feedback.
+function planCritiqueFeedbackBlock(task) {
+  const gaps = task && Array.isArray(task._planCritiqueFeedback) ? task._planCritiqueFeedback : [];
+  if (!gaps.length) return [];
+  return [
+    '',
+    'A plan reviewer flagged these gaps in your PREVIOUS plan -- your revised PLAN must close every one:',
+    ...gaps.map((g, i) => `${i + 1}. ${g}`),
+  ];
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -359,6 +371,7 @@ function adhocPlanPrompt(task) {
     '',
     'End your PLAN with a line "CRITERIA:" followed by 2-5 bullets, each a concrete, checkable definition of done for this task (a command that would pass, a file that would contain X, an endpoint that would return Y). These are what the implementation and the review will be held to.',
     ...seedPlanBlock(task),
+    ...planCritiqueFeedbackBlock(task),
     ...planGroundingBlock(task),
   ].join('\n');
 }
@@ -1631,7 +1644,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
-  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
