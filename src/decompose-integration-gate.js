@@ -12,7 +12,10 @@
 // this environment -- never fails the gate, it just narrows what was proven):
 //   1. py_compile      every changed/new .py file on the branch
 //   2. import          `python3 -c "import <sourcemodule>"` from the source file's dir --
-//                      the one check that actually catches the circular import
+//                      catches a circular import that bites even the module-import path
+//   2b. entrypoint     exec the source file's body as if it were `__main__` (how the app
+//                      is actually launched) -- catches a circular import that ONLY bites
+//                      the script entrypoint (`from <srcModule> import` re-enters the file)
 //   3. url_map         import the app on <main> and on <branch>, diff the sorted route
 //                      table. A "pure relocation" MUST leave it byte-identical -- only the
 //                      view function's module changes, never a rule, method, or endpoint.
@@ -38,6 +41,36 @@ const URL_MAP_DUMP = [
   '    print("NO_APP_OBJECT"); sys.exit(4)',
   'rules = sorted("%s %s -> %s" % (r.rule, ",".join(sorted(m for m in r.methods if m not in ("HEAD","OPTIONS"))), r.endpoint) for r in a.url_map.iter_rules())',
   'print(json.dumps(rules))',
+].join('\n');
+
+// `import <srcModule>` populates sys.modules[<srcModule>] BEFORE the module body runs, so a
+// moved sub-module doing `from <srcModule> import X` at its top level resolves fine. But
+// production runs the file as a script (`python app.py`) -- then it executes as `__main__`,
+// sys.modules has no `app` entry, and that same `from app import X` triggers a SECOND,
+// re-entrant import of app.py which re-hits `from routes.x import x_bp` while routes.x is
+// still initialising -> ImportError, the app never boots (live outage 2026-09-04, PR #86).
+// This reproduces the entrypoint path without running the server: exec the source file's
+// body under a private module name so sys.modules[<srcModule>] is empty during it, exactly
+// as when it is __main__. Skips the `if __name__ == "__main__":` block (no app.run, no
+// threads) -- circular imports happen at module-level import statements, not in there.
+const ENTRYPOINT_SMOKE = [
+  'import importlib.util, sys, os',
+  'src = sys.argv[1]',
+  '# mimic `python <src>`: the script\'s own dir is sys.path[0], not this shim\'s dir',
+  'sys.path.insert(0, os.path.dirname(os.path.abspath(src)) or ".")',
+  'name = "__decompose_entrypoint__"',
+  'try:',
+  '    spec = importlib.util.spec_from_file_location(name, src)',
+  '    mod = importlib.util.module_from_spec(spec)',
+  '    sys.modules[name] = mod',
+  '    spec.loader.exec_module(mod)',
+  'except ModuleNotFoundError as e:',
+  '    if e.name in ("flask", "werkzeug", "jinja2"):',
+  '        print("IMPORT_ERROR:" + repr(e)); sys.exit(3)',
+  '    import traceback; traceback.print_exc(); sys.exit(4)',
+  'except BaseException as e:',
+  '    import traceback; traceback.print_exc(); sys.exit(4)',
+  'print("ENTRYPOINT_OK")',
 ].join('\n');
 
 // A "pure relocation" must leave the route table byte-identical apart from which module
@@ -134,6 +167,38 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
     return done();
   }
 
+  // 2b. entrypoint smoke: exec the source file's body as __main__ (how it is launched).
+  // Catches the circular import that `import <srcModule>` above cannot -- the one that
+  // only fires when sys.modules has no <srcModule> entry during the module body. Kill
+  // switch AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE=false.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE !== 'false') {
+    const smokePath = path.join(branchWt, srcDir, '.decompose_entrypoint_smoke.py');
+    try {
+      fs.mkdirSync(path.dirname(smokePath), { recursive: true });
+      fs.writeFileSync(smokePath, ENTRYPOINT_SMOKE);
+    } catch { /* fall through -- exec will just fail to find it and we skip */ }
+    let out = '';
+    let smokeErr = null;
+    try {
+      out = String(exec('python3', ['.decompose_entrypoint_smoke.py', path.basename(sourceFile)],
+        { cwd: path.join(branchWt, srcDir), timeout: 30_000 }) || '');
+    } catch (e) {
+      smokeErr = e;
+      out = String(e.stdout || '');
+    }
+    try { fs.unlinkSync(smokePath); } catch { /* ignore */ }
+    const smokeMsg = smokeErr ? String(smokeErr.stderr || smokeErr.stdout || smokeErr.message) : out;
+    if (/IMPORT_ERROR:|ModuleNotFoundError: No module named '(flask|werkzeug|jinja2)'/.test(smokeMsg)
+        && !/circular|partially initialized/.test(smokeMsg)) {
+      record('entrypoint', 'skip', `app dependencies not installed here: ${smokeMsg.split('\n').filter(Boolean).pop()}`);
+    } else if (smokeErr) {
+      record('entrypoint', 'fail', `${srcModule} fails to execute as an entrypoint (circular import / import-time error):\n${smokeMsg}`);
+      return done();
+    } else {
+      record('entrypoint', 'pass', `${srcModule} module body executes clean with sys.modules[${srcModule}] unset (the __main__ path)`);
+    }
+  }
+
   // 3. url_map invariant: identical route table on main and on the branch.
   try {
     exec('git', ['worktree', 'add', '--detach', mainWt, mainBranch], { cwd: repoRoot });
@@ -176,4 +241,4 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
   return done();
 }
 
-module.exports = { runIntegrationGate, diffRouteTables, URL_MAP_DUMP, realExec };
+module.exports = { runIntegrationGate, diffRouteTables, URL_MAP_DUMP, ENTRYPOINT_SMOKE, realExec };

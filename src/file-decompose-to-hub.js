@@ -162,7 +162,9 @@ function moveRawText(request, move, index, total, meta = {}) {
       ? `The moved code references these names -- make sure ${dst} imports each: ${meta.neededImports.map((n) => `\`${n}\``).join(', ')}.`
       : '',
     meta.sharedDeps && meta.sharedDeps.length
-      ? `It also reads these names defined in ${src} that are NOT being moved: ${meta.sharedDeps.map((n) => `\`${n}\``).join(', ')}. Import them from the source module (e.g. \`from ${moduleNameFor(src)} import ${meta.sharedDeps.join(', ')}\`). Do NOT copy their definitions. The wiring step knows about this and will register the blueprint at the bottom of ${src} so the import resolves.`
+      ? (/\.py$/.test(dst)
+        ? `It also reads these names defined in ${src} that are NOT being moved: ${meta.sharedDeps.map((n) => `\`${n}\``).join(', ')}. Do NOT copy their definitions. Do NOT add a top-level \`from ${moduleNameFor(src)} import ...\` -- ${src} imports ${dst} to register it, so a module-level back-import is a circular import that crashes the moment ${src} is run as a script (\`python ${path.basename(src)}\`). Instead import them LAZILY: put \`from ${moduleNameFor(src)} import ${meta.sharedDeps.join(', ')}\` as the first line INSIDE each function body that uses one. By call time ${src} is fully loaded, so it is just a dict lookup.`
+        : `It also reads these names defined in ${src} that are NOT being moved: ${meta.sharedDeps.map((n) => `\`${n}\``).join(', ')}. Import them from the source module (e.g. \`from ${moduleNameFor(src)} import ${meta.sharedDeps.join(', ')}\`). Do NOT copy their definitions.`)
       : '',
     '',
     `Validate before finishing: run \`${compile}\` on BOTH ${src} and ${dst}. If ${src} no longer parses, you deleted too much -- fix it.`,

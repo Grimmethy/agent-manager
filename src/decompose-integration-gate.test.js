@@ -102,3 +102,75 @@ test('worktree creation failure -> errored (caller retries), not a hard fail ver
   assert.equal(res.ok, false);
   assert.equal(res.errored, true);
 });
+
+test('entrypoint smoke: a circular import that only bites the __main__ path fails the gate', () => {
+  const err = new Error('cmd failed');
+  err.stderr = [
+    'Traceback (most recent call last):',
+    '  File "routes/reports.py", line 7, in <module>',
+    '    from app import _REPORT_PERIODS, second_brain_dir',
+    "ImportError: cannot import name 'reports_bp' from partially initialized module 'routes.reports' (most likely due to a circular import)",
+  ].join('\n');
+  const f = fakeExec([
+    ['worktree add', ''],
+    ['git diff --name-only', 'python/dashboard/app.py\npython/dashboard/routes/reports.py'],
+    ['python3 -c import app', ''],                      // module-import path is fine
+    ['.decompose_entrypoint_smoke.py app.py', err],      // entrypoint path is NOT
+  ]);
+  const res = runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-reports', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  assert.equal(res.ok, false);
+  const ep = res.checks.find((c) => c.name === 'entrypoint');
+  assert.equal(ep.status, 'fail');
+  assert.match(ep.detail, /circular import/);
+  // it must have gotten past the plain import check
+  assert.equal(res.checks.find((c) => c.name === 'import').status, 'pass');
+});
+
+test('entrypoint smoke: clean module body -> entrypoint check passes', () => {
+  const f = fakeExec([
+    ['worktree add', ''],
+    ['git diff --name-only', 'python/dashboard/app.py'],
+    ['python3 -c import app', ''],
+    ['.decompose_entrypoint_smoke.py app.py', 'ENTRYPOINT_OK\n'],
+  ]);
+  const res = runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-x', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  assert.equal(res.checks.find((c) => c.name === 'entrypoint').status, 'pass');
+});
+
+test('entrypoint smoke: flask not installed -> skip, gate does not fail', () => {
+  const err = new Error('cmd failed');
+  err.stderr = "IMPORT_ERROR:ModuleNotFoundError(\"No module named 'flask'\")";
+  const f = fakeExec([
+    ['worktree add', ''],
+    ['git diff --name-only', ''],
+    ['python3 -c import app', ''],
+    ['.decompose_entrypoint_smoke.py app.py', err],
+  ]);
+  const res = runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-x', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.checks.find((c) => c.name === 'entrypoint').status, 'skip');
+});
+
+test('entrypoint smoke: kill switch disables the check', () => {
+  process.env.AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE = 'false';
+  const f = fakeExec([
+    ['worktree add', ''],
+    ['git diff --name-only', ''],
+    ['python3 -c import app', ''],
+  ]);
+  const res = runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-x', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  delete process.env.AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE;
+  assert.equal(res.checks.find((c) => c.name === 'entrypoint'), undefined);
+});
