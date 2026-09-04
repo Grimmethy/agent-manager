@@ -1221,6 +1221,177 @@ test('draftTask blocks (recursion stop) when a Split-Depth 1 candidate itself em
   });
 });
 
+// --- generic premiseCheck hook (arch-import-premise-check.js's call site) --------------
+
+test('draftTask blocks a split when the source\'s premiseCheck returns invalid-premise, and never sets candidateSplitProposals', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('premise_check_test_source')) {
+      registerTaskSource('premise_check_test_source', {
+        priority: 80, next: () => null, candidateFulfillment: true,
+        candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath,
+        candidateDocTitle: '# Test Candidates',
+        premiseCheck: async () => ({ verdict: 'invalid-premise', reason: 'the named function returns one uniform shape everywhere' }),
+      });
+      updateTaskSource('premise_check_test_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'premise-check-split-1', domain: 'default', source: 'premise_check_test_source', title: 'test',
+      promptContext: {
+        candidateId: 'AC-8', title: 'x', files: ['src/review-task.js'],
+        fetchedFiles: [{ path: 'src/review-task.js', content: 'function f(){ return {a:1}; }\n' }],
+        body: 'Files: src/review-task.js',
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'child a', problem: 'p1', solution: 's1', benefits: 'b1' },
+        { title: 'child b', problem: 'p2', solution: 's2', benefits: 'b2' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals, undefined, 'no children created');
+    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /Invalid premise: the named function returns one uniform shape/);
+  });
+});
+
+test('draftTask honors a split unchanged when the source has no premiseCheck registered (regression guard)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-split-nopremise-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: {
+        candidateId: 'AC-6', title: 'x', files: ['src/apply-task.js'],
+        fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }],
+        body: 'Files: src/apply-task.js',
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'a', problem: 'p1', solution: 's1', benefits: 'b1' },
+        { title: 'b', problem: 'p2', solution: 's2', benefits: 'b2' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask honors a split when the source\'s premiseCheck returns ok', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('premise_check_ok_source')) {
+      registerTaskSource('premise_check_ok_source', {
+        priority: 80, next: () => null, candidateFulfillment: true,
+        candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath,
+        candidateDocTitle: '# Test Candidates',
+        premiseCheck: async () => ({ verdict: 'ok' }),
+      });
+      updateTaskSource('premise_check_ok_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'premise-check-ok-split-1', domain: 'default', source: 'premise_check_ok_source', title: 'test',
+      promptContext: {
+        candidateId: 'AC-7', title: 'x', files: ['src/apply-task.js'],
+        fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }],
+        body: 'Files: src/apply-task.js',
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'a', problem: 'p1', solution: 's1', benefits: 'b1' },
+        { title: 'b', problem: 'p2', solution: 's2', benefits: 'b2' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask never calls premiseCheck when the split is already blocked by the recursion cap (cheapest check first)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    let premiseCheckCalls = 0;
+    if (!getRegisteredSource('premise_check_depthcap_source')) {
+      registerTaskSource('premise_check_depthcap_source', {
+        priority: 80, next: () => null, candidateFulfillment: true,
+        candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath,
+        candidateDocTitle: '# Test Candidates',
+        premiseCheck: async () => { premiseCheckCalls += 1; return { verdict: 'invalid-premise', reason: 'should never run' }; },
+      });
+      updateTaskSource('premise_check_depthcap_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'premise-check-depthcap-1', domain: 'default', source: 'premise_check_depthcap_source', title: 'test',
+      promptContext: {
+        candidateId: 'AC-8', title: 'x', files: ['src/a.js'],
+        fetchedFiles: [{ path: 'src/a.js', content: 'const a=1;\n' }],
+        body: 'Split-Depth: 1\nFiles: src/a.js', splitDepth: 1,
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'a', problem: 'p', solution: 's', benefits: 'b' }, { title: 'b', problem: 'p', solution: 's', benefits: 'b' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(premiseCheckCalls, 0, 'the recursion cap already blocks -- premiseCheck must not run');
+    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /already a one-level decomposition/);
+  });
+});
+
+test('draftTask honors a split when the source\'s premiseCheck throws (advisory -- never blocks a real split on its own failure)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('premise_check_throws_source')) {
+      registerTaskSource('premise_check_throws_source', {
+        priority: 80, next: () => null, candidateFulfillment: true,
+        candidatesPath: () => require('./config.js').getConfig().archReviewCandidatesPath,
+        candidateDocTitle: '# Test Candidates',
+        premiseCheck: async () => { throw new Error('model call timed out'); },
+      });
+      updateTaskSource('premise_check_throws_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'premise-check-throws-1', domain: 'default', source: 'premise_check_throws_source', title: 'test',
+      promptContext: {
+        candidateId: 'AC-9', title: 'x', files: ['src/apply-task.js'],
+        fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }],
+        body: 'Files: src/apply-task.js',
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: JSON.stringify({ mode: 'split', candidates: [
+        { title: 'a', problem: 'p1', solution: 's1', benefits: 'b1' },
+        { title: 'b', problem: 'p2', solution: 's2', benefits: 'b2' },
+      ] }), degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
 test('draftTask blocks a candidate-fulfillment source that says mode "split" but does not follow through with well-formed sub-candidates', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {
