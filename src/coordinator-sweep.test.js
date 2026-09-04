@@ -259,3 +259,74 @@ test('stacked hub: a re-queued wiring child re-arms the gate', () => {
   assert.equal(parent.integrationGate.status, 'pending');
   assert.equal(parent.blockedReason, undefined);
 });
+
+// --- stacked file-decompose hub: deterministic blueprint wiring ------------------------
+
+function wiringHub(dir, extra = {}) {
+  write(dir, 'coordinating', {
+    id: 'file-decompose-hub-w', status: 'coordinating', history: [],
+    mode: 'stacked', branch: 'agent/decompose-w', sourceFile: 'python/dashboard/app.py',
+    integrationGate: { status: 'pending' }, wiringPending: true,
+    wiringMoves: [{ newFile: 'python/dashboard/routes/hw.py', blueprint: 'hw_bp', kind: 'flask-blueprint' }],
+    subTasks: [
+      { id: 'adhoc-decompose-w-01-hw', title: 'move hw', status: 'pending' },
+      { id: 'adhoc-decompose-w-02-rp', title: 'move rp', status: 'pending' },
+    ],
+    ...extra,
+  });
+  write(dir, 'done', { id: 'adhoc-decompose-w-01-hw', stacked: { branch: 'agent/decompose-w' } });
+  write(dir, 'done', { id: 'adhoc-decompose-w-02-rp', stacked: { branch: 'agent/decompose-w' } });
+}
+
+test('wiring hub: all move children done -> runWiring fires, clears wiringPending, gate deferred to next tick', () => {
+  const dir = makePipeline();
+  wiringHub(dir);
+  let gateCalls = 0;
+  const summary = coordinatorSweep({
+    pipelineDir: dir, repoRoot: '/repo',
+    runWiring: () => ({ ok: true, registered: 1, sha: 'deadbeef00' }),
+    runGate: () => { gateCalls += 1; return { ok: true, checks: [] }; },
+  });
+  assert.equal(summary.wired, 1);
+  assert.equal(gateCalls, 0, 'gate does not run the same tick as wiring');
+  const parent = readParent(dir, 'coordinating', 'file-decompose-hub-w');
+  assert.equal(parent.wiringPending, false);
+  assert.equal(parent.integrationGate.status, 'pending');
+  assert.match(JSON.stringify(parent.history), /wired 1 blueprint/);
+});
+
+test('wiring hub: next tick runs the gate against the wired branch and completes the hub', () => {
+  const dir = makePipeline();
+  wiringHub(dir, { wiringPending: false });
+  const summary = coordinatorSweep({
+    pipelineDir: dir, repoRoot: '/repo',
+    runGate: () => ({ ok: true, checks: [{ name: 'import', status: 'pass' }] }),
+  });
+  assert.equal(summary.completed, 1);
+  assert.equal(readParent(dir, 'done', 'file-decompose-hub-w').integrationGate.status, 'passed');
+});
+
+test('wiring hub: a wiring failure blocks the hub with a blockedReason + coordinatorBlocked', () => {
+  const dir = makePipeline();
+  wiringHub(dir);
+  const summary = coordinatorSweep({
+    pipelineDir: dir, repoRoot: '/repo',
+    runWiring: () => ({ ok: false, detail: 'no __main__ guard and EOF splice rejected' }),
+  });
+  assert.equal(summary.wiringFailed, 1);
+  assert.equal(summary.completed, 0);
+  const parent = readParent(dir, 'coordinating', 'file-decompose-hub-w');
+  assert.equal(parent.wiringPending, true, 'stays pending for a retry');
+  assert.match(parent.blockedReason, /deterministic blueprint wiring failed/);
+  assert.equal(parent.coordinatorBlocked.signature, 'blueprint-wiring:failed');
+});
+
+test('wiring hub: not all children done -> wiring does not fire', () => {
+  const dir = makePipeline();
+  wiringHub(dir);
+  fs.unlinkSync(path.join(dir, 'queue', 'done', 'adhoc-decompose-w-02-rp.json'));
+  write(dir, 'adhoc', { id: 'adhoc-decompose-w-02-rp', stacked: { branch: 'agent/decompose-w' } });
+  let wiringCalls = 0;
+  coordinatorSweep({ pipelineDir: dir, repoRoot: '/repo', runWiring: () => { wiringCalls += 1; return { ok: true }; } });
+  assert.equal(wiringCalls, 0);
+});

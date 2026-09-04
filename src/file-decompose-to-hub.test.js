@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 
 function withEnv(repoRoot, extraEnv, fn) {
-  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'AGENT_MANAGER_DECOMPOSE_STACKED', 'AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB'];
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'AGENT_MANAGER_DECOMPOSE_STACKED', 'AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB', 'AGENT_MANAGER_DECOMPOSE_DET_WIRING'];
   const prev = {};
   for (const k of keys) prev[k] = process.env[k];
   process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
@@ -74,10 +74,10 @@ test('legacy mode: hub + one child per move + a wiring task gated on every move'
 
 // --- stacked model -------------------------------------------------------------------
 
-test('stacked mode (default): one shared branch, a sequential dependsOn chain, atomic children', () => {
+test('stacked mode + LLM wiring child (det-wiring off): one shared branch, sequential dependsOn chain, atomic children', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
-  withEnv(dir, {}, ({ sweep }) => {
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => {
     const s = sweep({ pipelineDir: dir });
     assert.equal(s.filedHubs, 1);
     assert.equal(s[PLAN.id].branch, 'agent/decompose-decompose-app-py');
@@ -130,7 +130,7 @@ test('stacked wiring prompt: bottom-of-file placement when a new module imports 
     moves: [{ newFile: 'python/dashboard/routes/reports.py', kind: 'flask-blueprint', blueprint: 'reports_bp',
       symbols: ['_reports_root', 'api_reports'] }],
   }));
-  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
 
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
   const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('-01-'))), 'utf8'));
@@ -196,7 +196,7 @@ test('sweep is idempotent -- a stamped request is skipped', () => {
     assert.equal(s2.checked, 0);
     assert.match(s2.skipped[0], /already filed/);
   });
-  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length, 3);
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length, 2);
 });
 
 test('kill switch + a malformed request are both no-ops', () => {
@@ -209,4 +209,61 @@ test('kill switch + a malformed request are both no-ops', () => {
   withEnv(dir, {}, ({ sweep }) => {
     assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
   });
+});
+
+// --- deterministic blueprint wiring (default) -----------------------------------------
+
+test('det-wiring default: all-blueprint plan files NO wiring child, hub carries wiringPending + wiringMoves', () => {
+  const dir = tmpRepo();
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  assert.equal(adhoc.length, 2, 'only the 2 move children, no -99-wiring');
+  assert.ok(!adhoc.some((n) => n.includes('wiring')));
+
+  const [m1, m2] = adhoc.map((n) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', n), 'utf8')));
+  assert.equal(m1.stacked.total, 2, 'total no longer counts a wiring child');
+  assert.deepEqual(m2.dependsOn, [m1.id]);
+
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.wiringPending, true);
+  assert.deepEqual(hub.wiringMoves, [
+    { newFile: 'python/dashboard/routes/plugins.py', blueprint: 'plugins_bp', kind: 'flask-blueprint' },
+    { newFile: 'python/dashboard/routes/hardware.py', blueprint: 'hardware_bp', kind: 'flask-blueprint' },
+  ]);
+  assert.equal(hub.progress.total, 2);
+});
+
+test('det-wiring + a mixed plan: LLM wiring child is filed but scoped to the non-blueprint move only', () => {
+  const dir = tmpRepo();
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'm.json'), JSON.stringify({
+    id: 'decompose-mixed',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [
+      { newFile: 'python/dashboard/static/js/hardware.js', kind: 'script-extract', symbols: ['renderHardwareTab'] },
+      { newFile: 'python/dashboard/routes/hw.py', kind: 'flask-blueprint', blueprint: 'hw_bp', symbols: ['api_hw'] },
+    ],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  const wiring = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('wiring'))), 'utf8'));
+  assert.match(wiring.promptContext.rawText, /static\/js\/hardware\.js/);
+  assert.doesNotMatch(wiring.promptContext.rawText, /register_blueprint/, 'blueprint move is handled deterministically, not by the child');
+
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.wiringPending, true);
+  assert.deepEqual(hub.wiringMoves, [{ newFile: 'python/dashboard/routes/hw.py', blueprint: 'hw_bp', kind: 'flask-blueprint' }]);
+});
+
+test('det-wiring kill switch restores the LLM wiring child for every move', () => {
+  const dir = tmpRepo();
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length, 3);
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.wiringPending, undefined);
 });

@@ -268,6 +268,18 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   const stacked = stackedEnabled();
   const branch = `agent/decompose-${planSlug}`;
 
+  // Deterministic wiring (wire-decomposed-blueprints.js): for flask-blueprint moves the
+  // coordinator splices the `register_blueprint` block itself once every move child is
+  // done -- no LLM wiring child. Anything else (script-extract, plain require) still gets
+  // an LLM wiring child, scoped to just those moves. Kill switch: DECOMPOSE_DET_WIRING.
+  const bpMoves = moves.filter((m) => m.kind === 'flask-blueprint');
+  const otherMoves = moves.filter((m) => m.kind !== 'flask-blueprint');
+  const useDetWiring = stacked && bpMoves.length > 0
+    && process.env.AGENT_MANAGER_DECOMPOSE_DET_WIRING !== 'false';
+  const fileWiringChild = !useDetWiring || otherMoves.length > 0;
+  const wiringChildMoves = useDetWiring ? otherMoves : moves;
+  const wiringChildCount = fileWiringChild ? 1 : 0;
+
   const children = [];
   const moveIds = [];
   let prevId = null;
@@ -290,7 +302,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     if (stacked) {
       record.atomic = true;
       record.noDecompose = true;
-      record.stacked = { branch, seq: i + 1, total: moves.length + 1 };
+      record.stacked = { branch, seq: i + 1, total: moves.length + wiringChildCount };
       if (prevId) record.dependsOn = [prevId];
     }
     fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
@@ -299,24 +311,28 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   });
 
   // Final wiring task. In stacked mode it depends only on the last move (the chain is
-  // sequential); in legacy mode it waits on every move being merged.
-  const wireId = `adhoc-decompose-${planSlug}-99-wiring`.slice(0, 120);
-  const wiringRecord = {
-    id: wireId,
-    domain: 'adhoc',
-    source: 'manual',
-    title: `Decompose ${request.sourceFile} — wire up the ${moves.length} new file(s)`,
-    createdAt: nowIso,
-    dependsOn: stacked ? [prevId] : moveIds,
-    promptContext: { rawText: wiringRawText(request, moves, validation.moveMeta), decomposedFrom: `file-decompose:${request.id}` },
-  };
-  if (stacked) {
-    wiringRecord.atomic = true;
-    wiringRecord.noDecompose = true;
-    wiringRecord.stacked = { branch, seq: moves.length + 1, total: moves.length + 1 };
+  // sequential); in legacy mode it waits on every move being merged. Skipped entirely when
+  // every move is a flask-blueprint the coordinator wires deterministically.
+  if (fileWiringChild) {
+    const wireId = `adhoc-decompose-${planSlug}-99-wiring`.slice(0, 120);
+    const wiringMetas = wiringChildMoves.map((m) => validation.moveMeta[moves.indexOf(m)]);
+    const wiringRecord = {
+      id: wireId,
+      domain: 'adhoc',
+      source: 'manual',
+      title: `Decompose ${request.sourceFile} — wire up ${wiringChildMoves.length} new file(s)`,
+      createdAt: nowIso,
+      dependsOn: stacked ? [prevId] : moveIds,
+      promptContext: { rawText: wiringRawText(request, wiringChildMoves, wiringMetas), decomposedFrom: `file-decompose:${request.id}` },
+    };
+    if (stacked) {
+      wiringRecord.atomic = true;
+      wiringRecord.noDecompose = true;
+      wiringRecord.stacked = { branch, seq: moves.length + 1, total: moves.length + wiringChildCount };
+    }
+    fs.writeFileSync(path.join(adhocDir, `${wireId}.json`), `${JSON.stringify(wiringRecord, null, 2)}\n`);
+    children.push({ id: wireId, title: `wire up ${wiringChildMoves.length} new file(s)`, status: 'pending' });
   }
-  fs.writeFileSync(path.join(adhocDir, `${wireId}.json`), `${JSON.stringify(wiringRecord, null, 2)}\n`);
-  children.push({ id: wireId, title: `wire up ${moves.length} new file(s)`, status: 'pending' });
 
   const hubId = `file-decompose-hub-${planSlug}`;
   const hub = {
@@ -331,13 +347,17 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     subTasks: children,
     progress: { done: 0, total: children.length },
     planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
-    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s) + 1 wiring task${stacked ? ` (stacked on ${branch})` : ''}` }],
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s)${useDetWiring ? ` + deterministic wiring for ${bpMoves.length} blueprint(s)` : ''}${fileWiringChild ? ` + 1 LLM wiring task${useDetWiring ? ` for ${otherMoves.length} non-blueprint move(s)` : ''}` : ''}${stacked ? ` (stacked on ${branch})` : ''}` }],
   };
   if (stacked) {
     hub.mode = 'stacked';
     hub.branch = branch;
     hub.sourceFile = request.sourceFile;
     hub.integrationGate = { status: 'pending' };
+  }
+  if (useDetWiring) {
+    hub.wiringPending = true;
+    hub.wiringMoves = bpMoves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, kind: m.kind }));
   }
   fs.writeFileSync(path.join(coordDir, `${hubId}.json`), `${JSON.stringify(hub, null, 2)}\n`);
 
