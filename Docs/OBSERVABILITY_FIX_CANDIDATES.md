@@ -2823,3 +2823,26 @@ No new dependency is introduced; `logging` is the stdlib module the project alre
 
 Benefits:
 An operator reviewing server logs will immediately see a timestamped, branch-specific warning whenever a remote-branch deletion fails, turning an invisible, accumulating problem into a one-line diagnostic. The warning level (not error) correctly signals "expected best-effort path, not a request failure," so alerting on ERROR/CRITICAL is not triggered while the signal is still present for log-search and post-incident review. The merge-to-main success path and the outer 500 handler are untouched, so no behavioural change is introduced beyond observability.
+
+### AC-158 · Chat-preempt kill reports success on PermissionError
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+                        d = read_json_safe(lp) or {}
+                        if d.get("pid") == kill_pid:
+                            lp.unlink()
+                    except OSError:
+                        pass
+
+            summary.append({"lane": lane, "action": "killed", "taskId": task_id, "ageSeconds": age_s})
+```
+
+Problem:
+The `except (ProcessLookupError, PermissionError): pass` on line 4221 lumps two semantically different failures into a silent no-op. `ProcessLookupError` means the target process is already gone (benign), but `PermissionError` means the process is still alive and we lack the rights to kill it. In either case execution falls through to the `summary.append({"lane": lane, "action": "killed", …})` and the `print(f"[chat-preempt] killed {lane} …")` lines, so an operator reading stderr or the summary JSON sees "killed" when the process was in fact *not* killed. There is no log line that distinguishes "already dead" from "could not kill," making a stuck model process invisible to anyone monitoring the chat-preempt path.
+
+Solution:
+Split the single `except` into two. For `ProcessLookupError`, keep the current `pass` (process already gone; the "killed" summary is accurate). For `PermissionError`, emit a `print(f"[chat-preempt] {lane}: WARNING os.kill({kill_pid}) denied – process still alive", file=sys.stderr, flush=True)` and change the summary entry to `"action": "kill_denied"` (or append a `"killed": False` flag) so downstream consumers and operators can see the kill did not take effect. The outer `except Exception` and the lock-file cleanup remain unchanged.
+
+Benefits:
+An operator tailing stderr or querying the requeue summary can immediately distinguish a benign race (process already exited) from a real failure (insufficient privileges, e.g. running as a non-root user in a container). The misleading "killed" label disappears from the PermissionError path, eliminating a class of silent resource-leak incidents where a zombie model process holds GPU memory while the system believes it was reclaimed.
