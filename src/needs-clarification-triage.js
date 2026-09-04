@@ -44,6 +44,23 @@
 //      must not shield them from a fix built specifically for this shape. Bounded by the
 //      same MAX_REQUEUES/ncTriageAttempts counter bucket A uses -- one clean retry, then
 //      it falls back to the normal leave-for-human path like everything else.
+//
+//   E. DECOMPOSE-LOOP, NOT AN OVERSIZED-FILE TARGET (2026-09-04) -- the original comment
+//      above ("decompose-loop subset -- autoroute owns those") was only half true:
+//      decompose-loop-autoroute.js explicitly declines a decompose-loop task whose target
+//      isn't a genuinely oversized file ("left for the human" -- see its own header), but
+//      this sweep's own unconditional `stalenessFlag.reason === 'decompose-loop' -> skip`
+//      trusted autoroute to own EVERY such task regardless. Root-caused live: of the 5
+//      decompose-loop-flagged adhoc tasks that have ever existed, all 5 hit this exact
+//      dead zone -- 4 were quietly moved to _archived_no_action with no
+//      terminalDisposition/resolvedBy/autorouteAttempts at all (dropped, never resolved),
+//      the 5th (a well-specified, mechanical test-writing task) sat with `ncTriageDecision`
+//      never even set. Fix: the skip now checks autoroute's own precondition
+//      (targetOversizedFile) before deferring; a non-oversized-file decompose-loop task
+//      gets one clean-state requeue instead (these are usually tractable -- the model just
+//      needs pushed toward "implement it directly" instead of "split it"), falling back to
+//      an honest, visible bucket-C leave-for-human stamp if it recurs, rather than staying
+//      invisible forever. Checked before the "already reviewed" skip, same reasoning as D.
 
 const fs = require('fs');
 const path = require('path');
@@ -51,6 +68,7 @@ const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
+const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
 // matches auto-confirm-review.js's discipline.
@@ -177,8 +195,51 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
     const nc = task.needsClarification || {};
     if (nc.reason !== 'design-decision') continue;                       // not ours
-    if (task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop') continue; // autoroute owns it
+    const decompLoop = !!(task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop');
+    if (decompLoop && targetOversizedFile(task, oversizedFiles(pipelineDir))) continue; // autoroute owns it
     if (task.stalenessKeep && task.stalenessKeep.until && task.stalenessKeep.until > now) continue; // human said Keep
+
+    // --- Bucket E: decompose-loop, not an oversized-file target -> clean-state requeue ---
+    // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
+    // toward `checked`) when decompLoop is set; otherwise falls through unchanged.
+    if (decompLoop) {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if ((task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket E but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket E (decompose-loop, not an oversized-file target) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.stalenessFlag;
+            delete task.decomposeBlockCount;
+            delete task.autoDecomposeCount;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-loop flag but target is not an oversized file (autoroute declines) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+      // Cap spent (or adhoc/ race) and still decompose-loop-flagged, non-oversized: fall
+      // through to the normal ladder below so it gets an honest, visible leave-for-human
+      // stamp instead of staying invisible (the actual bug being fixed).
+    }
 
     // --- Bucket D: false completion-claim signature -> clean-state requeue -----------
     // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts

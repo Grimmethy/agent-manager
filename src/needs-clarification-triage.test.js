@@ -105,9 +105,13 @@ test('bucket A skipped: has an exhausted history event -> bucket C retry-exhaust
   assert.ok(t.history.some((h) => /retry-exhausted/.test(h.detail || '')));
 });
 
-test('decompose-loop flag -> skipped entirely (autoroute owns it)', async () => {
+test('decompose-loop flag, target IS an oversized file -> skipped entirely (autoroute owns it)', async () => {
   const dir = makePipeline();
-  held(dir, baseTask('t5', { stalenessFlag: { reason: 'decompose-loop' } }));
+  fs.writeFileSync(at(dir, 'file-length-flags.json'), JSON.stringify({ findings: [{ file: 'python/dashboard/app.py' }] }));
+  held(dir, baseTask('t5', {
+    stalenessFlag: { reason: 'decompose-loop' },
+    promptContext: { rawText: 'Decompose python/dashboard/app.py -- it is too large to split in one pass.' },
+  }));
   const s = await needsClarificationTriage(args(dir));
   assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [0, 0, 0]);
   assert.ok(exists(at(dir, 'needs-clarification', 't5.json')));
@@ -337,5 +341,72 @@ test('bucket D: DRY_RUN=1 reports but does not move the file', async () => {
     assert.equal(s.requeued, 1);
     assert.ok(exists(at(dir, 'needs-clarification', 'td6.json')));
     assert.ok(!exists(at(dir, 'adhoc', 'td6.json')));
+  } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
+});
+
+// --- Bucket E: decompose-loop, not an oversized-file target (2026-09-04) -----------
+
+test('bucket E: decompose-loop + no oversized-file target -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('te1', {
+    stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
+    decomposeBlockCount: 2,
+    history: [{ stage: 'exhausted' }, { stage: 'needs-clarification' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'te1.json')));
+  const moved = read(at(dir, 'adhoc', 'te1.json'));
+  assert.equal(moved.stalenessFlag, undefined);
+  assert.equal(moved.decomposeBlockCount, undefined);
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /not an oversized file/.test(h.detail)));
+});
+
+test('bucket E: a real oversized-file target still defers to autoroute, unaffected', async () => {
+  const dir = makePipeline();
+  fs.writeFileSync(at(dir, 'file-length-flags.json'), JSON.stringify({ findings: [{ file: 'python/dashboard/app.py' }] }));
+  held(dir, baseTask('te2', {
+    stalenessFlag: { reason: 'decompose-loop' },
+    promptContext: { rawText: 'Split python/dashboard/app.py into smaller modules.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued], [0, 0]);
+  assert.ok(exists(at(dir, 'needs-clarification', 'te2.json')));
+});
+
+test('bucket E: already at MAX_REQUEUES -> falls through to bucket C, gets a visible leave-for-human stamp', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('te3', {
+    stalenessFlag: { reason: 'decompose-loop' },
+    ncTriageAttempts: 1,
+    history: [{ stage: 'exhausted' }, { stage: 'needs-clarification' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.equal(s.leftForHuman, 1);
+  const t = read(at(dir, 'needs-clarification', 'te3.json'));
+  assert.equal(t.ncTriageDecision, 'leave-for-human');
+});
+
+test('bucket E: adhoc/<id>.json already exists -> left in place, not double-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('te4', { stalenessFlag: { reason: 'decompose-loop' } }));
+  fs.writeFileSync(at(dir, 'adhoc', 'te4.json'), '{"id":"te4"}');
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'te4.json')));
+});
+
+test('bucket E: DRY_RUN=1 reports but does not move the file', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('te5', { stalenessFlag: { reason: 'decompose-loop' } }));
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try {
+    const s = await needsClarificationTriage(args(dir));
+    assert.equal(s.requeued, 1);
+    assert.ok(exists(at(dir, 'needs-clarification', 'te5.json')));
+    assert.ok(!exists(at(dir, 'adhoc', 'te5.json')));
   } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
 });
