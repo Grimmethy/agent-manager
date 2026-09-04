@@ -238,6 +238,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         // task explicitly forbids. The feedback names the real target(s).
         priorFeedback.push(task.adhocDiffSubstanceFeedback);
         delete task.adhocDiffSubstanceFeedback;
+      } else if (retryableDraftBlock && typeof task.adhocNoChangesClaimFeedback === 'string' && task.adhocNoChangesClaimFeedback.trim()) {
+        // Sibling of the above, for a `no-changes-needed` resolution: no "Already covered:"
+        // citation block, or a named object cited nowhere and grep-findable nowhere. The
+        // feedback names the exact gap. See adhoc-diff-sanity.js.
+        priorFeedback.push(task.adhocNoChangesClaimFeedback);
+        delete task.adhocNoChangesClaimFeedback;
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
       } else {
