@@ -39,6 +39,7 @@ const fs = require('fs');
 const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
+const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
 const { runSearches } = require('./project-search-fetch.js');
 const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
@@ -928,6 +929,16 @@ async function runPlanPass(task, {
       stillThin ? 'still thin, no prior plan to fall back on' : null,
     ].filter(Boolean);
     appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), ${task.planResponse.length} chars${notes.length ? `, ${notes.join(', ')}` : ''}`);
+  }
+
+  // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
+  // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
+  // trailing CRITERIA: block the plan pass was asked to write. Kill switch
+  // AGENT_MANAGER_ADHOC_ACCEPTANCE=false.
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') {
+    const ac = resolveAcceptanceCriteria(task);
+    task.acceptanceCriteria = ac.criteria;
+    task.acceptanceCriteriaSource = ac.source;
   }
 
   // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a

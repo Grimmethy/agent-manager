@@ -439,6 +439,13 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   task.implementResponse = task.rawDiff
     ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
     : summary;
+  // Component 2: pull the "Acceptance:" block the write prompt asked for (present only when
+  // the task had acceptanceCriteria) into a structured field the review gate reads.
+  if (resolution === 'implemented' && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length) {
+    try {
+      task.acceptanceResults = require('./acceptance-criteria.js').parseAcceptanceBlock(summary);
+    } catch { /* non-fatal */ }
+  }
   return { succeeded: true, blocked: false, ...meta };
 }
 
