@@ -2984,3 +2984,26 @@ Replace the bare `catch { continue; }` with a named catch that inspects `err.cod
 
 Benefits:
 An operator running the decompose loop will immediately see a stderr line identifying which queue directory failed, why (permission denied, I/O fault, etc.), and the process will exit non-zero rather than silently reporting zero pending tasks. The ENOENT fast-path is preserved, so normal first-run or partial-pipeline scenarios still skip cleanly without noise. The silent-data-loss path for EACCES/EIO is eliminated.
+
+### AC-165 · Swallowed getConfig() error in sweep() repo-root resolution
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Snippet:
+```
+  const requestsDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
+  let resolvedRepoRoot = repoRoot;
+  if (!resolvedRepoRoot) {
+    try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = pipelineDir; }
+  }
+
+  for (const { full, request } of readRequests(requestsDir)) {
+```
+
+Problem:
+In the `sweep` function (line ~379), the line `try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = pipelineDir; }` uses a bare optional-catch-binding `catch` that discards the thrown error entirely. If `getConfig()` throws — due to a missing config file, a parse error, a permissions issue, or any other failure — the code silently substitutes `pipelineDir` as the repo root with zero diagnostic output. Downstream, every path derived from `resolvedRepoRoot` (queue directories, request files, hub records) will be rooted at the wrong location, and no log line, stack trace, or stderr message will ever reveal that the fallback was triggered or why. In a pipeline that runs unattended, this produces a class of silent mis-routing that is extremely difficult to diagnose after the fact.
+
+Solution:
+Replace the bare `catch` with a named binding and emit a `console.error` call before the fallback assignment, e.g. `catch (err) { console.error(`[file-decompose-to-hub] sweep: getConfig() failed, falling back to pipelineDir as repoRoot: ${err.message}`, err.stack); resolvedRepoRoot = pipelineDir; }`. This matches the project's existing logging convention (console.error / console.warn, no third-party logger) and requires no new dependency. The fallback to `pipelineDir` is retained because it is a reasonable recovery path that lets the sweep continue; the error is logged rather than rethrown because the caller (`sweep`) already has a valid alternative and rethrowing would abort the entire sweep over a single config lookup.
+
+Benefits:
+An operator or on-call engineer reading stderr or a CI log will immediately see that `getConfig()` failed, the exact exception message and stack trace, and which fallback value was used. This converts an invisible silent mis-routing of pipeline artifacts into a one-line diagnostic that points directly at the root cause, eliminating the "why are my hub files in the wrong directory?" class of incident and making the fallback path auditable in post-mortems.
