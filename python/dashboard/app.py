@@ -6922,6 +6922,123 @@ def api_plugins_marketplace():
     })
 
 
+def _run_plugin_subprocess(args: list, cwd):
+    """Runs one subprocess for a plugin update (git fetch/checkout, npm update/install).
+    Kept as a single module-level seam so tests can monkeypatch it instead of shelling
+    out. Raises subprocess.CalledProcessError / subprocess.TimeoutExpired / OSError on
+    failure; returns (stdout, stderr) on success."""
+    result = subprocess.run(
+        args, cwd=str(cwd), capture_output=True, text=True, check=True, timeout=600
+    )
+    return result.stdout or "", result.stderr or ""
+
+
+@app.route("/api/plugins/update", methods=["POST"])
+def api_plugins_update():
+    """Updates one installed plugin to the catalog's latest version: fetch/checkout the
+    new source revision (or npm update), re-run npm install, record the new version +
+    source in plugins.json, and restart the pipeline if it's running."""
+    body = request.get_json(silent=True) or {}
+    plugin_id = (body.get("id") or "").strip()
+    if not plugin_id:
+        abort(400, description="id is required")
+
+    doc, _err = _read_plugin_catalog()
+    catalog_entry = next(
+        (e for e in doc.get("plugins", []) if isinstance(e, dict) and e.get("id") == plugin_id),
+        None,
+    )
+    if catalog_entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not in catalog")
+
+    manifest = _read_plugins_manifest()
+    entry = next(
+        (p for p in manifest if isinstance(p, dict) and p.get("name") == plugin_id),
+        None,
+    )
+    if entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not installed")
+
+    installed_version = entry.get("version")
+    new_version = catalog_entry.get("version")
+    if not (new_version and _version_tuple(new_version) > _version_tuple(installed_version or "")):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "reason": "no update available",
+            "installedVersion": installed_version,
+            "latestVersion": new_version,
+        })
+
+    plugin_dir = _plugins_install_dir() / plugin_id
+    if not plugin_dir.is_dir():
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"plugin checkout not found at {plugin_dir}",
+        }), 404
+
+    source = catalog_entry.get("source") or {}
+    if source.get("type") not in ("git", "npm"):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"unsupported source.type: {source.get('type')!r}",
+        }), 400
+
+    try:
+        if source["type"] == "git":
+            _run_plugin_subprocess(["git", "fetch", "--tags", "--prune"], plugin_dir)
+            candidates = [c for c in (source.get("ref"), new_version) if c]
+            checked_out = False
+            for ref in candidates:
+                try:
+                    _run_plugin_subprocess(["git", "checkout", ref], plugin_dir)
+                    checked_out = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if not checked_out:
+                # No usable ref/tag -- fall back to origin's default branch.
+                out, _ = _run_plugin_subprocess(
+                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], plugin_dir
+                )
+                default_ref = out.strip()
+                if not default_ref:
+                    raise subprocess.CalledProcessError(
+                        1, "git checkout",
+                        stderr="no source.ref, no version tag, and no origin/HEAD default",
+                    )
+                _run_plugin_subprocess(["git", "checkout", default_ref], plugin_dir)
+        else:  # npm
+            pkg = (source.get("url") or "").strip() or plugin_id
+            _run_plugin_subprocess(["npm", "update", pkg], plugin_dir)
+        _run_plugin_subprocess(["npm", "install"], plugin_dir)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        detail = (getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)).strip()
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": "plugin update failed",
+            "detail": detail,
+        }), 500
+
+    entry["version"] = new_version
+    entry["source"] = source
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({
+        "id": plugin_id,
+        "updated": True,
+        "installedVersion": installed_version,
+        "latestVersion": new_version,
+        "restarted": restarted,
+    })
+
+
 def _stop_pipeline(force: bool = False) -> list:
     """Stops whatever launch.sh/launch.bat started. On Windows, kills by PID from the
     current instances/*.json heartbeats (same trust model queue-watchdog.ps1's own
