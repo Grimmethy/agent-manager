@@ -1143,7 +1143,11 @@ def api_tokenfold_stats():
                 f"http://localhost:{port}/tokenfold/stats", timeout=3) as r:
             data = json.loads(r.read().decode())
         return jsonify({"available": True, "port": port, "stats": data})
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "TokenFold stats fetch failed (localhost:%s /tokenfold/stats): %s: %s",
+            port, type(exc).__name__, exc,
+        )
         return jsonify({"available": False, "port": port})
 
 
