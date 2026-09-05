@@ -23,7 +23,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
+const { normalizeTokens, jaccardSimilarity, sharesDistinctivePhrase } = require('./text-similarity.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { loadBrainDump } = require('./apply-group-a.js');
 const { inboxDir } = require('./side-finding.js');
@@ -85,10 +85,25 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
     try {
       const mine = normalizeTokens(`${record.title} ${record.body}`);
       let best = null;
-      if (mine.size >= 4) {
-        for (const entry of machineEntries) {
-          const sim = jaccardSimilarity(mine, normalizeTokens(`${(entry.rawText || '').slice(0, 300)}`));
-          if (sim >= threshold && (!best || sim > best.sim)) best = { entry, sim };
+      for (const entry of machineEntries) {
+        // Two signals, OR'd together -- root-caused live (2026-09-05): ~30 near-duplicate
+        // findings landed as separate entries in one evening because their whole-text
+        // Jaccard similarity (0.4, confirmed) sat under the 0.6 threshold even though they
+        // were obviously the same underlying observation, just elaborated with a
+        // different suggested fix each time. A shared distinctive multi-word phrase from
+        // the TITLE (e.g. "duplicate-instance race") is a much more precise "same topic"
+        // signal than a blended bag-of-words score, which dilutes on any elaboration.
+        // Neither signal alone is sufficient -- phrase-sharing catches same-topic/
+        // different-detail pairs Jaccard misses; Jaccard still catches a near-verbatim
+        // restatement whose title happens to be phrased without a clean shared n-gram.
+        const entryTitle = (entry.rawText || '').split('\n')[0];
+        const phraseMatch = sharesDistinctivePhrase(record.title, entryTitle);
+        const sim = mine.size >= 4
+          ? jaccardSimilarity(mine, normalizeTokens(`${(entry.rawText || '').slice(0, 300)}`))
+          : 0;
+        if (phraseMatch || sim >= threshold) {
+          const score = phraseMatch ? 1 : sim; // a phrase match always outranks a plain Jaccard match
+          if (!best || score > best.sim) best = { entry, sim: score, viaPhrase: phraseMatch };
         }
       }
 
