@@ -772,7 +772,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null, stage = null }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -859,7 +859,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       merged.response = cleanText;
       if (findings.length) {
         for (const finding of findings) {
-          writeSideFindingInbox(finding, { source, taskId, stage: null, pipelineDir });
+          writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir });
         }
       }
     }

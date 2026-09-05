@@ -201,7 +201,7 @@ async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = 
   const started = Date.now();
   let result;
   try {
-    result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source });
+    result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source, taskId: task.id, stage: 'agentic-read-only' });
   } catch (e) {
     console.error(`[local-agentic-draft] runPlan failed for task ${task.id ?? task.source}: ${e?.message ?? String(e)}`);
     return { applied: false, succeeded: true, reason: `local agentic investigation failed: ${e.message}` };

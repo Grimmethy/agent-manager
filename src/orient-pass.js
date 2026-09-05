@@ -54,7 +54,7 @@ async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, mayb
     return { notes: groundingText, turnsUsed: 0, skipped: true };
   }
 
-  const call = () => runPlan({ prompt: buildOrientPrompt(task, groundingText), maxTurns: ORIENT_TURNS, source: task.source });
+  const call = () => runPlan({ prompt: buildOrientPrompt(task, groundingText), maxTurns: ORIENT_TURNS, source: task.source, taskId: task.id, stage: 'orient' });
   let result;
   try {
     result = maybeLocked ? await maybeLocked(true, call, 'orient') : await call();
