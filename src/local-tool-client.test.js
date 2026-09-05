@@ -835,3 +835,50 @@ test('a done_reason:"length" cut-off mid-tool-loop (not just the final turn) sti
     assert.equal(result.response, 'a real final answer');
   });
 });
+
+// --- side-finding capture (2026-09-05) -----------------------------------------------
+
+function sideFindingInboxFiles(dir) {
+  const inbox = path.join(dir, 'queue', 'side-findings-inbox');
+  if (!fs.existsSync(inbox)) return [];
+  return fs.readdirSync(inbox).map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+}
+
+test('runPlanWithTools injects the SIDE-FINDING instruction into the first message by default', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'do the task' });
+    assert.match(sentBodies[0].messages[0].content, /SIDE-FINDING:/);
+  });
+});
+
+test('runPlanWithTools does not inject when allowSideFindings is false', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'classify this', allowSideFindings: false });
+    assert.doesNotMatch(sentBodies[0].messages[0].content, /SIDE-FINDING/);
+  });
+});
+
+test('runPlanWithTools extracts a SIDE-FINDING block from the final response, returns cleaned text, and files it to the inbox', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'Real answer here.\n\nSIDE-FINDING: Something worth a look\nBody of the finding.' },
+  ], async (mod, dir) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', source: 'arch_review', taskId: 'arch-review-ac-1' });
+    assert.equal(result.response.includes('SIDE-FINDING'), false);
+    assert.match(result.response, /Real answer here\./);
+    const files = sideFindingInboxFiles(dir);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].title, 'Something worth a look');
+    assert.equal(files[0].source, 'arch_review');
+    assert.equal(files[0].taskId, 'arch-review-ac-1');
+  });
+});
+
+test('runPlanWithTools with allowSideFindings:false never extracts even if the response happens to contain the marker text', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'SIDE-FINDING: should not be extracted\nbody' },
+  ], async (mod, dir) => {
+    const result = await mod.runPlanWithTools({ prompt: 'classify this', allowSideFindings: false });
+    assert.match(result.response, /SIDE-FINDING: should not be extracted/);
+    assert.equal(sideFindingInboxFiles(dir).length, 0);
+  });
+});

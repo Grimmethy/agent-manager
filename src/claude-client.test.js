@@ -128,8 +128,10 @@ test('callOnce builds the expected non-interactive invocation shape', async () =
     // 2026-08-24 (pipeline hardening): the raw prompt string is no longer sent verbatim
     // -- callOnce prepends a real-date anchor line to every call (see
     // current-date-line.js) -- so this asserts the ORIGINAL prompt is still present
-    // rather than the whole arg being exactly the caller's string.
-    assert.match(capturedArgs[1], /summarize this$/);
+    // rather than the whole arg being exactly the caller's string. Not end-anchored:
+    // 2026-09-05, callOnce also appends the SIDE-FINDING: instruction blurb after the
+    // caller's own prompt (see side-finding.test.js for that behavior's own coverage).
+    assert.match(capturedArgs[1], /summarize this/);
     assert.ok(capturedArgs.includes('--output-format'));
     assert.ok(capturedArgs.includes('json'));
     assert.ok(capturedArgs.includes('--max-turns'));
@@ -435,5 +437,53 @@ test('majorityVote() rethrows only when EVERY vote hard-fails (a real infra fail
         );
       },
     );
+  });
+});
+
+// --- side-finding capture (2026-09-05) -----------------------------------------------
+
+function sideFindingInboxFiles(dir) {
+  const inbox = path.join(dir, 'queue', 'side-findings-inbox');
+  if (!fs.existsSync(inbox)) return [];
+  return fs.readdirSync(inbox).map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+}
+
+test('callOnce injects the SIDE-FINDING instruction into the prompt by default', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'do the task' }); },
+    );
+    assert.match(capturedArgs[1], /SIDE-FINDING:/);
+  });
+});
+
+test('callOnce does not inject when allowSideFindings is false', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'classify this', allowSideFindings: false }); },
+    );
+    assert.doesNotMatch(capturedArgs[1], /SIDE-FINDING/);
+  });
+});
+
+test('call() extracts a SIDE-FINDING block from the response, returns cleaned text, and files it to the inbox', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-sf-test-'));
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token', AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: dir }, async () => {
+    await withMockedClient(
+      () => JSON.stringify({ result: 'Real answer.\n\nSIDE-FINDING: Something worth a look\nBody of the finding.' }),
+      async ({ call }) => {
+        const result = await call({ prompt: 'go', source: 'chat' });
+        assert.equal(result.response.includes('SIDE-FINDING'), false);
+        assert.match(result.response, /Real answer\./);
+      },
+    );
+    const files = sideFindingInboxFiles(dir);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].title, 'Something worth a look');
+    assert.equal(files[0].source, 'chat');
   });
 });

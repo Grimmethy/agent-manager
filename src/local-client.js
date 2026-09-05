@@ -15,6 +15,7 @@ const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
+const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -27,6 +28,15 @@ function resolveInstancesDir() {
   if (!repoRoot) return null;
   const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
   return path.join(pipelineDir, 'instances');
+}
+
+// Same tolerant derivation as resolveInstancesDir() above, one level up (the pipelineDir
+// itself rather than its instances/ subdir) -- side-finding inbox writes are just as
+// best-effort as the in-flight lock, never a hard requirement to have a full pipeline env.
+function resolvePipelineDir() {
+  const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  if (!repoRoot) return null;
+  return process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -109,8 +119,16 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source }) {
-  const datedPrompt = `${currentDateLine()}\n\n${prompt}`;
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true }) {
+  // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
+  // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
+  // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
+  // callers: brain_dump_sort's classify pass, digest-verdict parsing, decompose's JSON
+  // response, path-prefetch-resolve) OR the call is already grammar-constrained
+  // (`format` set) -- a constrained decode literally cannot emit free text, so the
+  // instruction would just be wasted prompt tokens.
+  const effectivePrompt = (allowSideFindings && !format) ? injectSideFindingInstruction(prompt) : prompt;
+  const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const promptTokens = estimateTokens(datedPrompt);
 
   const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
@@ -246,6 +264,20 @@ async function call(opts, maxRetries = 2) {
       continue;
     }
     gotAnyResponse = true;
+    // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
+    // so a response that's otherwise degenerate/empty except for a stray finding isn't
+    // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
+    // never sees the raw marker text.
+    if (opts.allowSideFindings !== false && result.response && result.response.includes('SIDE-FINDING:')) {
+      const { cleanText, findings } = extractSideFindings(result.response);
+      result = { ...result, response: cleanText };
+      if (findings.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const finding of findings) {
+          writeSideFindingInbox(finding, { source: opts.source, taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
     const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
