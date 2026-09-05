@@ -94,8 +94,10 @@ function countRecentCompletions(pipelineDir, now, windowMs) {
 function countPending(pipelineDir) {
   try {
     return fs.readdirSync(path.join(pipelineDir, 'queue', 'pending')).filter((f) => f.endsWith('.json')).length;
-  } catch {
-    return 0;
+  } catch (err) {
+    if (err.code === 'ENOENT') return 0;
+    console.error(`countPending: failed to read pending queue for ${pipelineDir}: ${err.message}`);
+    throw err;
   }
 }
 
