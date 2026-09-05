@@ -674,6 +674,33 @@ const MAX_ROLLBACK_ATTEMPTS = 2;
 // RESOLUTION line. Env-overridable; clamped below maxTurns so it always leaves room to act.
 const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS) || 10;
 
+// 2026-09-05, Grimmethy: real Chat panel investigation (chat-1788639495-31ed485b) burned
+// ~12.4 minutes and 16 turns auditing branches / reading git-runner.js -- confirmed live
+// via model-stats.db (turns_used=16, latency_ms=744939) that roughly the back half of that
+// run was structurally unwinnable: by the midpoint the accumulated messages array had
+// already grown to ~16,200 of the 16,384-token ceiling, leaving too little room for the
+// model to ever finish reading the file it kept trying to read. It just kept re-narrating
+// "let me read the full resetToMain() implementation" and getting clipped by
+// done_reason:"length" almost instantly, turn after turn, for zero forward progress --
+// this pipeline already has the right mechanism for the analogous "budget exhausted"
+// problem (forceSummaryOnCap/runForcedSummaryTurn, turn-count-triggered), just not for
+// the CONTEXT budget. RESERVED_RESPONSE_TOKENS is deliberately generous (not a tight
+// squeeze) so the forced summary turn itself has real room to write a coherent answer,
+// not just barely avoid one more failure.
+const RESERVED_RESPONSE_TOKENS = 2000;
+
+// Same rough chars-per-token estimate local-client.js's own estimateTokens() uses --
+// duplicated rather than imported since it's a one-line arithmetic heuristic, not worth
+// the shared-module treatment given to normalizeTokens/distinctivePhrases.
+function estimateMessagesTokens(messages) {
+  let chars = 0;
+  for (const m of messages) {
+    chars += JSON.stringify(m.content || '').length;
+    if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
 // Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
 // no multi-turn loop. local-client.js's own call() doesn't self-lock, so it's wrapped
 // externally here, the same discipline local-draft.js's maybeLocked() applies for its
@@ -893,12 +920,15 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // model already learned. Shared by the two forceSummaryOnCap paths below (cap hit while
   // still calling tools; stopped early with no RESOLUTION line). See the header on the
   // forceSummaryOnCap param and the call sites for why each path needs it.
-  const runForcedSummaryTurn = async () => {
+  const runForcedSummaryTurn = async (reason = 'turns') => {
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
+    const leadIn = reason === 'context'
+      ? 'This conversation has grown too large to safely continue -- you are nearly out of context room and can no longer call tools.'
+      : 'You are out of turns and can no longer call tools.';
     messages.push({
       role: 'user',
-      content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
+      content: `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`,
     });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
@@ -909,7 +939,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
     return withUsage({
       response: summaryContent || (lastMessage && lastMessage.content) || '',
-      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
+      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true, forcedSummaryReason: reason,
     });
   };
 
@@ -943,7 +973,19 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const NARRATION_NUDGE_MESSAGE = 'You just described taking an action ("let me check/look at/read/..." or similar) without actually calling the corresponding tool in this same turn. Either make the real tool call right now, or -- if you already have everything you need -- give your complete final answer now with no further hedging. Do not describe an action again without also calling it.';
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Context-budget exhaustion (see RESERVED_RESPONSE_TOKENS comment above): a normal
+    // turn attempted this close to PINNED_NUM_CTX is guaranteed to get clipped by Ollama's
+    // done_reason:"length" before the model can finish a coherent action -- checked BEFORE
+    // turnsUsed/the edit-nudge blocks below advance this turn, so turnsUsed reflects only
+    // turns actually attempted (this one is skipped entirely, not counted, then the forced
+    // summary turn itself adds exactly one). Unconditional (not gated behind
+    // forceSummaryOnCap) since this is a structural safety net every caller needs, not an
+    // opt-in behavioral nudge.
+    if (estimateMessagesTokens(messages) + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX) {
+      return runForcedSummaryTurn('context');
+    }
     turnsUsed = turn + 1;
+
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
 
