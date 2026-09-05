@@ -2090,16 +2090,28 @@ async function renderQueueTab(state) {
       return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">${label}</span><br>`;
     })() : '';
     const keepBtn = sf ? `<button type="button" class="secondary task-staleness-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays and is not re-flagged for a while">Keep</button>` : '';
+    // Stale-grounding flag (context-trim-sweep.js): the task's file-content anchoring went
+    // stale and re-anchoring against current content never resolved it. Same chip + Keep
+    // pattern as stalenessFlag above -- both can show simultaneously, though the sweep
+    // itself skips a task carrying a fresh stalenessFlag:{disposition:'retire'}.
+    const ctf = t.contextTrimFlag;
+    const trimChip = ctf ? (() => {
+      const tip = escapeAttr(((ctf.evidence || []).join(' • ')).slice(0, 400) + `  [${ctf.confidence}]`);
+      const col = ctf.confidence === 'strong' ? 'var(--bad)' : 'var(--warn)';
+      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">🔍 stale grounding — needs re-anchoring</span><br>`;
+    })() : '';
+    const trimKeepBtn = ctf ? `<button type="button" class="secondary task-context-trim-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays as-is and won't be re-anchored for a while">Keep grounding as-is</button>` : '';
     return `
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       <td>${t.id}</td>
       <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
-      <td>${staleChip}${detailCell}</td>
+      <td>${staleChip}${trimChip}${detailCell}</td>
       ${showArchiveRequeue ? `<td>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
         ${keepBtn}
+        ${trimKeepBtn}
       </td>` : ''}
       ${showArchiveOnly ? `<td>
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
@@ -2161,6 +2173,13 @@ async function renderQueueTab(state) {
       e.stopPropagation();
       postTaskAction(state, btn.dataset.id, 'staleness-keep',
         `Dismiss the staleness flag on '${btn.dataset.id}'? The task stays where it is and won't be re-flagged for a while.`);
+    };
+  });
+  main.querySelectorAll('.task-context-trim-keep-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      postTaskAction(state, btn.dataset.id, 'context-trim-keep',
+        `Dismiss the stale-grounding flag on '${btn.dataset.id}'? The task stays as-is and won't be re-anchored for a while.`);
     };
   });
   main.querySelectorAll('.task-confirm-delete-btn').forEach((btn) => {

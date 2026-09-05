@@ -1112,6 +1112,9 @@ def task_summary(data: dict, filename: str) -> dict:
         # adhoc-staleness-flag.js / staleness-auto-archive.js -- the row shows a chip +
         # Archive/Keep buttons so a human can retire a dead adhoc task without opening it.
         "stalenessFlag": data.get("stalenessFlag"),
+        # Same shape/purpose as stalenessFlag above but for context-trim-sweep.js: the
+        # task's file-content anchoring went stale and re-anchoring never resolved it.
+        "contextTrimFlag": data.get("contextTrimFlag"),
         # Coordinator (decomposed parent) checklist -- a small [{id,title,status}] list plus
         # a {done,total} rollup, stamped by coordinator-sweep.js. The Coordinating list row
         # shows the "N of M" from `progress` without a per-row round-trip.
@@ -2229,6 +2232,37 @@ def api_task_staleness_keep(state, task_id):
     data.setdefault("history", []).append({
         "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
         "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}",
+    })
+    src.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
+
+
+@app.route("/api/task/<state>/<task_id>/context-trim-keep", methods=["POST"])
+def api_task_context_trim_keep(state, task_id):
+    """Dismiss a contextTrimFlag (context-trim-sweep.js): the human looked and decided the
+    task's grounding is fine as-is, or that re-anchoring genuinely can't help. Clears the
+    flag and writes a `contextTrimKeep` cooldown so the sweep does not re-flag it for
+    AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS (default 21). The task stays exactly
+    where it is -- this only affects the flag, same as staleness-keep above."""
+    if state != "blocked":
+        abort(400, description="context-trim flags only exist on blocked tasks")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    src = qdir / state / f"{task_id}.json"
+    if not src.is_file():
+        abort(404)
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        abort(500, description="could not read the task file")
+    data.pop("contextTrimFlag", None)
+    cooldown_days = int(os.environ.get("AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS") or 21)
+    until = datetime.now(timezone.utc) + timedelta(days=cooldown_days)
+    data["contextTrimKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"context-trim flag dismissed by a human -- keep until {until.date().isoformat()}",
     })
     src.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
