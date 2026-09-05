@@ -3086,3 +3086,157 @@ Extract the block from the version-comparison check through the pipeline-restart
 
 Benefits:
 The endpoint handler drops to roughly 70–75 lines of straightforward request plumbing, making the HTTP contract immediately visible. The extracted helper is a pure function of its inputs (plus the filesystem/subprocess side-effects it owns), so it can be unit-tested with a mocked `subprocess.run` and a temporary directory tree without any Flask test-client machinery. Adding a new package-manager source type becomes a local change inside one well-named function rather than another branch bolted onto an already-long handler, and code review of that change is scoped to the helper's signature and body instead of requiring the reviewer to track state across 100+ lines of mixed concerns.
+
+### AC-34 · Decompose the ad-hoc harness pipeline into named stages
+Strength: Strong
+Files: src/adhoc-harness-draft.js
+Snippet:
+```
+ *     block the task outright.
+ */
+async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
+  if (requiresCommandExecution(task)) {
+    return { applied: false, succeeded: true, reason: 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access' };
+  }
+
+  const { repoRoot, pipelineDir } = getConfig();
+  // Deliberately NOT model-provider.js's providerFor(task).call -- adhoc is registered
+  // high-tier, so providerFor(task) resolves to Claude by default (unless
+  // AGENT_MANAGER_FORCE_PROVIDER=local happens to be set), the exact opposite of what a
+  // "try the local model first" tier needs. This tier is the local model, unconditionally
+  // -- local-client.js's own call(), same backend runPlanWithTools() (local-tool-client.js)
+  // always uses for local-agentic-draft.js's own tier, regardless of any tier/override
+  // routing that exists for other purposes entirely.
+  const resolvedLocalCall = localCall || require('./local-client.js').call;
+
+  let planResult;
+  try {
+    planResult = await resolvedLocalCall({ prompt: adhocHarnessSearchPlanPrompt(task), think: true, temperature: 0.4, numPredict: 800, source: task.source });
+  } catch (e) {
+    return { applied: false, succeeded: true, reason: `plan call failed: ${e.message}` };
+  }
+  if (!planResult || planResult.degenerate) {
+    return { applied: false, succeeded: true, reason: 'plan pass degenerate or empty' };
+  }
+
+  const queries = extractQueries(planResult.response);
+  let hits = [];
+  let files = [];
+  if (queries.length > 0) {
+    try {
+      // Cross-repo (2026-09-04): also search each loaded plugin's own repo
+      // (accessible-roots.js) -- root-caused via this exact tier failing to ground a stuck
+      // adhoc task ("function_length_fix recursively splits") whose real fix site lived
+      // entirely in agent-manager-hygiene. Collapses to [repoRoot] with zero plugins
+      // loaded, byte-identical to the pre-2026-09-04 single-repo call.
+      const roots = resolveAccessibleRoots({ repoRoot });
+      const result = archImportFetch(queries, { roots });
+      hits = result.hits || [];
+      files = result.files || [];
+    } catch (e) {
+      // Non-fatal -- same try/catch treatment pipeline_self_audit's own harness-search
+      // branch gives (local-draft.js): implement proceeds with no hits, its own prompt
+      // already handles that as "insufficient grounding."
+    }
+  }
+
+  // No real matches at all -- this tier genuinely cannot confidently ground anything.
+  // Deliberately does NOT call the implement model at all in this case (unlike
+  // pipeline_self_audit/arch_import, which still ask their implement pass to look at an
+  // empty-hits result and decide) -- an adhoc task's wording is far less constrained than
+  // a pre-vetted cluster/candidate, so zero hits is a strong enough signal on its own to
+  // skip straight to the next tier rather than spend a real implement call likely to
+  // either hallucinate or (best case) just say the same "nothing found" thing itself.
+  if (hits.length === 0) {
+    return { applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo or any loaded plugin repo' };
+  }
+
+  task.promptContext = task.promptContext || {};
+  task.promptContext.harnessHits = hits;
+  task.promptContext.harnessFiles = files;
+
+  let implResult;
+  try {
+    implResult = await resolvedLocalCall({
+      prompt: adhocHarnessSearchImplementPrompt(task, planResult.response),
+      think: false,
+      temperature: 0.3,
+      numPredict: 2800,
+      allowEmpty: true,
+      source: task.source,
+    });
+  } catch (e) {
+    return { applied: false, succeeded: true, reason: `implement call failed: ${e.message}` };
+  }
+  if (!implResult || implResult.degenerate) {
+    return { applied: false, succeeded: true, reason: 'implement pass degenerate' };
+  }
+
+  const responseText = (implResult.response || '').trim();
+
+  // 2026-08-24, Grimmethy: caught live via a real adhoc task ("show a count of
+  // observability/architecture tasks in the UI") that exhausted both automatic reject-
+  // retries on this exact path, twice, review correctly rejecting it both times for
+  // "does not specify any changes... contradicts the task's request" -- because this
+  // branch was stamping an empty response as a CONFIDENT, TERMINAL no-changes-needed
+  // verdict, directly contradicting what adhocHarnessSearchImplementPrompt's own text
+  // promises the model (prompts.js: "output the empty string... a deeper investigation
+  // pass will take over next" -- NOT "this ends here"). An empty response here means "I
+  // could not confidently ground a change from these hits," the exact same signal as the
+  // zero-hits case just above -- not a reasoned decision that nothing needs to change.
+  // adhoc-agentic-draft.js's real no-changes-needed mechanism (a full explained response
+  // plus an explicit `RESOLUTION: no-changes-needed` marker) is what a genuine, grounded
+  // "nothing to do here" verdict actually looks like in this codebase; a bare empty
+  // string was never that, and treating it as if it were skipped the Claude tier this
+  // exact case exists for, wasting the task's limited automatic-retry budget on a tier
+  // that had already told the model it wasn't confident enough to answer.
+  if (isEffectivelyEmptyResponse(responseText)) {
+    return { applied: false, succeeded: true, reason: 'implement pass found insufficient grounding to confidently draft a change (empty response, per its own prompt\'s contract)' };
+  }
+
+  // A "let me read/check/..." hedge (NON_IMPL_PATTERNS) means the model itself is
+  // signaling it needs more than a few grep queries can ground -- exactly the
+  // "genuinely needs multi-file investigation" case the next tier exists for.
+  if (NON_IMPL_PATTERNS.some((pat) => pat.test(responseText))) {
+    return { applied: false, succeeded: true, reason: 'implement pass signaled it needs deeper investigation than harness-search can ground' };
+  }
+
+  let rawDiff;
+  try {
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: responseText, worktreeSuffix: `harness-${task.id}`,
+    });
+  } catch (e) {
+    // Invalid/inapplicable Group-B JSON -- not confident enough to use; fall through.
+    return { applied: false, succeeded: true, reason: `harness-search draft did not apply cleanly: ${e.message}` };
+  }
+
+  if (!rawDiff) {
+    return { applied: false, succeeded: true, reason: 'harness-search draft produced no net change' };
+  }
+
+  // The diff applies cleanly and is non-empty -- but is it actually the change asked for,
+  // or a token gesture (an ADR instead of the code, an unrequested delete, a forbidden
+  // file)? This cheap tier should not stamp that as `implemented`; decline so the agentic
+  // tiers, which can investigate, take over. See adhoc-diff-sanity.js.
+  const substance = adhocDiffSubstanceProblem(task, rawDiff, responseText);
+  if (substance) {
+    return { applied: false, succeeded: true, reason: `harness-search draft is not a real implementation -- ${substance.reason}` };
+  }
+
+  task.adhocResolution = 'implemented';
+  task.rawDiff = rawDiff;
+  task.implementResponse = `Harness-search tier (local model, grounded in ${hits.length} real match(es)).\n\n=== DIFF ===\n${rawDiff}`;
+  task.draftModel = localDraftModelLabel();
+  return { applied: true, succeeded: true };
+}
+```
+
+Problem:
+The 136-line function in this file is a single forward pipeline that interleaves at least three distinct responsibilities—input validation and early-exit guards, the core transformation/orchestration logic, and result assembly plus side-effectful reporting—into one flat block. Because every stage lives in the same scope, a reader must hold the entire 136-line context to understand what any given line does, and a developer who wants to unit-test just the transformation step must either execute the whole pipeline (triggering the validation and reporting side effects) or duplicate the logic. The early-exit guards further obscure the "happy path" because they are interleaved with the main work rather than isolated, making it harder to reason about invariants at each stage.
+
+Solution:
+Extract three clearly-named helpers from the existing body, keeping the outer function as a thin orchestrator that calls them in sequence and returns early on the first guard failure. First, pull the validation and early-exit checks into a `validateHarnessInput` (or similarly named) function that returns either a normalized context object or throws/returns a sentinel. Second, isolate the core transformation/orchestration into a `runHarnessPipeline` function that takes the validated context and produces the intermediate result. Third, extract the result-assembly, formatting, and any logging/reporting side effects into a `finalizeHarnessResult` function. The outer function then becomes roughly 15–25 lines: call validate, call pipeline, call finalize, return. Each extracted helper is independently testable and its contract is visible from its name and signature rather than from reading 136 lines of interleaved logic.
+
+Benefits:
+Once decomposed, each stage can be unit-tested in isolation—validation edge cases, pipeline transformation logic, and output formatting—without exercising the other two stages or their side effects. Code review becomes tractable because a reviewer can evaluate the correctness of each 30–50-line helper independently rather than tracking state across 136 lines. The outer orchestrator's short length makes the overall flow immediately scannable, and future changes to one stage (e.g., adding a new validation rule or swapping the reporting mechanism) are localized to a single function, reducing the risk of accidental cross-stage coupling.
