@@ -275,7 +275,7 @@ def _stream_local(session: dict, message: str):
     result = None
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
-        primary_root=roots[0], extra_roots=roots[1:],
+        primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
     ):
         if event.get("type") == "chunk":
             yield event["text"]
@@ -283,17 +283,19 @@ def _stream_local(session: dict, message: str):
             result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
-    # 2026-08-26, same incident as CHAT_LOCAL_MAX_TURNS above: local-tool-client.js's own
-    # loop only ever returns a real synthesized answer when a turn comes back with NO tool
-    # calls -- hitting the turn cap while the model still wanted to keep investigating
-    # means the streamed text was whatever rode along with its LAST tool call ("I'll
-    # check X next"), not a considered answer, and there was previously no signal anywhere
-    # (including this session's own JSON) that this happened. turnsUsed >= max_turns is
-    # the same heuristic local-tool-client.js's own maxTurns-reached branch uses to detect
-    # this case; the one false-positive edge (a real final answer that happens to land
-    # with no tool calls on exactly the last allowed turn) errs toward over-labeling
-    # rather than silently presenting a cut-off status update as a finished answer.
-    if result and result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
+    # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so both a
+    # turn-cap hit AND a context-budget hit (see local-tool-client.js's own
+    # RESERVED_RESPONSE_TOKENS/estimateMessagesTokens check) now force one extra no-tools
+    # turn that produces a real considered answer with a RESOLUTION: line, rather than
+    # returning whatever rode along with the run's last tool call. `forcedSummary` /
+    # `forcedSummaryReason` are the real signal for that now -- prefer them over the old
+    # turnsUsed >= max_turns heuristic below (kept only as a fallback for the
+    # exceedingly rare case where forcedSummary itself never got set, e.g. the tools-
+    # disabled kill-switch path).
+    if result and result.get("forcedSummary"):
+        budget = "context room" if result.get("forcedSummaryReason") == "context" else f"its {CHAT_LOCAL_MAX_TURNS}-turn tool budget"
+        yield f"\n\n*(Ran out of {budget} mid-investigation, so it gave its best final answer using what it had already learned.)*"
+    elif result and result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
         yield (
             f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation -- "
             "the above may be a status update rather than a finished answer. Ask again, or "
