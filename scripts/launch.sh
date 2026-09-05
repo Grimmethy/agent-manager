@@ -154,8 +154,27 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
           LOCAL_MODEL="${AGENT_MANAGER_P40_MODEL}" \
           AGENT_MANAGER_GPU_YIELD_APPS= \
       bash "${SCRIPT_DIR}/local-worker.sh" worker-p40
+
+    # Second reasoning lane on the P40 (2026-09-05, Grimmethy: "we are still only doing
+    # one reasoning job at a time despite being fully capable of running 2
+    # simultaneously"). local-worker.sh's IS_REASONING_LANE match is a plain
+    # `worker-reasoning*` prefix (see its own comment) -- any instance named that way is
+    # a reasoning lane, so this is the same worker-p40 block above with a
+    # reasoning-shaped instance id, nothing else new to build. Before this, reasoning-
+    # tier work (adhoc/research_task/high-tier retries) could ONLY be claimed by the
+    # host's single worker-reasoning instance -- it queued up behind whatever that one
+    # lane was doing even while the P40 sat idle. Shares worker-p40's own OLLAMA_URL/
+    # LOCAL_MODEL (same physical GPU, same Ollama process) -- the two P40 lanes still
+    # serialise on that GPU's single-flight lock same as worker-1/worker-reasoning
+    # already do on the host's, but reasoning-tier work is no longer bottlenecked
+    # behind the host's GPU alone.
+    start_bg "worker-reasoning-p40" "${PID_DIR}/worker-reasoning-p40.pid" "${LOG_DIR}/worker-reasoning-p40.log" \
+      env OLLAMA_URL="${AGENT_MANAGER_P40_OLLAMA_URL}" \
+          LOCAL_MODEL="${AGENT_MANAGER_P40_MODEL}" \
+          AGENT_MANAGER_GPU_YIELD_APPS= \
+      bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning-p40
   else
-    printf '[launch] AGENT_MANAGER_P40_OLLAMA_URL/AGENT_MANAGER_P40_MODEL not both set -- skipping worker-p40 lane.\n'
+    printf '[launch] AGENT_MANAGER_P40_OLLAMA_URL/AGENT_MANAGER_P40_MODEL not both set -- skipping worker-p40/worker-reasoning-p40 lanes.\n'
   fi
 
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
