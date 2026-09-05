@@ -607,9 +607,19 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   // Ollama already tells us exactly this on the closing frame; surface it inline, right
   // where it happened, as a visible marker in the streamed text -- only in streaming mode
   // (onChunk present), since Chat is this call path's only streaming caller today.
+  //
+  // 2026-09-05 follow-up, Grimmethy: "I'd like the model's generation/context limit to be
+  // displayed when the chat hits it" -- confirmed live (this exact marker fired on a real
+  // turn) that the bare notice didn't say WHAT the limit actually was. Neither call above
+  // sets num_predict, so a "length" cutoff here can only be the context window itself,
+  // not a separate per-response generation cap -- PINNED_NUM_CTX is that number with
+  // certainty, not a guess. usage (prompt_eval_count/eval_count) comes from this same
+  // turn's own closing frame, captured just above.
   if (doneReason === 'length') {
-    onChunk('\n\n_[done_reason: "length" -- this turn was cut short by the model\'s '
-      + 'generation/context limit, not a real stopping point]_\n\n');
+    const total = (usage.prompt_eval_count || 0) + (usage.eval_count || 0);
+    onChunk(`\n\n_[done_reason: "length" -- hit the model's ${PINNED_NUM_CTX}-token context `
+      + `limit (~${usage.prompt_eval_count || 0} prompt + ${usage.eval_count || 0} generated `
+      + `≈ ${total} tokens this turn), cut short mid-response, not a real stopping point]_\n\n`);
   }
   return { message: { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined }, usage, doneReason };
 }
