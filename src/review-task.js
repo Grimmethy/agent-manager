@@ -643,7 +643,7 @@ async function main() {
   // the whole vote completes -- and so a reviewer killed mid-vote leaves a trace. The
   // authoritative writeTaskJson below still runs on completion; these are additive.
   setHistoryPersistHook(() => {
-    try { writeTaskJson(taskPath, task); } catch (_) { /* best-effort */ }
+    try { writeTaskJson(taskPath, task); } catch (err) { process.stderr.write(`[review-task] history-persist hook: writeTaskJson failed for ${taskPath}: ${err.message}\n`); }
   });
 
   const { repoRoot, pipelineDir, secondBrainDir, domainsPath, deepDiveCoveragePath } = getConfig();
