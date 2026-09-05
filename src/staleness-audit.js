@@ -325,23 +325,14 @@ function invalidPremiseSignal(repoRoot, task) {
 }
 
 // --- duplicate detection -----------------------------------------------------------
-const DUP_STOPWORDS = new Set(('a an the and or of to in for on with is are be it this that '
-  + 'add fix agent manager we i need should must task').split(' '));
+// normalizeTokens/jaccardSimilarity extracted to text-similarity.js (2026-09-05) so
+// side-finding-sweep.js's own duplicate-finding check can reuse the identical primitives
+// instead of a third near-duplicate copy.
+const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS } = require('./text-similarity.js');
 
 function normalizeTaskTokens(task) {
   const ctx = task.promptContext || {};
-  const text = `${task.title || ''} ${(ctx.rawText || '').slice(0, 600)}`.toLowerCase();
-  return new Set(
-    text.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
-      .filter((w) => w.length > 2 && !DUP_STOPWORDS.has(w)),
-  );
-}
-
-function jaccard(a, b) {
-  if (a.size === 0 || b.size === 0) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter += 1;
-  return inter / (a.size + b.size - inter);
+  return normalizeTokens(`${task.title || ''} ${(ctx.rawText || '').slice(0, 600)}`);
 }
 
 function dupSimilarityThreshold() {
