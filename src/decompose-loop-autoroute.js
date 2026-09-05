@@ -54,14 +54,28 @@ function oversizedFiles(pipelineDir) {
   return out;
 }
 
+// A sentence that's a verification/compile/test-run instruction, not a description of what
+// to change -- excluded from matching below so an oversized file named only incidentally
+// (e.g. "Run: python3 -m py_compile app.py test_x.py") doesn't get treated as the task's
+// real target. Root-caused live (2026-09-04) via a task to CREATE a new test file whose
+// last sentence was exactly this shape, naming an unrelated flagged-oversized app.py as a
+// compile-check argument -- targetOversizedFile returned it as "the target," and autoroute
+// auto-authored a real (if ultimately no-op) split plan for a file the task never asked to
+// touch.
+const VERIFICATION_SENTENCE_RE = /\b(?:py_compile|python3?\s+-m\s+\w+|pytest|unittest|npm (?:test|run|install)|node --test)\b|^\s*Run:/i;
+
 // The oversized file this task is about, or null. Matches the longest flagged path that
 // appears verbatim in the task's request text / title (longest so a/b/app.py wins over
-// app.py if both were flagged).
+// app.py if both were flagged), skipping any sentence that looks like a verification
+// command rather than a description of the change.
 function targetOversizedFile(task, oversized) {
   const hay = `${task.title || ''}\n${(task.promptContext && task.promptContext.rawText) || ''}`;
+  const searchable = hay.split(/(?<=[.!?:])\s+|\n+/)
+    .filter((s) => !VERIFICATION_SENTENCE_RE.test(s))
+    .join('\n');
   let best = null;
   for (const f of oversized) {
-    if (hay.includes(f) && (!best || f.length > best.length)) best = f;
+    if (searchable.includes(f) && (!best || f.length > best.length)) best = f;
   }
   return best;
 }
