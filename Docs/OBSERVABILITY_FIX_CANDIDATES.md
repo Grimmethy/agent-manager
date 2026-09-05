@@ -3099,3 +3099,26 @@ Replace the bare `catch { grounding = null; }` on line 893 with a `catch (err)` 
 
 Benefits:
 An operator can now `grep` logs for `[local-draft] plan grounding failed` and immediately see that the grounding enrichment is degraded, along with the specific error message (e.g., "Cannot read properties of undefined (reading 'path')"), turning a silent feature-outage into a one-line diagnostic. Because the tag is stable and the message is the raw `err.message`, the signal is sufficient to correlate with a recent refactor or environment change without needing a metrics dashboard. The fix adds zero runtime cost on the happy path and zero behavioral change on the failure path beyond the single log emission.
+
+### AC-170 · Swallowed premiseCheck exception is invisible to operators
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+      let premise;
+      try {
+        premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
+      } catch (e) {
+        premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
+      }
+      if (premise && premise.verdict === 'invalid-premise') {
+```
+
+Problem:
+In the `catch (e)` block at line 1258, the error thrown by `entry.premiseCheck` is captured into `e` and then immediately discarded: `premise` is set to `null` and execution falls through the `if (premise && …)` guard, so the split proceeds as though no check ever existed. The variable `e` is never logged, rethrown, or recorded in any history event. The comment ("a throwing premiseCheck must never block a real split") documents the *intent* to be non-blocking, but provides zero observability: if a source's `premiseCheck` implementation has a bug, hits a network timeout, or throws on a malformed task shape, the only trace is the absence of a `blocked` history event that an operator would have to notice by its missing presence. There is no `console.error`, no `appendHistoryEvent`, no field on the returned result—just a silent `null`.
+
+Solution:
+Inside the existing `catch (e)` block, before assigning `premise = null`, emit a single `console.error` call that includes the task identifier (`task.id` or `task.name`), the source's registered name if available on `entry`, and the full error (`e`), e.g. `console.error(\`[premiseCheck] task=${task.id ?? task.name ?? 'unknown'}: premiseCheck threw, proceeding without check: ${e?.message ?? e}\`, e?.stack ? { stack: e.stack } : undefined);`. Keep the `premise = null` assignment and the non-blocking semantics exactly as they are—this adds observability without changing control flow. No new dependency, no metrics primitive, no rethrow.
+
+Benefits:
+Operators can now see in stdout/stderr logs (the project's existing logging channel) exactly which task, which source, and which exception caused a `premiseCheck` to be skipped, turning a silent no-op into a diagnosable event. This is especially important because the comment itself references a real incident (AC-8 splitting into three children before its false premise was caught); a broken `premiseCheck` that silently no-ops would reproduce that class of failure with no trace. The fix is a one-line addition inside an existing `catch` block, changes no return shape, and introduces no new dependency.
