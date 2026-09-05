@@ -1468,7 +1468,7 @@ test('windowFetchedFileContent centers the window on a backtick-quoted symbol fr
   const content = `${padding}\nfunction theRealTarget() { return 1; }\n${padding}`;
   const section = 'Problem:\nThe `theRealTarget` function has a bug.\n\nSolution:\nFix it.';
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /theRealTarget/, 'the quoted symbol must actually be present, not truncated away');
   assert.match(windowed, /\[truncated\]/);
@@ -1481,10 +1481,11 @@ test('windowFetchedFileContent falls back to flat truncation from the start when
   const content = `start-marker\n${'x'.repeat(9000)}`;
   const section = 'Problem:\nSomething about `aSymbolThatIsNotInTheFile`.\n\nSolution:\nFix it.';
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
-  assert.match(windowed, /^start-marker/);
+  assert.match(windowed, /start-marker/);
   assert.match(windowed, /\[truncated\]$/);
+  assert.match(windowed, /LOW-CONFIDENCE GROUNDING/, 'zero anchors at all must be surfaced as low confidence to the model');
 });
 
 // 2026-08-27, root-caused live via observability-fix-ac-26: its quoted code snippet
@@ -1501,7 +1502,7 @@ test('windowFetchedFileContent falls back to a cited line number when no quoted 
   const targetLine = content.split('\n').findIndex((l) => l.includes('theRealTarget')) + 1;
   const section = `Problem:\nThe function at line ${targetLine} has a bug (quotes a paraphrase, not a real match: \`somethingElseEntirely()\`).\n\nSolution:\nFix it.`;
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /theRealTarget/, 'the cited line must actually be present, not truncated away');
 });
@@ -1515,7 +1516,7 @@ test('windowFetchedFileContent prefers a matching quoted symbol over a cited lin
   const wrongLine = content.split('\n').findIndex((l) => l.includes('wrongLineTarget')) + 1;
   const section = `Problem:\nSee \`function realQuotedTarget() {}\` (also mentioned near line ${wrongLine}).`;
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /realQuotedTarget/, 'a real quoted-symbol match must win over a line citation');
 });
@@ -1527,10 +1528,11 @@ test('windowFetchedFileContent ignores a line citation that is out of range for 
   const content = `start-marker\n${'x'.repeat(9000)}`;
   const section = 'Problem:\nSomething at line 999999 (`aSymbolThatIsNotInTheFile`).';
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
-  assert.match(windowed, /^start-marker/);
+  assert.match(windowed, /start-marker/);
   assert.match(windowed, /\[truncated\]$/);
+  assert.match(windowed, /LOW-CONFIDENCE GROUNDING/, 'zero anchors at all must be surfaced as low confidence to the model');
 });
 
 // Snippet: field ------------------------------------------------------------------------
@@ -1555,7 +1557,7 @@ test('windowFetchedFileContent uses a Snippet: field as the primary anchor when 
     'Problem:\nSomething paraphrased and unhelpful, quoting `wrongSymbolEntirely`.',
   ].join('\n');
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /realTarget/, 'the snippet must locate the real target even though the prose quote is wrong');
 });
@@ -1576,7 +1578,7 @@ test('windowFetchedFileContent matches a Snippet: field even when real code has 
     'Problem:\nSomething.',
   ].join('\n');
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /realTarget/, 'whitespace-only reformatting must not defeat the match');
 });
@@ -1597,7 +1599,7 @@ test('windowFetchedFileContent falls through to the quoted-symbol anchor when th
     'Problem:\nSee `realTarget` for the bug.',
   ].join('\n');
 
-  const windowed = windowFetchedFileContent(content, section, 2000);
+  const windowed = windowFetchedFileContent(content, section, 2000).text;
 
   assert.match(windowed, /realTarget/, 'a non-matching snippet must not block the weaker fallback anchors from still working');
 });
@@ -1607,7 +1609,7 @@ test('windowFetchedFileContent returns content unchanged when it is already unde
   const { windowFetchedFileContent } = freshTaskSources(dir);
 
   const content = 'small content, well under the cap';
-  assert.equal(windowFetchedFileContent(content, 'Problem:\n`whatever`', 2000), content);
+  assert.equal(windowFetchedFileContent(content, 'Problem:\n`whatever`', 2000).text, content);
 });
 
 // Multi-region, 2026-09-02: a candidate that names a helper to ADD and a call site to
@@ -1622,7 +1624,7 @@ test('windowFetchedFileContent windows every distinct symbol a multi-part candid
   const content = `${pad}\nfunction wireSiteHere() { /* call site */ }\n${pad}\nconst helperInsertPoint = 1;\n${pad}`;
   const section = 'Problem:\nThe `helperInsertPoint` area needs a new helper.\n\nSolution:\nAdd it, then call it from `wireSiteHere`.';
 
-  const windowed = windowFetchedFileContent(content, section, 4000);
+  const windowed = windowFetchedFileContent(content, section, 4000).text;
 
   assert.match(windowed, /helperInsertPoint/, 'the insertion-point anchor must be in the window');
   assert.match(windowed, /wireSiteHere/, 'the call-site anchor must ALSO be in the window');
@@ -1637,7 +1639,7 @@ test('windowFetchedFileContent windows all occurrences of a repeated helper name
   const content = `function makeThing() {}\n${pad}\nconst a = makeThing();\n${pad}\nreturn makeThing;\n${pad}`;
   const section = 'Solution:\nChange what `makeThing` returns everywhere it is used.';
 
-  const windowed = windowFetchedFileContent(content, section, 3000);
+  const windowed = windowFetchedFileContent(content, section, 3000).text;
   // all three occurrences land in their own (merged) regions
   assert.equal((windowed.match(/makeThing/g) || []).length >= 3, true);
 });

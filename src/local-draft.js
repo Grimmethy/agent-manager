@@ -174,7 +174,8 @@ function refreshCandidateFetchedFiles(task) {
     try {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
-      return { ...f, content: windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section) };
+      const windowed = windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section);
+      return { ...f, content: windowed.text, anchorConfidence: windowed.confidence };
     } catch (err) {
       console.warn('[local-draft] file enrich failed:', f.path, err.message);
       return f;
@@ -1678,7 +1679,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource };
 
 if (require.main === module) {
   main();
