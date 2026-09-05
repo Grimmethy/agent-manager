@@ -315,6 +315,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
       // header note: 59 of the last 62 real review attempts failed this way, each
       // discarding whatever votes DID land because the first failure killed the whole
       // majorityVote() call outright.
+      console.warn(`[local-client] majorityVote: vote ${i + 1}/${n} hard-failed: ${e.message}`);
       voteErrors.push(e.message);
       continue;
     }
