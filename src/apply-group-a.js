@@ -886,4 +886,5 @@ module.exports = {
   parsePathPrefetchResolveResult,
   closeBrainDumpEntryResolved,
   applyResearchTask,
+  loadBrainDump,
 };
