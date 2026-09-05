@@ -2101,3 +2101,52 @@ test('refreshCandidateFetchedFiles is a no-op when there are no fetchedFiles / n
   refreshCandidateFetchedFiles(t2);
   assert.equal(t2.promptContext.fetchedFiles[0].content, 'x', 'a path outside repoRoot is left untouched');
 });
+
+// --- side-finding capture: strictOutputOnly opt-out (2026-09-05) --------------------
+
+test('a source registered strictOutputOnly:true (e.g. brain_dump_sort) gets allowSideFindings:false on every real call', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { getRegisteredSource } = require('./task-source-registry.js');
+    assert.equal(getRegisteredSource('brain_dump_sort').strictOutputOnly, true, 'sanity check on the real registration this test depends on');
+
+    const task = { id: 'strict-test-1', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'a note to classify', tags: [] } };
+    const capturedOpts = [];
+    let callCount = 0;
+    const localCall = async (opts) => {
+      capturedOpts.push(opts);
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.ok(capturedOpts.length >= 2, 'plan + implement at least');
+    for (const opts of capturedOpts) {
+      assert.equal(opts.allowSideFindings, false);
+    }
+  });
+});
+
+test('a normal source (no strictOutputOnly) does not get allowSideFindings forced at all -- side-finding.js keeps its own true default', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-nonstrict-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/apply-task.js'], fetchedFiles: [{ path: 'src/apply-task.js', content: 'function f() {}\n' }], body: 'Files: src/apply-task.js' },
+    };
+    const capturedOpts = [];
+    let n = 0;
+    const localCall = async (opts) => {
+      capturedOpts.push(opts);
+      n++;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'RESOLUTION: implemented\ndid it', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.ok(capturedOpts.length >= 1);
+    for (const opts of capturedOpts) {
+      assert.equal('allowSideFindings' in opts, false, 'left unset -- the callee (local-client.js/runPlanWithTools) applies its own default of true');
+    }
+  });
+});
