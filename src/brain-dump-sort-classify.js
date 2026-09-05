@@ -139,6 +139,25 @@ function validateSecondBrainPath(relPath, secondBrainDir, trackedProjectLabels =
   return null;
 }
 
+// Does `checkText` show a real, concrete connection to `selfLabel` -- a change verb PLUS a
+// subject that's actually about this pipeline? Shared by two call sites in
+// deriveBelongsToProject below: the self-project RECOVERY path (classifier left the label
+// null/bogus, checked against rawText+rationale, unchanged from before this function was
+// extracted) and the self-project ASSERTION guard (classifier explicitly claimed the
+// self-label -- checked against rawText ALONE, never the classifier's own rationale, which
+// is exactly what a hallucinated claim fabricates to justify itself. Root-caused live
+// 2026-09-05: 3 confirmed incidents -- a note about Instagram sticker art, one about
+// sand-battery insulation, one titled "Climate finance solutions" -- each got
+// `belongsToProject: "agent-manager"` from the classifier with a fabricated rationale
+// ("...a feature related to handling drafts...", "...the start_research_on_thermal_batteries
+// feature...") inventing a connection that doesn't exist in the note itself).
+function hasSelfProjectSignal(checkText, selfLabel) {
+  const hasChangeVerb = /\b(add|fix|should|shouldn't|need|needs|make|change|changing|refactor|implement|support|remove|rename|persist|track|wire|handle|prevent|ensure|allow|expose|surface|store|stop|drop|split|guard|race|reset|expand)\b/i.test(checkText);
+  const selfSubject = (selfLabel && checkText.toLowerCase().includes(selfLabel.toLowerCase()))
+    || /\b(pipeline|dashboard|brain[- ]?dump|second[- ]?brain|worker|queue|review|apply|task[- ]?source|draft(?:ing)?|adhoc|prompt|classifier|coordinat|watchdog|reject-retry)\b/i.test(checkText);
+  return hasChangeVerb && selfSubject;
+}
+
 // Recovers `belongsToProject` when the classifier left it null (or set a label that isn't
 // tracked) for a note that is plainly a concrete change to this pipeline's own codebase --
 // the dominant failure of the blocked backlog. Returns { belongsToProject, actionable }
@@ -160,8 +179,16 @@ function deriveBelongsToProject(parsed, promptContext = {}) {
     || (/\bplugin\b/i.test(text) && /\b(new|standalone|separate|build a|create a|spin ?up|its own)\b/i.test(text));
   if (isNoteNotTask) return { belongsToProject: null, actionable: false };
 
-  // Already a real tracked label -- trust it.
+  // Already a real tracked label -- trust it, EXCEPT when it's the pipeline's OWN self-label
+  // and the note's own rawText shows no real connection to it (see hasSelfProjectSignal's
+  // header) -- the exact self-attribution bias that produced 3 confirmed fabricated-feature
+  // incidents live. An explicit claim about a DIFFERENT tracked project is unaffected; the
+  // evidenced bias is specifically "a model running inside its own pipeline defaults to
+  // 'this must be about me' when confused by off-topic content."
   if (rawLabel && trackedLabels.includes(rawLabel)) {
+    if (rawLabel === selfLabel && !hasSelfProjectSignal(rawText, selfLabel)) {
+      return { belongsToProject: null, actionable: false };
+    }
     return { belongsToProject: rawLabel, actionable };
   }
 
@@ -179,13 +206,8 @@ function deriveBelongsToProject(parsed, promptContext = {}) {
   }
 
   // Self-project recovery for a concrete change to this pipeline itself.
-  if (selfLabel && !parsed.requiresResearch) {
-    const hasChangeVerb = /\b(add|fix|should|shouldn't|need|needs|make|change|changing|refactor|implement|support|remove|rename|persist|track|wire|handle|prevent|ensure|allow|expose|surface|store|stop|drop|split|guard|race|reset|expand)\b/i.test(text);
-    const selfSubject = (text.toLowerCase().includes(selfLabel.toLowerCase()))
-      || /\b(pipeline|dashboard|brain[- ]?dump|second[- ]?brain|worker|queue|review|apply|task[- ]?source|draft(?:ing)?|adhoc|prompt|classifier|coordinat|watchdog|reject-retry)\b/i.test(text);
-    if (hasChangeVerb && selfSubject) {
-      return { belongsToProject: selfLabel, actionable: true };
-    }
+  if (selfLabel && !parsed.requiresResearch && hasSelfProjectSignal(text, selfLabel)) {
+    return { belongsToProject: selfLabel, actionable: true };
   }
 
   // No recovery -- return whatever the model said (a bogus label is caught by
