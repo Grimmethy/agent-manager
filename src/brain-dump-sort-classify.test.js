@@ -152,6 +152,51 @@ test('deriveBelongsToProject does NOT route to a project merely mentioned in the
   assert.notEqual(r.belongsToProject, 'promptforge');
 });
 
+// --- self-project hallucination guard (2026-09-05) ----------------------------------
+
+test('deriveBelongsToProject corrects an EXPLICIT self-label assertion with zero real connection (sand-battery incident)', () => {
+  const r = deriveBelongsToProject(
+    {
+      belongsToProject: 'agent-manager', actionable: true, requiresResearch: false,
+      rationale: 'This note describes a concrete feature request for the `agent-manager` project, '
+        + 'specifically for the `start_research_on_thermal_batteries` feature.',
+    },
+    { ...SELF, rawText: 'Sand battery insulation is critical for maintaining high temperatures (up to 600°C) '
+      + 'and minimizing heat loss, with commercial systems achieving storage losses of less than 5% over weeks.' },
+  );
+  assert.deepEqual(r, { belongsToProject: null, actionable: false });
+});
+
+test('deriveBelongsToProject is not fooled by a fabricated rationale echoing self-referential words', () => {
+  // Regression lock: the guard must check rawText ALONE, never rationale -- a hallucinated
+  // claim's own rationale always contains exactly the words (pipeline/implement/feature)
+  // that would make it look legitimate if checked together with rawText.
+  const r = deriveBelongsToProject(
+    {
+      belongsToProject: 'agent-manager', actionable: true, requiresResearch: false,
+      rationale: 'This is a change to the agent-manager pipeline: we should implement and track this feature.',
+    },
+    { ...SELF, rawText: 'Niyakichi_art on instagram has some great works that would do very well as stickers and shirts. We should investigate.' },
+  );
+  assert.deepEqual(r, { belongsToProject: null, actionable: false });
+});
+
+test('deriveBelongsToProject still trusts a genuine EXPLICIT self-label assertion', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: 'agent-manager', actionable: true },
+    { ...SELF, rawText: 'Fix the pipeline worker queue so drafts persist correctly across a restart.' },
+  );
+  assert.deepEqual(r, { belongsToProject: 'agent-manager', actionable: true });
+});
+
+test('deriveBelongsToProject leaves an explicit assertion of a DIFFERENT tracked project unaffected', () => {
+  const r = deriveBelongsToProject(
+    { belongsToProject: 'other-proj', actionable: true },
+    { ...SELF, rawText: 'Some note with no real connection to anything at all.' },
+  );
+  assert.deepEqual(r, { belongsToProject: 'other-proj', actionable: true });
+});
+
 test('parseBrainDumpSortResult coerces the literal string "null" / "none" to a real null', () => {
   const r = parseBrainDumpSortResult(JSON.stringify({
     secondBrainPath: 'Ideas/x.md', possibleDuplicateOf: 'null', belongsToProject: 'none',
