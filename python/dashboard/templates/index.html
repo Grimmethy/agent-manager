@@ -4156,10 +4156,21 @@ function renderBrainDumpCard(entry) {
     ? escapeHtml((sort.tags && sort.tags.length ? sort.tags.join(', ') : sort.secondBrainPath) || '')
     : new Date(entry.capturedAt).toLocaleString();
   const serialBadge = entry.serial ? `<span class="bd-serial" title="Reference this entry as #${entry.serial}">#${entry.serial}</span> ` : '';
+  // Side-finding provenance + count (2026-09-05, side-finding-sweep.js): same colored-
+  // chip-with-tooltip convention as the Job List tab's stalenessFlag/contextTrimFlag
+  // chips. countChip only shows once a duplicate has actually landed (count===1 is the
+  // common case and needs no extra UI); raisedByBadge marks a machine-raised entry so it
+  // reads differently from a human-typed note at a glance.
+  const countChip = entry.count > 1
+    ? `<span title="${escapeAttr(`Seen ${entry.count} times${(entry.seenIn || []).length ? ' -- tasks: ' + entry.seenIn.join(', ') : ''}`)}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔁 seen ${entry.count}&times;</span>`
+    : '';
+  const raisedByBadge = entry.raisedBy
+    ? `<span title="${escapeAttr(`Flagged automatically while working on a ${entry.raisedBy.source || 'pipeline'} task${entry.raisedBy.taskId ? ' (' + entry.raisedBy.taskId + ')' : ''}`)}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
+    : '';
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
-        <span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span>
+        <span class="text">${serialBadge}${escapeHtml(entry.rawText)}${countChip}${raisedByBadge}</span>
         ${statusBadge}
       </div>
       <div class="row meta">
