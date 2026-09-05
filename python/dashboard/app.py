@@ -1174,12 +1174,18 @@ def index():
 def _expected_instance_ids() -> list[str]:
     """The daemons scripts/launch.sh always starts (worker-1, reviewer, queue-watchdog),
     plus worker-reasoning whenever it would actually be launched (gated on the same
-    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses). apply-task-loop is deliberately
-    excluded -- it's a single-shot pass with no heartbeat file of its own (see launch.sh's
-    own comment), so it never has a slot to be "offline" in."""
+    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses), plus worker-p40 whenever the
+    optional second-GPU lane is configured (same AGENT_MANAGER_P40_* gate launch.sh
+    itself uses). apply-task-loop is deliberately excluded -- it's a single-shot pass
+    with no heartbeat file of its own (see launch.sh's own comment), so it never has a
+    slot to be "offline" in."""
     ids = ["worker-1", "reviewer", "watchdog"]
     if is_claude_token_configured():
         ids.append("worker-reasoning")
+    # Optional second GPU lane (2026-09-05) -- see agent-manager.env.example's
+    # AGENT_MANAGER_P40_OLLAMA_URL comment. Same gate scripts/launch.sh itself uses.
+    if os.environ.get("AGENT_MANAGER_P40_OLLAMA_URL") and os.environ.get("AGENT_MANAGER_P40_MODEL"):
+        ids.append("worker-p40")
     return ids
 
 
