@@ -4368,27 +4368,70 @@ async function renderHardwareTab() {
   const history = data.history || [];
   const ram = cur.ram || {};
   const disk = cur.disk || {};
-  const gpu = cur.gpu;
+  // Multi-GPU (2026-09-05): prefer the full "gpus" list (both this repo's plugins can
+  // report it -- see hardware_stats.py's _gpus()/goatmon_adapter.py's "gpus" key) so
+  // every GPU on the box gets its own labeled section, not just whichever one a
+  // legacy single-"gpu" heuristic picked as "primary". Falls back to a one-item list
+  // from the singular "gpu" field for any plugin that only ever reports one.
+  const gpuList = (cur.gpus && cur.gpus.length) ? cur.gpus : (cur.gpu ? [cur.gpu] : []);
+  const gpuLabel = (g, i) => g.name || `GPU ${g.index != null ? g.index : i}`;
+  // History rows carry the same "gpus" (or singular "gpu") shape per sample -- match
+  // by array position, since a GPU's index/name is stable across samples on one box.
+  const gpuHistoryValue = (entry, i, field) => {
+    if (entry.gpus && entry.gpus[i]) return entry.gpus[i][field];
+    if (i === 0 && entry.gpu) return entry.gpu[field];
+    return null;
+  };
+  const gpuAvg = (i, field) => {
+    const values = history.map(e => gpuHistoryValue(e, i, field)).filter(v => v != null);
+    return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+  };
 
   const tempStat = (label, curVal, avgVal) => `
     <div class="stat"><strong>${fmtTemp(curVal)}</strong>${escapeHtml(label)} temp (24h avg ${fmtTemp(avgVal)})</div>`;
 
-  main.innerHTML = `
+  const gpuSections = gpuList.length ? gpuList.map((g, i) => `
+    <div class="field-label">${escapeHtml(gpuLabel(g, i))}</div>
     <div class="stat-row">
-      <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization</div>
+      <div class="stat"><strong>${fmtPercent(g.utilizationPercent)}</strong>utilization (24h avg ${fmtPercent(gpuAvg(i, 'utilizationPercent'))})</div>
+      <div class="stat"><strong>${fmtMiB(g.vramUsedMiB)} / ${fmtMiB(g.vramTotalMiB)}</strong>VRAM used</div>
+      <div class="stat"><strong>${fmtTemp(g.temperatureCelsius)}</strong>temp (24h avg ${fmtTemp(gpuAvg(i, 'temperatureCelsius'))})</div>
+    </div>
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'utilizationPercent'), gpuAvg(i, 'utilizationPercent'), `${gpuLabel(g, i)} utilization`)}
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'vramUsedMiB'), gpuAvg(i, 'vramUsedMiB'), `${gpuLabel(g, i)} VRAM used`)}
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'temperatureCelsius'), gpuAvg(i, 'temperatureCelsius'), `${gpuLabel(g, i)} temperature`)}
+  `).join('') : `<div class="field-label">GPU</div><div class="meta">No GPU detected.</div>`;
+
+  main.innerHTML = `
+    <div class="field-label">System</div>
+    <div class="stat-row">
+      <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization (24h avg ${fmtPercent(avg.cpuPercent)})</div>
       <div class="stat"><strong>${fmtBytes(ram.usedBytes)} / ${fmtBytes(ram.totalBytes)}</strong>RAM used</div>
       <div class="stat"><strong>${fmtBytes(disk.usedBytes)} / ${fmtBytes(disk.totalBytes)}</strong>disk used</div>
-      ${gpu
-        ? `<div class="stat"><strong>${fmtPercent(gpu.utilizationPercent)}</strong>GPU utilization</div>
-      <div class="stat"><strong>${fmtMiB(gpu.vramUsedMiB)} / ${fmtMiB(gpu.vramTotalMiB)}</strong>VRAM used</div>`
-        : `<div class="stat"><strong>--</strong>no GPU detected</div>`}
-    </div>
-
-    <div class="field-label">Temperature -- current vs 24h average</div>
-    <div class="stat-row">
       ${tempStat('CPU', cur.cpuTemperatureCelsius, avg.cpuTemperatureCelsius)}
-      ${gpu ? tempStat('GPU', gpu.temperatureCelsius, avg.gpuTemperatureCelsius) : ''}
     </div>
+    ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
+    ${renderSparkline(history, e => e.cpuPercent, avg.cpuPercent, 'CPU utilization')}
+    ${renderSparkline(history, e => e.ram ? e.ram.usedBytes : null, avg.ramUsedBytes, 'RAM used')}
+    ${renderSparkline(history, e => e.disk ? e.disk.usedBytes : null, avg.diskUsedBytes, 'disk used')}
+
+    ${gpuSections}
+
+    ${cur.filesystems && cur.filesystems.length ? `
+    <div class="field-label">Filesystems</div>
+    <table style="width:100%; border-collapse:collapse;">
+      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Mount</th>
+          <th class="meta" style="text-align:left; padding:2px 8px;">Device</th>
+          <th class="meta" style="text-align:left; padding:2px 8px;">Type</th>
+          <th class="meta" style="text-align:right; padding:2px 0;">Used / total</th></tr>
+      ${cur.filesystems.map(fs => `
+        <tr>
+          <td class="meta" style="padding:2px 8px 2px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
+          <td class="meta" style="padding:2px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
+          <td class="meta" style="padding:2px 8px;">${escapeHtml(fs.type)}</td>
+          <td class="meta" style="padding:2px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
+        </tr>`).join('')}
+    </table>` : ''}
 
     ${(cur.power || (cur.runaways && cur.runaways.length)) ? `
     <div class="field-label">Power &amp; runaway processes</div>
@@ -4411,22 +4454,6 @@ async function renderHardwareTab() {
     </table>` : `<div class="meta" style="margin-top:6px;">No runaway processes detected.</div>`}
     ` : ''}
 
-    ${cur.filesystems && cur.filesystems.length ? `
-    <div class="field-label">Filesystems</div>
-    <table style="width:100%; border-collapse:collapse;">
-      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Mount</th>
-          <th class="meta" style="text-align:left; padding:2px 8px;">Device</th>
-          <th class="meta" style="text-align:left; padding:2px 8px;">Type</th>
-          <th class="meta" style="text-align:right; padding:2px 0;">Used / total</th></tr>
-      ${cur.filesystems.map(fs => `
-        <tr>
-          <td class="meta" style="padding:2px 8px 2px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
-          <td class="meta" style="padding:2px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
-          <td class="meta" style="padding:2px 8px;">${escapeHtml(fs.type)}</td>
-          <td class="meta" style="padding:2px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
-        </tr>`).join('')}
-    </table>` : ''}
-
     ${cur.processes && cur.processes.length ? `
     <div class="field-label">Top processes by CPU</div>
     <table style="width:100%; border-collapse:collapse;">
@@ -4448,29 +4475,6 @@ async function renderHardwareTab() {
           <td class="meta" style="padding:2px 0;">${escapeHtml(p.user || '-')} &middot; ${escapeHtml(p.scopeLabel || '-')}</td>
         </tr>`).join('')}
     </table>` : ''}
-
-    <div class="field-label">CPU temperature -- last 24h</div>
-    ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
-
-    ${gpu ? `
-    <div class="field-label">GPU temperature -- last 24h</div>
-    ${renderSparkline(history, e => e.gpu ? e.gpu.temperatureCelsius : null, avg.gpuTemperatureCelsius, 'GPU temperature')}` : ''}
-
-    <div class="field-label">CPU utilization -- last 24h</div>
-    ${renderSparkline(history, e => e.cpuPercent, avg.cpuPercent, 'CPU utilization')}
-
-    <div class="field-label">RAM used -- last 24h</div>
-    ${renderSparkline(history, e => e.ram ? e.ram.usedBytes : null, avg.ramUsedBytes, 'RAM used')}
-
-    <div class="field-label">Disk used -- last 24h</div>
-    ${renderSparkline(history, e => e.disk ? e.disk.usedBytes : null, avg.diskUsedBytes, 'disk used')}
-
-    ${gpu ? `
-    <div class="field-label">GPU utilization -- last 24h</div>
-    ${renderSparkline(history, e => e.gpu ? e.gpu.utilizationPercent : null, avg.gpuUtilizationPercent, 'GPU utilization')}
-
-    <div class="field-label">GPU VRAM used -- last 24h</div>
-    ${renderSparkline(history, e => e.gpu ? e.gpu.vramUsedMiB : null, avg.gpuVramUsedMiB, 'GPU VRAM used')}` : ''}
 
     <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
   `;
