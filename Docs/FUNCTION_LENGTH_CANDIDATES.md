@@ -3877,3 +3877,137 @@ Extract each check phase into its own clearly-named function that returns a stru
 
 Benefits:
 Each extracted check becomes independently unit-testable with mocked subprocess calls or fixture JSON — for example, compareRouteTables can be tested by feeding it two hand-written route-table objects without ever touching git. The orchestrator shrinks to roughly 25–30 lines of sequential calls, making the overall flow scannable in one screen. Code review becomes tractable because a reviewer can approve or reject each check's logic in isolation rather than holding all five phases in working memory simultaneously, and the single-point cleanup in the orchestrator eliminates the seven-way done() call-site audit that currently guards against leaked worktrees.
+
+### AC-39 · Decompose buildDecomposeHub into named sub-functions
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Snippet:
+```
+}
+
+function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
+  const validation = stackedEnabled() ? validatePlan(repoRoot, request) : { ok: true, hardProblems: [], moveMeta: request.moves.map(() => ({})) };
+  if (!validation.ok) {
+    return fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems: validation.hardProblems });
+  }
+
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(coordDir, { recursive: true });
+  const nowIso = new Date(now).toISOString();
+  const planSlug = slugify(request.id);
+  const moves = request.moves;
+  const stacked = stackedEnabled();
+  const branch = `agent/decompose-${planSlug}`;
+
+  // Deterministic wiring (wire-decomposed-blueprints.js): for flask-blueprint moves the
+  // coordinator splices the `register_blueprint` block itself once every move child is
+  // done -- no LLM wiring child. Anything else (script-extract, plain require) still gets
+  // an LLM wiring child, scoped to just those moves. Kill switch: DECOMPOSE_DET_WIRING.
+  const bpMoves = moves.filter((m) => m.kind === 'flask-blueprint');
+  const otherMoves = moves.filter((m) => m.kind !== 'flask-blueprint');
+  const useDetWiring = stacked && bpMoves.length > 0
+    && process.env.AGENT_MANAGER_DECOMPOSE_DET_WIRING !== 'false';
+  const fileWiringChild = !useDetWiring || otherMoves.length > 0;
+  const wiringChildMoves = useDetWiring ? otherMoves : moves;
+  const wiringChildCount = fileWiringChild ? 1 : 0;
+
+  const children = [];
+  const moveIds = [];
+  let prevId = null;
+  moves.forEach((move, i) => {
+    const id = `adhoc-decompose-${planSlug}-${String(i + 1).padStart(2, '0')}-${slugify(path.basename(move.newFile))}`.slice(0, 120);
+    moveIds.push(id);
+    const record = {
+      id,
+      domain: 'adhoc',
+      source: 'manual',
+      title: `Decompose ${request.sourceFile} → ${move.newFile}`,
+      createdAt: nowIso,
+      promptContext: {
+        rawText: moveRawText(request, move, i, moves.length, validation.moveMeta[i]),
+        decomposedFrom: `file-decompose:${request.id}`,
+        moveIndex: i,
+        newFile: move.newFile,
+      },
+    };
+    if (stacked) {
+      record.atomic = true;
+      record.noDecompose = true;
+      record.stacked = { branch, seq: i + 1, total: moves.length + wiringChildCount };
+      if (prevId) record.dependsOn = [prevId];
+    }
+    fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
+    children.push({ id, title: record.title, status: 'pending' });
+    prevId = id;
+  });
+
+  // Final wiring task. In stacked mode it depends only on the last move (the chain is
+  // sequential); in legacy mode it waits on every move being merged. Skipped entirely when
+  // every move is a flask-blueprint the coordinator wires deterministically.
+  if (fileWiringChild) {
+    const wireId = `adhoc-decompose-${planSlug}-99-wiring`.slice(0, 120);
+    const wiringMetas = wiringChildMoves.map((m) => validation.moveMeta[moves.indexOf(m)]);
+    const wiringRecord = {
+      id: wireId,
+      domain: 'adhoc',
+      source: 'manual',
+      title: `Decompose ${request.sourceFile} — wire up ${wiringChildMoves.length} new file(s)`,
+      createdAt: nowIso,
+      dependsOn: stacked ? [prevId] : moveIds,
+      promptContext: { rawText: wiringRawText(request, wiringChildMoves, wiringMetas), decomposedFrom: `file-decompose:${request.id}` },
+    };
+    if (stacked) {
+      wiringRecord.atomic = true;
+      wiringRecord.noDecompose = true;
+      wiringRecord.stacked = { branch, seq: moves.length + 1, total: moves.length + wiringChildCount };
+    }
+    fs.writeFileSync(path.join(adhocDir, `${wireId}.json`), `${JSON.stringify(wiringRecord, null, 2)}\n`);
+    children.push({ id: wireId, title: `wire up ${wiringChildMoves.length} new file(s)`, status: 'pending' });
+  }
+
+  const hubId = `file-decompose-hub-${planSlug}`;
+  const hub = {
+    id: hubId,
+    domain: 'adhoc',
+    source: 'manual',
+    status: 'coordinating',
+    adhocResolution: 'decompose',
+    title: `Decompose ${request.sourceFile} (${moves.length} module(s))`,
+    createdAt: nowIso,
+    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: `file-decompose:${request.id}` },
+    subTasks: children,
+    progress: { done: 0, total: children.length },
+    planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s)${useDetWiring ? ` + deterministic wiring for ${bpMoves.length} blueprint(s)` : ''}${fileWiringChild ? ` + 1 LLM wiring task${useDetWiring ? ` for ${otherMoves.length} non-blueprint move(s)` : ''}` : ''}${stacked ? ` (stacked on ${branch})` : ''}` }],
+  };
+  if (stacked) {
+    hub.mode = 'stacked';
+    hub.branch = branch;
+    hub.sourceFile = request.sourceFile;
+    hub.integrationGate = { status: 'pending' };
+  }
+  if (useDetWiring) {
+    hub.wiringPending = true;
+    hub.wiringMoves = bpMoves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, kind: m.kind }));
+  }
+  fs.writeFileSync(path.join(coordDir, `${hubId}.json`), `${JSON.stringify(hub, null, 2)}\n`);
+
+  request.hubFiledAt = nowIso;
+  request.hubId = hubId;
+  request.hubChildIds = children.map((c) => c.id);
+  if (stacked) request.branch = branch;
+  fs.writeFileSync(requestFile, `${JSON.stringify(request, null, 2)}\n`);
+  return { hubId, childCount: children.length, stacked, branch: stacked ? branch : undefined };
+}
+```
+
+Problem:
+The 116-line function interleaves three distinct responsibilities—wiring-strategy derivation (a small matrix of `stacked`, `bpMoves.length`, `otherMoves.length`, and an env kill-switch that produces `useDetWiring`, `fileWiringChild`, `wiringChildMoves`, and `wiringChildCount`), per-move record construction inside a `forEach` body whose shape branches on `stacked`, and the final hub-object assembly with conditional patches. Because the wiring-policy results are referenced at four separate later sites (the move loop's stacked block, the wiring-task `dependsOn`, the hub's `history` detail string, and the `useDetWiring` conditional), a developer changing the policy must trace all four call-sites through 116 lines of mixed concerns. The per-move record builder and the hub assembler each contain their own conditional logic that is only understandable in the context of the whole function, making isolated unit testing of any single concern impractical.
+
+Solution:
+Extract three clearly-named helpers from the existing function body, keeping them in the same file (or a sibling `wiring.js` / `records.js` if the file grows): (1) `resolveWiringStrategy(stacked, bpMoves, otherMoves, env)` returning the four derived values as a plain object, so the policy matrix lives in one testable unit; (2) `buildMoveRecord(move, ctx)` encapsulating the `forEach` body's conditional record shape (the `stacked`-gated `atomic`, `noDecompose`, `stacked`, `dependsOn` fields); and (3) `assembleHub(base, wiring, stacked, useDetWiring)` producing the final hub literal plus its two conditional patches. The original function then becomes a short orchestrator that calls these three in sequence and returns the result, reducing its body to roughly 15–20 lines of glue.
+
+Benefits:
+Each extracted helper can be unit-tested in isolation—`resolveWiringStrategy` against the full input matrix without needing a real move array, `buildMoveRecord` against representative move shapes, and `assembleHub` against stacked/non-stacked and det-wiring on/off combinations. Code review becomes a matter of checking three small, single-purpose diffs rather than scanning 116 lines for a one-line policy change. Future additions (a new move kind, a per-repo override, an extra hub field) slot into the relevant helper without risking accidental interaction with the other two concerns, and the orchestrator's short body makes the overall data flow immediately legible at a glance.
