@@ -451,9 +451,22 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
     ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
     : null;
   const baseLocalCall = localCall || providerFor(task).call;
-  const resolvedLocalCall = profileOverrides && !localCall
+  const profileWrappedCall = profileOverrides && !localCall
     ? (opts) => baseLocalCall({ ...profileOverrides, ...opts })
     : baseLocalCall;
+  // Side-finding capture (2026-09-05, side-finding.js) defaults to on for every call --
+  // opt a source out via `strictOutputOnly: true` on its registerTaskSource() entry when
+  // its implement pass MUST come back clean/parseable-only (brain_dump_sort's classify
+  // JSON, a digest-verdict pass, decompose's JSON array, path-prefetch-resolve) and
+  // couldn't tolerate an interleaved SIDE-FINDING: block. Read off the registry (not a
+  // hardcoded source-name list) same as candidateFulfillment/emptyApproval/etc. already
+  // are -- see isCandidateFulfillmentSource's own comment for why a hardcoded array was
+  // rejected here before.
+  const sourceEntry = getRegisteredSource(resolveSourceName(task));
+  const allowSideFindings = !(sourceEntry && sourceEntry.strictOutputOnly);
+  const resolvedLocalCall = allowSideFindings
+    ? profileWrappedCall
+    : (opts) => profileWrappedCall({ ...opts, allowSideFindings: false });
   // 2026-08-24 (root-caused live: every brain_dump_sort draft failed outright with
   // "does not support thinking" for as long as the brain-dump-cheap-local profile
   // existed) -- unlike model/numCtx/numPredict above, `think` can't just join

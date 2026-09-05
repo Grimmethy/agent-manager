@@ -1419,7 +1419,7 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // profile existed, since local-draft.js's own call sites unconditionally requested
 // think:true and had no way to know this profile's model couldn't honor it).
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping' });
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -1432,6 +1432,7 @@ registerTaskSource('path_prefetch_resolve', {
   priority: taskPriority('path_prefetch_resolve', 45),
   next: nextPathPrefetchResolveTask,
   reportClass: 'housekeeping',
+  strictOutputOnly: true,
 });
 // observability_review/observability_fix, performance_review/performance_fix -- moved
 // to src/maintenance/observability-review.js and src/maintenance/performance-review.js
