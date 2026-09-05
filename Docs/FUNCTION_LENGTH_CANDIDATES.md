@@ -3520,3 +3520,200 @@ Extract the `adhocResolution === 'decompose'` branch into its own exported funct
 
 Benefits:
 Each function now has a single, self-evident responsibility, so a reviewer can approve the decompose-coordinator change without reading the git/patch code (and vice-versa). Unit tests for the coordinator shape no longer need to mock `git` or a patch file, and tests for the diff path no longer need to stub the sub-task queue. The dense comment blocks that currently sit between the two paths can migrate with their respective code, reducing the "comment noise" a reader encounters when looking for either concern. Future edits to the decompose protocol (e.g., adding a new sub-task type) become a local change to one small function rather than a diff that touches the middle of a 136-line block.
+
+### AC-37 · Extract per-item reconciliation sub-workflows from coordinator sweep loop
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring } = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') { console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`); return summary; }
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try {
+      parent = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue; // a malformed coordinating file is not this sweep's problem to fix
+    }
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      // A coordinating parent with no checklist is a bug upstream -- complete it out so it
+      // does not sit here forever.
+      parent.status = 'done';
+      parent.doneMarker = 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      moveToDone(file, doneDir, name, parent);
+      summary.checked += 1;
+      summary.completed += 1;
+      continue;
+    }
+
+    summary.checked += 1;
+    let doneCount = 0;
+    const recById = new Map();
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+      recById.set(st && st.id, rec);
+      st.status = classifyChildStatus(rec);
+      if (TERMINAL_GOOD.has(st.status)) doneCount += 1;
+    }
+    parent.progress = { done: doneCount, total: parent.subTasks.length };
+    parent.lastReconciledAt = new Date().toISOString();
+
+    // Stuck-chain detection: surface a hub that can never complete on its own instead of
+    // leaving it frozen at partial progress. The hub STAYS in coordinating/ so the sweep
+    // keeps reconciling it (and auto-clears / auto-completes if the children get unstuck);
+    // what changes is a `coordinatorBlocked` marker + a `blockedReason` the dashboard
+    // renders, and after a grace period an `escalated` flag + a louder history event.
+    if (doneCount < parent.subTasks.length) {
+      const stuck = findStuckChildren(parent.subTasks, recById);
+      const now = new Date().toISOString();
+      if (stuck.length > 0) {
+        const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+        if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+          parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+          appendHistoryEvent(parent, 'blocked', `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+          summary.blocked = (summary.blocked || 0) + 1;
+        }
+        parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+        const escalateMs = stuckEscalateMs();
+        const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+        if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+          parent.coordinatorBlocked.escalated = true;
+          parent.coordinatorBlocked.escalatedAt = now;
+          appendHistoryEvent(parent, 'advisory',
+            `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+          summary.escalated = (summary.escalated || 0) + 1;
+        }
+      } else if (parent.coordinatorBlocked) {
+        delete parent.coordinatorBlocked;
+        delete parent.blockedReason;
+        appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+        summary.unblocked = (summary.unblocked || 0) + 1;
+      }
+    }
+
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    // A child went back to work (e.g. a human requeued the wiring step after a gate
+    // failure) -- re-arm the gate so the next all-done transition re-checks the branch.
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    // Stacked all-blueprint decompose hub: every move child committed its Blueprint module
+    // to the branch, but nothing registered them yet. Do the `register_blueprint` splice
+    // deterministically now, before the gate. On failure the hub stays in coordinating/
+    // with a blockedReason; on success wiringPending clears and the next tick runs the gate
+    // against the wired branch.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending')) {
+      const res = runWiring(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res && res.ok) {
+        parent.wiringPending = false;
+        appendHistoryEvent(parent, 'advisory', res.skipped
+          ? `blueprint wiring already present on ${parent.branch}`
+          : `wired ${res.registered} blueprint(s) onto ${parent.branch}${res.sha ? ` @ ${res.sha.slice(0, 10)}` : ''}`);
+        summary.wired = (summary.wired || 0) + 1;
+      } else {
+        parent.blockedReason = `deterministic blueprint wiring failed on ${parent.branch}: ${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: 'blueprint-wiring:failed', since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: (res && res.detail) || 'wiring failed' }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+      }
+      try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+      catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+      continue;
+    }
+
+    // Stacked decompose hub: children done is necessary but not sufficient -- the shared
+    // branch must actually import and keep its route table. Gate runs once; its result is
+    // cached on the hub so a quiet every-tick sweep never re-runs a worktree build.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.integrationGate
+        && parent.integrationGate.status === 'pending') {
+      const res = runGate(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res.skipped) {
+        parent.integrationGate = { status: 'skipped', at: now };
+      } else if (res.ok) {
+        parent.integrationGate = { status: 'passed', at: now, checks: res.checks || [] };
+        appendHistoryEvent(parent, 'advisory', `integration gate passed on ${parent.branch} -- ${(res.checks || []).map((c) => `${c.name}:${c.status}`).join(' ')}`);
+        summary.gatePassed = (summary.gatePassed || 0) + 1;
+      } else {
+        const failing = (res.checks || []).filter((c) => c.status === 'fail');
+        parent.integrationGate = { status: res.errored ? 'errored' : 'failed', at: now, checks: res.checks || [] };
+        parent.blockedReason = `decompose integration gate ${res.errored ? 'errored' : 'failed'} on ${parent.branch}: ${failing.map((c) => `${c.name} -- ${c.detail}`).join(' | ')}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: `integration-gate:${failing.map((c) => c.name).sort().join(',')}`,
+          since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: `integration gate failed: ${failing.map((c) => c.name).join(', ')}` }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.gateFailed = (summary.gateFailed || 0) + 1;
+        // errored (not failed) -> let a later tick retry the gate itself.
+        if (res.errored) parent.integrationGate.status = 'pending';
+        try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+        catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+        continue;
+      }
+    }
+
+    const gateClear = !(parent.mode === 'stacked' && parent.integrationGate
+      && ['failed', 'pending'].includes(parent.integrationGate.status) && allChildrenDone);
+
+    if (allChildrenDone && gateClear) {
+      parent.status = 'done';
+      parent.doneMarker = `coordinator complete: all ${parent.subTasks.length} sub-task(s) done`;
+      stampHubMerged(parent);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      moveToDone(file, doneDir, name, parent);
+      summary.completed += 1;
+    } else {
+      try {
+        fs.writeFileSync(file, JSON.stringify(parent, null, 2));
+        summary.updated += 1;
+      } catch (err) {
+        console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`);
+        summary.errors += 1;
+      }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The per-item reconciliation loop in the coordinator sweep is 179 lines long not because of verbosity but because it interleaves five to six logically independent sub-workflows—stuck-chain detection with signature dedup and grace-period escalation, blueprint wiring with success/failure branching, an integration gate with four distinct outcomes (skipped, passed, failed, errored), gate re-arming on child requeue, and completion/persistence—each carrying its own state mutations, error handling, history-event emissions, and early-continue exits. Because all of this lives in one flat `for`-body, a reader must track which state variables each branch touches, which `continue` paths skip which subsequent steps, and which history events are emitted under which conditions, all without any structural boundary to anchor comprehension. Adding a sixth sub-workflow or changing the ordering of existing ones requires editing a single monolithic block where a misplaced `continue` or a missing state reset silently corrupts sibling workflows.
+
+Solution:
+Extract each sub-workflow into a clearly-named private function that receives the per-item context object (the mutable state bag, the item under reconciliation, and the history-event emitter) and returns a small result struct indicating whether the loop should `continue` to the next item or proceed to the next sub-step. Concretely: `detectAndEscalateStuckChain(item, ctx, emit)`, `wireBlueprint(item, ctx, emit)`, `runIntegrationGate(item, ctx, emit)`, `rearmGateOnRequeue(item, ctx, emit)`, and `persistCompletion(item, ctx, emit)`. The outer `for` body then becomes a short, ordered sequence of calls with explicit early-exit checks (`if (result.shouldSkip) continue;`), making the control flow and the dependency ordering between sub-steps visible at a glance. Each extracted function owns its own try/catch and state mutations, so the shared context object's mutation surface is localized and auditable per function.
+
+Benefits:
+Each extracted function is independently unit-testable: you can feed it a crafted item and context, assert the exact history events emitted and the exact state mutations performed, without executing the other four sub-workflows. Code review becomes tractable because a diff touching the integration gate no longer scrolls past 60 lines of unrelated stuck-chain logic; reviewers can focus on the 30-line function that actually changed. The outer loop shrinks to roughly 25–30 lines of orchestration, making the overall reconciliation pipeline and its ordering constraints immediately legible, and reducing the risk that a future edit to one sub-workflow accidentally reorders or skips a sibling step.
