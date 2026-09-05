@@ -32,6 +32,7 @@ const path = require('path');
 const { detectDegenerate } = require('./local-client.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { currentDateLine } = require('./current-date-line.js');
+const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
@@ -84,7 +85,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -96,7 +97,10 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   const workDir = cwd || CLAUDE_CWD;
   fs.mkdirSync(workDir, { recursive: true });
 
-  const datedPrompt = `${currentDateLine()}\n\n${prompt}`;
+  // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header) --
+  // same treatment as local-client.js's callOnce(), the sibling chokepoint.
+  const effectivePrompt = allowSideFindings ? injectSideFindingInstruction(prompt) : prompt;
+  const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const args = [
     '-p', datedPrompt,
     '--output-format', 'json',
@@ -225,7 +229,18 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await callOnce(opts);
+    let result = await callOnce(opts);
+    // Same extraction as local-client.js's call() -- see side-finding.js's own header.
+    if (opts.allowSideFindings !== false && result.response && result.response.includes('SIDE-FINDING:')) {
+      const { cleanText, findings } = extractSideFindings(result.response);
+      result = { ...result, response: cleanText };
+      if (findings.length) {
+        const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || null;
+        for (const finding of findings) {
+          writeSideFindingInbox(finding, { source: opts.source || 'claude', taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
     const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;

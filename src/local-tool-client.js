@@ -17,6 +17,7 @@ const { wrapWithSandbox } = require('./sandbox.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
@@ -771,7 +772,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -827,6 +828,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const messages = Array.isArray(reqMessages) && reqMessages.length
     ? reqMessages.slice()
     : [{ role: 'user', content: prompt }];
+  // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
+  // inject once into whichever message is first (the system message when the caller
+  // provides one, else the sole user prompt) -- covers every tool-calling caller (Chat,
+  // arch_discovery, agentic drafts) from this one spot.
+  if (allowSideFindings && messages.length) {
+    messages[0] = { ...messages[0], content: injectSideFindingInstruction(messages[0].content) };
+  }
   const toolCallLog = [];
   let turnsUsed = 0;
   let lastMessage = null;
@@ -840,7 +848,23 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     usageAcc.eval_count += Number(u.eval_count) || 0;
     usageAcc.eval_duration += Number(u.eval_duration) || 0;
   };
-  const withUsage = (r) => ({ ...r, ...usageAcc });
+  // Same extraction as local-client.js's call()/claude-client.js's call() -- see
+  // side-finding.js's own header. Hooked into this one shared wrapper so every return
+  // path (normal finish, forced-summary, maxTurns-exhausted fallback) is covered from a
+  // single spot, same convention the done_reason:"length" marker uses in this file.
+  const withUsage = (r) => {
+    const merged = { ...r, ...usageAcc };
+    if (allowSideFindings && merged.response && merged.response.includes('SIDE-FINDING:')) {
+      const { cleanText, findings } = extractSideFindings(merged.response);
+      merged.response = cleanText;
+      if (findings.length) {
+        for (const finding of findings) {
+          writeSideFindingInbox(finding, { source, taskId, stage: null, pipelineDir });
+        }
+      }
+    }
+    return merged;
+  };
 
   // messages.length / toolCallLog.length as of the START of each turn, in order -- lets a
   // later turn's unrecoverable flake roll back exactly the PRIOR turn's own additions
