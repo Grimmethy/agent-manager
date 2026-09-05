@@ -257,6 +257,8 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       prompt,
       maxTurns: LOCAL_AGENTIC_WRITE_MAX_TURNS,
       source: task.source,
+      taskId: task.id,
+      stage: 'agentic-write',
       allowWrite: true,
       primaryRoot: worktreeDir,
       // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line

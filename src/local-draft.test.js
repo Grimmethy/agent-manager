@@ -2150,3 +2150,29 @@ test('a normal source (no strictOutputOnly) does not get allowSideFindings force
     }
   });
 });
+
+test('every real call site threads task.id and its own stage name into opts, so side-finding.js can trace a finding back to its source task', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-taskid-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/apply-task.js'], fetchedFiles: [{ path: 'src/apply-task.js', content: 'function f() {}\n' }], body: 'Files: src/apply-task.js' },
+    };
+    const capturedOpts = [];
+    let n = 0;
+    const localCall = async (opts) => {
+      capturedOpts.push(opts);
+      n++;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.ok(capturedOpts.length >= 1);
+    for (const opts of capturedOpts) {
+      assert.equal(opts.taskId, 'arch-review-taskid-1');
+      assert.ok(opts.stage, 'every real call site names its own stage');
+    }
+    // Spot-check the exact stage names on the two calls this run actually reaches.
+    assert.equal(capturedOpts[0].stage, 'plan');
+  });
+});

@@ -936,7 +936,7 @@ async function runPlanPass(task, {
   delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
   delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
 
-  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
+  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
   let planResult = await callPlan();
@@ -1084,7 +1084,7 @@ async function runCritiqueAndRevision(task, {
     return;
   }
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-  const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source }), 'critique');
+  const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source, taskId: task.id, stage: 'critique' }), 'critique');
 
   if (critiqueResult.degenerate) {
     task.critiqueOutcome = 'critique-degenerate';
@@ -1099,7 +1099,7 @@ async function runCritiqueAndRevision(task, {
     // reviewer might want to verify it really addressed those specific points.
     task.critiqueText = critiqueResult.response;
     const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-    const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source }), 'revise');
+    const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, taskId: task.id, stage: 'revise' }), 'revise');
     if (!reviseResult.degenerate) {
       task.implementResponse = reviseResult.response;
       task.revisionApplied = true;
@@ -1319,7 +1319,7 @@ async function finalizeCandidateFulfillment(task, {
       correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
     }
     const retryPrompt = `${implPrompt}\n\n${correction}`;
-    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement-retry');
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
@@ -1383,7 +1383,7 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
       model: abModel,
     }), 'implement');
   } else {
-    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source }), 'implement');
+    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement' }), 'implement');
   }
 
   // Records this implement-pass call into model-stats.db (powers the dashboard's
