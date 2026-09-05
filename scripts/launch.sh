@@ -141,6 +141,23 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   start_bg "worker-reasoning" "${PID_DIR}/worker-reasoning.pid" "${LOG_DIR}/worker-reasoning.log" \
     bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning
 
+  # Optional second GPU lane (2026-09-05, P40 passed through to a local VM -- see
+  # agent-manager.env.example's own comment on AGENT_MANAGER_P40_OLLAMA_URL for the full
+  # rationale). Claims from the SAME general pending pool as worker-1 (plain "worker-*"
+  # naming, not "worker-reasoning*") -- genuine extra throughput, not a dedicated tier.
+  # `env` here scopes OLLAMA_URL/LOCAL_MODEL/AGENT_MANAGER_GPU_YIELD_APPS to just this one
+  # child process so worker-1/worker-reasoning/reviewer keep talking to the host's own
+  # Ollama exactly as before -- nothing here touches this script's own exported OLLAMA_URL.
+  if [[ -n "${AGENT_MANAGER_P40_OLLAMA_URL:-}" && -n "${AGENT_MANAGER_P40_MODEL:-}" ]]; then
+    start_bg "worker-p40" "${PID_DIR}/worker-p40.pid" "${LOG_DIR}/worker-p40.log" \
+      env OLLAMA_URL="${AGENT_MANAGER_P40_OLLAMA_URL}" \
+          LOCAL_MODEL="${AGENT_MANAGER_P40_MODEL}" \
+          AGENT_MANAGER_GPU_YIELD_APPS= \
+      bash "${SCRIPT_DIR}/local-worker.sh" worker-p40
+  else
+    printf '[launch] AGENT_MANAGER_P40_OLLAMA_URL/AGENT_MANAGER_P40_MODEL not both set -- skipping worker-p40 lane.\n'
+  fi
+
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
     bash "${SCRIPT_DIR}/review-runner.sh" reviewer
 
