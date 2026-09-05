@@ -195,6 +195,28 @@ function listRootsTool(a) {
 //     chat_sessions.py)
 const CHAT_BASH_TIMEOUT_MS = 30_000;
 
+// 2026-09-05, Grimmethy ("is everything going into context or is it conserving tokens"):
+// read_file/grep_codebase both cap their output per call (MAX_READ_FILE_CHARS,
+// grep-codebase-tool.js's MAX_MATCHES), but run_bash's stdout had NO cap on the success
+// path at all -- only maxBuffer (1MB) as an outer ceiling, with truncation only ever
+// applied to the FAILURE path's stderr. A single `git log`/`git diff`/`cat` of a large
+// file run through run_bash could shove up to ~1MB of raw text into the message history
+// in one shot -- confirmed as one real contributor to the context-budget-exhaustion
+// incident this same investigation traced (see RESERVED_RESPONSE_TOKENS's own comment).
+// Same cap value and truncation-suffix convention as MAX_READ_FILE_CHARS, applied to
+// stdout on BOTH the success and failure paths (a failing command can still print a huge
+// stdout before erroring).
+const MAX_BASH_OUTPUT_CHARS = 8000;
+
+function capBashOutput(text) {
+  const s = (text || '').toString();
+  if (s.length <= MAX_BASH_OUTPUT_CHARS) return { text: s, truncated: false };
+  return {
+    text: `${s.slice(0, MAX_BASH_OUTPUT_CHARS)}\n...[truncated: output exceeded ${MAX_BASH_OUTPUT_CHARS} chars, narrow the command (e.g. pipe through head/tail/grep) and retry]`,
+    truncated: true,
+  };
+}
+
 function writeFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { path: relPath, content } = args;
@@ -303,17 +325,20 @@ function runBashTool(a, b) {
     return { error: 'sandbox (bwrap) is not available on this host -- run_bash is disabled without it' };
   }
   try {
-    const stdout = withApplyLock(() => execFileSync(wrapped.command, wrapped.args, {
+    const rawStdout = withApplyLock(() => execFileSync(wrapped.command, wrapped.args, {
       encoding: 'utf8', timeout: CHAT_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
     }));
-    return { command, stdout, exitCode: 0 };
+    const { text: stdout, truncated } = capBashOutput(rawStdout);
+    return { command, stdout, exitCode: 0, truncated };
   } catch (e) {
+    const { text: stdout, truncated } = capBashOutput(e.stdout);
     return {
       command,
-      stdout: (e.stdout || '').toString(),
+      stdout,
       stderr: (e.stderr || e.message || '').toString().slice(0, 2000),
       exitCode: e.status != null ? e.status : null,
       timedOut: e.signal === 'SIGTERM' && e.killed === true,
+      truncated,
     };
   }
 }
@@ -1086,6 +1111,7 @@ module.exports = {
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
   buildToolHandlers, buildWriteToolHandlers,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
+  capBashOutput, MAX_BASH_OUTPUT_CHARS,
 };
 
 // CLI: node local-tool-client.js <request.json>

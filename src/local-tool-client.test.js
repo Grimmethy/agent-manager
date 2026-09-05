@@ -235,6 +235,56 @@ test('runBashTool runs a real command in the repo root and captures stdout', () 
   });
 });
 
+// --- run_bash output cap (2026-09-05) ------------------------------------------------
+// Root-caused live (context-crowding investigation, this same session): read_file and
+// grep_codebase both cap their output per call, but run_bash's stdout had NO cap on the
+// success path at all -- only maxBuffer (1MB) as an outer ceiling -- so a single
+// `git log`/`git diff`/`cat` of a large file could shove up to ~1MB of raw text straight
+// into the message history in one shot.
+
+test('capBashOutput leaves short output untouched', () => {
+  withFixtureRepo((mod) => {
+    const { text, truncated } = mod.capBashOutput('short output');
+    assert.equal(text, 'short output');
+    assert.equal(truncated, false);
+  });
+});
+
+test('capBashOutput truncates output past MAX_BASH_OUTPUT_CHARS with a clear notice', () => {
+  withFixtureRepo((mod) => {
+    const huge = 'x'.repeat(mod.MAX_BASH_OUTPUT_CHARS + 5000);
+    const { text, truncated } = mod.capBashOutput(huge);
+    assert.equal(truncated, true);
+    assert.ok(text.length < huge.length, 'must actually be shorter than the input');
+    assert.match(text, /truncated: output exceeded \d+ chars/);
+    assert.match(text, /narrow the command/i);
+  });
+});
+
+test('capBashOutput handles null/undefined without throwing', () => {
+  withFixtureRepo((mod) => {
+    assert.deepEqual(mod.capBashOutput(null), { text: '', truncated: false });
+    assert.deepEqual(mod.capBashOutput(undefined), { text: '', truncated: false });
+  });
+});
+
+test('runBashTool caps a real oversized command output and flags it truncated', () => {
+  withFixtureRepo((mod) => {
+    // Real end-to-end through the sandbox: a command whose stdout is deliberately larger
+    // than MAX_BASH_OUTPUT_CHARS. Skips (not fails) when bwrap is unavailable, same
+    // convention as the existing runBashTool test above.
+    const bigLines = mod.MAX_BASH_OUTPUT_CHARS / 2 + 100; // each "y\n" line is 2 chars
+    const result = mod.runBashTool({ command: `yes y | head -n ${bigLines}` });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+      return;
+    }
+    assert.equal(result.truncated, true);
+    assert.ok(result.stdout.length <= mod.MAX_BASH_OUTPUT_CHARS + 200, 'capped, not the full ~ (bigLines*2) chars');
+    assert.match(result.stdout, /truncated: output exceeded/);
+  });
+});
+
 test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
   withFixtureRepo((mod) => {
     const names = mod.WRITE_TOOLS.map((t) => t.function.name).sort();
