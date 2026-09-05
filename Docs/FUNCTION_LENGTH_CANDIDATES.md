@@ -2965,3 +2965,124 @@ Extract three private helpers, each taking only the data it needs and returning 
 
 Benefits:
 Each helper can be unit-tested in isolation: `_validate_merge_request` needs only a fake branch name and a stubbed coordinator-hub client; `_perform_merge` can be exercised against a temporary bare repository without touching the HTTP layer; `_finalize_merge` can be tested with a canned `match` and a mocked notification bus. Code review becomes scoped—a reviewer touching the allowlist logic no longer needs to trace through the lock and push sequence. Future changes (adding a new validation rule, swapping the merge strategy, or adding a webhook notification) each land in exactly one helper, reducing the blast radius of every diff and making the function's control flow immediately legible at a glance.
+
+### AC-33 · Extract install-resolution logic from the dashboard endpoint
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+@app.route("/api/plugins/update", methods=["POST"])
+def api_plugins_update():
+    """Updates one installed plugin to the catalog's latest version: fetch/checkout the
+    new source revision (or npm update), re-run npm install, record the new version +
+    source in plugins.json, and restart the pipeline if it's running."""
+    body = request.get_json(silent=True) or {}
+    plugin_id = (body.get("id") or "").strip()
+    if not plugin_id:
+        abort(400, description="id is required")
+
+    doc, _err = _read_plugin_catalog()
+    catalog_entry = next(
+        (e for e in doc.get("plugins", []) if isinstance(e, dict) and e.get("id") == plugin_id),
+        None,
+    )
+    if catalog_entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not in catalog")
+
+    manifest = _read_plugins_manifest()
+    entry = next(
+        (p for p in manifest if isinstance(p, dict) and p.get("name") == plugin_id),
+        None,
+    )
+    if entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not installed")
+
+    installed_version = entry.get("version")
+    new_version = catalog_entry.get("version")
+    if not (new_version and _version_tuple(new_version) > _version_tuple(installed_version or "")):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "reason": "no update available",
+            "installedVersion": installed_version,
+            "latestVersion": new_version,
+        })
+
+    plugin_dir = _plugins_install_dir() / plugin_id
+    if not plugin_dir.is_dir():
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"plugin checkout not found at {plugin_dir}",
+        }), 404
+
+    source = catalog_entry.get("source") or {}
+    if source.get("type") not in ("git", "npm"):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"unsupported source.type: {source.get('type')!r}",
+        }), 400
+
+    try:
+        if source["type"] == "git":
+            _run_plugin_subprocess(["git", "fetch", "--tags", "--prune"], plugin_dir)
+            candidates = [c for c in (source.get("ref"), new_version) if c]
+            checked_out = False
+            for ref in candidates:
+                try:
+                    _run_plugin_subprocess(["git", "checkout", ref], plugin_dir)
+                    checked_out = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if not checked_out:
+                # No usable ref/tag -- fall back to origin's default branch.
+                out, _ = _run_plugin_subprocess(
+                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], plugin_dir
+                )
+                default_ref = out.strip()
+                if not default_ref:
+                    raise subprocess.CalledProcessError(
+                        1, "git checkout",
+                        stderr="no source.ref, no version tag, and no origin/HEAD default",
+                    )
+                _run_plugin_subprocess(["git", "checkout", default_ref], plugin_dir)
+        else:  # npm
+            pkg = (source.get("url") or "").strip() or plugin_id
+            _run_plugin_subprocess(["npm", "update", pkg], plugin_dir)
+        _run_plugin_subprocess(["npm", "install"], plugin_dir)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        detail = (getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)).strip()
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": "plugin update failed",
+            "detail": detail,
+        }), 500
+
+    entry["version"] = new_version
+    entry["source"] = source
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({
+        "id": plugin_id,
+        "updated": True,
+        "installedVersion": installed_version,
+        "latestVersion": new_version,
+        "restarted": restarted,
+    })
+```
+
+Problem:
+The endpoint handler is 103 lines (three over the 100-line threshold), and while the surrounding guard clauses and lookups are perfectly idiomatic Flask boilerplate, the middle section—version comparison, directory-existence check, source-type dispatch, the npm-path construction, the `npm install` subprocess call with its `try/except`, the manifest write-back, and the pipeline restart—forms a self-contained decision-and-act algorithm. It carries its own branching (four early-exit conditions), its own error semantics (the subprocess exception is caught and converted into a user-facing message), and its own testability concern: verifying "given this manifest state, should we install, and what exactly do we invoke" currently requires spinning up the Flask test client and exercising the full HTTP path. That coupling makes the install logic harder to reason about in code review, harder to unit-test in isolation, and more fragile to future changes (e.g., adding a `pnpm` or `yarn` source type) because every new branch lands inside an already-long handler.
+
+Solution:
+Extract the block from the version-comparison check through the pipeline-restart call into a single private helper, e.g. `_resolve_and_install(manifest_entry, catalog_entry, base_dir) -> tuple[bool, str | None]`. The helper receives the already-fetched manifest and catalog records plus the project's base directory, performs the four guard checks (version match, directory absence, non-npm source type), constructs the correct `npm` invocation path, runs the subprocess inside its own `try/except`, writes the updated manifest, and triggers the pipeline restart. It returns a small result tuple (installed: bool, error_message: str | None) so the endpoint handler can still produce the correct 200/409/500 response. The endpoint handler then shrinks to: parse → validate → two lookups → call `_resolve_and_install` → format the JSON response, bringing it comfortably under the threshold while keeping the HTTP-layer concerns (status codes, response shape) in the handler where they belong.
+
+Benefits:
+The endpoint handler drops to roughly 70–75 lines of straightforward request plumbing, making the HTTP contract immediately visible. The extracted helper is a pure function of its inputs (plus the filesystem/subprocess side-effects it owns), so it can be unit-tested with a mocked `subprocess.run` and a temporary directory tree without any Flask test-client machinery. Adding a new package-manager source type becomes a local change inside one well-named function rather than another branch bolted onto an already-long handler, and code review of that change is scoped to the helper's signature and body instead of requiring the reviewer to track state across 100+ lines of mixed concerns.
