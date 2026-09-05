@@ -803,6 +803,24 @@ test('a streaming turn cut off by done_reason:"length" gets a visible marker app
   });
 });
 
+test('the done_reason:"length" marker names the actual context limit and this turn\'s real token counts, not just a generic notice', async () => {
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'a long answer that got cut off' } },
+      { done: true, done_reason: 'length', prompt_eval_count: 7000, eval_count: 1200 },
+    ],
+  ], async (mod) => {
+    const chunks = [];
+    await mod.runPlanWithTools({ prompt: 'go', onChunk: (t) => chunks.push(t) });
+    const full = chunks.join('');
+    assert.match(full, new RegExp(`${PINNED_NUM_CTX}-token context`));
+    assert.match(full, /~7000 prompt/);
+    assert.match(full, /1200 generated/);
+    assert.match(full, /8200 tokens this turn/, 'prompt + generated, the actual usage reported for this turn');
+  });
+});
+
 test('a streaming turn that ends normally (done_reason:"stop") gets no marker', async () => {
   await withMockedStreamingChat([
     [
