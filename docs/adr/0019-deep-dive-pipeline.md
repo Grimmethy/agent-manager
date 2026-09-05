@@ -86,7 +86,7 @@ unchanged; `review-runner.ps1`'s majority-vote gate reviews the output before an
 reaches the operator, via a new `deep_dive` prompt branch (same pattern as the
 `project_search` empty-result carve-out added this session) — this step has the same
 fabrication risk `project_search` demonstrated live (Ornith inventing detail not
-grounded in the real fetched content), so it inherits the same gate, not a lighter one.
+grounded in the real fetched content), so it inherits the same gate, not a lighter one. The gate's verdict record carries the GUARDRAIL span vocabulary (`span.kind`, `policy.name`, `policy.phase`, `policy.action`, `policy.reason`) defined by AC-8, so a blocked `deep_dive` item is distinguishable in the queue by `policy.action: "deny"` rather than by an ad-hoc status string.
 
 Each action item is rated **Use / Adapt / Ignore** — not `arch_discovery`'s
 Strong/Worth-exploring/Speculative scale, which rates confidence in a *proposed code
