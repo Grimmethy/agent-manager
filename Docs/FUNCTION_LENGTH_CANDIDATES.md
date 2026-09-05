@@ -3240,3 +3240,129 @@ Extract three clearly-named helpers from the existing body, keeping the outer fu
 
 Benefits:
 Once decomposed, each stage can be unit-tested in isolation—validation edge cases, pipeline transformation logic, and output formatting—without exercising the other two stages or their side effects. Code review becomes tractable because a reviewer can evaluate the correctness of each 30–50-line helper independently rather than tracking state across 136 lines. The outer orchestrator's short length makes the overall flow immediately scannable, and future changes to one stage (e.g., adding a new validation rule or swapping the reporting mechanism) are localized to a single function, reducing the risk of accidental cross-stage coupling.
+
+### AC-35 · _start_pipeline mixes env-setup, registry-lookup, GPU-lease cleanup, and process launch
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    record_project_used(raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_INCLUDE_APPLY", "true" if include_apply else "false")
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_SKIP_PUSH", "true" if skip_push else "false")
+
+    # Fix, 2026-07-26 (Grimmethy: "I keep setting the Project tab's path to TaxHarvest,
+    # but it doesn't stick -- navigating away and back reverts to agent-manager"):
+    # get_active_repo_root() checks os.environ FIRST, only falling back to the .env FILE
+    # if unset -- by design, so a project pre-configured via launch.bat's own env vars
+    # wins at startup rather than a stale leftover .env value silently overriding it. But
+    # writing the new path to the file above was never reflected back into THIS already-
+    # running dashboard process's own os.environ, so get_active_repo_root() kept
+    # returning whatever the dashboard happened to be launched with, forever -- no
+    # dashboard restart, no amount of clicking Start Pipeline, would ever change what it
+    # reported as active. Mutating os.environ here keeps the original precedence (an
+    # externally-set env var still wins at the NEXT dashboard restart) while making an
+    # in-dashboard project switch actually take effect and persist for the rest of this
+    # process's lifetime, matching what the Project tab visibly promises.
+    os.environ["AGENT_MANAGER_REPO_ROOT"] = raw_path
+
+    # Fix, 2026-08-20 (Grimmethy: "I'm still only seeing the agent manager and it's clone
+    # [in the Project tab] -- we should be able to select from any of the projects"):
+    # AGENT_MANAGER_PIPELINE_DIR/AGENT_MANAGER_DOMAINS_PATH were NEVER written here at
+    # all -- only REPO_ROOT/INCLUDE_APPLY/SKIP_PUSH were -- so switching to a project with
+    # its own dedicated pipeline dir (several new plugin repos this session each got one,
+    # separate from repoRoot so pipeline internals don't land inside the tracked git repo)
+    # silently kept whatever pipelineDir the PREVIOUSLY active project left behind in the
+    # shared .env, real risk of one project's tasks landing in a completely different
+    # project's live queue. If this repoRoot was already registered (via a prior Start
+    # Pipeline, or set up directly -- see record_project_registry_entry), honor ITS
+    # pipelineDir/domainsPath instead of leaving the stale previous value in place; a
+    # genuinely first-time repo still falls through to the old raw_path-based default
+    # below, unchanged.
+    normalized_raw_path = os.path.normpath(raw_path)
+    existing_registration = next(
+        (e for e in read_project_registry() if os.path.normpath(e.get("repoRoot", "")) == normalized_raw_path),
+        None,
+    )
+    if existing_registration and existing_registration.get("pipelineDir"):
+        write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_PIPELINE_DIR", existing_registration["pipelineDir"])
+        os.environ["AGENT_MANAGER_PIPELINE_DIR"] = existing_registration["pipelineDir"]
+        if existing_registration.get("domainsPath"):
+            write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_DOMAINS_PATH", existing_registration["domainsPath"])
+            os.environ["AGENT_MANAGER_DOMAINS_PATH"] = existing_registration["domainsPath"]
+
+    env_overrides = read_env_file(ENV_FILE_PATH)
+    env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
+    child_env = {**os.environ, **env_overrides}
+
+    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
+
+    # Same pipelineDir/domainsPath resolution _ensure_task_domains just used above --
+    # recorded here so a later brain-dump routing decision can locate THIS project's
+    # queue even after a different project becomes active (project-history.json alone
+    # only ever stored the bare repoRoot).
+    pipeline_dir_for_registry = child_env.get("AGENT_MANAGER_PIPELINE_DIR") or raw_path
+    domains_path_for_registry = child_env.get("AGENT_MANAGER_DOMAINS_PATH") or str(Path(pipeline_dir_for_registry) / "task-domains.json")
+    record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
+
+    # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
+    # PromptForge left behind so the local-model daemons don't yield their ticks to a
+    # generation that isn't the priority anymore (see comfyui_lease_held in
+    # agent-manager-common.sh). scripts/launch.sh does the same on the Linux path; this
+    # also covers the Windows .ps1 path below.
+    _comfy_lease = Path(
+        os.environ.get("AGENT_MANAGER_COMFY_LEASE_PATH")
+        or (Path(os.environ.get("HOME") or "~").expanduser()
+            / ".local/state/agent-manager/comfyui-lease.json")
+    )
+    try:
+        _comfy_lease.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
+
+    if os.name != "nt":
+        import platform, subprocess as sp, shlex
+        LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+        launch_py = str(PACKAGE_ROOT / 'scripts' / 'launch.sh')
+        if not Path(launch_py).is_file():
+            return {"started": False, "reason": f"{launch_py} missing; cannot start daemons on Linux without a working launch script."}
+        subprocess.Popen(
+            ["bash", launch_py],
+            env=child_env,
+            cwd=str(PACKAGE_ROOT),
+            stdout=(LOG_DIR / 'launch-python.log').open('a'),
+            stderr=sp.STDOUT,
+            start_new_session=True,
+        )
+        return {"started": True, "repoRoot": raw_path}
+
+    creationflags = subprocess.CREATE_NEW_CONSOLE
+    scripts = [
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "local-worker.ps1"), "-InstanceId", "worker-1"], "Local Worker 1"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Local Review Runner"),
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
+    ]
+    if include_apply:
+        scripts.insert(2, (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"))
+
+    for args, _label in scripts:
+        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
+
+    return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+```
+
+Problem:
+`_start_pipeline` is 108 lines and, after stripping the two dated bug-fix comment blocks (2026-07-26 and 2026-08-20), still carries at least four separable responsibilities that were accreted over time: (a) writing three values to `.env` and mirroring `REPO_ROOT` into the live `os.environ`; (b) reading the project registry, conditionally writing `PIPELINE_DIR` and `DOMAINS_PATH`, building a `child_env` dict, calling `_ensure_task_domains`, and recording a registry entry; (c) unlinking the ComfyUI GPU-lease file; and (d) actually spawning the pipeline subprocess. These pieces have different failure modes (filesystem I/O, registry consistency, GPU-state cleanup, process management) and different testability profiles, yet they are interleaved in a single linear body. The two bolted-on fix comments are themselves evidence that the function has grown past a single cohesive concern: each fix had to be threaded into the middle of the existing logic rather than added to a focused helper.
+
+Solution:
+Extract three helpers, each called from the top of `_start_pipeline` in order: (1) `_write_env_and_mirror(repo_root: Path) -> None` – owns the `.env` writes and the `os.environ["REPO_ROOT"]` assignment; (2) `_resolve_project_context(project_id: str) -> dict` – owns the registry read, the conditional `PIPELINE_DIR`/`DOMAINS_PATH` writes, the `child_env` construction, the `_ensure_task_domains` call, and the registry-entry record, returning the `child_env` dict; (3) `_release_gpu_lease() -> None` – owns the ComfyUI lease-file unlink and its error handling. The remaining body of `_start_pipeline` then reduces to: call the three helpers in sequence, assemble the final `subprocess.Popen` arguments, and launch. Each helper is 15-30 lines, independently unit-testable, and can be modified (e.g., adding a new env var, changing registry schema) without re-reading the full 108-line body.
+
+Benefits:
+Readability: a reviewer scanning the 108-line function now sees a four-line "orchestration" body plus three clearly-named calls, making the control flow and ordering constraints immediately visible. Testability: `_resolve_project_context` can be unit-tested with a mocked registry without touching `.env` or the GPU-lease path; `_release_gpu_lease` can be tested in isolation with a temp file; `_write_env_and_mirror` can be tested against a temp directory. Review-ability: a future fix to the registry logic (the 2026-08-20 class of change) becomes a diff confined to one ~25-line function instead of a patch threaded through the middle of a 108-line body, reducing the chance of accidentally disturbing the env-setup or lease-cleanup code.
