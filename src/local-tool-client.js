@@ -618,6 +618,23 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
 // regenerate it (a fresh sample can easily come out with content this time, or a
 // properly-closed think block) can.
 const CHAT_FLAKE_MAX_ATTEMPTS = 3;
+
+// 2026-09-05 (Chat panel "silently empty replies", Grimmethy): a SECOND, distinct flake
+// class from the "no user query" one above -- a local-model turn can come back with NO
+// exception, NO tool_calls, and blank/whitespace-only content (a genuine bad sample, not
+// Ollama's renderer bug). Confirmed live: chat-1788141775-d4be8f54's transcript has seven
+// separate turns with a literal empty assistant reply. Before this fix, runPlanWithTools's
+// own "no tool calls -> return this as the final answer" branch treated that blank exactly
+// like a real, considered final answer -- no retry, no explanation, nothing. Classified as
+// a flake in chatTurnWithFlakeRecovery below so it gets the exact same recovery chain the
+// "no user query" bug already gets: resample within CHAT_FLAKE_MAX_ATTEMPTS, then roll
+// back and regenerate the prior turn, then gracefully degrade with an explainer note if
+// real content already streamed, then a genuine thrown error on an unrecoverable first turn
+// -- never a silent ''.
+function isEmptyCompletion(message) {
+  const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+  return !hasToolCalls && !(message.content || '').trim();
+}
 // Bounded separately from CHAT_FLAKE_MAX_ATTEMPTS -- each rollback re-asks the model to
 // redo a whole prior turn (a real generation, not a cheap resend), so this stays small.
 const MAX_ROLLBACK_ATTEMPTS = 2;
@@ -642,9 +659,10 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 }
 
 // Runs one /api/chat turn with the two-layer recovery this call path needs for Ollama's
-// "no user query found in messages" renderer bug (see CHAT_FLAKE_MAX_ATTEMPTS' comment):
-// retry the identical call CHAT_FLAKE_MAX_ATTEMPTS times first, then -- since that error
-// is baked into stored history and a plain retry can never clear it -- roll the
+// "no user query found in messages" renderer bug (see CHAT_FLAKE_MAX_ATTEMPTS' comment)
+// AND the empty-completion flake class (see isEmptyCompletion's own comment): retry the
+// identical call CHAT_FLAKE_MAX_ATTEMPTS times first, then -- since the "no user query"
+// shape is baked into stored history and a plain retry can never clear it -- roll the
 // conversation back to the START of the prior turn (up to MAX_ROLLBACK_ATTEMPTS times) so
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
@@ -658,6 +676,10 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
+        if (isEmptyCompletion(turnRes.message)) {
+          attemptErr = new Error('local model returned an empty completion (no content, no tool calls)');
+          continue;
+        }
         message = turnRes.message;
         usage = turnRes.usage;
         attemptErr = null;
@@ -852,6 +874,25 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   let hardNudgeFired = false;
   const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
 
+  // 2026-09-05 (Chat panel "stalls after declaring a tool call", Grimmethy): a real,
+  // repeatedly-confirmed local-model failure mode -- confirmed live via the Chat panel's
+  // own transcript (chat-1788141775-d4be8f54) and self-diagnosed by the model itself
+  // ("I was announcing the read without making the call", "I keep announcing and not
+  // calling"): a turn's content narrates an intended action ("Let me check the file...")
+  // with NO tool_calls actually attached to that completion. Before this fix, the
+  // no-tool-calls branch just below always treated that as the finished final answer --
+  // one bad sample from Ollama permanently ends the whole run right there, with the user
+  // seeing "let me check X" and then nothing. Applies to every runPlanWithTools caller
+  // (not just Chat) since it's the same underlying model behavior wherever it shows up --
+  // deliberately not gated behind a caller opt-in flag the way nudgeToEditEarly is.
+  // Bounded to MAX_NARRATION_NUDGES so a persistently narrating model still terminates
+  // (accepting the narration as-is, exactly today's pre-fix behavior) rather than nudging
+  // forever.
+  let narrationNudges = 0;
+  const NARRATION_WITHOUT_TOOL_CALL_RE = /\b(let me|let's|i'll|i will|i'm going to|i am going to)\s+(check|verify|look\s+(at|into)|read|search|find|investigate|explore|examine|confirm|dig\s+into|see|grep|scan)\b/i;
+  const MAX_NARRATION_NUDGES = 2;
+  const NARRATION_NUDGE_MESSAGE = 'You just described taking an action ("let me check/look at/read/..." or similar) without actually calling the corresponding tool in this same turn. Either make the real tool call right now, or -- if you already have everything you need -- give your complete final answer now with no further hedging. Do not describe an action again without also calling it.';
+
   for (let turn = 0; turn < maxTurns; turn++) {
     turnsUsed = turn + 1;
     turnStartLengths.push(messages.length);
@@ -901,6 +942,17 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const toolCalls = message.tool_calls || [];
     if (toolCalls.length === 0) {
       const content = message.content || '';
+      // Narrated-but-uncalled action: give the model one (bounded) chance to actually
+      // call the tool it just described, or produce a real final answer, instead of
+      // silently accepting the narration as the finished response. Checked FIRST, ahead
+      // of forceSummaryOnCap below -- a narrated action is a more specific, more
+      // correctable case than "ended early with no RESOLUTION line."
+      if (narrationNudges < MAX_NARRATION_NUDGES && turn < maxTurns - 1
+          && NARRATION_WITHOUT_TOOL_CALL_RE.test(content)) {
+        narrationNudges += 1;
+        messages.push({ role: 'user', content: NARRATION_NUDGE_MESSAGE });
+        continue;
+      }
       // forceSummaryOnCap, voluntary-stop case (bra-1788142124203 follow-up): the model can
       // also just END early -- a final no-tools message well before the cap -- without ever
       // writing a RESOLUTION: line. resolveAgenticDraft reads that exactly as fatally as a

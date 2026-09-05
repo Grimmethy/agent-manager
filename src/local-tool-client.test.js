@@ -446,6 +446,69 @@ test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the k
   }, { killSwitch: '.arch-discovery-tools-disabled' });
 });
 
+// --- empty-completion flake recovery + narration-nudge (2026-09-05, Chat panel "stalls
+// after declaring a tool call") ------------------------------------------------------
+
+test('runPlanWithTools resamples past an empty completion (no content, no tool_calls) instead of returning it as the final answer', async () => {
+  const empty = { role: 'assistant', content: '' };
+  await withMockedChat([empty, empty, { role: 'assistant', content: 'real answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5 });
+    assert.equal(result.response, 'real answer', 'must not settle for the two blank samples that came first');
+    assert.equal(result.turnsUsed, 1, 'the empty resamples happen inside ONE outer turn, not three');
+  });
+});
+
+test('runPlanWithTools rejects (does not silently return blank) when the FIRST turn never recovers from empty completions', async () => {
+  // CHAT_FLAKE_MAX_ATTEMPTS is 3 -- three empty samples in a row exhausts the retry budget,
+  // and there is no prior lastMessage (this is the very first turn) to gracefully degrade to.
+  const empty = { role: 'assistant', content: '' };
+  await withMockedChat([empty, empty, empty], async (mod) => {
+    await assert.rejects(
+      () => mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5 }),
+      /empty completion/i,
+    );
+  });
+});
+
+test('runPlanWithTools gracefully degrades (does not silently return blank) when a LATER turn never recovers from empty completions', async () => {
+  const realFirstTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const empty = { role: 'assistant', content: '' };
+  await withMockedChat([realFirstTurn, empty, empty, empty], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5 });
+    assert.match(result.response, /lost the connection/i, 'degrades with the existing flake explainer note, same as the "no user query" bug\'s degrade path');
+  });
+});
+
+test('runPlanWithTools nudges once when the model narrates an action without calling the tool, then accepts the real follow-up answer', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'Let me check the file for you.' },
+    { role: 'assistant', content: 'Confirmed, done.' },
+  ], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'investigate X', maxTurns: 5 });
+    assert.equal(result.response, 'Confirmed, done.', 'the narration itself must never be returned as the final answer');
+    assert.equal(result.turnsUsed, 2, 'the nudge consumes one real turn from the budget');
+    const secondCallMessages = sentBodies[1].messages;
+    assert.match(secondCallMessages[secondCallMessages.length - 1].content, /without actually calling/i);
+  });
+});
+
+test('runPlanWithTools caps narration nudges at MAX_NARRATION_NUDGES then accepts the narration as final rather than nudging forever', async () => {
+  const narrated = { role: 'assistant', content: "Let me look into that." };
+  await withMockedChat([narrated, narrated, narrated], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5 });
+    assert.equal(result.response, 'Let me look into that.', 'after the cap, the narration is accepted rather than nudged a third time');
+    assert.equal(result.turnsUsed, 3, 'two nudged turns plus the one that was finally accepted');
+  });
+});
+
+test('runPlanWithTools does not nudge normal, non-narrating final content (regression guard on the existing no-tool-calls path)', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi' });
+    assert.equal(result.response, 'here is the answer');
+    assert.equal(result.turnsUsed, 1);
+  });
+});
+
 // --- multi-root (2026-08-31, system-wide Chat panel) ---------------------------------
 
 test('resolveInsideRoots: a relative path resolves against the primary (first) root', () => {
