@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const { sweep } = require('./side-finding-sweep.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
+const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 
 function tmpPipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'side-finding-sweep-'));
@@ -156,4 +157,56 @@ test('batch cap: only up to BATCH_CAP items are processed in one tick', async ()
   assert.equal(s.scanned, BATCH_CAP);
   const remaining = fs.readdirSync(path.join(dir, 'queue', 'side-findings-inbox')).length;
   assert.equal(remaining, 5, 'the items beyond the cap must be left for the next tick');
+});
+
+test('a paraphrased finding sharing a distinctive title phrase merges even though its full-text Jaccard similarity is under threshold (the real bug: ~30 duplicates landed in one evening before this fix)', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox(
+    {
+      title: 'Duplicate-instance race is still unfixed in code',
+      body: "The CONTEXT.md notes the duplicate-instance bug was root-caused on 2026-07-19 but not yet fixed in code. If a fix hasn't landed since, the queue-watchdog auto-restart path remains a live data-corruption risk for any in-flight claim.",
+    },
+    { source: 'project_search', taskId: 'ps-1', pipelineDir: dir },
+  );
+  await sweep({ pipelineDir: dir });
+
+  writeSideFindingInbox(
+    {
+      title: 'Duplicate-instance race has no code fix as of 2026-07-19',
+      body: 'The CONTEXT.md notes the duplicate-instance root cause (manual restart racing queue-watchdog) was identified on 2026-07-19 but not yet fixed in code. If the fix is still pending, the heartbeat file is a single-writer assumption.',
+    },
+    { source: 'project_search', taskId: 'ps-2', pipelineDir: dir },
+  );
+  const s = await sweep({ pipelineDir: dir });
+
+  // Sanity check this is a real reproduction of the reported bug, not a strawman -- uses
+  // the EXACT same title+body text passed to writeSideFindingInbox above.
+  const bodyA = normalizeTokens("Duplicate-instance race is still unfixed in code The CONTEXT.md notes the duplicate-instance bug was root-caused on 2026-07-19 but not yet fixed in code. If a fix hasn't landed since, the queue-watchdog auto-restart path remains a live data-corruption risk for any in-flight claim.");
+  const bodyB = normalizeTokens('Duplicate-instance race has no code fix as of 2026-07-19 The CONTEXT.md notes the duplicate-instance root cause (manual restart racing queue-watchdog) was identified on 2026-07-19 but not yet fixed in code. If the fix is still pending, the heartbeat file is a single-writer assumption.');
+  assert.ok(jaccardSimilarity(bodyA, bodyB) < 0.6, 'sanity: this pair genuinely fails the plain Jaccard threshold');
+
+  assert.equal(s.merged, 1, 'must merge via the shared distinctive phrase, not create a second entry');
+  assert.equal(s.created, 0);
+  const data = readBrainDump(dir);
+  assert.equal(data.entries.length, 1);
+  assert.equal(data.entries[0].count, 2);
+  assert.deepEqual(data.entries[0].seenIn, ['ps-1', 'ps-2']);
+});
+
+test('two genuinely different findings sharing generic vocabulary but no distinctive phrase still file as separate entries', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox(
+    { title: 'Duplicate-instance race is still unfixed in code', body: 'The CONTEXT.md notes this was root-caused but not yet fixed in code, a real risk.' },
+    { source: 'project_search', pipelineDir: dir },
+  );
+  await sweep({ pipelineDir: dir });
+  writeSideFindingInbox(
+    { title: 'Stranded-claim detection is a known blind spot with no automated fix', body: 'The CONTEXT.md notes this is not yet fixed in code and remains a real risk for the pipeline.' },
+    { source: 'project_search', pipelineDir: dir },
+  );
+  const s = await sweep({ pipelineDir: dir });
+
+  assert.equal(s.created, 1, 'genuinely different findings must not merge just because they share generic pipeline vocabulary');
+  const data = readBrainDump(dir);
+  assert.equal(data.entries.length, 2);
 });
