@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import build_graph  # noqa: E402
 import visualize_graph  # noqa: E402
 
-import hardware_stats
+import plugin_process_manager
 
 app = Flask(__name__)
 # Re-reads templates/index.html per-request instead of caching it at first load -- the
@@ -6480,8 +6480,12 @@ def _write_plugins_manifest(entries: list) -> None:
 
 @app.route("/api/plugins")
 def api_plugins():
+    manifest = _read_plugins_manifest()
+    for p in manifest:
+        if p.get("slot"):
+            p["running"] = plugin_process_manager.is_running(p["name"])
     return jsonify({
-        "plugins": _read_plugins_manifest(),
+        "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
     })
 
@@ -7178,11 +7182,79 @@ def _is_loopback_host(host: str) -> bool:
 
 
 # --- Decomposed route blueprints (file-decompose) ---
-from routes.hardware import hardware_bp  # noqa: E402
 from routes.reports import reports_bp  # noqa: E402
 
-app.register_blueprint(hardware_bp)
 app.register_blueprint(reports_bp)
+
+
+@app.route("/api/hardware/stats")
+def api_hardware_stats():
+    # Hardware is now a swappable plugin slot (2026-09-05) -- this route is a thin
+    # same-origin proxy to whichever plugin is currently active for "hardware-tab" in
+    # plugins.json, same urllib.request.urlopen(..., timeout=3) + broad except ->
+    # degraded-but-200 pattern api_tokenfold_stats() already uses just above, rather
+    # than raising or 500ing when no plugin is running.
+    import urllib.request
+
+    manifest = _read_plugins_manifest()
+    active = next(
+        (p for p in manifest if p.get("slot") == "hardware-tab" and p.get("active")),
+        None,
+    )
+    if active is None:
+        return jsonify({"available": False})
+    try:
+        with urllib.request.urlopen(f"{active['url']}/api/hardware/stats", timeout=3) as r:
+            data = json.loads(r.read().decode())
+        return jsonify({"available": True, "plugin": active["name"], **data})
+    except Exception:
+        return jsonify({"available": False, "plugin": active["name"]})
+
+
+@app.route("/api/plugins/select-slot", methods=["POST"])
+def api_plugins_select_slot():
+    # One-click switch for a slotted plugin (e.g. "hardware-tab"): stops whichever
+    # same-slot entry is currently active (if different), starts the newly selected
+    # one, and persists exactly one active:true per slot -- name omitted/None is the
+    # explicit "None (stop monitoring)" state, leaving the slot with nothing active.
+    body = request.get_json(silent=True) or {}
+    slot = (body.get("slot") or "").strip()
+    name = body.get("name") or None
+    manifest = _read_plugins_manifest()
+    for p in manifest:
+        if p.get("slot") == slot and p.get("active") and p.get("name") != name:
+            plugin_process_manager.stop(p["name"])
+            p["active"] = False
+    started = healthy = False
+    if name:
+        target = next((p for p in manifest if p.get("name") == name and p.get("slot") == slot), None)
+        if target is None:
+            abort(404, description=f"no plugin named '{name}' in slot '{slot}'")
+        started = plugin_process_manager.start(target)
+        target["active"] = started
+        if started:
+            healthy = _wait_for_plugin_health(target)
+    _write_plugins_manifest(manifest)
+    return jsonify({"slot": slot, "name": name, "started": started, "healthy": healthy})
+
+
+def _wait_for_plugin_health(entry: dict, timeout_s: float = 5.0) -> bool:
+    # Bounded poll, same "never let a check block forever" shape launch.sh's own
+    # TokenFold /healthz wait loop uses (20 attempts x 0.25s = 5s).
+    import urllib.request
+
+    health_path = (entry.get("process") or {}).get("healthPath", "/healthz")
+    url = f"{entry['url']}{health_path}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
 
 
 if __name__ == "__main__":
@@ -7252,10 +7324,5 @@ if __name__ == "__main__":
     # shape as _run_build's own background thread; see _chat_reservation_watchdog's own
     # docstring for why this has to be built here rather than reused from elsewhere.
     threading.Thread(target=_chat_reservation_watchdog, daemon=True).start()
-    # Hardware stats sampler -- 10s interval, 24h retention (Grimmethy, 2026-08-24): the
-    # module's own start_sampler() already implements the sleep-and-sweep loop (same
-    # daemon=True shape as _chat_reservation_watchdog above), it just wasn't called from
-    # anywhere yet. /api/hardware/stats reads whatever this thread has persisted.
-    hardware_stats.start_sampler(interval_seconds=10, retention_hours=24)
 
     app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True, ssl_context=ssl_context)

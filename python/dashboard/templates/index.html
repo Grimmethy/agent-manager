@@ -3528,8 +3528,10 @@ async function renderPluginsTab() {
     main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
     return;
   }
-  const plugins = data.plugins || [];
-  const rows = plugins.map((p) => {
+  const slotted = plugins => plugins.filter((p) => p.slot);
+  const unslotted = plugins => plugins.filter((p) => !p.slot);
+  const allPlugins = data.plugins || [];
+  const rows = unslotted(allPlugins).map((p) => {
     const enabled = p.enabled !== false;
     return `
       <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
@@ -3544,8 +3546,42 @@ async function renderPluginsTab() {
       </div>`;
   }).join('');
 
+  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
+  // independent checkboxes, since exactly one (or none) actually runs at a time and
+  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+  const slotGroups = {};
+  slotted(allPlugins).forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
+  const slotSections = Object.entries(slotGroups).map(([slot, members]) => {
+    const radioName = `slot-${slot}`;
+    const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
+    const options = [`
+      <label style="display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="" ${noneChecked}>
+        <span>None (stop monitoring)</span>
+      </label>`, ...members.map((m) => {
+      const badge = m.running
+        ? '<span class="badge ok" style="margin-left:6px;">running</span>'
+        : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
+      return `
+      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
+        <span>
+          <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>
+          ${m.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(m.description)}</div>` : ''}
+        </span>
+      </label>`;
+    })];
+    return `
+      <div style="padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
+        <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
+        <div class="meta slot-status" style="margin-top:6px;"></div>
+      </div>`;
+  }).join('');
+
   main.innerHTML = `
     <h2 style="margin-top:0;">Plugins</h2>
+    ${slotSections}
     <div class="meta" style="margin-bottom:14px;">
       Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
       in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
@@ -3564,6 +3600,33 @@ async function renderPluginsTab() {
     <h3 style="margin-top:22px;">Available plugins</h3>
     <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
     <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+
+  main.querySelectorAll('.slot-radio').forEach((radio) => {
+    radio.onchange = async () => {
+      const slot = radio.dataset.slot;
+      const name = radio.value || null;
+      const group = main.querySelector(`#slot-group-${slot}`);
+      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
+      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
+      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
+      try {
+        const r = await fetch('/api/plugins/select-slot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slot, name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.description || r.status);
+        if (name && !body.healthy) {
+          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
+        }
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not switch plugin: ' + e.message);
+        await renderPluginsTab();
+      }
+    };
+  });
 
   main.querySelectorAll('.plugin-toggle').forEach((cb) => {
     cb.onchange = async () => {
@@ -4290,6 +4353,16 @@ function renderSparkline(history, getValue, avg, label) {
 async function renderHardwareTab() {
   const main = document.getElementById('main');
   const data = await fetchJson('/api/hardware/stats');
+  // Hardware is a swappable plugin slot (2026-09-05) -- "available: false" means no
+  // plugin is currently active/running for it, distinct from a plugin running but
+  // still warming up its first sample (which instead shows normally with nulls/no
+  // history yet, same as before this change).
+  if (data.available === false) {
+    main.innerHTML = `
+      <div class="empty">Hardware monitoring is off -- pick a plugin on the
+        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+    return;
+  }
   const cur = data.current || {};
   const avg = data.averages || {};
   const history = data.history || [];
@@ -4316,6 +4389,27 @@ async function renderHardwareTab() {
       ${tempStat('CPU', cur.cpuTemperatureCelsius, avg.cpuTemperatureCelsius)}
       ${gpu ? tempStat('GPU', gpu.temperatureCelsius, avg.gpuTemperatureCelsius) : ''}
     </div>
+
+    ${(cur.power || (cur.runaways && cur.runaways.length)) ? `
+    <div class="field-label">Power &amp; runaway processes</div>
+    <div class="stat-row">
+      ${cur.power && cur.power.packageWatts != null
+        ? `<div class="stat"><strong>${cur.power.packageWatts.toFixed(1)} W</strong>package power${avg.powerPackageWatts != null ? ` (24h avg ${avg.powerPackageWatts.toFixed(1)} W)` : ''}</div>`
+        : ''}
+    </div>
+    ${cur.power && cur.power.rails && cur.power.rails.length ? `
+    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+      ${cur.power.rails.map(r => `
+        <tr><td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(r.name)}</td>
+            <td class="meta" style="padding:2px 0;">${r.watts.toFixed(2)} W</td></tr>`).join('')}
+    </table>` : ''}
+    ${cur.runaways && cur.runaways.length ? `
+    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+      ${cur.runaways.map(a => `
+        <tr><td class="meta" style="padding:2px 8px 2px 0; color:var(--bad);">pid ${a.pid}</td>
+            <td class="meta" style="padding:2px 0;">${escapeHtml(a.headline)}</td></tr>`).join('')}
+    </table>` : `<div class="meta" style="margin-top:6px;">No runaway processes detected.</div>`}
+    ` : ''}
 
     <div class="field-label">CPU temperature -- last 24h</div>
     ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
