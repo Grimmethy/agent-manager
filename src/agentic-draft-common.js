@@ -133,8 +133,8 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
 }
 
 function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
-  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { console.warn('cleanupAdhocWorktree: failed to remove worktree', worktreeDir, e.message); }
-  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { console.warn('cleanupAdhocWorktree: failed to delete branch', branchName, e.message); }
+  try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { console.error('[draft-cleanup] git worktree remove', worktreeDir, e.message, e.stack); }
+  try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { console.error('[draft-cleanup] git branch -D', branchName, e.message, e.stack); }
 }
 
 // Convenience: prepare -> run -> resolve -> cleanup for one agentic draft. `runInWorktree`
