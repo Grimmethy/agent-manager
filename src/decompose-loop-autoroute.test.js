@@ -30,6 +30,31 @@ test('targetOversizedFile: matches the flagged path named in the task text', () 
   assert.equal(targetOversizedFile({ title: 'x', promptContext: { rawText: 'edit src/y.js' } }, oversized), null);
 });
 
+test('targetOversizedFile: an oversized file named ONLY in a verification/compile command is not the target', () => {
+  const oversized = new Set(['python/dashboard/app.py']);
+  const t = {
+    title: 'Add test_plugins_update.py with no-change and version-bumped cases',
+    promptContext: {
+      rawText: 'Create python/dashboard/test_plugins_update.py mirroring test_plugins_marketplace.py. '
+        + 'Run: python3 -m py_compile python/dashboard/app.py python/dashboard/test_plugins_update.py and '
+        + 'python3 -m unittest python.dashboard.test_plugins_update.',
+    },
+  };
+  assert.equal(targetOversizedFile(t, oversized), null);
+});
+
+test('targetOversizedFile: a verification-command mention does not shadow a REAL mention elsewhere', () => {
+  const oversized = new Set(['python/dashboard/app.py']);
+  const t = {
+    title: 'Split app.py',
+    promptContext: {
+      rawText: 'Split python/dashboard/app.py into smaller modules; it is too large to edit safely. '
+        + 'Run: python3 -m py_compile python/dashboard/app.py to verify it still compiles.',
+    },
+  };
+  assert.equal(targetOversizedFile(t, oversized), 'python/dashboard/app.py');
+});
+
 const STUCK = (over = true) => ({
   id: 'adhoc-add-job-stage-groups-table-1788382532092-0',
   domain: 'adhoc', source: 'manual', title: 'Add JOB_STAGE_GROUPS table + collapsed rows',
