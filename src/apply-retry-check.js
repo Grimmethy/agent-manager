@@ -44,7 +44,7 @@ function isApplyFailure(task) {
 }
 
 function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultRecordModelOutcome }) {
-  const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
+  const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] };
   let names = [];
   try {
     names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
@@ -54,6 +54,7 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
 
   for (const name of names) {
     const filePath = path.join(blockedDir, name);
+    let step = 'write';
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       if (!raw) continue;
@@ -86,10 +87,14 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
       const newPath = path.join(pendingDir, name);
       fs.mkdirSync(pendingDir, { recursive: true });
       fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+      step = 'unlink';
       fs.unlinkSync(filePath);
       summary.requeued++;
     } catch (e) {
       summary.errors++;
+      const detail = { task: name, step, message: e.message, code: e.code ?? null };
+      summary.errorDetails.push(detail);
+      console.error(JSON.stringify(detail));
     }
   }
 
