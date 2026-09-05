@@ -1497,6 +1497,38 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   }
   task.implementResponse = implResult.response;
 
+  // A source can register a `postImplementCheck(task, implementResponse, {call,
+  // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
+  // above but for the implement pass's OWN output rather than a candidate-fulfillment
+  // split decision. Catches a draft that hallucinates a detail contradicting its own real
+  // grounding BEFORE it burns a full local review vote round on something already doomed
+  // to be rejected for exactly that reason (function-length-grounding-check.js in the
+  // hygiene plugin, 2026-09-05: 8 of 9 blocked function_length_review tasks shared this
+  // exact shape -- "proposes extracting X, but the grounding source shows Y"). Routes an
+  // ungrounded verdict into the SAME blockedStage:'review' path a real review rejection
+  // takes -- reject-retry-check.js's existing, already-proven redraft/priorRejectionFeedback/
+  // exhaustion machinery handles everything from here, unchanged; this hook only decides
+  // WHETHER a rejection happens; never invents a new one.
+  const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
+    let grounding;
+    try {
+      grounding = await postImplementEntry.postImplementCheck(task, task.implementResponse, { call: resolvedLocalCall, maybeLockedOn: ctx.maybeLockedOn });
+    } catch (e) {
+      grounding = null; // advisory -- a throwing check must never block a real draft
+    }
+    if (grounding && grounding.verdict === 'ungrounded') {
+      const blockedReason = `Ungrounded draft: ${String(grounding.reason || '(no detail)')}`.slice(0, 500);
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+      appendHistoryEvent(task, 'blocked', blockedReason);
+      task.blockedStage = 'review';
+      task.blockedReason = blockedReason;
+      task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      task.priorRejectionFeedback.push(blockedReason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+    }
+  }
+
   // Deterministic find-verification retry (see findUnverifiedEdit's own header) --
   // ONLY for the five candidate-fulfillment sources, which are the only ones with
   // fetchedFiles to verify against. Bounded to a single retry, same "one real second

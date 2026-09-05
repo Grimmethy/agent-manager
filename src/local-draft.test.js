@@ -1526,6 +1526,111 @@ test('draftTask honors a split when the source\'s premiseCheck throws (advisory 
   });
 });
 
+// --- generic postImplementCheck hook (function-length-grounding-check.js's call site) --
+// A non-candidate-fulfillment source: postImplementCheck runs for ANY source that
+// registers it, not just the five candidate-fulfillment ones premiseCheck is scoped to.
+
+test('draftTask blocks a draft as a review rejection when the source\'s postImplementCheck returns ungrounded', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('post_implement_check_ungrounded_source')) {
+      registerTaskSource('post_implement_check_ungrounded_source', {
+        priority: 80, next: () => null,
+        postImplementCheck: async () => ({ verdict: 'ungrounded', reason: 'the real function never calls finalizePlanPass' }),
+      });
+      updateTaskSource('post_implement_check_ungrounded_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'post-implement-ungrounded-1', domain: 'default', source: 'post_implement_check_ungrounded_source', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'a genuine-looking but ungrounded candidate', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, 'review');
+    assert.match(task.blockedReason, /Ungrounded draft: the real function never calls finalizePlanPass/);
+    assert.deepEqual(task.priorRejectionFeedback, [task.blockedReason]);
+    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /Ungrounded draft/);
+  });
+});
+
+test('draftTask proceeds normally when the source\'s postImplementCheck returns ok', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('post_implement_check_ok_source')) {
+      registerTaskSource('post_implement_check_ok_source', {
+        priority: 80, next: () => null,
+        postImplementCheck: async () => ({ verdict: 'ok' }),
+      });
+      updateTaskSource('post_implement_check_ok_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'post-implement-ok-1', domain: 'default', source: 'post_implement_check_ok_source', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'a well-grounded candidate', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask proceeds normally when the source has no postImplementCheck registered (regression guard)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'post-implement-none-1', domain: 'default', source: 'observability_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'a candidate', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask proceeds normally when the source\'s postImplementCheck throws (advisory -- never blocks a real draft on its own failure)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('post_implement_check_throws_source')) {
+      registerTaskSource('post_implement_check_throws_source', {
+        priority: 80, next: () => null,
+        postImplementCheck: async () => { throw new Error('model call timed out'); },
+      });
+      updateTaskSource('post_implement_check_throws_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'post-implement-throws-1', domain: 'default', source: 'post_implement_check_throws_source', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'a candidate', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
 test('draftTask blocks a candidate-fulfillment source that says mode "split" but does not follow through with well-formed sub-candidates', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {
