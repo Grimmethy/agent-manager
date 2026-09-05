@@ -46,7 +46,13 @@ const MAX_FETCHED_FILE_CHARS = 8000;
 const MAX_FETCHED_FILE_TOTAL_CHARS = 22000;
 const MIN_REGION_CHARS = 1400;
 const MAX_ANCHOR_REGIONS = 5;
-const MAX_ANCHOR_OCCURRENCES = 5; // a symbol appearing more than this is too generic to anchor on
+// a symbol appearing more than this is too generic to anchor on with real confidence --
+// but see collectAnchorHits' rank-3 fallback below: dropping it entirely (the original
+// behavior) let observability-fix-ac-111 (2026-09-04) reproduce the exact same 22,000-char
+// noise window on every retry, because every other candidate symbol occurred >5 times in
+// the real 7333-line file and the ONLY hits left standing were two false positives that
+// windowFetchedFileContent then spread across the whole shared budget as if confident.
+const MAX_ANCHOR_OCCURRENCES = 5;
 const MIN_ANCHOR_SYMBOL_CHARS = 4;
 
 // Backtick-quoted spans in a candidate's Problem/Solution prose -- review-task.js's own
@@ -210,7 +216,15 @@ function collectAnchorHits(content, section) {
       occ.push(i);
       from = i + symbol.length;
     }
-    if (occ.length === 0 || occ.length > MAX_ANCHOR_OCCURRENCES) continue;
+    if (occ.length === 0) continue;
+    if (occ.length > MAX_ANCHOR_OCCURRENCES) {
+      // Too generic to trust as a real anchor, but a weak/last-resort single-window
+      // fallback beats blind head-truncation -- rank 3 is never eligible for the
+      // multi-region path (see windowFetchedFileContent), only its zero-strong-hits
+      // fallback.
+      push(occ[0], symbol.length, 3);
+      continue;
+    }
     for (const i of occ) push(i, symbol.length, 1);
   }
 
@@ -227,24 +241,59 @@ function collectAnchorHits(content, section) {
   return hits.sort((a, b) => a.rank - b.rank || a.index - b.index);
 }
 
-function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
-  if (content.length <= maxChars) return content;
+const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable anchor found '
+  + "for this candidate's cited code -- this window is a best-effort guess and may not "
+  + 'contain the real target. If you cannot find the described code here, respond with a '
+  + 'clarification request rather than guessing.]\n';
 
-  const hits = collectAnchorHits(content, section).slice(0, MAX_ANCHOR_REGIONS);
-  if (hits.length === 0) {
-    return `${content.slice(0, maxChars)}\n...[truncated]`;
+// Returns { text, confidence, anchorCount, usedSnippetFuzzyMatch }. confidence is
+// 'strong' (a real rank 0/1/2 hit anchored the window), 'weak' (only the rank-3
+// too-generic-to-trust fallback fired), or 'none' (flat head-truncation, no hits at all).
+// usedSnippetFuzzyMatch is true only when the frozen candidate Snippet still fuzzy-matches
+// the CURRENT file content (rank 0) -- this is the "has grounding gone stale since this
+// task was generated" signal context-trim-sweep.js re-checks on every retry.
+function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
+  if (content.length <= maxChars) {
+    return { text: content, confidence: 'strong', anchorCount: 0, usedSnippetFuzzyMatch: false };
   }
-  if (hits.length === 1) {
-    return windowAroundIndex(content, hits[0].index, hits[0].length, maxChars);
+
+  const allHits = collectAnchorHits(content, section);
+  const usedSnippetFuzzyMatch = allHits.some((h) => h.rank === 0);
+  const strongHits = allHits.filter((h) => h.rank < 3).slice(0, MAX_ANCHOR_REGIONS);
+
+  if (strongHits.length === 0) {
+    const weakHit = allHits.find((h) => h.rank === 3);
+    if (weakHit) {
+      return {
+        text: LOW_CONFIDENCE_GROUNDING_NOTE + windowAroundIndex(content, weakHit.index, weakHit.length, maxChars),
+        confidence: 'weak',
+        anchorCount: 1,
+        usedSnippetFuzzyMatch: false,
+      };
+    }
+    return {
+      text: LOW_CONFIDENCE_GROUNDING_NOTE + `${content.slice(0, maxChars)}\n...[truncated]`,
+      confidence: 'none',
+      anchorCount: 0,
+      usedSnippetFuzzyMatch: false,
+    };
+  }
+  if (strongHits.length === 1) {
+    return {
+      text: windowAroundIndex(content, strongHits[0].index, strongHits[0].length, maxChars),
+      confidence: 'strong',
+      anchorCount: 1,
+      usedSnippetFuzzyMatch,
+    };
   }
 
   // Equal share of a shared budget, capped at the single-window size, floored so each
   // window is still worth showing.
   const totalBudget = Math.min(MAX_FETCHED_FILE_TOTAL_CHARS, Math.max(maxChars, content.length));
-  const perRegion = Math.max(MIN_REGION_CHARS, Math.min(maxChars, Math.floor(totalBudget / hits.length)));
+  const perRegion = Math.max(MIN_REGION_CHARS, Math.min(maxChars, Math.floor(totalBudget / strongHits.length)));
   const half = Math.floor(perRegion / 2);
 
-  const ranges = hits
+  const ranges = strongHits
     .map((h) => ({ from: Math.max(0, h.index - half), to: Math.min(content.length, h.index + h.length + half) }))
     .sort((a, b) => a.from - b.from);
 
@@ -262,7 +311,7 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
     if (i < merged.length - 1) out.push('...[gap]...');
     else if (r.to < content.length) out.push('...[truncated]');
   });
-  return out.join('\n');
+  return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
 }
 
 // Shared by arch_review (candidatesPath=archReviewCandidatesPath) and arch_import_review
@@ -379,7 +428,8 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
         const full = path.resolve(repoRoot, relPath);
         if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
         const content = fs.readFileSync(full, 'utf8');
-        const entry = { path: relPath, content: windowFetchedFileContent(content, section) };
+        const windowed = windowFetchedFileContent(content, section);
+        const entry = { path: relPath, content: windowed.text, anchorConfidence: windowed.confidence };
         if (isContext) entry.context = true; // referenced in prose, not a declared edit target
         return entry;
       } catch {
@@ -426,6 +476,14 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     const numberedSteps = (solutionSlice.match(/(?:^|\n)\s*\d+[.)]\s+\S/g) || []).length;
     const mustPreSplit = splitDepth === 0 && (filesArray.length >= 2 || numberedSteps >= 3);
 
+    // "detect and label, never silently discard" (this function's existing placeholder/
+    // hallucination-guard convention, see comments above): a 'weak' fallback is still worth
+    // a real attempt, but if EVERY declared file came back with zero anchors at all, stamp
+    // that explicitly rather than letting the implement pass silently guess against noise.
+    const groundingConfidence = declaredFetched.length > 0 && declaredFetched.every((f) => f.anchorConfidence === 'none')
+      ? 'none'
+      : null;
+
     return {
       id: taskId,
       domain: defaultDomain,
@@ -439,6 +497,7 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
         body: section,
         splitDepth,
         mustPreSplit,
+        ...(groundingConfidence ? { groundingConfidence } : {}),
       },
     };
   }
