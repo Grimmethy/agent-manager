@@ -235,6 +235,56 @@ test('runBashTool runs a real command in the repo root and captures stdout', () 
   });
 });
 
+// --- run_bash output cap (2026-09-05) ------------------------------------------------
+// Root-caused live (context-crowding investigation, this same session): read_file and
+// grep_codebase both cap their output per call, but run_bash's stdout had NO cap on the
+// success path at all -- only maxBuffer (1MB) as an outer ceiling -- so a single
+// `git log`/`git diff`/`cat` of a large file could shove up to ~1MB of raw text straight
+// into the message history in one shot.
+
+test('capBashOutput leaves short output untouched', () => {
+  withFixtureRepo((mod) => {
+    const { text, truncated } = mod.capBashOutput('short output');
+    assert.equal(text, 'short output');
+    assert.equal(truncated, false);
+  });
+});
+
+test('capBashOutput truncates output past MAX_BASH_OUTPUT_CHARS with a clear notice', () => {
+  withFixtureRepo((mod) => {
+    const huge = 'x'.repeat(mod.MAX_BASH_OUTPUT_CHARS + 5000);
+    const { text, truncated } = mod.capBashOutput(huge);
+    assert.equal(truncated, true);
+    assert.ok(text.length < huge.length, 'must actually be shorter than the input');
+    assert.match(text, /truncated: output exceeded \d+ chars/);
+    assert.match(text, /narrow the command/i);
+  });
+});
+
+test('capBashOutput handles null/undefined without throwing', () => {
+  withFixtureRepo((mod) => {
+    assert.deepEqual(mod.capBashOutput(null), { text: '', truncated: false });
+    assert.deepEqual(mod.capBashOutput(undefined), { text: '', truncated: false });
+  });
+});
+
+test('runBashTool caps a real oversized command output and flags it truncated', () => {
+  withFixtureRepo((mod) => {
+    // Real end-to-end through the sandbox: a command whose stdout is deliberately larger
+    // than MAX_BASH_OUTPUT_CHARS. Skips (not fails) when bwrap is unavailable, same
+    // convention as the existing runBashTool test above.
+    const bigLines = mod.MAX_BASH_OUTPUT_CHARS / 2 + 100; // each "y\n" line is 2 chars
+    const result = mod.runBashTool({ command: `yes y | head -n ${bigLines}` });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+      return;
+    }
+    assert.equal(result.truncated, true);
+    assert.ok(result.stdout.length <= mod.MAX_BASH_OUTPUT_CHARS + 200, 'capped, not the full ~ (bigLines*2) chars');
+    assert.match(result.stdout, /truncated: output exceeded/);
+  });
+});
+
 test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
   withFixtureRepo((mod) => {
     const names = mod.WRITE_TOOLS.map((t) => t.function.name).sort();
@@ -433,6 +483,52 @@ test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when an early 
     assert.equal(result.turnsUsed, 2);
     assert.equal(result.forcedSummary, undefined);
     assert.match(result.response, /RESOLUTION: no-changes-needed/);
+  });
+});
+
+// --- Context-budget-aware forced wrap-up (2026-09-05) -------------------------------
+// Real Chat panel incident (chat-1788639495-31ed485b, confirmed via model-stats.db:
+// turns_used=16, latency_ms=744939): the message history grew unpruned until it
+// permanently pinned against PINNED_NUM_CTX, and every subsequent turn got clipped by
+// Ollama's done_reason:"length" before finishing a coherent action -- 16 turns burned for
+// zero forward progress in the back half of the run. This must trigger BEFORE any normal
+// turn is attempted, unconditionally (no forceSummaryOnCap opt-in needed), and must not
+// depend on the maxTurns cap at all.
+
+test('runPlanWithTools forces a wrap-up turn when the starting prompt alone is already near the context ceiling', async () => {
+  const summaryTurn = { role: 'assistant', content: 'Best answer given the room I have.\n\nRESOLUTION: needs-human-decision\nnot enough context room to finish.' };
+  const hugePrompt = 'x'.repeat(70000); // ~17,500 tokens at chars/4 -- already past PINNED_NUM_CTX minus the reserve
+  await withMockedChat([summaryTurn], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: hugePrompt, maxTurns: 50 });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'context');
+    assert.equal(result.turnsUsed, 1, 'must not attempt a normal turn first -- only the forced summary turn is sent');
+    assert.match(result.response, /RESOLUTION: needs-human-decision/);
+    const last = sentBodies[sentBodies.length - 1];
+    assert.deepEqual(last.tools, []);
+    assert.match(last.messages[last.messages.length - 1].content, /out of context room/i);
+  });
+});
+
+test('runPlanWithTools does NOT force a wrap-up turn for a normal-sized conversation well under the ceiling', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'RESOLUTION: implemented' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'a short normal prompt', maxTurns: 10 });
+    assert.equal(result.forcedSummary, undefined);
+    assert.equal(result.turnsUsed, 1);
+    assert.match(result.response, /RESOLUTION: implemented/);
+  });
+});
+
+test('runPlanWithTools context-budget wrap-up fires mid-run once accumulated tool output pushes the history past the ceiling, not just at the start', async () => {
+  const bigChunk = 'y'.repeat(30000); // ~7,500 tokens per turn of accumulated content
+  const growingTurn = { role: 'assistant', content: bigChunk, tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const summaryTurn = { role: 'assistant', content: 'Wrapping up now.\n\nRESOLUTION: needs-human-decision\nran out of room mid-investigation.' };
+  await withMockedChat([growingTurn, growingTurn, summaryTurn], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'investigate something', maxTurns: 50 });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'context');
+    assert.ok(result.turnsUsed < 50, 'must bail out to the forced summary long before maxTurns is reached');
+    assert.match(result.response, /RESOLUTION: needs-human-decision/);
   });
 });
 
