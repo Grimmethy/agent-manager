@@ -904,7 +904,7 @@ async function runPlanPass(task, {
   // Deterministic, no LLM. Kill switch AGENT_MANAGER_ADHOC_PLAN_GROUNDING=false.
   let grounding = null;
   if (substanceGated && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
-    try { grounding = buildPlanGrounding(task); } catch { grounding = null; }
+    try { grounding = buildPlanGrounding(task); } catch (err) { console.warn(`[adhoc-plan] buildPlanGrounding failed, proceeding without grounding | task=${task.id} | ${err.message} | ${err.stack}`); grounding = null; }
     if (grounding) {
       task._planGrounding = grounding.text;
       task.planWasGrounded = true;
