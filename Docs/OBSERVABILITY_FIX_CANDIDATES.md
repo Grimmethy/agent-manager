@@ -3145,3 +3145,26 @@ Replace the bare `catch { grounding = null; }` with `catch (err) { console.warn(
 
 Benefits:
 An operator tailing stderr or a log aggregator immediately sees, with the exact error and stack, that grounding is failing and for which task, turning a silent capability loss into a one-line diagnostic. The kill-switch env var becomes discoverable context rather than the only escape hatch. The fix is a single-line change that preserves every existing behavioral guarantee (non-blocking, null-fallback, no LLM call) while closing the observability gap.
+
+### AC-172 · Advisory premiseCheck failure is silently swallowed with zero observability
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+      let premise;
+      try {
+        premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
+      } catch (e) {
+        premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
+      }
+      if (premise && premise.verdict === 'invalid-premise') {
+```
+
+Problem:
+In `src/local-draft.js` (lines 1261–1263), the `catch (e)` block that guards the optional `entry.premiseCheck` hook assigns `premise = null` and discards the caught error object `e` entirely. The control-flow intent is correct—a throwing advisory hook must not block a real split, and the subsequent `if (premise && premise.verdict === 'invalid-premise')` guard is safely skipped when `premise` is `null`. However, no `console.warn`, `console.error`, or `process.stderr.write` call is made, so if `premiseCheck` throws due to a typo, a missing import, a network failure, or any other bug, the safety mechanism is silently disabled on every subsequent invocation. The AC-8 comment in the surrounding code documents that this hook previously caught a false premise that would have spawned three children; a regression in the hook would go undetected indefinitely because no log stream, operator console, or trace would ever reveal that the check is broken.
+
+Solution:
+Add a single `console.warn` call inside the `catch` block, before the `premise = null` assignment, that includes the hook's source identity (if available on `entry`), the error message, and a note that the split will proceed. Concretely, replace the two-line catch body with: `console.warn('[local-draft] premiseCheck threw (advisory; split proceeds):', e?.message ?? e, entry?.source ?? '(unknown source)'); premise = null;`. This uses only `console.warn`, which is the project's available logging primitive per the capabilities manifest. No rethrow is added because the caller cannot act on it—the split must proceed. No new dependency or telemetry system is introduced.
+
+Benefits:
+Once fixed, any operator tailing `stdout`/`stderr` or a CI log will immediately see a warning line identifying which source's `premiseCheck` threw, what the error was, and that the split proceeded without the advisory guard. This turns a silent, indefinite degradation of a safety mechanism into a single, greppable, one-line signal that is visible the moment the first invocation after a regression occurs, while preserving the existing guarantee that a throwing advisory hook never blocks a real split.
