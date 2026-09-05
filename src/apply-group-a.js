@@ -26,6 +26,7 @@ const {
   GENERIC_FILENAME_BLOCKLIST,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
+  normalizeSecondBrainPathCase,
   deriveBelongsToProject,
 } = require('./brain-dump-sort-classify.js');
 
@@ -399,6 +400,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   }
 
   const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
+  result.secondBrainPath = normalizeSecondBrainPathCase(result.secondBrainPath, trackedLabels);
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
     return recoverableSortSkip(data, entry, brainDumpPath,
@@ -882,6 +884,7 @@ module.exports = {
   applyForensicsReport,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
+  normalizeSecondBrainPathCase,
   applyPathPrefetchResolve,
   parsePathPrefetchResolveResult,
   closeBrainDumpEntryResolved,

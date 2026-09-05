@@ -92,6 +92,30 @@ function parseBrainDumpSortResult(implementResponse) {
   };
 }
 
+// Case-normalizes the top-level folder segment against the canonical taxonomy / tracked
+// project labels (2026-09-05): 6 of 7 blocked brain_dump_sort tasks shared one shape --
+// the classifier wrote a lowercase top-level folder ("journal/x.md", "research/y.md",
+// "projects/z.md") instead of the required exact-case canonical name, then burned all its
+// bounded retries writing the SAME wrong case again (a systematic model bias toward
+// lowercase, not a one-off typo -- blind redraft-with-feedback alone could not fix it).
+// Casing carries no semantic meaning here (unlike a genuinely wrong folder CHOICE, which
+// this deliberately does NOT touch), so silently correcting it before validation is
+// strictly safer than rejecting an otherwise-correct classification for a typo review
+// would just have to accept on the next attempt anyway. Returns relPath unchanged if its
+// top-level segment doesn't case-insensitively match anything (a genuinely wrong folder
+// choice is still rejected by validateSecondBrainPath below, unchanged).
+function normalizeSecondBrainPathCase(relPath, trackedProjectLabels = []) {
+  const segments = String(relPath || '').split(/[\\/]/).filter(Boolean);
+  if (segments.length === 0) return relPath;
+  const canonical = [...CANONICAL_TOP_LEVEL, ...(Array.isArray(trackedProjectLabels) ? trackedProjectLabels : [])];
+  const match = canonical.find((c) => c.toLowerCase() === segments[0].toLowerCase());
+  if (match && match !== segments[0]) {
+    segments[0] = match;
+    return segments.join('/');
+  }
+  return relPath;
+}
+
 // Rejects a proposed secondBrainPath outright (returns a reason string) rather than
 // silently accepting it. Checks, all about a name/location actively working against future
 // retrieval rather than style preference:
@@ -223,6 +247,7 @@ function reviewBrainDumpSort(task, { secondBrainDir, trackedProjectLabels = [] }
   if (!parsed) {
     return { ok: false, reason: 'classification is not a valid JSON object with a secondBrainPath field (no fences, no prose, no truncation)' };
   }
+  parsed.secondBrainPath = normalizeSecondBrainPathCase(parsed.secondBrainPath, trackedProjectLabels);
   const namingError = validateSecondBrainPath(parsed.secondBrainPath, secondBrainDir, trackedProjectLabels);
   if (namingError) {
     return { ok: false, reason: `secondBrainPath "${parsed.secondBrainPath}": ${namingError}` };
@@ -241,6 +266,7 @@ module.exports = {
   GENERIC_FILENAME_BLOCKLIST,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
+  normalizeSecondBrainPathCase,
   deriveBelongsToProject,
   reviewBrainDumpSort,
 };

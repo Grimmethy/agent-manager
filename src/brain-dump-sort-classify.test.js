@@ -10,6 +10,7 @@ const {
   CANONICAL_TOP_LEVEL,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
+  normalizeSecondBrainPathCase,
   deriveBelongsToProject,
   reviewBrainDumpSort,
 } = require('./brain-dump-sort-classify.js');
@@ -205,6 +206,36 @@ test('parseBrainDumpSortResult coerces the literal string "null" / "none" to a r
   assert.equal(r.belongsToProject, null);
 });
 
+// --- normalizeSecondBrainPathCase (2026-09-05) --------------------------------------
+// 6 of 7 blocked brain_dump_sort tasks shared one shape: the classifier wrote a lowercase
+// top-level folder ("journal/x.md", "research/y.md", "projects/z.md") and burned all its
+// bounded retries writing the SAME wrong case again -- a systematic model bias, not a
+// one-off typo. Casing carries no semantic meaning, so it is corrected rather than
+// rejected.
+
+test('normalizeSecondBrainPathCase corrects a lowercase canonical folder to its exact case', () => {
+  assert.equal(normalizeSecondBrainPathCase('journal/x.md'), 'Journal/x.md');
+  assert.equal(normalizeSecondBrainPathCase('research/y.md'), 'Research/y.md');
+  assert.equal(normalizeSecondBrainPathCase('projects/z.md'), 'Projects/z.md');
+});
+
+test('normalizeSecondBrainPathCase corrects a mis-cased tracked project label too', () => {
+  assert.equal(normalizeSecondBrainPathCase('my-project/x.md', ['my-Project']), 'my-Project/x.md');
+});
+
+test('normalizeSecondBrainPathCase leaves an already-correct path unchanged', () => {
+  assert.equal(normalizeSecondBrainPathCase('Journal/x.md'), 'Journal/x.md');
+});
+
+test('normalizeSecondBrainPathCase leaves a genuinely off-taxonomy folder unchanged (not this function\'s job to invent a match)', () => {
+  assert.equal(normalizeSecondBrainPathCase('Errands/x.md'), 'Errands/x.md');
+});
+
+test('normalizeSecondBrainPathCase handles an empty/bare path without throwing', () => {
+  assert.equal(normalizeSecondBrainPathCase(''), '');
+  assert.equal(normalizeSecondBrainPathCase('bare.md'), 'bare.md');
+});
+
 // --- reviewBrainDumpSort ----------------------------------------------------------
 
 test('reviewBrainDumpSort ok for a valid classification', () => {
@@ -229,4 +260,14 @@ test('reviewBrainDumpSort blocks a belongsToProject that is not a tracked label'
 test('reviewBrainDumpSort passes a belongsToProject that IS a tracked label', () => {
   const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'real-proj' }) };
   assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: ['real-proj'] }), { ok: true });
+});
+
+test('reviewBrainDumpSort accepts a lowercase canonical folder instead of rejecting it (the real 6-of-7 blocked-backlog shape)', () => {
+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'journal/go-on-a-date.md' }) };
+  assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: [] }), { ok: true });
+});
+
+test('reviewBrainDumpSort still rejects a genuinely off-taxonomy folder even though case-correction ran', () => {
+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'errands/x.md' }) };
+  assert.match(reviewBrainDumpSort(task, { trackedProjectLabels: [] }).reason, /not one of the allowed/);
 });
