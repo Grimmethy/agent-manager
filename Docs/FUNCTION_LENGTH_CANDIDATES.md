@@ -4011,3 +4011,132 @@ Extract three clearly-named helpers from the existing function body, keeping the
 
 Benefits:
 Each extracted helper can be unit-tested in isolation—`resolveWiringStrategy` against the full input matrix without needing a real move array, `buildMoveRecord` against representative move shapes, and `assembleHub` against stacked/non-stacked and det-wiring on/off combinations. Code review becomes a matter of checking three small, single-purpose diffs rather than scanning 116 lines for a one-line policy change. Future additions (a new move kind, a per-repo override, an extra hub field) slot into the relevant helper without risking accidental interaction with the other two concerns, and the orchestrator's short body makes the overall data flow immediately legible at a glance.
+
+### AC-40 · Decompose getGroundingSource assembly pipeline
+Strength: Strong
+Files: src/get-grounding-source.js
+Snippet:
+```
+}
+
+function main() {
+  const taskPath = process.argv[2];
+  const task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
+  const pc = task.promptContext;
+  const parts = [];
+
+  // Resolved once, used both to refresh fetchedFiles below and for the adhoc live-fetch
+  // block further down. Fails open (getConfig() can throw if AGENT_MANAGER_REPO_ROOT is
+  // unset -- a context/test-environment gap, not a reason to fail this whole grounding
+  // assembly) same as reasoningTierFor()'s own established try/catch treatment of the
+  // identical getConfig() call.
+  let repoRoot = null;
+  try {
+    ({ repoRoot } = getConfig());
+  } catch (e) {
+    console.warn(`[get-grounding-source] getConfig() failed, repoRoot will remain null: ${e?.message ?? e}`);
+  }
+
+  if (pc) {
+    if (pc.existingStub) parts.push(String(pc.existingStub));
+    if (pc.siblingExample && pc.siblingExample.content) parts.push(String(pc.siblingExample.content));
+    if (pc.goalMdFull) parts.push(String(pc.goalMdFull));
+    if (pc.csvRow) parts.push(JSON.stringify(pc.csvRow));
+    if (pc.body) parts.push(String(pc.body));
+    if (pc.noteContent) parts.push(String(pc.noteContent));
+    if (pc.files) {
+      for (const f of [].concat(pc.files)) {
+        if (f.content) parts.push(String(f.content));
+      }
+    }
+    // 2026-08-27, root-caused live via 3 real blocked observability_fix candidates
+    // (AC-3, AC-4, AC-11): nextCandidateFulfillmentTask() (task-sources.js) populates
+    // promptContext.fetchedFiles -- {path, content} pairs holding the REAL current
+    // content of each file the candidate names -- and local-draft.js reads it to ground
+    // the draft's find/replace edits. This function never looked at that field at all
+    // (pc.files above is a DIFFERENT, unrelated shape for a different set of sources --
+    // a plain array of filename strings here, so `f.content` on a string is always
+    // undefined and silently contributes nothing). The practical effect: a
+    // candidate-fulfillment draft that correctly quoted a real file verbatim (confirmed
+    // live: budget-monitor.js's actual `const os = require('os');` and a real bare
+    // `catch {}` block, byte-for-byte) got reviewed with NO grounding for that file at
+    // all, and the reviewer -- correctly per what it was actually given -- rejected the
+    // edit as unconfirmed. Every root-level file (no src/python/scripts/docs/ prefix)
+    // was hit hardest: extractLiveRepoGrounding's own live-fetch fallback below can't
+    // reach those either (REPO_FILE_PATH_RE requires that prefix), so there was no
+    // fallback catching this the way there is for adhoc's own equivalent gap.
+    if (pc.fetchedFiles) {
+      // Re-read each path's CURRENT content from repoRoot rather than trusting the frozen
+      // creation-time snapshot -- see refreshFetchedFileContent's own comment for the
+      // incident (sibling candidate branches merging out from under a still-queued task)
+      // this closes. Falls back to the frozen f.content when a live read isn't possible.
+      const refreshed = refreshFetchedFileContent([].concat(pc.fetchedFiles), repoRoot);
+      for (const f of refreshed) {
+        if (f && f.content) parts.push(String(f.content));
+      }
+    }
+    // toolCallLog lives directly on the task object, not inside promptContext -- it's
+    // added by a plan pass that used a tool (see local-tool-client.js), not pre-fetched
+    // deterministically like the fields above. Without this, a plan pass that used a tool
+    // correctly and found something real would still get rejected as "unverifiable".
+    if (task.toolCallLog && task.toolCallLog.length > 0) {
+      parts.push(JSON.stringify(task.toolCallLog));
+    }
+
+    const sourceName = resolveSourceName(task);
+    const source = getRegisteredSource(sourceName);
+    if (source) {
+      if (Array.isArray(source.groundingFields)) {
+        for (const fieldName of source.groundingFields) {
+          const value = pc[fieldName];
+          if (value) parts.push(typeof value === 'object' ? JSON.stringify(value) : String(value));
+        }
+      }
+      if (typeof source.extractGrounding === 'function') {
+        const extracted = source.extractGrounding(pc, task);
+        if (extracted) parts.push(String(extracted));
+      }
+    }
+
+    if (parts.length === 0 && task.domain === 'adhoc') {
+      parts.push(JSON.stringify(pc));
+    }
+  }
+
+  // Live current-repo enrichment (see this file's own comment above) -- unconditional for
+  // every adhoc task with a real implement draft, not just the parts.length===0 fallback
+  // case, since even a task WITH other grounding fields can still make a claim about a
+  // file none of those fields happen to cover.
+  if (task.domain === 'adhoc' && task.implementResponse) {
+    const liveFiles = extractLiveRepoGrounding(task.implementResponse, repoRoot);
+    if (liveFiles.length > 0) {
+      parts.push([
+        '=== LIVE current repo content (fetched fresh at REVIEW time to check the draft\'s ' +
+        'own file/code claims against reality -- this is NOT material the drafter was given; ' +
+        'the drafter had its own real Read/Grep/Bash access and found these paths itself. A ' +
+        'claim that matches this content is CONFIRMED, not merely plausible. ===',
+        ...liveFiles.map((f) => `--- ${f.path} ---\n${f.content}`),
+      ].join('\n\n'));
+    }
+  }
+
+  // A `no-changes-needed` adhoc draft claims "already implemented" -- give the reviewer the
+  // current repo state for every object the ORIGINAL request names, not just the files the
+  // draft's own summary happened to cite. See buildRequestObjectGrounding above.
+  if (task.domain === 'adhoc' && task.adhocResolution === 'no-changes-needed' && repoRoot && pc && pc.rawText) {
+    const objGrounding = buildRequestObjectGrounding(pc.rawText);
+    if (objGrounding) parts.push(objGrounding);
+  }
+
+  process.stdout.write(parts.join('\n\n'));
+}
+```
+
+Problem:
+The 111-line body of `getGroundingSource` is not one algorithm but five sequentially-executed, independently-guarded assembly steps—resolve `repoRoot` (try/catch, fail-open), push static `promptContext` fields (existingStub, siblingExample, goalMdFull, csvRow, body, noteContent, files), refresh-and-push `fetchedFiles` (live re-read vs. frozen snapshot), push `toolCallLog`, and look up a registered source to push its `groundingFields`. Each step has its own precondition (config present, source registered, files readable), its own failure mode (missing key, stale snapshot, unregistered id), and its own test surface. Because they are interleaved in a single flat body with no intermediate named boundaries, a reader must hold all five concerns in working memory to reason about any one of them, and a change to the `fetchedFiles` refresh logic is visually entangled with the unrelated `toolCallLog` push two lines below it.
+
+Solution:
+Extract four small, clearly-named helpers that each own one assembly step: `resolveRepoRoot(config)` returning a string or null; `buildStaticContextFields(ctx, repoRoot)` returning the object of static prompt-context keys; `refreshFetchedFiles(ctx, repoRoot)` performing the live-vs-frozen re-read and returning the updated array; and `attachGroundingFields(ctx, sourceId)` performing the registered-source lookup and push. The top-level `getGroundingSource` then shrinks to a ~15-line orchestration that calls these four in order, pushes `toolCallLog` inline (it is a single two-line guard-and-push), and returns the assembled context. Each helper is pure or near-pure with respect to its inputs, making the top-level function read as a table of contents for the assembly.
+
+Benefits:
+Each extracted helper can be unit-tested in isolation—`refreshFetchedFiles` with a mocked fs, `attachGroundingFields` with a stub registry—without constructing the full context object. Code review becomes a diff of one small function rather than a 111-line scroll, and a reviewer can verify the `fetchedFiles` refresh logic without scanning past the `toolCallLog` push. The top-level function's intent is immediately visible from its four named calls, reducing onboarding time for new contributors and making it straightforward to add a sixth assembly step (e.g., a future `metrics` field) without growing the already-crowded body.
