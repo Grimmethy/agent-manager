@@ -742,3 +742,96 @@ test('buildToolHandlers/read_file forwards offset and limit', () => {
     assert.match(res.content, /^n10\n/);
   });
 });
+
+// --- streaming (Chat panel) done_reason:"length" visibility (2026-09-05) -------------
+// Confirmed live: a real Chat turn ended mid-word ("...and see whatI was mid-invest")
+// with no error, no degenerate flag, nothing recorded anywhere -- Ollama's own
+// done_reason on the closing NDJSON frame already says exactly what happened, but nothing
+// downstream ever looked past done_reason==='error'. These exercise the STREAMING path
+// (onChunk present), which withMockedChat's postJsonStream stub deliberately does not
+// support -- a separate, minimal stub here scripts a sequence of NDJSON line objects.
+function withMockedStreamingChat(turnsOfLines, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-tool-client-stream-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  const queue = turnsOfLines.slice();
+  const stub = (relId, exportsObj) => {
+    const resolved = require.resolve(relId);
+    require.cache[resolved] = { id: resolved, filename: resolved, loaded: true, exports: exportsObj };
+  };
+  for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
+    delete require.cache[require.resolve(relId)];
+  }
+  stub('./ollama-http.js', {
+    postJson: async () => { throw new Error('non-streaming path not exercised in this test'); },
+    postJsonStream: async (_url, _body, _timeout, _headers, onLine) => {
+      const lines = queue.length ? queue.shift() : [{ done: true, done_reason: 'stop' }];
+      for (const line of lines) onLine(line);
+    },
+  });
+  stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
+  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '30m' });
+  try {
+    const mod = require('./local-tool-client.js');
+    return fn(mod, dir);
+  } finally {
+    for (const relId of ['./ollama-http.js', './single-flight-lock.js', './local-client.js', './local-tool-client.js']) {
+      delete require.cache[require.resolve(relId)];
+    }
+  }
+}
+
+test('a streaming turn cut off by done_reason:"length" gets a visible marker appended right where it happened', async () => {
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'this got cut ' } },
+      { message: { role: 'assistant', content: 'off mid-sen' } },
+      { done: true, done_reason: 'length', prompt_eval_count: 1, eval_count: 1 },
+    ],
+  ], async (mod) => {
+    const chunks = [];
+    const result = await mod.runPlanWithTools({ prompt: 'go', onChunk: (t) => chunks.push(t) });
+    const full = chunks.join('');
+    assert.match(full, /this got cut off mid-sen/);
+    assert.match(full, /done_reason: "length"/);
+    // The marker is a streaming-only debug artifact (onChunk), deliberately NOT folded
+    // into result.response -- non-chat callers parsing RESOLUTION lines etc. must never
+    // see it, and chat_sessions.py's persisted transcript is built from the streamed
+    // chunks (reply_parts), not from result.response, so it still reaches the saved chat.
+    assert.equal(result.response.includes('this got cut off mid-sen'), true);
+    assert.equal(result.response.includes('done_reason'), false);
+  });
+});
+
+test('a streaming turn that ends normally (done_reason:"stop") gets no marker', async () => {
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'a complete answer' } },
+      { done: true, done_reason: 'stop', prompt_eval_count: 1, eval_count: 1 },
+    ],
+  ], async (mod) => {
+    const chunks = [];
+    await mod.runPlanWithTools({ prompt: 'go', onChunk: (t) => chunks.push(t) });
+    assert.doesNotMatch(chunks.join(''), /done_reason/);
+  });
+});
+
+test('a done_reason:"length" cut-off mid-tool-loop (not just the final turn) still gets flagged inline', async () => {
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'thinking about it, cut ', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] } },
+      { done: true, done_reason: 'length', prompt_eval_count: 1, eval_count: 1 },
+    ],
+    [
+      { message: { role: 'assistant', content: 'a real final answer' } },
+      { done: true, done_reason: 'stop', prompt_eval_count: 1, eval_count: 1 },
+    ],
+  ], async (mod) => {
+    const chunks = [];
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, onChunk: (t) => chunks.push(t) });
+    const full = chunks.join('');
+    assert.match(full, /thinking about it, cut/);
+    assert.match(full, /done_reason: "length"/);
+    assert.equal(result.response, 'a real final answer');
+  });
+});

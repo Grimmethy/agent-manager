@@ -578,6 +578,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   let toolCalls = null;
   let streamError = null;
   let usage = pickUsage(null);
+  let doneReason = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
     model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
@@ -591,11 +592,25 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
       onChunk(msg.content);
     }
     if (msg.tool_calls && msg.tool_calls.length) toolCalls = msg.tool_calls;
-    // Ollama's final NDJSON frame carries done:true + the token counts for the turn.
-    if (obj.done) usage = pickUsage(obj);
+    // Ollama's final NDJSON frame carries done:true + the token counts for the turn, plus
+    // done_reason -- "stop" for a real, considered end, but "length" when the model hit
+    // its generation/context ceiling mid-response and got cut off. See below.
+    if (obj.done) { usage = pickUsage(obj); doneReason = obj.done_reason || null; }
   });
   if (streamError) throw new Error(streamError);
-  return { message: { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined }, usage };
+  // 2026-09-05, Grimmethy: "I'd very much like to see that done_reason: 'length' show up
+  // in the chat itself... handy debug tool" -- found live via the Chat panel's own
+  // transcript: two real turns ended mid-word ("...and see whatI was mid-invest") with NO
+  // error, NO degenerate flag, nothing recorded anywhere -- the pipeline had zero idea a
+  // truncation had even happened, because nothing ever looked past done_reason==='error'.
+  // Ollama already tells us exactly this on the closing frame; surface it inline, right
+  // where it happened, as a visible marker in the streamed text -- only in streaming mode
+  // (onChunk present), since Chat is this call path's only streaming caller today.
+  if (doneReason === 'length') {
+    onChunk('\n\n_[done_reason: "length" -- this turn was cut short by the model\'s '
+      + 'generation/context limit, not a real stopping point]_\n\n');
+  }
+  return { message: { role: 'assistant', content: contentAcc, tool_calls: toolCalls || undefined }, usage, doneReason };
 }
 
 // 2026-08-26 (Chat panel 502, Grimmethy): a real Ollama /api/chat call can
