@@ -65,7 +65,23 @@ const MODEL = process.env.LOCAL_MODEL;
 // between) paid a full cold reload (~114s observed) on the next turn.
 const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
 
-function detectDegenerate(text, { allowEmpty = false } = {}) {
+function detectDegenerate(text, { allowEmpty = false, doneReason } = {}) {
+  // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
+  // tasks (AC-4/6/8/20) whose PLAN pass came back non-empty, real-looking, non-degenerate
+  // text that just... stopped mid-sentence ("**Scope:** `src/local-tool-client.js` only.
+  // No other", "in `src/prompts.js` (imported via `require('./prompts.js')") -- Ollama's
+  // own done_reason:"length" (num_predict reached before the model emitted a real stop
+  // token, likely `think:true` reasoning eating most of the budget before any visible
+  // answer) was silently accepted as a complete, trustworthy response because nothing
+  // here ever looked at it. The truncated plan then fed a real implement call nothing
+  // coherent to work from, which failed its OWN separate way ("Implement pass degenerate:
+  // empty") 3 attempts running -- the actual root cause was one call earlier and
+  // invisible. done_reason:"length" is UNAMBIGUOUS (Ollama only sets it when generation
+  // was cut off before a natural stop, never for a genuinely complete response), so this
+  // checks it first, unconditionally (even ahead of allowEmpty) and feeds the SAME
+  // existing retry-on-degenerate loop callOnce()'s caller already runs for every other
+  // degenerate reason -- no new mechanism, just closing a blind spot in this one.
+  if (doneReason === 'length') return 'truncated';
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
   // The local model sometimes writes the literal two-character JSON-style empty-string
@@ -291,7 +307,7 @@ async function call(opts, maxRetries = 2) {
         recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
       }
     }
-    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });
+    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
   }
