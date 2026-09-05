@@ -4439,3 +4439,222 @@ Extract two named helpers scoped to `draftAdhocBranch`. (1) `shouldPreliminaryDe
 
 Benefits:
 `draftAdhocBranch` drops to roughly 110 lines and reads as a pure escalation ladder with two clearly-named pre-steps. The `isFreshAdhoc` predicate and the context-source priority order each become independently unit-testable: you can assert the six-condition gate against edge-case tasks, or verify that `buildPlanGrounding` is only consulted when both `priorInvestigation` and `orientNotes` are empty, without exercising the full ladder. Code review of a tier-2 prompt change no longer requires scrolling past 45 lines of unrelated decompose-gate and context-assembly logic, and the enable-flag / predicate coupling is visible in one small function rather than buried mid-body.
+
+### AC-43 · Extract requeue-to-adhoc boilerplate and per-bucket policy predicates
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Snippet:
+```
+}
+
+async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote }) {
+  const summary = { checked: 0, requeued: 0, archived: 0, flagged: 0, leftForHuman: 0, errors: 0 };
+  const { KILL, VOTE_ENABLED, DRY_RUN, MAX_REQUEUES, MAX_VOTES, VOTE_MODEL } = cfgEnv();
+  if (KILL) return summary;
+  if (DRY_RUN) summary.dryRun = true;
+
+  const ncDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+
+  let names;
+  try {
+    names = fs.readdirSync(ncDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return summary; // no needs-clarification/ dir
+    }
+    console.error('[needs-clarification-triage] readdirSync failed on', ncDir, err);
+    summary.errors += 1;
+    return summary;
+  }
+
+  const now = new Date().toISOString();
+  let votesUsed = 0;
+
+  const writeInPlace = (file, task) => {
+    if (DRY_RUN) return;
+    try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch (e) {
+      log(`write failed ${path.basename(file)}: ${e.message}`); summary.errors += 1;
+    }
+  };
+
+  for (const name of names) {
+    const file = path.join(ncDir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+
+    const nc = task.needsClarification || {};
+    if (nc.reason !== 'design-decision') continue;                       // not ours
+    const decompLoop = !!(task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop');
+    if (decompLoop && targetOversizedFile(task, oversizedFiles(pipelineDir))) continue; // autoroute owns it
+    if (task.stalenessKeep && task.stalenessKeep.until && task.stalenessKeep.until > now) continue; // human said Keep
+
+    // --- Bucket E: decompose-loop, not an oversized-file target -> clean-state requeue ---
+    // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
+    // toward `checked`) when decompLoop is set; otherwise falls through unchanged.
+    if (decompLoop) {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if ((task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket E but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket E (decompose-loop, not an oversized-file target) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.stalenessFlag;
+            delete task.decomposeBlockCount;
+            delete task.autoDecomposeCount;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-loop flag but target is not an oversized file (autoroute declines) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+      // Cap spent (or adhoc/ race) and still decompose-loop-flagged, non-oversized: fall
+      // through to the normal ladder below so it gets an honest, visible leave-for-human
+      // stamp instead of staying invisible (the actual bug being fixed).
+    }
+
+    // --- Bucket D: false completion-claim signature -> clean-state requeue -----------
+    // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
+    // toward `checked`) when the signature actually matches; otherwise falls through to
+    // the pre-existing flow unchanged.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const sig = FALSE_CLAIM_RE.test(String(task.blockedReason || '')) || FALSE_CLAIM_RE.test(String(nc.openQuestions || ''));
+      if (sig && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket D but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket D (false completion-claim signature) -> requeue ${attempt}/${MAX_REQUEUES}, now caught earlier by the draft-time verification gate`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: false completion-claim signature (draft asserted something the diff/repo contradicts) -- now caught at draft time by adhoc-diff-sanity.js, clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
+
+    summary.checked += 1;
+    const id = task.id || name.replace(/\.json$/, '');
+    const oq = nc.openQuestions || '';
+    const rawText = (task.promptContext && task.promptContext.rawText) || '';
+    const history = Array.isArray(task.history) ? task.history : [];
+    const hasExhausted = history.some((h) => h && h.stage === 'exhausted');
+
+    // --- Bucket A: degenerate draft -> clean-state requeue -------------------------
+    if (DEGENERATE_RE.test(oq) && rawText.length >= MIN_RAWTEXT_FOR_REQUEUE
+        && !hasExhausted && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      const adhocPath = path.join(adhocDir, `${id}.json`);
+      if (fs.existsSync(adhocPath)) {
+        log(`${id}: bucket A but ${id}.json already in adhoc/ -- already handled, skipping`);
+        continue;
+      }
+      const attempt = (task.ncTriageAttempts || 0) + 1;
+      log(`${id}: bucket A (degenerate draft, rawText ${rawText.length}c) -> requeue ${attempt}/${MAX_REQUEUES}`);
+      summary.requeued += 1;
+      if (DRY_RUN) continue;
+      for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+      task.ncTriageAttempts = attempt;
+      appendHistoryEvent(task, 'requeued',
+        `needs-clarification-triage: degenerate "no prior context" draft (rawText intact) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+      try {
+        fs.mkdirSync(adhocDir, { recursive: true });
+        fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+        fs.unlinkSync(file);
+      } catch (e) {
+        log(`${id}: requeue move failed: ${e.message}`);
+        summary.requeued -= 1;
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    // --- Bucket B: invalid premise / already done --------------------------------
+    // adhoc-staleness-flag's `invalid-premise` reason has a known false-positive mode on
+    // "create X" tasks (the files are absent because the task's job is to make them), so a
+    // stalenessFlag alone is NOT enough -- require a corroborating drafter conclusion too.
+    const flagSaysInvalid = task.stalenessFlag && task.stalenessFlag.confidence === 'high'
+      && /already-implemented|duplicate-of/.test(String(task.stalenessFlag.reason || ''));
+    const excludedFromB = CREATE_TASK_RE.test(rawText) || IN_PROGRESS_RE.test(oq);
+    const bucketB = !excludedFromB && (flagSaysInvalid || INVALID_PREMISE_RE.test(oq));
+
+    if (bucketB) {
+      const archive = (decisionNote) => {
+        log(`${id}: bucket B -> archive (${decisionNote})`);
+        summary.archived += 1;
+        if (DRY_RUN) return;
+        appendHistoryEvent(task, 'archived',
+          `needs-clarification-triage: premise invalid / already satisfied -- ${decisionNote}`);
+        task.status = 'done';
+        const dest = path.join(archiveDir, `${id}.json`);
+        try {
+          if (fs.existsSync(dest)) { log(`${id}: archive dest exists -- already handled`); summary.archived -= 1; return; }
+          fs.mkdirSync(archiveDir, { recursive: true });
+          fs.writeFileSync(dest, JSON.stringify(task, null, 2));
+          fs.unlinkSync(file);
+        } catch (e) {
+          log(`${id}: archive move failed: ${e.message}`);
+          summary.archived -= 1;
+          summary.errors += 1;
+        }
+      };
+
+      let resolved = false;
+      try { resolved = hasResolutionSignal(task, oq); } catch (e) { log(`${id}: hasResolutionSignal threw: ${e.message} -- treating as unresolved`); resolved = false; }
+      if (resolved) { archive('verified resolution signal'); continue; }
+
+      if (VOTE_ENABLED && typeof majorityVote === 'function' && votesUsed < MAX_VOTES) {
+// ... [truncated for review: this function continues for 53 more line(s) not shown]
+```
+
+Problem:
+The 253-line triage function interleaves three nearly identical ~15-line requeue-to-adhoc sequences (for Buckets E, D, and A) with short 1–2 line policy decisions, making the actual routing logic hard to spot amid repeated I/O and bookkeeping. Each requeue block performs the same check-adhocPath, increment-attempt, strip-fields, appendHistoryEvent, mkdir/writeFile/unlink, and error-rollback dance, yet the field-deletion lists differ subtly between buckets (e.g., Bucket E removes stalenessFlag and decomposeBlockCount while Bucket D does not), creating a copy-paste drift risk that is easy to miss in review. Additionally, each bucket's eligibility condition (degenerate-regex + raw-text-length + exhaustion check for A; CREATE_TASK_RE / IN_PROGRESS exclusion for B; staleness thresholds for E) is an independently meaningful policy rule that currently cannot be unit-tested without executing the entire 253-line body.
+
+Solution:
+Extract a single private helper, requeueToAdhoc(task, sourceFile, taskId, reason, attempt, extraFieldsToDelete), that encapsulates the adhoc-path existence check, attempt increment, summary bookkeeping, DRY_RUN guard, field stripping, history-event append, file write, and error rollback. Then extract each bucket's eligibility predicate into its own small named function—shouldRequeueBucketA(oq, rawText, task), shouldExcludeBucketB(oq, task), shouldRequeueBucketE(task), and so on—each returning a boolean and carrying its own constants or regex references. The main triage function then reduces to a linear sequence of if (shouldRequeueBucketX(...)) { requeueToAdhoc(...); continue; } branches, with the remaining fall-through logic (the non-requeue path) left inline.
+
+Benefits:
+The main function drops from ~253 lines to roughly 60–80 lines of readable routing logic, with each policy rule visible at a glance and independently testable via its predicate function. The single requeueToAdhoc helper eliminates the triplicated I/O block, so a future change to the file-write or rollback sequence is made in exactly one place, and the subtle per-bucket field-deletion differences become explicit arguments rather than hidden copy-paste variance. Code review becomes a matter of checking a one-line call site and the small predicate it invokes, rather than scanning 50 lines of interleaved bookkeeping to confirm nothing was missed.
