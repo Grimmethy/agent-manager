@@ -1631,6 +1631,59 @@ test('draftTask proceeds normally when the source\'s postImplementCheck throws (
   });
 });
 
+// --- deep_dive's real, wired postImplementCheck (deep-dive-grounding-check.js) ---------
+// Unlike the synthetic test sources above, deep_dive is registered for real by
+// task-sources.js (required directly in withFixtureRepo, not a hygiene stub) -- this
+// proves the actual production wiring, not just the generic hook mechanism in isolation.
+
+test('draftTask blocks deep_dive as a review rejection when the write-up cites a class name absent from the real community files', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'deep-dive-wiring-test-1', domain: 'default', source: 'deep_dive', title: 'test',
+      promptContext: {
+        projectName: 'deepset-ai/haystack', communityId: 'c1', communityName: 'converters',
+        files: [{ path: 'haystack/components/converters/txt.py', degree: 3, content: 'class TextFileToDocument:\n    pass\n' }],
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: '1. Use `TextFileToDocument` as-is.', degenerate: null, attempts: 1 };
+      return {
+        response: '### ITEM: reuse the converter\nCommunity: converters\nFiles: haystack/components/converters/txt.py\nRating: Use\nRationale: The `TextFileConverter` class converts text files into Documents.',
+        degenerate: null, attempts: 1,
+      };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, 'review');
+    assert.match(task.blockedReason, /Ungrounded draft:.*TextFileConverter/);
+  });
+});
+
+test('draftTask proceeds normally for a deep_dive write-up that is genuinely grounded in the real community files', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'deep-dive-wiring-test-2', domain: 'default', source: 'deep_dive', title: 'test',
+      promptContext: {
+        projectName: 'deepset-ai/haystack', communityId: 'c1', communityName: 'converters',
+        files: [{ path: 'haystack/components/converters/txt.py', degree: 3, content: 'class TextFileToDocument:\n    pass\n' }],
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: '1. Use `TextFileToDocument` as-is.', degenerate: null, attempts: 1 };
+      return {
+        response: '### ITEM: reuse the converter\nCommunity: converters\nFiles: haystack/components/converters/txt.py\nRating: Use\nRationale: The `TextFileToDocument` class converts text files into Documents.',
+        degenerate: null, attempts: 1,
+      };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
 test('draftTask blocks a candidate-fulfillment source that says mode "split" but does not follow through with well-formed sub-candidates', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {

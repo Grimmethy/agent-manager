@@ -32,6 +32,7 @@ const { buildForensicBundle } = require('./forensic-bundle.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 const { incrementJobTypeCounter } = require('./job-type-counters.js');
+const { runGroundingCheck: runDeepDiveGroundingCheck } = require('./deep-dive-grounding-check.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1864,7 +1865,11 @@ function markStalenessAuditReported(task) {
 }
 
 
-registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit' });
+// postImplementCheck (2026-09-05): 8 of 8 blocked deep_dive tasks investigated shared one
+// shape -- a write-up fabricating a specific class/function/architecture detail
+// contradicting the real community file content it was given. See
+// deep-dive-grounding-check.js's own header for the incident.
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck });
 registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
