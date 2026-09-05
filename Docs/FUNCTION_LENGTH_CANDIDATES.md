@@ -4140,3 +4140,126 @@ Extract four small, clearly-named helpers that each own one assembly step: `reso
 
 Benefits:
 Each extracted helper can be unit-tested in isolation—`refreshFetchedFiles` with a mocked fs, `attachGroundingFields` with a stub registry—without constructing the full context object. Code review becomes a diff of one small function rather than a 111-line scroll, and a reviewer can verify the `fetchedFiles` refresh logic without scanning past the `toolCallLog` push. The top-level function's intent is immediately visible from its four named calls, reducing onboarding time for new contributors and making it straightforward to add a sixth assembly step (e.g., a future `metrics` field) without growing the already-crowded body.
+
+### AC-41 · draftAdhocViaLocalAgentic mixes invocation, parsing, and diff capture
+Strength: Strong
+Files: src/local-agentic-draft.js
+Snippet:
+```
+ *   contract as adhoc-harness-draft.js's draftAdhocViaHarnessSearch -- see its own header.
+ */
+async function draftAdhocViaLocalAgentic(task, { runPlan = runPlanWithTools } = {}) {
+  if (!isEnabled()) {
+    return { applied: false, succeeded: true, reason: 'AGENT_MANAGER_LOCAL_AGENTIC_ADHOC is not enabled' };
+  }
+  if (requiresCommandExecution(task)) {
+    return { applied: false, succeeded: true, reason: 'task explicitly requires running a verification command (compile/test) this read-only tier cannot execute -- deferring to a tier with real command access' };
+  }
+
+  const { repoRoot, pipelineDir } = getConfig();
+
+  // 2026-08-26 (Grimmethy: "add turnsUsed recording... a data point we track for each
+  // job type in the Job List itself (min/max/average)"): this tier never called
+  // model_stats_client.record_call() at all before now -- the arch-review turn-budget
+  // question that prompted this had zero real telemetry to answer it from. Recorded on
+  // any result that actually came back (implemented, no-changes-needed, or declined for
+  // lack of a RESOLUTION line -- all three carry a real turnsUsed count worth keeping);
+  // a call that errored out entirely (the catch below) has no result to record.
+  const started = Date.now();
+  let result;
+  try {
+    result = await runPlan({ prompt: buildLocalAgenticPrompt(task), maxTurns: LOCAL_AGENTIC_MAX_TURNS, source: task.source });
+  } catch (e) {
+    console.error(`[local-agentic-draft] runPlan failed for task ${task.id ?? task.source}: ${e?.message ?? String(e)}`);
+    return { applied: false, succeeded: true, reason: `local agentic investigation failed: ${e.message}` };
+  }
+  modelStatsClient.recordCall({
+    taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
+    startedAt: new Date(started).toISOString(), latencyMs: Date.now() - started,
+    result, source: task.source,
+  });
+
+  const responseText = (result && result.response) || '';
+  // draft-attempt-record.js: the caller (draftAdhocBranch) records this tier's real
+  // output + tool activity even when it DECLINES -- previously response/toolCallLog were
+  // dropped as locals here, so a blocked task's investigation was a black box. Additive
+  // fields only; draftAdhocBranch reads .applied/.succeeded/.reason exactly as before.
+  // `investigationSummary` (2026-09-01): when this read-only tier declines, draftAdhocBranch
+  // forwards this compact map of what it already read/searched into the tier-3 write
+  // prompt so tier 3 doesn't burn its whole turn budget re-doing the same orientation and
+  // never getting to an edit.
+  const modelMeta = {
+    response: responseText,
+    toolCallLog: (result && result.toolCallLog) || undefined,
+    turnsUsed: result && result.turnsUsed,
+    investigationSummary: summariseInvestigation(responseText, result && result.toolCallLog) || undefined,
+  };
+  const resolutionMatch = responseText.match(RESOLUTION_RE);
+  if (!resolutionMatch) {
+    // Same "fail loud, don't guess" reasoning adhoc-agentic-draft.js's own missing-
+    // RESOLUTION-line handling documents -- but here that's an EXPECTED, non-fatal
+    // outcome (fall through to Claude), not a blocked task, since this tier is still an
+    // opt-in experiment.
+    return { applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line', ...modelMeta };
+  }
+  const resolution = resolutionMatch[1].toLowerCase();
+
+  if (resolution === 'needs-capability-i-dont-have') {
+    return { applied: false, succeeded: true, reason: 'local agentic investigation reported it needs a capability it does not have', ...modelMeta };
+  }
+
+  if (resolution === 'no-changes-needed') {
+    // This no-tools tier has no way to investigate further if its claim is wrong --
+    // decline and fall through to tier 3 (which has real tools) rather than confidently
+    // stamping an unverified claim that would otherwise spend a full review round-trip
+    // just to get rejected. See adhoc-diff-sanity.js.
+    const claim = adhocNoChangesClaimProblem(task, responseText);
+    if (claim) {
+      return { applied: false, succeeded: true, reason: `local agentic no-changes-needed claim is unverified -- ${claim.reason}`, ...modelMeta };
+    }
+    task.adhocResolution = 'no-changes-needed';
+    task.rawDiff = '';
+    task.implementResponse = responseText;
+    task.draftModel = localDraftModelLabel();
+    return { applied: true, succeeded: true, ...modelMeta };
+  }
+
+  // resolution === 'implemented' -- everything after the RESOLUTION line is expected to
+  // contain the Group-B JSON; parseJsonMaybeFenced (via applyGroupB, inside
+  // captureGroupBDiffInWorktree) tolerates surrounding prose/fencing, so the raw
+  // post-resolution text is handed over as-is rather than hand-parsed here too.
+  const afterResolution = responseText.slice(resolutionMatch.index + resolutionMatch[0].length);
+  let rawDiff;
+  try {
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: afterResolution, worktreeSuffix: `local-agentic-${task.id}`,
+    });
+  } catch (e) {
+    return { applied: false, succeeded: true, reason: `local agentic draft did not apply cleanly: ${e.message}`, ...modelMeta };
+  }
+
+  if (!rawDiff) {
+    return { applied: false, succeeded: true, reason: 'local agentic draft produced no net change', ...modelMeta };
+  }
+
+  const substance = adhocDiffSubstanceProblem(task, rawDiff, responseText);
+  if (substance) {
+    return { applied: false, succeeded: true, reason: `local agentic draft is not a real implementation -- ${substance.reason}`, ...modelMeta };
+  }
+
+  task.adhocResolution = 'implemented';
+  task.rawDiff = rawDiff;
+  task.implementResponse = `${responseText.slice(0, resolutionMatch.index).trim()}\n\nRESOLUTION: implemented\n\n=== DIFF ===\n${rawDiff}`.trim();
+  task.draftModel = localDraftModelLabel();
+  return { applied: true, succeeded: true, ...modelMeta };
+}
+```
+
+Problem:
+`draftAdhocViaLocalAgentic` currently interleaves three distinct responsibilities in a single body: it issues the model invocation (building the prompt, calling the model, handling the raw response), it parses the model's resolution output into a structured form, and it captures the resulting diff against the prior state. Because these three concerns are inlined in one function, a change to the resolution-parsing contract (e.g., a new field the model may emit) forces the reader to re-scan the entire invocation and diff-capture logic to confirm nothing else depends on the parsed shape, and a tweak to how the diff is recorded (say, switching from a unified patch to a per-hunk list) likewise drags the reviewer through unrelated model-call boilerplate. The function is long enough that its three phases are no longer scannable at a glance, which is a real maintainability cost in a file that is already the local-agentic draft path.
+
+Solution:
+Extract the three logical phases out of `draftAdhocViaLocalAgentic` into their own clearly-named helpers that live in the same module: (1) a function that takes the prompt/context and returns the raw model response after handling the invocation and any retry or timeout logic; (2) a function that takes that raw response and returns the parsed resolution structure, isolating all format-specific parsing and validation; (3) a function that takes the parsed resolution plus the prior state and returns the captured diff artifact. `draftAdhocViaLocalAgentic` then becomes a short orchestrator that calls these three in sequence and returns the final result, keeping the public entry point stable while making each phase independently readable.
+
+Benefits:
+Each extracted helper can be unit-tested in isolation—parsing can be tested with canned model outputs without hitting a model endpoint, and diff capture can be tested with fixed resolution objects—whereas today both are only exercised through the full invocation path. Code review becomes scoped: a PR that changes the resolution schema touches only the parsing helper, and a PR that changes diff formatting touches only the diff helper, so reviewers no longer need to verify that unrelated invocation logic is unaffected. The orchestrator function drops to a handful of lines, making the overall flow of `draftAdhocViaLocalAgentic` immediately legible to anyone reading the file for the first time.
