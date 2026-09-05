@@ -189,6 +189,16 @@ while :; do
     context_trim_result="$(node "${PACKAGE_SRC_DIR}/context-trim-sweep.js" 2>>"${HOME_LOGS}/context-trim-sweep.log")"
     printf '[watchdog] context-trim-sweep: %s\n' "$context_trim_result" >&2
 
+    # Side-finding sweep: drains queue/side-findings-inbox/ (a model flagging something
+    # it noticed outside its current task -- a SIDE-FINDING: block, see src/side-finding.js)
+    # into brain-dump.json, one batched read+write per tick. A near-duplicate of an
+    # existing machine-raised finding increments its count instead of filing a second
+    # entry; a genuinely new one is filed status:'captured' and flows through the normal
+    # brain_dump_sort pipeline like any human-typed note. Cheap when the inbox is empty.
+    # Disable with AGENT_MANAGER_SIDE_FINDING_SWEEP=false.
+    side_finding_result="$(node "${PACKAGE_SRC_DIR}/side-finding-sweep.js" 2>>"${HOME_LOGS}/side-finding-sweep.log")"
+    printf '[watchdog] side-finding-sweep: %s\n' "$side_finding_result" >&2
+
     # needs-clarification triage: churns stuck reason:'design-decision' tasks -- clean-state
     # requeues a degenerate "no prior context" draft (local-model forced-summary flake, not
     # a real question), archives an invalid-premise / already-done task behind a resolution-
