@@ -202,7 +202,11 @@ while :; do                                                                     
           const reviewResult = process.argv[2];
           const failureCount = process.argv[3];
           const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
-          const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b/i;
+          // 2026-09-05, Grimmethy: kept in sync with local-worker.sh own identical copy --
+          // a review call can hit the same model not pulled on this lane own Ollama host
+          // 404 a draft call can (e.g. a review vote falling back to a cheap model tag),
+          // so the pattern gap fixed there applies here too.
+          const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|model \x27[^\x27]*\x27 not found|\b50[0-9]\b/i;
           let o;
           try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
           // 2026-08-26, Grimmethy: "we have one big problem that keeps repeating" -- same
