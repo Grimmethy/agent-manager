@@ -1174,18 +1174,23 @@ def index():
 def _expected_instance_ids() -> list[str]:
     """The daemons scripts/launch.sh always starts (worker-1, reviewer, queue-watchdog),
     plus worker-reasoning whenever it would actually be launched (gated on the same
-    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses), plus worker-p40 whenever the
-    optional second-GPU lane is configured (same AGENT_MANAGER_P40_* gate launch.sh
-    itself uses). apply-task-loop is deliberately excluded -- it's a single-shot pass
-    with no heartbeat file of its own (see launch.sh's own comment), so it never has a
-    slot to be "offline" in."""
+    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses), plus worker-p40/
+    worker-reasoning-p40 whenever the optional second-GPU lanes are configured (same
+    AGENT_MANAGER_P40_* gate launch.sh itself uses). apply-task-loop is deliberately
+    excluded -- it's a single-shot pass with no heartbeat file of its own (see
+    launch.sh's own comment), so it never has a slot to be "offline" in."""
     ids = ["worker-1", "reviewer", "watchdog"]
     if is_claude_token_configured():
         ids.append("worker-reasoning")
-    # Optional second GPU lane (2026-09-05) -- see agent-manager.env.example's
+    # Optional second-GPU lanes (2026-09-05) -- see agent-manager.env.example's
     # AGENT_MANAGER_P40_OLLAMA_URL comment. Same gate scripts/launch.sh itself uses.
+    # worker-reasoning-p40 gives reasoning-tier work a second lane independent of the
+    # host's single worker-reasoning instance (Grimmethy, 2026-09-05: "we are still
+    # only doing one reasoning job at a time despite being fully capable of running 2
+    # simultaneously").
     if os.environ.get("AGENT_MANAGER_P40_OLLAMA_URL") and os.environ.get("AGENT_MANAGER_P40_MODEL"):
         ids.append("worker-p40")
+        ids.append("worker-reasoning-p40")
     return ids
 
 
