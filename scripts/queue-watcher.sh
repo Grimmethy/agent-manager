@@ -177,6 +177,18 @@ while :; do
     adhoc_stale_result="$(node "${PACKAGE_SRC_DIR}/adhoc-staleness-flag.js" 2>>"${HOME_LOGS}/adhoc-staleness-flag.log")"
     printf '[watchdog] adhoc-staleness-flag: %s\n' "$adhoc_stale_result" >&2
 
+    # Context-trim sweep: queue/blocked/ candidate-fulfillment tasks (observability_fix,
+    # arch_review, performance_fix, ...) ground on a file snapshot taken once at
+    # candidate-creation time -- if the real file has since moved, every retry re-anchors
+    # against the same stale, noisy window and reproduces the same rejection forever
+    # (root-caused live via the 54KB observability-fix-ac-111). This re-reads each declared
+    # file and re-windows it against current content, requeuing when that measurably helps
+    # (a Snippet fuzzy-match flip, a confidence-tier improvement, or a material content
+    # delta) and flagging task.contextTrimFlag otherwise. No model calls, no vote. Disable
+    # with AGENT_MANAGER_CONTEXT_TRIM_SWEEP=false.
+    context_trim_result="$(node "${PACKAGE_SRC_DIR}/context-trim-sweep.js" 2>>"${HOME_LOGS}/context-trim-sweep.log")"
+    printf '[watchdog] context-trim-sweep: %s\n' "$context_trim_result" >&2
+
     # needs-clarification triage: churns stuck reason:'design-decision' tasks -- clean-state
     # requeues a degenerate "no prior context" draft (local-model forced-summary flake, not
     # a real question), archives an invalid-premise / already-done task behind a resolution-
