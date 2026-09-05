@@ -2827,3 +2827,141 @@ Extract three named functions scoped to this file: (1) `runPreliminaryDecomposeG
 
 Benefits:
 Each tier becomes independently unit-testable by mocking `maybeLocked` and asserting on its specific result shape without exercising the other tiers. Code review diff size drops because a change to tier 2's recording fields no longer appears in the same hunk as tier 1's hard-fail logic. The preliminary gate's six-condition eligibility predicate is isolated, making it trivial to add or remove a condition without scrolling through the ladder. The design-rationale comments can migrate to the function they explain rather than sitting between unrelated code blocks, reducing cognitive load for the reader who only needs one tier.
+
+### AC-32 · Decompose merge-request handler into validation, merge, and post-merge phases
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+
+@app.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
+def api_git_merge_branch(branch):
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
+    # process already enumerated itself -- re-derive the current list (cheap: cached
+    # unless stale) and require an exact match, the same "only act on what we ourselves
+    # already offered" gate api_task_archive/api_task_requeue's state allowlists use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    # A branch owned by a coordinator hub that hasn't finished (a stacked file-decompose
+    # branch still missing its wiring commit + integration-gate pass) is not safe to merge
+    # -- doing so 404s the moved routes. Block it unless the caller explicitly forces.
+    hub = match.get("hub")
+    if hub and not hub.get("readyToMerge") and not (request.get_json(silent=True) or {}).get("force"):
+        prog = hub.get("progress") or {}
+        gate = (hub.get("integrationGate") or {}).get("status")
+        return jsonify({
+            "succeeded": False,
+            "reason": (
+                f"'{branch}' belongs to coordinator hub {hub.get('id')} which is not finished "
+                f"({prog.get('done')}/{prog.get('total')} task(s) done"
+                + (f", integration gate {gate}" if gate else "")
+                + "). Merging now would ship an incomplete decomposition. Re-send with "
+                '{"force": true} only if you have verified the branch is actually complete.'
+            ),
+        }), 409
+
+    lock_fd = _acquire_apply_lock()
+    if lock_fd is None:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    main_branch = match["mainBranch"]
+    try:
+        _run_git(["fetch", "origin"], repo_root)
+        _run_git(["checkout", main_branch], repo_root)
+        _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+        try:
+            _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+        except RuntimeError as merge_err:
+            subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+            # match['willConflict']/['conflictFiles'] came from list_unmerged_branches's
+            # own merge-tree preview a moment ago (same request, force-refreshed above) --
+            # if it already predicted this exact outcome, say so plainly instead of
+            # surfacing raw git stderr. Confirmed live 2026-08-18: an add/add conflict
+            # between two independently-drafted candidate docs produced exactly this kind
+            # of opaque failure with no indication of WHICH files or WHY.
+            if match.get("willConflict") and match.get("conflictFiles"):
+                files = ", ".join(match["conflictFiles"])
+                raise RuntimeError(
+                    f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
+                    f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
+                ) from merge_err
+            raise merge_err
+        _run_git(["push", "origin", main_branch], repo_root)
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+        except RuntimeError as e:
+            # Non-fatal -- the merge to main already succeeded and is the part that
+            # matters; a leftover now-fully-merged remote branch is harmless clutter
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            logger.warning("Non-fatal: could not delete remote branch %r (repo: %s): %s", branch, repo_root, e)
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    _invalidate_branch_cache()
+    live_sync = _sync_live_checkout(main_branch)
+
+    # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
+    # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
+    # with dependencies on new adhoc tasks are absolutely going to need to be done after
+    # the dependency is completed") -- this is the real "is this dependency satisfied"
+    # signal task-sources.js's nextAdhocTask() checks before letting a dependent task
+    # claim. Reaching queue/done/ alone isn't enough: a task there is only pushed to its
+    # OWN branch, not merged, and every adhoc draft's git worktree starts from
+    # origin/<mainBranch> -- a dependency's fix isn't actually visible to a dependent
+    # task's fresh checkout until it's merged, confirmed live by the exact failure this
+    # feature exists to prevent (a dependent task's diff going stale against code the
+    # dependency hadn't landed yet). Best-effort: a task record not found (already
+    # archived, or this merge came from some other source than the normal apply flow)
+    # must never fail the merge itself, which already fully succeeded above.
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        for candidate in (qdir / "done" / f"{task_id}.json", qdir / "done" / "_archived_no_action" / f"{task_id}.json"):
+            if candidate.is_file():
+                data = read_json_safe(candidate)
+                if data is not None:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    data["mergedAt"] = now_iso
+                    # Close the task log with a terminal disposition event (see
+                    # src/task-disposition.js) -- `mergedAt` alone is a field the dependency
+                    # gate reads; an update audit reads the history, which used to stop at
+                    # `applied`.
+                    if data.get("terminalDisposition") != "merged":
+                        hist = data.get("history")
+                        if not isinstance(hist, list):
+                            hist = data["history"] = []
+                        hist.append({
+                            "stage": "merged",
+                            "at": now_iso,
+                            "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                        })
+                        data["terminalDisposition"] = "merged"
+                    try:
+                        candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except OSError as exc:
+                        logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
+                        raise
+                break
+
+    return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
+```
+
+Problem:
+The handler interleaves three independently-evolvable concerns in a single ~120-line function (roughly 75–80 lines of executable code after stripping the ~40 lines of explanatory comments). First, request gating—repo-root existence check, branch-allowlist re-derivation, and the coordinator-hub readiness 409—occupies about 35 lines and is pure validation with no side-effects beyond early abort. Second, the git merge operation—acquiring the lock, fetch/checkout/reset/merge/push/delete, conflict re-throw, and lock release—spans roughly 30 lines and is an atomic sequence whose only external dependency is the `match` object produced by the gating step. Third, post-merge bookkeeping (state updates, notifications, response shaping) fills the remainder. Because all three live in one scope, a change to the allowlist logic forces a reviewer to re-read the lock lifecycle, a change to the push sequence forces a re-read of the validation guards, and unit-testing any single phase requires mocking the other two.
+
+Solution:
+Extract three private helpers, each taking only the data it needs and returning (or raising) a well-defined result: (1) `_validate_merge_request(branch) → match` that performs the repo-root check, re-derives the branch allowlist, and raises the 409 on coordinator-hub unavailability; (2) `_perform_merge(repo_root, match) → None` that acquires the lock, runs the fetch/checkout/reset/merge/push/delete sequence, re-throws a structured conflict exception on failure, and releases the lock in a `finally` block; (3) `_finalize_merge(match, result) → response` that handles post-merge state updates, notifications, and response construction. The original handler then becomes a short orchestrator—call the three in order, catch the conflict exception, and return the response—dropping to roughly 15–20 lines of glue.
+
+Benefits:
+Each helper can be unit-tested in isolation: `_validate_merge_request` needs only a fake branch name and a stubbed coordinator-hub client; `_perform_merge` can be exercised against a temporary bare repository without touching the HTTP layer; `_finalize_merge` can be tested with a canned `match` and a mocked notification bus. Code review becomes scoped—a reviewer touching the allowlist logic no longer needs to trace through the lock and push sequence. Future changes (adding a new validation rule, swapping the merge strategy, or adding a webhook notification) each land in exactly one helper, reducing the blast radius of every diff and making the function's control flow immediately legible at a glance.
