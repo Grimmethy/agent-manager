@@ -162,17 +162,58 @@ def _roots_blurb(session: dict) -> str:
     return "\n".join(lines)
 
 
+# 2026-09-05, Grimmethy: "Have it read agents.md for sure. I'd like to set that up as the
+# de facto starting point" -- confirmed live that neither provider ever read it before:
+# the local system prompt only announced accessible repos, and the Claude provider's CLI
+# auto-reads CLAUDE.md from cwd (a different file, a different convention) but never
+# AGENTS.md. A generous cap, not a tight one -- the real file here is a few KB; this only
+# guards against a pathological one blowing the prompt.
+AGENTS_MD_MAX_CHARS = 20000
+
+
+def _read_agents_md(session: dict) -> str:
+    """The primary repo's (roots[0]) own AGENTS.md, best-effort -- a project without one
+    just gets no section, never an error that would block a chat turn."""
+    roots = session.get("roots") or [session["repoRoot"]]
+    try:
+        content = (Path(roots[0]) / "AGENTS.md").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    if len(content) > AGENTS_MD_MAX_CHARS:
+        content = content[:AGENTS_MD_MAX_CHARS] + "\n...[truncated]"
+    return content
+
+
+def _agents_md_blurb(agents_md: str) -> str:
+    return (
+        "The primary repo's own AGENTS.md -- its de facto starting point. Read this "
+        "before anything else: it documents repo-specific hazards and conventions "
+        "(e.g. what's safe to hand-edit vs. what needs a real mechanism) that a generic "
+        "coding assistant would not otherwise know.\n\n" + agents_md
+    )
+
+
 def _send_claude(session: dict, message: str) -> str:
     started = time.time()
     roots = session.get("roots") or [session["repoRoot"]]
     # First turn only: the CLI's --add-dir makes the extra repos reachable but doesn't
-    # announce them. Tell Claude they exist; on later turns --resume carries the context.
-    if not session.get("claudeSessionId") and len(roots) > 1:
-        message = (
-            "You are rooted at the agent-manager repo and also have full read/write access "
-            "to these additional repos:\n" + _roots_blurb(session)
-            + "\n\n---\n\n" + message
-        )
+    # announce them, and nothing else primes Claude with this repo's own AGENTS.md (the
+    # CLI's own auto-read only covers CLAUDE.md). Tell it both on turn one; --resume
+    # carries all of this forward on every later turn, same as before.
+    if not session.get("claudeSessionId"):
+        preamble_parts = []
+        if len(roots) > 1:
+            preamble_parts.append(
+                "You are rooted at the agent-manager repo and also have full read/write "
+                "access to these additional repos:\n" + _roots_blurb(session)
+            )
+        agents_md = _read_agents_md(session)
+        if agents_md:
+            preamble_parts.append(_agents_md_blurb(agents_md))
+        if preamble_parts:
+            message = "\n\n---\n\n".join(preamble_parts) + "\n\n---\n\n" + message
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
@@ -200,7 +241,11 @@ _LOCAL_SYSTEM_PROMPT = (
 
 
 def _local_system_prompt(session: dict) -> str:
-    return _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
+    prompt = _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
+    agents_md = _read_agents_md(session)
+    if agents_md:
+        prompt += "\n\n---\n\n" + _agents_md_blurb(agents_md)
+    return prompt
 
 
 def _build_local_messages(session: dict, message: str) -> list:
