@@ -4327,11 +4327,19 @@ function fmtPercent(p) { return p == null ? '-' : Math.round(p) + '%'; }
 // present for that sample) -- those points are simply left out of the polyline, which
 // gaps the line across missing stretches rather than erroring or plotting a false 0.
 function renderSparkline(history, getValue, avg, label) {
+  // The label is rendered as this chart's own heading -- baked in here, not left to
+  // each call site to add separately, after a real regression (2026-09-06): the
+  // multi-GPU rewrite passed `label` through for the empty-state message only, so
+  // every sparkline with real data rendered with no visible heading at all -- three
+  // unlabeled stacked charts per GPU, no way to tell utilization from VRAM from
+  // temperature, or which GPU a given chart even belonged to. Baking the heading into
+  // the function itself means no future call site can drop it again by omission.
+  const heading = `<div class="field-label">${escapeHtml(label)} -- last 24h</div>`;
   const W = 300, H = 60, PAD = 3;
   const points = history
     .map((entry, i) => ({ i, v: getValue(entry) }))
     .filter(p => p.v != null);
-  if (points.length < 2) return `<div class="meta">Not enough history yet to graph ${escapeHtml(label)}.</div>`;
+  if (points.length < 2) return `${heading}<div class="meta">Not enough history yet to graph ${escapeHtml(label)}.</div>`;
   const values = points.map(p => p.v);
   const min = Math.min(...values, avg != null ? avg : values[0]);
   const max = Math.max(...values, avg != null ? avg : values[0]);
@@ -4342,6 +4350,7 @@ function renderSparkline(history, getValue, avg, label) {
   const last = points[points.length - 1];
   const avgY = avg != null ? y(avg) : null;
   return `
+    ${heading}
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:60px;display:block">
       ${avgY != null ? `<line x1="${PAD}" y1="${avgY.toFixed(1)}" x2="${W - PAD}" y2="${avgY.toFixed(1)}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4,3" vector-effect="non-scaling-stroke"/>` : ''}
       <polyline points="${linePoints}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
