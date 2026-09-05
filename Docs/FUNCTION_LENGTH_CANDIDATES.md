@@ -4263,3 +4263,179 @@ Extract the three logical phases out of `draftAdhocViaLocalAgentic` into their o
 
 Benefits:
 Each extracted helper can be unit-tested in isolation—parsing can be tested with canned model outputs without hitting a model endpoint, and diff capture can be tested with fixed resolution objects—whereas today both are only exercised through the full invocation path. Code review becomes scoped: a PR that changes the resolution schema touches only the parsing helper, and a PR that changes diff formatting touches only the diff helper, so reviewers no longer need to verify that unrelated invocation logic is unaffected. The orchestrator function drops to a handful of lines, making the overall flow of `draftAdhocViaLocalAgentic` immediately legible to anyone reading the file for the first time.
+
+### AC-42 · Extract preliminary-decompose gate and tier-3 context assembly from draftAdhocBranch
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+// strict, line-based format; a freeform rewrite is not a safe way to edit one) -- every
+// path here returns a final draftTask result directly instead.
+async function draftAdhocBranch(task, {
+  maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
+  draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+}) {
+  // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
+  // through qwen. Claude needs to be removed as a dependency from that system"). Every
+  // tier runs the local model against an isolated worktree:
+  //   1. harness-search  -- cheap, single-shot, grep-grounded blind diff (proven).
+  //   2. local-agentic   -- multi-turn, READ-ONLY tools, emits a Group-B diff (opt-in).
+  //   3. local-agentic-WRITE -- multi-turn with real edit/write/run_bash in a worktree
+  //      (default-on; this is what the deleted Claude adhoc-agentic-draft.js used to do).
+  // Tiers 1-2 return {applied, succeeded, reason?}: applied -> done; declined -> next
+  // tier. Tier 3 returns a terminal draftTask-shaped verdict (implemented / blocked /
+  // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
+  // fallback. All tiers are unconditionally lock-wrapped (always local).
+  //
+  // Each tier is bracketed with an 'implement-started' checkpoint. The ladder emits no
+  // other history until a tier resolves, and tier 3 is a multi-turn agentic pass that
+  // routinely runs for many minutes -- so without these, a task killed mid-ladder (or one
+  // that keeps dying in tier 3) shows only '... -> plan-done' and the Pipeline History
+  // looks cut short. With main()'s persist hook each one lands on disk the moment it fires,
+  // so the log shows exactly how far the draft got. (2026-08-31, Grimmethy: "the task log
+  // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
+
+  // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
+  // BEFORE any agentic tier. A task that is genuinely 5 endpoints + a UI + tests wastes a
+  // full 35-turn tier-3 pass (and 2 retries) discovering that; catch it here instead. Only
+  // on a FRESH task -- a retry / re-scoped / already-decomposed task has specific feedback
+  // to act on and skips this. The decompose verdict flows straight to review -> coordinator
+  // exactly like a RESOLUTION: decompose from tier 3.
+  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
+  const isFreshAdhoc = !task.localRejectCount
+    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
+    && !task.rescopedFromDecompose
+    && !task.autoDecomposeCount
+    && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
+    && task.adhocResolution !== 'decompose';
+  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
+    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
+    delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
+    if (split && split.subTasks.length >= 2) {
+      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
+      task.adhocResolution = 'decompose';
+      task.subTaskProposals = split.subTasks;
+      task.rawDiff = '';
+      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.`;
+      concludeDraft(task);
+      return { succeeded: true, blocked: false };
+    }
+  }
+
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
+  const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
+  recordTier(attempt, {
+    tier: 'harness-search', applied: harnessResult.applied, reason: harnessResult.reason,
+    response: harnessResult.applied ? task.implementResponse : undefined,
+    rawDiff: harnessResult.applied ? task.rawDiff : undefined,
+  });
+  if (!harnessResult.applied && harnessResult.succeeded === false) {
+    return { succeeded: false, reason: harnessResult.reason };
+  }
+
+  let localTierApplied = harnessResult.applied;
+  // Carried from a declined tier 2 into the tier-3 write prompt (see the tier-3 call
+  // below) so tier 3 starts from the read-only pass's map instead of re-orienting from
+  // cold and running out of turns before it edits anything.
+  let priorInvestigation = null;
+  if (!localTierApplied) {
+    appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
+    const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
+    recordTier(attempt, {
+      tier: 'local-agentic', applied: localAgenticResult.applied, reason: localAgenticResult.reason,
+      response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
+      toolCallLog: localAgenticResult.toolCallLog,
+    });
+    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog, finalMessage: localAgenticResult.response });
+    if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
+      return { succeeded: false, reason: localAgenticResult.reason };
+    }
+    if (!localAgenticResult.applied && localAgenticResult.investigationSummary) {
+      priorInvestigation = localAgenticResult.investigationSummary;
+    }
+    localTierApplied = localAgenticResult.applied;
+  }
+
+  if (localTierApplied) {
+    const appliedTier = harnessResult.applied ? 'harness-search' : 'local-agentic (read-only)';
+    appendHistoryEvent(task, 'implement-done', `${appliedTier} tier applied, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
+    concludeDraft(task);
+    return { succeeded: true, blocked: false };
+  }
+
+  // Tier 3: local write-agentic. Returns the same verdict shape the Claude tier did
+  // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
+  // genuine infra error (retry), everything else is terminal.
+  appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
+  // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
+  // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
+  // task (same pattern as runPlanPass's task._seedPlan).
+  if (priorInvestigation) {
+    task._priorInvestigation = priorInvestigation;
+  } else if (typeof task.orientNotes === 'string' && task.orientNotes.trim()) {
+    // The pre-plan orient pass (component 3) already mapped this task -- feed its report to
+    // tier 3 so it starts from confirmed findings instead of a blind re-grep.
+    task._priorInvestigation = `Pre-plan orientation report (read-only pass, before the plan):\n\n${task.orientNotes.trim()}`;
+  } else if (task.planWasGrounded && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
+    // No agentic exploration ran, but the plan pass built deterministic grounding. Rebuild
+    // it (cheap, no LLM) so tier 3 starts from verified file content instead of a blind re-grep.
+    try {
+      const g = buildPlanGrounding(task);
+      if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
+    } catch { /* non-fatal */ }
+  }
+  const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
+  delete task._priorInvestigation;
+  recordTier(attempt, {
+    tier: 'local-agentic-write',
+    resolution: agenticResult.resolution || task.adhocResolution,
+    blocked: agenticResult.blocked,
+    reason: agenticResult.reason || agenticResult.blockedReason,
+    response: agenticResult.response,
+    rawDiff: agenticResult.capturedDiff || (agenticResult.blocked ? undefined : task.rawDiff),
+    turnsUsed: agenticResult.turnsUsed,
+    toolCallLog: agenticResult.toolCallLog,
+  });
+  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog, finalMessage: agenticResult.response });
+  if (!agenticResult.succeeded) {
+    return { succeeded: false, reason: agenticResult.reason };
+  }
+  if (agenticResult.blocked) {
+    appendHistoryEvent(task, 'blocked', agenticResult.blockedReason);
+    return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
+  }
+  // 2026-08-24 (RESOLUTION: needs-human-decision, adhoc-agentic-draft.js): a real
+  // open product/design question, not a diff or a sub-task list -- nothing here for
+  // an automatic reviewer to verify against real repo state, so this skips review-
+  // task.js/apply-task.js entirely and goes straight to queue/needs-clarification/
+  // (local-worker.sh's own move-destination branch) for a human to actually answer.
+  // Reuses `needsClarification`'s FIELD NAME (not path_prefetch_resolve's specific
+  // shape) so the dashboard's existing "does this task have needsClarification"
+  // check and Discuss button pick it up; `reason: 'design-decision'` is what
+  // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
+  // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
+  if (agenticResult.needsClarification) {
+    // 2026-08-24 (Grimmethy: multiple-choice shortcut) -- options is undefined
+    // (never a key at all, not even null) when the model didn't offer a clean
+    // 2+ option OPTIONS block, so the dashboard's existing `nc.options` check
+    // stays a plain truthy test either way.
+    const options = parseClarificationOptions(task.implementResponse);
+    task.needsClarification = {
+      reason: 'design-decision', openQuestions: task.implementResponse,
+      ...(options ? { options } : {}),
+    };
+    appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+    appendHistoryEvent(task, 'needs-clarification');
+    return { succeeded: true, blocked: false, needsClarification: true };
+  }
+  appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
+```
+
+Problem:
+`draftAdhocBranch` (line 603) is a 158-line function whose core purpose is a three-tier local model escalation ladder (harness-search → local-agentic → local-agentic-write), but two sizeable sub-concerns are inlined directly in the body. First, a preliminary decompose gate (~25 lines) performs an enable-flag check, evaluates a six-condition `isFreshAdhoc` predicate, makes a model call, branches on the result, and can issue a terminal return—none of which is tier-escalation logic; it is a pre-flight size check that happens to live here. Second, the tier-3 (local-agentic-write) branch contains a ~20-line context-assembly cascade that probes `priorInvestigation`, `orientNotes`, and `buildPlanGrounding` in priority order to seed the write-agentic prompt. Because both blocks are interleaved with the ladder's control flow, a reader must hold the entire 158-line body in working memory to understand any single tier's behavior, and a change to the `isFreshAdhoc` conditions or the context-source priority order forces a re-review of the whole function.
+
+Solution:
+Extract two named helpers scoped to `draftAdhocBranch`. (1) `shouldPreliminaryDecompose(task)` returning the enable-flag and `isFreshAdhoc` boolean, plus `runPreliminaryDecompose(task, ctx)` that performs the model call, interprets the result, and returns either a decomposed sub-task list or `null` (meaning "continue to the ladder"). The main body's preliminary block collapses to a two-line `if` that calls these and early-returns on a non-null result. (2) `assembleTier3Context(task, ctx)` that encapsulates the `priorInvestigation` → `orientNotes` → `buildPlanGrounding` priority cascade and returns the final grounding string (or object) to splice into the write-agentic prompt. The ladder's three-tier dispatch logic remains in `draftAdhocBranch` untouched; only the two bolted-on blocks move out.
+
+Benefits:
+`draftAdhocBranch` drops to roughly 110 lines and reads as a pure escalation ladder with two clearly-named pre-steps. The `isFreshAdhoc` predicate and the context-source priority order each become independently unit-testable: you can assert the six-condition gate against edge-case tasks, or verify that `buildPlanGrounding` is only consulted when both `priorInvestigation` and `orientNotes` are empty, without exercising the full ladder. Code review of a tier-2 prompt change no longer requires scrolling past 45 lines of unrelated decompose-gate and context-assembly logic, and the enable-flag / predicate coupling is visible in one small function rather than buried mid-body.
