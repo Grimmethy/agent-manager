@@ -248,22 +248,13 @@ function symbolDefinedInRepo(repoRoot, symbol) {
 
 // Distinctive 2-3 word phrases from the task's title/first line -- what the task is
 // actually ABOUT, e.g. "FIFO ticket lock", "per-attempt record". Drops the
-// `<project> > <area> :` prefix and any n-gram without a real (>=5-char, non-stopword)
-// content word, so a grep for it means something.
+// `<project> > <area> :` prefix; the n-gram extraction itself is shared with
+// side-finding-sweep.js's dedup via text-similarity.js's own distinctivePhrases().
 const TITLE_PREFIX_RE = /^[^:>]*[>:]\s*/;
 function distinctivePhrases(task) {
   const line = String((task.promptContext && task.promptContext.rawText) || task.title || '')
-    .split('\n')[0].replace(TITLE_PREFIX_RE, '').toLowerCase();
-  const words = line.replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
-  const phrases = new Set();
-  for (let n = 3; n >= 2; n -= 1) {
-    for (let i = 0; i + n <= words.length; i += 1) {
-      const gram = words.slice(i, i + n);
-      const contentful = gram.filter((w) => w.length >= 5 && !DUP_STOPWORDS.has(w));
-      if (contentful.length >= 1 && gram.join(' ').length >= 8) phrases.add(gram.join(' '));
-    }
-  }
-  return [...phrases].slice(0, 8);
+    .split('\n')[0].replace(TITLE_PREFIX_RE, '');
+  return sharedDistinctivePhrases(line);
 }
 
 // Returns { strong, strongEvidence[], phraseHits[] }.
@@ -328,7 +319,7 @@ function invalidPremiseSignal(repoRoot, task) {
 // normalizeTokens/jaccardSimilarity extracted to text-similarity.js (2026-09-05) so
 // side-finding-sweep.js's own duplicate-finding check can reuse the identical primitives
 // instead of a third near-duplicate copy.
-const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS } = require('./text-similarity.js');
+const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS, distinctivePhrases: sharedDistinctivePhrases } = require('./text-similarity.js');
 
 function normalizeTaskTokens(task) {
   const ctx = task.promptContext || {};
