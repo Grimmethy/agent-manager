@@ -3076,3 +3076,26 @@ Replace the bare `catch { resolved = false; }` with `catch (e) { log(`${id}: has
 
 Benefits:
 Any future regression or data-shape mismatch in `hasResolutionSignal` becomes immediately visible in the triage log instead of silently misclassifying tasks as unresolved. Operators can correlate the log line with the task id to inspect the offending record, and the distinction between "genuinely no resolution signal" and "signal check crashed" is no longer lost. No behavioral change to the happy path; the only addition is one log line on the error path.
+
+### AC-169 · Log swallowed exception in plan-grounding catch block
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+  // Deterministic, no LLM. Kill switch AGENT_MANAGER_ADHOC_PLAN_GROUNDING=false.
+  let grounding = null;
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
+    try { grounding = buildPlanGrounding(task); } catch { grounding = null; }
+    if (grounding) {
+      task._planGrounding = grounding.text;
+      task.planWasGrounded = true;
+```
+
+Problem:
+On line 893 the `catch { grounding = null; }` clause discards the exception from `buildPlanGrounding(task)` with no log, no warning, and no trace. Because the project has no metrics or telemetry system (confirmed by the dependency manifests), the only available observability primitive is the `console` API. As written, if `buildPlanGrounding` begins throwing consistently—due to a schema drift in `task`, a missing property introduced in a refactor, or a filesystem permission change on the grep step—the grounding feature silently stops working for every adhoc task and no operator sees any signal. The surrounding comments ("Never blocks on its own") confirm the null-fall-through is intentional, but the total absence of a log line means the feature can go dark with zero diagnostic output.
+
+Solution:
+Replace the bare `catch { grounding = null; }` on line 893 with a `catch (err)` block that emits a single `console.warn` line carrying a stable tag and the error message, then still assigns `grounding = null`. Concretely: `catch (err) { console.warn('[local-draft] plan grounding failed, proceeding without:', err.message); grounding = null; }`. This uses only `console.warn`, which the project already relies on for Node-side logging. No new dependency is introduced, no control flow changes (the `if (grounding)` guard on the next line still skips the assignment and the task proceeds exactly as before), and no rethrow is added because the caller's design is explicitly "proceed without grounding"—there is no upstream handler that could act on the error.
+
+Benefits:
+An operator can now `grep` logs for `[local-draft] plan grounding failed` and immediately see that the grounding enrichment is degraded, along with the specific error message (e.g., "Cannot read properties of undefined (reading 'path')"), turning a silent feature-outage into a one-line diagnostic. Because the tag is stable and the message is the raw `err.message`, the signal is sufficient to correlate with a recent refactor or environment change without needing a metrics dashboard. The fix adds zero runtime cost on the happy path and zero behavioral change on the failure path beyond the single log emission.
