@@ -59,3 +59,22 @@ test('detectDegenerate still flags non-ascii gibberish', () => {
 test('detectDegenerate returns null for genuinely fine text', () => {
   assert.equal(detectDegenerate('This is a normal, real response with real content in it.'), null);
 });
+
+// --- done_reason:"length" (2026-09-05) -------------------------------------------------
+// Root-caused a real blocked-task cluster: a plan pass came back real-looking text that
+// just stopped mid-sentence because Ollama hit num_predict before a natural stop -- none
+// of the existing text-shape heuristics above ever catch that (it isn't empty, garbage,
+// repetitive, or non-ascii), so it needs its own, authoritative signal.
+
+test('detectDegenerate flags a done_reason:"length" response as "truncated", even though the text itself looks fine', () => {
+  assert.equal(detectDegenerate('**Scope:** `src/x.js` only. No other', { doneReason: 'length' }), 'truncated');
+});
+
+test('detectDegenerate treats done_reason:"length" as truncated even when allowEmpty is set (never a trustworthy intentional empty)', () => {
+  assert.equal(detectDegenerate('', { allowEmpty: true, doneReason: 'length' }), 'truncated');
+});
+
+test('detectDegenerate does not flag a genuinely complete response (done_reason:"stop" or omitted)', () => {
+  assert.equal(detectDegenerate('a real, complete response.', { doneReason: 'stop' }), null);
+  assert.equal(detectDegenerate('a real, complete response.'), null);
+});

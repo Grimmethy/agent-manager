@@ -133,6 +133,74 @@ test('call() does NOT throw when an earlier attempt hard-failed but a later atte
   );
 });
 
+// --- done_reason:"length" truncation detection (2026-09-05) -------------------------
+// Root-caused a real blocked-task cluster (pipeline_forensics_fix AC-4/6/8/20): a plan
+// pass came back non-empty, real-looking text that just stopped mid-sentence (Ollama
+// reached num_predict before a natural stop, likely think:true reasoning eating the
+// budget) -- detectDegenerate never looked at done_reason at all, so this sailed through
+// as a valid, complete plan and fed implement nothing coherent to work from.
+
+test('call() treats a done_reason:"length" response as degenerate ("truncated") and retries, succeeding on a later attempt', async () => {
+  let requestCount = 0;
+  await withServer(
+    (req, res) => {
+      requestCount += 1;
+      req.on('data', () => {});
+      req.on('end', () => {
+        if (requestCount === 1) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ response: '**Scope:** `src/x.js` only. No other', done: true, done_reason: 'length', eval_count: 1200 }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('a real, complete response that reached its own natural stop.'));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false }, 2);
+      assert.equal(result.degenerate, null);
+      assert.equal(result.response, 'a real, complete response that reached its own natural stop.');
+      assert.equal(requestCount, 2, 'the truncated first attempt must have been retried, not accepted as final');
+    }
+  );
+});
+
+test('call() returns degenerate:"truncated" (not a false "fine" verdict) when every retry also hits done_reason:"length"', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: 'a plausible-looking sentence that never finishes because', done: true, done_reason: 'length', eval_count: 1200 }));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false }, 1);
+      assert.equal(result.degenerate, 'truncated');
+    }
+  );
+});
+
+test('call() does NOT flag a genuinely complete response (done_reason:"stop") as truncated', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: 'a real, complete response.', done: true, done_reason: 'stop', eval_count: 10 }));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false }, 0);
+      assert.equal(result.degenerate, null);
+      assert.equal(result.response, 'a real, complete response.');
+    }
+  );
+});
+
 test('majorityVote() does not abort the whole vote when one vote hard-fails -- the other votes still count', async () => {
   let requestCount = 0;
   await withServer(
