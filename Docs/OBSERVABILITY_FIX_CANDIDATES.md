@@ -3122,3 +3122,26 @@ Inside the existing `catch (e)` block, before assigning `premise = null`, emit a
 
 Benefits:
 Operators can now see in stdout/stderr logs (the project's existing logging channel) exactly which task, which source, and which exception caused a `premiseCheck` to be skipped, turning a silent no-op into a diagnosable event. This is especially important because the comment itself references a real incident (AC-8 splitting into three children before its false premise was caught); a broken `premiseCheck` that silently no-ops would reproduce that class of failure with no trace. The fix is a one-line addition inside an existing `catch` block, changes no return shape, and introduces no new dependency.
+
+### AC-171 · Log swallowed buildPlanGrounding failure for operator visibility
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+  // Deterministic, no LLM. Kill switch AGENT_MANAGER_ADHOC_PLAN_GROUNDING=false.
+  let grounding = null;
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
+    try { grounding = buildPlanGrounding(task); } catch { grounding = null; }
+    if (grounding) {
+      task._planGrounding = grounding.text;
+      task.planWasGrounded = true;
+```
+
+Problem:
+The catch block on line 897 (`catch { grounding = null; }`) discards the exception entirely. The surrounding comments (lines 882-885) make the non-blocking intent explicit, and the null-fallback through the `if (grounding)` guard on line 898 is the correct control-flow contract. However, if `buildPlanGrounding` begins throwing consistently—due to a broken import, a changed file path, a permission error on the repo—every adhoc plan pass silently loses grounding with no log line, no stack trace, and no diagnostic of any kind. An operator investigating "why are adhoc plans inventing paths again?" has zero trail to follow; the kill-switch env var `AGENT_MANAGER_ADHOC_PLAN_GROUNDING` is the only lever, and it is invisible unless someone already knows it exists.
+
+Solution:
+Replace the bare `catch { grounding = null; }` with `catch (err) { console.warn('[adhoc-plan] buildPlanGrounding failed, proceeding without grounding:', err.message, err.stack); grounding = null; }`. This preserves the exact control-flow contract (grounding stays null, the `if (grounding)` guard skips the assignment, the task proceeds unblocked) while emitting a single `console.warn` line that includes the task context (the `[adhoc-plan]` prefix and the function name) and the full error message plus stack. No rethrow is warranted: the caller explicitly cannot act on this failure—the design is "proceed without grounding"—so rethrowing would violate the stated contract. No new dependency is introduced; `console.warn` is the logging primitive this file and project already use.
+
+Benefits:
+An operator tailing stderr or a log aggregator immediately sees, with the exact error and stack, that grounding is failing and for which task, turning a silent capability loss into a one-line diagnostic. The kill-switch env var becomes discoverable context rather than the only escape hatch. The fix is a single-line change that preserves every existing behavioral guarantee (non-blocking, null-fallback, no LLM call) while closing the observability gap.
