@@ -287,7 +287,21 @@ process_drafting_file() {
     # requeue-vs-block decision below already uses (kept in sync manually -- both are
     # small, static, rarely-changed literals; a shared source would cost more indirection
     # than it saves for two copies this short).
-    if grep -qEi 'timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b' <<< "$draft_result"; then
+    #
+    # 2026-09-05, Grimmethy: 27 tasks (mostly brain_dump_sort) permanently blocked on
+    # "Ollama HTTP 404: model 'qwen2.5:3b' not found" -- the worker-p40/worker-reasoning-p40
+    # lanes claim from the same general pool as worker-1 but talk to a DIFFERENT Ollama
+    # host that never had this cheap utility model pulled onto it (see model-profile-
+    # registry.js's own header for why a profile can override the model name but not which
+    # host serves it). Pulling the model onto that host fixes new failures but does nothing
+    # for tasks already sitting in blocked/ -- this pattern never matched "model ... not
+    # found" (no "50x" in a 404, and no dedicated wording for it either), so a missing-model
+    # misconfiguration on ANY lane was invisible to the exact mechanism built to survive
+    # transient infra faults. `model '[^']*' not found` matches Ollama's exact error shape;
+    # bounded by the same infraRequeueLimit as every other infra pattern below, so a
+    # genuinely wrong/typo'd model name (not just a not-yet-pulled one) still gives up and
+    # blocks permanently after a few rounds rather than retrying forever.
+    if grep -qEi "timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|model '[^']*' not found|\b50[0-9]\b" <<< "$draft_result"; then
       TICK_HAD_INFRA_FAILURE=true
     fi
 
@@ -371,7 +385,14 @@ process_drafting_file() {
         // went straight to "giving up" on the very first failure_count>=limit check, even
         // though the VM was healthy again within the hour. Kept in sync with the identical
         // copies in this file own bash pre-check just above and review-runner.sh copy.
-        const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b/i;
+        //
+        // 2026-09-05, Grimmethy: the SAME class of gap, one host over -- 27 tasks blocked
+        // on "Ollama HTTP 404: model 'qwen2.5:3b' not found" from the P40 lanes, which
+        // never had this cheap utility model pulled onto their own Ollama host. A missing
+        // model is a config/ops problem exactly like an unreachable host, and "the model
+        // was pulled 20 minutes ago" is just as real a self-clearing outage as "the VM
+        // came back" -- bounded by the same infraRequeueLimit either way.
+        const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|model \x27[^\x27]*\x27 not found|\b50[0-9]\b/i;
         // 2026-08-25, Grimmethy: found live -- a real overnight adhoc/research backlog
         // (draft calls hitting claude-pause.js manual pause, worded to match
         // INFRA_FAILURE_PATTERN "service unavailable" on purpose -- see that module own
