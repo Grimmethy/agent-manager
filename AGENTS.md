@@ -64,6 +64,25 @@ checkout directly when there's a specific reason to (e.g. inspecting exactly wha
 the live pipeline is in right now) -- and treat anything you leave there as ephemeral,
 never as the durable copy of the fix.
 
+**If you're doing rapid, live, in-checkout iteration anyway** (the actual mode of a long
+Claude Code session directing successive small fixes against the running pipeline, not a
+one-off manual edit) -- a worktree per fix is real overhead against that flow. What
+worked, confirmed across half a dozen real wipes in one session (2026-09-05): treat every
+self-contained, tested unit of work as a race against the next `resetToMain()` --
+
+- Write the change, run its real tests, and **commit + push immediately** once they pass.
+  Never let an edit sit uncommitted while you keep testing, keep exploring, or write the
+  next piece -- that gap is exactly when a reset lands.
+- Before re-doing anything that looks wiped (`git status` unexpectedly clean, a file you
+  just wrote is "not found," a `require`/`import` fails on a module you swear you just
+  created), **check `git stash list` first.** The auto-stash documented above is real and
+  already confirmed live -- most "wipes" are a stash entry away, not actually gone; `git
+  stash pop` costs one command against re-deriving and re-typing the same fix.
+- When a wipe is confirmed (nothing in the stash, or a commit that legitimately never
+  landed), just redo the lost piece from what's still in your own context and commit
+  again immediately -- don't spend time diagnosing which specific `resetToMain()` call
+  did it, the mechanism above already explains why it happened.
+
 ## queue/ is live pipeline state, not a source tree -- never hand-edit it
 
 `queue/*/*.json` (gitignored) is mutated continuously by `worker-1`, `reviewer`, and
