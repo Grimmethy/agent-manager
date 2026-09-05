@@ -287,7 +287,7 @@ process_drafting_file() {
     # requeue-vs-block decision below already uses (kept in sync manually -- both are
     # small, static, rarely-changed literals; a shared source would cost more indirection
     # than it saves for two copies this short).
-    if grep -qEi 'timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b' <<< "$draft_result"; then
+    if grep -qEi 'timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b' <<< "$draft_result"; then
       TICK_HAD_INFRA_FAILURE=true
     fi
 
@@ -361,7 +361,17 @@ process_drafting_file() {
         const draftResult = process.argv[2];
         const failureCount = process.argv[3];
         const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
-        const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
+        // 2026-09-05, Grimmethy: "investigate blocked adhoc task" -- found live, 76
+        // project_search tasks permanently blocked in one shot by a ~2hr window where the
+        // P40 VM Ollama endpoint was unreachable ("connect EHOSTUNREACH
+        // 192.168.122.29:11434"). EHOSTUNREACH (and its network-routing-failure siblings
+        // ENETUNREACH/EAI_AGAIN/ENOTFOUND) is exactly the same "cannot reach the host at
+        // all" class this pattern already exists to catch, but none of the four were in
+        // it -- every one of those 76 skipped the bounded-requeue path below entirely and
+        // went straight to "giving up" on the very first failure_count>=limit check, even
+        // though the VM was healthy again within the hour. Kept in sync with the identical
+        // copies in this file own bash pre-check just above and review-runner.sh copy.
+        const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b/i;
         // 2026-08-25, Grimmethy: found live -- a real overnight adhoc/research backlog
         // (draft calls hitting claude-pause.js manual pause, worded to match
         // INFRA_FAILURE_PATTERN "service unavailable" on purpose -- see that module own

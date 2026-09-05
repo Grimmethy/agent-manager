@@ -202,7 +202,7 @@ while :; do                                                                     
           const reviewResult = process.argv[2];
           const failureCount = process.argv[3];
           const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
-          const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|\b50[0-9]\b/i;
+          const INFRA_FAILURE_PATTERN = /timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|\b50[0-9]\b/i;
           let o;
           try { o = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { console.log("block"); process.exit(0); }
           // 2026-08-26, Grimmethy: "we have one big problem that keeps repeating" -- same
