@@ -1509,6 +1509,15 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // takes -- reject-retry-check.js's existing, already-proven redraft/priorRejectionFeedback/
   // exhaustion machinery handles everything from here, unchanged; this hook only decides
   // WHETHER a rejection happens; never invents a new one.
+  //
+  // 2026-09-06: also accepts verdict:'invalid-premise' (src/candidate-premise-check.js,
+  // wired onto pipeline_forensics_fix -- AC-16/AC-18 drafted a real, well-implemented
+  // guard against a prerequisite that was never actually built) -- a DISTINCT blockedReason
+  // prefix from 'ungrounded' (matching the wording finalizeCandidateFulfillment's own
+  // split-gated premiseCheck already uses) so blocked-task-classifiers.js can tell "the
+  // draft fabricated something" (model-side, worth a feedback-driven retry) apart from
+  // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
+  // same false premise every time -- structurally futile, not stochastically unlucky).
   const postImplementEntry = getRegisteredSource(resolveSourceName(task));
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
@@ -1517,8 +1526,9 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     } catch (e) {
       grounding = null; // advisory -- a throwing check must never block a real draft
     }
-    if (grounding && grounding.verdict === 'ungrounded') {
-      const blockedReason = `Ungrounded draft: ${String(grounding.reason || '(no detail)')}`.slice(0, 500);
+    if (grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise')) {
+      const prefix = grounding.verdict === 'invalid-premise' ? 'Invalid premise' : 'Ungrounded draft';
+      const blockedReason = `${prefix}: ${String(grounding.reason || '(no detail)')}`.slice(0, 500);
       recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
       appendHistoryEvent(task, 'blocked', blockedReason);
       task.blockedStage = 'review';

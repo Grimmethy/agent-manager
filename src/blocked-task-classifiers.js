@@ -73,6 +73,32 @@ function buildUnreliableGroundingQuestion(task) {
   ].join('\n');
 }
 
+// 2026-09-06: root-caused live via AC-16/AC-18 (real, duplicate pipeline_forensics_fix
+// candidates) -- both assumed a prerequisite feature already existed in the codebase
+// when it never did. src/candidate-premise-check.js's postImplementCheck wiring
+// produces this exact "Invalid premise: " prefix (matching the wording
+// finalizeCandidateFulfillment's own split-gated premiseCheck hook already uses) when a
+// candidate's own stated claim about the current code doesn't hold up. ENVIRONMENT-side,
+// not retryable: the false premise lives in the CANDIDATE itself (an earlier
+// generation/forensics stage), not in this draft -- redrafting the same candidate
+// against the same false premise reproduces the identical block every time.
+function hasInvalidPremise(task) {
+  return /^invalid premise:/i.test(String(task.blockedReason || '').trim());
+}
+
+function buildInvalidPremiseQuestion(task) {
+  return [
+    `This candidate's own Problem statement makes a claim about agent-manager's current `
+      + `code that a deterministic/model check found does not hold up: `
+      + `"${String(task.blockedReason || '').replace(/^invalid premise:\s*/i, '')}".`,
+    '',
+    'A blind redraft cannot fix this -- the false premise is in the candidate itself, not '
+      + 'in how it was implemented. Check whether the premise was ever true (a prerequisite '
+      + 'that was simply never built, or already superseded by a sibling task) and either '
+      + 'Archive this candidate or re-file it with an accurate premise.',
+  ].join('\n');
+}
+
 // Keyword categories over blockedReason text, same ones used by hand triaging this
 // session's blocked queue, same priority order. faultSide:'model' -- a keyword match on
 // the draft's own text/behavior -- and retryable:true for all five: no real evidence yet
@@ -124,6 +150,16 @@ const CLASSIFIERS = [
       return null;
     },
     buildQuestion: buildUnreliableGroundingQuestion,
+  },
+  {
+    name: 'invalid-premise',
+    classify(task) {
+      if (hasInvalidPremise(task)) {
+        return { category: 'invalid-premise', faultSide: 'environment', retryable: false };
+      }
+      return null;
+    },
+    buildQuestion: buildInvalidPremiseQuestion,
   },
   {
     name: 'harness-search-zero-results',
@@ -186,6 +222,7 @@ module.exports = {
   categorizeBlockedReason,
   hasZeroHitHarnessSearch,
   hasUnreliableGrounding,
+  hasInvalidPremise,
   signatureForTask,
   findClassifier,
 };

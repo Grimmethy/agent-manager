@@ -33,6 +33,7 @@ const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = 
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 const { incrementJobTypeCounter } = require('./job-type-counters.js');
 const { runGroundingCheck: runDeepDiveGroundingCheck } = require('./deep-dive-grounding-check.js');
+const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -2230,6 +2231,16 @@ registerTaskSource('pipeline_forensics_fix', {
   harnessSearch: 'archImport',
   reportClass: 'benefit',
   reviewGuidance: PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE,
+  // 2026-09-06: AC-16/AC-18 (real, duplicate pipeline_forensics_fix candidates) assumed
+  // a prerequisite gate already existed in the codebase -- it never did. This source's
+  // own noCandidateSplit:true means finalizeCandidateFulfillment's split-gated
+  // premiseCheck hook could never have caught it (see candidate-premise-check.js's own
+  // header for the full incident); postImplementCheck runs unconditionally on every
+  // implement pass instead, checking the candidate's OWN stated premise against its real
+  // fetched grounding. NOT wired onto pipeline_self_audit -- that source's tasks
+  // describe a cross-task PATTERN (promptContext.evidenceText), not a single candidate
+  // with a promptContext.body to premise-check.
+  postImplementCheck: runPremiseCheckAsPostImplement,
 });
 
 // function_length_review/fix, observability_review/fix, performance_review/fix -- the
