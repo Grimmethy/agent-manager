@@ -19,6 +19,7 @@ const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
+const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
@@ -302,11 +303,36 @@ function withApplyLock(fn) {
   }
 }
 
+// Chat-driven task completion reliability (2026-09-06, Design option A -- see
+// concept-chat-driven-task-completion-reliability-f08ae0's own research): confirmed
+// live that Chat, asked to review 34 unmerged branches, correctly diagnosed the 2 with
+// real work but never checked the dashboard's own /api/git/unmerged-branches API, which
+// already knew one of them would conflict -- had Chat gone on to actually run the merge
+// itself (run_bash has full writable-bind git access today, nothing stopped it), that
+// conflict would have hit blind. `git merge`/`git push` specifically -- "landing a
+// change on shared history" -- are denied here; read-only/working-tree-only git
+// commands (log/diff/show/status/branch listing/fetch) are unaffected, so Chat's actual
+// investigation capability (exactly what it used to correctly diagnose the 34 branches)
+// doesn't change at all. Matches this repo's own deterministic-command-shape-check
+// house style (INFRA_FAILURE_PATTERN in local-worker.sh/review-runner.sh) rather than
+// attempting real shell parsing -- a match anywhere in the command string, including
+// inside a compound `&&`/`;` chain, is a deliberate over-block: better to refuse a
+// disguised merge/push than let one slip through a parser gap.
+const RISKY_GIT_COMMAND_RE = /\bgit\s+(merge\b|push\b)/;
+
 function runBashTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { command } = args;
   if (typeof command !== 'string' || !command.trim()) {
     return { error: 'run_bash requires a non-empty "command" argument' };
+  }
+  if (RISKY_GIT_COMMAND_RE.test(command)) {
+    return {
+      error: 'git merge/push is not available via run_bash -- call queue_reviewed_task with a '
+        + 'title and description of what should be merged/pushed and why. This lands the change '
+        + 'through the same reviewed pipeline (implement/critique/review/majority-vote) every '
+        + 'other change goes through, instead of executing directly from Chat.',
+    };
   }
   const realRoots = allowedRoots.map((r) => fs.realpathSync(r));
   const wrapped = wrapWithSandbox('bash', ['-c', command], {
@@ -380,13 +406,28 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'run_bash',
-      description: 'Run a shell command inside a filesystem sandbox. The working directory is the primary repo root; every accessible repo is mounted writable (use `git -C <abs path>` or `cd` for another repo). Use for git operations, running tests, or anything the file tools cannot do directly.',
+      description: 'Run a shell command inside a filesystem sandbox. The working directory is the primary repo root; every accessible repo is mounted writable (use `git -C <abs path>` or `cd` for another repo). Use for read-only investigation (git log/diff/show/status, running tests) or anything the file tools cannot do directly. Refuses `git merge`/`git push` -- use queue_reviewed_task for those.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The shell command to run.' },
         },
         required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'queue_reviewed_task',
+      description: 'Hand off a risky or history-mutating action (merging a branch, pushing a change) to the existing reviewed pipeline instead of attempting it directly. Use this whenever run_bash refuses a git merge/push, or whenever you are recommending an action you should not take yourself. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Short title for the queued task, e.g. "Merge agent/observability-fix-ac-57 into master".' },
+          description: { type: 'string', description: 'What should be done and why -- include enough detail (branch names, the specific change, any known risks like a merge conflict) for the pipeline to act on without further back-and-forth.' },
+        },
+        required: ['title', 'description'],
       },
     },
   },
@@ -539,11 +580,27 @@ function withGrepDirsHint(tools) {
   });
 }
 
-function buildWriteToolHandlers(allowedRoots) {
+function queueReviewedTaskTool(pipelineDir, { title, description }) {
+  if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
+  if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
+  const { domainsPath } = getConfig();
+  try {
+    const { record } = queueAdhocTask(
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' } },
+      { pipelineDir, domainsPath },
+    );
+    return { queuedTaskId: record.id, message: `Queued as ${record.id} -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
+  } catch (e) {
+    return { error: `failed to queue task: ${e.message}` };
+  }
+}
+
+function buildWriteToolHandlers(allowedRoots, pipelineDir) {
   return {
     write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content }),
     edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace }),
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command }),
+    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
   };
 }
 
@@ -922,7 +979,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
   const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
   const toolHandlers = allowWrite
-    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
+    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots, pipelineDir) }
     : buildToolHandlers(allowedRoots);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
