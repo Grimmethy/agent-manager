@@ -66,6 +66,41 @@ function isAdhocTask(task) {
   return task.domain === 'adhoc' || task.source === 'manual';
 }
 
+// 2026-09-06: root-caused live via pipeline-forensics-fix-ac-8 -- a candidate-fulfillment
+// task whose cited code couldn't be anchor-matched in its target file at all
+// (windowFetchedFileContent, src/sdk/candidate-fulfillment.js, falls back to
+// confidence:'none': an unstructured blind slice of the file, explicitly prefixed
+// "[LOW-CONFIDENCE GROUNDING: no reliable anchor found... may not contain the real
+// target]"). The model correctly refused rather than fabricate an edit against
+// admittedly-unreliable grounding -- but refreshCandidateFetchedFiles() re-derives the
+// SAME deterministic anchor search from the SAME unchanged file on every retry, so a
+// blind requeue can only ever reproduce identical grounding and fail identically. All 3
+// requeue attempts did exactly that before exhausting. Retrying is structurally futile
+// here, not stochastically unlucky -- this must escalate on the FIRST rejection, not
+// after burning 2 more requeues that were never going to differ.
+function hasUnreliableGrounding(task) {
+  const fetchedFiles = task.promptContext && task.promptContext.fetchedFiles;
+  return Array.isArray(fetchedFiles) && fetchedFiles.some((f) => f && f.anchorConfidence === 'none');
+}
+
+function buildUnreliableGroundingQuestion(task) {
+  const fetchedFiles = (task.promptContext && task.promptContext.fetchedFiles) || [];
+  const badFiles = fetchedFiles.filter((f) => f && f.anchorConfidence === 'none').map((f) => f.path).filter(Boolean);
+  return [
+    `The grounding-fetch could not find a reliable anchor for this candidate's cited code in `
+      + `${badFiles.join(', ') || 'its target file'} -- every draft attempt sees the same `
+      + 'unstructured, low-confidence file slice (a blind requeue cannot fix this; the anchor '
+      + 'search is deterministic against unchanged file content), so this was escalated after '
+      + 'ONE rejection instead of burning further identical retries.',
+    '',
+    'Likely causes: the candidate\'s own citation of the target code is stale or wrong (check '
+      + 'whether the described code still exists, possibly already fixed by a sibling task), '
+      + 'or the anchor-matching heuristic missed a real match that does exist. If the '
+      + 'underlying issue is already resolved, Archive this task. If the citation is wrong but '
+      + 'the issue is real, re-file the candidate with an accurate code citation.',
+  ].join('\n');
+}
+
 // On a brain_dump_sort task exhausting its redrafts, bump the originating brain-dump
 // entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
 // (…-aN) instead of the entry being stuck 'captured' forever behind this blocked record.
@@ -166,6 +201,23 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
       // not be gated by, or count against, the blind-redraft cap.
       const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
+
+      // Unreliable-grounding escalation runs BEFORE the retry-cap check below and
+      // regardless of retryCount -- see hasUnreliableGrounding's own header. A blind
+      // requeue here is not a cheaper first attempt at a possible fix, it is a guaranteed
+      // repeat of the exact same failure, so there is no reason to wait for the cap.
+      if (isReviewRejection(task) && hasUnreliableGrounding(task) && needsClarificationDir) {
+        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+        if (!alreadyEscalated) {
+          task.needsClarification = { reason: 'unreliable-grounding', openQuestions: buildUnreliableGroundingQuestion(task) };
+          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- grounding anchor-confidence is none, a blind retry cannot differ');
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+      }
 
       const retryCount = Number(task.localRejectCount) || 0;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
@@ -296,7 +348,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck };
+module.exports = { rejectRetryCheck, hasUnreliableGrounding };
 
 if (require.main === module) {
   main();

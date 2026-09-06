@@ -356,3 +356,90 @@ test('a NON-adhoc task carrying retryableDraftBlock is NOT requeued (guarded on 
   assert.equal(summary.requeued, 0);
   assert.ok(fs.existsSync(path.join(d.blockedDir, 'nonadhoc-tb.json')), 'left in blocked/');
 });
+
+// --- unreliable-grounding escalation (2026-09-06) -------------------------------------
+// Root-caused live via pipeline-forensics-fix-ac-8: windowFetchedFileContent falls back
+// to anchorConfidence:'none' when it can't find the candidate's cited code at all, and
+// refreshCandidateFetchedFiles() re-derives that SAME deterministic result from the SAME
+// unchanged file on every retry -- so a blind requeue can only ever reproduce the
+// identical failure. Must escalate on the FIRST rejection, not after burning the full
+// retry cap on guaranteed repeats.
+const { hasUnreliableGrounding } = require('./reject-retry-check.js');
+
+function unreliableGroundingTask(overrides = {}) {
+  return {
+    id: 'pff-ac8', source: 'pipeline_forensics_fix', blockedStage: 'review',
+    blockedReason: 'the draft is a refusal citing insufficient grounding', localRejectCount: 0, history: [],
+    promptContext: {
+      fetchedFiles: [{ path: 'src/local-draft.js', content: '[LOW-CONFIDENCE GROUNDING...]', anchorConfidence: 'none' }],
+    },
+    ...overrides,
+  };
+}
+
+test('hasUnreliableGrounding is true when any fetchedFiles entry has anchorConfidence:none', () => {
+  assert.equal(hasUnreliableGrounding(unreliableGroundingTask()), true);
+});
+
+test('hasUnreliableGrounding is false for strong/weak confidence or no fetchedFiles at all', () => {
+  assert.equal(hasUnreliableGrounding({ promptContext: { fetchedFiles: [{ anchorConfidence: 'strong' }] } }), false);
+  assert.equal(hasUnreliableGrounding({ promptContext: { fetchedFiles: [{ anchorConfidence: 'weak' }] } }), false);
+  assert.equal(hasUnreliableGrounding({ promptContext: {} }), false);
+  assert.equal(hasUnreliableGrounding({}), false);
+});
+
+test('a review rejection with anchorConfidence:none escalates to needs-clarification on the FIRST rejection, not after 2 more retries', () => {
+  const d = setupAdhocDirs();
+  const task = unreliableGroundingTask({ localRejectCount: 0 });
+  fs.writeFileSync(path.join(d.blockedDir, 'pff-ac8.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'pff-ac8.json')));
+  const p = path.join(d.needsClarificationDir, 'pff-ac8.json');
+  assert.ok(fs.existsSync(p), 'escalated straight to needs-clarification/, not requeued to pending/');
+  const out = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(out.needsClarification.reason, 'unreliable-grounding');
+  assert.match(out.needsClarification.openQuestions, /src\/local-draft\.js/);
+  assert.match(out.needsClarification.openQuestions, /blind requeue cannot fix this/);
+  assert.ok(out.history.some((h) => h.stage === 'needs-clarification'));
+});
+
+test('applies to non-adhoc, non-candidateFulfillment-specific sources alike -- gated on grounding, not on source', () => {
+  const d = setupAdhocDirs();
+  const task = unreliableGroundingTask({ id: 'obs-x', source: 'observability_fix', domain: 'default' });
+  fs.writeFileSync(path.join(d.blockedDir, 'obs-x.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(fs.existsSync(path.join(d.needsClarificationDir, 'obs-x.json')));
+});
+
+test('does not re-escalate a task already carrying a needs-clarification history entry', () => {
+  const d = setupAdhocDirs();
+  const task = unreliableGroundingTask({ history: [{ stage: 'needs-clarification', at: '2026-01-01T00:00:00Z' }] });
+  fs.writeFileSync(path.join(d.blockedDir, 'pff-ac8.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  // Falls through to the ordinary retry-cap path instead of looping the escalation --
+  // localRejectCount 0 is under the cap, so this becomes a normal (if likely futile) requeue.
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+});
+
+test('a task with only strong/weak-confidence grounding is NOT escalated -- falls through to the ordinary retry path', () => {
+  const d = setupAdhocDirs();
+  const task = unreliableGroundingTask({
+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', content: 'real content', anchorConfidence: 'strong' }] },
+  });
+  fs.writeFileSync(path.join(d.blockedDir, 'pff-ac8.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+});
