@@ -39,41 +39,17 @@ const CLUSTER_THRESHOLD = 5; // below this, "a pattern" is indistinguishable fro
 const MAX_EXAMPLES = 5;
 const MAX_REASON_CHARS = 220;
 
-// Checked first, from task.history rather than free-text blockedReason -- a precise,
-// mechanical signal (same one that found the grep-codebase-tool.js bug) rather than a
-// keyword guess.
-function hasZeroHitHarnessSearch(task) {
-  const hist = Array.isArray(task.history) ? task.history : [];
-  return hist.some((h) => h.stage === 'harness-search' && /\b0\s+(hit|result)\(s\)/.test(h.detail || ''));
-}
-
-// Keyword categories over blockedReason text, same ones used by hand triaging this
-// session's blocked queue, in the same priority order (a fabricated claim is more
-// actionable to report on its own than a generic "refusal", so it's checked first).
-const REASON_CATEGORIES = [
-  { key: 'fabricated-ungrounded-claim', keywords: ['fabricat', 'hallucinat', 'unverified claim', 'ungrounded'] },
-  { key: 'refusal-no-changes-needed', keywords: ['no-changes-needed', 'refus'] },
-  { key: 'empty-degenerate-draft', keywords: ['empty', 'degenerate', 'no actual implementation', 'no implementation', 'no code'] },
-  { key: 'truncated-draft', keywords: ['truncat'] },
-  { key: 'inconclusive-review', keywords: ['inconclusive'] },
-];
-
-function categorizeBlockedReason(reason) {
-  const lower = (reason || '').toLowerCase();
-  for (const { key, keywords } of REASON_CATEGORIES) {
-    if (keywords.some((kw) => lower.includes(kw))) return key;
-  }
-  return null;
-}
-
-// One signature per task -- null means "not confidently categorizable, skip it." A
-// genuinely unique/ambiguous blocked task is exactly the kind of thing that needs a
-// human's own judgment, not a pattern report.
-function signatureForTask(task) {
-  if (hasZeroHitHarnessSearch(task)) return `${task.source || 'unknown'}::harness-search-zero-results`;
-  const category = categorizeBlockedReason(task.blockedReason);
-  return category ? `${task.source || 'unknown'}::${category}` : null;
-}
+// 2026-09-06: classification itself moved to src/blocked-task-classifiers.js -- the
+// unified fault-side registry that ALSO backs reject-retry-check.js's retry-safety
+// decision, so a category discovered once (in either mechanism) benefits both instead
+// of needing the same keyword/structural check written twice with no shared vocabulary.
+// Re-exported here UNCHANGED (same names, same value shapes, same signature format
+// `${source}::${category}`) so pipeline-forensics.js and staleness-audit.js's existing
+// `require('./pipeline-self-audit.js')` imports need zero changes -- this file's public
+// API is identical, only its internal implementation is now a pure delegation.
+const {
+  REASON_CATEGORIES, categorizeBlockedReason, hasZeroHitHarnessSearch, signatureForTask, classifyBlockedTask,
+} = require('./blocked-task-classifiers.js');
 
 // coverage: { [signature]: { reportedAt, taskId } } -- signatures already turned into an
 // audit task are skipped forever (this module reports a pattern once; whether the
@@ -117,9 +93,20 @@ function buildAuditRawText(cluster) {
     return `- ${t.id}: ${reason}`;
   });
   const remainder = tasks.length - examples.length;
+  // Every task in a cluster shares the same signature by construction (findAuditClusters
+  // groups by it), so the first task's classification speaks for the whole cluster --
+  // cheap, direct context for whoever investigates this next (human or the audit task's
+  // own drafting pass) about WHERE to look before they start reading code.
+  const { faultSide } = classifyBlockedTask(tasks[0]);
+  const faultSideNote = {
+    harness: 'Classified as: harness-side (a tool/fetch/scaffolding bug, not a bad model attempt).',
+    environment: 'Classified as: environment-side (an external resource/dependency this sandbox cannot provide).',
+    model: 'Classified as: model-side (the draft itself is wrong -- targeted feedback may fix it on redraft).',
+  }[faultSide] || '';
 
   return [
     `A deterministic scan of this pipeline's own queue/blocked/ found ${tasks.length} tasks (source="${source}") all failing the SAME way: ${category}.`,
+    faultSideNote,
     '',
     'Example blocked tasks (id: blockedReason, truncated):',
     ...examples,
