@@ -39,6 +39,20 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 
 const AUTO_CONFIRM_VOTES = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_VOTES) || 3;
 const AUTO_CONFIRM_MIN_AGREEING = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_MIN_AGREEING) || 2;
+// pipeline_debrief (2026-09-06, Grimmethy: "Does it really need three separate votes?
+// debrief is a review process that makes a brain dump, no actual code written") -- a
+// genuinely lower-stakes gate than forensics (files straight into a real code-diff
+// pipeline) or the delete gate (irreversible): a wrong CONFIRM here just archives already-
+// shipped done/ tasks a little early (harmless -- done-archive.js's own time-based sweep
+// would do it anyway) and files a Now-What note that still has to clear brain_dump_sort's
+// own triage before it becomes anything; a wrong DENY just leaves the report archived and
+// the window's done/ tasks fall back to that same time-based sweep. The report has ALSO
+// already passed real majority review (2/3+ Ornith votes) before ever reaching this gate --
+// a fresh 3-vote majority on top of that is redundant scrutiny for this risk level. One
+// real vote is proportionate. Separately overridable so forensics/delete keep their own
+// heavier default untouched.
+const DEBRIEF_VOTES = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_DEBRIEF_VOTES) || 1;
+const DEBRIEF_MIN_AGREEING = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_DEBRIEF_MIN_AGREEING) || 1;
 
 // Same classify helper inline-duplicated in review-task.js:246 and local-client.js's CLI.
 // Kept local here too (extracting the trio into src/classify-vote.js is a follow-up).
@@ -320,8 +334,8 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       vote = await majorityVote({
         prompt,
         classify: classifyVote(['CONFIRM', 'DENY'], 15),
-        n: AUTO_CONFIRM_VOTES,
-        minAgreeing: AUTO_CONFIRM_MIN_AGREEING,
+        n: isDebrief ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: isDebrief ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
         temperature: 0.2,
         source: task.source,
       });
