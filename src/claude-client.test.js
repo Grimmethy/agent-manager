@@ -487,3 +487,44 @@ test('call() extracts a SIDE-FINDING block from the response, returns cleaned te
     assert.equal(files[0].source, 'chat');
   });
 });
+
+// --- concept-build self-report (2026-09-06) -------------------------------------------
+
+test('callOnce does NOT inject CONCEPT-BUILD when no conceptId is given', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'do the task' }); },
+    );
+    assert.doesNotMatch(capturedArgs[1], /CONCEPT-BUILD/);
+  });
+});
+
+test('callOnce injects the CONCEPT-BUILD instruction when conceptId is set', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'do the task', conceptId: 'concept-foo-abc' }); },
+    );
+    assert.match(capturedArgs[1], /CONCEPT-BUILD:/);
+  });
+});
+
+test('call() extracts a CONCEPT-BUILD report and records the tally on concepts.json', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-cb-test-'));
+  const { createConcept } = require('./concepts.js');
+  const concept = createConcept({ name: 'Claude concept' }, dir);
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token', AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: dir }, async () => {
+    await withMockedClient(
+      () => JSON.stringify({ result: 'Done.\n\nCONCEPT-BUILD: scratch | Wrote this fresh, no reference.' }),
+      async ({ call }) => {
+        const result = await call({ prompt: 'go', conceptId: concept.id });
+        assert.equal(result.response.includes('CONCEPT-BUILD'), false);
+      },
+    );
+    const updated = JSON.parse(fs.readFileSync(path.join(dir, 'concepts.json'), 'utf8')).concepts.find((c) => c.id === concept.id);
+    assert.equal(updated.builtFromScratchCount, 1);
+  });
+});

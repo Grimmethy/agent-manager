@@ -16,6 +16,7 @@ const gpuCapacity = require('./gpu-capacity.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -119,7 +120,7 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true }) {
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, conceptId = null }) {
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
@@ -127,7 +128,12 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // response, path-prefetch-resolve) OR the call is already grammar-constrained
   // (`format` set) -- a constrained decode literally cannot emit free text, so the
   // instruction would just be wasted prompt tokens.
-  const effectivePrompt = (allowSideFindings && !format) ? injectSideFindingInstruction(prompt) : prompt;
+  let effectivePrompt = (allowSideFindings && !format) ? injectSideFindingInstruction(prompt) : prompt;
+  // Concept-build self-report (2026-09-06, see concepts.js's own header): only injected
+  // when the CALLER opted this specific task into concept tracking (conceptId set) --
+  // unlike side-finding, never on by default, since this is a deliberate audit tag, not
+  // a general-purpose channel.
+  if (conceptId && !format) effectivePrompt = injectConceptBuildInstruction(effectivePrompt);
   const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const promptTokens = estimateTokens(datedPrompt);
 
@@ -276,6 +282,13 @@ async function call(opts, maxRetries = 2) {
         for (const finding of findings) {
           writeSideFindingInbox(finding, { source: opts.source, taskId: opts.taskId, stage: opts.stage, pipelineDir });
         }
+      }
+    }
+    if (opts.conceptId && result.response && result.response.includes('CONCEPT-BUILD:')) {
+      const { cleanText, report } = extractConceptBuildReport(result.response);
+      result = { ...result, response: cleanText };
+      if (report) {
+        recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
       }
     }
     const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty });

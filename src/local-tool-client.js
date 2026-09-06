@@ -18,6 +18,7 @@ const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
@@ -895,7 +896,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null, stage = null }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null, stage = null, conceptId = null }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -958,6 +959,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   if (allowSideFindings && messages.length) {
     messages[0] = { ...messages[0], content: injectSideFindingInstruction(messages[0].content) };
   }
+  // Concept-build self-report (2026-09-06, see concepts.js's own header): only injected
+  // when the caller opted this session into concept tracking (conceptId set).
+  if (conceptId && messages.length) {
+    messages[0] = { ...messages[0], content: injectConceptBuildInstruction(messages[0].content) };
+  }
   const toolCallLog = [];
   let turnsUsed = 0;
   let lastMessage = null;
@@ -991,6 +997,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
           writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir });
         }
       }
+    }
+    if (conceptId && merged.response && merged.response.includes('CONCEPT-BUILD:')) {
+      const { cleanText, report } = extractConceptBuildReport(merged.response);
+      merged.response = cleanText;
+      if (report) recordConceptBuildTally(pipelineDir, conceptId, report.kind);
     }
     return merged;
   };
