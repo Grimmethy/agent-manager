@@ -22,6 +22,34 @@ an existing sweep). Hand-editing `queue/` or committing a fix straight to a stuc
 branch is the exception that needs a stated reason, not the default move. If no mechanism
 fits, the deliverable is a proposal for one — surface it, don't paper over it.
 
+## Second principle: build for after-the-fact audit, not just correctness
+
+Grimmethy has said this directly, more than once: *"you know how much I love being able
+to audit the work"*, and *"I'd like you to investigate what the actual [X] could be rather
+than making arbitrary [numbers]"*. Treat this as a standing preference, not a one-off ask
+— it shapes how a fix should be built, not just whether it works:
+
+- **A fix that only works silently isn't finished.** When you build something that makes a
+  real-time decision (a threshold, a retry, a gate), also give it a durable, inspectable
+  trail of *why* it decided what it decided — a persisted log line, a stamped field on the
+  task/record itself, a real DB column — not just the correct behavior with no evidence
+  left behind. Concrete precedent: `local-tool-client.js`'s context-budget check
+  (`logContextAudit` → `instances/context-budget-audit.log`, 2026-09-06) logs every
+  evaluation, not just the ones that trigger, specifically so a later investigation reads a
+  file instead of re-deriving turn-by-turn state from a chat transcript's own visible text.
+- **Ground a threshold/limit in a real measurement, never a round guess.** Before picking a
+  number (a token reserve, a retry cap, a timeout), find the real data first — query
+  `model-stats.db`, read the actual error text, check what the underlying system really
+  reports (e.g. Ollama's own `prompt_eval_count` is ground truth; a `chars/4` guess is not)
+  — and say in the comment where the number came from. If a similar-sounding stat is
+  missing (e.g. a whole call class has NULL token columns because nothing ever threaded
+  them through), fix that gap too, don't work around it with a guess.
+- **A "why did X happen" question deserves a real answer, not a plausible-sounding one.**
+  When you can't fully explain an observed behavior from available evidence, say so
+  explicitly rather than asserting a root cause you haven't verified — and treat the gap in
+  evidence itself as something worth closing (usually via the logging point above), not
+  just something to route around this one time.
+
 ## Agent skills
 
 ### Issue tracker
