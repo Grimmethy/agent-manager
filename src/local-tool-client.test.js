@@ -532,6 +532,50 @@ test('runPlanWithTools context-budget wrap-up fires mid-run once accumulated too
   });
 });
 
+// --- Real-token-anchored context estimate (2026-09-05 follow-up) --------------------
+// A SECOND real Chat run (chat-1788643062-70636c80) still hit done_reason:"length" at
+// ~16319 real prompt tokens even with the check above live: estimateMessagesTokens'
+// chars/4 guess is calibrated for English prose, and this pipeline's own tool results are
+// dense code/JSON, which tokenizes tighter than 4 chars/token -- the guess ran optimistic
+// by enough to eat the whole RESERVED_RESPONSE_TOKENS margin before the check ever
+// tripped. estimateContextTokens anchors on Ollama's own real prompt_eval_count from the
+// most recent turn instead of re-guessing the whole history from characters every time.
+
+test('estimateContextTokens falls back to the pure chars/4 guess before any real measurement exists', () => {
+  const { estimateContextTokens, estimateMessagesTokens } = require('./local-tool-client.js');
+  const messages = [{ role: 'user', content: 'hello world' }];
+  assert.equal(estimateContextTokens(messages, null, 0), estimateMessagesTokens(messages));
+});
+
+test('estimateContextTokens anchors on the real measurement plus only the DELTA since it was taken, not the whole history', () => {
+  const { estimateContextTokens } = require('./local-tool-client.js');
+  const messages = [
+    { role: 'user', content: 'x'.repeat(4000) }, // already covered by the real measurement below
+    { role: 'assistant', content: 'y'.repeat(400) }, // new since -- only this should be estimated
+  ];
+  // Real measurement covers messages[0] alone (length 1 at measurement time): 15000 real
+  // tokens for content chars/4 would have called "only ~1000" -- exactly the gap that let
+  // the second real incident through. The delta (messages.slice(1)) is ~100 tokens.
+  const result = estimateContextTokens(messages, 15000, 1);
+  assert.equal(result, 15000 + Math.ceil(JSON.stringify('y'.repeat(400)).length / 4));
+});
+
+test('runPlanWithTools uses the real prompt_eval_count from the previous turn to trigger the context check even when the visible message text is textually short', async () => {
+  // The exact real-world gap: a turn's OWN text content is small, but Ollama's real
+  // tokenizer count for the full messages array it actually sent was already right at the
+  // ceiling (dense tool-call JSON/code from EARLIER turns, already summarized/trimmed in
+  // visible text but still counted by the real tokenizer). A pure chars/4 re-guess of the
+  // current (short) messages array would never catch this; the real anchor does.
+  const shortButHeavy = { role: 'assistant', content: 'ok', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }], _usage: { prompt_eval_count: 15000, eval_count: 5, eval_duration: 1 } };
+  const summaryTurn = { role: 'assistant', content: 'Wrapping up now.\n\nRESOLUTION: needs-human-decision\nran out of real context room.' };
+  await withMockedChat([shortButHeavy, summaryTurn], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 50 });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'context');
+    assert.equal(result.turnsUsed, 2, 'one real (short-text) turn, then the forced summary -- not 50');
+  });
+});
+
 test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the kill switch file is present', async () => {
   await withMockedChat([], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'hi' });

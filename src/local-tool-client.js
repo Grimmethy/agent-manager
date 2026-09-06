@@ -709,14 +709,36 @@ const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS)
 // done_reason:"length" almost instantly, turn after turn, for zero forward progress --
 // this pipeline already has the right mechanism for the analogous "budget exhausted"
 // problem (forceSummaryOnCap/runForcedSummaryTurn, turn-count-triggered), just not for
-// the CONTEXT budget. RESERVED_RESPONSE_TOKENS is deliberately generous (not a tight
-// squeeze) so the forced summary turn itself has real room to write a coherent answer,
-// not just barely avoid one more failure.
-const RESERVED_RESPONSE_TOKENS = 2000;
+// the CONTEXT budget.
+//
+// 2026-09-05 follow-up (Grimmethy: "investigate what the actual context limits could be
+// rather than making arbitrary limits" -- a SECOND real Chat run, chat-1788643062-70636c80,
+// still hit done_reason:"length" at ~16319 real prompt tokens): the chars/4
+// estimateMessagesTokens() below re-guesses the ENTIRE message history from scratch every
+// turn, and chars/4 is calibrated for plain English prose -- this pipeline's own tool
+// results are dense code/diffs/JSON, which tokenize noticeably tighter (closer to 3
+// chars/token for a BPE tokenizer on code), so the guess silently ran ~2000 tokens optimistic
+// by the time this fired, eating the entire reserve before the check ever tripped. Fixed
+// below (estimateContextTokens) by anchoring on Ollama's OWN real prompt_eval_count from
+// the most recently completed turn -- a genuine per-request tokenizer count, not a
+// guess -- and only estimating the small delta appended since (this turn's own response +
+// any tool result), which is a much smaller error surface than re-guessing 16,000+ tokens
+// of accumulated history from characters alone.
+//
+// RESERVED_RESPONSE_TOKENS: model-stats.db's real eval_count (tokens actually generated
+// per call) for this exact model today averages ~1200 with a real observed max of 21,088
+// (`SELECT AVG(eval_count), MAX(eval_count) FROM model_calls WHERE model LIKE '%27b%' AND
+// started_at > '2026-09-05'`) -- 2000 was already above the average but not comfortably so;
+// widened to keep real margin above a typical completion instead of barely clearing it.
+const RESERVED_RESPONSE_TOKENS = 2500;
 
 // Same rough chars-per-token estimate local-client.js's own estimateTokens() uses --
 // duplicated rather than imported since it's a one-line arithmetic heuristic, not worth
-// the shared-module treatment given to normalizeTokens/distinctivePhrases.
+// the shared-module treatment given to normalizeTokens/distinctivePhrases. Only ever
+// applied to the small delta since the last real Ollama measurement now (see
+// estimateContextTokens below), not the whole history -- see this file's own comment
+// above for why applying it to 16,000+ tokens of accumulated code/JSON ran unsafely
+// optimistic.
 function estimateMessagesTokens(messages) {
   let chars = 0;
   for (const m of messages) {
@@ -724,6 +746,17 @@ function estimateMessagesTokens(messages) {
     if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
   }
   return Math.ceil(chars / 4);
+}
+
+// Real-anchored context estimate: `real` is Ollama's own prompt_eval_count from the most
+// recently completed turn (the exact tokenized size of `messages` as of `realAtLength`
+// entries) -- ground truth, not a guess. Everything appended since (this turn's own
+// response, tool results, nudges) is still unmeasured, so that DELTA (never the whole
+// history) is what chars/4 estimates. Falls back to a pure chars/4 guess of the whole
+// array only before any real measurement exists yet (the very first turn).
+function estimateContextTokens(messages, real, realAtLength) {
+  if (real == null) return estimateMessagesTokens(messages);
+  return real + estimateMessagesTokens(messages.slice(realAtLength));
 }
 
 // Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
@@ -904,6 +937,12 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // Ollama token accounting, summed across every turn (incl. flake-retried and
   // forced-summary turns) -- surfaced on the result for model-stats-client.recordCall.
   const usageAcc = { prompt_eval_count: 0, eval_count: 0, eval_duration: 0 };
+  // Real per-turn anchor for estimateContextTokens (see its own header): the LAST turn's
+  // real prompt_eval_count, and how many `messages` entries existed when that request was
+  // sent -- captured in the main loop right after each real (non-flake-degraded) turn,
+  // before that turn's own response/tool-results get appended.
+  let lastRealPromptTokens = null;
+  let lastRealPromptAtLength = 0;
   const addUsage = (u) => {
     if (!u) return;
     usageAcc.prompt_eval_count += Number(u.prompt_eval_count) || 0;
@@ -1006,7 +1045,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     // summary turn itself adds exactly one). Unconditional (not gated behind
     // forceSummaryOnCap) since this is a structural safety net every caller needs, not an
     // opt-in behavioral nudge.
-    if (estimateMessagesTokens(messages) + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX) {
+    if (estimateContextTokens(messages, lastRealPromptTokens, lastRealPromptAtLength) + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX) {
       return runForcedSummaryTurn('context');
     }
     turnsUsed = turn + 1;
@@ -1041,11 +1080,20 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       turnStartLengths[turnStartLengths.length - 1] = messages.length;
     }
 
+    const sentAtLength = messages.length;
     const { message, usage, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
     addUsage(usage);
+    // Real anchor for estimateContextTokens (see its own header) -- prompt_eval_count is
+    // Ollama's own tokenized size of exactly the `messages` array as it existed at
+    // sentAtLength, a real measurement even when the turn itself later flakes/rolls back
+    // (the messages sent were real either way; only the response was unusable).
+    if (usage && usage.prompt_eval_count) {
+      lastRealPromptTokens = usage.prompt_eval_count;
+      lastRealPromptAtLength = sentAtLength;
+    }
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
@@ -1112,6 +1160,7 @@ module.exports = {
   buildToolHandlers, buildWriteToolHandlers,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
+  estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS,
 };
 
 // CLI: node local-tool-client.js <request.json>
