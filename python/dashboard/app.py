@@ -24,6 +24,7 @@ import signal
 import socket
 import sqlite3
 import string
+import uuid
 import subprocess
 import sys
 import threading
@@ -3479,6 +3480,137 @@ def api_brain_dump_prioritize(entry_id):
     entry["queuedAt"] = datetime.now(timezone.utc).isoformat()
     write_brain_dump_entries(entries)
     return jsonify(entry)
+
+
+def concepts_path() -> Path | None:
+    """Mirrors brain_dump_path()'s shape -- src/concepts.js (Node side) and this module
+    read/write the exact same concepts.json, same theoretical cross-process race already
+    accepted for brain-dump.json (see write_brain_dump_entries's own precedent), not a
+    new or weaker guarantee."""
+    d = get_pipeline_dir()
+    return (d / "concepts.json") if d else None
+
+
+def read_concepts() -> list:
+    path = concepts_path()
+    if not path:
+        return []
+    data = read_json_safe(path)
+    concepts = data.get("concepts") if isinstance(data, dict) else None
+    return concepts if isinstance(concepts, list) else []
+
+
+def write_concepts(concepts: list):
+    path = concepts_path()
+    if not path:
+        abort(500, description="no active project configured")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"concepts": concepts}, indent=2), encoding="utf-8")
+
+
+def slugify_concept_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:48] or "concept"
+
+
+@app.route("/api/concepts")
+def api_concepts():
+    """Concept Chart tab's list view -- see AGENTS.md's "Concept research" section for
+    what a concept is and why this stays a manually/organically populated registry, not
+    an autonomous task source."""
+    return jsonify(read_concepts())
+
+
+@app.route("/api/concepts", methods=["POST"])
+def api_concepts_create():
+    """Manual concept creation (the dashboard's "+ New Concept" action). Idempotent on
+    the slugified name -- matches src/concepts.js's createConcept(), since an organic
+    creation from a research fork can race a human creating the same concept by hand."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        abort(400, description="name is required")
+    description = (body.get("description") or "").strip()
+
+    concepts = read_concepts()
+    slug = slugify_concept_name(name)
+    existing = next((c for c in concepts if c.get("slug") == slug), None)
+    if existing:
+        return jsonify(existing)
+
+    concept = {
+        "id": f"concept-{slug}-{uuid.uuid4().hex[:6]}",
+        "slug": slug,
+        "name": name,
+        "description": description,
+        "status": "open",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "createdBy": "manual",
+        "researchForkCount": 0,
+        "lastResearchedAt": None,
+        "builtFromScratchCount": 0,
+        "adaptedFromResourceCount": 0,
+    }
+    concepts.append(concept)
+    write_concepts(concepts)
+    return jsonify(concept)
+
+
+def _concept_task_history_rows(pipeline_dir: Path, concept_id: str) -> list:
+    """Scans every real queue location a task can carry a conceptId in, on demand --
+    computed only when a concept's timeline is actually opened, never polled, so this
+    stays cheap even as the queue grows. Mirrors _task_state_index()'s own coverage of
+    QUEUE_STATES + the done/-archive locations, minus drafting/ (a task mid-draft has no
+    completedAt worth showing on an audit timeline yet)."""
+    rows = []
+    qdir = pipeline_dir / "queue"
+    search_dirs = [qdir / state for state in QUEUE_STATES]
+    search_dirs.append(qdir / "done" / "_archived_no_action")
+    dated_archive_root = qdir / "done" / "_archived"
+    if dated_archive_root.is_dir():
+        search_dirs.extend(p for p in dated_archive_root.iterdir() if p.is_dir())
+
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.json"):
+            task = read_json_safe(f)
+            if not isinstance(task, dict) or task.get("conceptId") != concept_id:
+                continue
+            rows.append({
+                "at": task.get("completedAt") or task.get("updatedAt") or task.get("createdAt"),
+                "kind": "task",
+                "ref": task.get("id") or f.stem,
+                "summary": task.get("title") or task.get("id") or f.stem,
+            })
+    return rows
+
+
+@app.route("/api/concepts/<concept_id>/timeline")
+def api_concept_timeline(concept_id):
+    """On-demand merge of a concept's research findings (brain-dump entries whose
+    raisedBy.conceptId matches) and implementation task history, sorted chronologically --
+    a query over existing data, never a duplicated log, so it can't drift from the
+    source (see src/concepts.js's getConceptTimeline, this route's Node-side
+    equivalent)."""
+    pipeline_dir = get_pipeline_dir()
+    if not pipeline_dir:
+        abort(500, description="no active project configured")
+
+    rows = []
+    for entry in read_brain_dump_entries():
+        raised_by = entry.get("raisedBy") or {}
+        if raised_by.get("conceptId") != concept_id:
+            continue
+        raw_text = entry.get("rawText") or ""
+        rows.append({
+            "at": entry.get("capturedAt") or entry.get("lastSeenAt"),
+            "kind": "research-finding",
+            "ref": entry.get("id"),
+            "summary": raw_text.split("\n")[0][:120],
+        })
+    rows.extend(_concept_task_history_rows(pipeline_dir, concept_id))
+    rows.sort(key=lambda r: r.get("at") or "")
+    return jsonify(rows)
 
 
 @app.route("/api/brain-dump/<entry_id>/discuss/latest", methods=["GET"])
