@@ -5198,3 +5198,222 @@ Extract the re-roll/seed-fallback loop into a helper such as `attemptSeedReroll(
 
 Benefits:
 Each extracted helper has a single, nameable responsibility, so a reviewer can validate the seed-fallback retry policy without scanning tool-access boilerplate, and a change to harness-search parameters does not require re-reading the re-roll logic. Unit tests can target `attemptSeedReroll` with synthetic `planResult`/`substanceGated`/`stillThin` inputs in isolation, and `resolveHarnessSearch` can be tested against mock search fixtures, rather than constructing the full `runPlanPass` context for every case. The top-level function shrinks to a readable orchestration skeleton, reducing the cognitive load when onboarding or auditing the plan-pass path.
+
+### AC-48 · resolveAgenticDraft is a monolithic multi-branch resolver
+Strength: Strong
+Files: src/agentic-draft-common.js
+Snippet:
+```
+// neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
+// diff. `retriedForTurnBudget` only tunes the "did not end with RESOLUTION" note.
+function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
+  const summary = (result && result.response) || '';
+  // Both cleared on every outcome; set true again below only for the specific
+  // draft-stage blocks a redraft could plausibly fix, which reject-retry-check.js then
+  // requeues (bounded, with grounding) instead of leaving them to dead-end in blocked/.
+  // A stale true from an earlier attempt must not survive a later one.
+  //   turnBudgetExhausted  -- ran the whole turn budget, made zero edits, no diff
+  //   retryableDraftBlock  -- the broader "adhoc tier-3 block that is redraft-eligible"
+  //                           marker (turn-budget exhaustion OR a malformed decompose)
+  task.turnBudgetExhausted = false;
+  task.retryableDraftBlock = false;
+  // draft-attempt-record.js: the caller records this tier's real output, tool activity,
+  // and -- on a NON-clean outcome (degenerate / no RESOLUTION line / bad decompose) where
+  // resolveAgenticDraft otherwise stages nothing -- whatever the model left in the
+  // worktree, so a 20-turn tier-3 run that ends up blocked is no longer a black box.
+  // All additive on the returned object; callers read succeeded/blocked/blockedReason/
+  // needsClarification exactly as before. bestEffortDiff is best-effort (the worktree is
+  // still alive here; cleanup runs in runAgenticDraftInWorktree's outer finally).
+  const meta = {
+    response: summary,
+    toolCallLog: (result && result.toolCallLog) || undefined,
+    turnsUsed: result && result.turnsUsed,
+  };
+  const bestEffortDiff = () => {
+    try {
+      runGit(['add', '-A'], worktreeDir);
+      return runGit(['diff', '--cached'], worktreeDir).trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  if (result && result.degenerate) {
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`, ...meta, capturedDiff: bestEffortDiff() };
+  }
+
+  const resolutionMatch = summary.match(RESOLUTION_RE);
+  const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
+  if (modelLabel) task.draftModel = modelLabel;
+  meta.resolution = resolution || undefined;
+
+  if (!resolution) {
+    // Fix (2026-08-31, bra-1788142124203): the run hit its turn cap and even
+    // runPlanWithTools' forced final no-tools turn (result.forcedSummary) didn't yield a
+    // parseable RESOLUTION. Hard-blocking here throws the whole run away as "cannot
+    // determine outcome". Instead hand it to a human as a clarification, carrying the
+    // transcript and whatever partial work landed in the worktree -- the same terminal
+    // shape a real RESOLUTION: needs-human-decision produces.
+    if (result && result.forcedSummary) {
+      const capturedDiff = bestEffortDiff();
+      const edits = ((result && result.toolCallLog) || [])
+        .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+      // The failure class this whole grounding change targets: the model spent its entire
+      // turn budget exploring and never edited a single file (no edit/write calls, empty
+      // worktree). A hardcoded "needs-human-decision" placeholder is neither a real
+      // question nor a retryable state -- record a clean, honest block that
+      // reject-retry-check.js can requeue once with the plan + prior-investigation map.
+      if (edits === 0 && !capturedDiff) {
+        task.turnBudgetExhausted = true;
+        task.retryableDraftBlock = true;
+        // Sticky (survives reject-retry-check's reset of turnBudgetExhausted): a leaf that
+        // has demonstrably blown a full budget with zero edits is NOT confirmed-atomic --
+        // local-agentic-write-draft.js's leafDecomposeLocked() reads this to let it
+        // choose RESOLUTION: decompose on the next pass.
+        task.turnBudgetExhaustedBefore = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
+          ...meta,
+          capturedDiff: undefined,
+        };
+      }
+      // Otherwise the model got somewhere (partial work in the worktree, or the forced
+      // summary produced real content) -- keep the existing human-clarification path.
+      task.adhocResolution = 'needs-human-decision';
+      task.rawDiff = '';
+      task.implementResponse = summary
+        || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
+    }
+    const budgetNote = retriedForTurnBudget
+      ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
+      : '';
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
+  }
+
+  if (resolution === 'decompose') {
+    const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
+    const subTasks = parseSubTaskProposals(afterResolution);
+    const n = subTasks ? subTasks.length : 0;
+
+    if (n === 0) {
+      // The model reached a conclusion ("this is too big, split it") but produced no
+      // usable sub-task JSON at all.
+      //
+      // If it made REAL edits first, that is "I did part of it then ran low on turns/
+      // confidence" -- redirect to a CONTINUATION (finish what you started) exactly like
+      // the n >= 2 branch below, rather than blocking and throwing the partial work away.
+      // Confirmed live 2026-09-02 (second-brain note-graph task): two passes each made
+      // several successful edit_file calls, then answered RESOLUTION: decompose with
+      // malformed JSON -- every retry restarted from origin/master.
+      const partialDiff = bestEffortDiff();
+      const priorContinuations = Number(task.agenticContinuationCount) || 0;
+      if (partialDiff && priorContinuations < MAX_AGENTIC_CONTINUATIONS) {
+        task.agenticContinuationCount = priorContinuations + 1;
+        task.agenticContinuationNote = summary;
+        task.priorPartialDiff = partialDiff;
+        task.retryableDraftBlock = true;
+        task.isAgenticContinuation = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish`,
+          ...meta,
+          capturedDiff: partialDiff,
+        };
+      }
+      // No partial work (or continuation budget spent): redraft-eligible with a format
+      // reminder. Sticky count of "said decompose, gave nothing usable" passes: local-
+      // agentic-write-draft.js's repeated-decompose backstop fires once this reaches 2 (do
+      // the split in a single clean call rather than requeue toward escalation).
+      // reject-retry-check.js does not reset it.
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+      task.retryableDraftBlock = true;
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
+    }
+
+    if (n === 1) {
+      // A "decompose" into exactly ONE sub-task is the model saying "this is atomic" --
+      // usually it just could not commit to editing. Treat the single sub-task as a
+      // sharper re-scope of THIS task and requeue once (reject-retry-check.js swaps in the
+      // sharper rawText). If it decomposes-to-one AGAIN after being re-scoped, that is a
+      // real signal it needs a human -- escalate instead of looping.
+      if (task.rescopedFromDecompose === true) {
+        task.adhocResolution = 'needs-human-decision';
+        task.rawDiff = '';
+        task.implementResponse = `${summary}\n\n(decomposed to a single atomic sub-task twice without implementing it -- needs a human)`;
+        return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+      }
+      task.rescopedFromDecompose = true;
+      task.rescopedRawText = subTasks[0].rawText;
+      // Also a "said decompose, not implementable as given" pass -- counts toward the
+      // repeated-decompose backstop (see the n === 0 branch).
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+      task.retryableDraftBlock = true;
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
+    }
+
+    // A pass that made REAL edits and then answered RESOLUTION: decompose is not "this
+    // can't be one change" -- it is "I did part of it and ran low on turns/confidence."
+    // Accepting the split here discards that partial work (rawDiff = '') AND routinely
+    // drops whatever the model already finished from the sub-task list (root-caused live
+    // 2026-09-02 via the plugins-marketplace endpoint task: tier 3 wrote the catalog
+    // validators in app.py, then split into "seed file" + "test file" and the endpoint
+    // itself -- the actual deliverable -- silently vanished). Redirect it to a CONTINUATION
+    // (finish what you started), same mechanism the needs-human-decision branch uses,
+    // bounded by MAX_AGENTIC_CONTINUATIONS. Only once that budget is spent and it STILL
+    // wants to split do we accept the decompose.
+    const decomposeDiff = bestEffortDiff();
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    if (decomposeDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = decomposeDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish before any split`,
+        ...meta,
+        capturedDiff: decomposeDiff,
+      };
+    }
+
+    task.adhocResolution = resolution;
+    task.subTaskProposals = subTasks;
+    task.rawDiff = '';
+    // Keep the partial-work note visible for the sub-task drafters / a human even when the
+    // split is finally accepted -- the diff itself is not carried (the pieces re-derive it
+    // against current code), but "an earlier pass got this far" is worth stating.
+    task.implementResponse = decomposeDiff
+      ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they were not carried forward -- each sub-task starts from current \`main\`.)`
+      : summary;
+    return { succeeded: true, blocked: false, ...meta };
+  }
+
+  if (resolution === 'needs-human-decision') {
+    const capturedDiff = bestEffortDiff();
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    // "Re-run me", not a real question -- see MAX_AGENTIC_CONTINUATIONS. Only when real
+    // partial work landed (an empty worktree here is a genuine "I could not even start").
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS && RERUN_NOT_A_QUESTION_RE.test(summary)) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+// ... [truncated for review: this function continues for 51 more line(s) not shown]
+```
+
+Problem:
+`resolveAgenticDraft` is a single function whose body sequentially handles eight-plus distinct terminal resolution paths—clean-resolution, decompose with n=0, decompose with n=1, decompose with n≥2, needs-human-decision, and several additional state-specific branches—each carrying its own local variable setup, conditional guards, and return-shape assembly. Because every branch's logic lives inline in one body, the function grows linearly with the number of states the agentic-draft pipeline can produce, making it hard to trace a single path without scanning unrelated branches, and making it easy for a change in one branch to accidentally perturb a shared local that a neighboring branch still depends on.
+
+Solution:
+Reduce the top-level body to a short classifier (a few lines of if/else or a switch on the draft's resolved state) that delegates to one named inner function per terminal branch. Each inner function—`resolveClean`, `resolveDecomposeZero`, `resolveDecomposeOne`, `resolveDecomposeMany`, `resolveNeedsHuman`, and the remaining state-specific handlers—owns its own local variables, guards, and return construction so that no branch's setup leaks into another. The top-level function becomes a thin dispatch of roughly one line per branch, and the total line count of the outer function drops to the length of the classifier plus the delegation calls, while every branch's full logic remains reachable from the same single entry point.
+
+Benefits:
+A reviewer can verify one branch's logic in isolation without holding seven other branches in working memory; a unit test can target a single inner function by calling it directly with a crafted draft state rather than exercising the full function and hoping the right branch fires; and adding a new terminal state means adding one new inner function and one new dispatch line, rather than inserting a block mid-function where it can collide with adjacent branches' local state.
