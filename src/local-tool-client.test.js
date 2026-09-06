@@ -11,6 +11,16 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const { execFileSync } = require('child_process');
+
+function execSyncGitInit(dir) {
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'init\n');
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+}
 
 function withFixtureRepo(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-tool-client-test-'));
@@ -235,6 +245,81 @@ test('runBashTool runs a real command in the repo root and captures stdout', () 
   });
 });
 
+// --- risky git command hand-off (2026-09-06) -----------------------------------------
+// See RISKY_GIT_COMMAND_RE's own header: Chat must never execute a git merge/push
+// directly (confirmed live: it recommended a merge without ever checking a known
+// conflict) -- these commands are refused before the sandbox even runs, pointing at
+// queue_reviewed_task instead. Refusal happens before wrapWithSandbox, so no bwrap
+// dependency for these tests.
+
+test('runBashTool refuses a git merge command and points at queue_reviewed_task', () => {
+  withFixtureRepo((mod) => {
+    const result = mod.runBashTool({ command: 'git merge agent/observability-fix-ac-57' });
+    assert.match(result.error, /git merge\/push is not available via run_bash/);
+    assert.match(result.error, /queue_reviewed_task/);
+    assert.equal(result.stdout, undefined, 'must never have actually executed the command');
+  });
+});
+
+test('runBashTool refuses a git push command', () => {
+  withFixtureRepo((mod) => {
+    const result = mod.runBashTool({ command: 'git push origin master' });
+    assert.match(result.error, /git merge\/push is not available via run_bash/);
+  });
+});
+
+test('runBashTool refuses a merge/push disguised inside a compound command', () => {
+  withFixtureRepo((mod) => {
+    const result = mod.runBashTool({ command: 'git checkout master && git merge agent/foo && git push' });
+    assert.match(result.error, /git merge\/push is not available via run_bash/);
+  });
+});
+
+test('runBashTool still runs read-only git investigation commands normally', () => {
+  withFixtureRepo((mod, dir) => {
+    execSyncGitInit(dir);
+    for (const command of ['git log --oneline -1', 'git status', 'git diff', 'git branch']) {
+      const result = mod.runBashTool({ command });
+      if (result.error) {
+        assert.match(result.error, /sandbox \(bwrap\) is not available/, `unexpected error for "${command}": ${result.error}`);
+      } else {
+        assert.equal(result.exitCode, 0, `"${command}" should succeed: ${result.stderr}`);
+      }
+    }
+  });
+});
+
+// --- queue_reviewed_task tool (2026-09-06) --------------------------------------------
+
+test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and returns its id', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {} }));
+    const handlers = mod.buildWriteToolHandlers([dir], dir);
+    const result = handlers.queue_reviewed_task({
+      title: 'Merge AC-57',
+      description: 'AC-57 is clean, no conflicts -- merge into master.',
+    });
+    assert.match(result.queuedTaskId, /^adhoc-merge-ac-57-\d+$/);
+    assert.match(result.message, /Adhoc Tasks tab/);
+    const files = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+    assert.equal(files.length, 1);
+    const record = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', files[0]), 'utf8'));
+    assert.equal(record.title, 'Merge AC-57');
+    assert.equal(record.source, 'manual');
+    assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- merge into master.');
+    assert.equal(record.promptContext.raisedFrom, 'chat');
+  });
+});
+
+test('buildWriteToolHandlers.queue_reviewed_task rejects an empty title or description', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {} }));
+    const handlers = mod.buildWriteToolHandlers([dir], dir);
+    assert.match(handlers.queue_reviewed_task({ title: '', description: 'x' }).error, /non-empty "title"/);
+    assert.match(handlers.queue_reviewed_task({ title: 'x', description: '' }).error, /non-empty "description"/);
+  });
+});
+
 // --- run_bash output cap (2026-09-05) ------------------------------------------------
 // Root-caused live (context-crowding investigation, this same session): read_file and
 // grep_codebase both cap their output per call, but run_bash's stdout had NO cap on the
@@ -285,10 +370,10 @@ test('runBashTool caps a real oversized command output and flags it truncated', 
   });
 });
 
-test('WRITE_TOOLS declares exactly write_file, edit_file, and run_bash', () => {
+test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_reviewed_task', () => {
   withFixtureRepo((mod) => {
     const names = mod.WRITE_TOOLS.map((t) => t.function.name).sort();
-    assert.deepEqual(names, ['edit_file', 'run_bash', 'write_file']);
+    assert.deepEqual(names, ['edit_file', 'queue_reviewed_task', 'run_bash', 'write_file']);
   });
 });
 
