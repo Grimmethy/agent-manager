@@ -576,6 +576,81 @@ test('runPlanWithTools uses the real prompt_eval_count from the previous turn to
   });
 });
 
+// --- Persistent context audit log (2026-09-06, Grimmethy: "make sure I can audit after
+// the fact") -- one NDJSON line per context-check evaluation plus one per real
+// done_reason:"length" truncation, so a later investigation reads a file instead of
+// reconstructing turn-by-turn state from a transcript's own visible text. -----------
+
+function readAuditLog(dir) {
+  const p = path.join(dir, 'instances', 'context-budget-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('logContextAudit appends one well-formed NDJSON line per call, never throwing on a bad pipelineDir', () => {
+  withFixtureRepo((mod, dir) => {
+    mod.logContextAudit({ event: 'check', turn: 0, estimatedTokens: 123 });
+    mod.logContextAudit({ event: 'truncated', turn: 1 });
+    const lines = readAuditLog(dir);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].event, 'check');
+    assert.equal(lines[0].estimatedTokens, 123);
+    assert.ok(lines[0].at, 'each entry carries its own real timestamp');
+    assert.equal(lines[1].event, 'truncated');
+  });
+});
+
+test('logContextAudit is advisory: a broken pipelineDir never throws or breaks the caller', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-audit-broken-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = path.join(dir, 'does-not-exist-and-is-a-file');
+  fs.writeFileSync(process.env.AGENT_MANAGER_REPO_ROOT, 'x'); // a FILE where a dir is expected -- mkdirSync must fail
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  delete require.cache[require.resolve('./local-tool-client.js')];
+  const mod = require('./local-tool-client.js');
+  assert.doesNotThrow(() => mod.logContextAudit({ event: 'check' }));
+});
+
+test('runPlanWithTools writes a "check" audit entry for every turn, and a "truncated" entry exactly when done_reason:"length" fires', async () => {
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'partial', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] } },
+      { done: true, done_reason: 'length', prompt_eval_count: 15000, eval_count: 5 },
+    ],
+    [
+      { message: { role: 'assistant', content: 'Wrapping up now.\n\nRESOLUTION: needs-human-decision\nx.' } },
+      { done: true, done_reason: 'stop', prompt_eval_count: 15200, eval_count: 40 },
+    ],
+  ], async (mod, dir) => {
+    await mod.runPlanWithTools({
+      prompt: 'go', maxTurns: 50, taskId: 'chat-test-1', stage: 'chat', source: 'chat',
+      onChunk: () => {},
+    });
+    const lines = readAuditLog(dir);
+    const checks = lines.filter((l) => l.event === 'check');
+    const truncations = lines.filter((l) => l.event === 'truncated');
+    assert.ok(checks.length >= 2, 'a check entry for at least the first real turn and the one that forces the summary');
+    assert.equal(checks[0].source, 'chat');
+    assert.equal(checks[0].taskId, 'chat-test-1');
+    assert.equal(truncations.length, 1);
+    assert.equal(truncations[0].promptEvalCount, 15000);
+    assert.equal(truncations[0].evalCount, 5);
+  });
+});
+
+test('runPlanWithTools does NOT write a "truncated" entry for a normal, non-clipped turn', async () => {
+  await withMockedStreamingChat([
+    [
+      { message: { role: 'assistant', content: 'RESOLUTION: implemented' } },
+      { done: true, done_reason: 'stop', prompt_eval_count: 100, eval_count: 10 },
+    ],
+  ], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, onChunk: () => {} });
+    const lines = readAuditLog(dir);
+    assert.equal(lines.filter((l) => l.event === 'truncated').length, 0);
+    assert.ok(lines.some((l) => l.event === 'check' && l.triggered === false));
+  });
+});
+
 test('runPlanWithTools drops to the no-tools fallback (toolsDisabled) when the kill switch file is present', async () => {
   await withMockedChat([], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'hi' });

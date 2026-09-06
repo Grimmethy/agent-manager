@@ -759,6 +759,32 @@ function estimateContextTokens(messages, real, realAtLength) {
   return real + estimateMessagesTokens(messages.slice(realAtLength));
 }
 
+// Persistent, human-auditable trail of every context-budget decision (2026-09-06,
+// Grimmethy: "make sure I can audit after the fact" -- root-caused live investigating a
+// real Chat run where the done_reason:"length" marker fired 3 times with an IDENTICAL
+// real prompt_eval_count before the forced-summary check finally caught it: nothing
+// persisted the per-turn estimate/real-anchor values anywhere, so reconstructing what the
+// check actually saw at each turn required re-deriving it from a transcript's own visible
+// text after the fact -- lossy and slow. One NDJSON line per context-check evaluation
+// (every turn, not just the ones that trigger) plus one per real done_reason:"length"
+// truncation, so a later investigation is `tail`/`grep`, not archaeology. Best-effort --
+// a write failure here must never break the real call, same contract every other
+// best-effort audit trail in this codebase (side-finding.js's inbox, model-stats-client's
+// _run_event) already holds itself to.
+function logContextAudit(entry) {
+  try {
+    const { pipelineDir } = getConfig();
+    const dir = path.join(pipelineDir, 'instances');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, 'context-budget-audit.log'),
+      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+    );
+  } catch {
+    // best-effort audit trail -- must never break the real call
+  }
+}
+
 // Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
 // no multi-turn loop. local-client.js's own call() doesn't self-lock, so it's wrapped
 // externally here, the same discipline local-draft.js's maybeLocked() applies for its
@@ -783,6 +809,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
   for (;;) {
     let message;
     let usage = null;
+    let doneReason = null;
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
@@ -793,6 +820,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
         }
         message = turnRes.message;
         usage = turnRes.usage;
+        doneReason = turnRes.doneReason;
         attemptErr = null;
         break;
       } catch (e) {
@@ -800,7 +828,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
         attemptErr = e;
       }
     }
-    if (!attemptErr) return { message, usage };
+    if (!attemptErr) return { message, usage, doneReason };
     if (rollbackAttempts < MAX_ROLLBACK_ATTEMPTS && turnStartLengths.length >= 2) {
       const priorStart = turnStartLengths[turnStartLengths.length - 2];
       const priorLogStart = turnStartLogLengths[turnStartLengths.length - 2];
@@ -995,11 +1023,21 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       content: `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`,
     });
     turnsUsed += 1;
-    const { message: summaryMsg, usage: summaryUsage, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+    const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
       messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
     addUsage(summaryUsage);
+    // The forced-summary turn itself can, in principle, also get clipped -- worth its own
+    // audit entry (see logContextAudit's own header) since RESERVED_RESPONSE_TOKENS is
+    // exactly the margin betting this never happens.
+    if (summaryDoneReason === 'length') {
+      logContextAudit({
+        event: 'summary-truncated', source, taskId, stage, reason,
+        promptEvalCount: summaryUsage && summaryUsage.prompt_eval_count,
+        evalCount: summaryUsage && summaryUsage.eval_count, ceiling: PINNED_NUM_CTX,
+      });
+    }
     const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
     return withUsage({
       response: summaryContent || (lastMessage && lastMessage.content) || '',
@@ -1045,7 +1083,15 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     // summary turn itself adds exactly one). Unconditional (not gated behind
     // forceSummaryOnCap) since this is a structural safety net every caller needs, not an
     // opt-in behavioral nudge.
-    if (estimateContextTokens(messages, lastRealPromptTokens, lastRealPromptAtLength) + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX) {
+    const contextEstimate = estimateContextTokens(messages, lastRealPromptTokens, lastRealPromptAtLength);
+    const contextWillTrigger = contextEstimate + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX;
+    logContextAudit({
+      event: 'check', source, taskId, stage, turn, messagesLength: messages.length,
+      estimatedTokens: contextEstimate, realAnchorTokens: lastRealPromptTokens,
+      realAnchorAtLength: lastRealPromptAtLength, reserved: RESERVED_RESPONSE_TOKENS,
+      ceiling: PINNED_NUM_CTX, triggered: contextWillTrigger,
+    });
+    if (contextWillTrigger) {
       return runForcedSummaryTurn('context');
     }
     turnsUsed = turn + 1;
@@ -1081,7 +1127,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     }
 
     const sentAtLength = messages.length;
-    const { message, usage, flakeErr } = await chatTurnWithFlakeRecovery({
+    const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
@@ -1093,6 +1139,17 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     if (usage && usage.prompt_eval_count) {
       lastRealPromptTokens = usage.prompt_eval_count;
       lastRealPromptAtLength = sentAtLength;
+    }
+    // Logged unconditionally (not just when it happens to coincide with a forced summary)
+    // so a later investigation can see every real truncation event on its own timeline --
+    // see logContextAudit's own header for the incident this closes (3 identical
+    // done_reason:"length" hits in one real run with no persisted record of any of them).
+    if (doneReason === 'length') {
+      logContextAudit({
+        event: 'truncated', source, taskId, stage, turn, sentAtLength,
+        promptEvalCount: usage && usage.prompt_eval_count, evalCount: usage && usage.eval_count,
+        ceiling: PINNED_NUM_CTX,
+      });
     }
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
@@ -1160,7 +1217,7 @@ module.exports = {
   buildToolHandlers, buildWriteToolHandlers,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
-  estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS,
+  estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
 };
 
 // CLI: node local-tool-client.js <request.json>
