@@ -236,7 +236,22 @@ _LOCAL_SYSTEM_PROMPT = (
     "You are ROOTED at the agent-manager repo (relative paths resolve there) and also have "
     "full read/write access to every registered plugin and project repo. Call list_roots "
     "to see them; use an absolute path (or grep_codebase's `root` argument) to reach a "
-    "non-primary repo."
+    "non-primary repo.\n\n"
+    "IMPORTANT -- run_bash cannot see real host processes: your run_bash tool executes "
+    "inside a bwrap sandbox with its own isolated PID namespace (--unshare-pid, its own "
+    "/proc), by design, for containment -- NOT the real host. `ps aux` (or any process "
+    "listing) run there will show only the sandbox's own tiny process tree and can NEVER "
+    "see worker-1/worker-reasoning/worker-p40/reviewer/queue-watchdog even when every one "
+    "of them is genuinely alive on the host. Confirmed live 2026-09-06: this produced a "
+    "confident, completely false \"the pipeline is down, no live processes\" conclusion "
+    "while 5 real worker/reviewer processes were actively running. NEVER use run_bash's "
+    "`ps`/`pgrep`/`top` output as evidence the pipeline is up or down. The real, correct "
+    "liveness signal is the heartbeat file each instance writes on every status change -- "
+    "read `instances/<instanceId>.json` (worker-1, worker-reasoning, worker-p40, "
+    "worker-reasoning-p40, reviewer, watchdog) and check `lastHeartbeat` is recent (a live "
+    "instance heartbeats roughly every tick, well under a minute stale) -- the exact same "
+    "signal this codebase's own Test-InstanceLiveness/check_instance_liveness and "
+    "dead-process-check.js already use as their sole source of truth."
 )
 
 
