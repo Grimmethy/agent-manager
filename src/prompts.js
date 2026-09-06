@@ -371,6 +371,20 @@ function planCritiqueFeedbackBlock(task) {
 
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
+  // 2026-09-06: a brain_dump_sort-spawned task (promptContext.brainDumpEntryId) is
+  // "implement this research finding/design option" -- fundamentally more open-ended
+  // than a typical concrete-bug-fix adhoc task ("fix this specific thing"). Root-caused
+  // live: 19 of these blocked "Plan pass degenerate: truncated" with 0 visible chars on
+  // ALL 3 internal retries, regardless of rawText length -- think:true reasoning
+  // apparently indulges extensively on the open-ended "how would I even approach this"
+  // question before ever emitting visible plan text. This directive doesn't remove the
+  // ambiguity (a real design decision may still be needed), it just asks for the
+  // model's best concrete first cut instead of an unbounded survey of the possibility
+  // space -- paired with a real numPredict increase for this same task shape
+  // (local-draft.js's callPlan) so there's also more room even when it doesn't help.
+  const brainDumpDirective = (ctx && ctx.brainDumpEntryId)
+    ? ['This task originated from a captured research finding or design recommendation, not a concrete bug report -- it may describe an IDEA rather than a fully-specified change. Do not exhaustively survey every possible approach: pick the most direct, concrete first step the finding itself suggests and plan THAT. If it genuinely cannot be scoped into one plan without a human decision, say so plainly and stop -- do not keep reasoning in search of a perfect scope.', '']
+    : [];
   return [
     'You are drafting a plan for this one-off task submitted directly by a human or an orchestrating agent.',
     '',
@@ -378,6 +392,7 @@ function adhocPlanPrompt(task) {
     '',
     truncate(JSON.stringify(ctx), 4000),
     '',
+    ...brainDumpDirective,
     'Write a numbered, actionable PLAN.',
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...statedAcceptanceBlock(task),

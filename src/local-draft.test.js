@@ -149,6 +149,60 @@ test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls c
   });
 });
 
+// 2026-09-06: root-caused live -- 19 brain_dump_sort-spawned adhoc tasks ("implement
+// this research finding") ALL blocked "Plan pass degenerate: truncated" with EXACTLY
+// 3/3 internal retries and 0 visible chars every time, regardless of rawText length --
+// ruling out "input too large." A higher plan-pass numPredict, keyed on the real
+// structured field brainDumpEntryId (not a text heuristic), gives the model enough
+// budget to actually finish reasoning and emit visible text for this genuinely more
+// open-ended task genre.
+test('an adhoc task spawned by brain_dump_sort (promptContext.brainDumpEntryId) gets a higher plan-pass numPredict', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let planNumPredict = null;
+    const localCall = async (opts) => {
+      if (opts.stage === 'plan' && planNumPredict === null) planNumPredict = opts.numPredict;
+      return { response: PLAN_STUB, degenerate: null, attempts: 1 };
+    };
+    const task = {
+      id: 'adhoc-bd-test-1', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: { rawText: 'design option: do X', brainDumpEntryId: 'bd-123' },
+    };
+    await draftTask(task, {
+      localCall,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        t.adhocResolution = 'no-changes-needed';
+        t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+        return { succeeded: true, blocked: false };
+      },
+    });
+    assert.equal(planNumPredict, 2800);
+  });
+});
+
+test('an ordinary adhoc task with no brainDumpEntryId keeps the standard plan-pass numPredict', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let planNumPredict = null;
+    const localCall = async (opts) => {
+      if (opts.stage === 'plan' && planNumPredict === null) planNumPredict = opts.numPredict;
+      return { response: PLAN_STUB, degenerate: null, attempts: 1 };
+    };
+    const task = { id: 'adhoc-ordinary-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'fix the bug in foo.js' } };
+    await draftTask(task, {
+      localCall,
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        t.adhocResolution = 'no-changes-needed';
+        t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+        return { succeeded: true, blocked: false };
+      },
+    });
+    assert.equal(planNumPredict, 1400);
+  });
+});
+
 // 2026-09-02: the preliminary decompose check. A fresh adhoc task, after its blind plan
 // and BEFORE any agentic tier, gets one cheap model call that can split it. A split routes
 // straight to needs-review with adhocResolution: 'decompose' -- no tier ever runs.
