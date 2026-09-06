@@ -202,6 +202,48 @@ test('an empty implementResponse (an approved no-changes-needed outcome) skips c
   assert.match(result.doneMarker, /no code change needed/);
 });
 
+// Regression, 2026-09-06: found live as a real 2-task cluster (observability-fix-ac-45,
+// -ac-59) in queue/blocked/ -- a Group B source can legitimately answer with a plain-text
+// "FALSE POSITIVE" refusal (the flagged issue no longer exists in the real file) instead
+// of a change. Review approved this prose as a genuinely correct answer, but apply had no
+// matching check (unlike the empty-response case above) and threw "Invalid JSON in Group
+// B implementResponse: Unexpected token 'F', \"FALSE POSI\"...", landing the task in
+// blocked/ instead of a clean skip.
+test('a "FALSE POSITIVE" prose refusal skips cleanly instead of throwing a JSON parse error', () => {
+  const gitRunner = createFakeGitRunner();
+  const refusal = 'FALSE POSITIVE -- the real file already contains the corrected block; the flagged issue no longer exists.';
+  const task = baseTask({ source: 'observability_fix', implementResponse: refusal });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, true);
+  assert.match(result.doneMarker, /false positive/i);
+  assert.match(result.doneMarker, /already contains the corrected block/);
+});
+
+test('a "false positive" refusal is matched case-insensitively and with a hyphen', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ source: 'observability_fix', implementResponse: 'false-positive: nothing to do here.' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  assert.match(result.doneMarker, /false positive/i);
+});
+
+test('a real Group B JSON change is never misclassified just because it mentions "false positive" inside a string value', () => {
+  const gitRunner = createFakeGitRunner();
+  const change = JSON.stringify({
+    mode: 'edit', file: 'foo.js', find: 'a', replace: 'b',
+    note: 'this was previously flagged as a false positive but is real',
+  });
+  const task = baseTask({ source: 'observability_fix', implementResponse: change });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  // Must take the real Group B apply-and-commit path, not a skip -- the anchored regex
+  // only matches when the response itself STARTS with "false positive", never a substring
+  // buried inside real JSON.
+  assert.equal(result.succeeded, true);
+  assert.equal(result.doneMarker, undefined, 'a real applied change has no doneMarker -- only a skip does');
+  assert.equal(fs.readFileSync(path.join(REPO_ROOT, 'foo.js'), 'utf8'), 'b');
+});
+
 // --- arch_discovery/arch_import/observability_review/performance_review: direct-to-main
 // path (no throwaway branch) --------------------------------------------------------
 // Confirmed live 2026-08-16: the old branch-per-task flow left ~301 of ~311 real applied
