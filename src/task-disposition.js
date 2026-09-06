@@ -129,6 +129,17 @@ function branchAheadCount(git, repoRoot, mainBranch, branch) {
 }
 
 const FILED_RE = /filed under|->\s*\/|→\s*\/|appended|candidate\(s\)|wrote .*\.md/i;
+// pipeline_debrief's own apply (2026-09-06): it never touches git at all -- it only moves
+// task JSON files under pipelineDir (archiving the window's done/ tasks) and writes brain-
+// dump side-finding inbox entries for its Now-What items -- so it can never be picked up by
+// the git-commit checks above, and its detail string ("debriefed N task(s); archived M,
+// already-moved K; filed J Now-What finding(s) to the brain-dump inbox") doesn't match
+// FILED_RE's existing patterns either (it says "finding(s)", not "candidate(s)"). Root-
+// caused live: the catch-all at the bottom was swallowing this into a bare 'noop', reading
+// exactly like an inconclusive verdict that produced nothing -- misleading for an audit
+// trying to gauge whether the automated-debrief pattern is paying off, right as that
+// pattern starts mattering (auto-confirm gate now runs debriefs unattended).
+const DEBRIEF_ARCHIVED_RE = /^debriefed \d+ task/i;
 const DISMISSED_RE = /\bfalse[\s-]?positive\b/i;
 const NOOP_RE = /no candidates|no code change|degenerate|false positive|empty implement|no-op|suggested 0|nothing to (apply|do)|skipped/i;
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;
@@ -206,6 +217,12 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   // 4. The apply wrote a doc / note -- nothing to merge.
   if (FILED_RE.test(detail)) {
     return { stage: 'filed', detail: `apply wrote a doc/note: ${detail}`.slice(0, 200) };
+  }
+
+  // 4a. pipeline_debrief's own apply -- see DEBRIEF_ARCHIVED_RE above. Archiving a window
+  //     of done/ tasks and filing Now-What findings is real terminal work, not a no-op.
+  if (DEBRIEF_ARCHIVED_RE.test(detail)) {
+    return { stage: 'filed', detail: `debrief archived its window + filed its findings: ${detail}`.slice(0, 200) };
   }
 
   // 4b. Records with no structured reviewDisposition (older plugin build, or a historical
