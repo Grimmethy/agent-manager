@@ -530,3 +530,33 @@ test('pipelineDebriefImplementPrompt encodes What/So-What/Now-What, the survivor
   assert.match(p, /stuck-a/);              // contrast task ids surfaced
   assert.match(p, /src\/maintenance\/observability-review\.js:40/); // harness hit rendered
 });
+
+// 2026-09-06: root-caused live -- 2 real debrief reports blocked 3 attempts running,
+// each time inventing a plausible-but-nonexistent NOW WHAT path (src/project-search.js,
+// src/observability-review.js) even on the attempt that had real harness hits/files in
+// front of it. Closed-list citation: the prompt must hand over the exact real paths and
+// forbid anything else, rather than trusting an open "cite a real file" instruction.
+test('pipelineDebriefImplementPrompt: closed-list AVAILABLE FILES with real fetched paths', () => {
+  const { pipelineDebriefImplementPrompt } = require('./prompts.js');
+  const p = pipelineDebriefImplementPrompt({
+    promptContext: {
+      evidenceText: 'EVID', taskIds: ['done-a'], contrastIds: [],
+      harnessHits: [{ file: 'src/maintenance/observability-review.js', line: 40, query: 'x', text: 'y' }],
+      harnessFiles: [{ path: 'src/maintenance/observability-review.js', content: 'const x = 1;' }],
+    },
+  }, 'QUERY: x');
+  assert.match(p, /AVAILABLE FILES/);
+  assert.match(p, /copied EXACTLY.*character-for-character.*from the AVAILABLE FILES/s);
+  assert.match(p, /Never invent, guess, paraphrase/);
+  // The real path is listed in the closed set exactly once, verbatim.
+  const matches = p.match(/- src\/maintenance\/observability-review\.js/g) || [];
+  assert.ok(matches.length >= 1);
+});
+
+test('pipelineDebriefImplementPrompt: empty AVAILABLE FILES explicitly forbids any Files: line', () => {
+  const { pipelineDebriefImplementPrompt } = require('./prompts.js');
+  const p = pipelineDebriefImplementPrompt({
+    promptContext: { evidenceText: 'EVID', taskIds: ['done-a'], contrastIds: [], harnessHits: [], harnessFiles: [] },
+  }, 'QUERY: x');
+  assert.match(p, /none -- no real file content was fetched for this window; NOW WHAT must not include a Files: line/);
+});

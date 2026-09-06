@@ -1077,6 +1077,19 @@ function pipelineDebriefImplementPrompt(task, planText) {
     ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
     : '(no matches -- the searches found nothing new in this repo; work from the evidence alone)';
   const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+  // Closed-list file citation (2026-09-06, real incident: 2 real debrief reports blocked
+  // 3 attempts running, each time inventing a plausible-but-nonexistent path in NOW WHAT
+  // -- `src/project-search.js`, `src/observability-review.js` -- EVEN on the one attempt
+  // that had real harness hits and fetched file content in front of it. The open "cite a
+  // real file" instruction was not enough to override the model's own training-data
+  // guess at a plausible name. Grimmethy: "Debrief isn't meant to go digging around the
+  // system for files" -- so instead of asking it to find/verify a path itself, hand it
+  // the exact closed set of paths this task's OWN harness step already fetched real
+  // content for, and require it copy one verbatim or cite none at all.
+  const availablePaths = files.map((f) => f.path).filter(Boolean);
+  const availablePathsText = availablePaths.length
+    ? availablePaths.map((p) => `- ${p}`).join('\n')
+    : '(none -- no real file content was fetched for this window; NOW WHAT must not include a Files: line for any item)';
 
   const stable = [
     'You are running a pipeline DEBRIEF: a structured retrospective over work that already SHIPPED, so the pipeline can get more efficient. This is analysis, not a code change -- output prose, never a diff.',
@@ -1085,7 +1098,7 @@ function pipelineDebriefImplementPrompt(task, planText) {
     '1. WHAT: state plainly what this batch of completed work was -- which sources, roughly how many tasks, what shape (fast/clean vs. many attempts/expensive), grounded ONLY in the evidence below.',
     '2. SO WHAT: name the real pattern behind it. A plan/implement shape that correlated with a fast accept? A source that is consistently cheap or consistently costly? A step that burned turns/tokens without changing the outcome? Cite the specific evidence (task id, history stage, model_calls row) for every claim.',
     '3. SURVIVORSHIP-BIAS CHECK: for every SO WHAT pattern, check it against the CONTRAST tasks (same sources, still stuck). If a contrast task ALSO shows the pattern you are crediting, say so -- it is not the real cause. If there are no contrast tasks, say plainly that the pattern is unconfirmed.',
-    '4. NOW WHAT: at most 2-3 concrete, BOUNDED recommendations, each naming a real src/ file or config this pipeline already has (from the harness matches below or the evidence\'s own TIER -> SOURCE FILE map -- never an invented name). A vague or open-ended list is worse than a short, specific one.',
+    '4. NOW WHAT: at most 2-3 concrete, BOUNDED recommendations. If an item names a file, its Files: line MUST be copied EXACTLY (character-for-character) from the AVAILABLE FILES list below -- that is the ONLY closed set of files you may cite. Never invent, guess, paraphrase, or reconstruct-from-memory a path, even a plausible-sounding one -- you are not expected to go digging through the codebase yourself. If AVAILABLE FILES is empty, or none of them genuinely fit a real recommendation, omit the Files: line for that item entirely and recommend in prose only. A recommendation naming no file is far better than one naming a wrong one.',
     '',
     'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CONFIDENT PATTERN" if the evidence genuinely does not support one:',
     '',
@@ -1099,7 +1112,7 @@ function pipelineDebriefImplementPrompt(task, planText) {
     '<did the contrast tasks share this pattern? if so, say the pattern is not confirmed; if there were no contrast tasks, say so>',
     '',
     'NOW WHAT',
-    '1. <concrete, bounded change> -- Files: src/<file>. Why: <one sentence tying it back to SO WHAT>.',
+    '1. <concrete, bounded change> -- Files: <copied verbatim from AVAILABLE FILES, or omit this entirely>. Why: <one sentence tying it back to SO WHAT>.',
     '2. <...>',
     '',
     'If instead the evidence does not support a confident pattern, output ONLY:',
@@ -1123,6 +1136,10 @@ function pipelineDebriefImplementPrompt(task, planText) {
     'Full content of the matched file(s):',
     '',
     filesText,
+    '',
+    'AVAILABLE FILES -- the ONLY real file paths you may cite in a NOW WHAT Files: line (copy verbatim; if empty, cite none):',
+    '',
+    availablePathsText,
   ];
   return assemblePrompt(stable, volatile);
 }
