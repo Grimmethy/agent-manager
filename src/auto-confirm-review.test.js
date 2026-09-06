@@ -111,6 +111,31 @@ test('debrief prompt includes the report and the window summary', () => {
   assert.match(p, /DENY: /);
 });
 
+test('debrief gate requests only 1 vote (vs. forensics\' 3) -- lower stakes, no code diff, already majority-reviewed', async () => {
+  const dir = makePipeline();
+  put(dir, DEBRIEF);
+  const calls = [];
+  const capturingVote = async (opts) => { calls.push(opts); return { verdict: 'CONFIRM', confident: true, votes: [{ verdict: 'CONFIRM', response: 'CONFIRM: fine' }], realVoteCount: 1, requestedVotes: opts.n, voteErrors: [] }; };
+  await autoConfirmReview({ ...commonArgs(dir), majorityVote: capturingVote });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].n, 1);
+  assert.equal(calls[0].minAgreeing, 1);
+});
+
+test('forensics gate still requests the heavier default (3 votes, 2 agreeing) -- unaffected by the debrief-specific override', async () => {
+  const dir = makePipeline();
+  put(dir, FORENSICS);
+  fs.writeFileSync(path.join(dir, 'CANDIDATES.md'), '# Pipeline Fix Candidates\n');
+  const calls = [];
+  const capturingVote = async (opts) => { calls.push(opts); return { verdict: 'CONFIRM', confident: true, votes: [{ verdict: 'CONFIRM', response: 'CONFIRM: fine' }], realVoteCount: 2, requestedVotes: opts.n, voteErrors: [] }; };
+  await autoConfirmReview({ ...commonArgs(dir), majorityVote: capturingVote });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].n, 3);
+  assert.equal(calls[0].minAgreeing, 2);
+});
+
 test('confident CONFIRM: debrief task moves to approved/ with debriefReportConfirmedAt', async () => {
   const dir = makePipeline();
   put(dir, DEBRIEF);
