@@ -70,12 +70,30 @@ function withinRoot(repoRoot, rel) {
   return full.startsWith(path.resolve(repoRoot) + path.sep) ? full : null;
 }
 
+// Just the backtick-quoted names -- the task author's own EXPLICIT symbol list (as
+// opposed to taskIdentifiers' broader heuristic sweep below), highest-confidence because
+// it required no guessing to extract. adhocHarnessSearchPlanPrompt (prompts.js) uses this
+// to steer the harness-search tier's query choice toward these over a bare file path --
+// 2026-09-06, root-caused live: a file-decompose "move these symbols" sub-task (rawText
+// names its symbols in backticks) had the harness-search plan pass choose the SOURCE
+// FILE'S OWN PATH as its query instead of any of the named symbols -- a generically
+// common path (mentioned in dozens of unrelated tests/docs/scripts) returned almost pure
+// noise, one irrelevant unrelated file got embedded as "the" fetched content, and the
+// resulting bloated, low-signal context contributed to the plan pass truncating on every
+// retry (see local-client.js's call() truncation-escalation fix for the other half of
+// that incident).
+function backtickIdentifiers(rawText) {
+  const out = new Set();
+  for (const m of rawText.matchAll(/`([A-Za-z_][\w.]*(?:\(\))?)`/g)) out.add(m[1].replace(/\(\)$/, ''));
+  return [...out];
+}
+
 // Distinctive identifiers the task names -- backtick-quoted tokens, snake_case /
 // camelCase / SCREAMING names, `foo()` calls. Used to WINDOW an oversized anchor file
 // around the part the task actually points at instead of head-truncating it.
 function taskIdentifiers(rawText) {
   const out = new Set();
-  for (const m of rawText.matchAll(/`([A-Za-z_][\w.]*(?:\(\))?)`/g)) out.add(m[1].replace(/\(\)$/, ''));
+  for (const name of backtickIdentifiers(rawText)) out.add(name);
   for (const m of rawText.matchAll(/\b([a-z][a-z0-9]*(?:_[a-z0-9]+){1,})\b/g)) out.add(m[1]); // snake_case
   for (const m of rawText.matchAll(/\b([a-z]+[A-Z][A-Za-z0-9]+)\b/g)) out.add(m[1]);          // camelCase
   for (const m of rawText.matchAll(/\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,})\b/g)) out.add(m[1]); // SCREAMING_SNAKE
@@ -298,4 +316,4 @@ function anchorFilesPromptBlock(task) {
   ].join('\n');
 }
 
-module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename, taskIdentifiers };
+module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename, taskIdentifiers, backtickIdentifiers };

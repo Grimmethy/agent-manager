@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { taskAnchorFiles, resolveBareFilename } = require('./task-anchor-files.js');
+const { taskAnchorFiles, resolveBareFilename, backtickIdentifiers } = require('./task-anchor-files.js');
 
 function makeRepo(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-test-'));
@@ -194,4 +194,20 @@ test('resolveBareFilename returns null when ambiguous', () => {
 test('path traversal is refused', () => {
   const dir = makeRepo({ 'src/x.js': 'a\n' });
   assert.deepEqual(taskAnchorFiles(adhoc('edit ../../../etc/passwd and src/x.js'), dir).map((f) => f.path), ['src/x.js']);
+});
+
+// --- backtickIdentifiers (2026-09-06) ---------------------------------------------------
+// Root-caused live: a file-decompose "move these symbols" task names its exact symbols in
+// backticks, but the harness-search plan pass (adhocHarnessSearchPlanPrompt) still picked
+// the source file's own path as its query -- this is the extraction the fix surfaces back
+// to that prompt so the model has the task's own explicit, no-guessing-required list of
+// names to prefer instead.
+
+test('backtickIdentifiers extracts every distinct backtick-quoted name, in first-seen order, stripping trailing ()', () => {
+  const rawText = 'Move `renderAdhocTasksTab`, `fooBar`, and `renderAdhocTasksTab` (again) plus `doThing()` out.';
+  assert.deepEqual(backtickIdentifiers(rawText), ['renderAdhocTasksTab', 'fooBar', 'doThing']);
+});
+
+test('backtickIdentifiers returns [] when the task names nothing in backticks', () => {
+  assert.deepEqual(backtickIdentifiers('fix the bug in foo.js'), []);
 });

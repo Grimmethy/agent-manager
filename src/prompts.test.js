@@ -601,3 +601,26 @@ test('driftFixImplementPrompt: no stale rows renders an explicit "nothing to rem
   }, 'QUERY: x');
   assert.match(p, /\(no stale rows to remove\)/);
 });
+
+// --- adhocHarnessSearchPlanPrompt (2026-09-06) -------------------------------------------
+// Root-caused live: a file-decompose "move these symbols" sub-task names its exact symbols
+// in backticks, yet the harness-search plan pass chose the SOURCE file's own path as its
+// query -- a path mentioned in dozens of unrelated tests/docs/scripts returned almost pure
+// noise, contributing to the plan pass truncating on every retry. Surfacing the task's own
+// named symbols explicitly, when present, steers the model toward the highest-signal query
+// it already has instead of guessing a path.
+
+test('adhocHarnessSearchPlanPrompt surfaces backtick-quoted symbol names and tells the model to prefer them over a bare path', () => {
+  const { adhocHarnessSearchPlanPrompt } = require('./prompts.js');
+  const task = { title: 'Decompose x', promptContext: { rawText: 'Move these symbols OUT of index.html into it, VERBATIM: `renderAdhocTasksTab`, `fooBar`.' } };
+  const p = adhocHarnessSearchPlanPrompt(task);
+  assert.match(p, /names these specific symbol\(s\) by name.*renderAdhocTasksTab, fooBar/s);
+  assert.match(p, /prefer these as your search terms/i);
+});
+
+test('adhocHarnessSearchPlanPrompt is unchanged (no extra section) when the task names no backtick-quoted symbols', () => {
+  const { adhocHarnessSearchPlanPrompt } = require('./prompts.js');
+  const task = { title: 'Fix a bug', promptContext: { rawText: 'fix the bug in foo.js' } };
+  const p = adhocHarnessSearchPlanPrompt(task);
+  assert.doesNotMatch(p, /Prefer these as your search terms/);
+});
