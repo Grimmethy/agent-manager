@@ -10,6 +10,35 @@ function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
 }
 
+// Extracted (2026-09-06) so callers other than this CLI -- e.g. Chat's
+// queue_reviewed_task tool in local-tool-client.js, handing off a risky git action
+// instead of executing it directly -- can queue a real adhoc task without shelling out
+// to this script. Throws on an invalid domain rather than the CLI's own
+// print-and-exit(1), since a library call has no business calling process.exit.
+function queueAdhocTask({ title, promptContext, domain, dependsOn }, { pipelineDir, domainsPath }) {
+  if (!title) throw new Error('queueAdhocTask: title is required');
+  if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
+
+  const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
+  const resolvedDomain = domain || validDomains[0];
+  if (!validDomains.includes(resolvedDomain)) {
+    throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
+  }
+
+  const id = `adhoc-${slugify(title)}-${Date.now()}`;
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+
+  const cleanDependsOn = Array.isArray(dependsOn) ? dependsOn.filter(Boolean) : undefined;
+  const record = {
+    id, domain: resolvedDomain, source: 'manual', title, promptContext,
+    ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
+  };
+  const filePath = path.join(adhocDir, `${id}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
+  return { record, filePath };
+}
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
@@ -39,19 +68,6 @@ if (require.main === module) {
   }
 
   const { pipelineDir, domainsPath } = getConfig();
-  // task-domains.json is the single source of truth for valid domains -- the consumer
-  // supplies it (see README.md's "Domains" section).
-  const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
-  const domain = parsed['--domain'] || validDomains[0];
-  if (!validDomains.includes(domain)) {
-    console.error(`Invalid --domain '${domain}'. Valid domains: ${validDomains.join(', ')}`);
-    process.exit(1);
-  }
-
-  const id = `adhoc-${slugify(parsed['--title'])}-${Date.now()}`;
-  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
-  fs.mkdirSync(adhocDir, { recursive: true });
-
   // dependsOn (2026-08-22): other adhoc task ids this one must not be drafted before --
   // see task-sources.js's nextAdhocTask()/isDependencySatisfied() for the enforcement
   // (satisfied only once a dependency is actually MERGED, not just done, since a fresh
@@ -60,9 +76,16 @@ if (require.main === module) {
     ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
     : undefined;
 
-  const record = { id, domain, source: 'manual', title: parsed['--title'], promptContext, ...(dependsOn && dependsOn.length ? { dependsOn } : {}) };
-  const filePath = path.join(adhocDir, `${id}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
-
-  console.log(`queued adhoc task: ${filePath}`);
+  try {
+    const { filePath } = queueAdhocTask(
+      { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn },
+      { pipelineDir, domainsPath },
+    );
+    console.log(`queued adhoc task: ${filePath}`);
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
 }
+
+module.exports = { queueAdhocTask, slugify };
