@@ -210,3 +210,49 @@ test('two genuinely different findings sharing generic vocabulary but no distinc
   const data = readBrainDump(dir);
   assert.equal(data.entries.length, 2);
 });
+
+test('a new entry created from a concept-tagged finding carries conceptId on raisedBy', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox({ title: 'SearXNG fits the local-first ethos', body: 'Self-hosted, no API key, 70+ engines.' }, {
+    source: 'web_search_capability_research', pipelineDir: dir, conceptId: 'concept-web-search-capability-abc',
+  });
+  await sweep({ pipelineDir: dir });
+  const data = readBrainDump(dir);
+  assert.equal(data.entries[0].raisedBy.conceptId, 'concept-web-search-capability-abc');
+});
+
+test('near-identical wording from two different concepts must NOT merge, even when it would have without conceptId scoping', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox(
+    { title: 'Open WebUI opt-in Context Compaction', body: 'Open WebUI does not trim by default; compaction is an opt-in setting the user enables.' },
+    { source: 'chat_context_research', pipelineDir: dir, conceptId: 'concept-chat-context-trimming-1' },
+  );
+  await sweep({ pipelineDir: dir });
+
+  writeSideFindingInbox(
+    { title: 'Open WebUI web-search backend selection', body: 'Open WebUI lets an admin pick one search backend; the model never builds a URL itself.' },
+    { source: 'web_search_capability_research', pipelineDir: dir, conceptId: 'concept-web-search-capability-2' },
+  );
+  const s = await sweep({ pipelineDir: dir });
+
+  assert.equal(s.created, 1, 'a finding from a different concept must never merge into another concept\'s entry just because titles share a project name');
+  assert.equal(s.merged, 0);
+  const data = readBrainDump(dir);
+  assert.equal(data.entries.length, 2);
+});
+
+test('two concept-less findings (no conceptId on either side) still dedup against each other as before', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox(
+    { title: 'queue-watcher silently swallows a bwrap timeout', body: 'The bwrap sandbox timeout error is caught and dropped without logging.' },
+    { source: 'observability_fix', taskId: 'task-1', pipelineDir: dir },
+  );
+  await sweep({ pipelineDir: dir });
+  writeSideFindingInbox(
+    { title: 'queue-watcher script swallows the bwrap sandbox timeout silently', body: 'It catches the bwrap sandbox timeout error and drops it with no logging.' },
+    { source: 'performance_fix', taskId: 'task-2', pipelineDir: dir },
+  );
+  const s = await sweep({ pipelineDir: dir });
+  assert.equal(s.merged, 1);
+  assert.equal(readBrainDump(dir).entries.length, 1);
+});

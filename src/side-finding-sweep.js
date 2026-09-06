@@ -86,6 +86,17 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
       const mine = normalizeTokens(`${record.title} ${record.body}`);
       let best = null;
       for (const entry of machineEntries) {
+        // Scope comparison to the same concept (see src/concepts.js) when either side
+        // carries one -- root-caused live (2026-09-06): two web-search-capability
+        // findings ("Open WebUI", "Synthesis: recommended path...") wrongly merged into
+        // unrelated chat-context-trimming entries sharing the same boilerplate phrasing
+        // ("Open WebUI", "Synthesis: recommended path for agent-manager"), because
+        // nothing distinguished "same phrase, different research batch" from "same
+        // phrase, same topic". A conceptId mismatch is a hard skip, independent of the
+        // similarity signals below; two conceptId-less findings (e.g. from before this
+        // field existed, or ad hoc single-finding flags with no concept) still compare
+        // against each other as before.
+        if ((record.conceptId || null) !== (entry.raisedBy.conceptId || null)) continue;
         // Two signals, OR'd together -- root-caused live (2026-09-05): ~30 near-duplicate
         // findings landed as separate entries in one evening because their whole-text
         // Jaccard similarity (0.4, confirmed) sat under the 0.6 threshold even though they
@@ -131,7 +142,12 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
           capturedAt: nowIso,
           rawText: `${record.title}\n\n${record.body}`,
           status: 'captured',
-          raisedBy: { source: record.source || null, taskId: record.taskId || null, stage: record.stage || null },
+          raisedBy: {
+            source: record.source || null,
+            taskId: record.taskId || null,
+            stage: record.stage || null,
+            conceptId: record.conceptId || null,
+          },
           count: 1,
           lastSeenAt: nowIso,
           seenIn: record.taskId ? [record.taskId] : [],

@@ -109,7 +109,7 @@ function inboxDir(pipelineDir) {
 // dashboard/CLI single writer is side-finding-sweep.js, later). Never throws past the
 // caller -- a disk/permissions problem here must never turn into a pipeline-wide outage
 // over what is, after all, an optional side channel.
-function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir }) {
+function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir, conceptId }) {
   if (!pipelineDir) return;
   try {
     const dir = inboxDir(pipelineDir);
@@ -121,6 +121,12 @@ function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir }) 
       source: source || null,
       taskId: taskId || null,
       stage: stage || null,
+      // Tags this finding to a concepts.js registry row (see src/concepts.js) when the
+      // caller is doing concept-directed research -- lets side-finding-sweep.js scope
+      // dedup comparisons to the same concept instead of comparing across unrelated
+      // research batches (see that file's dedup-scoping comment for the incident this
+      // closes).
+      conceptId: conceptId || null,
       extractedAt: new Date().toISOString(),
     };
     fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2));
