@@ -42,6 +42,17 @@ class ChatMergeHandoffPromptTest(unittest.TestCase):
         self.assertIn("Read-only git commands", chat_sessions._LOCAL_SYSTEM_PROMPT)
         self.assertIn("completely unaffected", chat_sessions._LOCAL_SYSTEM_PROMPT)
 
+    def test_is_imperative_about_actually_calling_the_tool_not_just_describing_it(self):
+        # Strengthened 2026-09-06 after a real live test: asked to merge a branch, Chat
+        # correctly explained that run_bash refuses git merge and that the action should
+        # be queued -- then stopped there, never actually calling queue_reviewed_task, so
+        # nothing landed in queue/adhoc/. The prompt must be unambiguous that narrating
+        # the correct behavior is not the same as performing it.
+        self.assertIn("YOU MUST ACTUALLY CALL THE", chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn("do not just describe, promise, or narrate", chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn("A text description of the plan is not the hand-off", chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn("queuedTaskId", chat_sessions._LOCAL_SYSTEM_PROMPT)
+
     def test_present_in_every_real_local_system_prompt_built_for_a_session(self):
         with tempfile.TemporaryDirectory() as d:
             prompt = chat_sessions._local_system_prompt(_session(d))
