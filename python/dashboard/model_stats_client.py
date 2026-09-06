@@ -49,7 +49,20 @@ def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss
     own local_tool_client.stream_plan_with_tools() result always carries a real turnsUsed
     count -- it just never reached this far before. result.get("turnsUsed") is None for
     every shape that isn't a runPlanWithTools()-backed result (e.g. a bare Claude Code
-    reply), matching this file's own existing degenerate-field convention."""
+    reply), matching this file's own existing degenerate-field convention.
+
+    promptEvalCount/evalCount/evalDurationNs (2026-09-06, Grimmethy: "you know how much I
+    love being able to audit the work" -- found investigating a real Chat done_reason:
+    "length" incident that model-stats.db had zero per-turn token data for Chat to check
+    against): local-tool-client.js's own runPlanWithTools() already aggregates real Ollama
+    usage (prompt_eval_count/eval_count/eval_duration, summed across every internal turn)
+    onto its result object via withUsage() -- these three fields were hardcoded to None
+    here instead of ever being read off it, so every "chat-session" row in model_calls was
+    permanently blind on exactly the columns the Models tab's tokens-per-sec math needs.
+    result.get(...) naturally stays None for a Claude-backed result (claude_client.generate()
+    has no such fields at all -- a different provider's own usage accounting, not tracked
+    the same way), so this is a strict improvement for the local provider with no change
+    in behavior for Claude."""
     call_id = str(uuid.uuid4())
     result = result or {}
     _run_event("record-call", {
@@ -59,9 +72,9 @@ def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss
         "model": model,
         "startedAt": started_at or datetime.now(timezone.utc).isoformat(),
         "latencyMs": latency_ms,
-        "evalDurationNs": None,
-        "promptEvalCount": None,
-        "evalCount": None,
+        "evalDurationNs": result.get("eval_duration"),
+        "promptEvalCount": result.get("prompt_eval_count"),
+        "evalCount": result.get("eval_count"),
         "attempts": None,
         "degenerate": result.get("degenerate"),
         "turnsUsed": result.get("turnsUsed"),
