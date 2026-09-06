@@ -98,9 +98,20 @@ test('writeSideFindingInbox writes one uniquely-named file with the expected sha
   assert.equal(record.source, 'observability_fix');
   assert.equal(record.taskId, 'observability-fix-ac-1');
   assert.equal(record.stage, 'implement');
+  assert.equal(record.conceptId, null);
   assert.ok(record.extractedAt);
 
   assert.doesNotThrow(() => writeSideFindingInbox({ title: 'x', body: 'y' }, {}));
+});
+
+test('writeSideFindingInbox stores an optional conceptId for concept-directed research', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'side-finding-test-'));
+  writeSideFindingInbox({ title: 'A finding', body: 'Detail.' }, {
+    pipelineDir: dir, conceptId: 'concept-web-search-capability-abc123',
+  });
+  const files = fs.readdirSync(inboxDir(dir));
+  const record = JSON.parse(fs.readFileSync(path.join(inboxDir(dir), files[0]), 'utf8'));
+  assert.equal(record.conceptId, 'concept-web-search-capability-abc123');
 });
 
 test('writeSideFindingInbox writing two findings produces two distinct files, never overwriting', () => {
