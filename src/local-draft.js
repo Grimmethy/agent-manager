@@ -874,6 +874,42 @@ function bestPriorPlan(task) {
   return null;
 }
 
+// 2026-09-06: root-caused live -- 19 brain_dump_sort-spawned adhoc tasks ("implement
+// this research finding/design option") ALL blocked "Plan pass degenerate: truncated"
+// with EXACTLY 3/3 internal call() retries and 0 visible chars every time, regardless
+// of promptContext.rawText length (396 to 1,619 chars, no correlation) -- ruling out
+// "input too large" as the cause. These are fundamentally more open-ended than a
+// typical concrete-bug-fix adhoc task ("here's a finding, figure out how to approach
+// it" vs. "fix this specific thing"), and think:true reasoning apparently indulges
+// extensively on that open-endedness before ever emitting visible plan text, hitting
+// the 1400-token ceiling identically on every attempt -- a genuinely different failure
+// shape from a stochastic partial truncation. 2800 matches adhoc-harness-draft.js's
+// own real precedent for a similarly demanding pass (its implement call), not an
+// arbitrary guess. Keyed on promptContext.brainDumpEntryId (a real structured field,
+// not a text-content heuristic) -- present on every brain_dump_sort-spawned adhoc
+// task; a higher ceiling costs nothing for a task that doesn't need it, since
+// numPredict only bounds the MAXIMUM, never forces more tokens to be spent.
+//
+// 2026-09-06: same failure shape, different trigger -- 2 real pipeline_debrief tasks
+// blocked "Plan pass degenerate: truncated" (confirmed via model_calls: doneReason
+// 'length', i.e. the 1400-token ceiling hit before any visible QUERY: text). Its plan
+// prompt embeds the SAME kind of large evidence-bundle text (debrief-bundle.js /
+// forensic-bundle.js, up to a 28000-char DEFAULT_BUDGET_CHARS blob) that pipeline_
+// forensics' own implement-side fix (isWholeDocReport, computeImplementBudget below)
+// was built for -- and think:true reasons extensively about that blob before ever
+// emitting the plan's own short output, the exact same mechanism as the brain-dump-
+// entry case above. Checked live: the one window that stayed under ~22KB of evidence
+// text passed its plan call fine at 1400; the one at the 28000-char cap did not --
+// correlates with evidence size, not source identity, so this checks
+// promptContext.evidenceText's length directly rather than hardcoding source names (a
+// future evidence-bundling source gets this for free without needing its own carve-out
+// here). Extracted to its own pure function (mirrors computeImplementBudget) purely for
+// direct unit-testability.
+function computePlanNumPredict(task) {
+  const hasLargeEvidenceBundle = !!(task.promptContext && task.promptContext.evidenceText && task.promptContext.evidenceText.length > 10000);
+  return (task.promptContext && task.promptContext.brainDumpEntryId) || hasLargeEvidenceBundle ? 2800 : 1400;
+}
+
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
@@ -966,22 +1002,7 @@ async function runPlanPass(task, {
   delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
   delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
 
-  // 2026-09-06: root-caused live -- 19 brain_dump_sort-spawned adhoc tasks ("implement
-  // this research finding/design option") ALL blocked "Plan pass degenerate: truncated"
-  // with EXACTLY 3/3 internal call() retries and 0 visible chars every time, regardless
-  // of promptContext.rawText length (396 to 1,619 chars, no correlation) -- ruling out
-  // "input too large" as the cause. These are fundamentally more open-ended than a
-  // typical concrete-bug-fix adhoc task ("here's a finding, figure out how to approach
-  // it" vs. "fix this specific thing"), and think:true reasoning apparently indulges
-  // extensively on that open-endedness before ever emitting visible plan text, hitting
-  // the 1400-token ceiling identically on every attempt -- a genuinely different failure
-  // shape from a stochastic partial truncation. 2800 matches adhoc-harness-draft.js's
-  // own real precedent for a similarly demanding pass (its implement call), not an
-  // arbitrary guess. Keyed on promptContext.brainDumpEntryId (a real structured field,
-  // not a text-content heuristic) -- present on every brain_dump_sort-spawned adhoc
-  // task; a higher ceiling costs nothing for a task that doesn't need it, since
-  // numPredict only bounds the MAXIMUM, never forces more tokens to be spent.
-  const planNumPredict = (task.promptContext && task.promptContext.brainDumpEntryId) ? 2800 : 1400;
+  const planNumPredict = computePlanNumPredict(task);
   const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
@@ -1220,7 +1241,13 @@ function computeImplementBudget(task, implPrompt) {
   // the reasoning trace, emitting zero final content (confirmed live on the first real run:
   // eval_count 2800, implementResponse empty). Its "how much output" signal is the evidence
   // blob, not the plan, so it gets its own higher floor plus the 16000 ceiling.
-  const isWholeDocReport = task.source === 'pipeline_forensics';
+  // pipeline_debrief (2026-09-06): the identical shape -- a full What/So-What/Now-What
+  // report over an evidence blob (debrief-bundle.js), tiny plan. Confirmed live: 2 real
+  // debrief tasks blocked "Plan pass degenerate: truncated"/"Implement pass degenerate:
+  // truncated" back to back, one of them AFTER its plan pass succeeded -- the implement
+  // pass alone still exhausted the un-widened 2800 floor. Belongs in this class for the
+  // exact reason pipeline_forensics does.
+  const isWholeDocReport = task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
   const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline' || isWholeDocReport) ? 16000 : 8000;
   const forensicsFloor = isWholeDocReport
     ? Math.max(6000, Math.ceil(((task.promptContext && task.promptContext.evidenceText) || '').length / 8))
@@ -1281,7 +1308,13 @@ function computeImplementBudget(task, implPrompt) {
   // every time (this is the same "reasoning trace eats the budget" starvation the
   // fixedLiterals branch above already fixes by disabling think). Hand the whole budget
   // to the report.
-  const implNoThink = hasFixedLiterals || task.source === 'pipeline_forensics';
+  // pipeline_debrief (2026-09-06): same shape -- its METHOD section forces the same kind
+  // of explicit reasoning into the report (per-item counterfactual-style Why:, the
+  // survivorship-bias check), same evidence-blob size class. Confirmed live: 2 real
+  // debrief tasks hit "degenerate: truncated" (doneReason 'length') back to back,
+  // including one whose PLAN pass had already succeeded -- the implement pass alone still
+  // burned its entire budget on a redundant think trace.
+  const implNoThink = hasFixedLiterals || task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
   return { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement };
 }
 
@@ -1780,7 +1813,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource };
 
 if (require.main === module) {
   main();

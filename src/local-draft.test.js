@@ -629,6 +629,38 @@ test('computeImplementBudget gives pipeline_forensics a large implement budget d
   assert.equal(normal.implNoThink, false);
 });
 
+// 2026-09-06: root-caused live -- 2 real pipeline_debrief tasks blocked "degenerate:
+// truncated" (doneReason 'length'), one at plan, one at implement -- the exact same
+// "whole-document report, think:true burns the budget on reasoning" shape
+// pipeline_forensics was fixed for. pipeline_debrief belongs in the identical class.
+test('computeImplementBudget gives pipeline_debrief the same large implement budget and disabled think as pipeline_forensics', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const tinyPlan = { source: 'pipeline_debrief', planResponse: 'QUERY: a\nQUERY: b', promptContext: { evidenceText: 'x'.repeat(24000) } };
+  const b = computeImplementBudget(tinyPlan, 'z'.repeat(20000));
+  assert.ok(b.implNumPredict >= 6000, `floor should clear the report length, got ${b.implNumPredict}`);
+  assert.ok(b.implNumPredict <= 16000, 'capped at the whole-document ceiling');
+  assert.equal(b.implNoThink, true, 'think must be disabled the same way it is for pipeline_forensics');
+});
+
+test('computePlanNumPredict gives a large evidence-bundle task (e.g. pipeline_debrief) the higher plan budget', () => {
+  const { computePlanNumPredict } = require('./local-draft.js');
+  const bigEvidence = { source: 'pipeline_debrief', promptContext: { evidenceText: 'x'.repeat(28000) } };
+  assert.equal(computePlanNumPredict(bigEvidence), 2800);
+
+  // Below the threshold -- confirmed live: a 22KB debrief window's plan call succeeded
+  // fine at the standard budget, only the one AT the 28000-char cap failed.
+  const smallEvidence = { source: 'pipeline_debrief', promptContext: { evidenceText: 'x'.repeat(5000) } };
+  assert.equal(computePlanNumPredict(smallEvidence), 1400);
+
+  // Keyed on evidence SIZE, not source identity -- a future evidence-bundling source gets
+  // this for free.
+  const otherSourceBigEvidence = { source: 'some_future_source', promptContext: { evidenceText: 'y'.repeat(15000) } };
+  assert.equal(computePlanNumPredict(otherSourceBigEvidence), 2800);
+
+  // No promptContext at all must never throw.
+  assert.equal(computePlanNumPredict({ source: 'manual' }), 1400);
+});
+
 test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
   const { computeImplementBudget } = require('./local-draft.js');
   const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
