@@ -308,14 +308,32 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
 // at all, the real error still propagates (existing callers -- draft's infra-requeue
 // regex match, review-runner's own equivalent -- depend on receiving a real thrown Error
 // with the actual message, e.g. "Ollama request timed out...", not a swallowed one).
+// 2026-09-06: logDegenerateAudit's very first real production data (the mechanism it
+// was built to enable) showed this loop's blind spot immediately -- two brain-dump-
+// spawned adhoc plan passes each hit doneReason:"length" on ALL 3 attempts with
+// evalCount === numPredict every single time, identically. Unlike the other degenerate
+// classes (empty/repeated-character/non-ascii-gibberish/repetition-loop), which the
+// module doc above correctly calls "usually a transient inference-state glitch" worth
+// retrying unchanged, a numPredict ceiling is not transient: the SAME ceiling on the
+// SAME prompt reproduces the SAME cutoff deterministically, so retrying identically
+// burns the entire retry budget for zero chance of success. Escalating numPredict
+// (not numCtx -- resolveNumCtx already ignores numPredict and returns the fixed
+// PINNED_NUM_CTX/16384 regardless, so there is always ample headroom left for a
+// bigger numPredict on the same prompt) on a truncated retry gives a REAL chance the
+// next attempt actually completes, at the same latency cost the identical-retry
+// approach was already paying either way.
+const TRUNCATION_RETRY_MULTIPLIER = 2;
+const TRUNCATION_RETRY_NUM_PREDICT_CEILING = 8000;
+
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
+  let callOpts = opts;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     let result;
     try {
-      result = await callOnce(opts);
+      result = await callOnce(callOpts);
     } catch (e) {
       lastError = e;
       continue;
@@ -351,9 +369,16 @@ async function call(opts, maxRetries = 2) {
     // task.blockedReason alone preserves today.
     logDegenerateAudit({
       source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
-      model: opts.model || MODEL, numPredict: opts.numPredict, doneReason: result.done_reason,
+      model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
       degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
     });
+    if (degenerate === 'truncated' && callOpts.numPredict) {
+      const escalated = Math.min(
+        Math.round(callOpts.numPredict * TRUNCATION_RETRY_MULTIPLIER),
+        TRUNCATION_RETRY_NUM_PREDICT_CEILING,
+      );
+      if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+    }
   }
   // Only propagate the hard error if NO attempt ever got a real response, degenerate or
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
