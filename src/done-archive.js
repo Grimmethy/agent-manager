@@ -142,6 +142,42 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
 }
 
 /**
+ * Archives an EXPLICIT list of done/ task ids into the same queue/done/_archived/<YYYY-MM>/
+ * bucket archiveDoneTasks() uses -- for `pipeline_debrief` (2026-09-06, Grimmethy: "We'll
+ * have it archive the 'Done' tasks as part of the process"): once a debrief report over a
+ * bounded window of done/ tasks is human-confirmed, those SPECIFIC tasks (not merely "old
+ * enough") are done being read for patterns and can leave queue/done/'s top level, same as
+ * the time-based pass does for aged-out tasks. Reuses the identical destination scheme
+ * (bucketed by the month this call runs in) so both passes' output is indistinguishable to
+ * every existing consumer (api_task_requeue's 'archived' pseudo-state, forensic-bundle.js's
+ * listArchivedMonthDirs-based lookup, work-log.js's taskIsLive retention) -- no separate
+ * "debrief-archived" location to teach those consumers about.
+ * @returns {{moved: number, missing: number, errors: string[]}}
+ */
+function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  const destDir = path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+  const result = { moved: 0, missing: 0, errors: [] };
+  let destDirEnsured = false;
+
+  for (const id of taskIds || []) {
+    const src = path.join(doneDir, `${id}.json`);
+    if (!fs.existsSync(src)) { result.missing++; continue; }
+    if (!destDirEnsured) {
+      fs.mkdirSync(destDir, { recursive: true });
+      destDirEnsured = true;
+    }
+    try {
+      fs.renameSync(src, path.join(destDir, `${id}.json`));
+      result.moved++;
+    } catch (e) {
+      result.errors.push(`rename(${src}): ${e.message}`);
+    }
+  }
+  return result;
+}
+
+/**
  * Gate: runs the real archive pass only if RECHECK_INTERVAL_MS has elapsed since the last
  * run (persisted lastArchivedAt in statePath(pipelineDir)) -- the CLI's own `--check-due`
  * mode, meant to be called every queue-watcher.sh tick the same way system-report.js's
@@ -178,7 +214,9 @@ function listArchivedMonthDirs(pipelineDir) {
   }
 }
 
-module.exports = { archiveDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, ARCHIVE_DIRNAME };
+module.exports = {
+  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, ARCHIVE_DIRNAME,
+};
 
 if (require.main === module) {
   const { pipelineDir } = getConfig();

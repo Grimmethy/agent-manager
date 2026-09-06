@@ -500,3 +500,33 @@ test('pipelineForensicsImplementPrompt encodes the ranked-counterfactual method,
   assert.match(p, /win-a, win-b/);          // winner ids surfaced
   assert.match(p, /src\/local-agentic-write-draft\.js:90/); // harness hit rendered
 });
+
+test('pipelineDebriefPlanPrompt emits QUERY: lines and carries the evidence blob', () => {
+  const { pipelineDebriefPlanPrompt } = require('./prompts.js');
+  const p = pipelineDebriefPlanPrompt({
+    promptContext: { evidenceText: 'DEBRIEF_EVIDENCE_MARKER\nTIER → SOURCE FILE' },
+  });
+  assert.match(p, /QUERY: <search terms>/);
+  assert.match(p, /DEBRIEF_EVIDENCE_MARKER/);
+});
+
+test('pipelineDebriefImplementPrompt encodes What/So-What/Now-What, the survivorship-bias check, and the bounded output contract', () => {
+  const { pipelineDebriefImplementPrompt } = require('./prompts.js');
+  const p = pipelineDebriefImplementPrompt({
+    promptContext: {
+      evidenceText: 'EVID', taskIds: ['done-a', 'done-b'], contrastIds: ['stuck-a'],
+      harnessHits: [{ file: 'src/maintenance/observability-review.js', line: 40, query: 'enclosingCode', text: 'const enclosingCode = ...' }],
+      harnessFiles: [],
+    },
+  }, 'QUERY: enclosingCode');
+  assert.match(p, /WHAT/);
+  assert.match(p, /SO WHAT/);
+  assert.match(p, /SURVIVORSHIP-BIAS CHECK/);
+  assert.match(p, /NOW WHAT/);
+  assert.match(p, /at most 2-3/);
+  assert.match(p, /NO CONFIDENT PATTERN/);
+  assert.match(p, /never a diff|output prose, never a diff/);
+  assert.match(p, /done-a, done-b/);       // window task ids surfaced
+  assert.match(p, /stuck-a/);              // contrast task ids surfaced
+  assert.match(p, /src\/maintenance\/observability-review\.js:40/); // harness hit rendered
+});

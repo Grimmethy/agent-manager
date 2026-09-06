@@ -695,6 +695,54 @@ function applyForensicsReport({ implementResponse, task }) {
   return { succeeded: true, file: res.file, doneMarker: `filed ${(res.candidateIds || []).join(', ')} to ${res.file}` };
 }
 
+// pipeline_debrief (2026-09-06, see debrief-bundle.js): the implement pass wrote a
+// What/So-What/Now-What report over a bounded window of queue/done/ tasks (advisoryProse --
+// no diff). Two passes, same shape as applyForensicsReport right above:
+//  1. First reach here (no task.debriefReportConfirmedAt): hold at queue/awaiting-confirm/
+//     so a human reads the report before its window of done/ tasks is moved off done/'s top
+//     level for good.
+//  2. Second reach (dashboard stamped debriefReportConfirmedAt, task back in approved/):
+//     archive exactly the window's task ids (task.promptContext.taskIds) into the same
+//     queue/done/_archived/<YYYY-MM>/ bucket the time-based done-archive.js pass uses
+//     (archiveSpecificDoneTasks) -- Grimmethy: "We'll have it archive the 'Done' tasks as
+//     part of the process." A task id already gone (raced with the daily time-based pass,
+//     or a human archived it by hand meanwhile) is not an error -- archiveSpecificDoneTasks
+//     reports it as `missing`, same "already moved, nothing left to do" idempotency
+//     archiveDoneTasks itself relies on.
+function applyDebriefReport({ implementResponse, task }) {
+  const { archiveSpecificDoneTasks } = require('./done-archive.js');
+  const { getConfig } = require('./config.js');
+  const text = (implementResponse || '').trim();
+
+  if (!text) {
+    return { skipped: true, reason: 'debrief report came back empty; nothing to hold or archive' };
+  }
+  if (!task || !task.debriefReportConfirmedAt) {
+    return {
+      succeeded: false,
+      needsConfirmation: true,
+      reason: 'pipeline debrief report -- held in queue/awaiting-confirm/ for human review before its window of done/ tasks is archived',
+    };
+  }
+
+  const taskIds = (task.promptContext && Array.isArray(task.promptContext.taskIds)) ? task.promptContext.taskIds : [];
+  if (!taskIds.length) {
+    return { skipped: true, reason: 'confirmed debrief report has no promptContext.taskIds -- nothing to archive' };
+  }
+  const { pipelineDir } = getConfig();
+  const result = archiveSpecificDoneTasks({ pipelineDir, taskIds });
+  // {skipped: true} (never {succeeded: true} with no `file`) -- this apply never touches
+  // the tracked repo's git state at all (it only moves task JSON files under pipelineDir),
+  // same shape as applyVerdictOnly right above: apply-task.js's git-branch-diff flow reads
+  // `artifact.skipped` BEFORE it ever requires `artifact.file`/`artifact.files` (see its own
+  // "artifact.skipped" branch), where a bare {succeeded: true, doneMarker} with no file
+  // would instead reach `gitRunner.add([artifact.file])` as `git add [undefined]` and throw.
+  return {
+    skipped: true,
+    reason: `debriefed ${taskIds.length} task(s); archived ${result.moved}, already-moved ${result.missing}${result.errors.length ? `, ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''}`,
+  };
+}
+
 // Parses path_prefetch_resolve's implement-pass output -- a single JSON object (see
 // prompts.js's pathPrefetchResolveImplementPrompt for the exact schema):
 //   { "paths": ["..."], "rationale": "...", "confident": true/false }
@@ -882,6 +930,7 @@ module.exports = {
   applyBrainDumpSort,
   applyVerdictOnly,
   applyForensicsReport,
+  applyDebriefReport,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,

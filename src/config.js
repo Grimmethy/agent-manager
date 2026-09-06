@@ -174,6 +174,15 @@ function getConfig() {
   // line points at this pipeline's OWN src/.
   const pipelineFixCandidatesPath = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH
     || path.join(repoRoot, 'Docs', 'PIPELINE_FIX_CANDIDATES.md');
+  // pipeline_debrief (2026-09-06, "The Debrief" concept, Grimmethy: "a whole phase where we
+  // go through actually completed work to analyze for patterns... What / So What / Now
+  // What") -- see debrief-bundle.js. The cursor advanced past is a timestamp
+  // (lastDebriefedAt), not a signature/source key like the coverage files above: a debrief
+  // window is a bounded slice of queue/done/'s own timeline, so "already covered" means
+  // "already inside a prior window," tracked the same single-cursor way as
+  // changeReviewCursorPath's commit walk.
+  const debriefCoveragePath = process.env.AGENT_MANAGER_DEBRIEF_COVERAGE_PATH
+    || path.join(pipelineDir, 'debrief-coverage.json');
   // change_review (agent-manager-hygiene, 2026-09-04) -- diff-scoped correctness review of
   // each unit merged to the main branch. Confirmed regressions land here as `### AC-NNN`
   // candidates (same format as PIPELINE_FIX_CANDIDATES.md) and change_review_fix turns them
@@ -317,6 +326,7 @@ function getConfig() {
     stalenessAuditCoveragePath,
     forensicsCoveragePath,
     pipelineFixCandidatesPath,
+    debriefCoveragePath,
     changeReviewCandidatesPath, changeReviewCursorPath,
     jobTypeCountersPath,
     performanceCoveragePath,

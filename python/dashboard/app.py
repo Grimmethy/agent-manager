@@ -2307,6 +2307,12 @@ def api_task_confirm_delete(task_id):
     # (see applyForensicsReport in src/apply-group-a.js).
     if data.get("source") == "pipeline_forensics":
         data["forensicsReportConfirmedAt"] = now_iso
+    # pipeline_debrief (2026-09-06): its apply's first pass held the What/So-What/Now-What
+    # report here for a human read. Confirming it stamps debriefReportConfirmedAt so the
+    # re-run's second pass archives the window's own done/ tasks (see applyDebriefReport in
+    # src/apply-group-a.js).
+    if data.get("source") == "pipeline_debrief":
+        data["debriefReportConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)

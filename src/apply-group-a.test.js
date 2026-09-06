@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -1104,4 +1104,70 @@ test('applyForensicsReport: confirmed pass files a LEAN, consumable AC candidate
     if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
     for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
   }
+});
+
+// --- applyDebriefReport (pipeline_debrief) -----------------------------------
+
+const DEBRIEF_REPORT = [
+  'WHAT',
+  '15 observability_review tasks shipped this window, each a single-file catch-block verdict.',
+  '',
+  'SO WHAT',
+  'Every accepted draft cited a real file:line from the harness scan (task done-1..done-15 history).',
+  '',
+  'SURVIVORSHIP-BIAS CHECK',
+  'The one still-stuck contrast task (stuck-1) also had a real file:line cite, so this alone is not the differentiator; the difference was the size of the enclosing function.',
+  '',
+  'NOW WHAT',
+  '1. Cap the enclosing-function window fed to the model. Files: src/maintenance/observability-review.js. Why: the stuck task\'s function was 4x longer than any window task\'s.',
+].join('\n');
+
+function makeDebriefPipeline() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-debrief-test-'));
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  return dir;
+}
+
+test('applyDebriefReport: first pass holds the report for human confirmation', () => {
+  const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task: { id: 't', title: 'Pipeline debrief: x', promptContext: { taskIds: ['d1'] } } });
+  assert.equal(r.succeeded, false);
+  assert.equal(r.needsConfirmation, true);
+});
+
+test('applyDebriefReport: empty implement response -> clean skip, no archive attempted', () => {
+  const r = applyDebriefReport({ implementResponse: '   ', task: { id: 't' } });
+  assert.equal(r.skipped, true);
+});
+
+test('applyDebriefReport: confirmed pass archives exactly the window\'s taskIds and returns {skipped:true} (no git file to stage)', () => {
+  const dir = makeDebriefPipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'd2.json'), JSON.stringify({ id: 'd2' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'left-alone.json'), JSON.stringify({ id: 'left-alone' }));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const task = { id: 't', title: 'Pipeline debrief: x', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1', 'd2'] } };
+    const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task });
+    // Never {succeeded: true} with no `file` -- apply-task.js's git-branch-diff flow would
+    // run `git add [undefined]` on that shape (see applyDebriefReport's own comment).
+    assert.equal(r.skipped, true);
+    assert.match(r.reason, /archived 2/);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'd1.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'd2.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'left-alone.json')), true);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
+});
+
+test('applyDebriefReport: confirmed pass with no promptContext.taskIds -> clean skip, nothing archived', () => {
+  const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task: { id: 't', debriefReportConfirmedAt: 'now', promptContext: {} } });
+  assert.equal(r.skipped, true);
+  assert.match(r.reason, /no promptContext.taskIds/);
 });

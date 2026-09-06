@@ -21,13 +21,14 @@ const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
-const { applyArchDiscoveryCandidates, applyForensicsReport } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
+const debriefBundle = require('./debrief-bundle.js');
 const { buildForensicBundle } = require('./forensic-bundle.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
@@ -1348,6 +1349,8 @@ const STALENESS_AUDIT_COMPLETENESS_QUESTION = 'Does it contain a genuine three-p
 
 const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: the implement draft is DELIBERATELY an advisory prose report -- a RANKED root-cause analysis of why a class of pipeline tasks keeps failing -- not code or a diff. There is nothing to implement here. Judge it on: (1) does it rank concrete causes and, for each, state a real COUNTERFACTUAL ("if this alone were fixed, the failing case WOULD / WOULD NOT have shipped, because ...")? (2) does it actually CONTRAST the failing tasks with the named winner tasks in the evidence, rather than analysing the failures in isolation? (3) is every cited file a real src/ path from the harness hits or the tier->file map in the evidence -- not an invented module name? (4) is the RECOMMENDED FOLLOW-UP FIX a change to THIS PIPELINE, scoped and with an acceptance check, not a re-attempt of the failed task or a hand-built version of the feature it was trying to build? "NO CLEAR ROOT CAUSE" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a tier did something the draftAttempts/worklog show it did not), it proposes hand-building the failed feature instead of fixing the pipeline, or it asserts a root cause with no counterfactual and no contrast.';
 const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT CAUSE list with a counterfactual per cause, an explicit CONTRAST with the successful sibling tasks, and a RECOMMENDED FOLLOW-UP FIX (or a justified NO CLEAR ROOT CAUSE) -- all grounded in the real evidence and citing real src/ files?';
+const PIPELINE_DEBRIEF_REVIEW_GUIDANCE = 'This is a pipeline_debrief task: the implement draft is DELIBERATELY an advisory prose report -- a What/So-What/Now-What retrospective over a WINDOW of pipeline tasks that already SHIPPED -- not code or a diff. There is nothing to implement here. Judge it on: (1) does WHAT give a factual account grounded in the evidence (not invented task counts or outcomes)? (2) does SO WHAT name a real, evidence-cited pattern, not a generic platitude ("communication is important")? (3) does the SURVIVORSHIP-BIAS CHECK actually engage with the contrast tasks named in the evidence (or explicitly note there were none) rather than skip straight to celebrating the wins? (4) is NOW WHAT at most 2-3 concrete, bounded recommendations naming a real src/ file from the harness hits or the evidence\'s TIER -> SOURCE FILE map -- not an invented module name, and not a sprawling wish list? "NO CONFIDENT PATTERN" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a task/history entry says something the record does not), it skips the survivorship-bias check entirely when contrast tasks were provided, or NOW WHAT is vague/unbounded with no real file cited.';
+const PIPELINE_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain all four sections (WHAT, SO WHAT, SURVIVORSHIP-BIAS CHECK, NOW WHAT) or a justified NO CONFIDENT PATTERN, with NOW WHAT (if present) bounded to 2-3 items each citing a real src/ file -- all grounded in the real evidence rather than invented?';
 const PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE = 'This task implements a human-CONFIRMED pipeline-fix candidate produced by a pipeline_forensics root-cause study (its full ranked report is in the candidate body). The change edits THIS pipeline\'s own src/. Judge it as a normal code change: does the diff actually do what the candidate\'s Solution describes, does it stay within the candidate\'s Files: line, and does it include (or make trivially checkable) the acceptance check the candidate named? Reject a diff that re-implements the ORIGINAL failed feature instead of fixing the pipeline mechanism, that is scoped far wider than the candidate, or that lands with no test/acceptance evidence for a behavioural change. An empty draft is NOT a valid "nothing to do" here -- it means the fix could not be produced.';
 
 // The PLAN section of an adhoc task is drafted blind, before investigation -- this guarantee
@@ -1781,6 +1784,57 @@ function markPipelineForensicsReported(task) {
   if (ctx._requestFile) { try { fs.unlinkSync(ctx._requestFile); } catch { /* raced */ } }
 }
 
+// pipeline_debrief (2026-09-06, "The Debrief" concept -- see debrief-bundle.js). A
+// structured What/So-What/Now-What retrospective over a bounded, chronological window of
+// queue/done/ tasks that SHIPPED, rather than a cluster of tasks that failed. Cursor-based
+// (like changeReviewCursorPath's commit walk), not signature-keyed like the coverage files
+// above: `debriefCoveragePath` holds a single lastDebriefedAt, and the next window always
+// starts right after it -- so windows never overlap and every done/ task is eventually
+// covered exactly once, in order. debrief-bundle.js's own MIN_WINDOW_TASKS floor means this
+// simply returns null (not "due yet") until enough NEW done/ tasks have accumulated past the
+// cursor -- no separate time-based gate needed, since a small trickle of done/ tasks doesn't
+// need a debrief on a clock, it needs one once there's enough of a batch to find a pattern in.
+function nextPipelineDebriefTask() {
+  const { pipelineDir, debriefCoveragePath, defaultDomain } = getConfig();
+  const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
+  const now = Date.now();
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(debriefCoveragePath) || '{}'); } catch { coverage = {}; }
+
+  const bundle = debriefBundle.buildDebriefBundle({ pipelineDir, dbPath, sinceIso: coverage.lastDebriefedAt, now });
+  if (!bundle.evidenceText) return null;
+
+  const id = `pipeline-debrief-${slugifyForId(bundle.windowEnd).slice(0, 40)}-${now}`;
+  if (taskIdExistsInQueue(id)) return null;
+
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'pipeline_debrief',
+    title: `Pipeline debrief: ${bundle.taskIds.length} completed tasks, ${bundle.windowStart.slice(0, 10)}..${bundle.windowEnd.slice(0, 10)}`.slice(0, 140),
+    promptContext: {
+      evidenceText: bundle.evidenceText,
+      taskIds: bundle.taskIds,
+      contrastIds: bundle.contrastIds,
+      windowStart: bundle.windowStart,
+      windowEnd: bundle.windowEnd,
+    },
+  };
+}
+
+// Called once from the CLI, only after writeTask() persists a pipeline_debrief task --
+// advances the cursor PAST this window (windowEnd) so the next call never re-selects any of
+// these same done/ tasks, same "record coverage only after the write actually landed" lesson
+// nextPipelineForensicsTask()'s own comment names.
+function markPipelineDebriefReported(task) {
+  const { debriefCoveragePath } = getConfig();
+  const windowEnd = task.promptContext && task.promptContext.windowEnd;
+  if (!windowEnd) return;
+  fs.mkdirSync(path.dirname(debriefCoveragePath), { recursive: true });
+  fs.writeFileSync(debriefCoveragePath, JSON.stringify({ lastDebriefedAt: windowEnd, taskId: task.id, reportedAt: new Date().toISOString() }, null, 2));
+}
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header for the full design):
 // per-task counterpart to nextPipelineSelfAuditTask() right above -- reads queue/blocked/
 // and queue/needs-clarification/ fresh every call (same "no persistent flags file that
@@ -1915,6 +1969,26 @@ registerTaskSource('pipeline_forensics', {
   reportClass: 'housekeeping',
   reviewGuidance: PIPELINE_FORENSICS_REVIEW_GUIDANCE,
   reviewCompletenessQuestion: PIPELINE_FORENSICS_COMPLETENESS_QUESTION,
+});
+// pipeline_debrief (2026-09-06) -- the retrospective sibling of pipeline_forensics: same
+// advisoryProse / awaiting-confirm / directToMain-free shape, but looking BACKWARD at work
+// that shipped instead of forward at a fix for work that failed. Priority 95 (below every
+// other reasoning worker here, including staleness_audit(91)) -- this is the least urgent
+// source in the file by design: a debrief window only ever grows (debrief-bundle.js's own
+// MIN_WINDOW_TASKS floor gates it, not a clock), so ranking it last has zero crowd-out cost
+// and never starves a task that would otherwise fix something actually broken.
+registerTaskSource('pipeline_debrief', {
+  priority: taskPriority('pipeline_debrief', 95),
+  next: nextPipelineDebriefTask,
+  apply: applyDebriefReport,
+  // NOT emptyApproval: debrief-bundle.js's own MIN_WINDOW_TASKS floor already guarantees a
+  // real, non-trivial window to report on, same reasoning as pipeline_forensics.
+  advisoryProse: true,
+  harnessSearch: 'archImport',
+  reasoningTier: 'low',
+  reportClass: 'housekeeping',
+  reviewGuidance: PIPELINE_DEBRIEF_REVIEW_GUIDANCE,
+  reviewCompletenessQuestion: PIPELINE_DEBRIEF_COMPLETENESS_QUESTION,
 });
 // Priority 90, just under staleness_audit(91) -- an operational incident (today's real
 // example: every draft of one task type silently failing outright) can be actively
@@ -2335,6 +2409,7 @@ module.exports = {
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
+  nextPipelineDebriefTask, markPipelineDebriefReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
@@ -2640,6 +2715,7 @@ if (require.main === module) {
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.source === 'pipeline_forensics') markPipelineForensicsReported(task);
+      if (task.source === 'pipeline_debrief') markPipelineDebriefReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();
       if (task.source === 'staleness_audit') markStalenessAuditReported(task);
