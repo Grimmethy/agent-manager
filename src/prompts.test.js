@@ -501,6 +501,45 @@ test('pipelineForensicsImplementPrompt encodes the ranked-counterfactual method,
   assert.match(p, /src\/local-agentic-write-draft\.js:90/); // harness hit rendered
 });
 
+// 2026-09-06 ("Task Atomization" brain-dump: use debrief's own hardened concepts to
+// improve the existing blocked-task analysis) -- pipeline_forensics' "Files:" line had
+// only a soft "cite real files" instruction, the exact same shape of risk that produced
+// 2 real fabricated NOW-WHAT file citations in pipeline_debrief before its closed-list fix.
+test('pipelineForensicsImplementPrompt constrains the Files: line to a closed list of real fetched paths', () => {
+  const { pipelineForensicsImplementPrompt } = require('./prompts.js');
+  const p = pipelineForensicsImplementPrompt({
+    promptContext: {
+      evidenceText: 'EVID', winnerIds: ['win-a'], loserIds: ['lose-a'],
+      harnessHits: [],
+      harnessFiles: [{ path: 'src/apply-group-a.js', content: 'x' }, { path: 'src/system-report.js', content: 'y' }],
+    },
+  }, 'QUERY: x');
+  assert.match(p, /AVAILABLE FILES/);
+  assert.match(p, /- src\/apply-group-a\.js/);
+  assert.match(p, /- src\/system-report\.js/);
+  assert.match(p, /verbatim from AVAILABLE FILES/);
+});
+
+test('pipelineForensicsImplementPrompt renders "(none fetched)" for AVAILABLE FILES when no harness files were fetched', () => {
+  const { pipelineForensicsImplementPrompt } = require('./prompts.js');
+  const p = pipelineForensicsImplementPrompt({
+    promptContext: { evidenceText: 'EVID', winnerIds: [], loserIds: ['lose-a'], harnessHits: [], harnessFiles: [] },
+  }, 'QUERY: x');
+  assert.match(p, /\(none fetched\)/);
+});
+
+// Mirrors pipeline_debrief's own SURVIVORSHIP-BIAS CHECK discipline: the contrast section
+// must give the model explicit permission to say the evidence is inconclusive, rather than
+// asking for a divergence paragraph unconditionally.
+test('pipelineForensicsImplementPrompt requires an honest "inconclusive" option in the winner/loser contrast, mirroring debrief\'s survivorship-bias check', () => {
+  const { pipelineForensicsImplementPrompt } = require('./prompts.js');
+  const p = pipelineForensicsImplementPrompt({
+    promptContext: { evidenceText: 'EVID', winnerIds: ['win-a'], loserIds: ['lose-a'], harnessHits: [], harnessFiles: [] },
+  }, 'QUERY: x');
+  assert.match(p, /say so plainly instead of asserting a divergence you cannot support/);
+  assert.match(p, /if the evidence does not support a confident divergence, say so plainly/);
+});
+
 test('pipelineDebriefPlanPrompt emits QUERY: lines and carries the evidence blob', () => {
   const { pipelineDebriefPlanPrompt } = require('./prompts.js');
   const p = pipelineDebriefPlanPrompt({

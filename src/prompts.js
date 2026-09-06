@@ -985,6 +985,17 @@ function pipelineForensicsPlanPrompt(task) {
   ].join('\n');
 }
 
+// 2026-09-06 ("Task Atomization" brain-dump: "debrief doesn't look at blocked tasks... can
+// we use its concepts to improve the existing blocked task analysis" -- pipeline_forensics
+// IS the existing blocked-task-side analysis, already doing a contrast-vs-successes study
+// the same way debrief does one in reverse, but two disciplines debrief was hardened with
+// afterward had never been ported back): (1) the closed-list AVAILABLE FILES constraint --
+// pipelineDebriefImplementPrompt only got this after 2 real reports fabricated file paths
+// despite real harness hits; the "Files:" line here had the exact same soft "cite real
+// files" instruction and the exact same shape of risk, just never caught live yet. (2) an
+// explicit honesty requirement mirroring debrief's own SURVIVORSHIP-BIAS CHECK section --
+// "CONTRAST WITH SUCCESSFUL SIBLINGS" asked for a divergence paragraph unconditionally,
+// with no permission to say the winner evidence doesn't actually support one.
 function pipelineForensicsImplementPrompt(task, planText) {
   const ctx = task.promptContext || {};
   const hits = ctx.harnessHits || [];
@@ -993,14 +1004,16 @@ function pipelineForensicsImplementPrompt(task, planText) {
     ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
     : '(no matches -- the searches found nothing new in this repo; work from the draftAttempts evidence)';
   const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+  const availablePaths = files.map((f) => f.path).filter(Boolean);
+  const availablePathsText = availablePaths.length ? availablePaths.map((p) => `- ${p}`).join('\n') : '(none fetched)';
 
   const stable = [
     'You are running a pipeline FORENSIC STUDY: figuring out why a class of agent-manager tasks keeps failing, so the PIPELINE can be fixed. This is analysis, not a code change -- output prose, never a diff.',
     '',
     'METHOD -- follow it exactly:',
     '1. Rank the candidate ROOT CAUSES by COUNTERFACTUAL impact. For each cause, state plainly: "if this cause alone were fixed, the failing case WOULD / WOULD NOT have gone through, because <reason grounded in the evidence>."',
-    '2. CONTRAST the failing tasks with the WINNER tasks named in the evidence (same task source / same decomposition parent, but they succeeded). What did the winners do -- which tier reached, which tool called, at which turn -- that the failing tasks did not? The divergence point is usually the root cause.',
-    '3. Cite REAL files: every file you name must be a real src/... path from the harness matches below or the "TIER -> SOURCE FILE" map in the evidence. Never invent a module or symbol name.',
+    '2. CONTRAST the failing tasks with the WINNER tasks named in the evidence (same task source / same decomposition parent, but they succeeded). What did the winners do -- which tier reached, which tool called, at which turn -- that the failing tasks did not? The divergence point is usually the root cause. If the evidence does not actually show what the winners did differently (too little winner evidence, or the winners look the same as the losers up to the failure point), say so plainly instead of asserting a divergence you cannot support -- a confident-sounding contrast the evidence does not back is worse than admitting the comparison is inconclusive.',
+    '3. Cite REAL files: every file you name must be a real src/... path from the harness matches below or the "TIER -> SOURCE FILE" map in the evidence. Never invent a module or symbol name. The "Files:" line below must be copied verbatim from AVAILABLE FILES (or list none) -- never a path you searched for but never actually saw content for.',
     '4. The deliverable is a fix to THIS PIPELINE\'s code. NOT a re-attempt of the failed task. NOT a hand-built version of the feature the failed task was trying to build.',
     '',
     'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CLEAR ROOT CAUSE" if the evidence genuinely does not support one:',
@@ -1010,11 +1023,11 @@ function pipelineForensicsImplementPrompt(task, planText) {
     '2. <cause> -- ...',
     '',
     'CONTRAST WITH SUCCESSFUL SIBLINGS',
-    '<one short paragraph: what the winners did that the losers did not, and where their paths diverge>',
+    '<one short paragraph: what the winners did that the losers did not, and where their paths diverge -- or, if the evidence does not support a confident divergence, say so plainly and name the one thing that would be needed to confirm it, rather than asserting a pattern the evidence does not back>',
     '',
     'RECOMMENDED FOLLOW-UP FIX',
     'Strength: Strong | Worth exploring',
-    'Files: src/<file>, ...',
+    'Files: src/<file>, ... (verbatim from AVAILABLE FILES below, or "none")',
     'Problem: <the ranked analysis, condensed to 2-4 sentences>',
     'Solution: <one concrete, safely-scoped change to the named files + a specific acceptance check that would prove it worked>',
     'Benefits: <what class of task stops failing>',
@@ -1040,6 +1053,10 @@ function pipelineForensicsImplementPrompt(task, planText) {
     'Full content of the matched file(s):',
     '',
     filesText,
+    '',
+    'AVAILABLE FILES -- the ONLY real file paths you may cite in the "Files:" line (copy verbatim; if empty, cite none):',
+    '',
+    availablePathsText,
   ];
   return assemblePrompt(stable, volatile);
 }
