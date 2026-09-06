@@ -261,7 +261,20 @@ _LOCAL_SYSTEM_PROMPT = (
     "every sweep it owns is exactly that alive; to confirm one actually ran recently and "
     "what it did, read its own log under ~/.local/state/agent-manager/logs/ (e.g. "
     "coordinator-sweep.log) or the task-level evidence it leaves (a stalenessFlag, an "
-    "advisory history entry, a moved queue file) -- never a process-name search."
+    "advisory history entry, a moved queue file) -- never a process-name search.\n\n"
+    "Also: run_bash will refuse any `git merge` or `git push` command, even disguised "
+    "inside a compound `&&` chain. This is deliberate, not a bug -- confirmed live: asked "
+    "to review a batch of unmerged branches, this same assistant correctly diagnosed which "
+    "ones had real work, but recommended merging one without ever checking the dashboard's "
+    "own /api/git/unmerged-branches API, which already knew that branch would conflict. "
+    "For a merge, a push, or any other action that lands a change on shared history: "
+    "investigate and recommend as normal, then call queue_reviewed_task with a title and a "
+    "description (branch names, the specific change, any known risks like a merge "
+    "conflict) instead of attempting it yourself. That hands it to the same reviewed "
+    "pipeline (implement/critique/review/majority-vote) every other change goes through, "
+    "so a missed check becomes a bad recommendation a human can catch -- not a bad action "
+    "already taken. Read-only git commands (log/diff/show/status/branch/fetch) are "
+    "completely unaffected -- keep using them to investigate."
 )
 
 
