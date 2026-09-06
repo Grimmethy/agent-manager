@@ -93,9 +93,10 @@ class ConceptsRoutesTest(unittest.TestCase):
             {"id": "bd-human", "capturedAt": "2026-09-06T01:15:00Z", "rawText": "Human note"},
         ])
         resp = self.client.get("/api/concepts/concept-x/timeline")
-        rows = resp.get_json()
-        self.assertEqual([r["ref"] for r in rows], ["bd-1", "bd-2"])
-        self.assertEqual(rows[0]["kind"], "research-finding")
+        data = resp.get_json()
+        self.assertEqual(data["truncated"], False)
+        self.assertEqual([r["ref"] for r in data["rows"]], ["bd-1", "bd-2"])
+        self.assertEqual(data["rows"][0]["kind"], "research-finding")
 
     def test_timeline_includes_matching_task_history_rows(self):
         self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X"}])
@@ -110,10 +111,33 @@ class ConceptsRoutesTest(unittest.TestCase):
         }), encoding="utf-8")
 
         resp = self.client.get("/api/concepts/concept-x/timeline")
-        rows = resp.get_json()
-        self.assertEqual([r["ref"] for r in rows], ["task-1"])
-        self.assertEqual(rows[0]["kind"], "task")
-        self.assertEqual(rows[0]["summary"], "Implement thing")
+        data = resp.get_json()
+        self.assertEqual(data["truncated"], False)
+        self.assertEqual([r["ref"] for r in data["rows"]], ["task-1"])
+        self.assertEqual(data["rows"][0]["kind"], "task")
+        self.assertEqual(data["rows"][0]["summary"], "Implement thing")
+
+    def test_timeline_truncates_the_slow_scan_under_a_hard_time_budget_and_flags_it(self):
+        # Regression test for the real 73s live incident (2026-09-06): an unbounded
+        # glob over a large done/ directory must never hang the request. Forces the
+        # budget check to trip on the very first file by monkeypatching it to zero.
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X"}])
+        self._write_brain_dump([])
+        done_dir = self.pipeline_dir / "queue" / "done"
+        done_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            (done_dir / f"task-{i}.json").write_text(json.dumps({
+                "id": f"task-{i}", "conceptId": "concept-x", "completedAt": f"2026-09-06T0{i}:00:00Z", "title": f"Task {i}",
+            }), encoding="utf-8")
+
+        orig_budget = app.CONCEPT_TASK_SCAN_BUDGET_SECONDS
+        app.CONCEPT_TASK_SCAN_BUDGET_SECONDS = -1  # already-expired deadline
+        try:
+            resp = self.client.get("/api/concepts/concept-x/timeline")
+        finally:
+            app.CONCEPT_TASK_SCAN_BUDGET_SECONDS = orig_budget
+        data = resp.get_json()
+        self.assertEqual(data["truncated"], True)
 
 
 if __name__ == "__main__":

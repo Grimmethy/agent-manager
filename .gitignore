@@ -48,6 +48,7 @@ scanner-review-attempts.json
 dashboard.pid
 .claude/
 brain-dump.json
+concepts.json
 project-history.json
 projects.json
 runs/

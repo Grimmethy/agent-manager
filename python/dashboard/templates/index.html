@@ -311,6 +311,7 @@ const TABS = [
   { key: 'deepdive', label: 'Scouted Repos', description: 'Browse repos the scouting pass has found, with enough detail to decide whether to deep-dive or queue them for work.' },
   { key: 'discovery', label: 'Discovery', description: 'Watch the architecture-discovery job work through the project\'s code communities, and read the candidate write-ups it has produced.' },
   { key: 'brain-dump', label: 'Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard.' },
+  { key: 'concepts', label: '🔬 Concepts', description: 'Track named concepts (e.g. chat-context-trimming) that get research-fork treatment -- a running audit log of research and build work per concept, plus a self-reported (unverified) built-from-scratch vs adapted tally.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
   { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
@@ -1176,6 +1177,101 @@ async function renderAdhocTasksTab() {
   main.innerHTML = `<table><thead><tr><th>Title</th><th>State</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>${footer}`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openTaskAnywhere(row.dataset.id);
+  });
+}
+
+// --- Concepts tab (2026-09-06, see AGENTS.md's "Concept research" section) ------------
+// A concept's audit trail (research findings + implementation tasks tied to it) is
+// fetched on demand per-card ("View timeline"), not eagerly for the whole list -- same
+// reasoning as Brain Dump's own per-entry lazy behaviors: cheap by default, real cost
+// only paid when a human actually wants to look.
+
+function renderConceptCard(concept) {
+  const statusBadge = `<span class="badge idle">${escapeHtml(concept.status || 'open')}</span>`;
+  const researchChip = concept.researchForkCount > 0
+    ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px">🔬 researched ${concept.researchForkCount}×</span>`
+    : '';
+  const scratch = concept.builtFromScratchCount || 0;
+  const adapted = concept.adaptedFromResourceCount || 0;
+  const buildChip = (scratch + adapted) > 0
+    ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
+    : '';
+  return `
+    <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
+      <div class="row">
+        <span class="text"><strong>${escapeHtml(concept.name)}</strong>${researchChip}${buildChip}</span>
+        ${statusBadge}
+      </div>
+      <div class="row meta"><span>${escapeHtml(concept.description || '')}</span></div>
+      <div class="row" style="margin-top:8px">
+        <span></span>
+        <span>
+          <button class="secondary" data-view-timeline="${escapeAttr(concept.id)}">View timeline</button>
+        </span>
+      </div>
+      <div class="concept-timeline" data-timeline-for="${escapeAttr(concept.id)}" hidden></div>
+    </div>
+  `;
+}
+
+function renderConceptTimelineRows({ rows, truncated }) {
+  const truncatedNote = truncated
+    ? '<div class="meta" style="color:var(--warn)">⚠ Task history scan hit its time budget -- older completed tasks may be missing from this list (research findings above are always complete).</div>'
+    : '';
+  if (!rows.length) return truncatedNote + '<div class="meta">No research findings or tasks tied to this concept yet.</div>';
+  return truncatedNote + '<ul class="concept-timeline-list">' + rows.map((r) => {
+    const when = r.at ? new Date(r.at).toLocaleString() : 'unknown time';
+    const icon = r.kind === 'research-finding' ? '🔬' : '🛠';
+    return `<li>${icon} <span class="meta">${escapeHtml(when)}</span> — ${escapeHtml(r.summary || r.ref)}</li>`;
+  }).join('') + '</ul>';
+}
+
+async function renderConceptsTab() {
+  const main = document.getElementById('main');
+  let concepts;
+  try {
+    concepts = await fetchJson('/api/concepts');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error loading concepts: ${e.message}</div>`;
+    return;
+  }
+  const newConceptForm = `
+    <div class="row" style="margin-bottom:12px">
+      <input type="text" id="concept-new-name" placeholder="Concept name (e.g. dependency-ordering)" style="flex:1">
+      <input type="text" id="concept-new-description" placeholder="Short description (optional)" style="flex:2">
+      <button id="concept-new-submit">+ New Concept</button>
+    </div>
+  `;
+  const list = concepts.length
+    ? concepts.map(renderConceptCard).join('')
+    : '<div class="empty">No concepts tracked yet -- add one above, or one will appear the first time a research fork runs on a new topic.</div>';
+  main.innerHTML = newConceptForm + list;
+
+  document.getElementById('concept-new-submit').onclick = async () => {
+    const name = document.getElementById('concept-new-name').value.trim();
+    const description = document.getElementById('concept-new-description').value.trim();
+    if (!name) return;
+    await fetch('/api/concepts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description }),
+    });
+    renderConceptsTab();
+  };
+
+  main.querySelectorAll('[data-view-timeline]').forEach((btn) => {
+    btn.onclick = async () => {
+      const id = btn.dataset.viewTimeline;
+      const panel = main.querySelector(`[data-timeline-for="${CSS.escape(id)}"]`);
+      if (!panel.hidden) { panel.hidden = true; return; }
+      panel.innerHTML = '<div class="meta">Loading…</div>';
+      panel.hidden = false;
+      try {
+        const rows = await fetchJson(`/api/concepts/${encodeURIComponent(id)}/timeline`);
+        panel.innerHTML = renderConceptTimelineRows(rows);
+      } catch (e) {
+        panel.innerHTML = `<div class="empty">Error loading timeline: ${e.message}</div>`;
+      }
+    };
   });
 }
 
@@ -3196,6 +3292,7 @@ async function renderMain() {
     else if (activeTab === 'adforge') await renderAdForgeTab();
     else if (activeTab === 'scriptforge') await renderScriptForgeTab();
     else if (activeTab === 'adhoc') await renderAdhocTasksTab();
+    else if (activeTab === 'concepts') await renderConceptsTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
@@ -3216,7 +3313,11 @@ async function refresh() {
   // promptforge / adforge / scriptforge are embedded iframes -- re-running
   // renderMain() every 5s would rebuild them and reload the app out from under the
   // user's inputs, same reason project / brain-dump opt out here.
-  if (!['project', 'brain-dump', 'promptforge', 'adforge', 'scriptforge'].includes(activeTab)) renderMain();
+  // concepts (2026-09-06): confirmed live -- a "View timeline" click could lose the
+  // race against this same 5s cycle rebuilding the tab's DOM via innerHTML mid-click,
+  // silently discarding the interaction with no error. Same class of bug Brain Dump's
+  // own opt-out already exists to prevent; re-entering the tab still re-fetches once.
+  if (!['project', 'brain-dump', 'promptforge', 'adforge', 'scriptforge', 'concepts'].includes(activeTab)) renderMain();
 }
 
 // --- Project tab --------------------------------------------------------------------
