@@ -70,6 +70,44 @@ test('parseArchDiscoveryCandidates leaves splitDepth 0 for a normal candidate', 
   assert.equal(c.splitDepth, 0);
 });
 
+// --- Depends-On-Index / Depends-On (2026-09-05, see prompts.js's candidateSplitInstructions
+// for the incident: two sibling split candidates, one depending on the other, both offered
+// for drafting the same tick because nothing tracked the relationship) -----------------
+
+test('parseArchDiscoveryCandidates reads Depends-On-Index and excludes it from the body', () => {
+  const [c] = parseArchDiscoveryCandidates('### AC-16 · guard\nStrength: Strong\nFiles: src/a.js\nDepends-On-Index: 0\n\nProblem:\nX.\n\nSolution:\nY.');
+  assert.equal(c.dependsOnIndex, 0);
+  assert.doesNotMatch(c.body, /Depends-On-Index/, 'the marker is metadata, not part of the body');
+});
+
+test('parseArchDiscoveryCandidates leaves dependsOnIndex null when the line is absent', () => {
+  const [c] = parseArchDiscoveryCandidates('### AC-9 · Normal\nStrength: Strong\nFiles: src/a.js\n\nProblem:\nX.');
+  assert.equal(c.dependsOnIndex, null);
+});
+
+test('applyArchDiscoveryCandidates resolves a dependsOnIndex to the real Depends-On: AC-NNN id of its earlier sibling, in the same batch', () => {
+  const docPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cd-dep-')), 'D.md');
+  const implementResponse = [
+    '### AC-1 · the gate', 'Strength: Strong', 'Files: src/a.js', '', 'Problem:', 'p1', 'Solution:', 's1',
+    '', '### AC-2 · the guard', 'Strength: Strong', 'Files: src/b.js', 'Depends-On-Index: 0', '', 'Problem:', 'p2', 'Solution:', 's2',
+  ].join('\n');
+  const result = applyArchDiscoveryCandidates({ implementResponse, candidatesPath: docPath });
+  assert.equal(result.candidateIds.length, 2);
+  const written = fs.readFileSync(docPath, 'utf8');
+  const guardBlock = written.slice(written.indexOf(`### ${result.candidateIds[1]}`));
+  assert.match(guardBlock, new RegExp(`^Depends-On: ${result.candidateIds[0]}$`, 'm'));
+  assert.doesNotMatch(guardBlock, /Depends-On-Index/, 'the placeholder must be replaced, not left alongside the real line');
+});
+
+test('applyArchDiscoveryCandidates omits Depends-On entirely for a candidate with no dependsOnIndex', () => {
+  const docPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cd-dep-')), 'D.md');
+  applyArchDiscoveryCandidates({
+    implementResponse: '### AC-1 · plain\nStrength: Strong\nFiles: src/a.js\n\nProblem:\np\nSolution:\ns',
+    candidatesPath: docPath,
+  });
+  assert.doesNotMatch(fs.readFileSync(docPath, 'utf8'), /Depends-On/);
+});
+
 test('nextAvailableCandidateId returns 1 for empty text and max+1 otherwise', () => {
   assert.equal(nextAvailableCandidateId(''), 1);
   assert.equal(nextAvailableCandidateId('### AC-4 x\n### AC-41 y\n### AC-9 z'), 42);

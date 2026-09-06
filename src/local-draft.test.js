@@ -1150,6 +1150,94 @@ test('parseCandidateSplit recognizes a well-formed split and returns its sub-can
   assert.equal(result.invalid, undefined);
   assert.equal(result.candidates.length, 2);
   assert.equal(result.candidates[0].title, 'Extract git apply path');
+  assert.equal(result.candidates[0].dependsOn, null, 'no dependsOn given -> defaults to null, not undefined');
+  assert.equal(result.candidates[1].dependsOn, null);
+});
+
+// --- dependsOn (2026-09-05, see prompts.js's candidateSplitInstructions for the incident:
+// two sibling split candidates, one structurally depending on the other, both offered for
+// drafting the same tick because nothing tracked the relationship) --------------------
+
+test('parseCandidateSplit passes through a valid dependsOn index unchanged when nothing was filtered out', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const response = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'gate', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1', dependsOn: null },
+      { title: 'guard', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2', dependsOn: 0 },
+    ],
+  });
+  const result = parseCandidateSplit(response);
+  assert.equal(result.candidates[0].dependsOn, null);
+  assert.equal(result.candidates[1].dependsOn, 0);
+});
+
+test('parseCandidateSplit remaps a dependsOn index when an earlier malformed candidate gets filtered out', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const response = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'malformed, no solution', problem: 'p0' }, // raw index 0 -- dropped
+      { title: 'gate', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1', dependsOn: null }, // raw index 1 -> final index 0
+      { title: 'guard', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2', dependsOn: 1 }, // raw index 2 -> final index 1, depends on raw index 1 (final index 0)
+    ],
+  });
+  const result = parseCandidateSplit(response);
+  assert.equal(result.candidates.length, 2);
+  assert.equal(result.candidates[0].title, 'gate');
+  assert.equal(result.candidates[1].title, 'guard');
+  assert.equal(result.candidates[1].dependsOn, 0, 'must be remapped to the POST-filter index, not the raw one');
+});
+
+test('parseCandidateSplit drops a dependsOn that points at a filtered-out (invalid) sibling instead of leaving a dangling index', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const response = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'malformed', problem: 'p0' }, // raw index 0 -- dropped
+      { title: 'a', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1', dependsOn: 0 }, // depends on the DROPPED one
+      { title: 'b', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+  });
+  const result = parseCandidateSplit(response);
+  assert.equal(result.candidates.length, 2);
+  assert.equal(result.candidates[0].dependsOn, null, 'a dependency on a dropped sibling must not survive as a dangling index');
+});
+
+test('parseCandidateSplit ignores a self-reference or forward-reference dependsOn (only an EARLIER sibling is a valid dependency)', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const selfRef = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'a', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1', dependsOn: 0 },
+      { title: 'b', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+  });
+  assert.equal(parseCandidateSplit(selfRef).candidates[0].dependsOn, null);
+
+  const forwardRef = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'a', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1', dependsOn: 1 },
+      { title: 'b', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2' },
+    ],
+  });
+  assert.equal(parseCandidateSplit(forwardRef).candidates[0].dependsOn, null);
+});
+
+test('parseCandidateSplit treats a non-integer/out-of-range dependsOn as null rather than throwing', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const response = JSON.stringify({
+    mode: 'split',
+    candidates: [
+      { title: 'a', files: 'a.js', problem: 'p1', solution: 's1', benefits: 'b1' },
+      { title: 'b', files: 'b.js', problem: 'p2', solution: 's2', benefits: 'b2', dependsOn: 'zero' },
+      { title: 'c', files: 'c.js', problem: 'p3', solution: 's3', benefits: 'b3', dependsOn: 99 },
+    ],
+  });
+  const result = parseCandidateSplit(response);
+  assert.equal(result.candidates[1].dependsOn, null);
+  assert.equal(result.candidates[2].dependsOn, null);
 });
 
 test('parseCandidateSplit returns invalid:true when mode is "split" but fewer than 2 sub-candidates are well-formed', () => {

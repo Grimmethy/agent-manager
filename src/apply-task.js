@@ -117,6 +117,12 @@ function applyCandidateSplit(task, source) {
     // depth >= 1, the hard one-level recursion stop for the deterministic pre-split gate.
     c.splitDepth ? `Split-Depth: ${c.splitDepth}` : '',
     c.files ? `Files: ${c.files}` : '',
+    // Placeholder, index-space local to THIS split batch -- candidate-docs.js's
+    // applyArchDiscoveryCandidates resolves it to the sibling's REAL AC-NNN id (known
+    // only once ids are actually assigned, in the same pass) and rewrites this into a
+    // real `Depends-On: AC-NNN` line before the doc is ever saved. See
+    // prompts.js's candidateSplitInstructions for the incident this fixes.
+    Number.isInteger(c.dependsOn) ? `Depends-On-Index: ${c.dependsOn}` : '',
     '',
     'Problem:', c.problem,
     '',

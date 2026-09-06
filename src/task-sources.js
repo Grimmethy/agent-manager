@@ -2315,7 +2315,7 @@ module.exports = {
   nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
-  isTaskReady, pendingReadinessMap,
+  isTaskReady, pendingReadinessMap, isDependencySatisfied,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,

@@ -416,12 +416,42 @@ function parseCandidateSplit(implementResponse) {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.mode !== 'split') return null;
   const raw = Array.isArray(parsed.candidates) ? parsed.candidates : [];
-  const valid = raw.filter((c) => c && typeof c.title === 'string' && c.title.trim()
+  const isValidShape = (c) => c && typeof c.title === 'string' && c.title.trim()
     && typeof c.problem === 'string' && c.problem.trim()
-    && typeof c.solution === 'string' && c.solution.trim());
+    && typeof c.solution === 'string' && c.solution.trim();
+
+  // dependsOn (2026-09-05, see prompts.js's candidateSplitInstructions for the incident:
+  // two sibling sub-candidates, one structurally depending on the other, both offered for
+  // drafting in the SAME tick because nothing tracked the relationship the model's own
+  // prose already stated). The model writes dependsOn as a 0-based index into its OWN,
+  // pre-filter candidates array -- remap it into the POST-filter `valid` array's own index
+  // space here, since a candidate with a malformed shape can be dropped between the two,
+  // and that's the index space applyCandidateSplit (apply-task.js) actually numbers
+  // against. A malformed/self/forward/dangling reference just means "no dependency"
+  // rather than corrupting the ordering of everything downstream.
+  const rawToValidIndex = raw.map(() => -1);
+  const valid = [];
+  raw.forEach((c, i) => {
+    if (!isValidShape(c)) return;
+    rawToValidIndex[i] = valid.length;
+    valid.push({ ...c, _rawIndex: i });
+  });
+
   if (valid.length < 2) {
     return { invalid: true, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
   }
+
+  valid.forEach((c, finalIndex) => {
+    const depRaw = raw[c._rawIndex].dependsOn;
+    let dep = null;
+    if (Number.isInteger(depRaw) && depRaw >= 0 && depRaw < raw.length) {
+      const depFinal = rawToValidIndex[depRaw];
+      if (depFinal !== -1 && depFinal < finalIndex) dep = depFinal;
+    }
+    c.dependsOn = dep;
+    delete c._rawIndex;
+  });
+
   return { candidates: valid };
 }
 
