@@ -5417,3 +5417,151 @@ Reduce the top-level body to a short classifier (a few lines of if/else or a swi
 
 Benefits:
 A reviewer can verify one branch's logic in isolation without holding seven other branches in working memory; a unit test can target a single inner function by calling it directly with a crafted draft state rather than exercising the full function and hoping the right branch fires; and adding a new terminal state means adding one new inner function and one new dispatch line, rather than inserting a block mid-function where it can collide with adjacent branches' local state.
+
+### AC-49 · Decompose `draftAdhocViaHarnessSearch` orchestration
+Strength: Strong
+Files: src/adhoc-harness-draft.js
+Snippet:
+```
+ *     block the task outright.
+ */
+async function draftAdhocViaHarnessSearch(task, { localCall } = {}) {
+  if (requiresCommandExecution(task)) {
+    return { applied: false, succeeded: true, reason: 'task explicitly requires running a verification command (compile/test) this no-tool tier cannot execute -- deferring to a tier with real command access' };
+  }
+
+  const { repoRoot, pipelineDir } = getConfig();
+  // Deliberately NOT model-provider.js's providerFor(task).call -- adhoc is registered
+  // high-tier, so providerFor(task) resolves to Claude by default (unless
+  // AGENT_MANAGER_FORCE_PROVIDER=local happens to be set), the exact opposite of what a
+  // "try the local model first" tier needs. This tier is the local model, unconditionally
+  // -- local-client.js's own call(), same backend runPlanWithTools() (local-tool-client.js)
+  // always uses for local-agentic-draft.js's own tier, regardless of any tier/override
+  // routing that exists for other purposes entirely.
+  const resolvedLocalCall = localCall || require('./local-client.js').call;
+
+  let planResult;
+  try {
+    planResult = await resolvedLocalCall({ prompt: adhocHarnessSearchPlanPrompt(task), think: true, temperature: 0.4, numPredict: 800, source: task.source });
+  } catch (e) {
+    return { applied: false, succeeded: true, reason: `plan call failed: ${e.message}` };
+  }
+  if (!planResult || planResult.degenerate) {
+    return { applied: false, succeeded: true, reason: 'plan pass degenerate or empty' };
+  }
+
+  const queries = extractQueries(planResult.response);
+  let hits = [];
+  let files = [];
+  if (queries.length > 0) {
+    try {
+      const result = archImportFetch(queries);
+      hits = result.hits || [];
+      files = result.files || [];
+    } catch (e) {
+      // Non-fatal -- same try/catch treatment pipeline_self_audit's own harness-search
+      // branch gives (local-draft.js): implement proceeds with no hits, its own prompt
+      // already handles that as "insufficient grounding."
+    }
+  }
+
+  // No real matches at all -- this tier genuinely cannot confidently ground anything.
+  // Deliberately does NOT call the implement model at all in this case (unlike
+  // pipeline_self_audit/arch_import, which still ask their implement pass to look at an
+  // empty-hits result and decide) -- an adhoc task's wording is far less constrained than
+  // a pre-vetted cluster/candidate, so zero hits is a strong enough signal on its own to
+  // skip straight to the next tier rather than spend a real implement call likely to
+  // either hallucinate or (best case) just say the same "nothing found" thing itself.
+  if (hits.length === 0) {
+    return { applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo' };
+  }
+
+  task.promptContext = task.promptContext || {};
+  task.promptContext.harnessHits = hits;
+  task.promptContext.harnessFiles = files;
+
+  let implResult;
+  try {
+    implResult = await resolvedLocalCall({
+      prompt: adhocHarnessSearchImplementPrompt(task, planResult.response),
+      think: false,
+      temperature: 0.3,
+      numPredict: 2800,
+      allowEmpty: true,
+      source: task.source,
+    });
+  } catch (e) {
+    return { applied: false, succeeded: true, reason: `implement call failed: ${e.message}` };
+  }
+  if (!implResult || implResult.degenerate) {
+    return { applied: false, succeeded: true, reason: 'implement pass degenerate' };
+  }
+
+  const responseText = (implResult.response || '').trim();
+
+  // 2026-08-24, Grimmethy: caught live via a real adhoc task ("show a count of
+  // observability/architecture tasks in the UI") that exhausted both automatic reject-
+  // retries on this exact path, twice, review correctly rejecting it both times for
+  // "does not specify any changes... contradicts the task's request" -- because this
+  // branch was stamping an empty response as a CONFIDENT, TERMINAL no-changes-needed
+  // verdict, directly contradicting what adhocHarnessSearchImplementPrompt's own text
+  // promises the model (prompts.js: "output the empty string... a deeper investigation
+  // pass will take over next" -- NOT "this ends here"). An empty response here means "I
+  // could not confidently ground a change from these hits," the exact same signal as the
+  // zero-hits case just above -- not a reasoned decision that nothing needs to change.
+  // adhoc-agentic-draft.js's real no-changes-needed mechanism (a full explained response
+  // plus an explicit `RESOLUTION: no-changes-needed` marker) is what a genuine, grounded
+  // "nothing to do here" verdict actually looks like in this codebase; a bare empty
+  // string was never that, and treating it as if it were skipped the Claude tier this
+  // exact case exists for, wasting the task's limited automatic-retry budget on a tier
+  // that had already told the model it wasn't confident enough to answer.
+  if (isEffectivelyEmptyResponse(responseText)) {
+    return { applied: false, succeeded: true, reason: 'implement pass found insufficient grounding to confidently draft a change (empty response, per its own prompt\'s contract)' };
+  }
+
+  // A "let me read/check/..." hedge (NON_IMPL_PATTERNS) means the model itself is
+  // signaling it needs more than a few grep queries can ground -- exactly the
+  // "genuinely needs multi-file investigation" case the next tier exists for.
+  if (NON_IMPL_PATTERNS.some((pat) => pat.test(responseText))) {
+    return { applied: false, succeeded: true, reason: 'implement pass signaled it needs deeper investigation than harness-search can ground' };
+  }
+
+  let rawDiff;
+  try {
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: responseText, worktreeSuffix: `harness-${task.id}`,
+    });
+  } catch (e) {
+    // Invalid/inapplicable Group-B JSON -- not confident enough to use; fall through.
+    return { applied: false, succeeded: true, reason: `harness-search draft did not apply cleanly: ${e.message}` };
+  }
+
+  if (!rawDiff) {
+    return { applied: false, succeeded: true, reason: 'harness-search draft produced no net change' };
+  }
+
+  // The diff applies cleanly and is non-empty -- but is it actually the change asked for,
+  // or a token gesture (an ADR instead of the code, an unrequested delete, a forbidden
+  // file)? This cheap tier should not stamp that as `implemented`; decline so the agentic
+  // tiers, which can investigate, take over. See adhoc-diff-sanity.js.
+  const substance = adhocDiffSubstanceProblem(task, rawDiff);
+  if (substance) {
+    return { applied: false, succeeded: true, reason: `harness-search draft is not a real implementation -- ${substance.reason}` };
+  }
+
+  task.adhocResolution = 'implemented';
+  task.rawDiff = rawDiff;
+  task.implementResponse = `Harness-search tier (local model, grounded in ${hits.length} real match(es)).\n\n=== DIFF ===\n${rawDiff}`;
+  task.draftModel = localDraftModelLabel();
+  return { applied: true, succeeded: true };
+}
+```
+
+Problem:
+`draftAdhocViaHarnessSearch` is an async orchestration function that sequentially (or conditionally) drives three distinct sub-operations—`resolvedLocalCall`, `archImportFetch`, and `captureGroupBDiffInWorktree`—and then stitches their results together. Because all three call-sites, their error-handling branches, and the result-combination logic live in a single body, the function's length is driven by the sum of three unrelated concerns rather than by one cohesive transformation. A reader must hold the entire orchestration sequence in working memory to understand which intermediate value feeds which downstream call, and any change to one sub-operation (e.g., adding a retry to `archImportFetch`) forces a diff review across the whole function, increasing the chance of accidentally disturbing the other two paths.
+
+Solution:
+Extract each of the three operational phases into its own clearly-named helper: (1) `resolveLocalCallForDraft` wrapping the `resolvedLocalCall` invocation plus its local error/normalisation logic; (2) `fetchArchImportForDraft` wrapping `archImportFetch` and any shape-mapping of the fetched payload; (3) `captureWorktreeDiffForDraft` wrapping `captureGroupBDiffInWorktree` and the diff normalisation. The remaining `draftAdhocViaHarnessSearch` body then becomes a short sequential (or parallel, if the calls are independent) pipeline that calls the three helpers, combines their return values, and returns the final draft result—roughly 10–15 lines of pure orchestration with no inline operational detail.
+
+Benefits:
+Each helper can be unit-tested in isolation by mocking its single external dependency, so a regression in, say, the diff-capture path is caught without exercising the import-fetch path. Code review diffs become scoped to one helper at a time, reducing the surface area a reviewer must validate. The top-level function reads as a table-of-contents of the draft pipeline, making it immediately obvious what the three stages are and in what order they execute, which aids onboarding and future re-ordering (e.g., parallelising independent stages).
