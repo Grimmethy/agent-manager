@@ -29,6 +29,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
 const debriefBundle = require('./debrief-bundle.js');
+const driftFix = require('./drift-fix.js');
 const { buildForensicBundle } = require('./forensic-bundle.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
@@ -1351,6 +1352,9 @@ const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: t
 const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT CAUSE list with a counterfactual per cause, an explicit CONTRAST with the successful sibling tasks, and a RECOMMENDED FOLLOW-UP FIX (or a justified NO CLEAR ROOT CAUSE) -- all grounded in the real evidence and citing real src/ files?';
 const PIPELINE_DEBRIEF_REVIEW_GUIDANCE = 'This is a pipeline_debrief task: the implement draft is DELIBERATELY an advisory prose report -- a What/So-What/Now-What retrospective over a WINDOW of pipeline tasks that already SHIPPED -- not code or a diff. There is nothing to implement here. Judge it on: (1) does WHAT give a factual account grounded in the evidence (not invented task counts or outcomes)? (2) does SO WHAT name a real, evidence-cited pattern, not a generic platitude ("communication is important")? (3) does the SURVIVORSHIP-BIAS CHECK actually engage with the contrast tasks named in the evidence (or explicitly note there were none) rather than skip straight to celebrating the wins? (4) is NOW WHAT at most 2-3 concrete, bounded recommendations naming a real src/ file from the harness hits or the evidence\'s TIER -> SOURCE FILE map -- not an invented module name, and not a sprawling wish list? "NO CONFIDENT PATTERN" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a task/history entry says something the record does not), it skips the survivorship-bias check entirely when contrast tasks were provided, or NOW WHAT is vague/unbounded with no real file cited.';
 const PIPELINE_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain all four sections (WHAT, SO WHAT, SURVIVORSHIP-BIAS CHECK, NOW WHAT) or a justified NO CONFIDENT PATTERN, with NOW WHAT (if present) bounded to 2-3 items each citing a real src/ file -- all grounded in the real evidence rather than invented?';
+
+const DOC_DRIFT_FIX_REVIEW_GUIDANCE = 'This is a doc_drift_fix task: a deterministic scan (drift-scan.js) found a static doc list out of sync with a live registry, and the evidence already gives the drafter every fact it needs -- the exact missing/stale names, the REAL priority number for each missing one (never guessed), the real current table rows to insert after, and any stale row\'s exact text to remove. Judge it as a small, mechanical edit, not a judgment call: (1) does it add ONE new row for every name in missingFromStatic, with the EXACT given priority number, and nothing else; (2) does it remove ONLY the exact stale rows given, verbatim; (3) does each new row\'s description come from the real fetched code shown (the harness hits/files), not invented behavior; (4) does it leave every OTHER row and all other content in the file completely untouched. Reject a draft that touches any row not named in missingFromStatic/staleInStatic, that uses a priority number different from the one given, that invents a description not grounded in the real fetched code, or that reformats/reorders existing rows beyond the specific add/remove asked for. An empty draft, or a "FALSE POSITIVE" claim, is NOT a valid "nothing to do" here -- the evidence already guarantees a real, fixable gap exists (drift-scan.js only flags a pair when it found a genuine difference); reject either and let it redraft.';
+const DOC_DRIFT_FIX_COMPLETENESS_QUESTION = 'Does the diff add exactly the rows named in missingFromStatic (with the given priority, grounded description) and remove exactly the rows named in staleInStatic, touching nothing else in the file?';
 const PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE = 'This task implements a human-CONFIRMED pipeline-fix candidate produced by a pipeline_forensics root-cause study (its full ranked report is in the candidate body). The change edits THIS pipeline\'s own src/. Judge it as a normal code change: does the diff actually do what the candidate\'s Solution describes, does it stay within the candidate\'s Files: line, and does it include (or make trivially checkable) the acceptance check the candidate named? Reject a diff that re-implements the ORIGINAL failed feature instead of fixing the pipeline mechanism, that is scoped far wider than the candidate, or that lands with no test/acceptance evidence for a behavioural change. An empty draft is NOT a valid "nothing to do" here -- it means the fix could not be produced.';
 
 // The PLAN section of an adhoc task is drafted blind, before investigation -- this guarantee
@@ -1846,6 +1850,79 @@ function markPipelineDebriefReported(task) {
   fs.writeFileSync(debriefCoveragePath, JSON.stringify({ lastDebriefedAt: windowEnd, taskId: task.id, reportedAt: new Date().toISOString() }, null, 2));
 }
 
+// doc_drift_fix (2026-09-06, "Project Documentation" concept -- see drift-fix.js's own
+// header for the full incident). drift-scan.js already runs every watchdog tick and
+// writes queue/drift-flags.json, but nothing ever consumed it into a real fix -- this
+// closes that loop. Deliberately reads the ALREADY-WRITTEN flags file rather than
+// re-running drift-scan.js itself (cheap, avoids a redundant subprocess spawn on every
+// worker's own generator tick; the watchdog's own tick keeps the file fresh to within
+// its own cadence, same "read what the periodic scanner already wrote" shape
+// nextPipelineHealthAuditTask/nextUiVisibilityAuditTask already use for their own
+// advisory flags).
+function nextDriftFixTask() {
+  const { pipelineDir, repoRoot, defaultDomain, driftFixCoveragePath } = getConfig();
+
+  const flags = driftFix.readFlags(pipelineDir);
+  const fixable = driftFix.fixableFlags(flags);
+  if (!fixable.length) return null;
+
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(driftFixCoveragePath) || '{}'); } catch { coverage = {}; }
+
+  for (const flag of fixable) {
+    const signature = driftFix.signatureFor(flag);
+    if (coverage[signature]) continue; // this exact gap-state already has a task filed
+
+    const evidence = driftFix.buildFixEvidence(repoRoot, flag);
+    if (!evidence) continue; // pair definition or file moved on since the flag was written -- skip, don't guess
+
+    // Real, deterministic priority values straight from the live registry -- never
+    // something the drafting model has to guess or verify itself.
+    const registered = getRegisteredSources();
+    const priorities = {};
+    for (const name of flag.missingFromStatic || []) {
+      const reg = registered.find((s) => s.name === name);
+      if (reg) priorities[name] = reg.priority;
+    }
+
+    const id = `doc-drift-fix-${slugifyForId(signature).slice(0, 90)}`;
+    if (taskIdExistsInQueue(id)) continue;
+
+    return {
+      id,
+      domain: defaultDomain,
+      source: 'doc_drift_fix',
+      title: `Fix documentation drift: ${flag.label}`.slice(0, 140),
+      promptContext: {
+        label: flag.label,
+        staticFile: evidence.staticFile,
+        missingFromStatic: flag.missingFromStatic || [],
+        staleInStatic: flag.staleInStatic || [],
+        priorities,
+        insertAfter: evidence.insertAfter,
+        staleRows: evidence.staleRows,
+        signature,
+      },
+    };
+  }
+  return null;
+}
+
+// Called once from the CLI, only after writeTask() persists a doc_drift_fix task --
+// coverage is keyed on the exact gap-state signature (drift-fix.js's own signatureFor),
+// which can never recur once genuinely fixed, so this is a "report once, forever" cover,
+// same discipline as pipeline_self_audit's own signature coverage.
+function markDriftFixReported(task) {
+  const { driftFixCoveragePath } = getConfig();
+  const signature = task.promptContext && task.promptContext.signature;
+  if (!signature) return;
+  let coverage;
+  try { coverage = JSON.parse(readIfExists(driftFixCoveragePath) || '{}'); } catch { coverage = {}; }
+  coverage[signature] = { reportedAt: new Date().toISOString(), taskId: task.id };
+  fs.mkdirSync(path.dirname(driftFixCoveragePath), { recursive: true });
+  fs.writeFileSync(driftFixCoveragePath, JSON.stringify(coverage, null, 2));
+}
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header for the full design):
 // per-task counterpart to nextPipelineSelfAuditTask() right above -- reads queue/blocked/
 // and queue/needs-clarification/ fresh every call (same "no persistent flags file that
@@ -2000,6 +2077,25 @@ registerTaskSource('pipeline_debrief', {
   reportClass: 'housekeeping',
   reviewGuidance: PIPELINE_DEBRIEF_REVIEW_GUIDANCE,
   reviewCompletenessQuestion: PIPELINE_DEBRIEF_COMPLETENESS_QUESTION,
+});
+// doc_drift_fix (2026-09-06, "Project Documentation" concept -- see drift-fix.js's own
+// header). Priority 68: real, if low-urgency, value -- a doc actively claiming
+// completeness ("the rows below are every registered source") while silently missing 6
+// real ones is worse than no table at all, but it's still housekeeping, not a code fix,
+// so it sits below the candidate-fulfillment tier (70-73) and self_audit(65)'s own
+// blocked-task-pattern urgency, well above the large background-generation sources
+// (79-91) that would otherwise crowd it out indefinitely.
+registerTaskSource('doc_drift_fix', {
+  priority: taskPriority('doc_drift_fix', 68),
+  next: nextDriftFixTask,
+  // NOT emptyApproval: drift-fix.js's own fixableFlags() already guarantees a real,
+  // concrete gap (a real missing/stale name list) before this ever mints a task, so an
+  // empty draft means the model failed to act on evidence already handed to it.
+  harnessSearch: 'archImport',
+  reasoningTier: 'low',
+  reportClass: 'housekeeping',
+  reviewGuidance: DOC_DRIFT_FIX_REVIEW_GUIDANCE,
+  reviewCompletenessQuestion: DOC_DRIFT_FIX_COMPLETENESS_QUESTION,
 });
 // Priority 90, just under staleness_audit(91) -- an operational incident (today's real
 // example: every draft of one task type silently failing outright) can be actively
@@ -2421,6 +2517,7 @@ module.exports = {
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
   nextPipelineDebriefTask, markPipelineDebriefReported,
+  nextDriftFixTask, markDriftFixReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
@@ -2727,6 +2824,7 @@ if (require.main === module) {
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.source === 'pipeline_forensics') markPipelineForensicsReported(task);
       if (task.source === 'pipeline_debrief') markPipelineDebriefReported(task);
+      if (task.source === 'doc_drift_fix') markDriftFixReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();
       if (task.source === 'staleness_audit') markStalenessAuditReported(task);

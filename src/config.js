@@ -183,6 +183,15 @@ function getConfig() {
   // changeReviewCursorPath's commit walk.
   const debriefCoveragePath = process.env.AGENT_MANAGER_DEBRIEF_COVERAGE_PATH
     || path.join(pipelineDir, 'debrief-coverage.json');
+  // doc_drift_fix (2026-09-06, "Project Documentation" concept -- drift-scan.js already
+  // detected README.md's task-source table silently missing 6 real registered sources,
+  // correctly, every tick, but nothing ever turned that detection into a fix; a human had
+  // to notice queue/drift-flags.json or the watchdog log line themselves). Keyed by the
+  // exact flagged gap-state (label + sorted missing/stale names, see drift-fix.js's own
+  // signatureFor), not a timestamp -- a signature is unique to a real drift state and can
+  // never recur once actually fixed (the next scan would show a different, smaller gap).
+  const driftFixCoveragePath = process.env.AGENT_MANAGER_DRIFT_FIX_COVERAGE_PATH
+    || path.join(pipelineDir, 'drift-fix-coverage.json');
   // change_review (agent-manager-hygiene, 2026-09-04) -- diff-scoped correctness review of
   // each unit merged to the main branch. Confirmed regressions land here as `### AC-NNN`
   // candidates (same format as PIPELINE_FIX_CANDIDATES.md) and change_review_fix turns them
@@ -327,6 +336,7 @@ function getConfig() {
     forensicsCoveragePath,
     pipelineFixCandidatesPath,
     debriefCoveragePath,
+    driftFixCoveragePath,
     changeReviewCandidatesPath, changeReviewCursorPath,
     jobTypeCountersPath,
     performanceCoveragePath,
