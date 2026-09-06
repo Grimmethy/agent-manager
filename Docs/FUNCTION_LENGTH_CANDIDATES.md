@@ -5066,3 +5066,135 @@ Extract two clearly-named helpers from inside `runDraftPasses`: (1) `selectPassS
 
 Benefits:
 A reviewer can verify the pass-selection policy in `selectPassSequence` without being distracted by state-threading details, and vice-versa. Unit tests can target the selection logic (given a draft state, which passes fire?) and the threading logic (given a pass list and a failure at step N, what does the state look like?) independently, rather than exercising the full orchestrator for every edge case. Future additions—say a new pass between implement and critique—become a one-line change in the selection list rather than a re-threading of the entire inline body.
+
+### AC-47 · runPlanPass conflates tool-access setup, re-roll/seed-fallback, and harness search
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+// after emitting the 'blocked' event -- when the plan pass produced no usable plan (and no
+// prior plan to fall back on), else { blocked: false }.
+async function runPlanPass(task, {
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
+}) {
+  // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
+  // trial lookup): researchPlanPrompt's own header used to call the research plan pass
+  // "intentionally throwaway" and never gave it tool access -- so it could (and did)
+  // invent a plausible-looking-but-fake registry ID and site with nothing to check it
+  // against, before any real research had happened. That fabrication then leaked into
+  // review as if it were a verified requirement (buildVerdictPrompt hands the reviewer
+  // task.planResponse directly), and three straight implement attempts got rejected for
+  // "failing" to reproduce a record that never existed. Same class of fix as
+  // draftResearchImplement's own WebSearch/WebFetch grant: give the PLAN pass real tool
+  // access too, for research_task only, so any specific fact-like claim it makes (an
+  // ID, a date, a site) has actually been looked up, not guessed. Scoped narrowly to
+  // task.domain === 'research' -- every other source's plan pass is unaffected, kept as
+  // a plain no-tool completion exactly as before.
+  const researchPlanTools = task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
+  // arch_discovery / arch_import are GENERATORS registered emptyApproval:true -- their
+  // own plan prompt explicitly invites "found nothing" as the correct answer, and an
+  // empty implement already auto-approves as "no candidates -- nothing to apply". An
+  // empty PLAN is just the terser form of that same conclusion. Confirmed live:
+  // arch-discovery-community-11 (src/gpu-guard.js + its test, a clean well-documented
+  // utility with no real architectural friction) blocked TWICE on "Plan pass
+  // degenerate: empty", while community-10 -- same no-friction outcome -- only passed
+  // because its model happened to write a 646-char "nothing found" paragraph before
+  // the (also-empty) implement pass carried it to the auto-approve path. Without this,
+  // every clean community is a coin-flip between those two fates. Candidate-
+  // FULFILLMENT sources (arch_review, observability_fix, ...) are excluded: they have a
+  // specific candidate to implement, so an empty plan there is a genuine model failure.
+  // advisoryProse sources (pipeline_forensics, staleness_audit, observability_review, ...)
+  // produce a prose report/verdict, not a code diff -- the plan pass's QUERY-line output is
+  // supplementary grounding, never a required artifact, and critique is already skipped for
+  // them (runCritiqueAndRevision). An empty plan roll must not block the whole draft:
+  // confirmed live 2026-09-01, the pipeline_forensics study of the "empty-degenerate-draft"
+  // signature blocked at "Plan pass degenerate: empty" -- a 1400-token plan budget spent on
+  // the think trace against a 26KB evidence prompt -- so the report pass (which PR #64 gave
+  // a real 16K budget) never ran at all. Let it fall through to implement, same as the
+  // emptyApproval generators below.
+  const allowEmptyPlan = (isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source))
+    || isAdvisoryProseSource(resolveSourceName(task));
+  // Fix 1/2 (2026-08-31, bra-1788142124203): for adhoc tasks, gate the plan on real
+  // substance and, when a prior attempt on this same task already produced a good plan,
+  // seed the pass with it rather than cold-roll every retry. Scoped to adhoc -- the
+  // domain the incident lives in; other sources' plan passes are unchanged. Never blocks
+  // on its own: a thin plan with no prior plan to fall back on still proceeds (with a
+  // note), exactly as before -- the implement tiers, not this gate, decide feasibility.
+  const substanceGated = resolveSourceName(task) === 'adhoc';
+  const seedPlan = substanceGated ? bestPriorPlan(task) : null;
+
+  if (seedPlan) task._seedPlan = seedPlan;
+  const planPrompt = buildPlanPrompt(task);
+  delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
+
+  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, ...researchPlanTools }), 'plan');
+  const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
+
+  let planResult = await callPlan();
+  let totalAttempts = planResult.attempts || 1;
+  let reRolled = false;
+  if (substanceGated && !planResult.degenerate && planIsThin(planResult.response)) {
+    // One thin (but not degenerate) roll -- give it exactly one more, then keep whichever
+    // of the two rolls carries more content.
+    reRolled = true;
+    const reRoll = await callPlan();
+    totalAttempts += reRoll.attempts || 1;
+    if (planLen(reRoll) > planLen(planResult)) planResult = reRoll;
+  }
+
+  if (planResult.degenerate) {
+    const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
+    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: totalAttempts });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    return { blocked: true, blockedReason };
+  }
+
+  const stillThin = substanceGated && planIsThin(planResult.response);
+
+  if (stillThin && seedPlan) {
+    // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
+    // than hand the implement tiers a stub with no map.
+    task.planResponse = seedPlan;
+    task.lastGoodPlan = seedPlan;
+    recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
+    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
+  } else {
+    task.planResponse = planResult.response;
+    // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
+    // it -- it is the seed source for any later retry). Never store a thin one.
+    if (!stillThin) task.lastGoodPlan = planResult.response;
+    recordPlan(attempt, {
+      text: planResult.response,
+      attempts: totalAttempts,
+      ...(reRolled ? { reRolled: true } : {}),
+      ...(seedPlan ? { seededFromPrior: true } : {}),
+      ...(stillThin ? { thin: true } : {}),
+    });
+    const notes = [
+      seedPlan ? 'seeded from a prior plan' : null,
+      reRolled ? 're-rolled once' : null,
+      stillThin ? 'still thin, no prior plan to fall back on' : null,
+    ].filter(Boolean);
+    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), ${task.planResponse.length} chars${notes.length ? `, ${notes.join(', ')}` : ''}`);
+  }
+
+  // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a
+  // real search harness and hand the hits to implement. Which harness (if any) is
+  // declared per source via `harnessSearch` on its registration -- see runHarnessSearch
+  // above. Replaces the per-source branches this used to be (project_search,
+  // arch_import, pipeline_self_audit, pipeline_health_audit, ui_visibility_audit,
+  // staleness_audit).
+  const harnessKind = getRegisteredSource(resolveSourceName(task))?.harnessSearch;
+  if (harnessKind) {
+    await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch });
+  }
+```
+
+Problem:
+`runPlanPass` bundles at least three distinct responsibilities into a single body: (1) establishing plan-pass tool access, (2) the substance-gated re-roll and seed-fallback loop (`substanceGated` → `seedPlan` → `stillThin` retry), and (3) harness search. The degenerate-plan early-exit (`if (planResult.degenerate) { … return { blocked: true, blockedReason }; }`) is a single inline guard that is fine where it sits, but the multi-step re-roll/seed-fallback sequence that surrounds it is a self-contained "try again with a seed" concern that is interleaved with tool-access setup and search logic. Because these concerns share one scope, a change to the seed-fallback retry policy forces the reader to re-orient through the tool-access and search code, and vice-versa; the function's length is not incidental padding but the sum of three logically independent workflows.
+
+Solution:
+Extract the re-roll/seed-fallback loop into a helper such as `attemptSeedReroll(planResult, substanceGated, stillThin)` that owns the `substanceGated`/`seedPlan`/`stillThin` retry cycle and returns either a usable plan or a "still thin" signal. Extract the harness-search step into `resolveHarnessSearch(planContext)` so the search parameters and result-shaping live in one place. Leave the degenerate-plan guard inline in `runPlanPass` (it is a single early-return branch tightly coupled to the surrounding flow). The remaining `runPlanPass` body then reads as a short orchestration: set up tool access → check degenerate → call `attemptSeedReroll` → call `resolveHarnessSearch` → assemble the return object.
+
+Benefits:
+Each extracted helper has a single, nameable responsibility, so a reviewer can validate the seed-fallback retry policy without scanning tool-access boilerplate, and a change to harness-search parameters does not require re-reading the re-roll logic. Unit tests can target `attemptSeedReroll` with synthetic `planResult`/`substanceGated`/`stillThin` inputs in isolation, and `resolveHarnessSearch` can be tested against mock search fixtures, rather than constructing the full `runPlanPass` context for every case. The top-level function shrinks to a readable orchestration skeleton, reducing the cognitive load when onboarding or auditing the plan-pass path.
