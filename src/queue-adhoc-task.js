@@ -10,6 +10,19 @@ function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
 }
 
+// Port of app.py's default_task_domain() (2026-09-06): picking the first key in
+// task-domains.json with no regard for whether it's a sane generic default is what once
+// queued two real tasks with domain='adhoc' into a project whose task-domains.json
+// didn't even list 'adhoc', permanently blocking them with "Unknown task domain: adhoc".
+// Tries 'default' then 'adhoc' first, only falling back to the first key if a project
+// defines neither.
+function defaultTaskDomain(validDomains) {
+  for (const candidate of ['default', 'adhoc']) {
+    if (validDomains.includes(candidate)) return candidate;
+  }
+  return validDomains[0];
+}
+
 // Extracted (2026-09-06) so callers other than this CLI -- e.g. Chat's
 // queue_reviewed_task tool in local-tool-client.js, handing off a risky git action
 // instead of executing it directly -- can queue a real adhoc task without shelling out
@@ -20,7 +33,7 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn }, { pipelineD
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
   const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
-  const resolvedDomain = domain || validDomains[0];
+  const resolvedDomain = domain || defaultTaskDomain(validDomains);
   if (!validDomains.includes(resolvedDomain)) {
     throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
   }
@@ -88,4 +101,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { queueAdhocTask, slugify };
+module.exports = { queueAdhocTask, slugify, defaultTaskDomain };
