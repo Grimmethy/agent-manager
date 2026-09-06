@@ -1212,6 +1212,68 @@ test('markPipelineSelfAuditReported writes coverage only when explicitly called,
   assert.equal(next, null);
 });
 
+// pipeline_debrief (2026-09-06, "The Debrief" concept) ---------------------------------
+
+function writeDoneTaskForDebrief(dir, id, atIso, source = 'adhoc') {
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', `${id}.json`), JSON.stringify({
+    id, source, domain: 'adhoc',
+    promptContext: { rawText: 'do a thing' },
+    mergedAt: atIso,
+    history: [{ stage: 'created', at: atIso }, { stage: 'applied', at: atIso }],
+  }));
+}
+
+function freshTaskSourcesForDebrief(repoRoot) {
+  delete require.cache[require.resolve('./debrief-bundle.js')];
+  return freshTaskSources(repoRoot);
+}
+
+test('nextPipelineDebriefTask returns null below MIN_WINDOW_TASKS and a real task once the window fills', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-debrief-test-'));
+  const { MIN_WINDOW_TASKS } = require('./debrief-bundle.js');
+  for (let i = 0; i < MIN_WINDOW_TASKS - 1; i++) {
+    writeDoneTaskForDebrief(dir, `done-${i}`, `2026-09-0${1 + (i % 8)}T0${i % 8}:00:00Z`);
+  }
+  const { nextPipelineDebriefTask } = freshTaskSourcesForDebrief(dir);
+  assert.equal(nextPipelineDebriefTask(), null);
+
+  writeDoneTaskForDebrief(dir, 'done-extra', '2026-09-08T09:00:00Z');
+  const task = nextPipelineDebriefTask();
+  assert.ok(task);
+  assert.equal(task.source, 'pipeline_debrief');
+  assert.equal(task.promptContext.taskIds.length, MIN_WINDOW_TASKS);
+  assert.ok(task.promptContext.evidenceText.includes('PIPELINE DEBRIEF'));
+});
+
+test('markPipelineDebriefReported advances the cursor so the next call never re-selects this window\'s tasks', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-debrief-test-'));
+  const { MIN_WINDOW_TASKS } = require('./debrief-bundle.js');
+  for (let i = 0; i < MIN_WINDOW_TASKS; i++) {
+    writeDoneTaskForDebrief(dir, `first-${i}`, `2026-09-0${1 + (i % 8)}T0${i % 8}:00:00Z`);
+  }
+  const { nextPipelineDebriefTask, markPipelineDebriefReported } = freshTaskSourcesForDebrief(dir);
+  const first = nextPipelineDebriefTask();
+  assert.ok(first);
+  markPipelineDebriefReported(first);
+
+  const coveragePath = path.join(dir, 'debrief-coverage.json');
+  assert.ok(fs.existsSync(coveragePath));
+  const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  assert.equal(coverage.lastDebriefedAt, first.promptContext.windowEnd);
+
+  // Same window, nothing new past the cursor -- not due again.
+  assert.equal(nextPipelineDebriefTask(), null);
+
+  // A fresh batch past the cursor is a genuinely new window.
+  for (let i = 0; i < MIN_WINDOW_TASKS; i++) {
+    writeDoneTaskForDebrief(dir, `second-${i}`, `2026-09-2${i % 8}T0${i % 8}:00:00Z`);
+  }
+  const second = nextPipelineDebriefTask();
+  assert.ok(second);
+  assert.ok(second.promptContext.taskIds.every((id) => id.startsWith('second-')), 'must not re-include the already-covered first window');
+});
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header): per-task counterpart
 // to pipeline_self_audit right above -- same coverage-timing discipline (a pure read,
 // coverage written only by markStalenessAuditReported() after writeTask() persists it).

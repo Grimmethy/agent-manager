@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  archiveDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket,
+  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket,
 } = require('./done-archive.js');
 
 function makePipelineDir() {
@@ -195,4 +195,42 @@ test('archiveDoneTasks reports (not throws) when queue/done/ does not exist yet'
   const result = archiveDoneTasks({ pipelineDir, now: Date.now() });
   assert.equal(result.moved, 0);
   assert.ok(result.errors.length > 0);
+});
+
+// archiveSpecificDoneTasks (pipeline_debrief, 2026-09-06) -------------------------------
+
+test('archiveSpecificDoneTasks moves exactly the given ids into the current month bucket, regardless of mtime', () => {
+  const pipelineDir = makePipelineDir();
+  const now = Date.now();
+  writeDoneTask(pipelineDir, 'fresh-1', { mtimeMs: now }); // would NOT qualify for the time-based pass
+  writeDoneTask(pipelineDir, 'fresh-2', { mtimeMs: now });
+  writeDoneTask(pipelineDir, 'left-behind', { mtimeMs: now });
+
+  const result = archiveSpecificDoneTasks({ pipelineDir, taskIds: ['fresh-1', 'fresh-2'], now });
+  assert.equal(result.moved, 2);
+  assert.equal(result.missing, 0);
+  assert.deepEqual(result.errors, []);
+
+  const bucket = path.join(pipelineDir, 'queue', 'done', '_archived', monthBucket(new Date(now)));
+  assert.ok(fs.existsSync(path.join(bucket, 'fresh-1.json')));
+  assert.ok(fs.existsSync(path.join(bucket, 'fresh-2.json')));
+  assert.ok(fs.existsSync(path.join(pipelineDir, 'queue', 'done', 'left-behind.json')), 'a task not named in taskIds must stay in done/');
+});
+
+test('archiveSpecificDoneTasks reports an id already gone from done/ top level as missing, not an error', () => {
+  const pipelineDir = makePipelineDir();
+  const result = archiveSpecificDoneTasks({ pipelineDir, taskIds: ['never-existed'], now: Date.now() });
+  assert.equal(result.moved, 0);
+  assert.equal(result.missing, 1);
+  assert.deepEqual(result.errors, []);
+});
+
+test('archiveSpecificDoneTasks lands in the SAME bucket location listArchivedMonthDirs already knows about', () => {
+  const pipelineDir = makePipelineDir();
+  const now = Date.now();
+  writeDoneTask(pipelineDir, 'd1', { mtimeMs: now });
+  archiveSpecificDoneTasks({ pipelineDir, taskIds: ['d1'], now });
+  const dirs = listArchivedMonthDirs(pipelineDir);
+  assert.equal(dirs.length, 1);
+  assert.ok(fs.existsSync(path.join(dirs[0], 'd1.json')));
 });

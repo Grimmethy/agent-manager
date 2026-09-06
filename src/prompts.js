@@ -1044,6 +1044,89 @@ function pipelineForensicsImplementPrompt(task, planText) {
   return assemblePrompt(stable, volatile);
 }
 
+// pipeline_debrief (2026-09-06, "The Debrief" concept -- Grimmethy: "A whole phase where we
+// go through actually completed work to analyze for patterns that can make it more
+// efficient in the future... what happened (the What), why it happened (the So What) and
+// what should happen in the future (the Now What)."). Same two-call harness shape as
+// pipelineForensics* right above: the plan pass proposes greps to locate the pipeline code
+// implicated by the window's own evidence (a Now-What that names real code needs to see the
+// CURRENT code, not remembered names), the harness runs them against this repo's own src/,
+// and the implement pass writes the report. debrief-bundle.js's evidence (a bounded window
+// of queue/done/ tasks that SHIPPED, plus a survivorship-bias contrast set of still-stuck
+// siblings) is already in ctx.evidenceText.
+function pipelineDebriefPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'A deterministic scan assembled the debrief evidence below: a window of pipeline tasks that SHIPPED, plus a contrast set of still-stuck siblings. Your eventual job is a What / So What / Now What report -- but first, locate the real pipeline code your Now What recommendations would need to name.',
+    '',
+    ctx.evidenceText || '(no evidence text)',
+    '',
+    'Propose 1 to 3 SHORT search terms (a function name, a file name, a config key, or a few-word phrase) that would let you read the CURRENT code of the pipeline paths implicated above -- use the TIER -> SOURCE FILE map in the evidence to pick real targets (e.g. the tier most of the window\'s tasks passed through, or a mechanism a contrast task\'s history shows it never reached).',
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function pipelineDebriefImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- the searches found nothing new in this repo; work from the evidence alone)';
+  const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+
+  const stable = [
+    'You are running a pipeline DEBRIEF: a structured retrospective over work that already SHIPPED, so the pipeline can get more efficient. This is analysis, not a code change -- output prose, never a diff.',
+    '',
+    'METHOD -- What / So What / Now What, exactly as named:',
+    '1. WHAT: state plainly what this batch of completed work was -- which sources, roughly how many tasks, what shape (fast/clean vs. many attempts/expensive), grounded ONLY in the evidence below.',
+    '2. SO WHAT: name the real pattern behind it. A plan/implement shape that correlated with a fast accept? A source that is consistently cheap or consistently costly? A step that burned turns/tokens without changing the outcome? Cite the specific evidence (task id, history stage, model_calls row) for every claim.',
+    '3. SURVIVORSHIP-BIAS CHECK: for every SO WHAT pattern, check it against the CONTRAST tasks (same sources, still stuck). If a contrast task ALSO shows the pattern you are crediting, say so -- it is not the real cause. If there are no contrast tasks, say plainly that the pattern is unconfirmed.',
+    '4. NOW WHAT: at most 2-3 concrete, BOUNDED recommendations, each naming a real src/ file or config this pipeline already has (from the harness matches below or the evidence\'s own TIER -> SOURCE FILE map -- never an invented name). A vague or open-ended list is worse than a short, specific one.',
+    '',
+    'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CONFIDENT PATTERN" if the evidence genuinely does not support one:',
+    '',
+    'WHAT',
+    '<factual account of this batch, grounded in the evidence>',
+    '',
+    'SO WHAT',
+    '<the real pattern, with cited evidence per claim>',
+    '',
+    'SURVIVORSHIP-BIAS CHECK',
+    '<did the contrast tasks share this pattern? if so, say the pattern is not confirmed; if there were no contrast tasks, say so>',
+    '',
+    'NOW WHAT',
+    '1. <concrete, bounded change> -- Files: src/<file>. Why: <one sentence tying it back to SO WHAT>.',
+    '2. <...>',
+    '',
+    'If instead the evidence does not support a confident pattern, output ONLY:',
+    'NO CONFIDENT PATTERN -- <the one additional signal that would be needed>',
+  ];
+  const volatile = [
+    'Earlier you proposed search terms to locate the implicated pipeline code:',
+    '',
+    planText,
+    '',
+    'DEBRIEF EVIDENCE:',
+    ctx.evidenceText || '(none)',
+    '',
+    `Completed (window) tasks: ${(ctx.taskIds || []).join(', ') || '(see evidence)'}`,
+    `Contrast (still-stuck, same source) tasks: ${(ctx.contrastIds || []).join(', ') || '(none)'}`,
+    '',
+    'The harness ran your searches against THIS repo\'s CURRENT src/. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+  ];
+  return assemblePrompt(stable, volatile);
+}
+
 // adhoc harness-search tier (2026-08-22, Grimmethy: "expand the tooling capabilities so
 // that the local reasoning model can handle the work... I'd like to see the automated
 // work being handled entirely locally"): a FIRST, cheap attempt at an adhoc-domain task
@@ -1562,6 +1645,7 @@ updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAudit
 updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('pipeline_forensics', { buildPlanPrompt: pipelineForensicsPlanPrompt, buildImplementPrompt: pipelineForensicsImplementPrompt });
+updateTaskSource('pipeline_debrief', { buildPlanPrompt: pipelineDebriefPlanPrompt, buildImplementPrompt: pipelineDebriefImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('product_spec_outline', { buildPlanPrompt: productSpecOutlinePlanPrompt, buildImplementPrompt: productSpecOutlineImplementPrompt });
 updateTaskSource('product_spec_section', { buildPlanPrompt: productSpecSectionPlanPrompt, buildImplementPrompt: productSpecSectionImplementPrompt });
@@ -1674,6 +1758,7 @@ module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
+  pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
   // Bodies stay here; archReview{Plan,Implement}Prompt also stay wired below for core
