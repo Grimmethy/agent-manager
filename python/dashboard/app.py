@@ -2420,8 +2420,18 @@ def api_task_requeue(state, task_id):
     anything was wrong until the wiring step later found the branch missing pieces.
     `dependsOn` (also file-decompose-to-hub.js, and consumed by nextAdhocTask's/
     coordinator-sweep.js's dependency gate) is the identical shape -- a top-level field a
-    generic reset has no way to know matters. Both preserved explicitly now, when present,
-    rather than trusting this allowlist to anticipate every future coordination field.
+    generic reset has no way to know matters.
+
+    2026-09-06, same requeue, second field: `atomic` (also file-decompose-to-hub.js) was
+    STILL being dropped by this same allowlist gap even after the stacked/dependsOn fix
+    above -- confirmed live, the requeued sub-task's own local-draft.js pre-split check
+    (`!task.atomic`, the guard that exists specifically because "a file-decompose child IS
+    the output of a decomposition; re-splitting it loops") saw `atomic: undefined` and let
+    the model try to decompose it AGAIN, producing a malformed 2-piece split and blocking a
+    second time. `noDecompose` (set alongside `atomic` by the same code, currently unread
+    elsewhere but the same coordination-field shape) is preserved too rather than assuming
+    it stays unused forever. All four preserved explicitly now, when present, rather than
+    trusting this allowlist to anticipate every future coordination field one at a time.
 
     'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
     api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
@@ -2491,6 +2501,10 @@ def api_task_requeue(state, task_id):
         fresh["stacked"] = data["stacked"]
     if "dependsOn" in data:
         fresh["dependsOn"] = data["dependsOn"]
+    if "atomic" in data:
+        fresh["atomic"] = data["atomic"]
+    if "noDecompose" in data:
+        fresh["noDecompose"] = data["noDecompose"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     return jsonify({"id": task_id, "requeued": True})
