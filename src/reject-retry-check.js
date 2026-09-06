@@ -29,6 +29,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
 
@@ -66,40 +67,12 @@ function isAdhocTask(task) {
   return task.domain === 'adhoc' || task.source === 'manual';
 }
 
-// 2026-09-06: root-caused live via pipeline-forensics-fix-ac-8 -- a candidate-fulfillment
-// task whose cited code couldn't be anchor-matched in its target file at all
-// (windowFetchedFileContent, src/sdk/candidate-fulfillment.js, falls back to
-// confidence:'none': an unstructured blind slice of the file, explicitly prefixed
-// "[LOW-CONFIDENCE GROUNDING: no reliable anchor found... may not contain the real
-// target]"). The model correctly refused rather than fabricate an edit against
-// admittedly-unreliable grounding -- but refreshCandidateFetchedFiles() re-derives the
-// SAME deterministic anchor search from the SAME unchanged file on every retry, so a
-// blind requeue can only ever reproduce identical grounding and fail identically. All 3
-// requeue attempts did exactly that before exhausting. Retrying is structurally futile
-// here, not stochastically unlucky -- this must escalate on the FIRST rejection, not
-// after burning 2 more requeues that were never going to differ.
-function hasUnreliableGrounding(task) {
-  const fetchedFiles = task.promptContext && task.promptContext.fetchedFiles;
-  return Array.isArray(fetchedFiles) && fetchedFiles.some((f) => f && f.anchorConfidence === 'none');
-}
-
-function buildUnreliableGroundingQuestion(task) {
-  const fetchedFiles = (task.promptContext && task.promptContext.fetchedFiles) || [];
-  const badFiles = fetchedFiles.filter((f) => f && f.anchorConfidence === 'none').map((f) => f.path).filter(Boolean);
-  return [
-    `The grounding-fetch could not find a reliable anchor for this candidate's cited code in `
-      + `${badFiles.join(', ') || 'its target file'} -- every draft attempt sees the same `
-      + 'unstructured, low-confidence file slice (a blind requeue cannot fix this; the anchor '
-      + 'search is deterministic against unchanged file content), so this was escalated after '
-      + 'ONE rejection instead of burning further identical retries.',
-    '',
-    'Likely causes: the candidate\'s own citation of the target code is stale or wrong (check '
-      + 'whether the described code still exists, possibly already fixed by a sibling task), '
-      + 'or the anchor-matching heuristic missed a real match that does exist. If the '
-      + 'underlying issue is already resolved, Archive this task. If the citation is wrong but '
-      + 'the issue is real, re-file the candidate with an accurate code citation.',
-  ].join('\n');
-}
+// 2026-09-06: classification (unreliable-grounding, external-dependency, and every
+// keyword category) moved to src/blocked-task-classifiers.js -- the same registry
+// pipeline-self-audit.js's cluster-reporting now uses, so a category discovered in
+// either mechanism benefits both. See that file's own header for the fault-side
+// research (arXiv 2607.28802) behind treating "would a blind retry reproduce this
+// exact failure?" as the deciding question, not the failure's mere existence.
 
 // On a brain_dump_sort task exhausting its redrafts, bump the originating brain-dump
 // entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
@@ -196,47 +169,45 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       if (!isReviewRejection(task) && !retryableDraftBlock) continue;
 
-      // AC-13b (2026-09-06): a task the AC-13a feasibility gate (local-agentic-write-
-      // draft.js's detectExternalDependency) already stamped external-dependency is
-      // externally-impossible for THIS sandbox, full stop -- no amount of blind
-      // re-queueing into the local-agentic-write tier can ever change that. Skip it here
-      // even if it also carries a stale blockedStage:'review' from an earlier, unrelated
-      // rejection cycle (a realistic sequence: rejected at review, re-queued, then hit the
-      // feasibility gate on the redraft) -- that history must never re-enable the loop
-      // AC-13a exists specifically to close. A single unconditional `continue` here
-      // covers BOTH the under-cap requeue path and the at-cap exhaustion/needs-
-      // clarification escalation below (the source candidate's own spec proposed two
-      // separate guards, one per branch -- unnecessary, since exiting the loop this early
-      // means an external-dependency task can never reach either branch in the first
-      // place, and a second, more specific reason string can never be overwritten by the
-      // generic 'design-decision' one).
-      if (task.needsClarification && task.needsClarification.reason === 'external-dependency') {
-        // summary.checked was already incremented above when this entry was parsed --
-        // the candidate's own spec text called for a second increment here, which would
-        // have double-counted this entry against summary.checked.
-        continue;
-      }
-
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
       // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
       // not be gated by, or count against, the blind-redraft cap.
       const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
 
-      // Unreliable-grounding escalation runs BEFORE the retry-cap check below and
-      // regardless of retryCount -- see hasUnreliableGrounding's own header. A blind
-      // requeue here is not a cheaper first attempt at a possible fix, it is a guaranteed
-      // repeat of the exact same failure, so there is no reason to wait for the cap.
-      if (isReviewRejection(task) && hasUnreliableGrounding(task) && needsClarificationDir) {
-        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
-        if (!alreadyEscalated) {
-          task.needsClarification = { reason: 'unreliable-grounding', openQuestions: buildUnreliableGroundingQuestion(task) };
-          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- grounding anchor-confidence is none, a blind retry cannot differ');
-          fs.mkdirSync(needsClarificationDir, { recursive: true });
-          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
-          fs.unlinkSync(filePath);
-          summary.exhausted++;
-          continue;
+      // A task already carrying ANY needsClarification (e.g. external-dependency,
+      // stamped at DRAFT time by AC-13a; or a design-decision left by some other
+      // mechanism) has already been triaged -- never overwrite or re-decide it, and
+      // never let a stale blockedStage:'review' from an earlier, unrelated rejection
+      // cycle re-enable a blind-retry loop for a task a human is already meant to be
+      // looking at. Generalizes AC-13b's original external-dependency-specific check
+      // (2026-09-06): once ANY prior mechanism flags a needed human decision, nothing
+      // here should ever re-decide it, regardless of which reason string it used.
+      if (task.needsClarification) continue;
+
+      // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
+      // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
+      // unreliable-grounding gate). Runs BEFORE the retry-cap check below and regardless
+      // of retryCount -- a non-retryable classification means retrying would reproduce
+      // the exact same failure, structurally, not stochastically, so there is no reason
+      // to wait for the cap.
+      const classification = classifyBlockedTask(task);
+      if (!classification.retryable) {
+        if (needsClarificationDir) {
+          const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+          if (!alreadyEscalated) {
+            const classifier = findClassifier(classification.classifierName);
+            const openQuestions = classifier && typeof classifier.buildQuestion === 'function'
+              ? classifier.buildQuestion(task)
+              : `Classified as ${classification.category} (${classification.faultSide}-side), which a blind retry cannot fix -- needs a human decision.`;
+            task.needsClarification = { reason: classification.category, openQuestions };
+            appendHistoryEvent(task, 'needs-clarification', `escalated immediately -- ${classification.category} (${classification.faultSide}-side), a blind retry cannot differ`);
+            fs.mkdirSync(needsClarificationDir, { recursive: true });
+            fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+            fs.unlinkSync(filePath);
+            summary.exhausted++;
+            continue;
+          }
         }
       }
 
@@ -369,7 +340,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, hasUnreliableGrounding };
+module.exports = { rejectRetryCheck };
 
 if (require.main === module) {
   main();
