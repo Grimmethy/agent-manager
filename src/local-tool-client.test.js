@@ -371,6 +371,30 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
   }
 }
 
+// --- concept-build self-report (2026-09-06) -------------------------------------------
+
+test('runPlanWithTools does not inject CONCEPT-BUILD when no conceptId is given', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'hi' });
+    assert.doesNotMatch(JSON.stringify(sentBodies[0].messages), /CONCEPT-BUILD/);
+  });
+});
+
+test('runPlanWithTools injects CONCEPT-BUILD and records the tally when conceptId is set', async () => {
+  const { createConcept, loadConcepts, findConcept } = require('./concepts.js');
+  await withMockedChat(
+    [{ role: 'assistant', content: 'Done.\n\nCONCEPT-BUILD: adapted | Based on the SearXNG research finding.' }],
+    async (mod, dir) => {
+      const concept = createConcept({ name: 'Web search capability' }, dir);
+      const result = await mod.runPlanWithTools({ prompt: 'hi', conceptId: concept.id });
+      assert.equal(result.response.includes('CONCEPT-BUILD'), false);
+      assert.match(result.response, /Done\./);
+      const updated = findConcept(loadConcepts(dir), concept.id);
+      assert.equal(updated.adaptedFromResourceCount, 1);
+    },
+  );
+});
+
 test('runPlanWithTools returns the model reply immediately when the first turn has no tool calls', async () => {
   await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'hi' });

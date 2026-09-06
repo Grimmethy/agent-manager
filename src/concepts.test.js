@@ -8,6 +8,7 @@ const path = require('path');
 const {
   loadConcepts, writeConcepts, findConcept, createConcept,
   recordConceptResearch, recordConceptBuildTally, getConceptTimeline,
+  injectConceptBuildInstruction, extractConceptBuildReport,
 } = require('./concepts.js');
 
 function tmpDir() {
@@ -128,4 +129,38 @@ test('getConceptTimeline merges and sorts brain-dump findings and task history b
 test('getConceptTimeline returns an empty list when no collaborators are provided', () => {
   const dir = tmpDir();
   assert.deepEqual(getConceptTimeline(dir, 'concept-x'), []);
+});
+
+test('injectConceptBuildInstruction appends the blurb once and is idempotent', () => {
+  const once = injectConceptBuildInstruction('Do the task.');
+  assert.match(once, /Do the task\./);
+  assert.match(once, /CONCEPT-BUILD:/);
+  const twice = injectConceptBuildInstruction(once);
+  assert.equal(twice, once);
+  assert.equal((twice.match(/CONCEPT-BUILD:/g) || []).length, 1);
+});
+
+test('extractConceptBuildReport pulls the marker out and strips it from cleanText', () => {
+  const text = 'Implemented the fix.\n\nCONCEPT-BUILD: adapted | Based this on SearXNG\'s JSON API design.';
+  const result = extractConceptBuildReport(text);
+  assert.deepEqual(result.report, { kind: 'adapted', detail: "Based this on SearXNG's JSON API design." });
+  assert.doesNotMatch(result.cleanText, /CONCEPT-BUILD/);
+  assert.match(result.cleanText, /Implemented the fix\./);
+});
+
+test('extractConceptBuildReport is a lenient no-op when the marker is absent or malformed', () => {
+  const noMarker = extractConceptBuildReport('Just a normal answer.');
+  assert.equal(noMarker.report, null);
+  assert.equal(noMarker.cleanText, 'Just a normal answer.');
+
+  const badKind = extractConceptBuildReport('Done.\nCONCEPT-BUILD: bogus | some detail');
+  assert.equal(badKind.report, null, 'an invalid kind must not be accepted as a real report');
+
+  const emptyDetail = extractConceptBuildReport('Done.\nCONCEPT-BUILD: scratch | ');
+  assert.equal(emptyDetail.report, null, 'a marker with no real detail must be dropped, not recorded as a hollow report');
+});
+
+test('extractConceptBuildReport accepts either scratch or adapted, case-insensitively', () => {
+  const scratch = extractConceptBuildReport('CONCEPT-BUILD: SCRATCH | wrote this fresh, no external reference');
+  assert.equal(scratch.report.kind, 'scratch');
 });

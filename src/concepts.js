@@ -155,6 +155,41 @@ function getConceptTimeline(pipelineDir, conceptId, { loadBrainDump, listTaskHis
   return rows;
 }
 
+// Self-reported build-vs-borrow tally (Part 4). Same house style as
+// side-finding.js's SIDE-FINDING: marker (one-line, lenient, strip-and-continue), but
+// gated on the CALLER opting a task into it via conceptId -- unlike side-finding, this
+// is not injected into every prompt, only ones a human/assistant explicitly tied to a
+// concept (see AGENTS.md's "Concept research" section for why this stays manual for v1).
+const CONCEPT_BUILD_INSTRUCTION = (
+  'This task is tied to tracked concept work. When you finish, end your response with '
+  + 'one line: CONCEPT-BUILD: scratch|adapted | <one-sentence detail> -- "scratch" if you '
+  + "wrote this from nothing, \"adapted\" if you drew on a specific researched repo or "
+  + 'design option, naming which one in the detail. This is a self-report for an audit '
+  + 'chart, not graded -- be honest, not impressive.'
+);
+
+const CONCEPT_BUILD_MARKER_RE = /^CONCEPT-BUILD:\s*(scratch|adapted)\s*\|\s*(.+)$/im;
+
+function injectConceptBuildInstruction(text) {
+  const base = text || '';
+  if (base.includes('CONCEPT-BUILD:')) return base;
+  return `${base}\n\n${CONCEPT_BUILD_INSTRUCTION}`;
+}
+
+// Returns { cleanText, report: {kind, detail} | null }. Lenient: a missing/malformed
+// marker just means report is null, never thrown -- the real response must never be
+// held hostage by an optional audit tag the model forgot to include.
+function extractConceptBuildReport(text) {
+  const source = text || '';
+  const match = source.match(CONCEPT_BUILD_MARKER_RE);
+  if (!match) return { cleanText: source, report: null };
+  const kind = match[1].toLowerCase();
+  const detail = match[2].trim();
+  const cleanText = source.replace(match[0], '').replace(/\n{3,}/g, '\n\n').trim();
+  if (!detail) return { cleanText, report: null };
+  return { cleanText, report: { kind, detail } };
+}
+
 module.exports = {
   conceptsPath,
   loadConcepts,
@@ -164,4 +199,7 @@ module.exports = {
   recordConceptResearch,
   recordConceptBuildTally,
   getConceptTimeline,
+  CONCEPT_BUILD_INSTRUCTION,
+  injectConceptBuildInstruction,
+  extractConceptBuildReport,
 };
