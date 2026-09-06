@@ -1532,6 +1532,134 @@ test('nextCandidateFulfillmentTask is unaffected (regression) for a candidate wi
   assert.equal(task.id, 'pipeline-forensics-fix-ac-1');
 });
 
+// --- Pre-draft premise recheck (2026-09-06, real incident: AC-4/AC-7) -----------------
+
+function writeNeedsClarificationTask(dir, id, task) {
+  const ncDir = path.join(dir, 'queue', 'needs-clarification');
+  fs.mkdirSync(ncDir, { recursive: true });
+  fs.writeFileSync(path.join(ncDir, `${id}.json`), JSON.stringify({ id, ...task }));
+}
+
+test('nextCandidateFulfillmentTask archives (not drafts) a candidate whose named signature has ZERO live needs-clarification members', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/local-tool-client.js'), 'const x = 1;\n');
+  // The dir exists (a real deployment always has this dir) but is EMPTY -- a genuine
+  // zero-count, distinct from "can't determine" (no dir at all), which the check must
+  // never guess on.
+  fs.mkdirSync(path.join(dir, 'queue', 'needs-clarification'), { recursive: true });
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'STALE.md');
+  fs.writeFileSync(p, [
+    '### AC-4 · Add a wrap-up nudge',
+    'Strength: Strong',
+    'Files: src/local-tool-client.js',
+    '',
+    'Problem:\nWhen the model exhausts its turn budget, it never emits a RESOLUTION line, producing the manual::no-resolution-line signature.',
+    '',
+    'Solution:\nAdd a nudge.',
+    '',
+    'Benefits:\nFewer blocks.',
+  ].join('\n'));
+
+  // No queue/needs-clarification/ tasks at all with this signature -- live count is 0.
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.equal(task, null, 'must not offer a draft -- the candidate is archived instead');
+
+  const archived = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'pipeline-forensics-fix-ac-4.json'), 'utf8'));
+  assert.equal(archived.id, 'pipeline-forensics-fix-ac-4');
+  assert.match(archived.history[archived.history.length - 1].detail, /manual::no-resolution-line/);
+  assert.match(archived.history[archived.history.length - 1].detail, /ZERO live/);
+});
+
+test('nextCandidateFulfillmentTask still offers a candidate whose named signature has a live needs-clarification member', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/local-tool-client.js'), 'const x = 1;\n');
+  writeNeedsClarificationTask(dir, 'still-stuck-1', {
+    source: 'manual',
+    blockedReason: 'Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome',
+    history: [],
+  });
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'LIVE.md');
+  fs.writeFileSync(p, [
+    '### AC-4 · Add a wrap-up nudge',
+    'Strength: Strong',
+    'Files: src/local-tool-client.js',
+    '',
+    'Problem:\nWhen the model exhausts its turn budget, it never emits a RESOLUTION line, producing the manual::no-resolution-line signature.',
+    '',
+    'Solution:\nAdd a nudge.',
+    '',
+    'Benefits:\nFewer blocks.',
+  ].join('\n'));
+
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task, 'the signature still has a live member -- must still be offered for drafting');
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-4');
+});
+
+test('nextCandidateFulfillmentTask is unaffected (regression) for a candidate that names no signature at all', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/a.js'), 'const a = 1;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'NOSIG.md');
+  fs.writeFileSync(p, '### AC-9 · ordinary fix\nStrength: Strong\nFiles: src/a.js\n\nProblem:\np.\n\nSolution:\ns.\n\nBenefits:\nb.');
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task);
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-9');
+});
+
+test('nextCandidateFulfillmentTask archives a candidate that cites a symbol absent from its own cited (real) file content', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/local-draft.js'), 'function draftTask() { return null; }\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'BADCITE.md');
+  fs.writeFileSync(p, [
+    '### AC-7 · Retry once on empty plan',
+    'Strength: Strong',
+    'Files: src/local-draft.js',
+    '',
+    'Problem:\nIn `src/local-draft.js`, the `checkEmptyPlanResponse` function returns immediately without retrying.',
+    '',
+    'Solution:\nAdd a retry.',
+    '',
+    'Benefits:\nFewer blocks.',
+  ].join('\n'));
+
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.equal(task, null, 'checkEmptyPlanResponse does not appear anywhere in the real fetched file content');
+
+  const archived = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'pipeline-forensics-fix-ac-7.json'), 'utf8'));
+  assert.match(archived.history[archived.history.length - 1].detail, /checkEmptyPlanResponse/);
+});
+
+test('nextCandidateFulfillmentTask still offers a candidate whose cited symbol genuinely exists in the real fetched file', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/local-draft.js'), 'function draftTask() { return null; }\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'GOODCITE.md');
+  fs.writeFileSync(p, [
+    '### AC-8 · Real fix',
+    'Strength: Strong',
+    'Files: src/local-draft.js',
+    '',
+    'Problem:\nIn `src/local-draft.js`, the `draftTask` function has a bug.',
+    '',
+    'Solution:\nFix it.',
+    '',
+    'Benefits:\nBetter.',
+  ].join('\n'));
+
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task, 'draftTask genuinely exists in the real fetched content -- must still be offered');
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-8');
+});
+
 test('nextCandidateFulfillmentTask skips past a blocked (unmet-dependency) candidate to offer a later, independent one instead of stalling', () => {
   const dir = makeAdhocFixtureRepo();
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });

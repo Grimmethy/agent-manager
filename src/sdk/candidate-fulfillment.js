@@ -20,6 +20,9 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('../config.js');
 const candidateDocs = require('../candidate-docs.js');
+const { computePremiseEvidence } = require('../candidate-premise-check.js');
+const { signatureForClarificationTask } = require('../pipeline-forensics.js');
+const { appendHistoryEvent } = require('../task-history.js');
 
 function readIfExists(filePath) {
   try {
@@ -322,6 +325,99 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
 // arch_import_review needed the exact same logic against a second doc -- parameterized
 // instead of copy-pasting a second near-identical function that would inevitably drift
 // (see this whole session's running theme of exactly that happening elsewhere).
+// Pre-draft premise recheck (2026-09-06, Grimmethy: "a post-op blocked task investigator
+// ... surely we already have post op tasks that can sort these better?"). Root incident:
+// AC-4 and AC-7 (both pipeline_forensics_fix candidates) each burned multiple full plan/
+// implement/review cycles before review finally caught, by hand, that their premise was
+// stale -- AC-4's own manual::no-resolution-line cluster had shrunk to ZERO live
+// needs-clarification members since it was filed (the safety net it wanted to add had
+// already shipped elsewhere); AC-7's proposed retry-on-empty-plan mechanism already
+// existed, one file over, in local-client.js. staleness-audit.js's existing invalid-
+// premise/already-implemented checks could not have caught either: they only fire when a
+// candidate's OWN named files are entirely missing from the repo, or when it asks to
+// CREATE something that already exists -- neither AC-4 nor AC-7 named a missing file, and
+// neither asked to create anything. This closes that specific gap, cheaply and
+// deterministically (no model call), for every candidate-fulfillment source at once:
+//
+//   1. Signature staleness: a candidate produced by a pipeline_forensics/pipeline_self_
+//      audit cluster study often names the real `<source>::<category>` signature that
+//      motivated it, in its title or Problem prose (e.g. "the manual::no-resolution-line
+//      signature", or a title like "... same signature (manual::fabricated-ungrounded-
+//      claim)"). Re-derive the LIVE count of queue/needs-clarification/ tasks that still
+//      carry that exact signature (signatureForClarificationTask, the same function
+//      pipeline_forensics' own cluster detector uses) -- if it has dropped to zero, the
+//      problem this candidate targets no longer exists in the current backlog.
+//   2. Citation/prerequisite premise: reuses candidate-premise-check.js's existing,
+//      already-tested computePremiseEvidence() verbatim (built for the POST-implement
+//      hook) against the candidate's OWN body + the real fetchedFiles this function just
+//      read -- a fabricated citation or an unverified "the existing X already..." claim is
+//      just as detectable before a draft as after one; nothing about that check depends
+//      on implementResponse.
+//
+// Either hit skips a full draft cycle entirely -- the candidate is filed straight to
+// queue/done/_archived_no_action/ (same location/shape a human's manual archive uses,
+// full audit trail preserved) instead of ever reaching queue/pending/, and the loop moves
+// on to the next candidate in the doc. Never silent: a task-shaped record with a real
+// 'archived' history entry lands exactly where a human archiving it by hand would put it,
+// so nothing about this is invisible to the dashboard's Done/Archived view.
+const SIGNATURE_RE = /\b([a-z][a-z0-9_]*)::([a-z][a-z0-9-]*)\b/g;
+
+function extractCandidateSignatures(section) {
+  const found = new Set();
+  let m;
+  SIGNATURE_RE.lastIndex = 0;
+  while ((m = SIGNATURE_RE.exec(section))) found.add(`${m[1]}::${m[2]}`);
+  return [...found];
+}
+
+function liveSignatureCount(pipelineDir, signature) {
+  const dir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  let names;
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return null; }
+  let count = 0;
+  for (const name of names) {
+    try {
+      const task = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (signatureForClarificationTask(task) === signature) count += 1;
+    } catch { /* unparseable -- not this check's problem */ }
+  }
+  return count;
+}
+
+// Zero live members for EVERY signature this candidate names is unambiguous ("nothing
+// left to fix"); a candidate naming no signature at all, or one whose count could not be
+// determined (no needs-clarification/ dir), is never flagged by this check -- it has
+// nothing to disprove, same "no real claim, no verdict" discipline computePremiseEvidence
+// applies to citations.
+function staleSignatureReason(pipelineDir, section) {
+  const signatures = extractCandidateSignatures(section);
+  if (!signatures.length) return null;
+  const zeroed = [];
+  for (const sig of signatures) {
+    const count = liveSignatureCount(pipelineDir, sig);
+    if (count === 0) zeroed.push(sig);
+    else if (count === null) return null; // can't determine -- don't guess
+  }
+  if (zeroed.length !== signatures.length) return null; // at least one signature still live
+  return `every signature this candidate names (${zeroed.join(', ')}) has ZERO live queue/needs-clarification/ members -- the cluster that motivated it no longer exists`;
+}
+
+function archiveStaleCandidate({ pipelineDir, taskId, domain, sourceName, titleText, candidateId, section, reason }) {
+  const record = {
+    id: taskId,
+    domain,
+    source: sourceName,
+    title: `${candidateId} · ${titleText}`,
+    promptContext: { candidateId, title: titleText, body: section },
+    history: [],
+  };
+  appendHistoryEvent(record, 'created', sourceName);
+  appendHistoryEvent(record, 'archived', `pre-draft premise recheck: ${reason}`);
+  const dir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${taskId}.json`), JSON.stringify(record, null, 2));
+}
+
 function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
   // lazy (see module header) -- task-sources.js is fully loaded by the time any
   // next() poll calls this.
@@ -454,6 +550,21 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     const declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
     const contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
     const fetchedFiles = [...declaredFetched, ...contextFetched];
+
+    // Pre-draft premise recheck (see this file's own header comment above
+    // staleSignatureReason/archiveStaleCandidate for the full incident): either check
+    // hitting skips a full plan/implement/review cycle entirely -- filed straight to
+    // done/_archived_no_action/, loop continues to the next candidate in the doc.
+    const staleReason = staleSignatureReason(pipelineDir, section);
+    const evidence = computePremiseEvidence({ promptContext: { body: section, fetchedFiles } });
+    const invalidPremiseReason = evidence.contradictions.length ? evidence.contradictions[0].detail : null;
+    if (staleReason || invalidPremiseReason) {
+      archiveStaleCandidate({
+        pipelineDir, taskId, domain: defaultDomain, sourceName, titleText, candidateId, section,
+        reason: staleReason || invalidPremiseReason,
+      });
+      continue;
+    }
 
     // Path-hallucination guard (2026-08-26, Grimmethy: "Can we answer why it didn't get
     // correct files to begin with?" -- arch-review-ac-7 investigation). Same shape as the
