@@ -47,6 +47,15 @@ class RunBashPsAuxWarningTest(unittest.TestCase):
             self.assertIn("cannot see real host processes", prompt)
             self.assertIn("lastHeartbeat", prompt)
 
+    def test_clarifies_watchdog_sweeps_are_one_shot_subprocesses_not_daemons(self):
+        # 2026-09-06 follow-up: the real incident was narrower than "the whole pipeline is
+        # down" -- watchdog itself (and every OTHER worker/reviewer) was genuinely alive;
+        # the model was specifically confused about decompose-loop-autoroute/coordinator-
+        # sweep, which never appear in `ps aux` between ticks even when working correctly.
+        self.assertIn("decompose-loop-autoroute.js", chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn("one-shot", chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn("coordinator-sweep.log", chat_sessions._LOCAL_SYSTEM_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()
