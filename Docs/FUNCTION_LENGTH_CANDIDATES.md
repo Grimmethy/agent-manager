@@ -4916,3 +4916,153 @@ Extract three focused helpers from `_start_pipeline`: (1) `_build_pipeline_env` 
 
 Benefits:
 Each extracted helper has a single, nameable responsibility, so a reviewer can verify the env-var list, the registry guard, and the platform branching independently. Unit tests can target `_build_pipeline_env` (assert exact key/value pairs) and `_launch_pipeline_subprocess` (mock `subprocess.Popen`, assert per-platform argument vectors) without executing the full pipeline. Future platform support or a change to the registry schema touches exactly one helper rather than a long monolith, reducing the chance of an accidental cross-concern edit.
+
+### AC-46 · runDraftPasses orchestrator is too long
+Strength: Strong
+Files: src/local-draft.js
+Snippet:
+```
+}
+
+async function runDraftPasses(task, attempt, {
+  localCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
+  draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
+  draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
+  draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
+  draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
+  isClaudePausedFn = isClaudePaused, runOrientPassFn = runOrientPass, runPlanCritiqueFn = runPlanCritique,
+} = {}) {
+  const { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn } =
+    resolveDraftContext(task, { localCall, withLockFn });
+
+  try {
+    appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
+
+    // Re-ground a candidate-fulfillment task against CURRENT file content before any
+    // prompt is built (see refreshCandidateFetchedFiles) -- a sibling AC on the same file
+    // may have merged since the frozen fetchedFiles snapshot was taken.
+    if (isCandidateFulfillmentSource(resolveSourceName(task))) {
+      refreshCandidateFetchedFiles(task);
+    }
+
+    // Deterministic staleness-recheck short-circuit -- see runStalenessFastpath().
+    if (task.source === 'staleness_audit') {
+      const fastpathResult = runStalenessFastpath(task, attempt);
+      if (fastpathResult) return fastpathResult;
+      // else: not a rule this file knows how to re-run deterministically (adhoc,
+      // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
+      // existing harness-grounded local-model path below, completely unchanged.
+    }
+
+    // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
+    // human, or an orchestrating agent acting as architect) that already knows the exact
+    // implementResponse -- skips plan+implement entirely, straight to critique. Matches
+    // local-worker.ps1's isPreDrafted check EXACTLY (an explicit flag, requiring non-empty
+    // implementResponse) -- NOT "does implementResponse happen to already have a value",
+    // which was this file's original (wrong) heuristic. That wrong heuristic meant ANY
+    // requeued/retried task (reject-retry-check.js moves blocked->pending without clearing
+    // planResponse/implementResponse, by design -- priorRejectionFeedback is what's SUPPOSED
+    // to inform the next attempt) hit this branch and skipped straight to critique on its
+    // stale, ALREADY-REJECTED implementResponse from the prior attempt -- reject-retry-
+    // requeue's entire purpose (a FRESH redraft) silently never happened. Confirmed live
+    // 2026-08-14: every task in queue/drafting/ or queue/pending/ with localRejectCount>0
+    // already had planResponse+implementResponse populated from its original (rejected)
+    // attempt.
+    const isPreDrafted = task.preDrafted === true && !!task.implementResponse;
+
+    if (isPreDrafted) {
+      if (!task.planResponse) {
+        task.planResponse = 'Pre-drafted task: the exact implementResponse below was specified directly by the caller, not produced by a plan+implement pass.';
+      }
+      recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+      recordImplement(attempt, { text: task.implementResponse, note: 'pre-drafted (caller-supplied implementResponse)' });
+    } else {
+      // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research
+      // can't run on Claude (not opted in / no token / paused) block BEFORE the plan
+      // pass rather than run a webless plan that produces nothing usable.
+      if (task.domain === 'research') {
+        const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);
+        if (!claudeStatus.ok) {
+          appendHistoryEvent(task, 'blocked', claudeStatus.reason);
+          return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
+        }
+      }
+
+      const planOutcome = await runPlanPass(task, {
+        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
+      });
+      if (planOutcome.blocked) {
+        return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason };
+      }
+
+      const literalEditResult = tryDeterministicLiteralEdit(task, attempt);
+      if (literalEditResult) return literalEditResult;
+
+      // Plan critique (component 4): check the grounded plan for mechanical gaps before the
+      // implement ladder burns turns. A deterministic pre-filter does the high-value checks;
+      // a small qwen2.5:3b call on its own lock key is the semantic fallback. Advisory --
+      // "gaps" triggers exactly one bounded re-plan. Default OFF (=== 'true' to enable).
+      if (resolveSourceName(task) === 'adhoc'
+          && process.env.AGENT_MANAGER_ADHOC_PLAN_CRITIQUE === 'true'
+          && !task._planCritiqueRevised) {
+        try {
+          const critique = await runPlanCritiqueFn(task, { maybeLockedOn });
+          recordPlanCritique(attempt, { verdict: critique.verdict, gapCount: critique.gaps.length, viaModel: critique.viaModel });
+          appendHistoryEvent(task, 'plan-critique-done', critique.verdict === 'ok' ? 'ok' : `${critique.gaps.length} gap(s): ${critique.gaps.map((g) => g.split(' ')[0]).join(',')}`);
+          if (critique.verdict === 'gaps') {
+            task._planCritiqueFeedback = critique.gaps;
+            task._planCritiqueRevised = true;
+            if (critique.gaps.some((g) => g.startsWith('SCOPE_TOO_BIG'))) {
+              task._decomposeHint = critique.gaps.find((g) => g.startsWith('SCOPE_TOO_BIG'));
+            }
+            const rePlan = await runPlanPass(task, {
+              maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
+            });
+            delete task._planCritiqueFeedback;
+            if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason };
+          }
+        } catch (e) {
+          appendHistoryEvent(task, 'advisory', `plan-critique errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
+        }
+      }
+
+      // adhoc-shaped tasks implement via a tiered LOCAL agentic ladder (harness-search ->
+      // read-only agentic -> write agentic in an isolated worktree) instead of the blind
+      // JSON-diff pass below -- see draftAdhocBranch(). Every path there returns a final
+      // draftTask result; nothing here calls Claude.
+      if (resolveSourceName(task) === 'adhoc') {
+        return await draftAdhocBranch(task, {
+          maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
+          draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+        });
+      }
+
+      // research_task implements via a real agentic Claude (WebSearch/WebFetch) call -- see
+      // draftResearchBranch(). Same "the agentic pass already produced the final artifact,
+      // skip the local plan/critique/revision loop" reasoning as the adhoc branch.
+      if (task.domain === 'research') {
+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });
+      }
+
+      const implementOutcome = await runImplementPass(task, {
+        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+      }, { recordModelCall, attempt });
+      if (implementOutcome.done) return implementOutcome.result;
+    }
+
+    await runCritiqueAndRevision(task, {
+      maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt,
+    });
+
+    concludeDraft(task);
+
+```
+
+Problem:
+`runDraftPasses` is the top-level orchestrator that sequences `runPlanPass`, `runImplementPass`, and `runCritiqueAndRevision`, while also handling the `draftAdhocBranch` path and the state-threading between each pass. Because all of that conditional branching, intermediate-state bookkeeping, and error-recovery logic lives inline in one body, a reader must hold the entire pass-sequence in working memory to understand what happens when, say, the critique pass fails and the adhoc branch is taken. The function's length is not just a line-count issue; it conflates "decide which passes to run" with "thread results between passes" with "handle the adhoc fallback," making any single change risky without re-reading the whole block.
+
+Solution:
+Extract two clearly-named helpers from inside `runDraftPasses`: (1) `selectPassSequence` (or similar) that inspects the incoming draft state and returns an ordered list of the pass functions to invoke—encapsulating the decision logic that currently mixes `runPlanPass`, `runImplementPass`, `runCritiqueAndRevision`, and the `draftAdhocBranch` guard into one tangled conditional; and (2) `threadPassResults` (or similar) that takes the ordered list and the mutable draft state, calls each pass in turn, and handles the inter-pass state handoff and the adhoc-branch fallback in one place. `runDraftPasses` itself then shrinks to a short "select → thread → return" skeleton, with the two extracted helpers carrying the bulk of the logic.
+
+Benefits:
+A reviewer can verify the pass-selection policy in `selectPassSequence` without being distracted by state-threading details, and vice-versa. Unit tests can target the selection logic (given a draft state, which passes fire?) and the threading logic (given a pass list and a failure at step N, what does the state look like?) independently, rather than exercising the full orchestrator for every edge case. Future additions—say a new pass between implement and critique—become a one-line change in the selection list rather than a re-threading of the entire inline body.
