@@ -5565,3 +5565,193 @@ Extract each of the three operational phases into its own clearly-named helper: 
 
 Benefits:
 Each helper can be unit-tested in isolation by mocking its single external dependency, so a regression in, say, the diff-capture path is caught without exercising the import-fetch path. Code review diffs become scoped to one helper at a time, reducing the surface area a reviewer must validate. The top-level function reads as a table-of-contents of the draft pipeline, making it immediately obvious what the three stages are and in what order they execute, which aids onboarding and future re-ordering (e.g., parallelising independent stages).
+
+### AC-50 · nextCandidateFulfillmentTask mixes loading, parsing, per-candidate I/O, and result assembly
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+Snippet:
+```
+// instead of copy-pasting a second near-identical function that would inevitably drift
+// (see this whole session's running theme of exactly that happening elsewhere).
+function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+  // lazy (see module header) -- task-sources.js is fully loaded by the time any
+  // next() poll calls this.
+  const { taskIdExistsInQueue } = require('../task-sources.js');
+  const { defaultDomain } = getConfig();
+  const text = readIfExists(candidatesPath);
+  if (!text) return null;
+
+  const sections = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const start = text.indexOf('### ', pos);
+    if (start === -1) break;
+
+    const nextH2 = text.indexOf('\n## ', start + 3);
+    const nextH3 = text.indexOf('\n### ', start + 3);
+    let end;
+    if (nextH2 !== -1 && nextH3 !== -1) {
+      end = Math.min(nextH2, nextH3);
+    } else if (nextH2 !== -1) {
+      end = nextH2;
+    } else if (nextH3 !== -1) {
+      end = nextH3;
+    } else {
+      end = -1;
+    }
+
+    const sectionText = end === -1 ? text.slice(start) : text.slice(start, end);
+    sections.push(sectionText);
+    pos = end === -1 ? text.length : end + 1;
+  }
+
+  for (const section of sections) {
+    const headingLine = section.split('\n')[0];
+
+    const idMatch = headingLine.match(/AC-\d+/);
+    if (!idMatch) continue;
+    const candidateId = idMatch[0];
+
+    const strengthMatch = section.match(/^Strength:\s*(.+)$/m);
+    if (!strengthMatch || strengthMatch[1].trim() !== 'Strong') continue;
+
+    if (section.length > MAX_ARCH_REVIEW_TASK_CHARS) continue;
+
+    // 2026-08-24 -- caught live: a real task (arch-review-ac-10, "AC-10 · Example
+    // candidate", Files: foo.js) sat permanently un-completable for weeks, repeatedly
+    // bulk-requeued on the assumption it was a "crash-bug casualty" rather than ever
+    // having its own content re-examined -- its Problem/Solution sections were literally
+    // "Problem: ...\nSolution: ..." (an unfilled template placeholder), not a real
+    // finding. Traced to a real, if narrow, gap: this function has always trusted ANY
+    // "Strength: Strong" section as actionable with no check that its content is real.
+    // Deliberately NOT rejecting on "no referenced files exist" (see fetchedFiles'
+    // own comment below -- a candidate proposing a genuinely NEW file is a valid,
+    // intended shape, not a stale one) -- an ellipsis-only Problem/Solution body is a
+    // much more specific, unambiguous signal: no real LLM-drafted finding ever produces
+    // literally just "..." as its entire problem or solution description, regardless of
+    // whether the files it names exist yet.
+    const problemMatch = section.match(/^Problem:\s*\n?([\s\S]*?)(?=\n(?:Solution|Benefits):|$)/m);
+    const solutionMatch = section.match(/^Solution:\s*\n?([\s\S]*?)(?=\nBenefits:|$)/m);
+    const isPlaceholderBody = (m) => !m || m[1].trim() === '' || /^\.{3,}$/.test(m[1].trim());
+    if (isPlaceholderBody(problemMatch) || isPlaceholderBody(solutionMatch)) continue;
+
+    const taskId = sourceName.replace(/_/g, '-') + '-' + candidateId.toLowerCase();
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    const titleMatch = headingLine.match(/AC-\d+\s*·\s*(.+)/);
+    const titleText = (titleMatch ? titleMatch[1] : headingLine.replace(/^###\s*/, '')).trim();
+
+    let filesArray = [];
+    const filesMatch = section.match(/^Files:\s*(.+)$/m);
+    if (filesMatch) {
+      filesArray = filesMatch[1].split(',').map((f) => f.trim());
+    }
+
+    // 2026-09-02: the `Files:` line is frequently incomplete -- a candidate whose Solution
+    // says "call `buildPlanPrompt` with a second arg" needs prompts.js in view to see that
+    // function's real signature, but only lists local-draft.js (pipeline-forensics-fix-ac-7
+    // /-ac-14). Also read any repo-relative source path the Problem/Solution prose names
+    // into fetchedFiles (NOT into `files` -- those stay the candidate's declared edit
+    // targets, which the review/decompose gates count against), so the drafter can ground
+    // a cross-file change instead of editing blind or refusing.
+    const contextFiles = [...new Set(
+      [...section.matchAll(/(?<![\w/.-])((?:src|python|scripts|lib)\/[\w./-]+\.(?:js|ts|py|mjs|cjs))\b/g)].map((m) => m[1]),
+    )].filter((p) => !filesArray.includes(p)).slice(0, 3);
+
+    // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
+    // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing
+    // in the real file, because this candidate's own implement pass was never shown real
+    // file content, only its own prose write-up from whenever the candidate was originally
+    // drafted, possibly hours or days earlier by a different pass entirely. Every OTHER
+    // fulfillment-style source (arch_import, pipeline_self_audit) grounds its implement
+    // pass in real, freshly-read file content; this generic consumer -- shared by
+    // arch_review, arch_import_review, observability_fix, performance_fix, and
+    // backlog_fulfillment all at once -- never did. Unlike arch_import's own harness
+    // grounding (which has to SEARCH for candidate files because it doesn't know them yet),
+    // this already knows exactly which files from the candidate's own "Files:" line, so no
+    // search step is needed -- just read them, best-effort. A file that doesn't exist
+    // (a candidate proposing a brand-new file, or a stale/illustrative path) is not an
+    // error -- see fetchedFiles' own promptContext field, which the implement prompt is
+    // told explicitly means "ground a create, or flag the mismatch, don't invent content."
+    const { repoRoot } = getConfig();
+    const readWindowed = (relPath, isContext) => {
+      try {
+        const full = path.resolve(repoRoot, relPath);
+        if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
+        const content = fs.readFileSync(full, 'utf8');
+        const entry = { path: relPath, content: windowFetchedFileContent(content, section) };
+        if (isContext) entry.context = true; // referenced in prose, not a declared edit target
+        return entry;
+      } catch {
+        return null; // doesn't exist / unreadable -- not an error, see comment above
+      }
+    };
+    const declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
+    const contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
+    const fetchedFiles = [...declaredFetched, ...contextFetched];
+
+    // Path-hallucination guard (2026-08-26, Grimmethy: "Can we answer why it didn't get
+    // correct files to begin with?" -- arch-review-ac-7 investigation). Same shape as the
+    // isPlaceholderBody skip above (a real, precedented gap: arch-review-ac-10 sat
+    // permanently un-completable for weeks because this function trusted ANY
+    // "Strength: Strong" section as actionable with no check its content was real) but for
+    // the "Files:" line instead of the Problem/Solution body. Confirmed live: AC-7 listed
+    // 5 files (none with a directory prefix, two -- resolveGraphPath.js/getConfig.js --
+    // not real files at all, both actually live together in src/config.js) despite
+    // archReviewImplementPrompt's own explicit instruction to copy paths exactly as given
+    // -- the model just didn't follow it. Every one of the 5 silently failed to resolve
+    // above, leaving fetchedFiles empty, and the task was queued anyway, doomed to the same
+    // "no real implementation code" degenerate/blocked cycle every single pass. Deliberately
+    // NOT skipping on filesArray.length === 1 with zero fetchedFiles -- see this function's
+    // own comment above: a candidate proposing ONE genuinely brand-new file is a valid,
+    // intended shape (fetchedFiles' own promptContext meaning is "ground a create, or flag
+    // the mismatch"). Multiple listed files where NONE resolve is a much stronger signal --
+    // no real architectural finding proposes touching several already-existing-sounding
+    // files that are ALL, simultaneously, brand new.
+    if (filesArray.length >= 2 && declaredFetched.length === 0) continue;
+
+    // Deterministic, one-level candidate pre-split (2026-09-02). A candidate declaring >=2
+    // files, or laying out >=3 numbered edit steps in its Solution, is more than the local
+    // 27B reliably lands in a single diff (pipeline-forensics-fix-ac-1/-ac-14 blocked+
+    // exhausted exactly this way). `mustPreSplit` tells the implement pass to decompose it
+    // into single-concern sub-candidates FIRST. Every sub-candidate the split writes back
+    // carries `Split-Depth: 1`; this reader refuses to pre-split anything already at depth
+    // >= 1, a hard recursion stop that does NOT depend on the model's judgement (the earlier
+    // model-driven re-split went infinite -- AC-4..AC-12, 2026-09-01).
+    const depthMatch = section.match(/^Split-Depth:\s*(\d+)\s*$/m);
+    const splitDepth = depthMatch ? Number(depthMatch[1]) : 0;
+    // Count numbered steps off the raw section (the Solution-only capture above stops at
+    // the first end-of-line under /m, so it can't be used for this).
+    const solutionSlice = section.split(/^Solution:/m)[1] ? section.split(/^Solution:/m)[1].split(/^Benefits:/m)[0] : '';
+    const numberedSteps = (solutionSlice.match(/(?:^|\n)\s*\d+[.)]\s+\S/g) || []).length;
+    const mustPreSplit = splitDepth === 0 && (filesArray.length >= 2 || numberedSteps >= 3);
+
+    return {
+      id: taskId,
+      domain: defaultDomain,
+      source: sourceName,
+      title: `${candidateId} · ${titleText}`,
+      promptContext: {
+        candidateId,
+        title: titleText,
+        files: filesArray,
+        fetchedFiles,
+        body: section,
+        splitDepth,
+        mustPreSplit,
+      },
+    };
+  }
+
+  return null;
+}
+```
+
+Problem:
+`nextCandidateFulfillmentTask` performs four distinct responsibilities in a single body: (1) it loads the candidates file via `readIfExists(candidatesPath)`, (2) it walks the raw text with inline `indexOf` calls to locate and slice out individual candidate sections, (3) for each candidate it invokes the locally-defined `readWindowed` closure (which internally calls `fs.readFileSync`) to pull declared/context files and also consults `taskIdExistsInQueue` for external queue state, and (4) it assembles and returns the final fulfillment result object. Because the section-parsing logic, the per-candidate file-fetching loop, the external state check, and the result shaping are all interleaved in one scope, a reader must track closure-captured variables and the `indexOf` bookkeeping simultaneously, and any change to the candidate-file format or the queue-lookup contract forces a review of the entire function.
+
+Solution:
+Extract two helpers scoped to this function. First, `parseCandidateSections(rawText)` encapsulates the inline `indexOf`-based scanning that locates section boundaries and slices out per-candidate blocks; it takes the raw string returned by `readIfExists` and returns an array of structured section objects (name, body, declared-file list, context-file list). Second, `evaluateCandidate(section, readWindowed, taskIdExistsInQueue)` receives a single parsed section plus the two dependencies it needs—the `readWindowed` closure for fetching declared/context files and the `taskIdExistsInQueue` predicate for the external state check—and returns a per-candidate verdict object. The top-level `nextCandidateFulfillmentTask` then reduces to: call `readIfExists(candidatesPath)`, pass the text to `parseCandidateSections`, iterate the sections calling `evaluateCandidate` with the closure and predicate in hand, and assemble the final result. No new I/O is introduced; the I/O boundary remains exactly where it is today, but it is now an explicit parameter rather than an implicit closure capture.
+
+Benefits:
+`parseCandidateSections` can be unit-tested with fixture strings in isolation, verifying that the `indexOf` boundary logic handles edge cases (empty file, missing delimiters, trailing whitespace) without any filesystem access. `evaluateCandidate` makes the two external dependencies (`readWindowed`, `taskIdExistsInQueue`) visible in its signature, so a reviewer immediately sees what the function reads from disk and what external state it consults, and a mock can be injected in tests. The top-level function shrinks to a short orchestration sequence that is trivially reviewable, and future changes to the candidate-file format or the queue-lookup contract are localized to a single helper rather than scattered through a long body.
