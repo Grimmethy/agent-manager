@@ -14,7 +14,7 @@ const path = require('path');
 // effect of populating the registry with this package's 10 built-in sources.
 const { getRegisteredSource, updateTaskSource, resolveSourceName } = require('./task-source-registry.js');
 const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
-const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
+const { anchorFilesPromptBlock, backtickIdentifiers } = require('./task-anchor-files.js');
 const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
 
@@ -1237,19 +1237,32 @@ function pipelineDebriefImplementPrompt(task, planText) {
 // same shape, not a new apply path.
 function adhocHarnessSearchPlanPrompt(task) {
   const ctx = task.promptContext || {};
+  const rawText = ctx.rawText || truncate(JSON.stringify(ctx), 4000);
+  // 2026-09-06, root-caused live: a file-decompose "move these symbols" sub-task names its
+  // exact symbols in backticks, yet the harness-search tier picked the SOURCE file's own
+  // path as its query instead -- a path mentioned in dozens of unrelated tests/docs/scripts
+  // returns almost pure noise, one irrelevant file got embedded as "the" fetched content,
+  // and the resulting bloated, low-signal context contributed to the plan pass truncating
+  // on every retry. Surfacing the task's own named symbols explicitly, when present, steers
+  // the model toward the highest-signal query it already has rather than guessing a path.
+  const namedSymbols = backtickIdentifiers(rawText);
   return [
     'A human or an orchestrating agent submitted this one-off task directly.',
     '',
     `Title: ${task.title || ''}`,
     '',
-    ctx.rawText || truncate(JSON.stringify(ctx), 4000),
+    rawText,
     '',
+    namedSymbols.length
+      ? `This task names these specific symbol(s) by name (backtick-quoted above): ${namedSymbols.join(', ')}. Prefer these as your search terms -- a distinctive symbol name finds its real definition directly, where a bare file path (especially one also mentioned in unrelated tests, docs, or other tasks) mostly returns noise.`
+      : null,
+    namedSymbols.length ? '' : null,
     'Before anything else, propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the exact code this task is about -- think about which file(s) the task\'s own wording points at. The harness searches this repo AND any loaded plugin repo (e.g. agent-manager-hygiene), so a task about the pipeline\'s own behavior may point at code that lives in either.',
     '',
     'Output EXACTLY this format, one query per line, nothing else:',
     'QUERY: <search terms>',
     'QUERY: <search terms>',
-  ].join('\n');
+  ].filter((l) => l !== null).join('\n');
 }
 
 function adhocHarnessSearchImplementPrompt(task, planText) {
