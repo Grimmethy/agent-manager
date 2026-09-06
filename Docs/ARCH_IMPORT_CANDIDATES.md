@@ -195,3 +195,32 @@ Add a `confidenceSource` field to the `stalenessFlag` object as a three-value en
 
 Benefits:
 A dashboard operator or a queue-watcher script can now branch on `confidenceSource` to apply different trust levels: a `'deterministic-rule'` high-confidence flag can auto-retire with no human confirmation, while a `'model-vote'` high-confidence flag can be surfaced for a one-click human confirm before the task is archived. This eliminates the current ambiguity where a model's self-assessment (which the codebase's own ADR-0022 notes can produce "opposite verdicts" at the same temperature) is indistinguishable in the stored artifact from a rule that checked file existence and found the target already implemented. The three-value enum also leaves room for a future `'human-override'` source without a schema migration, matching the finding's core principle that a downstream consumer must never silently conflate "authoritative" with "inferred."
+
+### AC-15 · Add confidenceSource provenance tag at all three stamping sites in the source
+Strength: Strong
+Split-Depth: 1
+Files: src/adhoc-staleness-flag.js
+
+Problem:
+The stalenessFlag object carries a `confidence` field ('high' or 'medium') but no provenance tag explaining WHERE that confidence came from. A human reading the flag on the dashboard cannot tell whether 'high' means a deterministic rule fired (no model involved) or a model vote promoted it, and 'medium' is always the heuristic-default (vote OFF) path. This makes the flag's epistemic status opaque.
+
+Solution:
+Three edits in one file. (1) Extend the `mk` helper inside `classifyStaleTask` to accept a fifth parameter `confidenceSource` and include it in the returned object literal: change `const mk = (reason, disposition, confidence, extra = []) => ({ reason, disposition, confidence, evidence: [...ev, ...extra] })` to `const mk = (reason, disposition, confidence, extra = [], confidenceSource = 'heuristic-default') => ({ reason, disposition, confidence, confidenceSource, evidence: [...ev, ...extra] })`. (2) At the three high-confidence call sites — `return mk('already-implemented', 'retire', 'high')`, `return mk('invalid-premise', 'retire', 'high')`, and `return mk('duplicate-of', 'retire', 'high', [...])` — pass `'deterministic-rule'` as the fifth argument. (3) In the sweep function's CONFIRM-promotion branch (the code path where `vote.confident && vote.verdict === 'CONFIRM'` causes the existing medium-confidence flag to be overwritten to `confidence: 'high'`), also set `confidenceSource: 'model-vote'` on the flag object at the same write site where `confidence` is set to `'high'`. The four medium-confidence `mk` calls (duplicate-of live, decompose-loop, fabrication-repeat, retries-exhausted) need no change because the default parameter value `'heuristic-default'` already covers them.
+
+Benefits:
+Every stalenessFlag now carries a three-value enum (`'deterministic-rule'` | `'model-vote'` | `'heuristic-default'`) that tells the dashboard and any downstream consumer exactly how the confidence was derived, without changing the existing `confidence` value, `reason`, or `disposition` fields.
+
+### AC-16 · Assert confidenceSource in all affected test cases
+Strength: Strong
+Split-Depth: 1
+Files: src/adhoc-staleness-flag.test.js
+Depends-On: AC-15
+
+Problem:
+The test file exercises every confidence path (high deterministic, medium heuristic-default, and vote-promoted high) but never asserts the new `confidenceSource` field, so a regression that drops or mislabels the provenance tag would pass silently.
+
+Solution:
+Add one `assert.equal` line per relevant test case, each checking `confidenceSource` against the correct enum value for that path: (a) In the test named 'already-implemented-strong -> retire / high', after the existing `assert.equal(strong.confidence, 'high')` line, add `assert.equal(strong.confidenceSource, 'deterministic-rule');`. (b) In the test named 'invalid-premise -> retire / high', after `assert.equal(f.confidence, 'high')`, add `assert.equal(f.confidenceSource, 'deterministic-rule');`. (c) In the test named 'duplicate of an already-done task -> retire / high; of a live task -> medium', after `assert.equal(done.confidence, 'high')` add `assert.equal(done.confidenceSource, 'deterministic-rule');` and after `assert.equal(live.confidence, 'medium')` add `assert.equal(live.confidenceSource, 'heuristic-default');`. (d) In the test named 'decompose-loop -> re-scope / medium', after `assert.equal(f.confidence, 'medium')`, add `assert.equal(f.confidenceSource, 'heuristic-default');`. (e) In the test named 'retries-exhausted only -> capability-ceiling / medium', after `assert.equal(f.confidence, 'medium')`, add `assert.equal(f.confidenceSource, 'heuristic-default');`. (f) In the test named 'vote is OFF by default -- a medium candidate is stamped directly, no majorityVote call', after `assert.equal(readTask(dir, 'blocked', 'nov-1').stalenessFlag.confidence, 'medium')`, add `assert.equal(readTask(dir, 'blocked', 'nov-1').stalenessFlag.confidenceSource, 'heuristic-default');`. (g) In the test named 'with the vote enabled: DENY drops the flag + Keep cooldown; CONFIRM promotes to high', after `assert.equal(readTask(dir2, 'blocked', 'conf-1').stalenessFlag.confidence, 'high')`, add `assert.equal(readTask(dir2, 'blocked', 'conf-1').stalenessFlag.confidenceSource, 'model-vote');`. CRITICAL: the 'vote is OFF by default' test (f) must assert `'heuristic-default'`, NOT `'deterministic-rule'` — that path is the medium-confidence stamp with no model involvement, which is the third value of the enum.
+
+Benefits:
+All three enum values are now pinned by tests, so any future refactor that accidentally drops, renames, or misassigns the provenance tag will fail immediately in CI rather than silently corrupting the dashboard's confidence display.
