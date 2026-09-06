@@ -68,6 +68,20 @@ test('resolveDisposition: a doc/note apply -> filed', () => {
   assert.equal(out.stage, 'filed');
 });
 
+// 2026-09-06: pipeline_debrief's apply never touches git (it only archives done/ task JSON
+// files and files brain-dump Now-What findings), so it can never hit the git-commit checks
+// above, and its detail string doesn't match FILED_RE's own patterns ("finding(s)", not
+// "candidate(s)"). Root-caused live: this fell through to the bottom catch-all and got
+// stamped 'noop', reading exactly like an inconclusive verdict that produced nothing.
+test('resolveDisposition: a pipeline_debrief apply (archived its window + filed findings) -> filed, not noop', () => {
+  const out = resolveDisposition(
+    { id: 'pipeline-debrief-1', ...applied('debriefed 25 task(s); archived 25, already-moved 0; filed 2 Now-What finding(s) to the brain-dump inbox') },
+    { ctx: ctx() },
+  );
+  assert.equal(out.stage, 'filed');
+  assert.match(out.detail, /debrief archived its window/);
+});
+
 test('resolveDisposition: a no-op verdict apply -> noop', () => {
   for (const d of ['no candidates in implement response -- nothing to apply', 'False positive. The catch block is not silent.', 'no code change needed (empty implement response)']) {
     assert.equal(resolveDisposition({ id: 'x', ...applied(d) }, { ctx: ctx() }).stage, 'noop', d);
