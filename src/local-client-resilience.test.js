@@ -183,6 +183,84 @@ test('call() returns degenerate:"truncated" (not a false "fine" verdict) when ev
   );
 });
 
+// 2026-09-06: logDegenerateAudit's first real production data showed the gap this fixes
+// -- two brain-dump-spawned adhoc plan passes each hit done_reason:"length" on ALL 3
+// attempts with eval_count === numPredict every time, identically, because the retry
+// loop above called with the exact same numPredict each attempt: a fixed ceiling on the
+// same prompt reproduces the same cutoff deterministically, so an identical retry has
+// zero chance of a different outcome. Proves the retry loop actually escalates
+// numPredict after a truncated attempt, not just that it eventually gives up correctly.
+test('call() escalates numPredict on a retry after a "truncated" (done_reason:"length") attempt, not just repeating the same ceiling', async () => {
+  const capturedNumPredicts = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        capturedNumPredicts.push(body.options.num_predict);
+        if (capturedNumPredicts.length < 3) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ response: 'still reasoning, never finishes because', done: true, done_reason: 'length', eval_count: body.options.num_predict }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('a real, complete response that finally finished.'));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false, numPredict: 1000 }, 2);
+      assert.equal(result.degenerate, null);
+      assert.deepEqual(capturedNumPredicts, [1000, 2000, 4000], 'each truncated retry must double the prior numPredict, not repeat it');
+    }
+  );
+});
+
+test('call() caps the escalated numPredict at the ceiling rather than growing unbounded', async () => {
+  const capturedNumPredicts = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        capturedNumPredicts.push(body.options.num_predict);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: 'still truncating', done: true, done_reason: 'length', eval_count: body.options.num_predict }));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false, numPredict: 6000 }, 2);
+      assert.equal(result.degenerate, 'truncated');
+      assert.deepEqual(capturedNumPredicts, [6000, 8000, 8000], 'must clamp at the ceiling (8000), never exceed it');
+    }
+  );
+});
+
+test('call() does NOT escalate numPredict on a non-truncation degenerate (e.g. empty) -- only "truncated" gets the ceiling bump', async () => {
+  const capturedNumPredicts = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        capturedNumPredicts.push(body.options.num_predict);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse(''));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: false, numPredict: 1000 }, 1);
+      assert.equal(result.degenerate, 'empty');
+      assert.deepEqual(capturedNumPredicts, [1000, 1000], 'an empty-response retry has no ceiling to escalate away from');
+    }
+  );
+});
+
 test('call() does NOT flag a genuinely complete response (done_reason:"stop") as truncated', async () => {
   await withServer(
     (req, res) => {
