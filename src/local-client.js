@@ -9,6 +9,7 @@
 // (these have been observed to self-heal), and a majority-vote helper for judgment
 // calls that are otherwise an invisible coin flip at default temperature.
 
+const fs = require('fs');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
@@ -38,6 +39,40 @@ function resolvePipelineDir() {
   const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
   if (!repoRoot) return null;
   return process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
+}
+
+// Persistent, human-auditable trail of every degenerate plan/implement attempt (2026-09-06,
+// Grimmethy: "can we use the same end of task logging developed for diagnosing the in app
+// chat" -- local-tool-client.js's logContextAudit closed the identical problem for the
+// agentic tool-calling loop: a real Chat run hit done_reason:"length" 3 times with nothing
+// persisting WHY at each turn, so a later investigation meant re-deriving it from a
+// transcript's own visible text after the fact. The plain plan/implement call() below --
+// used by every non-agentic source (pipeline_debrief, observability_fix, change_review,
+// pipeline_forensics_fix, ...) -- had the exact same blind spot, just one level lower: only
+// task.blockedReason's own final string survived past a degenerate attempt, and every
+// EARLIER attempt within the SAME call's retry loop left no trace at all. Confirmed live
+// investigating a 37-task truncation cluster spanning 6+ different sources: reconstructing
+// "does this always hit the same numPredict ceiling, or does it vary" required manually
+// cross-referencing model-stats.db against each task's own JSON, one at a time. One NDJSON
+// line per degenerate attempt (not just the final one) means that's `grep` from now on.
+// Same file-writing shape as logContextAudit (best-effort, must never break the real call),
+// deliberately a SEPARATE log file (degenerate-audit.log, not context-budget-audit.log) --
+// a numPredict-too-small truncation and a context-window-overflow truncation are different
+// failure classes with different fixes, and conflating them in one file would just
+// reintroduce the same "which one was this" archaeology this exists to remove.
+function logDegenerateAudit(entry) {
+  try {
+    const pipelineDir = resolvePipelineDir();
+    if (!pipelineDir) return;
+    const dir = path.join(pipelineDir, 'instances');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, 'degenerate-audit.log'),
+      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+    );
+  } catch {
+    // best-effort audit trail -- must never break the real call
+  }
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -310,6 +345,15 @@ async function call(opts, maxRetries = 2) {
     const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
+    // Logged for THIS attempt, not just once the whole call gives up -- so a later
+    // investigation can see the retry PATTERN (e.g. all 3 attempts hit numPredict
+    // identically vs. attempt 1 empty then 2-3 truncated), not just the final verdict
+    // task.blockedReason alone preserves today.
+    logDegenerateAudit({
+      source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+      model: opts.model || MODEL, numPredict: opts.numPredict, doneReason: result.done_reason,
+      degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+    });
   }
   // Only propagate the hard error if NO attempt ever got a real response, degenerate or
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
@@ -399,7 +443,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, KEEP_ALIVE };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, KEEP_ALIVE };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

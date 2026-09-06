@@ -9,6 +9,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { detectDegenerate } = require('./local-client.js');
 
 test('detectDegenerate flags a genuinely empty response as "empty"', () => {
@@ -77,4 +80,47 @@ test('detectDegenerate treats done_reason:"length" as truncated even when allowE
 test('detectDegenerate does not flag a genuinely complete response (done_reason:"stop" or omitted)', () => {
   assert.equal(detectDegenerate('a real, complete response.', { doneReason: 'stop' }), null);
   assert.equal(detectDegenerate('a real, complete response.'), null);
+});
+
+// --- logDegenerateAudit (2026-09-06) ----------------------------------------------------
+// Same pattern as local-tool-client.test.js's logContextAudit tests: a fixture repo sets
+// AGENT_MANAGER_REPO_ROOT/AGENT_MANAGER_PIPELINE_DIR and requires the module fresh, since
+// resolvePipelineDir() reads those env vars at call time.
+
+function withFixtureRepo(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-test-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  delete require.cache[require.resolve('./local-client.js')];
+  const mod = require('./local-client.js');
+  return fn(mod, dir);
+}
+
+function readAuditLog(dir) {
+  const p = path.join(dir, 'instances', 'degenerate-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('logDegenerateAudit appends one well-formed NDJSON line per call, never throwing on a real pipelineDir', () => {
+  withFixtureRepo((mod, dir) => {
+    mod.logDegenerateAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 1, degenerate: 'truncated' });
+    mod.logDegenerateAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 2, degenerate: 'truncated' });
+    const lines = readAuditLog(dir);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].source, 'pipeline_debrief');
+    assert.equal(lines[0].attempt, 1);
+    assert.ok(lines[0].at, 'each entry carries its own real timestamp');
+    assert.equal(lines[1].attempt, 2);
+  });
+});
+
+test('logDegenerateAudit is advisory: a broken pipelineDir never throws or breaks the caller', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-test-broken-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = path.join(dir, 'does-not-exist-and-is-a-file');
+  fs.writeFileSync(process.env.AGENT_MANAGER_REPO_ROOT, 'x'); // a FILE where a dir is expected -- mkdirSync must fail
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  delete require.cache[require.resolve('./local-client.js')];
+  const mod = require('./local-client.js');
+  assert.doesNotThrow(() => mod.logDegenerateAudit({ source: 'x' }));
 });
