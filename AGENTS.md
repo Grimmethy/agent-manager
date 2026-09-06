@@ -50,6 +50,39 @@ than making arbitrary [numbers]"*. Treat this as a standing preference, not a on
   evidence itself as something worth closing (usually via the logging point above), not
   just something to route around this one time.
 
+## Concept research: give a named topic the same treatment, tag it as it flows through
+
+Twice this session (2026-09-06), a narrow topic (chat-context-trimming, then
+web-search-capability) got the same real treatment: a background research fork surveys
+several other projects' approaches, deep-dives each, and files the findings via
+`writeSideFindingInbox()`/`side-finding-sweep.js` into `brain-dump.json`. Grimmethy asked
+for this to become a tracked, repeatable pattern — `src/concepts.js`'s `concepts.json`
+registry (Concept Chart, dashboard tab in progress) is the persistent row for each named
+topic, with a self-reported (deliberately unverified) build-from-scratch-vs-adapted
+tally and an on-demand timeline over the data below.
+
+- **Before launching a concept-directed research fork**, create (or reuse — it's
+  idempotent on the slugified name) the concept's row first:
+  `require('./src/concepts.js').createConcept({name, description}, pipelineDir,
+  {createdBy: 'organic'})` if the topic has no row yet, `{createdBy: 'manual'}` when a
+  human names it explicitly via the dashboard. Pass the resulting `id` into the fork's
+  prompt.
+- **Every `writeSideFindingInbox()` call the fork makes** should include that
+  `conceptId` in its options. This isn't just bookkeeping — `side-finding-sweep.js`
+  scopes its dedup comparison to matching `conceptId` (both-null still counts as a
+  match), specifically because two research batches on different topics can otherwise
+  false-positive-merge over shared boilerplate phrasing (root-caused live 2026-09-06:
+  "Open WebUI" and "Synthesis: recommended path..." findings from the web-search batch
+  wrongly absorbed into unrelated chat-context-trimming entries).
+- **When the fork finishes**, call `recordConceptResearch(pipelineDir, conceptId)` once
+  (bumps `researchForkCount`, promotes `status` from `open` to `researched`) — same
+  verification step as confirming the brain-dump entries actually landed.
+- **A "concepts needing research" autonomous task source is explicitly deferred.**
+  Concept creation and research-triggering stay human-initiated for now — the same risk
+  shape as the `arch_import` premise-check incident (an unverified discovery-source claim
+  splitting into children before anyone checked it) applies just as much to a pipeline
+  deciding on its own what's worth researching.
+
 ## Agent skills
 
 ### Issue tracker
