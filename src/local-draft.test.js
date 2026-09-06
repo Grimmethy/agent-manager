@@ -1559,6 +1559,40 @@ test('draftTask blocks a draft as a review rejection when the source\'s postImpl
   });
 });
 
+// 2026-09-06: postImplementCheck also accepts verdict:'invalid-premise' (src/candidate-
+// premise-check.js), producing a DISTINCT blockedReason prefix from 'ungrounded' -- so
+// blocked-task-classifiers.js can tell "the draft fabricated something" (model-side,
+// worth a feedback-driven retry) apart from "the CANDIDATE's own premise is false"
+// (retrying redrafts against the same false premise every time).
+test('draftTask blocks a draft with an "Invalid premise:" prefix when the source\'s postImplementCheck returns invalid-premise', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('post_implement_check_invalid_premise_source')) {
+      registerTaskSource('post_implement_check_invalid_premise_source', {
+        priority: 80, next: () => null,
+        postImplementCheck: async () => ({ verdict: 'invalid-premise', reason: 'the AC-13a gate was never actually built' }),
+      });
+      updateTaskSource('post_implement_check_invalid_premise_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'post-implement-invalid-premise-1', domain: 'default', source: 'post_implement_check_invalid_premise_source', title: 'test',
+      promptContext: { candidateId: 'AC-16', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'a well-implemented guard against a nonexistent prerequisite', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, 'review');
+    assert.match(task.blockedReason, /Invalid premise: the AC-13a gate was never actually built/);
+    assert.doesNotMatch(task.blockedReason, /Ungrounded draft/);
+    assert.deepEqual(task.priorRejectionFeedback, [task.blockedReason]);
+  });
+});
+
 test('draftTask proceeds normally when the source\'s postImplementCheck returns ok', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');

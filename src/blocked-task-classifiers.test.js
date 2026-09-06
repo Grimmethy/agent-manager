@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyBlockedTask, categorizeBlockedReason, hasZeroHitHarnessSearch, hasUnreliableGrounding,
-  signatureForTask, findClassifier, REASON_CATEGORIES,
+  hasInvalidPremise, signatureForTask, findClassifier, REASON_CATEGORIES,
 } = require('./blocked-task-classifiers.js');
 
 test('classifyBlockedTask recognizes a pre-stamped external-dependency task as environment-side, non-retryable', () => {
@@ -23,6 +23,26 @@ test('classifyBlockedTask recognizes a zero-hit harness search as harness-side, 
   const task = { history: [{ stage: 'harness-search', detail: '0 hit(s) found' }] };
   const result = classifyBlockedTask(task);
   assert.deepEqual(result, { category: 'harness-search-zero-results', faultSide: 'harness', retryable: true, classifierName: 'harness-search-zero-results' });
+});
+
+test('classifyBlockedTask recognizes an "Invalid premise:" blockedReason as environment-side, non-retryable', () => {
+  const task = { blockedReason: 'Invalid premise: candidate claims `foo` already exists, but it does not' };
+  const result = classifyBlockedTask(task);
+  assert.deepEqual(result, { category: 'invalid-premise', faultSide: 'environment', retryable: false, classifierName: 'invalid-premise' });
+});
+
+test('hasInvalidPremise matches case-insensitively and is false for an unrelated reason', () => {
+  assert.equal(hasInvalidPremise({ blockedReason: 'invalid premise: x' }), true);
+  assert.equal(hasInvalidPremise({ blockedReason: 'INVALID PREMISE: x' }), true);
+  assert.equal(hasInvalidPremise({ blockedReason: 'Ungrounded draft: x' }), false);
+  assert.equal(hasInvalidPremise({}), false);
+});
+
+test('findClassifier("invalid-premise") has a buildQuestion that quotes the blockedReason detail', () => {
+  const c = findClassifier('invalid-premise');
+  assert.ok(c);
+  const question = c.buildQuestion({ blockedReason: 'Invalid premise: the AC-13a gate was never built' });
+  assert.match(question, /the AC-13a gate was never built/);
 });
 
 test('classifyBlockedTask maps each existing keyword category to faultSide:model, retryable:true', () => {
