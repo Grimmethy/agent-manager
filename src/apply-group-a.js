@@ -695,6 +695,33 @@ function applyForensicsReport({ implementResponse, task }) {
   return { succeeded: true, file: res.file, doneMarker: `filed ${(res.candidateIds || []).join(', ')} to ${res.file}` };
 }
 
+// Extracts the NOW WHAT section's numbered items out of a confirmed debrief report, one
+// {title, body} per item, for writeSideFindingInbox() below. Lenient by construction (same
+// "drop malformed, never fail everything" discipline as candidate-docs.js's
+// parseArchDiscoveryCandidates and side-finding.js's own extractSideFindings): a report
+// missing the section (including the whole-response "NO CONFIDENT PATTERN" escape hatch,
+// which never contains a "NOW WHAT" heading at all) simply yields no items, and an item not
+// shaped like "<change> -- Files: ... Why: ..." still files fine, just with its whole text
+// as both title and body rather than being dropped.
+function parseDebriefNowWhatItems(text) {
+  const idx = (text || '').search(/^NOW WHAT\s*$/m);
+  if (idx === -1) return [];
+  const section = text.slice(idx).replace(/^NOW WHAT\s*$/m, '').trim();
+  if (!section) return [];
+
+  return section.split(/(?=^\d+\.\s+)/m)
+    .map((chunk) => chunk.replace(/^\d+\.\s+/, '').trim())
+    .filter(Boolean)
+    .slice(0, 5) // defensive cap -- the prompt itself already asks for at most 2-3
+    .map((item) => {
+      const sepIdx = item.indexOf(' -- ');
+      const title = (sepIdx === -1 ? item : item.slice(0, sepIdx)).trim();
+      const body = (sepIdx === -1 ? item : item.slice(sepIdx + 4)).trim() || title;
+      return title ? { title: title.slice(0, 200), body: body.slice(0, 1000) } : null;
+    })
+    .filter(Boolean);
+}
+
 // pipeline_debrief (2026-09-06, see debrief-bundle.js): the implement pass wrote a
 // What/So-What/Now-What report over a bounded window of queue/done/ tasks (advisoryProse --
 // no diff). Two passes, same shape as applyForensicsReport right above:
@@ -709,8 +736,22 @@ function applyForensicsReport({ implementResponse, task }) {
 //     or a human archived it by hand meanwhile) is not an error -- archiveSpecificDoneTasks
 //     reports it as `missing`, same "already moved, nothing left to do" idempotency
 //     archiveDoneTasks itself relies on.
+//     THEN (2026-09-06, Grimmethy: "we already have our searches creating brain dumps full
+//     of nitpicks... build the brain-dump route"): each NOW WHAT item is filed into
+//     queue/side-findings-inbox/ via side-finding.js's writeSideFindingInbox() -- the exact
+//     same channel the day's concept-research forks already use -- for side-finding-
+//     sweep.js to drain into brain-dump.json (dedup'd against prior debrief findings,
+//     since it carries a real `raisedBy`) and from there through the EXISTING
+//     brain_dump_sort classifier. Deliberately NOT the pipeline_forensics AC-NNN
+//     candidate-doc route: a Now-What item isn't always a scoped diff spec (sometimes it's
+//     "source X is unusually cheap, worth noting"), and brain_dump_sort already knows how
+//     to split "this is a real scoped idea" (-> adhoc) from "this is a pattern worth
+//     remembering" (-> secondbrain) -- reusing it here means a well-formed Now-What
+//     recommendation ends up drafted as a real task the same way "Design Option A" (this
+//     very feature) did, instead of evaporating once its report is archived.
 function applyDebriefReport({ implementResponse, task }) {
   const { archiveSpecificDoneTasks } = require('./done-archive.js');
+  const { writeSideFindingInbox } = require('./side-finding.js');
   const { getConfig } = require('./config.js');
   const text = (implementResponse || '').trim();
 
@@ -731,6 +772,14 @@ function applyDebriefReport({ implementResponse, task }) {
   }
   const { pipelineDir } = getConfig();
   const result = archiveSpecificDoneTasks({ pipelineDir, taskIds });
+
+  const nowWhatItems = parseDebriefNowWhatItems(text);
+  for (const item of nowWhatItems) {
+    writeSideFindingInbox(item, {
+      source: 'pipeline_debrief', taskId: task.id, stage: 'now-what', pipelineDir,
+    });
+  }
+
   // {skipped: true} (never {succeeded: true} with no `file`) -- this apply never touches
   // the tracked repo's git state at all (it only moves task JSON files under pipelineDir),
   // same shape as applyVerdictOnly right above: apply-task.js's git-branch-diff flow reads
@@ -739,7 +788,7 @@ function applyDebriefReport({ implementResponse, task }) {
   // would instead reach `gitRunner.add([artifact.file])` as `git add [undefined]` and throw.
   return {
     skipped: true,
-    reason: `debriefed ${taskIds.length} task(s); archived ${result.moved}, already-moved ${result.missing}${result.errors.length ? `, ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''}`,
+    reason: `debriefed ${taskIds.length} task(s); archived ${result.moved}, already-moved ${result.missing}${result.errors.length ? `, ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''}; filed ${nowWhatItems.length} Now-What finding(s) to the brain-dump inbox`,
   };
 }
 
@@ -931,6 +980,7 @@ module.exports = {
   applyVerdictOnly,
   applyForensicsReport,
   applyDebriefReport,
+  parseDebriefNowWhatItems,
   parseBrainDumpSortResult,
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,

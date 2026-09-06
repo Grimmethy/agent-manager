@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -1119,7 +1119,7 @@ const DEBRIEF_REPORT = [
   'The one still-stuck contrast task (stuck-1) also had a real file:line cite, so this alone is not the differentiator; the difference was the size of the enclosing function.',
   '',
   'NOW WHAT',
-  '1. Cap the enclosing-function window fed to the model. Files: src/maintenance/observability-review.js. Why: the stuck task\'s function was 4x longer than any window task\'s.',
+  '1. Cap the enclosing-function window fed to the model. -- Files: src/maintenance/observability-review.js. Why: the stuck task\'s function was 4x longer than any window task\'s.',
 ].join('\n');
 
 function makeDebriefPipeline() {
@@ -1170,4 +1170,94 @@ test('applyDebriefReport: confirmed pass with no promptContext.taskIds -> clean 
   const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task: { id: 't', debriefReportConfirmedAt: 'now', promptContext: {} } });
   assert.equal(r.skipped, true);
   assert.match(r.reason, /no promptContext.taskIds/);
+});
+
+// --- parseDebriefNowWhatItems / the brain-dump route (2026-09-06) --------------------
+
+test('parseDebriefNowWhatItems: parses a single well-formed item into {title, body}', () => {
+  const items = parseDebriefNowWhatItems(DEBRIEF_REPORT);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, 'Cap the enclosing-function window fed to the model.');
+  assert.match(items[0].body, /Files: src\/maintenance\/observability-review\.js/);
+  assert.match(items[0].body, /Why: the stuck task's function was 4x longer/);
+});
+
+test('parseDebriefNowWhatItems: splits multiple numbered items correctly', () => {
+  const report = [
+    'WHAT', 'stuff shipped', '',
+    'SO WHAT', 'a pattern', '',
+    'SURVIVORSHIP-BIAS CHECK', 'checked', '',
+    'NOW WHAT',
+    '1. Do the first thing. -- Files: src/a.js. Why: reason one.',
+    '2. Do the second thing. -- Files: src/b.js. Why: reason two.',
+    '3. Do the third thing, no Files/Why markers at all.',
+  ].join('\n');
+  const items = parseDebriefNowWhatItems(report);
+  assert.equal(items.length, 3);
+  assert.equal(items[0].title, 'Do the first thing.');
+  assert.match(items[0].body, /src\/a\.js/);
+  assert.equal(items[1].title, 'Do the second thing.');
+  assert.match(items[1].body, /src\/b\.js/);
+  // No " -- " separator -- falls back to using the whole text as both title and body
+  // rather than dropping the item.
+  assert.equal(items[2].title, 'Do the third thing, no Files/Why markers at all.');
+  assert.equal(items[2].body, items[2].title);
+});
+
+test('parseDebriefNowWhatItems: NO CONFIDENT PATTERN (no NOW WHAT heading at all) yields zero items', () => {
+  const items = parseDebriefNowWhatItems('NO CONFIDENT PATTERN -- would need a larger window to see a real pattern');
+  assert.deepEqual(items, []);
+});
+
+test('parseDebriefNowWhatItems: empty/missing text yields zero items, never throws', () => {
+  assert.deepEqual(parseDebriefNowWhatItems(''), []);
+  assert.deepEqual(parseDebriefNowWhatItems(null), []);
+});
+
+test('applyDebriefReport: confirmed pass files each NOW WHAT item into queue/side-findings-inbox/ (the brain-dump route)', () => {
+  const dir = makeDebriefPipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const task = { id: 't', title: 'Pipeline debrief: x', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1'] } };
+    const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task });
+    assert.match(r.reason, /filed 1 Now-What finding\(s\)/);
+
+    const inboxDir = path.join(dir, 'queue', 'side-findings-inbox');
+    const names = fs.readdirSync(inboxDir).filter((f) => f.endsWith('.json'));
+    assert.equal(names.length, 1);
+    const filed = JSON.parse(fs.readFileSync(path.join(inboxDir, names[0]), 'utf8'));
+    assert.equal(filed.title, 'Cap the enclosing-function window fed to the model.');
+    assert.equal(filed.source, 'pipeline_debrief');
+    assert.equal(filed.taskId, 't');
+    assert.equal(filed.stage, 'now-what');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
+});
+
+test('applyDebriefReport: a report with no NOW WHAT section (NO CONFIDENT PATTERN) archives but files nothing', () => {
+  const dir = makeDebriefPipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const task = { id: 't2', title: 'Pipeline debrief: y', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1'] } };
+    const r = applyDebriefReport({ implementResponse: 'NO CONFIDENT PATTERN -- needs a bigger window', task });
+    assert.match(r.reason, /filed 0 Now-What finding\(s\)/);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'side-findings-inbox')), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
 });
