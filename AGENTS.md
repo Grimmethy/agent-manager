@@ -82,6 +82,22 @@ self-contained, tested unit of work as a race against the next `resetToMain()` -
   landed), just redo the lost piece from what's still in your own context and commit
   again immediately -- don't spend time diagnosing which specific `resetToMain()` call
   did it, the mechanism above already explains why it happened.
+- **A single logical change spanning several file edits can get split across MULTIPLE
+  stash entries** if resets land back-to-back while you're still mid-sequence (confirmed
+  live 2026-09-05: one change touching 6 files hit 3 separate resets before it was done,
+  landing across `stash@{0}`, `stash@{1}`, and `stash@{2}` simultaneously, each holding a
+  disjoint subset of the files). Popping only the newest one silently ships a fix missing
+  the rest. Before popping anything, run `git stash list` and `git stash show -p
+  stash@{N} --stat` on every entry from *before* your current work started -- if more than
+  one touches files you were just editing, pop them **oldest first** (highest index first;
+  `git stash pop stash@{N}` names a specific entry without disturbing the others) so each
+  applies cleanly on top of the last, then re-run `git status`/`grep` for your own marker
+  text to confirm the full change landed before testing or committing.
+- A "changed on disk since you last read it" notice on a file you just edited is not
+  automatically a wipe -- it also fires on your own just-applied edit. Don't assume data
+  loss from the notice alone; `grep` for a string unique to your edit (a comment, a new
+  function name) to check before spending time on recovery that isn't needed. If it comes
+  back empty, *then* treat it as a real wipe and check `git stash list`.
 
 ## queue/ is live pipeline state, not a source tree -- never hand-edit it
 
