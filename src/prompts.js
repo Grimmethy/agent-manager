@@ -1044,6 +1044,83 @@ function pipelineForensicsImplementPrompt(task, planText) {
   return assemblePrompt(stable, volatile);
 }
 
+// doc_drift_fix (2026-09-06, "Project Documentation" concept -- see drift-fix.js's own
+// header for the full incident: drift-scan.js already correctly detected README.md's
+// task-source table silently missing 6 real registered sources, every watchdog tick, but
+// nothing ever turned that into a fix). The evidence already hands over every fact
+// needed deterministically -- the real priority numbers, the real current table rows to
+// insert after, any stale row's exact text to remove -- so the drafting model's only
+// real job is writing an accurate one-line description per missing source, grounded in
+// the harness-fetched code for it, and emitting the groupBJsonInstructions edit(s).
+function driftFixPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  const missing = ctx.missingFromStatic || [];
+  const stale = ctx.staleInStatic || [];
+  return [
+    `A deterministic drift check (drift-scan.js) found ${ctx.staticFile || 'a doc'} out of sync with the live registry: ${ctx.label || '(unlabeled check)'}.`,
+    '',
+    missing.length ? `Missing from ${ctx.staticFile}: ${missing.join(', ')}` : null,
+    stale.length ? `Stale in ${ctx.staticFile} (no longer registered -- already located for you verbatim, no need to search for these): ${stale.join(', ')}` : null,
+    '',
+    `Propose one short search query PER missing name above (${missing.length || 0} total) to find its real registration code, so you can later write an accurate one-line description of what it actually does. Skip stale names entirely -- nothing to look up for those.`,
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+  ].filter((l) => l !== null).join('\n');
+}
+
+function driftFixImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- work from the current table rows and priorities alone)';
+  const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+  const priorities = ctx.priorities || {};
+  const priorityLines = Object.keys(priorities).length
+    ? Object.entries(priorities).map(([name, p]) => `- ${name}: priority ${p} (exact, real, given -- never guess or change this number)`).join('\n')
+    : '(none given -- every missing name must still get the priority shown in the plan-stage evidence above, if any)';
+  const staleRowsText = (ctx.staleRows || []).length
+    ? (ctx.staleRows || []).join('\n')
+    : '(no stale rows to remove)';
+
+  const stable = [
+    'You are fixing a DOCUMENTATION DRIFT: a deterministic scan found a static doc list out of sync with the live task-source registry. This is a small, mechanical doc edit -- not a code change, and not a judgment call about which sources matter; that judgment was already made by the live registry itself.',
+    '',
+    `For each name in "missing from ${ctx.staticFile}", add exactly ONE new table row in EXACTLY the same format as the existing rows shown in CURRENT TABLE below: a pipe-delimited row of backtick-quoted name, priority number, one-line description. Use the REAL priority number given in REAL PRIORITIES below for that name -- never guess it, never reuse a different row's number. Write the description from the REAL fetched code shown below, in the same terse style as the existing rows (what file/queue dir it reads, what it writes) -- do not invent behavior the fetched code does not show; if no real code was fetched for a name, write a minimal, honest description from the CURRENT TABLE's own row format alone rather than guessing specifics.`,
+    '',
+    'For each STALE row listed below, remove it verbatim -- it is already located for you character-for-character; do not search for it or paraphrase it.',
+    '',
+    'Insert new rows immediately after the exact CURRENT TABLE text below (that text is your `find`; your `replace` is that same text plus your new row(s) appended after it, each on its own line).',
+    '',
+    groupBJsonInstructions,
+  ];
+  const volatile = [
+    'REAL PRIORITIES (do not guess these):',
+    priorityLines,
+    '',
+    'CURRENT TABLE (last real rows -- this exact text is your insertion anchor):',
+    ctx.insertAfter || '(none)',
+    '',
+    'STALE ROWS TO REMOVE (verbatim, already located for you):',
+    staleRowsText,
+    '',
+    'Earlier you proposed search terms to locate each missing source\'s real registration:',
+    '',
+    planText,
+    '',
+    'Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+  ];
+  return assemblePrompt(stable, volatile);
+}
+
 // pipeline_debrief (2026-09-06, "The Debrief" concept -- Grimmethy: "A whole phase where we
 // go through actually completed work to analyze for patterns that can make it more
 // efficient in the future... what happened (the What), why it happened (the So What) and
@@ -1663,6 +1740,7 @@ updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlan
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('pipeline_forensics', { buildPlanPrompt: pipelineForensicsPlanPrompt, buildImplementPrompt: pipelineForensicsImplementPrompt });
 updateTaskSource('pipeline_debrief', { buildPlanPrompt: pipelineDebriefPlanPrompt, buildImplementPrompt: pipelineDebriefImplementPrompt });
+updateTaskSource('doc_drift_fix', { buildPlanPrompt: driftFixPlanPrompt, buildImplementPrompt: driftFixImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
 updateTaskSource('product_spec_outline', { buildPlanPrompt: productSpecOutlinePlanPrompt, buildImplementPrompt: productSpecOutlineImplementPrompt });
 updateTaskSource('product_spec_section', { buildPlanPrompt: productSpecSectionPlanPrompt, buildImplementPrompt: productSpecSectionImplementPrompt });
@@ -1776,6 +1854,7 @@ module.exports = {
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
+  driftFixPlanPrompt, driftFixImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.
   // Bodies stay here; archReview{Plan,Implement}Prompt also stay wired below for core

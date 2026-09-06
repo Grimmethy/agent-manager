@@ -173,4 +173,13 @@ function main() {
 
 if (require.main === module) { main(); }
 
-module.exports = { scan, checkPair, extractAll, sliceBetween };
+module.exports = {
+  scan, checkPair, extractAll, sliceBetween,
+  // Exported for drift-fix.js (2026-09-06): it needs the SAME staticStartMarker/
+  // staticEndMarker each pair used to locate its block in the first place, to
+  // deterministically re-find the real insertion point when drafting a fix -- these
+  // never lived in drift-flags.json itself (that only records the RESULT), and
+  // hand-duplicating the markers there would be exactly the kind of second copy that
+  // silently drifts from this file's own definition.
+  PAIRS,
+};

@@ -1300,6 +1300,94 @@ test('nextPipelineDebriefTask: two concurrent workers racing before markPipeline
   assert.equal(workerB, null, 'a second concurrent tick must not duplicate an already-claimed window');
 });
 
+// doc_drift_fix (2026-09-06, "Project Documentation" concept) ------------------------
+
+function writeDriftFlags(dir, flags) {
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'drift-flags.json'), JSON.stringify(flags));
+}
+
+function writeFakeReadme(dir, extraRows = []) {
+  fs.writeFileSync(path.join(dir, 'README.md'), [
+    '# agent-manager',
+    '',
+    '| Source | Priority | Reads |',
+    '|---|---|---|',
+    '| `adhoc` | 10 | `queue/adhoc/*.json` |',
+    ...extraRows,
+    '',
+    '## Building the codebase graph',
+    'unrelated section',
+  ].join('\n'));
+}
+
+test('nextDriftFixTask returns null when drift-flags.json has nothing fixable', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeFakeReadme(dir);
+  writeDriftFlags(dir, [{ label: 'x', missingFromStatic: [], staleInStatic: [] }]);
+  const { nextDriftFixTask } = freshTaskSources(dir);
+  assert.equal(nextDriftFixTask(), null);
+});
+
+test('nextDriftFixTask mints a real task with the real registry priority and a deterministic insertion anchor', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeFakeReadme(dir);
+  writeDriftFlags(dir, [{
+    label: 'README.md Built-in task sources table vs the live registry',
+    staticFile: 'README.md',
+    missingFromStatic: ['brain_dump_sort'],
+    staleInStatic: [],
+  }]);
+  const { nextDriftFixTask } = freshTaskSources(dir);
+  const task = nextDriftFixTask();
+  assert.ok(task);
+  assert.equal(task.source, 'doc_drift_fix');
+  assert.deepEqual(task.promptContext.missingFromStatic, ['brain_dump_sort']);
+  // Real priority from the live registry (42), not something the caller has to supply.
+  assert.equal(task.promptContext.priorities.brain_dump_sort, 42);
+  assert.match(task.promptContext.insertAfter, /`adhoc`/);
+});
+
+test('markDriftFixReported covers the exact gap-state so the same signature is never re-filed, but a NEW gap still is', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeFakeReadme(dir);
+  writeDriftFlags(dir, [{
+    label: 'README.md Built-in task sources table vs the live registry',
+    staticFile: 'README.md',
+    missingFromStatic: ['brain_dump_sort'],
+    staleInStatic: [],
+  }]);
+  const { nextDriftFixTask, markDriftFixReported } = freshTaskSources(dir);
+  const first = nextDriftFixTask();
+  assert.ok(first);
+  markDriftFixReported(first);
+
+  const coveragePath = path.join(dir, 'drift-fix-coverage.json');
+  assert.ok(fs.existsSync(coveragePath));
+
+  // Same exact gap-state -- covered, must not re-file.
+  assert.equal(nextDriftFixTask(), null);
+
+  // A genuinely different gap-state (a second name now also missing) is a new signature.
+  writeDriftFlags(dir, [{
+    label: 'README.md Built-in task sources table vs the live registry',
+    staticFile: 'README.md',
+    missingFromStatic: ['brain_dump_sort', 'path_prefetch_resolve'],
+    staleInStatic: [],
+  }]);
+  const second = nextDriftFixTask();
+  assert.ok(second, 'a genuinely new gap-state must still be offered');
+  assert.deepEqual(second.promptContext.missingFromStatic.sort(), ['brain_dump_sort', 'path_prefetch_resolve']);
+});
+
+test('nextDriftFixTask skips a flag whose label no longer matches any real drift-scan.js PAIRS entry', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeFakeReadme(dir);
+  writeDriftFlags(dir, [{ label: 'a label nothing defines anymore', missingFromStatic: ['x'], staleInStatic: [] }]);
+  const { nextDriftFixTask } = freshTaskSources(dir);
+  assert.equal(nextDriftFixTask(), null);
+});
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header): per-task counterpart
 // to pipeline_self_audit right above -- same coverage-timing discipline (a pure read,
 // coverage written only by markStalenessAuditReported() after writeTask() persists it).

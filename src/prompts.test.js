@@ -560,3 +560,44 @@ test('pipelineDebriefImplementPrompt: empty AVAILABLE FILES explicitly forbids a
   }, 'QUERY: x');
   assert.match(p, /none -- no real file content was fetched for this window; NOW WHAT must not include a Files: line/);
 });
+
+test('driftFixPlanPrompt names each missing source and asks for one query per name, skipping stale', () => {
+  const { driftFixPlanPrompt } = require('./prompts.js');
+  const p = driftFixPlanPrompt({
+    promptContext: { staticFile: 'README.md', label: 'README.md Built-in task sources table vs the live registry', missingFromStatic: ['change_review', 'pipeline_debrief'], staleInStatic: ['old_source'] },
+  });
+  assert.match(p, /Missing from README\.md: change_review, pipeline_debrief/);
+  assert.match(p, /Stale in README\.md.*old_source/);
+  assert.match(p, /one short search query PER missing name/i);
+  assert.match(p, /QUERY: <search terms>/);
+});
+
+test('driftFixImplementPrompt: embeds real priorities, the real insertion anchor, and pre-located stale rows verbatim', () => {
+  const { driftFixImplementPrompt } = require('./prompts.js');
+  const p = driftFixImplementPrompt({
+    promptContext: {
+      staticFile: 'README.md',
+      missingFromStatic: ['change_review'],
+      staleInStatic: ['old_source'],
+      priorities: { change_review: 60 },
+      insertAfter: '| `unused_export` | 90 | queue/dead-code-flags.json |',
+      staleRows: ['| `old_source` | 55 | some old thing |'],
+      harnessHits: [{ file: 'src/task-sources.js', line: 100, query: 'change_review', text: "registerTaskSource('change_review', ...)" }],
+      harnessFiles: [],
+    },
+  }, 'QUERY: change_review');
+  assert.match(p, /DOCUMENTATION DRIFT/);
+  assert.match(p, /change_review: priority 60 \(exact, real, given -- never guess or change this number\)/);
+  assert.match(p, /\| `unused_export` \| 90 \| queue\/dead-code-flags\.json \|/);
+  assert.match(p, /\| `old_source` \| 55 \| some old thing \|/);
+  assert.match(p, /src\/task-sources\.js:100/);
+  assert.match(p, /mode.*edit.*find.*replace/s);
+});
+
+test('driftFixImplementPrompt: no stale rows renders an explicit "nothing to remove" line, not an empty section', () => {
+  const { driftFixImplementPrompt } = require('./prompts.js');
+  const p = driftFixImplementPrompt({
+    promptContext: { staticFile: 'README.md', missingFromStatic: ['x'], staleInStatic: [], priorities: { x: 5 }, insertAfter: '| `a` | 1 | b |', staleRows: [], harnessHits: [], harnessFiles: [] },
+  }, 'QUERY: x');
+  assert.match(p, /\(no stale rows to remove\)/);
+});

@@ -113,6 +113,7 @@ registry), so it stays honest across the plugin boundary. Priorities 30/50/60 ar
 | `pipeline_health_audit` | 90 | periodic deterministic check of the pipeline's own health signals; files an advisory |
 | `ui_visibility_audit` | 63 | checks pipeline state a human needs is surfaced in the dashboard; files an advisory for a gap |
 | `staleness_audit` | 91 | `queue/blocked/*.json` + `queue/needs-clarification/*.json` — flags an old or repeatedly-rejected task for a human to re-check; never applies anything |
+| `doc_drift_fix` | 68 | `queue/drift-flags.json` (written every watchdog tick by `drift-scan.js`) — turns a detected "static doc list drifted from the live registry" gap (e.g. this very table missing a row) into a real, grounded edit: the missing row's priority comes straight from the registry, never guessed |
 
 ## Building the codebase graph (`arch_discovery`'s input)
 
