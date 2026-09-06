@@ -416,6 +416,20 @@ test('adhocPlanPrompt: no seed block when task has no _seedPlan', () => {
   assert.doesNotMatch(prompt, /PRIOR attempt on this exact task/);
 });
 
+test('adhocPlanPrompt: no brain-dump directive for an ordinary adhoc task with no brainDumpEntryId', () => {
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'fix the bug in foo.js' } });
+  assert.doesNotMatch(prompt, /captured research finding/);
+});
+
+test('adhocPlanPrompt: a brain_dump_sort-spawned task gets the open-endedness directive, before the standard PLAN instruction', () => {
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'design option: do X', brainDumpEntryId: 'bd-123' } });
+  assert.match(prompt, /captured research finding or design recommendation/);
+  assert.match(prompt, /pick the most direct, concrete first step/);
+  const directiveIdx = prompt.indexOf('captured research finding');
+  const planIdx = prompt.indexOf('Write a numbered, actionable PLAN');
+  assert.ok(directiveIdx < planIdx, 'directive must appear before the standard PLAN instruction');
+});
+
 test('adhocPlanPrompt: a _seedPlan is embedded as a trailing "improve this" block, after the stable instructions', () => {
   const seed = '1. step one\n2. step two\n3. step three';
   const task = { domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' }, _seedPlan: seed };

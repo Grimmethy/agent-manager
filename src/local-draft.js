@@ -966,7 +966,23 @@ async function runPlanPass(task, {
   delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
   delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
 
-  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
+  // 2026-09-06: root-caused live -- 19 brain_dump_sort-spawned adhoc tasks ("implement
+  // this research finding/design option") ALL blocked "Plan pass degenerate: truncated"
+  // with EXACTLY 3/3 internal call() retries and 0 visible chars every time, regardless
+  // of promptContext.rawText length (396 to 1,619 chars, no correlation) -- ruling out
+  // "input too large" as the cause. These are fundamentally more open-ended than a
+  // typical concrete-bug-fix adhoc task ("here's a finding, figure out how to approach
+  // it" vs. "fix this specific thing"), and think:true reasoning apparently indulges
+  // extensively on that open-endedness before ever emitting visible plan text, hitting
+  // the 1400-token ceiling identically on every attempt -- a genuinely different failure
+  // shape from a stochastic partial truncation. 2800 matches adhoc-harness-draft.js's
+  // own real precedent for a similarly demanding pass (its implement call), not an
+  // arbitrary guess. Keyed on promptContext.brainDumpEntryId (a real structured field,
+  // not a text-content heuristic) -- present on every brain_dump_sort-spawned adhoc
+  // task; a higher ceiling costs nothing for a task that doesn't need it, since
+  // numPredict only bounds the MAXIMUM, never forces more tokens to be spent.
+  const planNumPredict = (task.promptContext && task.promptContext.brainDumpEntryId) ? 2800 : 1400;
+  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
   let planResult = await callPlan();
