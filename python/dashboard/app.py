@@ -2410,6 +2410,19 @@ def api_task_requeue(state, task_id):
     let a manually-requeued task block again after fewer real attempts than a task hitting
     that cap for the first time gets.
 
+    2026-09-06, real incident: a stacked file-decompose sub-task (seq 2 of 5, sharing one
+    branch with its 4 siblings -- see file-decompose-to-hub.js) blocked on a sustained
+    Ollama infra outage. Its `stacked` field -- {branch, seq, total}, the ONLY thing that
+    ties it back to the shared branch and its position in the sequence -- is a TOP-LEVEL
+    task field, not part of promptContext, so the "fresh" rebuild below silently dropped it
+    on every requeue: a human clicking Requeue on a stuck stacked sub-task would have
+    detached it from its hub, breaking the coordination with no error and no visible sign
+    anything was wrong until the wiring step later found the branch missing pieces.
+    `dependsOn` (also file-decompose-to-hub.js, and consumed by nextAdhocTask's/
+    coordinator-sweep.js's dependency gate) is the identical shape -- a top-level field a
+    generic reset has no way to know matters. Both preserved explicitly now, when present,
+    rather than trusting this allowlist to anticipate every future coordination field.
+
     'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
     api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
     'archived', not 'done', so this must be handled as a separate lookup path rather than
@@ -2471,6 +2484,13 @@ def api_task_requeue(state, task_id):
         "createdAt": now_iso,
         "history": [{"status": "pending", "at": now_iso, "note": f"manually requeued from {state}/"}],
     }
+    # Coordination fields (see this endpoint's own docstring) -- never part of the
+    # drafting/review/apply history this reset is meant to clear, so always carried over
+    # verbatim when present rather than silently dropped.
+    if "stacked" in data:
+        fresh["stacked"] = data["stacked"]
+    if "dependsOn" in data:
+        fresh["dependsOn"] = data["dependsOn"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     return jsonify({"id": task_id, "requeued": True})
