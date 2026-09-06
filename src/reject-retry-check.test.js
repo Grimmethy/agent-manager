@@ -364,7 +364,7 @@ test('a NON-adhoc task carrying retryableDraftBlock is NOT requeued (guarded on 
 // unchanged file on every retry -- so a blind requeue can only ever reproduce the
 // identical failure. Must escalate on the FIRST rejection, not after burning the full
 // retry cap on guaranteed repeats.
-const { hasUnreliableGrounding } = require('./reject-retry-check.js');
+const { hasUnreliableGrounding } = require('./blocked-task-classifiers.js');
 
 function unreliableGroundingTask(overrides = {}) {
   return {
@@ -507,4 +507,40 @@ test('a plain review rejection with no needsClarification field at all is unaffe
 
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
   assert.equal(summary.requeued, 1);
+});
+
+// --- unified fault-side registry (2026-09-06) -----------------------------------------
+// reject-retry-check.js now consults src/blocked-task-classifiers.js's
+// classifyBlockedTask() for the non-retryable decision, generalizing AC-13b's specific
+// "already carries needsClarification.reason==='external-dependency'" check to "already
+// carries ANY needsClarification, from ANY prior mechanism" -- once a human decision is
+// flagged, nothing here should ever re-decide it.
+test('a task carrying a needsClarification for an UNRELATED reason (not external-dependency) is also left untouched', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'some-other-nc', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'stale rejection from an earlier cycle', localRejectCount: 0, history: [],
+    needsClarification: { reason: 'design-decision', openQuestions: 'some unrelated prior question' },
+  };
+  fs.writeFileSync(path.join(d.adhocDir, 'some-other-nc.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'some-other-nc.json'), 'utf8'));
+  assert.equal(out.needsClarification.reason, 'design-decision', 'left exactly as it was, never re-decided');
+  assert.equal(out.localRejectCount, 0);
+});
+
+test('a non-retryable classification with no pre-existing needsClarification stamps one using the classifier registry, with category+faultSide in the history detail', () => {
+  const d = setupAdhocDirs();
+  const task = unreliableGroundingTask({ localRejectCount: 0 });
+  fs.writeFileSync(path.join(d.blockedDir, 'pff-ac8.json'), JSON.stringify(task));
+
+  rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  const out = JSON.parse(fs.readFileSync(path.join(d.needsClarificationDir, 'pff-ac8.json'), 'utf8'));
+  const ncEvent = out.history.find((h) => h.stage === 'needs-clarification');
+  assert.match(ncEvent.detail, /unreliable-grounding \(harness-side\)/);
 });
