@@ -196,6 +196,27 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       if (!isReviewRejection(task) && !retryableDraftBlock) continue;
 
+      // AC-13b (2026-09-06): a task the AC-13a feasibility gate (local-agentic-write-
+      // draft.js's detectExternalDependency) already stamped external-dependency is
+      // externally-impossible for THIS sandbox, full stop -- no amount of blind
+      // re-queueing into the local-agentic-write tier can ever change that. Skip it here
+      // even if it also carries a stale blockedStage:'review' from an earlier, unrelated
+      // rejection cycle (a realistic sequence: rejected at review, re-queued, then hit the
+      // feasibility gate on the redraft) -- that history must never re-enable the loop
+      // AC-13a exists specifically to close. A single unconditional `continue` here
+      // covers BOTH the under-cap requeue path and the at-cap exhaustion/needs-
+      // clarification escalation below (the source candidate's own spec proposed two
+      // separate guards, one per branch -- unnecessary, since exiting the loop this early
+      // means an external-dependency task can never reach either branch in the first
+      // place, and a second, more specific reason string can never be overwritten by the
+      // generic 'design-decision' one).
+      if (task.needsClarification && task.needsClarification.reason === 'external-dependency') {
+        // summary.checked was already incremented above when this entry was parsed --
+        // the candidate's own spec text called for a second increment here, which would
+        // have double-counted this entry against summary.checked.
+        continue;
+      }
+
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
       // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must

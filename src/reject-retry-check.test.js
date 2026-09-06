@@ -443,3 +443,68 @@ test('a task with only strong/weak-confidence grounding is NOT escalated -- fall
   assert.equal(summary.requeued, 1);
   assert.equal(summary.exhausted, 0);
 });
+
+// --- AC-13b: guard against blind re-queueing of feasibility-gated tasks (2026-09-06) --
+// AC-13a (local-agentic-write-draft.js's detectExternalDependency) stamps
+// needsClarification.reason='external-dependency' on a task that's structurally
+// impossible for the sandbox. A stale blockedStage:'review' from an earlier, unrelated
+// rejection cycle must never let this sweep blindly re-queue it back into the
+// local-agentic-write tier -- retrying can never change "this needs a human to
+// provision an external resource first."
+
+test('a review-rejected task ALSO stamped external-dependency is never requeued, under the cap', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'ext-under-cap', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'stale rejection from an earlier cycle', localRejectCount: 0, history: [],
+    needsClarification: { reason: 'external-dependency', openQuestions: ['confirm the resource'] },
+  };
+  fs.writeFileSync(path.join(d.adhocDir, 'ext-under-cap.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'ext-under-cap.json')), 'left exactly where it was, not re-queued into the write tier');
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'ext-under-cap.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 0, 'never touched -- not treated as a spent retry');
+});
+
+test('a review-rejected task ALSO stamped external-dependency at the retry cap is left alone, not re-stamped design-decision', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'ext-at-cap', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'never produced a real diff', localRejectCount: 2, history: [],
+    needsClarification: { reason: 'external-dependency', openQuestions: ['confirm the resource'] },
+  };
+  fs.writeFileSync(path.join(d.adhocDir, 'ext-at-cap.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 0, 'must not run the generic exhaustion/escalation path at all');
+  assert.ok(!fs.existsSync(path.join(d.needsClarificationDir, 'ext-at-cap.json')), 'not moved -- it is already the caller\'s job to have filed this appropriately');
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'ext-at-cap.json'), 'utf8'));
+  assert.equal(out.needsClarification.reason, 'external-dependency', 'the specific reason must survive untouched, never overwritten with the generic design-decision one');
+});
+
+test('checked is incremented exactly once for a skipped external-dependency task, not twice', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'ext-count', domain: 'adhoc', source: 'manual', status: 'blocked',
+    blockedStage: 'review', blockedReason: 'r', localRejectCount: 0, history: [],
+    needsClarification: { reason: 'external-dependency', openQuestions: [] },
+  };
+  fs.writeFileSync(path.join(d.adhocDir, 'ext-count.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.checked, 1);
+});
+
+test('a plain review rejection with no needsClarification field at all is unaffected by the AC-13b guard', () => {
+  const d = setupAdhocDirs();
+  const task = { id: 'ordinary', domain: 'adhoc', source: 'manual', blockedStage: 'review', blockedReason: 'r', localRejectCount: 0, history: [] };
+  fs.writeFileSync(path.join(d.blockedDir, 'ordinary.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+});

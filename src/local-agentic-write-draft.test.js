@@ -76,6 +76,56 @@ test('write tier: disabled via the shared queue/.chat-write-tools-disabled kill 
   });
 });
 
+// --- AC-13a: external-dependency feasibility gate (2026-09-06) -----------------------
+// Real field names verified against this codebase's actual task shape -- NOT task.ask/
+// task.plan (those fields don't exist anywhere here). See detectExternalDependency's
+// own header.
+test('detectExternalDependency matches each real marker category via title/rawText/planResponse', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({ title: 'Create a new repo for this' }), 'creating a new repo');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'deploy to production' } }), 'hosting/deploying/publishing');
+  assert.equal(detectExternalDependency({ planResponse: 'run git push origin main' }), 'a git remote operation');
+  assert.equal(detectExternalDependency({ title: 'add the API key to config' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
+});
+
+test('detectExternalDependency returns null for an ordinary local code task', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({ title: 'Fix the off-by-one in countPending', promptContext: { rawText: 'narrow the catch block' } }), null);
+  assert.equal(detectExternalDependency({}), null);
+});
+
+test('write tier: a task requiring an external resource is blocked with needsClarification BEFORE any model call', async () => {
+  await withRepo(async () => {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const task = { id: 'w-ext', source: 'manual', title: 'Create a new repo for the plugin', promptContext: { rawText: 'we need a fresh repo' } };
+    const res = await draftAdhocViaLocalAgenticWrite(task, {
+      runInWorktree: async () => { throw new Error('must not spend a single turn on an externally-impossible task'); },
+    });
+    assert.equal(res.succeeded, true);
+    assert.equal(res.blocked, true);
+    assert.match(res.blockedReason, /external-state operation \(creating a new repo\)/);
+    assert.equal(res.needsClarification.reason, 'external-dependency');
+    assert.match(res.needsClarification.openQuestions[0], /creating a new repo/);
+  });
+});
+
+test('write tier: a task whose PLAN (not the original ask) reveals an external dependency is still caught', async () => {
+  await withRepo(async () => {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const task = {
+      id: 'w-ext-plan', source: 'manual', title: 'Wire up the notification feature',
+      promptContext: { rawText: 'add notifications when a task completes' },
+      planResponse: 'Plan: call an external API (Twilio) to send the SMS notification.',
+    };
+    const res = await draftAdhocViaLocalAgenticWrite(task, {
+      runInWorktree: async () => { throw new Error('must not run once the plan reveals an external dependency'); },
+    });
+    assert.equal(res.blocked, true);
+    assert.equal(res.needsClarification.reason, 'external-dependency');
+  });
+});
+
 test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks + the 4 RESOLUTION verbs', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
