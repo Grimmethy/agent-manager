@@ -333,23 +333,34 @@ function nextAdhocTask() {
     return null;
   }
 
+  // File-decompose children (task.atomic===true, set by file-decompose-to-hub.js) are an
+  // already-in-progress multi-step job -- a stuck one blocks its whole hub AND every
+  // sibling still waiting on `dependsOn` -- so they jump ahead of ordinary/brain-dump adhoc
+  // work within this same priority-10 lane, rather than competing purely on mtime against
+  // an ever-growing organic research backlog. (2026-09-06, Grimmethy: "Give decompose
+  // children a priority bump above generic adhoc/brain-dump work" -- root-caused live: a
+  // stacked decompose sub-task sat ready for 25+ minutes because both reasoning-tier
+  // worker lanes were saturated with older, unrelated brain-dump tasks that happened to
+  // have earlier mtimes.) Parsed once here and carried through to the loop below instead
+  // of re-reading each file twice.
   const files = entries
     .filter((e) => e.isFile() && e.name.endsWith('.json'))
     .map((e) => {
       const full = path.join(adhocDir, e.name);
-      return { full, mtime: fs.statSync(full).mtimeMs };
+      const mtime = fs.statSync(full).mtimeMs;
+      let parsed = null;
+      try { parsed = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { /* handled below via null parsed */ }
+      return { full, mtime, parsed, isDecomposeChild: !!(parsed && parsed.atomic) };
     })
-    .sort((a, b) => a.mtime - b.mtime);
+    .sort((a, b) => (a.isDecomposeChild === b.isDecomposeChild
+      ? a.mtime - b.mtime
+      : (a.isDecomposeChild ? -1 : 1)));
 
   for (const f of files) {
-    let parsed;
-    try {
-      parsed = JSON.parse(fs.readFileSync(f.full, 'utf8'));
-    } catch {
-      continue;
-    }
+    const parsed = f.parsed;
+    if (!parsed) continue;
 
-    if (!parsed || typeof parsed.id !== 'string' || !parsed.id.trim()) continue;
+    if (typeof parsed.id !== 'string' || !parsed.id.trim()) continue;
 
     const id = parsed.id.trim();
     if (taskIdExistsInQueue(id)) continue;
