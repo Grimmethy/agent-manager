@@ -251,7 +251,17 @@ _LOCAL_SYSTEM_PROMPT = (
     "worker-reasoning-p40, reviewer, watchdog) and check `lastHeartbeat` is recent (a live "
     "instance heartbeats roughly every tick, well under a minute stale) -- the exact same "
     "signal this codebase's own Test-InstanceLiveness/check_instance_liveness and "
-    "dead-process-check.js already use as their sole source of truth."
+    "dead-process-check.js already use as their sole source of truth.\n\n"
+    "Also: watchdog's own sweeps (coordinator-sweep.js, decompose-loop-autoroute.js, "
+    "blocked-drain.js, staleness/context-trim sweeps, ...) are NOT separate daemons with "
+    "their own instanceId -- watchdog invokes each as a plain one-shot `node <script>.js` "
+    "subprocess once per tick, then it exits. `ps aux | grep decompose` (or any sweep name) "
+    "will ALWAYS show nothing between ticks even when the sweep is working perfectly -- see "
+    "CONTEXT.md's own \"Watchdog sweep\" glossary entry. If watchdog's heartbeat is fresh, "
+    "every sweep it owns is exactly that alive; to confirm one actually ran recently and "
+    "what it did, read its own log under ~/.local/state/agent-manager/logs/ (e.g. "
+    "coordinator-sweep.log) or the task-level evidence it leaves (a stalenessFlag, an "
+    "advisory history entry, a moved queue file) -- never a process-name search."
 )
 
 
