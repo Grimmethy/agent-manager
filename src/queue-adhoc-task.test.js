@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const { queueAdhocTask, defaultTaskDomain } = require('./queue-adhoc-task.js');
 
 function tmpPipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
@@ -14,7 +14,7 @@ function tmpPipeline() {
   return dir;
 }
 
-test('queueAdhocTask writes the expected record shape and defaults domain to the first entry', () => {
+test('queueAdhocTask writes the expected record shape and defaults domain to "default"', () => {
   const dir = tmpPipeline();
   const { record, filePath } = queueAdhocTask(
     { title: 'Merge AC-57', promptContext: { rawText: 'merge it', raisedFrom: 'chat' } },
@@ -28,6 +28,34 @@ test('queueAdhocTask writes the expected record shape and defaults domain to the
   assert.ok(fs.existsSync(filePath));
   const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf8'));
   assert.deepEqual(onDisk, record);
+});
+
+// Port of app.py's default_task_domain() (2026-09-06): picking the first key with no
+// regard for whether it's a sane generic default once queued two real tasks with
+// domain='adhoc' into a project whose task-domains.json didn't even list 'adhoc',
+// permanently blocking them with "Unknown task domain: adhoc".
+test('defaultTaskDomain prefers "default" even when it is not the first key', () => {
+  assert.equal(defaultTaskDomain(['zzz_first', 'default', 'adhoc']), 'default');
+});
+
+test('defaultTaskDomain falls back to "adhoc" when "default" is absent', () => {
+  assert.equal(defaultTaskDomain(['zzz_first', 'adhoc']), 'adhoc');
+});
+
+test('defaultTaskDomain falls back to the first key only when neither preferred candidate exists', () => {
+  assert.equal(defaultTaskDomain(['deep_dive', 'project_search']), 'deep_dive');
+});
+
+test('queueAdhocTask uses defaultTaskDomain, not a bare first-key lookup, when no domain is given', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  // 'deep_dive' is deliberately first here -- a bare validDomains[0] would wrongly pick
+  // it; defaultTaskDomain must still find and prefer 'default'.
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ deep_dive: {}, default: {} }));
+  const { record } = queueAdhocTask(
+    { title: 'X', promptContext: {} },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal(record.domain, 'default');
 });
 
 test('queueAdhocTask respects an explicit domain', () => {
