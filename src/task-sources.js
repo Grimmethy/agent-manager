@@ -1805,7 +1805,18 @@ function nextPipelineDebriefTask() {
   const bundle = debriefBundle.buildDebriefBundle({ pipelineDir, dbPath, sinceIso: coverage.lastDebriefedAt, now });
   if (!bundle.evidenceText) return null;
 
-  const id = `pipeline-debrief-${slugifyForId(bundle.windowEnd).slice(0, 40)}-${now}`;
+  // Deterministic id (windowEnd only, NO Date.now() suffix) -- confirmed live 2026-09-06:
+  // two workers (worker-1, worker-p40) ticked ~335ms apart, both read the SAME
+  // debrief-coverage.json cursor (neither had written markPipelineDebriefReported() yet),
+  // computed the IDENTICAL window, and a trailing `-${now}` made their ids differ, so
+  // taskIdExistsInQueue(id) below -- which already scans queue/drafting/*/ specifically to
+  // catch exactly this cross-worker race -- never saw the collision and both ended up
+  // independently drafting (and, left alone, would have both archived) the same 25 tasks.
+  // windowEnd is a real done/ task's own terminal timestamp; once a debrief consumes it the
+  // cursor moves past it forever, so it can never recur as a windowEnd again -- safe as the
+  // sole idempotency key, and it's the SAME "no Date.now() in the id" trick every truly
+  // idempotent generator in this file already relies on (e.g. AC-NNN-keyed fulfillment ids).
+  const id = `pipeline-debrief-${slugifyForId(bundle.windowEnd).slice(0, 60)}`;
   if (taskIdExistsInQueue(id)) return null;
 
   return {

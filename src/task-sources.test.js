@@ -1274,6 +1274,32 @@ test('markPipelineDebriefReported advances the cursor so the next call never re-
   assert.ok(second.promptContext.taskIds.every((id) => id.startsWith('second-')), 'must not re-include the already-covered first window');
 });
 
+test('nextPipelineDebriefTask: two concurrent workers racing before markPipelineDebriefReported() persists do NOT mint two tasks for the same window (regression, 2026-09-06)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-debrief-test-'));
+  const { MIN_WINDOW_TASKS } = require('./debrief-bundle.js');
+  for (let i = 0; i < MIN_WINDOW_TASKS; i++) {
+    writeDoneTaskForDebrief(dir, `race-${i}`, `2026-09-0${1 + (i % 8)}T0${i % 8}:00:00Z`);
+  }
+  const { nextPipelineDebriefTask } = freshTaskSourcesForDebrief(dir);
+
+  // Worker A's tick: computes the window, mints a task, "claims" it by writing the file
+  // into its own drafting/ subfolder -- exactly what local-worker.sh does after a
+  // generator call returns, and BEFORE this same CLI invocation ever reaches
+  // markPipelineDebriefReported() (debrief-coverage.json is deliberately left untouched
+  // here, simulating the real race window).
+  const workerA = nextPipelineDebriefTask();
+  assert.ok(workerA);
+  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-a');
+  fs.mkdirSync(draftingDir, { recursive: true });
+  fs.writeFileSync(path.join(draftingDir, `${workerA.id}.json`), JSON.stringify(workerA, null, 2));
+
+  // Worker B's tick, moments later, same unchanged coverage cursor -- must see worker A's
+  // already-claimed id (now deterministic) via taskIdExistsInQueue and back off instead of
+  // minting a second task for the identical 12-task window.
+  const workerB = nextPipelineDebriefTask();
+  assert.equal(workerB, null, 'a second concurrent tick must not duplicate an already-claimed window');
+});
+
 // staleness_audit (2026-08-22, see staleness-audit.js's own header): per-task counterpart
 // to pipeline_self_audit right above -- same coverage-timing discipline (a pure read,
 // coverage written only by markStalenessAuditReported() after writeTask() persists it).
