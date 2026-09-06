@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 
 const {
-  autoConfirmReview, classifyVote, parseDeleteItems, buildForensicsConfirmPrompt,
+  autoConfirmReview, classifyVote, parseDeleteItems, buildForensicsConfirmPrompt, buildDebriefConfirmPrompt,
 } = require('./auto-confirm-review.js');
 
 function makePipeline() {
@@ -37,6 +37,12 @@ const FORENSICS = {
   id: 'pf-1', source: 'pipeline_forensics', status: 'awaiting-confirm', history: [],
   title: 'Pipeline forensics: observability_review',
   implementResponse: 'ROOT CAUSE RANKING\n1. ...\nRECOMMENDED FOLLOW-UP FIX\nFiles: src/prompts.js',
+};
+const DEBRIEF = {
+  id: 'pd-1', source: 'pipeline_debrief', status: 'awaiting-confirm', history: [],
+  title: 'Pipeline debrief: 25 completed tasks',
+  promptContext: { windowStart: '2026-09-06T00:00:00.000Z', windowEnd: '2026-09-06T01:00:00.000Z', taskIds: ['t1', 't2'] },
+  implementResponse: 'WHAT\nstuff shipped\n\nSO WHAT\na pattern\n\nSURVIVORSHIP-BIAS CHECK\nchecked\n\nNOW WHAT\n1. Do a thing. -- Files: src/a.js. Why: reason.',
 };
 const DELETE_BATCH = {
   id: 'ob-1', source: 'observability_fix', status: 'awaiting-confirm', history: [],
@@ -92,6 +98,40 @@ test('confident DENY: forensics task is archived to _archived_no_action/', async
   assert.ok(!exists(at(dir, 'awaiting-confirm', 'pf-1')));
   const arch = read(at(dir, 'done/_archived_no_action', 'pf-1'));
   assert.equal(arch.status, 'done');
+  assert.equal(arch.autoConfirmDecision, 'deny');
+  assert.match(arch.doneMarker, /auto-denied/);
+});
+
+test('debrief prompt includes the report and the window summary', () => {
+  const p = buildDebriefConfirmPrompt(DEBRIEF);
+  assert.match(p, /WHAT/);
+  assert.match(p, /NOW WHAT/);
+  assert.match(p, /2 completed task\(s\)/);
+  assert.match(p, /CONFIRM: /);
+  assert.match(p, /DENY: /);
+});
+
+test('confident CONFIRM: debrief task moves to approved/ with debriefReportConfirmedAt', async () => {
+  const dir = makePipeline();
+  put(dir, DEBRIEF);
+  const s = await autoConfirmReview({ ...commonArgs(dir), majorityVote: voteOf('CONFIRM', 'grounded in real task ids and costs') });
+
+  assert.deepEqual({ confirmed: s.confirmed, denied: s.denied, escalated: s.escalated }, { confirmed: 1, denied: 0, escalated: 0 });
+  assert.ok(!exists(at(dir, 'awaiting-confirm', 'pd-1')));
+  const moved = read(at(dir, 'approved', 'pd-1'));
+  assert.ok(moved.debriefReportConfirmedAt, 'gate stamp set');
+  assert.ok(!moved.forensicsReportConfirmedAt, 'only the debrief gate stamp');
+  assert.equal(moved.autoConfirmDecision, 'confirm');
+});
+
+test('confident DENY: debrief task is archived to _archived_no_action/', async () => {
+  const dir = makePipeline();
+  put(dir, DEBRIEF);
+  const s = await autoConfirmReview({ ...commonArgs(dir), majorityVote: voteOf('DENY', 'NOW WHAT is vague hand-waving') });
+
+  assert.equal(s.denied, 1);
+  assert.ok(!exists(at(dir, 'awaiting-confirm', 'pd-1')));
+  const arch = read(at(dir, 'done/_archived_no_action', 'pd-1'));
   assert.equal(arch.autoConfirmDecision, 'deny');
   assert.match(arch.doneMarker, /auto-denied/);
 });

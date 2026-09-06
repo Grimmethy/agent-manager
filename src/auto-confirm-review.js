@@ -6,11 +6,15 @@
 // re-run) or Deny (archive). Grimmethy: "If it's important to have a review gate, feed it
 // to the review worker." -- so this sweep makes that call automatically.
 //
-// Two gates currently reach awaiting-confirm/ (see apply-task.js:296 and
-// apply-group-a.js:applyForensicsReport):
+// Three gates currently reach awaiting-confirm/ (see apply-task.js:296 and
+// apply-group-a.js:applyForensicsReport/applyDebriefReport):
 //   1. a Group B batch containing a { mode: 'delete' } item  -> held before any git/disk op
 //   2. a pipeline_forensics ranked root-cause report         -> held before its RECOMMENDED
 //      FOLLOW-UP FIX is filed as an AC-NNN candidate in Docs/PIPELINE_FIX_CANDIDATES.md
+//   3. a pipeline_debrief What/So-What/Now-What report       -> held before its window's
+//      done/ tasks are archived and its Now-What items filed into the brain-dump inbox
+//      (2026-09-06, real incident: priority-1 debrief backpressure produced 40 real reports
+//      before any human confirmed even one -- "I'm not going to go through that manually")
 //
 // For each held task this sweep runs a small local majority vote (CONFIRM / DENY):
 //   CONFIRM (confident)  -> stamp the gate's *ConfirmedAt + move to queue/approved/; the
@@ -87,6 +91,51 @@ function buildForensicsConfirmPrompt(task, candidatesDocText) {
     'If you genuinely cannot decide, do not force it -- a non-answer leaves it for a human.',
     'Answer with EXACTLY one line, nothing after it:',
     'CONFIRM: <one sentence why this fix is worth filing and not a duplicate>',
+    'or',
+    'DENY: <one sentence why not>',
+  ].join('\n');
+}
+
+// --- debrief gate -----------------------------------------------------------
+// 2026-09-06, real incident: priority-1 pipeline_debrief backpressure (Grimmethy watching
+// the mechanism work) plus an old, near-instant-timestamped batch of 25 observability_review
+// tasks (from the earlier silent-catch-block bulk pass) meant the pipeline generated 40 real
+// debrief reports before any human confirmed even one -- "I'm not going to go through that
+// manually." Same CONFIRM/DENY local-vote gate as the forensics one above: pipeline_debrief
+// reports already passed real majority review (2/3+ Ornith votes) before ever reaching here,
+// so this is the same narrow second check forensics gets -- is it actually safe to act on the
+// CONSEQUENCE of confirming (archive this window's done/ tasks, file its Now-What items into
+// the brain-dump inbox) -- not a re-review of quality from scratch. CONFIRM stamps
+// debriefReportConfirmedAt (the field applyDebriefReport's second pass checks); DENY archives
+// the report itself to done/_archived_no_action/ -- the window's own done/ tasks are simply
+// never archived by this mechanism (they still age out via done-archive.js's ordinary
+// time-based sweep eventually, so nothing is lost, just not fast-tracked).
+function buildDebriefConfirmPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'You are the confirmation gate for a pipeline_debrief What/So-What/Now-What report.',
+    'The report has ALREADY passed a review that judged it well-formed. Your ONLY decision',
+    'now: is it safe to (1) archive this window\'s done/ tasks, and (2) file its Now-What',
+    'items into the brain-dump inbox for further triage?',
+    '',
+    `TITLE: ${task.title || '(none)'}`,
+    `WINDOW: ${ctx.windowStart || '?'} .. ${ctx.windowEnd || '?'}  (${(ctx.taskIds || []).length} completed task(s))`,
+    '',
+    'THE REPORT:',
+    clip(task.implementResponse, 4500),
+    '',
+    'CONFIRM if the report is grounded in the evidence it was given -- real task ids,',
+    '  real-looking costs/timings/attempt counts, a NOW WHAT that (if present) names real',
+    '  src/ files -- even if the window itself is unremarkable or the finding is modest.',
+    '  A short, narrow, well-evidenced report is exactly as valid as a dramatic one.',
+    'DENY if: the report is "NO CONFIDENT PATTERN" with no real content around it; it',
+    '  invents a file/symbol/task id not plausibly from the evidence; it contradicts itself',
+    '  (e.g. claims a survivorship-bias contrast it never actually checked); or NOW WHAT is',
+    '  vague hand-waving with no real file cited.',
+    '',
+    'If you genuinely cannot decide, do not force it -- a non-answer leaves it for a human.',
+    'Answer with EXACTLY one line, nothing after it:',
+    'CONFIRM: <one sentence why this report is grounded and safe to act on>',
     'or',
     'DENY: <one sentence why not>',
   ].join('\n');
@@ -235,13 +284,17 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
 
     summary.checked += 1;
     const isForensics = task.source === 'pipeline_forensics';
-    const deleteItems = isForensics ? [] : parseDeleteItems(task.implementResponse);
+    const isDebrief = task.source === 'pipeline_debrief';
+    const deleteItems = (isForensics || isDebrief) ? [] : parseDeleteItems(task.implementResponse);
 
     let prompt;
     let gateStamp;
     if (isForensics) {
       prompt = buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath));
       gateStamp = 'forensicsReportConfirmedAt';
+    } else if (isDebrief) {
+      prompt = buildDebriefConfirmPrompt(task);
+      gateStamp = 'debriefReportConfirmedAt';
     } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
       const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file));
       prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
@@ -325,6 +378,7 @@ module.exports = {
   classifyVote,
   clip,
   buildForensicsConfirmPrompt,
+  buildDebriefConfirmPrompt,
   buildDeleteConfirmPrompt,
   parseDeleteItems,
   gatherDeleteReferences,
