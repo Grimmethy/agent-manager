@@ -947,6 +947,45 @@ test('nextAdhocTask still carries preDrafted/implementResponse/planResponse thro
   assert.equal(task.planResponse, 'the real plan');
 });
 
+// 2026-09-06, Grimmethy: "Give decompose children a priority bump above generic adhoc/
+// brain-dump work" -- root-caused live: a stacked file-decompose sub-task (task.atomic:
+// true) sat ready in queue/adhoc/ for 25+ minutes while both reasoning-tier worker lanes
+// churned through an ever-growing organic brain-dump backlog with older mtimes. All of it
+// shares the same registered 'adhoc' source/priority, so the only lever available is
+// nextAdhocTask()'s own internal ordering: a decompose child (atomic:true) now sorts
+// ahead of ordinary adhoc/brain-dump candidates regardless of mtime.
+test('nextAdhocTask picks an atomic (file-decompose child) candidate ahead of an older ordinary adhoc task', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Written FIRST -- older mtime, would win under plain FIFO.
+  writeAdhocFile(dir, 'a-ordinary.json', {
+    id: 'adhoc-brain-dump-ordinary-1',
+    title: 'An ordinary brain-dump-derived task',
+  });
+  // Written SECOND -- newer mtime, but atomic:true must still win.
+  writeAdhocFile(dir, 'b-decompose-child.json', {
+    id: 'adhoc-decompose-hub-x-02-child',
+    title: 'A stacked file-decompose move child',
+    atomic: true,
+    stacked: { branch: 'agent/decompose-hub-x', seq: 2, total: 3 },
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-decompose-hub-x-02-child', 'the atomic decompose child must win despite its newer mtime');
+});
+
+test('nextAdhocTask still applies oldest-first FIFO within each tier (two ordinary tasks, or two decompose children)', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });
+  writeAdhocFile(dir, 'b-newer-ordinary.json', { id: 'adhoc-newer-ordinary-1', title: 'newer ordinary' });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-older-ordinary-1', 'FIFO must still hold within the ordinary tier');
+});
+
 // dependsOn (2026-08-22, Grimmethy: "We need some systematic way to prioritize what
 // order adhoc tasks get completed in. Those with dependencies on new adhoc tasks are
 // absolutely going to need to be done after the dependency is completed") -- satisfied
