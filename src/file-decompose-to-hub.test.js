@@ -70,6 +70,14 @@ test('legacy mode: hub + one child per move + a wiring task gated on every move'
   assert.equal(move1.atomic, undefined);
   assert.match(move1.promptContext.rawText, /VERBATIM: `api_plugins_marketplace`, `api_plugins_install`/);
   assert.match(move1.promptContext.rawText, /@plugins_bp\.route/);
+
+  // 2026-09-06: decomposedFrom used to be a synthetic `file-decompose:<requestId>` marker
+  // -- never a real, navigable task id (the hub's own real id is
+  // `file-decompose-hub-<slug>`) -- so a dashboard "jump to the owning hub" link built
+  // from a sub-task's decomposedFrom 404'd. Every promptContext.decomposedFrom across the
+  // hub and all its children must now equal the hub's own real id.
+  assert.equal(move1.promptContext.decomposedFrom, hub.id);
+  assert.equal(wiring.promptContext.decomposedFrom, hub.id);
 });
 
 // --- stacked model -------------------------------------------------------------------
@@ -105,6 +113,11 @@ test('stacked mode + LLM wiring child (det-wiring off): one shared branch, seque
   assert.equal(hub.branch, 'agent/decompose-decompose-app-py');
   assert.equal(hub.sourceFile, 'python/dashboard/app.py');
   assert.equal(hub.integrationGate.status, 'pending');
+
+  // 2026-09-06: same real-navigable-id requirement as the legacy-mode test above.
+  assert.equal(m1.promptContext.decomposedFrom, hub.id);
+  assert.equal(m2.promptContext.decomposedFrom, hub.id);
+  assert.equal(wiring.promptContext.decomposedFrom, hub.id);
 });
 
 test('stacked wiring prompt: bottom-of-file placement when a new module imports back from the source', () => {

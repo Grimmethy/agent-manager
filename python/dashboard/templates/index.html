@@ -1508,6 +1508,18 @@ function renderTaskDetailModal(task) {
   html += `<div style="margin:8px 0 4px"><button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button></div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
+  // able to click into the hub task from the top of the sub task's task log") -- the
+  // inverse of renderSubTaskChecklist just below (which shows a hub's children): a
+  // decomposed sub-task's promptContext.decomposedFrom already names its owning hub's id
+  // (file-decompose-to-hub.js, applyAdhocDiff's own decompose path), but nothing ever
+  // surfaced it -- a human landing on a stuck sub-task (like the stacked file-decompose
+  // incident this same night) had no one-click way back to the hub coordinating it.
+  // taskLink() + the existing data-open-task-anywhere delegation below already do the
+  // rest -- the hub could be in coordinating/, done/, or blocked/, so this doesn't guess.
+  if (task.promptContext && task.promptContext.decomposedFrom) {
+    html += `<div class="field-label">Part of Hub</div><div>${taskLink(task.promptContext.decomposedFrom)}</div>`;
+  }
   html += renderSubTaskChecklist(task);
   // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
   // bit of meta data. How much machine time was spent on the task and a list of all the

@@ -237,7 +237,7 @@ function fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems }
     adhocResolution: 'decompose',
     title: `Decompose ${request.sourceFile} -- plan needs revision`,
     createdAt: nowIso,
-    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: `file-decompose:${request.id}` },
+    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: hubId },
     subTasks: [],
     progress: { done: 0, total: 0 },
     planValidation: { ok: false, problems: hardProblems, checkedAt: nowIso },
@@ -296,7 +296,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
       createdAt: nowIso,
       promptContext: {
         rawText: moveRawText(request, move, i, moves.length, validation.moveMeta[i]),
-        decomposedFrom: `file-decompose:${request.id}`,
+        decomposedFrom: `file-decompose-hub-${planSlug}`,
         moveIndex: i,
         newFile: move.newFile,
       },
@@ -325,7 +325,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
       title: `Decompose ${request.sourceFile} — wire up ${wiringChildMoves.length} new file(s)`,
       createdAt: nowIso,
       dependsOn: stacked ? [prevId] : moveIds,
-      promptContext: { rawText: wiringRawText(request, wiringChildMoves, wiringMetas), decomposedFrom: `file-decompose:${request.id}` },
+      promptContext: { rawText: wiringRawText(request, wiringChildMoves, wiringMetas), decomposedFrom: `file-decompose-hub-${planSlug}` },
     };
     if (stacked) {
       wiringRecord.atomic = true;
@@ -345,7 +345,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     adhocResolution: 'decompose',
     title: `Decompose ${request.sourceFile} (${moves.length} module(s))`,
     createdAt: nowIso,
-    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: `file-decompose:${request.id}` },
+    promptContext: { rawText: `Coordinator for the ${request.id} decomposition of ${request.sourceFile}.`, decomposedFrom: hubId },
     subTasks: children,
     progress: { done: 0, total: children.length },
     planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
