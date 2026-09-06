@@ -3555,34 +3555,69 @@ def api_concepts_create():
     return jsonify(concept)
 
 
-def _concept_task_history_rows(pipeline_dir: Path, concept_id: str) -> list:
-    """Scans every real queue location a task can carry a conceptId in, on demand --
-    computed only when a concept's timeline is actually opened, never polled, so this
-    stays cheap even as the queue grows. Mirrors _task_state_index()'s own coverage of
-    QUEUE_STATES + the done/-archive locations, minus drafting/ (a task mid-draft has no
-    completedAt worth showing on an audit timeline yet)."""
+CONCEPT_TASK_SCAN_BUDGET_SECONDS = 1.5
+
+
+def _concept_task_history_rows(pipeline_dir: Path, concept_id: str) -> tuple:
+    """Scans queue locations a task can carry a conceptId in, on demand -- computed only
+    when a concept's timeline is actually opened, never polled.
+
+    BUG FOUND LIVE (2026-09-06): an unbounded glob over every QUEUE_STATES dir plus every
+    done/-archive location took 73s on this repo's own real done/ (6,077 files, 290MB
+    accumulated over this session) for a feature that, on day one, matches nothing at
+    all -- the "View timeline" button hung and the dashboard's own 8s client fetch
+    timeout fired. A full-history scan does not scale with this pipeline's real size, so
+    this now scans the small, actively-changing states in full (pending/review/
+    approved/blocked/needs-clarification/awaiting-confirm/coordinating -- always cheap,
+    bounded by how much work is in flight, not by all-time history) and the large
+    done/-archive locations under a hard wall-clock budget, returning a `truncated` flag
+    the caller must surface rather than silently presenting a partial history as
+    complete -- matching AGENTS.md's "say explicitly when something can't be fully
+    explained" principle applied to "can't fully scan" too. Once real conceptId-tagged
+    tasks exist, a durable incrementally-updated index (matching side-finding.js's own
+    write-as-it-happens convention, not a re-derive-by-scanning-everything approach) is
+    the right follow-up -- flagged, not built here, since no real usage data exists yet
+    to size it against."""
     rows = []
     qdir = pipeline_dir / "queue"
-    search_dirs = [qdir / state for state in QUEUE_STATES]
-    search_dirs.append(qdir / "done" / "_archived_no_action")
+    fast_states = ["pending", "review", "approved", "blocked", "needs-clarification", "awaiting-confirm", "coordinating"]
+    fast_dirs = [qdir / state for state in fast_states]
+
+    slow_dirs = [qdir / "done"]
+    archived_no_action = qdir / "done" / "_archived_no_action"
+    if archived_no_action.is_dir():
+        slow_dirs.append(archived_no_action)
     dated_archive_root = qdir / "done" / "_archived"
     if dated_archive_root.is_dir():
-        search_dirs.extend(p for p in dated_archive_root.iterdir() if p.is_dir())
+        slow_dirs.extend(p for p in dated_archive_root.iterdir() if p.is_dir())
 
-    for d in search_dirs:
+    def scan(d, deadline):
+        for f in d.glob("*.json"):
+            if deadline is not None and time.monotonic() > deadline:
+                return True  # truncated
+            task = read_json_safe(f)
+            if isinstance(task, dict) and task.get("conceptId") == concept_id:
+                rows.append({
+                    "at": task.get("completedAt") or task.get("updatedAt") or task.get("createdAt"),
+                    "kind": "task",
+                    "ref": task.get("id") or f.stem,
+                    "summary": task.get("title") or task.get("id") or f.stem,
+                })
+        return False
+
+    for d in fast_dirs:
+        if d.is_dir():
+            scan(d, None)  # small, in-flight-work-sized dirs -- no budget needed
+
+    truncated = False
+    deadline = time.monotonic() + CONCEPT_TASK_SCAN_BUDGET_SECONDS
+    for d in slow_dirs:
         if not d.is_dir():
             continue
-        for f in d.glob("*.json"):
-            task = read_json_safe(f)
-            if not isinstance(task, dict) or task.get("conceptId") != concept_id:
-                continue
-            rows.append({
-                "at": task.get("completedAt") or task.get("updatedAt") or task.get("createdAt"),
-                "kind": "task",
-                "ref": task.get("id") or f.stem,
-                "summary": task.get("title") or task.get("id") or f.stem,
-            })
-    return rows
+        if scan(d, deadline):
+            truncated = True
+            break
+    return rows, truncated
 
 
 @app.route("/api/concepts/<concept_id>/timeline")
@@ -3591,7 +3626,10 @@ def api_concept_timeline(concept_id):
     raisedBy.conceptId matches) and implementation task history, sorted chronologically --
     a query over existing data, never a duplicated log, so it can't drift from the
     source (see src/concepts.js's getConceptTimeline, this route's Node-side
-    equivalent)."""
+    equivalent). Task-history coverage is time-budgeted -- see
+    _concept_task_history_rows's own header for the 73s live incident this closes --
+    so `truncated: true` means the done/-archive history may be incomplete, not that
+    nothing was found."""
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:
         abort(500, description="no active project configured")
@@ -3608,9 +3646,10 @@ def api_concept_timeline(concept_id):
             "ref": entry.get("id"),
             "summary": raw_text.split("\n")[0][:120],
         })
-    rows.extend(_concept_task_history_rows(pipeline_dir, concept_id))
+    task_rows, truncated = _concept_task_history_rows(pipeline_dir, concept_id)
+    rows.extend(task_rows)
     rows.sort(key=lambda r: r.get("at") or "")
-    return jsonify(rows)
+    return jsonify({"rows": rows, "truncated": truncated})
 
 
 @app.route("/api/brain-dump/<entry_id>/discuss/latest", methods=["GET"])
