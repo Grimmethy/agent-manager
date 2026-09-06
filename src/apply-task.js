@@ -172,6 +172,21 @@ function writeArtifact(task, repoRoot, pipelineDir) {
   if (isEffectivelyEmptyResponse(task.implementResponse)) {
     return { skipped: true, reason: 'no code change needed (empty implement response, already approved at review)' };
   }
+  // Same failure shape as the empty-response gap above, one layer further out: a Group B
+  // source can legitimately answer with a plain-text refusal ("FALSE POSITIVE -- the real
+  // file already contains the fix the candidate described") instead of a change. Review
+  // can and does approve this prose as a genuinely correct answer -- unlike the
+  // empty-string case, nothing marks it specially at review time, so it reaches here as
+  // ordinary approved implementResponse text. Found live as a real 2-task cluster
+  // (observability-fix-ac-45/ac-59) in queue/blocked/: both correctly explained the flagged
+  // issue no longer exists, and both got "Invalid JSON in Group B implementResponse:
+  // Unexpected token 'F', \"FALSE POSI\"..." instead of the clean skip they deserved.
+  // Anchored to the START of the (trimmed) response -- real Group B JSON always begins
+  // with `[` or `{`, so this can never misfire on a legitimate change whose diff content
+  // happens to mention "false positive" somewhere inside a string value.
+  if (/^false[\s-]?positive\b/i.test(String(task.implementResponse || '').trim())) {
+    return { skipped: true, reason: `false positive (already fixed / no code change needed): ${String(task.implementResponse).trim().slice(0, 300)}` };
+  }
   return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
 }
 
