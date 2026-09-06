@@ -48,6 +48,39 @@ function isEnabled() {
   return process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE !== 'false';
 }
 
+// AC-13a (2026-09-06, from a real pipeline_forensics_fix candidate -- Docs/
+// PIPELINE_FIX_CANDIDATES.md's AC-17): a task whose ask/plan text fundamentally requires
+// an external-state operation (creating a remote repo, deploying/publishing, git remote
+// push/clone, credentials/API keys, a third-party network call) is structurally
+// impossible for this tier's isolated worktree + bwrap sandbox to perform -- it will burn
+// the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation or a partial
+// edit, then land in the decompose backstop or a needs-clarification verdict anyway. This
+// is knowable before the first model call, in O(markers) string work. Each marker carries
+// a human-readable label (not a dumped regex source) so the blockedReason names the actual
+// pattern that matched.
+const EXTERNAL_DEP_MARKERS = [
+  { label: 'creating a new repo', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
+  { label: 'hosting/deploying/publishing', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
+  { label: 'a git remote operation', re: /\bgit\s+(remote|push|clone)\b/i },
+  { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|tokens?|secrets?)\b/i },
+  { label: 'a network/third-party service call', re: /\b(network|internet|external\s+api|third[\s_-]?party\s+service)\b/i },
+];
+
+// Real field names, verified against this repo's actual task shape -- NOT task.ask/
+// task.plan (no such fields exist anywhere in this codebase): task.title +
+// task.promptContext.rawText are the real "ask" text (see buildWriteAgenticPrompt's own
+// `Title: ${task.title}` / `ctx.rawText` usage just below), task.planResponse /
+// task.lastGoodPlan is the real plan-pass output (see local-draft.js's draftPlan()).
+function detectExternalDependency(task) {
+  const ctx = (task && task.promptContext) || {};
+  const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
+    .filter(Boolean).join(' ');
+  for (const marker of EXTERNAL_DEP_MARKERS) {
+    if (marker.re.test(text)) return marker.label;
+  }
+  return null;
+}
+
 // Same shared kill switch runPlanWithTools({allowWrite}) checks (queue/.chat-write-tools-
 // disabled). Checked here too so a disabled tier returns a clean decline instead of
 // letting runPlanWithTools silently drop to its no-tools fallback (a plain completion,
@@ -249,6 +282,21 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (queue/.chat-write-tools-disabled kill switch) and the cheaper local tiers could not complete this task -- needs a human.' };
   }
 
+  // AC-13a: bail before spending a single turn on a task that's structurally impossible
+  // for this sandbox -- see EXTERNAL_DEP_MARKERS/detectExternalDependency's own header.
+  const extDep = detectExternalDependency(task);
+  if (extDep) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task requires external-state operation (${extDep}) that the local sandbox cannot perform -- needs a human to provision the resource first.`,
+      needsClarification: {
+        reason: 'external-dependency',
+        openQuestions: [`This task references an external resource (${extDep}). Please confirm: (a) the resource already exists and its URL/credentials, or (b) you want it created, in which case this must be handled outside the local sandbox.`],
+      },
+    };
+  }
+
   const prompt = buildWriteAgenticPrompt(task);
   const started = Date.now();
 
@@ -348,4 +396,5 @@ function modelStatsSafe(fn, args) {
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
   isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
+  detectExternalDependency, EXTERNAL_DEP_MARKERS,
 };
