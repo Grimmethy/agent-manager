@@ -1385,6 +1385,83 @@ test('nextCandidateFulfillmentTask marks a many-numbered-step single-file candid
   assert.equal(nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix').promptContext.mustPreSplit, true);
 });
 
+// --- Depends-On (2026-09-05, see prompts.js's candidateSplitInstructions for the
+// incident: two sibling split candidates -- pipeline-forensics-fix's real AC-13a/AC-13b --
+// one structurally depending on the other, both offered for drafting the same tick
+// because nothing tracked the relationship the model's own prose already stated) --------
+
+function writeDoneTask(dir, taskId, { mergedAt } = {}) {
+  const doneDir = path.join(dir, 'queue', 'done');
+  fs.mkdirSync(doneDir, { recursive: true });
+  const data = { id: taskId, domain: 'default' };
+  if (mergedAt) data.mergedAt = mergedAt;
+  fs.writeFileSync(path.join(doneDir, `${taskId}.json`), JSON.stringify(data));
+}
+
+test('nextCandidateFulfillmentTask skips a candidate whose Depends-On sibling has not reached done/ at all', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/b.js'), 'const b = 1;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'DEP.md');
+  fs.writeFileSync(p, '### AC-2 · guard\nStrength: Strong\nFiles: src/b.js\nDepends-On: AC-1\n\nProblem:\np.\n\nSolution:\ns.\n\nBenefits:\nb.');
+  assert.equal(nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix'), null, 'the dependency (pipeline-forensics-fix-ac-1) has not reached done/ at all');
+});
+
+test('nextCandidateFulfillmentTask skips a candidate whose Depends-On sibling reached done/ but was never merged', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/b.js'), 'const b = 1;\n');
+  writeDoneTask(dir, 'pipeline-forensics-fix-ac-1');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'DEP.md');
+  fs.writeFileSync(p, '### AC-2 · guard\nStrength: Strong\nFiles: src/b.js\nDepends-On: AC-1\n\nProblem:\np.\n\nSolution:\ns.\n\nBenefits:\nb.');
+  assert.equal(nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix'), null, 'reaching done/ means the branch was pushed, not that a human merged it yet');
+});
+
+test('nextCandidateFulfillmentTask offers a candidate once its Depends-On sibling has actually merged', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/b.js'), 'const b = 1;\n');
+  writeDoneTask(dir, 'pipeline-forensics-fix-ac-1', { mergedAt: '2026-09-05T00:00:00.000Z' });
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'DEP.md');
+  fs.writeFileSync(p, '### AC-2 · guard\nStrength: Strong\nFiles: src/b.js\nDepends-On: AC-1\n\nProblem:\np.\n\nSolution:\ns.\n\nBenefits:\nb.');
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task, 'the dependency is merged -- this candidate must now be offered');
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-2');
+});
+
+test('nextCandidateFulfillmentTask is unaffected (regression) for a candidate with no Depends-On line at all', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/a.js'), 'const a = 1;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'NODEP.md');
+  fs.writeFileSync(p, '### AC-1 · independent\nStrength: Strong\nFiles: src/a.js\n\nProblem:\np.\n\nSolution:\ns.\n\nBenefits:\nb.');
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task);
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-1');
+});
+
+test('nextCandidateFulfillmentTask skips past a blocked (unmet-dependency) candidate to offer a later, independent one instead of stalling', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/a.js'), 'const a = 1;\n');
+  fs.writeFileSync(path.join(dir, 'src/b.js'), 'const b = 1;\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const p = path.join(dir, 'MIXED.md');
+  fs.writeFileSync(p, [
+    '### AC-1 · guard', 'Strength: Strong', 'Files: src/a.js', 'Depends-On: AC-0',
+    '', 'Problem:', 'p1.', '', 'Solution:', 's1.', '', 'Benefits:', 'b1.',
+    '', '### AC-2 · independent', 'Strength: Strong', 'Files: src/b.js',
+    '', 'Problem:', 'p2.', '', 'Solution:', 's2.', '', 'Benefits:', 'b2.',
+  ].join('\n'));
+  const task = nextCandidateFulfillmentTask(p, 'pipeline_forensics_fix');
+  assert.ok(task);
+  assert.equal(task.id, 'pipeline-forensics-fix-ac-2', 'must skip past the blocked AC-1 rather than returning null for the whole doc');
+});
+
 test('nextCandidateFulfillmentTask fetches real, current content for a file that actually exists on disk', () => {
   const dir = makeAdhocFixtureRepo();
   fs.writeFileSync(path.join(dir, 'worker.js'), 'try {\n  risky();\n} catch {}\n');

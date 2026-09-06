@@ -64,9 +64,18 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const sourceMatch = block.match(/^Source:\s*(.+)$/m);
       const filesMatch = block.match(/^Files:\s*(.+)$/m);
       const splitDepthMatch = block.match(/^Split-Depth:\s*(\d+)\s*$/m);
-      // Body is everything after the LAST metadata line present (Files:, else Source:,
-      // else the heading) -- the Problem/Solution/Benefits paragraphs, kept verbatim.
-      const bodyAnchor = filesMatch ? filesMatch[0] : sourceMatch ? sourceMatch[0] : headingLine;
+      // Placeholder written by apply-task.js's applyCandidateSplit -- local-only index
+      // into THIS split batch, resolved to a real Depends-On: AC-NNN line by
+      // applyArchDiscoveryCandidates below once ids are actually assigned (see
+      // prompts.js's candidateSplitInstructions for the incident this fixes). Never
+      // present on a hand-authored or non-split candidate.
+      const dependsOnIndexMatch = block.match(/^Depends-On-Index:\s*(\d+)\s*$/m);
+      // Body is everything after the LAST metadata line present (Depends-On-Index:, else
+      // Files:, else Source:, else the heading) -- the Problem/Solution/Benefits
+      // paragraphs, kept verbatim. Depends-On-Index always comes after Files: in
+      // apply-task.js's own field order, so it must be preferred first here or its own
+      // line leaks into the body text.
+      const bodyAnchor = dependsOnIndexMatch ? dependsOnIndexMatch[0] : filesMatch ? filesMatch[0] : sourceMatch ? sourceMatch[0] : headingLine;
       const anchorIdx = block.indexOf(bodyAnchor);
       const body = block.slice(anchorIdx + bodyAnchor.length).trim();
       return {
@@ -75,6 +84,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
         source: sourceMatch ? sourceMatch[1].trim() : '',
         files: filesMatch ? filesMatch[1].trim() : '',
         splitDepth: splitDepthMatch ? Number(splitDepthMatch[1]) : 0,
+        dependsOnIndex: dependsOnIndexMatch ? Number(dependsOnIndexMatch[1]) : null,
         body,
       };
     })
@@ -129,7 +139,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
   const candidateIds = [];
-  for (const c of candidates) {
+  candidates.forEach((c) => {
     const id = `AC-${nextAvailableCandidateId(text)}`;
     const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
     // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
@@ -137,6 +147,16 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
     if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
     if (c.source) lines.push(`Source: ${c.source}`);
     if (c.files) lines.push(`Files: ${c.files}`);
+    // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
+    // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
+    // once ids are actually being assigned in this same pass. Only valid within a single
+    // split batch (candidates all arrive together, in original order, from
+    // apply-task.js's applyCandidateSplit) -- candidateIds[c.dependsOnIndex] is only
+    // populated when that index refers to an EARLIER candidate in THIS SAME call, which
+    // parseCandidateSplit's own remapping already guarantees.
+    if (Number.isInteger(c.dependsOnIndex) && candidateIds[c.dependsOnIndex]) {
+      lines.push(`Depends-On: ${candidateIds[c.dependsOnIndex]}`);
+    }
     // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
     // contain backticks (template literals are common in this codebase), so a fence is
     // the only delimiter that can't collide with the content it's wrapping.
@@ -144,7 +164,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
     lines.push('', c.body);
     text += '\n' + lines.join('\n') + '\n';
     candidateIds.push(id);
-  }
+  });
 
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);

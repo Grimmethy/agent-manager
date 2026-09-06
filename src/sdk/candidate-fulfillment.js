@@ -325,8 +325,8 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
 function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
   // lazy (see module header) -- task-sources.js is fully loaded by the time any
   // next() poll calls this.
-  const { taskIdExistsInQueue } = require('../task-sources.js');
-  const { defaultDomain } = getConfig();
+  const { taskIdExistsInQueue, isDependencySatisfied } = require('../task-sources.js');
+  const { defaultDomain, pipelineDir } = getConfig();
   const text = readIfExists(candidatesPath);
   if (!text) return null;
 
@@ -360,6 +360,21 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     const idMatch = headingLine.match(/AC-\d+/);
     if (!idMatch) continue;
     const candidateId = idMatch[0];
+
+    // Depends-On: AC-NNN (2026-09-05, see prompts.js's candidateSplitInstructions for the
+    // incident: two sibling split candidates, one structurally depending on the other,
+    // both offered for drafting the same tick because nothing tracked the relationship).
+    // Reuses nextAdhocTask's own isDependencySatisfied -- "satisfied" means MERGED, not
+    // just done, same reasoning: a candidateFulfillment source without directToMain still
+    // drafts from a fresh worktree off origin/<mainBranch>, so a dependency only reached
+    // done/ (branch pushed, not yet merged) is not actually visible to this draft yet.
+    // Skips PAST this candidate (does not block the whole lane) so a later, independent
+    // one still gets picked up this same call.
+    const dependsOnMatch = section.match(/^Depends-On:\s*(AC-\d+)\s*$/m);
+    if (dependsOnMatch) {
+      const depTaskId = `${sourceName.replace(/_/g, '-')}-${dependsOnMatch[1].toLowerCase()}`;
+      if (!isDependencySatisfied(pipelineDir, depTaskId)) continue;
+    }
 
     const strengthMatch = section.match(/^Strength:\s*(.+)$/m);
     if (!strengthMatch || strengthMatch[1].trim() !== 'Strong') continue;
