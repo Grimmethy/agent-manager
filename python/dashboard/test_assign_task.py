@@ -202,6 +202,7 @@ class ApiAssignTaskRouteTest(AssignTaskTestBase):
         self.assertEqual(resp.status_code, 404)
 
     def test_400_when_taskid_is_missing(self):
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
         resp = self.client.post(
             "/api/instances/worker-1/assign-task",
             data=json.dumps({}), content_type="application/json",
@@ -281,6 +282,7 @@ class ApiAssignableTasksRouteTest(AssignTaskTestBase):
     unit tests exercise the underlying function directly)."""
 
     def test_lists_pending_plus_cross_lane_drafting_tasks_tier_filtered_by_location(self):
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
         (self.queue / "drafting" / "worker-reasoning-p40").mkdir(parents=True)
         (self.queue / "drafting" / "worker-1").mkdir(parents=True, exist_ok=True)
         self._pending_task("idle-one", {"source": "trouble_log", "title": "Idle one"})
@@ -301,6 +303,7 @@ class ApiAssignableTasksRouteTest(AssignTaskTestBase):
         self.assertNotIn("already-mine", by_id)
 
     def test_tier_filters_reasoning_only_tasks_out_of_a_non_reasoning_lanes_list(self):
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
         self._pending_task("high-tier", {"source": "adhoc", "title": "High tier"})
         self._pending_task("low-tier", {"source": "trouble_log", "title": "Low tier"})
 
@@ -311,6 +314,24 @@ class ApiAssignableTasksRouteTest(AssignTaskTestBase):
     def test_404_for_an_unknown_instance(self):
         resp = self.client.get("/api/instances/worker-does-not-exist/assignable-tasks")
         self.assertEqual(resp.status_code, 404)
+
+    # 2026-09-07 follow-up, Grimmethy: "It was missing from p40 reasoning, I found the
+    # task in worker-reasoning. Why do the 2 reasoning workers have different lists?
+    # they really should share the same task list." A task pinned to one reasoning lane
+    # used to be invisible to its sibling lane entirely; it should show up in both,
+    # tagged with pinnedTo so the operator can see (and, by picking it, override) the
+    # existing pin.
+    def test_pending_task_pinned_to_a_sibling_lane_is_still_listed_tagged_with_pinnedto(self):
+        self._hb("worker-reasoning", status="idle", pass_="idle", pid=None, task_id=None)
+        self._hb("worker-reasoning-p40", status="idle", pass_="idle", pid=None, task_id=None)
+        self._pending_task("pinned-one", {"source": "adhoc", "title": "Pinned one", "pinnedWorker": "worker-reasoning"})
+
+        resp = self.client.get("/api/instances/worker-reasoning-p40/assignable-tasks")
+
+        self.assertEqual(resp.status_code, 200)
+        by_id = {i["id"]: i for i in resp.get_json()["items"]}
+        self.assertIn("pinned-one", by_id)
+        self.assertEqual(by_id["pinned-one"]["pinnedTo"], "worker-reasoning")
 
 
 if __name__ == "__main__":

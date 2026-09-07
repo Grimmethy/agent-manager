@@ -158,7 +158,33 @@ test('listAssignableTasks includes pending/ candidates, tier-filtered same as pi
 
   const items = listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false });
 
-  assert.deepEqual(items, [{ id: 'ordinary', title: 'Ordinary task', source: 'trouble_log', location: 'pending' }]);
+  assert.deepEqual(items, [{ id: 'ordinary', title: 'Ordinary task', source: 'trouble_log', location: 'pending', pinnedTo: null }]);
+});
+
+// 2026-09-07, Grimmethy after finding the same task in worker-reasoning's list but not
+// worker-reasoning-p40's: "why do the 2 reasoning workers have different lists? they
+// really should share the same task list." A pin used to EXCLUDE a still-pending task
+// from every sibling lane's browsing list -- right for pickClaimableTasks() (the real
+// claim loop, where excluding it stops a race to steal it), wrong for this dashboard-
+// facing list, which should show every tier-matching candidate regardless of which lane
+// currently has first claim, tagged so the operator can see (and, if they choose,
+// override) the existing pin.
+test('listAssignableTasks includes a pending task pinned to a SIBLING lane, tagged with pinnedTo instead of hidden', () => {
+  const queueDir = setupQueue();
+  writeTask(path.join(queueDir, 'pending'), 'pinned-elsewhere', { source: 'adhoc', title: 'Pinned task', pinnedWorker: 'worker-reasoning' });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning-p40', { isReasoningLane: true });
+
+  assert.deepEqual(items, [{ id: 'pinned-elsewhere', title: 'Pinned task', source: 'adhoc', location: 'pending', pinnedTo: 'worker-reasoning' }]);
+});
+
+test('listAssignableTasks does not tag pinnedTo when the task is pinned to the QUERIED instance itself', () => {
+  const queueDir = setupQueue();
+  writeTask(path.join(queueDir, 'pending'), 'pinned-here', { source: 'adhoc', title: 'Pinned to me', pinnedWorker: 'worker-reasoning' });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items, [{ id: 'pinned-here', title: 'Pinned to me', source: 'adhoc', location: 'pending', pinnedTo: null }]);
 });
 
 test('listAssignableTasks includes tier-matching tasks sitting in OTHER lanes\' drafting/, tagged with their location', () => {
