@@ -4439,6 +4439,18 @@ _PREEMPT_LANES_AGE_GATED = ("reviewer",)
 _PREEMPT_CHILD_PASSES = frozenset({
     "plan", "implement", "implement-retry", "critique", "revise",
     "harness-search", "local-agentic", "local-agentic-write", "vote", "review",
+    # 2026-09-07, Grimmethy: "I was able to select the decompose task but it still
+    # doesn't seem to set it as the queued task" -- this exact allowlist-goes-stale-
+    # when-a-new-pass-is-added failure class the 2026-09-02 comment below already
+    # names, recurring for a genuinely new (non-prefix-sharing) label instead of a
+    # variant of an existing one: 'orient' (src/orient-pass.js's own maybeLocked
+    # label, the pre-plan investigation pass) and 'decompose-check' (local-draft.js's
+    # preliminary one-cheap-call decompose check, before any tier runs) were both
+    # missing, so a task caught mid-orient/decompose-check could never actually be
+    # preempted -- assign-task's own preempt step silently returned killed:false and
+    # the operator's pin just sat there with nothing to reclaim it until whatever was
+    # running happened to finish or fail on its own.
+    "orient", "decompose-check",
 })
 # Prefixes for the adhoc agentic-draft family (local-draft.js's maybeLocked labels:
 # local-agentic, local-agentic-write, local-agentic-test-*). Matched by prefix so a new
