@@ -39,7 +39,16 @@ function slugify(str) {
 // its checklist). A proposal's optional `after: N` (N = index of an EARLIER sub-task, so
 // the graph is a DAG by construction) becomes a real dependsOn edge -- isDependencySatisfied
 // (task-sources.js) then holds that child in queue/adhoc/ until the earlier one is MERGED.
-function queueSubTasks(subTasks, pipelineDir, parentTaskId) {
+// premiumPriority propagation (2026-09-07, Grimmethy: "This decompose should be the
+// absolute highest priority job and we need a way to make sure it stays that way until
+// completion" -- confirmed live: the real task this was built for hit exactly this gap.
+// Its own decompose split produced 2 fresh child tasks with no premiumPriority at all,
+// silently dropping back to ordinary priority the moment the parent (which no longer
+// gets claimed itself -- it becomes a coordinator hub) stopped being the thing actually
+// doing the work. Required a manual re-stamp on both children to keep the original
+// intent. A parent that was flagged premium clearly wants ITS descendants prioritized
+// too -- decomposition is supposed to be transparent to that intent, not reset it.
+function queueSubTasks(subTasks, pipelineDir, parentTaskId, parentTask) {
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
   const ids = subTasks.map((sub, i) => `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`);
@@ -54,6 +63,7 @@ function queueSubTasks(subTasks, pipelineDir, parentTaskId) {
     if (Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i) {
       record.dependsOn = [ids[sub.after]];
     }
+    if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     return { id: ids[i], title: sub.title };
   });
@@ -67,7 +77,7 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     if (!subTasks.length) {
       return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
     }
-    const queued = queueSubTasks(subTasks, pipelineDir, task.id);
+    const queued = queueSubTasks(subTasks, pipelineDir, task.id, task);
     // The parent does NOT go to done/ -- it becomes a coordinator in queue/coordinating/,
     // tracking its children on a checklist and auto-completing (coordinator-sweep.js) once
     // every child reaches done/. See recordApplyOutcome + apply-task.sh for the routing.
