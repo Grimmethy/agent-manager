@@ -2917,6 +2917,75 @@ def api_task_anywhere(task_id):
     abort(404, description=f"task {task_id} not found in any queue state")
 
 
+def _find_live_task_file(qdir: Path, task_id: str) -> Path | None:
+    """Same search order as api_task_anywhere above (drafting first, then every
+    QUEUE_STATES dir, then adhoc/), but returns the actual file Path instead of its
+    parsed content -- for a route that needs to WRITE the file back, not just display it.
+    Deliberately does not search the done/_archived* trees api_task_anywhere also checks:
+    a task that has already reached a terminal, archived state is never read by
+    next-claimable-task.js's claim ranking again, so there's nothing for a priority flag
+    to affect there."""
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for candidate in drafting_root.rglob(f"{task_id}.json"):
+            return candidate
+    for state in QUEUE_STATES:
+        p = qdir / state / f"{task_id}.json"
+        if p.is_file():
+            return p
+    adhoc_p = qdir / "adhoc" / f"{task_id}.json"
+    if adhoc_p.is_file():
+        return adhoc_p
+    return None
+
+
+@app.route("/api/task-anywhere/<task_id>/premium-priority", methods=["POST"])
+def api_task_set_premium_priority(task_id):
+    """Persistent, cross-retry claim-priority override (2026-09-07, Grimmethy: "I'll need
+    a way in app to be able to set that premium priority slot for any specific task. I am
+    getting tired of manually selecting it for the worker queue every pass.").
+
+    Sets/clears task.premiumPriority -- next-claimable-task.js's effectivePriority() sorts
+    a premiumPriority task ahead of EVERY other pending item regardless of source, and
+    (unlike the Workers tab's assign-task pinnedWorker, which local-draft.js deletes the
+    instant the task is claimed -- a deliberate one-shot override) this is never
+    auto-cleared: it survives every retry/requeue cycle until the operator turns it off
+    here again, or the task reaches a terminal state and stops being read by claim
+    ranking at all. This is what actually closes "manually selecting it every pass" --
+    pinnedWorker is still the right tool for "run THIS on THAT lane right now"; this is
+    for "keep this at the front of the queue no matter which lane gets to it next."
+
+    Works on a task wherever it currently sits (pending, blocked, needs-clarification,
+    drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
+    file-decompose move this feature was built for, which was cycling blocked <-> pending
+    for hours) needs to be able to set this BEFORE it's back in pending/, not only once
+    it happens to be there. Body: {"enabled": true|false}, defaults to true."""
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled", True))
+
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    target = _find_live_task_file(qdir, task_id)
+    if not target:
+        abort(404, description=f"'{task_id}' not found in any live queue state")
+
+    data = read_json_safe(target)
+    if not data:
+        abort(500, description="could not read the task file")
+
+    if enabled:
+        data["premiumPriority"] = True
+    else:
+        data.pop("premiumPriority", None)
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
+    })
+    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "premiumPriority": enabled})
+
+
 def _adhoc_task_excerpt(data):
     """Short status-relevant snippet for the Adhoc Tasks list -- whichever field
     actually carries the human-relevant signal for wherever the task currently sits,
@@ -3699,6 +3768,14 @@ def api_brain_dump_prioritize(entry_id):
         "domain": default_task_domain(),
         "source": "manual",
         "title": entry["rawText"][:120],
+        # humanQueued (2026-09-07, Grimmethy: "tasks that come from bot findings get
+        # sorted into a lower priority than human entered adhoc tasks") -- clicking
+        # "Process this now" is a real, explicit human decision about THIS entry, unlike
+        # brain_dump_sort's own fully-autonomous actionable-classification queueing the
+        # identical shape with no human ever looking at it. See
+        # next-claimable-task.js's effectivePriority() for the other human-entry point
+        # (queue-adhoc-task.js) and why `source` alone can't carry this signal.
+        "humanQueued": True,
         "promptContext": {
             "rawText": entry["rawText"],
             "brainDumpEntryId": entry["id"],

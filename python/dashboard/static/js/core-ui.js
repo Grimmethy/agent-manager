@@ -418,6 +418,11 @@ async function renderWorkers(isPoll) {
             let full = base;
             if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
             else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+            // premiumPriority (2026-09-07, Grimmethy: "I am getting tired of manually
+            // selecting it for the worker queue every pass") -- surfaces here so the
+            // operator can SEE this task is already set to always-claim-first and
+            // doesn't need to keep re-picking it via this very dropdown.
+            if (t.premiumPriority) full = `★ ${full}`;
             return truncateLabel(full);
           };
           const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">

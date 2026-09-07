@@ -45,6 +45,15 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn }, { pipelineD
   const cleanDependsOn = Array.isArray(dependsOn) ? dependsOn.filter(Boolean) : undefined;
   const record = {
     id, domain: resolvedDomain, source: 'manual', title, promptContext,
+    // humanQueued (2026-09-07, Grimmethy: "tasks that come from bot findings get sorted
+    // into a lower priority than human entered adhoc tasks") -- this CLI (and its
+    // library form, queueAdhocTask() as called by e.g. Chat's queue_reviewed_task tool)
+    // is one of exactly two genuinely human-directed adhoc entry points (the other is
+    // app.py's api_brain_dump_prioritize, "Process this now"); see
+    // next-claimable-task.js's effectivePriority() for why this can't be derived from
+    // `source` alone (task-sources.js's own loader force-overrides source:'manual' on
+    // every queue/adhoc/ file it reads, human- or bot-written).
+    humanQueued: true,
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);

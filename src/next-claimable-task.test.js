@@ -17,7 +17,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { pickClaimableTasks, pickNextPendingTask, listAssignableTasks } = require('./next-claimable-task.js');
+const { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, BOT_ADHOC_PRIORITY_PENALTY } = require('./next-claimable-task.js');
+const { resolveSourceName } = require('./task-source-registry.js');
 
 function setupPending() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
@@ -76,6 +77,85 @@ test('a reasoning lane claims only high-tier tasks; a non-reasoning lane skips t
 
   const ordinaryItems = pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false });
   assert.deepEqual(ordinaryItems, ['ordinary-task.json']);
+});
+
+// --- effectivePriority (bot-vs-human adhoc split + premiumPriority pin, 2026-09-07) ---
+
+test('effectivePriority: an adhoc task with no humanQueued marker is demoted by BOT_ADHOC_PRIORITY_PENALTY', () => {
+  const p = effectivePriority({ source: 'adhoc' }, 10, resolveSourceName);
+  assert.equal(p, 10 + BOT_ADHOC_PRIORITY_PENALTY);
+});
+
+test('effectivePriority: an adhoc task with humanQueued:true keeps the base source priority', () => {
+  const p = effectivePriority({ source: 'adhoc', humanQueued: true }, 10, resolveSourceName);
+  assert.equal(p, 10);
+});
+
+test('effectivePriority: a non-adhoc source is never touched by the bot-adhoc penalty regardless of humanQueued', () => {
+  assert.equal(effectivePriority({ source: 'trouble_log' }, 20, resolveSourceName), 20);
+  assert.equal(effectivePriority({ source: 'trouble_log', humanQueued: false }, 20, resolveSourceName), 20);
+});
+
+test('effectivePriority: premiumPriority always wins, -Infinity, regardless of source or humanQueued', () => {
+  assert.equal(effectivePriority({ source: 'adhoc', premiumPriority: true }, 10, resolveSourceName), -Infinity);
+  assert.equal(effectivePriority({ source: 'trouble_log', premiumPriority: true }, 20, resolveSourceName), -Infinity);
+});
+
+test('pickClaimableTasks: a human-queued adhoc task is claimed before a bot-originated one of the same source, oldest-bot-first tie-break still applies within each tier', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'bot-adhoc-a', { source: 'adhoc' });                          // no humanQueued -> demoted
+  writeTask(pendingDir, 'human-adhoc', { source: 'adhoc', humanQueued: true });       // stays at base priority 10
+  writeTask(pendingDir, 'bot-adhoc-b', { source: 'adhoc' });
+
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items, ['human-adhoc.json', 'bot-adhoc-a.json', 'bot-adhoc-b.json']);
+});
+
+test('pickClaimableTasks: premiumPriority puts a task ahead of everything, including a human-queued adhoc task and an unrelated higher-priority source', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'human-adhoc', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'bot-adhoc', { source: 'adhoc' });
+  writeTask(pendingDir, 'premium-low-tier', { source: 'trouble_log', premiumPriority: true }); // priority 20 normally, but pinned to the front
+
+  const items = pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false });
+
+  // worker-1 is not a reasoning lane, so the two adhoc (high-tier) tasks are excluded --
+  // only premium-low-tier is a candidate at all, proving the pin doesn't bypass the tier
+  // filter (it only affects ORDER among tier-eligible candidates).
+  assert.deepEqual(items, ['premium-low-tier.json']);
+});
+
+test('pickClaimableTasks: premiumPriority sorts ahead of an ordinary same-tier task even when the ordinary task is older', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'ordinary-older', { source: 'trouble_log' });
+  writeTask(pendingDir, 'premium-newer', { source: 'trouble_log', premiumPriority: true });
+
+  const items = pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false });
+
+  assert.deepEqual(items, ['premium-newer.json', 'ordinary-older.json']);
+});
+
+test('pickClaimableTasks: premiumPriority persists through the ranking even though it is not pinnedWorker -- any lane can claim it', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'premium-unpinned', { source: 'trouble_log', premiumPriority: true });
+
+  const forWorker1 = pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false });
+  assert.deepEqual(forWorker1, ['premium-unpinned.json']);
+});
+
+test('listAssignableTasks: surfaces premiumPriority on both pending and drafting-elsewhere items', () => {
+  const queueDir = setupQueue();
+  writeTask(path.join(queueDir, 'pending'), 'premium-pending', { source: 'trouble_log', premiumPriority: true });
+  writeDraftingTask(queueDir, 'worker-2', 'premium-drafting', { premiumPriority: true });
+  writeDraftingTask(queueDir, 'worker-2', 'ordinary-drafting', {});
+
+  const items = listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false });
+  const byId = Object.fromEntries(items.map((i) => [i.id, i]));
+
+  assert.equal(byId['premium-pending'].premiumPriority, true);
+  assert.equal(byId['premium-drafting'].premiumPriority, true);
+  assert.equal(byId['ordinary-drafting'].premiumPriority, false);
 });
 
 test('a task pinned to this instance wins immediately, skipping tier filter and priority sort', () => {
@@ -158,7 +238,7 @@ test('listAssignableTasks includes pending/ candidates, tier-filtered same as pi
 
   const items = listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false });
 
-  assert.deepEqual(items, [{ id: 'ordinary', title: 'Ordinary task', source: 'trouble_log', location: 'pending', pinnedTo: null }]);
+  assert.deepEqual(items, [{ id: 'ordinary', title: 'Ordinary task', source: 'trouble_log', location: 'pending', pinnedTo: null, premiumPriority: false }]);
 });
 
 // 2026-09-07, Grimmethy after finding the same task in worker-reasoning's list but not
@@ -175,7 +255,7 @@ test('listAssignableTasks includes a pending task pinned to a SIBLING lane, tagg
 
   const items = listAssignableTasks(queueDir, 'worker-reasoning-p40', { isReasoningLane: true });
 
-  assert.deepEqual(items, [{ id: 'pinned-elsewhere', title: 'Pinned task', source: 'adhoc', location: 'pending', pinnedTo: 'worker-reasoning' }]);
+  assert.deepEqual(items, [{ id: 'pinned-elsewhere', title: 'Pinned task', source: 'adhoc', location: 'pending', pinnedTo: 'worker-reasoning', premiumPriority: false }]);
 });
 
 test('listAssignableTasks does not tag pinnedTo when the task is pinned to the QUERIED instance itself', () => {
@@ -184,7 +264,7 @@ test('listAssignableTasks does not tag pinnedTo when the task is pinned to the Q
 
   const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
 
-  assert.deepEqual(items, [{ id: 'pinned-here', title: 'Pinned to me', source: 'adhoc', location: 'pending', pinnedTo: null }]);
+  assert.deepEqual(items, [{ id: 'pinned-here', title: 'Pinned to me', source: 'adhoc', location: 'pending', pinnedTo: null, premiumPriority: false }]);
 });
 
 test('listAssignableTasks includes tier-matching tasks sitting in OTHER lanes\' drafting/, tagged with their location', () => {
@@ -193,7 +273,7 @@ test('listAssignableTasks includes tier-matching tasks sitting in OTHER lanes\' 
 
   const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
 
-  assert.deepEqual(items, [{ id: 'stuck-elsewhere', title: 'Stuck task', source: 'adhoc', location: 'drafting:worker-reasoning-p40' }]);
+  assert.deepEqual(items, [{ id: 'stuck-elsewhere', title: 'Stuck task', source: 'adhoc', location: 'drafting:worker-reasoning-p40', premiumPriority: false }]);
 });
 
 test('listAssignableTasks excludes this instance\'s OWN drafting/ contents -- reassigning to itself is a no-op', () => {
