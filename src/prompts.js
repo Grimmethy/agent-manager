@@ -385,6 +385,22 @@ function adhocPlanPrompt(task) {
   const brainDumpDirective = (ctx && ctx.brainDumpEntryId)
     ? ['This task originated from a captured research finding or design recommendation, not a concrete bug report -- it may describe an IDEA rather than a fully-specified change. Do not exhaustively survey every possible approach: pick the most direct, concrete first step the finding itself suggests and plan THAT. If it genuinely cannot be scoped into one plan without a human decision, say so plainly and stop -- do not keep reasoning in search of a perfect scope.', '']
     : [];
+  // File-decompose move child (2026-09-07, Grimmethy: "I'd like to see the outputs
+  // becoming more efficient" -- root-caused live via degenerate-audit.log: a script-
+  // extract move's rawText already names every symbol with its exact line number plus a
+  // full procedure and validation commands, then this same prompt still asks for "a
+  // numbered, actionable PLAN" on top of it. This task's own real numbers: 6 separate
+  // draft cycles, every single plan-pass attempt hit doneReason:"length" even after
+  // escalating num_predict 1400 -> 2800 -> 5600 -- the model kept re-deriving/re-listing
+  // a step per symbol instead of treating the already-complete spec as, in fact, already
+  // complete. (The .html/script-extract subset of this same task shape now has a true
+  // zero-model-call path -- see local-draft.js's tryDeterministicScriptExtractEdit and
+  // decompose-move-determinism-backfill.js -- this directive is what's left for every
+  // move that ISN'T eligible for that: a flask-blueprint/.py move, or a script-extract
+  // move whose symbols don't (yet) all resolve unambiguously.)
+  const decomposeMoveDirective = (ctx && typeof ctx.decomposedFrom === 'string' && ctx.decomposedFrom.startsWith('file-decompose-hub-') && ctx.newFile)
+    ? ['This is a file-decompose MOVE task: the request above already fully specifies what to move, where each piece is, and how to validate it -- it is a mechanical relocation, not a design question. Do NOT re-derive or re-list a step per symbol/line number; the request already has that. Write a SHORT plan (2-5 lines: confirm the approach, name anything the request leaves genuinely ambiguous) and go straight to CRITERIA. "Follow the move procedure above verbatim; validate with the stated commands" is a complete, correct plan on its own.', '']
+    : [];
   return [
     'You are drafting a plan for this one-off task submitted directly by a human or an orchestrating agent.',
     '',
@@ -393,6 +409,7 @@ function adhocPlanPrompt(task) {
     truncate(JSON.stringify(ctx), 4000),
     '',
     ...brainDumpDirective,
+    ...decomposeMoveDirective,
     'Write a numbered, actionable PLAN.',
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...statedAcceptanceBlock(task),

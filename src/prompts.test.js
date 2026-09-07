@@ -430,6 +430,28 @@ test('adhocPlanPrompt: a brain_dump_sort-spawned task gets the open-endedness di
   assert.ok(directiveIdx < planIdx, 'directive must appear before the standard PLAN instruction');
 });
 
+test('adhocPlanPrompt: no file-decompose-move directive for an ordinary adhoc task', () => {
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'fix the bug in foo.js' } });
+  assert.doesNotMatch(prompt, /file-decompose MOVE task/);
+});
+
+test('adhocPlanPrompt: a file-decompose move child gets the "don\'t re-derive" directive, before the standard PLAN instruction', () => {
+  const prompt = buildPlanPrompt({
+    domain: 'adhoc', source: 'manual', title: 't',
+    promptContext: { rawText: 'move fn A, B, C', decomposedFrom: 'file-decompose-hub-my-plan', moveIndex: 1, newFile: 'app/static/js/mod.js' },
+  });
+  assert.match(prompt, /file-decompose MOVE task/);
+  assert.match(prompt, /Do NOT re-derive or re-list a step per symbol/);
+  const directiveIdx = prompt.indexOf('file-decompose MOVE task');
+  const planIdx = prompt.indexOf('Write a numbered, actionable PLAN');
+  assert.ok(directiveIdx < planIdx, 'directive must appear before the standard PLAN instruction');
+});
+
+test('adhocPlanPrompt: the file-decompose-move directive requires BOTH decomposedFrom and newFile -- a plain decomposedFrom (e.g. a needs-clarification sub-task) does not trip it', () => {
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'unrelated', decomposedFrom: 'some-other-parent-task' } });
+  assert.doesNotMatch(prompt, /file-decompose MOVE task/);
+});
+
 test('adhocPlanPrompt: a _seedPlan is embedded as a trailing "improve this" block, after the stable instructions', () => {
   const seed = '1. step one\n2. step two\n3. step three';
   const task = { domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' }, _seedPlan: seed };
