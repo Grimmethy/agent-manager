@@ -9,6 +9,7 @@ const {
   loadConcepts, writeConcepts, findConcept, createConcept,
   recordConceptResearch, recordConceptBuildTally, getConceptTimeline,
   injectConceptBuildInstruction, extractConceptBuildReport,
+  shelveConcept, reopenConcept, shipConcept,
 } = require('./concepts.js');
 
 function tmpDir() {
@@ -163,4 +164,86 @@ test('extractConceptBuildReport is a lenient no-op when the marker is absent or 
 test('extractConceptBuildReport accepts either scratch or adapted, case-insensitively', () => {
   const scratch = extractConceptBuildReport('CONCEPT-BUILD: SCRATCH | wrote this fresh, no external reference');
   assert.equal(scratch.report.kind, 'scratch');
+});
+
+// --- Lifecycle: shelved / shipped (2026-09-06) -------------------------------------------
+// Real registry data confirmed 14 of 16 concepts were stuck at 'researched' forever, with
+// no way to distinguish "deliberately parked" from "forgotten." shelveConcept/reopenConcept/
+// shipConcept close that gap.
+
+test('shelveConcept requires a reason, stashes the prior status, and stamps shelvedAt', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'Task Atomization' }, dir);
+  recordConceptResearch(dir, concept.id); // -> 'researched'
+  const shelved = shelveConcept(dir, concept.id, { reason: 'a day of work, backlog takes priority', revisitCondition: 'reasoning-bench gives a real P40 number' });
+  assert.equal(shelved.status, 'shelved');
+  assert.equal(shelved.statusBeforeShelve, 'researched');
+  assert.ok(shelved.shelvedAt);
+  assert.equal(shelved.shelvedReason, 'a day of work, backlog takes priority');
+  assert.equal(shelved.revisitCondition, 'reasoning-bench gives a real P40 number');
+});
+
+test('shelveConcept refuses without a reason -- no silent, unexplained parking', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'X' }, dir);
+  assert.equal(shelveConcept(dir, concept.id, {}), null);
+  assert.equal(findConcept(loadConcepts(dir), concept.id).status, 'open');
+});
+
+test('reopenConcept restores the pre-shelve status and clears shelve fields', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'Y' }, dir);
+  recordConceptBuildTally(dir, concept.id, 'scratch'); // -> 'in-progress'
+  shelveConcept(dir, concept.id, { reason: 'paused' });
+  const reopened = reopenConcept(dir, concept.id);
+  assert.equal(reopened.status, 'in-progress', 'must restore real progress state, not reset to a blank slate');
+  assert.equal(reopened.statusBeforeShelve, undefined);
+  assert.equal(reopened.shelvedAt, undefined);
+  assert.equal(reopened.shelvedReason, undefined);
+  assert.equal(reopened.revisitCondition, undefined);
+});
+
+test('reopenConcept on a shipped concept (no prior shelve) defaults to researched', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'Z' }, dir);
+  shipConcept(dir, concept.id);
+  const reopened = reopenConcept(dir, concept.id);
+  assert.equal(reopened.status, 'researched');
+});
+
+test('reopenConcept is a safe no-op on a concept that is not shelved/shipped', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'W' }, dir);
+  assert.equal(reopenConcept(dir, concept.id), null);
+});
+
+test('shipConcept sets status to shipped and stamps shippedAt', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'V' }, dir);
+  const shipped = shipConcept(dir, concept.id);
+  assert.equal(shipped.status, 'shipped');
+  assert.ok(shipped.shippedAt);
+});
+
+test('a shelved or shipped concept refuses recordConceptResearch/recordConceptBuildTally until explicitly reopened', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'U' }, dir);
+  shelveConcept(dir, concept.id, { reason: 'paused' });
+  assert.equal(recordConceptResearch(dir, concept.id), null, 'a stray research fork must not silently reopen a shelved concept');
+  assert.equal(recordConceptBuildTally(dir, concept.id, 'scratch'), null);
+  const onDisk = findConcept(loadConcepts(dir), concept.id);
+  assert.equal(onDisk.status, 'shelved', 'status must stay exactly as the human left it');
+  assert.equal(onDisk.researchForkCount, 0);
+
+  const other = createConcept({ name: 'T' }, dir);
+  shipConcept(dir, other.id);
+  assert.equal(recordConceptResearch(dir, other.id), null);
+  assert.equal(recordConceptBuildTally(dir, other.id, 'adapted'), null);
+});
+
+test('shelveConcept/shipConcept are safe no-ops for an unknown conceptId', () => {
+  const dir = tmpDir();
+  assert.equal(shelveConcept(dir, 'concept-does-not-exist', { reason: 'x' }), null);
+  assert.equal(shipConcept(dir, 'concept-does-not-exist'), null);
+  assert.equal(reopenConcept(dir, 'concept-does-not-exist'), null);
 });

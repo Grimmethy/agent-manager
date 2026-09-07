@@ -83,11 +83,20 @@ function createConcept({ name, description }, pipelineDir, { createdBy } = {}) {
   return concept;
 }
 
+// A concept parked (shelved) or finished (shipped) is a deliberate, terminal-for-now
+// decision -- mirrors task-disposition.js's own STABLE_TERMINAL_STAGES convention (a
+// stable state a sweep/mutation must never silently reopen). Every mutator below that
+// would otherwise keep nudging status forward (research, build-tally) now refuses to
+// touch a concept in one of these states until it's explicitly reopened -- e.g. a stray
+// research fork landing after Task Atomization was shelved for "a day of work, backlog
+// takes priority" must not silently flip it back to 'researched' and erase that decision.
+const STABLE_CONCEPT_STATUSES = new Set(['shelved', 'shipped']);
+
 function recordConceptResearch(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept) return null;
+  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   concept.researchForkCount = (concept.researchForkCount || 0) + 1;
   concept.lastResearchedAt = new Date().toISOString();
   if (concept.status === 'open') concept.status = 'researched';
@@ -102,10 +111,69 @@ function recordConceptBuildTally(pipelineDir, conceptId, kind) {
   if (!conceptId || (kind !== 'scratch' && kind !== 'adapted')) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept) return null;
+  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   if (kind === 'scratch') concept.builtFromScratchCount = (concept.builtFromScratchCount || 0) + 1;
   else concept.adaptedFromResourceCount = (concept.adaptedFromResourceCount || 0) + 1;
   if (concept.status === 'researched' || concept.status === 'open') concept.status = 'in-progress';
+  writeConcepts(pipelineDir, data);
+  return concept;
+}
+
+// Lifecycle (2026-09-06, Grimmethy: "I envision them as a sort of hub we can return to
+// and develop and optimize over time" -- real registry data confirmed the actual gap:
+// 14 of 16 tracked concepts were stuck at 'researched' forever, indistinguishable
+// between "genuinely forgotten" and "deliberately parked" -- e.g. Task Atomization,
+// explicitly scoped as "a job for a whole day of work" and shelved with the backlog
+// taking priority, had no way to record that decision at all).
+//
+// shelveConcept: parks a concept deliberately, with WHY and (optionally) what would make
+// it worth reopening -- the two things a future session actually needs to pick this back
+// up without re-deriving the same judgment call from scratch. statusBeforeShelve is
+// stashed so reopenConcept can restore real progress state (researched vs in-progress)
+// instead of resetting every reopened concept back to a blank slate.
+function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}) {
+  if (!conceptId || !reason) return null;
+  const data = loadConcepts(pipelineDir);
+  const concept = findConcept(data, conceptId);
+  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  concept.statusBeforeShelve = concept.status;
+  concept.status = 'shelved';
+  concept.shelvedAt = new Date().toISOString();
+  concept.shelvedReason = String(reason).trim();
+  concept.revisitCondition = revisitCondition ? String(revisitCondition).trim() : null;
+  writeConcepts(pipelineDir, data);
+  return concept;
+}
+
+// reopenConcept: the only way out of 'shelved' (or 'shipped', for the rare "actually,
+// more to do here" case) -- restores whatever status the concept held right before it
+// was shelved, defaulting to 'researched' for a shipped concept reopened with no prior
+// shelve on record. Clears the shelve-specific fields rather than leaving stale ones
+// that would misleadingly suggest the concept is still parked.
+function reopenConcept(pipelineDir, conceptId) {
+  if (!conceptId) return null;
+  const data = loadConcepts(pipelineDir);
+  const concept = findConcept(data, conceptId);
+  if (!concept || !STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  concept.status = concept.statusBeforeShelve || 'researched';
+  delete concept.statusBeforeShelve;
+  delete concept.shelvedAt;
+  delete concept.shelvedReason;
+  delete concept.revisitCondition;
+  writeConcepts(pipelineDir, data);
+  return concept;
+}
+
+// shipConcept: the concept's work is genuinely done, not just "some work happened"
+// (which 'in-progress' already means) -- a real terminal state a hub view can use to
+// stop surfacing a concept as active work.
+function shipConcept(pipelineDir, conceptId) {
+  if (!conceptId) return null;
+  const data = loadConcepts(pipelineDir);
+  const concept = findConcept(data, conceptId);
+  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  concept.status = 'shipped';
+  concept.shippedAt = new Date().toISOString();
   writeConcepts(pipelineDir, data);
   return concept;
 }
@@ -202,4 +270,8 @@ module.exports = {
   CONCEPT_BUILD_INSTRUCTION,
   injectConceptBuildInstruction,
   extractConceptBuildReport,
+  STABLE_CONCEPT_STATUSES,
+  shelveConcept,
+  reopenConcept,
+  shipConcept,
 };
