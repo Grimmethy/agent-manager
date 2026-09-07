@@ -111,21 +111,19 @@ function spyLock() {
   return { calls, withLockFn };
 }
 
-// The three LOCAL adhoc tiers (harness-search, read-only agentic, write agentic -- see
-// local-draft.js's dispatch comment) are all injectable. `declineLocalTiers()` makes the
-// first two decline and the write tier block-for-human, matching the real "no local tier
-// could do this" outcome for tests not specifically exercising a tier. (2026-09-01: there
-// is no Claude tier any more.)
+// The single LOCAL adhoc write-agentic pass (see local-draft.js's dispatch comment) is
+// injectable. `declineLocalTiers()` makes it block-for-human, matching the real "local
+// couldn't do this" outcome for tests not specifically exercising its behavior.
+// (2026-09-01: there is no Claude tier. 2026-09-06: there is no harness-search/read-only
+// escalation ladder any more either -- see local-draft.js's draftAdhocBranch header for
+// why it was removed. Name kept plural for a smaller test diff.)
 function declineLocalTiers() {
-  const decline = async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' });
   return {
-    draftAdhocViaHarnessSearchFn: decline,
-    draftAdhocViaLocalAgenticFn: decline,
-    draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'all local adhoc tiers declined (test stub)' }),
+    draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'local adhoc draft declined (test stub)' }),
   };
 }
 
-test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls claude-client', async () => {
+test('adhoc: plan + the write-agentic tier are lock-wrapped; nothing ever calls claude-client', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();
     const task = { id: 'adhoc-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
@@ -133,8 +131,6 @@ test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls c
     await draftTask(task, {
       localCall: fakeLocalCall(PLAN_STUB),
       withLockFn,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn: async (t) => {
         t.adhocResolution = 'no-changes-needed';
         t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
@@ -142,10 +138,10 @@ test('adhoc: plan + all three local tiers are lock-wrapped; nothing ever calls c
       },
     });
 
-    // plan + preliminary decompose-check + harness + read-only agentic + write agentic
-    // = 5 lock cycles, all local. (The decompose-check returns non-JSON here so the task
-    // falls through to the tiers.)
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end', 'start', 'end', 'start', 'end']);
+    // plan + preliminary decompose-check + write agentic = 3 lock cycles, all local.
+    // (The decompose-check returns non-JSON here so the task falls through to the write
+    // tier.)
+    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end']);
   });
 });
 
@@ -169,8 +165,6 @@ test('an adhoc task spawned by brain_dump_sort (promptContext.brainDumpEntryId) 
     };
     await draftTask(task, {
       localCall,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn: async (t) => {
         t.adhocResolution = 'no-changes-needed';
         t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
@@ -191,8 +185,6 @@ test('an ordinary adhoc task with no brainDumpEntryId keeps the standard plan-pa
     const task = { id: 'adhoc-ordinary-test-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'fix the bug in foo.js' } };
     await draftTask(task, {
       localCall,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn: async (t) => {
         t.adhocResolution = 'no-changes-needed';
         t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
@@ -231,8 +223,6 @@ test('adhoc: the preliminary check splits a fresh task straight to decompose, no
     const result = await draftTask(task, {
       localCall: splittingLocalCall(),
       withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn: markTier,
-      draftAdhocViaLocalAgenticFn: markTier,
       draftAdhocViaLocalAgenticWriteFn: markTier,
     });
 
@@ -285,8 +275,6 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
     const result = await draftTask(task, {
       localCall: fakeLocalCall('no real match -- nothing plausible'),
       withLockFn,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn,
     });
 
@@ -298,61 +286,29 @@ test('an adhoc task whose agentic draft needs a human decision skips needs-revie
   });
 });
 
-// 2026-09-01: a declined read-only tier 2 does real exploration; forward its map into
-// tier 3 so tier 3 doesn't re-orient from cold and run out of turns before it edits.
-test('adhoc: a declined tier-2 investigationSummary reaches tier 3 as task._priorInvestigation and is never persisted', async () => {
-  await withFixtureRepo(async (draftTask) => {
-    const { withLockFn } = spyLock();
-    const task = { id: 'adhoc-fwd', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-    let seenAtTier3;
-
-    const result = await draftTask(task, {
-      localCall: fakeLocalCall('no confident match'),
-      withLockFn,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({
-        applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line',
-        investigationSummary: 'Files already read: python/dashboard/app.py\nSearches that returned NOTHING: "/api/chat/inject" in python',
-      }),
-      draftAdhocViaLocalAgenticWriteFn: async (t) => {
-        seenAtTier3 = t._priorInvestigation;
-        t.adhocResolution = 'implemented';
-        t.implementResponse = 'RESOLUTION: implemented\ndone';
-        return { succeeded: true, blocked: false };
-      },
-    });
-
-    assert.equal(result.succeeded, true);
-    assert.match(seenAtTier3, /Files already read: python\/dashboard\/app\.py/);
-    assert.equal(task._priorInvestigation, undefined, 'transient -- deleted after tier 3, never persisted');
-  });
-});
-
 function seedWidget(dir) {
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'src', 'widget.js'), 'function updateWidgetCache() { return WIDGET_CACHE; }\n');
   process.env.AGENT_MANAGER_GREP_DIRS = 'src';
 }
 
-test('adhoc: the orient pass runs, stamps orientNotes + oriented + orient-done history, and feeds tier 3', async () => {
+test('adhoc: the orient pass runs, stamps orientNotes + oriented + orient-done history, and feeds the write-agentic pass', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     seedWidget(dir);
     const { withLockFn } = spyLock();
     const task = { id: 'adhoc-orient', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'change updateWidgetCache in src/widget.js' } };
-    let seenAtTier3;
+    let seenAtWriteTier;
     await draftTask(task, {
       localCall: fakeLocalCall(PLAN_STUB),
       withLockFn,
       runOrientPassFn: async () => ({ notes: 'CURRENT STATE: widget.js has a cache\nEDIT LOCATION: src/widget.js:40', turnsUsed: 4, skipped: false }),
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
-      draftAdhocViaLocalAgenticWriteFn: async (t) => { seenAtTier3 = t._priorInvestigation; t.adhocResolution = 'implemented'; t.implementResponse = 'RESOLUTION: implemented\ndone'; return { succeeded: true, blocked: false }; },
+      draftAdhocViaLocalAgenticWriteFn: async (t) => { seenAtWriteTier = t._priorInvestigation; t.adhocResolution = 'implemented'; t.implementResponse = 'RESOLUTION: implemented\ndone'; return { succeeded: true, blocked: false }; },
     });
     assert.equal(task.oriented, true);
     assert.match(task.orientNotes, /CURRENT STATE: widget\.js has a cache/);
     assert.ok((task.history || []).some((h) => h.stage === 'orient-done'));
-    assert.match(seenAtTier3, /Pre-plan orientation report/);
-    assert.match(seenAtTier3, /EDIT LOCATION: src\/widget\.js:40/);
+    assert.match(seenAtWriteTier, /Pre-plan orientation report/);
+    assert.match(seenAtWriteTier, /EDIT LOCATION: src\/widget\.js:40/);
   });
 });
 
@@ -428,30 +384,28 @@ test('adhoc: plan-critique is OFF by default (no flag) -- runPlanCritiqueFn neve
   });
 });
 
-test('adhoc: tier 3 gets no _priorInvestigation when tier 2 produced no investigation summary', async () => {
+test('adhoc: the write-agentic pass gets no _priorInvestigation when there is no orient/plan grounding to seed it', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { withLockFn } = spyLock();
     const task = { id: 'adhoc-fwd-none', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-    let seenAtTier3 = 'SENTINEL';
+    let seenAtWriteTier = 'SENTINEL';
 
     await draftTask(task, {
       localCall: fakeLocalCall('no confident match'),
       withLockFn,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn: async (t) => {
-        seenAtTier3 = t._priorInvestigation;
+        seenAtWriteTier = t._priorInvestigation;
         t.adhocResolution = 'no-changes-needed';
         t.implementResponse = 'nothing';
         return { succeeded: true, blocked: false };
       },
     });
 
-    assert.equal(seenAtTier3, undefined);
+    assert.equal(seenAtWriteTier, undefined);
   });
 });
 
-test('adhoc: every tier lock-cycle is fully closed before the next tier runs (no nesting)', async () => {
+test('adhoc: every lock-cycle (plan, decompose-check, write-agentic) is fully closed in turn, no nesting', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { calls, withLockFn } = spyLock();
     const task = { id: 'adhoc-test-2', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
@@ -467,49 +421,18 @@ test('adhoc: every tier lock-cycle is fully closed before the next tier runs (no
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn,
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.succeeded, true);
     assert.equal(calls.length % 2, 0, 'all lock cycles closed by the end');
-    assert.ok(calls.length >= 8, 'plan + harness + read-only + write agentic each locked');
-    // The write tier runs inside its OWN (single) lock -- every earlier tier's lock is
-    // already released, so exactly one `start` is unmatched at that point.
+    assert.ok(calls.length >= 4, 'plan + write agentic each locked');
+    // The write tier runs inside its OWN (single) lock -- the plan/decompose-check locks
+    // are already released, so exactly one `start` is unmatched at that point.
     const starts = callsAtWriteTier.filter((c) => c === 'start').length;
     const ends = callsAtWriteTier.filter((c) => c === 'end').length;
     assert.equal(starts - ends, 1);
     assert.equal(callsAtWriteTier[callsAtWriteTier.length - 1], 'start');
-  });
-});
-
-test('an adhoc task where the harness-search tier applies a change -- never reaches local-agentic or Claude at all', async () => {
-  await withFixtureRepo(async (draftTask) => {
-    const { calls, withLockFn } = spyLock();
-    const task = { id: 'adhoc-test-3', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-
-    const draftAdhocViaHarnessSearchFn = async (t) => {
-      t.implementResponse = 'harness-search tier result';
-      t.adhocResolution = 'implemented';
-      t.rawDiff = 'fake diff';
-      t.draftModel = 'test-local-model';
-      return { applied: true, succeeded: true };
-    };
-    const draftAdhocViaLocalAgenticFn = async () => { throw new Error('must not be called when harness-search already applied'); };
-    const draftAdhocViaLocalAgenticWriteFn = async () => { throw new Error('must not reach the write tier when harness-search already applied'); };
-
-    const result = await draftTask(task, {
-      localCall: fakeLocalCall(PLAN_STUB),
-      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
-    });
-
-    assert.equal(result.succeeded, true);
-    assert.equal(result.blocked, false);
-    assert.equal(task.status, 'needs-review');
-    // plan pass + preliminary decompose-check + the applied harness-search tier = 3 lock
-    // cycles; the read-only and write tiers are never reached.
-    assert.deepEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end']);
   });
 });
 
@@ -519,18 +442,16 @@ test('an adhoc task where the harness-search tier applies a change -- never reac
 test('a successful draft appends draft-done immediately before needs-review, after implement-done', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-dd-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-    const draftAdhocViaHarnessSearchFn = async (t) => {
+    const draftAdhocViaLocalAgenticWriteFn = async (t) => {
       t.implementResponse = 'x';
       t.adhocResolution = 'implemented';
       t.draftModel = 'test-local-model';
-      return { applied: true, succeeded: true };
+      return { succeeded: true, blocked: false };
     };
     await draftTask(task, {
       localCall: fakeLocalCall('confident match: none'),
       withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn,
-      draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
-      draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
+      draftAdhocViaLocalAgenticWriteFn,
     });
     const stages = (task.history || []).map((e) => e.stage);
     const dd = stages.indexOf('draft-done');
@@ -556,12 +477,10 @@ test('a persist hook registered around a draft is flushed on every checkpoint, s
       await draftTask(task, {
         localCall: fakeLocalCall('confident match: none'),
         withLockFn: async (d, fn) => fn(),
-        draftAdhocViaHarnessSearchFn: async (t) => {
+        draftAdhocViaLocalAgenticWriteFn: async (t) => {
           t.implementResponse = 'x'; t.adhocResolution = 'implemented'; t.draftModel = 'test-local-model';
-          return { applied: true, succeeded: true };
+          return { succeeded: true, blocked: false };
         },
-        draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
-        draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
       });
       assert.ok(snapshots.length >= 3, `hook fired for each checkpoint mid-draft, not once at the end (got ${snapshots.length})`);
       assert.deepEqual(snapshots[0], ['draft-started'], 'first flush happens as soon as the draft starts, before any model work');
@@ -670,35 +589,10 @@ test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even
   assert.ok(b.implNumCtx >= PINNED_NUM_CTX);
 });
 
-test('an adhoc task where harness-search declines but local-agentic (read-only) applies -- never reaches the write tier', async () => {
-  await withFixtureRepo(async (draftTask) => {
-    const { withLockFn } = spyLock();
-    const task = { id: 'adhoc-test-4', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-
-    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'no real matches' });
-    const draftAdhocViaLocalAgenticFn = async (t) => {
-      t.implementResponse = 'local-agentic tier result';
-      t.adhocResolution = 'implemented';
-      t.rawDiff = 'fake diff';
-      t.draftModel = 'test-local-model';
-      return { applied: true, succeeded: true };
-    };
-    const draftAdhocViaLocalAgenticWriteFn = async () => { throw new Error('must not reach the write tier when the read-only tier already applied'); };
-
-    const result = await draftTask(task, {
-      localCall: fakeLocalCall('confident match: none -- no real match'),
-      withLockFn, draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
-    });
-
-    assert.equal(result.succeeded, true);
-    assert.equal(task.adhocResolution, 'implemented');
-  });
-});
-
-// 2026-09-01: adhoc has no Claude tier. When every local tier (harness-search, read-only
-// agentic, write agentic) declines/can't do it, the task BLOCKS for a human -- it never
-// reaches out to claude-client, and Claude's paused state is irrelevant.
-test('an adhoc task blocks for a human (no Claude) when all three local tiers decline', async () => {
+// 2026-09-01: adhoc has no Claude tier. When the local write-agentic pass declines/can't
+// do it, the task BLOCKS for a human -- it never reaches out to claude-client, and
+// Claude's paused state is irrelevant.
+test('an adhoc task blocks for a human (no Claude) when the local write-agentic pass declines', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-test-all-decline', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
@@ -710,52 +604,33 @@ test('an adhoc task blocks for a human (no Claude) when all three local tiers de
 
     assert.equal(result.succeeded, true);
     assert.equal(result.blocked, true);
-    assert.match(result.blockedReason, /local adhoc tiers declined/);
+    assert.match(result.blockedReason, /local adhoc draft declined/);
     assert.equal(task.status, undefined, 'not routed into needs-review');
   });
 });
 
-// 2026-08-31 ("the task log gets cut short"): the adhoc tier ladder used to emit no
-// history between 'plan-done' and its terminal event, so a draft killed mid-ladder (or
-// looping in the multi-minute tier 3) showed only '...-> plan-done'. Each tier now emits
-// an 'implement-started' breadcrumb as it's entered.
-test('the adhoc tier ladder emits an implement-started checkpoint for each tier it enters', async () => {
+// 2026-08-31 ("the task log gets cut short"): the adhoc draft pass used to emit no
+// history between 'plan-done' and its terminal event, so a draft killed mid-way (or
+// looping in the multi-minute agentic pass) showed only '...-> plan-done'. The pass now
+// emits an 'implement-started' breadcrumb as it's entered.
+test('the adhoc write-agentic pass emits an implement-started checkpoint before it runs', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-tier-crumbs', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
     await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn: async (d, fn) => fn(),
-      ...declineLocalTiers(), // harness + read-only decline; write tier blocks for a human
+      ...declineLocalTiers(), // write-agentic pass blocks for a human
     });
 
     const started = (task.history || []).filter((e) => e.stage === 'implement-started').map((e) => e.detail);
-    assert.equal(started.length, 3, 'one implement-started per tier (harness, read-only agentic, write agentic)');
-    assert.match(started[0], /tier 1\/3: harness-search/);
-    assert.match(started[1], /tier 2\/3: local-agentic/);
-    assert.match(started[2], /tier 3\/3: local-agentic-write/);
+    assert.equal(started.length, 1, 'one implement-started checkpoint for the single write-agentic pass');
+    assert.match(started[0], /adhoc: local-agentic-write/);
 
     const stages = (task.history || []).map((e) => e.stage);
-    // the tier-3 breadcrumb lands BEFORE the terminal 'blocked' -- so a draft killed
-    // inside tier 3 still shows it got that far.
+    // the breadcrumb lands BEFORE the terminal 'blocked' -- so a draft killed inside the
+    // agentic pass still shows it got that far.
     assert.ok(stages.lastIndexOf('implement-started') < stages.indexOf('blocked'));
-  });
-});
-
-test('a successful cheap-tier adhoc draft names which tier applied in implement-done', async () => {
-  await withFixtureRepo(async (draftTask) => {
-    const task = { id: 'adhoc-tier-named', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
-    await draftTask(task, {
-      localCall: fakeLocalCall('confident match: none'),
-      withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn: async (t) => { t.implementResponse = 'x'; t.adhocResolution = 'implemented'; t.draftModel = 'test-local-model'; return { applied: true, succeeded: true }; },
-      draftAdhocViaLocalAgenticFn: async () => { throw new Error('unused'); },
-      draftAdhocViaLocalAgenticWriteFn: async () => { throw new Error('unused'); },
-    });
-    const done = (task.history || []).find((e) => e.stage === 'implement-done');
-    assert.match(done.detail, /harness-search tier applied/);
-    // tier 2 was never entered, so only tier 1's implement-started exists
-    assert.equal((task.history || []).filter((e) => e.stage === 'implement-started').length, 1);
   });
 });
 
@@ -811,7 +686,7 @@ test('a research task runs its Claude implement pass when research_task IS in AG
   });
 });
 
-test('an adhoc task reaches the local write-agentic tier when harness + read-only both decline', async () => {
+test('an adhoc task with a real implemented resolution reaches the local write-agentic pass and lands in needs-review', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-test-write-tier', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
 
@@ -827,8 +702,6 @@ test('an adhoc task reaches the local write-agentic tier when harness + read-onl
     const result = await draftTask(task, {
       localCall: fakeLocalCall('confident match: none -- no real match'),
       withLockFn: async (dir2, fn) => fn(),
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'no match' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined' }),
       draftAdhocViaLocalAgenticWriteFn,
     });
 
@@ -1161,8 +1034,6 @@ test('a script-extract move task falls through to the normal path when the file 
 
     await draftTask(task, {
       localCall, withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
       draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'test stub' }),
     });
 
@@ -1182,8 +1053,6 @@ test('a task without the deterministicApply marker never triggers the script-ext
     const localCall = async () => ({ response: PLAN_STUB, degenerate: null, attempts: 1 });
     await draftTask(task, {
       localCall, withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
-      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
       draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'test stub' }),
     });
     assert.equal(task.implementResponse, undefined);
@@ -2395,16 +2264,10 @@ test('greenfield product_spec: unchanged -- runs the normal local plan+implement
 // collapse / tool-summary coverage; these are the local-draft.js integration.
 // ---------------------------------------------------------------------------
 
-test('draft attempt record: a blocked adhoc run captures the plan text + every declining tier', async () => {
+test('draft attempt record: a blocked adhoc run captures the plan text + the declining write-agentic tier', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'da-adhoc-blocked', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
 
-    const draftAdhocViaHarnessSearchFn = async () => ({ applied: false, succeeded: true, reason: 'harness-search found no real matches in this repo' });
-    const draftAdhocViaLocalAgenticFn = async () => ({
-      applied: false, succeeded: true, reason: 'local agentic investigation did not end with a RESOLUTION: line',
-      response: 'I looked at three files but could not decide', turnsUsed: 6,
-      toolCallLog: [{ tool: 'read_file', args: { path: 'x.js' }, result: { content: 'abc' } }],
-    });
     const draftAdhocViaLocalAgenticWriteFn = async () => ({
       succeeded: true, blocked: true, blockedReason: 'Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome',
       response: 'ran out of turns', turnsUsed: 20, resolution: null,
@@ -2415,7 +2278,7 @@ test('draft attempt record: a blocked adhoc run captures the plan text + every d
     const result = await draftTask(task, {
       localCall: fakeLocalCall('QUERY: something\n\nThe plan is to investigate the widget subsystem carefully.'),
       withLockFn: async (d, fn) => fn(),
-      draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+      draftAdhocViaLocalAgenticWriteFn,
     });
 
     assert.equal(result.blocked, true);
@@ -2424,14 +2287,10 @@ test('draft attempt record: a blocked adhoc run captures the plan text + every d
     assert.equal(a.attemptNo, 1);
     assert.equal(a.outcome, 'blocked');
     assert.match(a.plan.text, /investigate the widget subsystem/);
-    assert.equal(a.tiers.length, 3);
-    assert.deepEqual(a.tiers.map((t) => t.tier), ['harness-search', 'local-agentic', 'local-agentic-write']);
-    assert.match(a.tiers[0].reason, /no real matches/);
-    assert.equal(a.tiers[1].response, 'I looked at three files but could not decide');
-    assert.equal(a.tiers[1].turnsUsed, 6);
-    assert.equal(a.tiers[1].toolCalls.total, 1);
-    assert.equal(a.tiers[2].turnsUsed, 20);
-    assert.match(a.tiers[2].rawDiff, /partial edit/);
+    assert.equal(a.tiers.length, 1);
+    assert.deepEqual(a.tiers.map((t) => t.tier), ['local-agentic-write']);
+    assert.equal(a.tiers[0].turnsUsed, 20);
+    assert.match(a.tiers[0].rawDiff, /partial edit/);
     // a 'draft-attempt' history event is emitted so the persist hook flushes it
     assert.ok((task.history || []).some((e) => e.stage === 'draft-attempt'));
   });
