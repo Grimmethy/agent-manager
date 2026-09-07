@@ -19,6 +19,14 @@
 // Each findings entry is { file, line, detail } (scanProject's own shape). Nothing
 // registered for a source => deterministicRecheck returns null => the LLM path runs,
 // exactly as it did before the fastpath existed.
+//
+// 2026 caveat -- 'Cheap Verifiers, Large Blind Spots': the cheap-model verifier
+// (qwen2.5:3b grounding-check fallback) is a better-than-nothing second layer, NOT a
+// substitute for a deterministic check. Its blind spot (the fraction of wrong answers
+// wrongly waved through) is LARGEST and moves adversarially in the cheap-student /
+// cheap-verifier config. A 'pass' from the 3B verifier is a probability gate, not a
+// proof -- the deterministic recheck above is the only layer that can certify a
+// staleness finding as resolved.
 
 const registry = {};
 
