@@ -133,13 +133,25 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
   for (const name of pendingNames) {
     const { task } = readTaskSafe(path.join(pendingDir, name));
     if (!task) continue;
-    if (task.pinnedWorker && task.pinnedWorker !== instanceId) continue; // pinned elsewhere -- not really "available" to offer here
+    // 2026-09-07, Grimmethy after finding the SAME task in worker-reasoning's list but
+    // not worker-reasoning-p40's: "why do the 2 reasoning workers have different lists?
+    // they really should share the same task list." A pin to one lane used to EXCLUDE a
+    // task from every sibling lane's browsing list entirely -- correct for
+    // pickClaimableTasks() (the real claim loop, where excluding it prevents a second
+    // lane racing to steal it away from the one it's pinned to), wrong here: an operator
+    // browsing worker-reasoning-p40's dropdown has no way to even discover a task that's
+    // currently pinned to worker-reasoning, even though picking it here is a completely
+    // legitimate "actually, reassign it to THIS lane instead" action the assign-task
+    // route already supports (it just re-pins). List it for every tier-matching lane
+    // either way; only tag it (pinnedTo) so the dashboard can show which lane currently
+    // has first claim on it, same spirit as the drafting-elsewhere `location` tag below.
     if (!resolvesToTier(task, isReasoningLane)) continue;
     out.push({
       id: task.id || name.replace(/\.json$/, ''),
       title: task.title || null,
       source: task.source || null,
       location: 'pending',
+      pinnedTo: (task.pinnedWorker && task.pinnedWorker !== instanceId) ? task.pinnedWorker : null,
     });
   }
 
