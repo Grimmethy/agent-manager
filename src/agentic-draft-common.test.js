@@ -43,6 +43,35 @@ test('parseSubTaskProposals drops malformed entries but keeps the batch, returns
   assert.equal(parseSubTaskProposals('[not json]'), null);
 });
 
+// 2026-09-07, Grimmethy (live-caught investigating a real stuck decompose move task,
+// blockedReason "RESOLUTION: decompose but no valid JSON array of {title, rawText}
+// sub-tasks followed it"): a multi-turn agentic implement pass routinely appends
+// conversational commentary AFTER the JSON array -- the old `/\[[\s\S]*\]/` greedy
+// regex extended its match all the way to a LATER, unrelated `]` in that trailing
+// prose, corrupting an otherwise perfectly well-formed array into invalid JSON.
+test('parseSubTaskProposals is not fooled by a bracket character appearing in prose AFTER the real JSON array', () => {
+  const text = 'here is the split:\n[{"title":"a","rawText":"do a"},{"title":"b","rawText":"do b"}]\n\n'
+    + 'Let me know if this breakdown looks right, or if you would prefer a different grouping [e.g. merging steps 2 and 3].';
+  assert.deepEqual(parseSubTaskProposals(text), [
+    { title: 'a', rawText: 'do a' }, { title: 'b', rawText: 'do b' },
+  ]);
+});
+
+test('parseSubTaskProposals is not fooled by a bracket character appearing in prose BEFORE the real JSON array', () => {
+  const text = 'Splitting this into pieces [roughly 2, maybe 3] based on the natural boundaries:\n'
+    + '[{"title":"a","rawText":"do a"},{"title":"b","rawText":"do b"}]';
+  assert.deepEqual(parseSubTaskProposals(text), [
+    { title: 'a', rawText: 'do a' }, { title: 'b', rawText: 'do b' },
+  ]);
+});
+
+test('parseSubTaskProposals correctly handles a literal bracket character INSIDE a sub-task\'s own rawText string', () => {
+  const text = '[{"title":"a","rawText":"update the config[env] block"},{"title":"b","rawText":"do b"}]';
+  assert.deepEqual(parseSubTaskProposals(text), [
+    { title: 'a', rawText: 'update the config[env] block' }, { title: 'b', rawText: 'do b' },
+  ]);
+});
+
 test('parseClarificationOptions needs an OPTIONS: header + 2 well-formed lines', () => {
   const text = 'the question is X\nOPTIONS:\n1. Redis :: use a redis instance\n2. In-memory :: keep it in the process\n';
   assert.deepEqual(parseClarificationOptions(text), [
