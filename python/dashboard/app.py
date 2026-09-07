@@ -1202,6 +1202,26 @@ def _expected_instance_ids() -> list[str]:
     return ids
 
 
+def _is_live_worker_instance(instance_id: str) -> bool:
+    """Real "does this worker lane actually exist right now" check for the assign-task /
+    assignable-tasks routes (2026-09-07 bug, Grimmethy: "worker-reasoning doesn't have
+    any task option"). These routes used to gate on `instance_id in _expected_instance_ids()`
+    -- but that list's worker-reasoning entry is itself gated on
+    is_claude_token_configured(), a completely orthogonal concern (whether a Claude
+    subscription token happens to be configured) that has nothing to do with whether the
+    lane exists or can run local-model drafts, which it can and does. A running
+    worker-reasoning daemon has a real instances/worker-reasoning.json heartbeat file
+    regardless of Claude-token config, so checking for that file directly -- what every
+    lane actually IS, not what launch.sh would have started under some other env -- is
+    both simpler and correct. _expected_instance_ids() itself is unaffected: its one
+    remaining caller (api_instances' offline-placeholder logic) has a different, correct
+    use for "would launch.sh have started this," not "is this assignable right now."""
+    if not instance_id.startswith("worker"):
+        return False
+    inst_dir = instances_dir()
+    return bool(inst_dir and (inst_dir / f"{instance_id}.json").is_file())
+
+
 @app.route("/api/instances")
 def api_instances():
     results = []
@@ -1490,7 +1510,7 @@ def api_instance_assignable_tasks(instance_id):
     real registered task sources + config overrides and must never be re-derived in
     Python, where it could silently drift from the Node source of truth that
     local-worker.sh's actual claim loop uses."""
-    if instance_id not in _expected_instance_ids() or not instance_id.startswith("worker"):
+    if not _is_live_worker_instance(instance_id):
         abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
     qdir = queue_dir()
     if not qdir:
@@ -1596,7 +1616,7 @@ def api_instance_assign_task(instance_id):
     or just relocating it if it's merely sitting in that lane's own drafting/ backlog)
     and moves it into pending/ first, so everything below operates on it the same way
     either way."""
-    if instance_id not in _expected_instance_ids() or not instance_id.startswith("worker"):
+    if not _is_live_worker_instance(instance_id):
         abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
 
     body = request.get_json(silent=True) or {}
