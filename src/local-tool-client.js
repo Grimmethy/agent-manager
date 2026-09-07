@@ -11,6 +11,8 @@ const os = require('os');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { grepCodebase } = require('./grep-codebase-tool.js');
+const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
+const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
@@ -177,6 +179,204 @@ function listRootsTool(a) {
     primary: roots[0],
     roots: roots.map((r, i) => ({ path: r, name: path.basename(r), primary: i === 0 })),
   };
+}
+
+// read_task / search_tasks (2026-09-07, Send to Chat: "what if we limit it to only the
+// task ID... without it being pasted in its entirety" -- see concept-send-to-chat-307f1b's
+// research). Two real gaps made a bare task ID useless on its own: none of the tools
+// above can find a task at all (grep_codebase is scoped to AGENT_MANAGER_GREP_DIRS +
+// a code-file extension allowlist that excludes queue/*.json entirely; read_file/
+// list_directory need a path the model has no way to derive, since a task can be sitting
+// in any of a dozen queue-state directories), and there was no text search anywhere in
+// this dashboard either -- only the dashboard's own exact-ID api_task_anywhere. Both are
+// read-only and safe for every caller (not gated behind allowWrite/WRITE_TOOLS -- no
+// destructive-action risk here), so they live in the base TOOLS array below, not
+// WRITE_TOOLS.
+
+// Same field list as python/dashboard/app.py's task_summary() (deliberately excludes
+// planResponse/implementResponse/promptContext -- read_task's `section` param is how a
+// caller pulls one of those on demand instead of eagerly, see below).
+function taskSummary(data, fallbackId) {
+  return {
+    id: data.id || fallbackId,
+    title: data.title,
+    domain: data.domain,
+    source: data.source,
+    status: data.status,
+    blockedReason: data.blockedReason,
+    blockedStage: data.blockedStage,
+    branch: data.branch,
+    compareUrl: data.compareUrl,
+    doneMarker: data.doneMarker,
+    createdAt: data.createdAt,
+    reviewedAt: data.reviewedAt,
+    appliedAt: data.appliedAt,
+    localRejectCount: data.localRejectCount != null ? data.localRejectCount : data.ornithRejectCount,
+    needsClarification: data.needsClarification,
+    stalenessFlag: data.stalenessFlag,
+    contextTrimFlag: data.contextTrimFlag,
+    subTasks: data.subTasks,
+    progress: data.progress,
+    coordinatorBlocked: data.coordinatorBlocked,
+  };
+}
+
+const READ_TASK_SECTIONS = { plan: 'planResponse', implement: 'implementResponse', blockedReason: 'blockedReason', history: 'history' };
+
+function formatTaskHistory(history) {
+  if (!Array.isArray(history)) return '';
+  return history.map((h) => `${h.at || ''} [${h.stage || ''}]${h.detail ? ` -- ${h.detail}` : ''}`).join('\n');
+}
+
+// Standalone line-window helper for read_task's `section` reads, mirroring read_file's
+// own offset/limit paging + MAX_READ_FILE_CHARS truncation convention (see readFileTool
+// above) without touching that already-tested function's own implementation.
+function windowSectionText(text, offset, limit) {
+  const lines = (text || '').split('\n');
+  const totalLines = lines.length;
+  const windowGiven = offset != null || limit != null;
+  let off = Number.isFinite(offset) ? Math.floor(offset) : 1;
+  if (off < 1) off = 1;
+  let lim = Number.isFinite(limit) ? Math.floor(limit) : READ_FILE_DEFAULT_LINES;
+  if (lim < 1) lim = 1;
+  if (lim > READ_FILE_MAX_LINES) lim = READ_FILE_MAX_LINES;
+
+  if (off > totalLines) {
+    return { content: '', offset: off, limit: lim, totalLines, nextOffset: null, truncated: false };
+  }
+  const endLine = Math.min(totalLines, off - 1 + lim);
+  let slice = lines.slice(off - 1, endLine).join('\n');
+  let truncated = false;
+  if (slice.length > MAX_READ_FILE_CHARS) {
+    slice = `${slice.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`;
+    truncated = true;
+  }
+  const returnedThrough = truncated ? off : endLine;
+  const nextOffset = endLine < totalLines ? endLine + 1 : null;
+  const out = { content: slice, offset: off, limit: lim, totalLines, nextOffset, truncated };
+  if (nextOffset != null) {
+    out.notice = windowGiven
+      ? `showing lines ${off}-${returnedThrough} of ${totalLines}. Re-call with offset=${nextOffset} for the next window.`
+      : `showing 1-${returnedThrough} of ${totalLines} lines; re-call with offset=${nextOffset} to page further (limit up to ${READ_FILE_MAX_LINES}).`;
+  }
+  return out;
+}
+
+function readTaskTool(pipelineDir, { taskId, section, offset, limit } = {}) {
+  if (typeof taskId !== 'string' || !taskId.trim()) {
+    return { error: 'read_task requires a non-empty "taskId" argument' };
+  }
+  if (section != null && !Object.prototype.hasOwnProperty.call(READ_TASK_SECTIONS, section)) {
+    return { error: `unknown section '${section}'. Valid sections: ${Object.keys(READ_TASK_SECTIONS).join(', ')}, or omit section for a summary.` };
+  }
+  const found = findTaskAnywhere(pipelineDir, taskId);
+  if (!found) {
+    return { error: `task ${taskId} not found in any queue state` };
+  }
+  const { data, foundState } = found;
+  if (!section) {
+    return { ...taskSummary(data, taskId), foundState };
+  }
+  const field = READ_TASK_SECTIONS[section];
+  const raw = field === 'history' ? formatTaskHistory(data.history) : data[field];
+  if (!raw) {
+    return { error: `task ${taskId} has no ${section} content`, foundState };
+  }
+  return { taskId, foundState, section, ...windowSectionText(raw, offset, limit) };
+}
+
+const MAX_SEARCH_TASK_RESULTS = 15;
+
+function candidateTaskFiles(pipelineDir, state) {
+  const qdir = path.join(pipelineDir, 'queue');
+  const out = []; // [{ fullPath, foundState }]
+  const addDir = (dirPath, foundState) => {
+    let names;
+    try { names = fs.readdirSync(dirPath); } catch { return; }
+    for (const name of names) {
+      if (name.endsWith('.json')) out.push({ fullPath: path.join(dirPath, name), foundState });
+    }
+  };
+  if (state === 'drafting') {
+    const draftingRoot = path.join(qdir, 'drafting');
+    let lanes;
+    try { lanes = fs.readdirSync(draftingRoot, { withFileTypes: true }); } catch { lanes = []; }
+    for (const lane of lanes) {
+      if (lane.isDirectory()) addDir(path.join(draftingRoot, lane.name), `drafting:${lane.name}`);
+    }
+  } else if (state === 'adhoc') {
+    addDir(path.join(qdir, 'adhoc'), 'adhoc');
+  } else if (QUEUE_STATES.includes(state)) {
+    addDir(path.join(qdir, state), state);
+  }
+  return out;
+}
+
+function archivedTaskFiles(pipelineDir) {
+  const qdir = path.join(pipelineDir, 'queue');
+  const out = [];
+  const noActionDir = path.join(qdir, 'done', '_archived_no_action');
+  let names;
+  try { names = fs.readdirSync(noActionDir); } catch { names = []; }
+  for (const name of names) {
+    if (name.endsWith('.json')) out.push({ fullPath: path.join(noActionDir, name), foundState: 'archived' });
+  }
+  const datedRoot = path.join(qdir, 'done', '_archived');
+  let months;
+  try { months = fs.readdirSync(datedRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { months = []; }
+  for (const month of months) {
+    const monthDir = path.join(datedRoot, month);
+    let files;
+    try { files = fs.readdirSync(monthDir); } catch { continue; }
+    for (const name of files) {
+      if (name.endsWith('.json')) out.push({ fullPath: path.join(monthDir, name), foundState: 'archived' });
+    }
+  }
+  return out;
+}
+
+// { query, state?, includeArchived? } -> { results: [taskSummary-shaped, each tagged
+// foundState] }. state, if given, scopes the scan to one location ('drafting' for every
+// lane, 'drafting:<lane>' for one, 'adhoc', or any QUEUE_STATES name); omitted scans
+// drafting (every lane) + QUEUE_STATES + adhoc, matching findTaskAnywhere's own
+// precedence order. Archived buckets are excluded by default (scanning every dated
+// month on every call would make this slow for the common case) -- pass
+// includeArchived: true for the rare "what happened with that task last month" search.
+function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
+  if (typeof query !== 'string' || !query.trim()) {
+    return { error: 'search_tasks requires a non-empty "query" argument' };
+  }
+  const validStates = ['drafting', 'adhoc', ...QUEUE_STATES];
+  let candidates = [];
+  if (state != null) {
+    if (state.startsWith('drafting:')) {
+      const lane = state.slice('drafting:'.length);
+      candidates = candidateTaskFiles(pipelineDir, 'drafting').filter((c) => c.foundState === `drafting:${lane}`);
+    } else if (validStates.includes(state)) {
+      candidates = candidateTaskFiles(pipelineDir, state);
+    } else {
+      return { error: `unknown state '${state}'. Valid: ${validStates.join(', ')}, a 'drafting:<lane>' name, or omit to search everywhere live.` };
+    }
+  } else {
+    candidates = [
+      ...candidateTaskFiles(pipelineDir, 'drafting'),
+      ...QUEUE_STATES.flatMap((s) => candidateTaskFiles(pipelineDir, s)),
+      ...candidateTaskFiles(pipelineDir, 'adhoc'),
+    ];
+  }
+  if (includeArchived) candidates = [...candidates, ...archivedTaskFiles(pipelineDir)];
+
+  const results = [];
+  for (const { fullPath, foundState } of candidates) {
+    if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
+    let data;
+    try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+    const fallbackId = path.basename(fullPath, '.json');
+    const haystack = `${data.title || ''} ${data.id || fallbackId}`;
+    if (!lineMatches(haystack, query)) continue;
+    results.push({ ...taskSummary(data, fallbackId), foundState });
+  }
+  return { results };
 }
 
 // 2026-08-24 (Chat panel, Brain Dump #153, Grimmethy: explicitly chose real local-model
@@ -521,12 +721,48 @@ const TOOLS = [
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'read_task',
+      description: 'Look up one pipeline task by its exact ID (searches every queue state: drafting, pending, review, blocked, done, needs-clarification, awaiting-confirm, coordinating, approved, adhoc, and archived). With no "section", returns a summary (title, source, status, blockedReason, etc.) -- cheap, use this first. Pass "section" to pull one specific piece of the full content on demand instead of everything at once.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The exact task id.' },
+          section: { type: 'string', description: 'Optional: one of "plan", "implement", "history", "blockedReason" to pull just that piece of the task\'s full content instead of the summary.' },
+          offset: { type: 'integer', description: 'With "section": first line to return (1-indexed). Default 1.' },
+          limit: { type: 'integer', description: 'With "section": how many lines to return. Default 400, max 800.' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_tasks',
+      description: 'Find tasks by a keyword/phrase match against their title and id (NOT a regex) when you do not already have an exact task id -- pass the result\'s "id" to read_task for details. Searches live queue states by default (not old archived tasks); pass includeArchived to also search those (slower).',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Literal substring, or several words (a task matches if its title/id contains every word).' },
+          state: { type: 'string', description: 'Optional: scope the search to one location -- a QUEUE_STATES name (pending, review, approved, blocked, done, needs-clarification, awaiting-confirm, coordinating), "adhoc", "drafting" (every worker lane), or "drafting:<lane>" for one lane. Omit to search everywhere live.' },
+          includeArchived: { type: 'boolean', description: 'Also search done/_archived*/ (every dated month) -- slower, only needed for an old/completed task search.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
 ];
 
 // Handler sets are built PER CALL as closures over that call's allowedRoots (the
 // system-wide Chat path threads a multi-repo list; every other caller gets
-// [getConfig().repoRoot], identical to the old static behaviour).
-function buildToolHandlers(allowedRoots) {
+// [getConfig().repoRoot], identical to the old static behaviour). pipelineDir is
+// threaded through for read_task/search_tasks (2026-09-07) the same way
+// buildWriteToolHandlers already threads it for queue_reviewed_task -- these two are
+// just not chat-only, since they're harmless reads.
+function buildToolHandlers(allowedRoots, pipelineDir) {
   // A model-supplied `root` for grep_codebase must be one of THIS call's allowed roots --
   // otherwise the tool would grep any path on disk. allowedRoots is already realpath'd
   // (see runPlanWithTools), so compare on realpath. A `root` that resolves to the primary
@@ -548,6 +784,8 @@ function buildToolHandlers(allowedRoots) {
     read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit }),
     list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path }),
     list_roots: () => listRootsTool(allowedRoots),
+    read_task: (args) => readTaskTool(pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit }),
+    search_tasks: (args) => searchTasksTool(pipelineDir, { query: args.query, state: args.state, includeArchived: args.includeArchived }),
   };
 }
 
@@ -979,8 +1217,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
   const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
   const toolHandlers = allowWrite
-    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots, pipelineDir) }
-    : buildToolHandlers(allowedRoots);
+    ? { ...buildToolHandlers(allowedRoots, pipelineDir), ...buildWriteToolHandlers(allowedRoots, pipelineDir) }
+    : buildToolHandlers(allowedRoots, pipelineDir);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
   // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
@@ -1283,6 +1521,7 @@ module.exports = {
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
   buildToolHandlers, buildWriteToolHandlers,
+  readTaskTool, searchTasksTool, taskSummary,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
