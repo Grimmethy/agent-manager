@@ -51,7 +51,15 @@ class PreemptDecisionTest(unittest.TestCase):
 
     def test_is_preemptable_child_pass(self):
         for p in ("plan", "implement", "critique", "harness-search", "local-agentic",
-                  "local-agentic-write", "local-agentic-test-repo-x", "vote", "review"):
+                  "local-agentic-write", "local-agentic-test-repo-x", "vote", "review",
+                  # 2026-09-07: 'orient' (src/orient-pass.js's maybeLocked label) and
+                  # 'decompose-check' (local-draft.js's preliminary decompose check)
+                  # were both missing -- a task caught mid-pass in either could never
+                  # actually be preempted by assign-task/chat-preempt (silently
+                  # returned killed:false with no error, "I was able to select the
+                  # decompose task but it still doesn't seem to set it as the queued
+                  # task").
+                  "orient", "decompose-check"):
             self.assertTrue(app._is_preemptable_child_pass(p), p)
         for p in (None, "", "idle", "claim", "starting"):
             self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
