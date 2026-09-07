@@ -23,7 +23,40 @@ const DEFAULT_NUM_CTX = 8192; // fallback when no live VRAM reading is available
 // tokens for a real large draft) with real margin, not review's typical case -- this
 // value is meant to almost never need to grow again, since growing is exactly what
 // triggers the hang this fix exists to avoid.
-const PINNED_NUM_CTX = 16384;
+//
+// RAISED 16384 -> 24576, 2026-09-07 (Grimmethy: "Set the context limits to what we can
+// feasibly hold while having both the 3b and 27b models running" -- context-limit
+// complaints this same session). Measured directly against the real local 3090 (not
+// estimated): qwen3.8:27b-q4_K_M costs ~16.55 GB base + ~0.061 MB/token of context
+// (anchors: num_ctx=8192 -> 17.05 GB, num_ctx=32768 -> 18.55 GB -- far cheaper per
+// token than assumed before measuring). qwen2.5:3b (brain_dump_sort's utility model,
+// see model-profile-registry.js's 'brain-dump-cheap-local' profile) costs a further
+// ~2.72 GB whenever both are meant to stay resident together (this pipeline's own
+// launch.sh pre-warm fix, same date, depends on both coexisting without eviction).
+// 24576 is the value that keeps this pipeline's existing SAFETY_MARGIN_FRACTION (15%)
+// convention intact with BOTH models loaded: 24576 total VRAM - 15% margin (3.69 GB) -
+// qwen2.5:3b (2.72 GB) = 18.17 GB budget for the 27B model, and 24576 tokens costs it
+// ~18.05 GB by the measured formula above -- a genuine ~15.5% margin, not a guess.
+// See EXTENDED_NUM_CTX below for a task that needs to go past this and is willing to
+// give up the small model's residency for its own duration to get there.
+const PINNED_NUM_CTX = 24576;
+
+// A task whose own real prompt need exceeds PINNED_NUM_CTX (see local-draft.js's
+// implNumCtx -- whole-document sources like product_spec/pipeline_forensics/
+// pipeline_debrief) may request this larger ceiling instead, but doing so requires
+// giving up qwen2.5:3b's residency for that one call (local-draft.js's
+// ensureHeadroomForExtendedContext explicitly unloads it first) -- there isn't enough
+// VRAM to hold the small model AND this much context on this box. Sized the same way as
+// PINNED_NUM_CTX above, minus the small-model reservation: 24576 total - 15% margin
+// (3.69 GB) = 20.89 GB budget for the 27B model alone; by the measured formula that
+// affords ~71K tokens, but this is picked well BELOW that (49152 = 3x PINNED_NUM_CTX,
+// itself already 1.5x the OLD prior baseline) specifically because the underlying
+// per-token cost was only ever measured up to 32768 tokens directly -- extrapolating
+// linearly another 16K+ tokens past the last real measurement carries real uncertainty
+// this pipeline's own "ground a threshold in a real measurement, not a guess" principle
+// (AGENTS.md) argues against pushing right up against blindly. Re-measure and raise
+// further only once a real workload actually needs more than this.
+const EXTENDED_NUM_CTX = 49152;
 
 // ollama-http.js documents a hard-won 5-minute ceiling (docs/pipeline-incident-2026-07-19.md):
 // a call legitimately needing longer than this is a signal to change the workload, not to
@@ -129,6 +162,7 @@ module.exports = {
   MIN_NUM_CTX,
   DEFAULT_NUM_CTX,
   PINNED_NUM_CTX,
+  EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,

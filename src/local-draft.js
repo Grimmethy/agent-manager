@@ -65,7 +65,9 @@ const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
-const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
+const { postJson } = require('./ollama-http.js');
+const { getModelProfile } = require('./model-profile-registry.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
@@ -1271,6 +1273,27 @@ async function runCritiqueAndRevision(task, {
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 }
 
+// 2026-09-07, Grimmethy: "If we need to go higher the task can request the 3b model be
+// dropped until the end of that task." A call using EXTENDED_NUM_CTX (see gpu-capacity.js's
+// own comment on it) doesn't fit on this box alongside the resident qwen2.5:3b utility
+// model -- explicitly evict it first via keep_alive:0 rather than letting Ollama's own
+// conservative peak-VRAM safety margin discover the collision mid-load, which is the exact
+// eviction/reload livelock this same session's launch.sh pre-warm fix was written to avoid
+// for the OTHER load-order case. Best-effort: a failed unload just means the upcoming
+// extended-context call may itself trigger Ollama's own eviction instead, no worse than
+// before this existed, so this must never throw or block the real call.
+async function ensureHeadroomForExtendedContext(implNumCtx) {
+  if (!(implNumCtx > PINNED_NUM_CTX)) return;
+  const smallModel = getModelProfile('brain-dump-cheap-local')?.model;
+  if (!smallModel) return;
+  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+  try {
+    await postJson(`${ollamaUrl}/api/generate`, { model: smallModel, keep_alive: 0 }, 10_000);
+  } catch (_err) {
+    // best-effort -- see comment above.
+  }
+}
+
 // Token budget for the implement pass: how many tokens it may generate (implNumPredict),
 // the context window that has to hold prompt + thinking trace + that output (implNumCtx),
 // whether the task carries fixedLiterals to transcribe verbatim (hasFixedLiterals), and
@@ -1378,7 +1401,7 @@ function computeImplementBudget(task, implPrompt) {
   // computed need is almost always below the floor anyway; only the whole-document
   // sources (product_spec family, implNumPredict up to 16000) still grow past it, and a
   // one-time reload there beats a truncated spec.
-  const implNumCtx = Math.min(32768, Math.max(PINNED_NUM_CTX, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
+  const implNumCtx = Math.min(EXTENDED_NUM_CTX, Math.max(PINNED_NUM_CTX, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
   // Several sources' implement prompts explicitly tell the local model to output the empty
   // string when nothing genuinely applies (see prompts.js) -- an empty response from
   // them is a valid, intended answer, not a failed call, so the degenerate-output
@@ -1631,6 +1654,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const implPrompt = buildImplementPrompt(task, task.planResponse);
   const budget = computeImplementBudget(task, implPrompt);
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
+  await ensureHeadroomForExtendedContext(implNumCtx);
 
   // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
   // have. A single implement call can legitimately run close to its timeout; with the
@@ -1951,7 +1975,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext };
 
 if (require.main === module) {
   main();
