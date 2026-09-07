@@ -25,6 +25,60 @@ const path = require('path');
 // to reassign is usually already claimed by some other lane -- so this also surfaces
 // every OTHER lane's queue/drafting/ contents, tier-filtered the same way.
 
+// Bot-vs-human adhoc sub-prioritization + the persistent "premium priority" pin
+// (2026-09-07, Grimmethy: "Adhoc has bloomed immensely because of the brain dump entries
+// being fed tangentially. It's lost its effectiveness as a sorting mechanism. We need to
+// make sure that tasks that come from bot findings get sorted into a lower priority than
+// human entered adhoc tasks... I'll need a way in app to be able to set that premium
+// priority slot for any specific task. I am getting tired of manually selecting it for
+// the worker queue every pass.").
+//
+// Root cause of the first half: EVERY task filed under queue/adhoc/ -- a human running
+// queue-adhoc-task.js, a human clicking Brain Dump's "Process this now", brain_dump_sort's
+// own fully-autonomous actionable-classification, file-decompose-to-hub.js's move
+// children, product-spec-to-hub.js's section children, decompose-loop-autoroute.js's
+// re-routed children -- all resolve to the SAME registered source name ('adhoc',
+// task-source-registry.js's resolveSourceName()) and therefore the SAME static priority
+// number (10, currently tied for the best in the whole registry). task-sources.js's own
+// nextAdhocTask() loader force-overrides id/domain/source/title on every file it reads
+// from queue/adhoc/ -- including whatever `source` a bot writer originally stamped
+// (confirmed live: a file-decompose move child and an apply-group-a.js brain-dump-spawned
+// task both come back source:'manual' regardless of what they were written with) -- so by
+// the time a task reaches claim-ranking, there is no live signal left to tell a human's
+// explicit ask apart from a bot's autonomous output. `humanQueued: true` is a NEW,
+// top-level, opt-IN field stamped ONLY by the two genuinely human-initiated adhoc entry
+// points (queue-adhoc-task.js's queueAdhocTask(), and app.py's api_brain_dump_prioritize
+// -- a human clicking "Process this now" on a captured note, as opposed to
+// brain_dump_sort's own automatic actionable-classification queueing the identical shape
+// with no human decision about THIS specific task) -- everything else defaults to
+// bot-originated without needing to name every current or future bot source. It survives
+// every requeue path checked live (task-sources.js's nextAdhocTask spread, the
+// needs-clarification /resolve route, reject-retry-check.js) because none of them strip
+// unrecognized top-level fields.
+//
+// `premiumPriority: true` is a second, independent, OPERATOR-SET field (new
+// POST /api/task-anywhere/<id>/premium-priority route) -- always sorts a task ahead of
+// EVERY other task regardless of source or the bot/human split above, and (unlike
+// pinnedWorker, which local-draft.js deletes the instant a task is claimed -- a
+// deliberate one-shot override) is never auto-cleared, so it survives every retry/
+// requeue cycle until the operator turns it off or the task reaches a terminal state and
+// stops being read by this ranking at all. This is what actually closes "I am getting
+// tired of manually selecting it every pass" -- pinnedWorker still exists for "run THIS
+// on THAT specific lane right now"; premiumPriority is for "keep this at the front of
+// the queue no matter which lane gets to it next, for as long as it takes."
+//
+// Shared by pickClaimableTasks and listAssignableTasks so the two can never disagree --
+// same discipline this file's own resolvesToTier() header already documents for the tier
+// split, and the exact class of bug the "ghost in the machine" concept's own
+// standing-mechanism-vs-one-time-check lesson (AGENTS.md) warns to watch for: a rule that
+// only ever gets applied in ONE of two places that are supposed to agree.
+const BOT_ADHOC_PRIORITY_PENALTY = 30; // 10 -> 40, landing alongside brain_dump_sort (42) / secondbrain (40) -- thematically apt, since most bot-adhoc IS brain_dump_sort's own continued output
+function effectivePriority(task, basePriority, resolveSourceNameFn) {
+  if (task && task.premiumPriority) return -Infinity;
+  if (task && resolveSourceNameFn(task) === 'adhoc' && !task.humanQueued) return basePriority + BOT_ADHOC_PRIORITY_PENALTY;
+  return basePriority;
+}
+
 function readTaskSafe(fullPath) {
   let mtimeMs = 0;
   try { mtimeMs = fs.statSync(fullPath).mtimeMs; } catch (_) { /* file vanished mid-scan */ }
@@ -89,7 +143,7 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
     if (task) {
       try {
         const source = getRegisteredSource(resolveSourceName(task));
-        if (source && typeof source.priority === 'number') priority = source.priority;
+        if (source && typeof source.priority === 'number') priority = effectivePriority(task, source.priority, resolveSourceName);
       } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
     }
     if (!resolvesToTier(task, isReasoningLane)) continue;
@@ -152,6 +206,7 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
       source: task.source || null,
       location: 'pending',
       pinnedTo: (task.pinnedWorker && task.pinnedWorker !== instanceId) ? task.pinnedWorker : null,
+      premiumPriority: !!task.premiumPriority,
     });
   }
 
@@ -177,6 +232,7 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
         title: task.title || null,
         source: task.source || null,
         location: `drafting:${lane}`,
+        premiumPriority: !!task.premiumPriority,
       });
     }
   }
@@ -184,7 +240,7 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
   return out;
 }
 
-module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks };
+module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, BOT_ADHOC_PRIORITY_PENALTY };
 
 // --- CLI --------------------------------------------------------------------------
 // Two modes:

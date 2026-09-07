@@ -23,6 +23,7 @@ test('queueAdhocTask writes the expected record shape and defaults domain to "de
   assert.equal(record.domain, 'default');
   assert.equal(record.source, 'manual');
   assert.equal(record.title, 'Merge AC-57');
+  assert.equal(record.humanQueued, true, 'this is one of the two genuine human-adhoc entry points -- next-claimable-task.js\'s effectivePriority() depends on this to NOT demote it');
   assert.deepEqual(record.promptContext, { rawText: 'merge it', raisedFrom: 'chat' });
   assert.match(record.id, /^adhoc-merge-ac-57-\d+$/);
   assert.ok(fs.existsSync(filePath));
