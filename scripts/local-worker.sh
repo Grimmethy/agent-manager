@@ -301,7 +301,21 @@ process_drafting_file() {
     # bounded by the same infraRequeueLimit as every other infra pattern below, so a
     # genuinely wrong/typo'd model name (not just a not-yet-pulled one) still gives up and
     # blocks permanently after a few rounds rather than retrying forever.
-    if grep -qEi "timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|model '[^']*' not found|\b50[0-9]\b" <<< "$draft_result"; then
+    # A SIGKILL'd child (chat-preempt, the Workers-tab assign-task override) leaves
+    # $draft_result completely EMPTY -- no JSON, no error text, nothing for the pattern
+    # match above to match against, so this case fell through both checks entirely and
+    # TICK_HAD_INFRA_FAILURE never got set for it. Confirmed live 2026-09-07, Grimmethy:
+    # "I was able to select the decompose task but it still doesn't seem to set it as
+    # the queued task" -- the kill worked, but because this wasn't recognized as an
+    # infra failure, the `for name in items` loop below did NOT stop early; it just
+    # continued to whatever was next in the SAME items list this tick had already
+    # captured (from before the operator's fresh pin was even written), so the pinned
+    # task never got a look-in until every other candidate ahead of it in that stale
+    # list had also been tried. An empty result is never a legitimate success OR a
+    # legitimate "this task itself is bad" verdict -- it can only mean the process
+    # never got to finish, exactly the same "stop claiming more this tick, let a fresh
+    # tick re-evaluate" situation the pattern match below exists to catch.
+    if [[ -z "$draft_result" ]] || grep -qEi "timed out|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|econnreset|socket hang up|bad gateway|service unavailable|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ENOTFOUND|model '[^']*' not found|\b50[0-9]\b" <<< "$draft_result"; then
       TICK_HAD_INFRA_FAILURE=true
     fi
 
