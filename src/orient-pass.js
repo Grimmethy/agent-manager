@@ -16,7 +16,7 @@
 // proposes a change, only maps the ground.
 
 const { runPlanWithTools } = require('./local-tool-client.js');
-const { summariseInvestigation } = require('./local-agentic-draft.js');
+const { summariseInvestigation } = require('./agentic-draft-common.js');
 const { buildPlanGrounding, groundingCovers } = require('./plan-grounding.js');
 
 const ORIENT_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_ORIENT_TURNS) || 8;

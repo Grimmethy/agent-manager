@@ -57,8 +57,6 @@ const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
-const { draftAdhocViaHarnessSearch } = require('./adhoc-harness-draft.js');
-const { draftAdhocViaLocalAgentic } = require('./local-agentic-draft.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
@@ -521,7 +519,7 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // cheap enough that tests just inject withLockFn as a lightweight in-memory spy instead
   // (see local-draft.test.js), and production behavior stays exactly what labelFor(task)
   // says regardless of how a test wires the rest of this function. For adhoc, the IMPLEMENT
-  // path is a tiered ladder (draftAdhocBranch) whose tiers manage their own locks; for
+  // path is a single write-agentic pass (draftAdhocBranch) which manages its own lock; for
   // research (when opted into Claude), the implement call is a Claude call that never
   // touches the local GPU. For every other task, plan and implement resolve to the SAME
   // backend, so locking around each call individually (rather than one lock spanning the
@@ -646,34 +644,43 @@ function runStalenessFastpath(task, attempt) {
 // path here returns a final draftTask result directly instead.
 async function draftAdhocBranch(task, {
   maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
-  draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+  draftAdhocViaLocalAgenticWriteFn,
 }) {
-  // Tiered LOCAL escalation (2026-09-01, Grimmethy: "reasoning workers are supposed to go
-  // through qwen. Claude needs to be removed as a dependency from that system"). Every
-  // tier runs the local model against an isolated worktree:
-  //   1. harness-search  -- cheap, single-shot, grep-grounded blind diff (proven).
-  //   2. local-agentic   -- multi-turn, READ-ONLY tools, emits a Group-B diff (opt-in).
-  //   3. local-agentic-WRITE -- multi-turn with real edit/write/run_bash in a worktree
-  //      (default-on; this is what the deleted Claude adhoc-agentic-draft.js used to do).
-  // Tiers 1-2 return {applied, succeeded, reason?}: applied -> done; declined -> next
-  // tier. Tier 3 returns a terminal draftTask-shaped verdict (implemented / blocked /
+  // Single LOCAL pass: local-agentic-write, multi-turn with real edit/write/run_bash in
+  // an isolated worktree (this is what the deleted Claude adhoc-agentic-draft.js used to
+  // do). Returns a terminal draftTask-shaped verdict (implemented / blocked /
   // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
-  // fallback. All tiers are unconditionally lock-wrapped (always local).
+  // fallback. Unconditionally lock-wrapped (always local).
   //
-  // Each tier is bracketed with an 'implement-started' checkpoint. The ladder emits no
-  // other history until a tier resolves, and tier 3 is a multi-turn agentic pass that
-  // routinely runs for many minutes -- so without these, a task killed mid-ladder (or one
-  // that keeps dying in tier 3) shows only '... -> plan-done' and the Pipeline History
-  // looks cut short. With main()'s persist hook each one lands on disk the moment it fires,
-  // so the log shows exactly how far the draft got. (2026-08-31, Grimmethy: "the task log
-  // gets cut short" -- observed on a stubborn brain-dump adhoc looping in tier 3.)
+  // 2026-09-06, Grimmethy: this used to be a 3-tier escalation (cheap harness-search ->
+  // read-only local-agentic -> this write-capable pass), added 2026-09-01 on the theory
+  // that trying cheap tiers first would save time and that a read-only tier ahead of
+  // write access was a meaningful safety gate. Real production history disproved both:
+  // across 81 real adhoc tasks with a determinable winner, tier1 won 6% of the time and
+  // tier2 won 5% -- the write tier won 89% regardless. Measured tier durations (tier1
+  // avg 138.6s, tier2 avg 198.3s, tier3 avg 247.2s) meant the ~94% of tasks that declined
+  // tier 1 paid its full cost for nothing, and expected-value math across the sample
+  // showed starting every task at this tier directly saves ~55% of total drafting time
+  // vs. the 3-tier cascade. A safety audit before removing tier 2's read-only gate found
+  // zero real incidents of this tier's write access producing a bad edit that a cheaper
+  // read-only pass would have caught (28 live tier-3 tasks' history checked for revert/
+  // bad-edit signals -- zero hits, every decline was the model correctly refusing rather
+  // than writing something wrong; only 2 revert commits exist in this repo's entire git
+  // history and neither involves the adhoc ladder at all).
+  //
+  // Bracketed with an 'implement-started' checkpoint: this is a multi-turn agentic pass
+  // that routinely runs for many minutes, so without it a task killed mid-draft shows
+  // only '... -> plan-done' and the Pipeline History looks cut short. With main()'s
+  // persist hook this lands on disk the moment it fires, so the log shows exactly how
+  // far the draft got. (2026-08-31, Grimmethy: "the task log gets cut short" -- observed
+  // on a stubborn brain-dump adhoc looping in this pass.)
 
   // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
-  // BEFORE any agentic tier. A task that is genuinely 5 endpoints + a UI + tests wastes a
-  // full 35-turn tier-3 pass (and 2 retries) discovering that; catch it here instead. Only
-  // on a FRESH task -- a retry / re-scoped / already-decomposed task has specific feedback
-  // to act on and skips this. The decompose verdict flows straight to review -> coordinator
-  // exactly like a RESOLUTION: decompose from tier 3.
+  // BEFORE the write-agentic pass. A task that is genuinely 5 endpoints + a UI + tests
+  // wastes a full 35-turn agentic pass (and 2 retries) discovering that; catch it here
+  // instead. Only on a FRESH task -- a retry / re-scoped / already-decomposed task has
+  // specific feedback to act on and skips this. The decompose verdict flows straight to
+  // review -> coordinator exactly like a RESOLUTION: decompose from the agentic pass.
   const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
   const isFreshAdhoc = !task.localRejectCount
     && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
@@ -695,63 +702,20 @@ async function draftAdhocBranch(task, {
     }
   }
 
-  appendHistoryEvent(task, 'implement-started', 'adhoc tier 1/3: harness-search (cheap grep-grounded blind diff)');
-  const harnessResult = await maybeLocked(true, () => draftAdhocViaHarnessSearchFn(task), 'harness-search');
-  recordTier(attempt, {
-    tier: 'harness-search', applied: harnessResult.applied, reason: harnessResult.reason,
-    response: harnessResult.applied ? task.implementResponse : undefined,
-    rawDiff: harnessResult.applied ? task.rawDiff : undefined,
-  });
-  if (!harnessResult.applied && harnessResult.succeeded === false) {
-    return { succeeded: false, reason: harnessResult.reason };
-  }
-
-  let localTierApplied = harnessResult.applied;
-  // Carried from a declined tier 2 into the tier-3 write prompt (see the tier-3 call
-  // below) so tier 3 starts from the read-only pass's map instead of re-orienting from
-  // cold and running out of turns before it edits anything.
-  let priorInvestigation = null;
-  if (!localTierApplied) {
-    appendHistoryEvent(task, 'implement-started', 'adhoc tier 2/3: local-agentic (multi-turn, read-only tools)');
-    const localAgenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticFn(task), 'local-agentic');
-    recordTier(attempt, {
-      tier: 'local-agentic', applied: localAgenticResult.applied, reason: localAgenticResult.reason,
-      response: localAgenticResult.response, turnsUsed: localAgenticResult.turnsUsed,
-      toolCallLog: localAgenticResult.toolCallLog,
-    });
-    appendTierWorkLog(task, { tier: 'local-agentic', turnsUsed: localAgenticResult.turnsUsed, toolCallLog: localAgenticResult.toolCallLog, finalMessage: localAgenticResult.response });
-    if (!localAgenticResult.applied && localAgenticResult.succeeded === false) {
-      return { succeeded: false, reason: localAgenticResult.reason };
-    }
-    if (!localAgenticResult.applied && localAgenticResult.investigationSummary) {
-      priorInvestigation = localAgenticResult.investigationSummary;
-    }
-    localTierApplied = localAgenticResult.applied;
-  }
-
-  if (localTierApplied) {
-    const appliedTier = harnessResult.applied ? 'harness-search' : 'local-agentic (read-only)';
-    appendHistoryEvent(task, 'implement-done', `${appliedTier} tier applied, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}, model=${task.draftModel}`);
-    concludeDraft(task);
-    return { succeeded: true, blocked: false };
-  }
-
-  // Tier 3: local write-agentic. Returns the same verdict shape the Claude tier did
+  // Local write-agentic. Returns the same verdict shape the Claude tier did
   // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
   // genuine infra error (retry), everything else is terminal.
-  appendHistoryEvent(task, 'implement-started', 'adhoc tier 3/3: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
+  appendHistoryEvent(task, 'implement-started', 'adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
   // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
   // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
   // task (same pattern as runPlanPass's task._seedPlan).
-  if (priorInvestigation) {
-    task._priorInvestigation = priorInvestigation;
-  } else if (typeof task.orientNotes === 'string' && task.orientNotes.trim()) {
-    // The pre-plan orient pass (component 3) already mapped this task -- feed its report to
-    // tier 3 so it starts from confirmed findings instead of a blind re-grep.
+  if (typeof task.orientNotes === 'string' && task.orientNotes.trim()) {
+    // The pre-plan orient pass (component 3) already mapped this task -- feed its report
+    // in so this pass starts from confirmed findings instead of a blind re-grep.
     task._priorInvestigation = `Pre-plan orientation report (read-only pass, before the plan):\n\n${task.orientNotes.trim()}`;
   } else if (task.planWasGrounded && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
     // No agentic exploration ran, but the plan pass built deterministic grounding. Rebuild
-    // it (cheap, no LLM) so tier 3 starts from verified file content instead of a blind re-grep.
+    // it (cheap, no LLM) so this pass starts from verified file content instead of a blind re-grep.
     try {
       const g = buildPlanGrounding(task);
       if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
@@ -841,8 +805,8 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
 
 // Fix (2026-08-31, bra-1788142124203): a plan can clear detectDegenerate (non-empty, no
 // repeat/gibberish loop) while still being useless -- e.g. a lone "1. Inspect the current
-// code" bullet. That stub then reaches every implement tier with no map, and for adhoc the
-// tier-3 agent burns its whole turn budget re-discovering what the task text already said.
+// code" bullet. That stub then reaches implement with no map, and for adhoc the
+// write-agentic pass burns its whole turn budget re-discovering what the task text already said.
 const MIN_PLAN_CHARS = 200;
 
 function planIsThin(text) {
@@ -989,7 +953,7 @@ async function runPlanPass(task, {
       appendHistoryEvent(task, 'orient-done', orient.skipped ? 'skipped (grep-covered)' : `${orient.turnsUsed} turn(s)`);
       if (!orient.skipped && orient.notes) {
         task._planGrounding = orient.notes;   // richer than the deterministic text
-        task.orientNotes = orient.notes;      // persisted -- fed to tier 3, visible for debugging
+        task.orientNotes = orient.notes;      // persisted -- fed to the write-agentic pass, visible for debugging
         task.oriented = true;
       }
     } catch (e) {
@@ -1771,8 +1735,6 @@ async function draftTask(task, deps = {}) {
 
 async function runDraftPasses(task, attempt, {
   localCall = null, projectSearchFetch = runSearches, recordModelCall = defaultRecordModelCall,
-  draftAdhocViaHarnessSearchFn = draftAdhocViaHarnessSearch,
-  draftAdhocViaLocalAgenticFn = draftAdhocViaLocalAgentic,
   draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
   draftResearchImplementFn = draftResearchImplement, withLockFn = defaultWithLock,
   isClaudePausedFn = isClaudePaused, runOrientPassFn = runOrientPass, runPlanCritiqueFn = runPlanCritique,
@@ -1876,14 +1838,13 @@ async function runDraftPasses(task, attempt, {
         }
       }
 
-      // adhoc-shaped tasks implement via a tiered LOCAL agentic ladder (harness-search ->
-      // read-only agentic -> write agentic in an isolated worktree) instead of the blind
-      // JSON-diff pass below -- see draftAdhocBranch(). Every path there returns a final
-      // draftTask result; nothing here calls Claude.
+      // adhoc-shaped tasks implement via a single LOCAL write-agentic pass in an isolated
+      // worktree instead of the blind JSON-diff pass below -- see draftAdhocBranch().
+      // Every path there returns a final draftTask result; nothing here calls Claude.
       if (resolveSourceName(task) === 'adhoc') {
         return await draftAdhocBranch(task, {
           maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
-          draftAdhocViaHarnessSearchFn, draftAdhocViaLocalAgenticFn, draftAdhocViaLocalAgenticWriteFn,
+          draftAdhocViaLocalAgenticWriteFn,
         });
       }
 
