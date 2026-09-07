@@ -51,18 +51,83 @@ const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose|ne
 const MAX_AGENTIC_CONTINUATIONS = Number(process.env.AGENT_MANAGER_MAX_AGENTIC_CONTINUATIONS) || 2;
 const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:question|decision)\b|\b(?:ran |run )out of turns\b|\bexhausted (?:my|its|the|this) turn(?: budget)?\b|\bre-?run (?:this|the|it|me)\b|\bfresh pass (?:can|could|will) (?:complete|finish)\b|\bwhat (?:did |does )not(?: yet)? land\b/i;
 
+// Finds the FIRST top-level `[...]` array in text by depth-counting brackets (both `[`/`]`
+// and `{`/`}`, since the array's own elements are objects) while skipping over string
+// content -- unlike a plain `/\[[\s\S]*\]/` regex, this can't be dragged past the real
+// array's end by a LATER, unrelated `]` anywhere else in the text. Confirmed live
+// 2026-09-07: a multi-turn agentic implement pass answering RESOLUTION: decompose
+// routinely appends conversational commentary AFTER the JSON array ("...let me know if
+// you'd prefer a different grouping [e.g. merging steps 2 and 3]") -- the old greedy
+// regex extended its match all the way to THAT bracket, corrupting the extracted
+// substring and making JSON.parse fail on an otherwise perfectly well-formed array. The
+// task's own history read exactly like that failure: "RESOLUTION: decompose but no
+// valid JSON array of sub-tasks followed it," even though a real array clearly did.
+// Depth-counts one bracket-balanced span starting AT the given `[` position (skipping
+// over string content so a literal `[`/`]` inside a quoted value can't miscount), and
+// returns { text, nextSearchFrom } -- the matched span, and where to resume looking for
+// a NEXT candidate `[` if this one turns out not to be the real array (its own opening
+// bracket, so the next indexOf('[', nextSearchFrom) can't just re-find the same one).
+// Returns null if this particular `[` is never closed (truncated response).
+function balancedBracketSpanAt(s, start) {
+  let depth = 0;
+  let inString = null;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inString = ch; continue; }
+    if (ch === '[' || ch === '{') depth++;
+    else if (ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return { text: s.slice(start, i + 1), nextSearchFrom: start + 1 };
+    }
+  }
+  return null;
+}
+
+// Tries EVERY top-level `[...]` span in text, in order, and returns the first one that's
+// actually valid JSON AND an array -- not just the first balanced-bracket-looking span.
+// Confirmed live 2026-09-07 this needs to check more than one candidate in BOTH
+// directions: a multi-turn agentic implement pass can append commentary containing a
+// bracket AFTER the real array ("...a different grouping [e.g. merging 2 and 3]" --
+// which used to make the old greedy `/\[[\s\S]*\]/` regex swallow past the real array's
+// end), and can equally well put one BEFORE it ("splitting into pieces [roughly 2 or 3]
+// based on..." -- which would make a naive "first bracket span, stop" scan return that
+// prose instead of ever reaching the real array a few lines later). Trying candidates in
+// order and moving on when one fails to parse handles either shape without needing to
+// guess which one occurred.
+function extractFirstJsonArray(text) {
+  const s = text || '';
+  let from = 0;
+  for (;;) {
+    const start = s.indexOf('[', from);
+    if (start === -1) return null;
+    const span = balancedBracketSpanAt(s, start);
+    if (!span) return null; // unclosed -- nothing later in a truncated response can help either
+    try {
+      const parsed = JSON.parse(span.text);
+      if (Array.isArray(parsed)) return span.text;
+    } catch { /* not this one -- try the next candidate */ }
+    from = span.nextSearchFrom;
+  }
+}
+
 // A RESOLUTION: decompose response is expected to be followed by a JSON array of 2+
 // {title, rawText} sub-tasks. Deliberately permissive -- pulls the first bracketed JSON
-// array found anywhere after the RESOLUTION line and drops malformed entries rather than
-// failing the whole batch. An optional integer `after` (0-based index of an EARLIER
-// sub-task) is preserved -- queueSubTasks turns it into a `dependsOn` edge so a piece that
-// can't start until an earlier one is merged waits for it.
+// array found anywhere after the RESOLUTION line (via extractFirstJsonArray, not a plain
+// regex -- see its own header) and drops malformed entries rather than failing the whole
+// batch. An optional integer `after` (0-based index of an EARLIER sub-task) is preserved
+// -- queueSubTasks turns it into a `dependsOn` edge so a piece that can't start until an
+// earlier one is merged waits for it.
 function parseSubTaskProposals(text) {
-  const match = (text || '').match(/\[[\s\S]*\]/);
-  if (!match) return null;
+  const candidate = extractFirstJsonArray(text);
+  if (!candidate) return null;
   let parsed;
   try {
-    parsed = JSON.parse(match[0]);
+    parsed = JSON.parse(candidate);
   } catch {
     return null;
   }
@@ -528,7 +593,7 @@ function summariseInvestigation(responseText, toolCallLog) {
 
 module.exports = {
   GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock,
-  RESOLUTION_RE, parseSubTaskProposals, parseClarificationOptions,
+  RESOLUTION_RE, parseSubTaskProposals, parseClarificationOptions, extractFirstJsonArray,
   agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree,
   runAgenticDraftInWorktree, resolveAgenticDraft,
   summariseInvestigation,
