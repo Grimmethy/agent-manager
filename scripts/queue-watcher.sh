@@ -81,6 +81,18 @@ while :; do
       action_script="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.script||"")}catch(e){}')"
       action_pidfile_name="$(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.pidfileName||"")}catch(e){}')"
       mapfile -t action_args < <(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));(o.args||[]).forEach(a=>console.log(a))}catch(e){}')
+      # env (2026-09-07, Grimmethy: "the p40 has 2 tasks running on it and the gtx is
+      # idle" -- root-caused live to THIS restart path: worker-p40/worker-reasoning-p40
+      # need the OLLAMA_URL/LOCAL_MODEL env launch.sh's own start_bg() wraps them in
+      # (routes to the P40 passthrough VM's own Ollama instead of the host's), but this
+      # restart path used to spawn a bare `bash local-worker.sh <id>` with none of that --
+      # confirmed live: a watchdog-restarted worker-p40 silently fell back to the HOST's
+      # model, fighting worker-1/reviewer for the host GPU's lock instead of ever
+      # touching the P40 again. dead-process-check.js's restartTargetFor() now includes
+      # this lane's own env when applicable (empty/absent for every other instance,
+      # exactly as before); KEY=VALUE pairs here, not JSON, so this becomes a plain `env`
+      # prefix below -- same shape action_args already uses for the same reason.
+      mapfile -t action_env_pairs < <(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));Object.entries(o.env||{}).forEach(([k,v])=>console.log(`${k}=${v}`))}catch(e){}')
 
       if [[ "$action_kind" == "restart-after-kill" && -n "$action_pid" ]]; then
         kill -9 "$action_pid" 2>/dev/null    # zombie: the pid is still real and running (that's the whole problem) -- force-kill before restarting, or it keeps squatting the drafting claim/heartbeat file identity alongside the fresh replacement.
@@ -109,7 +121,11 @@ while :; do
         fi
       fi
 
-      nohup bash "${SCRIPT_DIR}/${action_script}" "${action_args[@]}" > "${LOG_DIR}/${action_instance}.log" 2>&1 &
+      if [[ ${#action_env_pairs[@]} -gt 0 ]]; then
+        nohup env "${action_env_pairs[@]}" bash "${SCRIPT_DIR}/${action_script}" "${action_args[@]}" > "${LOG_DIR}/${action_instance}.log" 2>&1 &
+      else
+        nohup bash "${SCRIPT_DIR}/${action_script}" "${action_args[@]}" > "${LOG_DIR}/${action_instance}.log" 2>&1 &
+      fi
       new_pid=$!
       echo "$new_pid" > "${PID_DIR}/${action_pidfile_name}"
       printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2

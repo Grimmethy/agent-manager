@@ -520,7 +520,16 @@ write_heartbeat_file() {
       if (prevKey === key && prev.stateSince && String(prev.pid) === pid) stateSince = prev.stateSince;
     } catch (e) {}
     const hb = {
-      instanceId, pid: Number(pid), model: model || null, status,
+      // daemonPid (2026-09-07, Grimmethy: the p40 has 2 tasks running on it and the
+      // gtx is idle -- root-caused live): this bash daemon is the ONLY writer of
+      // daemonPid, always its own stable dollar-dollar pid -- see src/heartbeat.js for
+      // why plain pid (overwritten by a spawned child process own pid while a real
+      // call is in flight) is not safe for check_instance_liveness to trust as owner
+      // identity. pid stays exactly as before (whichever process most recently wrote a
+      // heartbeat -- the dashboard display/cost-attribution still wants that), this
+      // just adds a second, narrower field for the ONE thing that actually needs a
+      // stable identity.
+      instanceId, pid: Number(pid), daemonPid: Number(pid), model: model || null, status,
       currentTaskId: taskId || null, currentPass: pass || null,
       lastHeartbeat: now, stateSince,
     };
@@ -619,12 +628,22 @@ check_instance_liveness() {
     const [hbPath, myPid] = process.argv.slice(1);
     let hb;
     try { hb = JSON.parse(fs.readFileSync(hbPath, "utf8")); } catch { process.exit(0); }
-    if (!hb || !hb.pid || String(hb.pid) === myPid) process.exit(0);
+    // daemonPid (2026-09-07 -- see write_heartbeat_file/src/heartbeat.js for the full
+    // incident): the STABLE identity of the daemon itself, not whichever process
+    // (daemon or a spawned child) most recently wrote a heartbeat -- plain `pid` gets
+    // clobbered with a spawned child own process.pid for the entire duration of a real
+    // call, so checking it here let a second daemon start the moment the previous
+    // child exited but before the real daemon looped back to its own next "idle" write
+    // (confirmed live: every worker-* lane running two processes at once). Falls back
+    // to `pid` only for a heartbeat file written before this field existed -- self
+    // heals on that instance next heartbeat write either way.
+    const ownerPid = hb && (hb.daemonPid != null ? hb.daemonPid : hb.pid);
+    if (!hb || !ownerPid || String(ownerPid) === myPid) process.exit(0);
     let alive = true;
-    try { process.kill(hb.pid, 0); } catch { alive = false; }
+    try { process.kill(ownerPid, 0); } catch { alive = false; }
     if (!alive) process.exit(0);
     // Still alive -- print its pid (stdout) and signal via exit 1.
-    console.log(hb.pid);
+    console.log(ownerPid);
     process.exit(1);
   ' "$hb_path" "$$")"
   local rc=$?

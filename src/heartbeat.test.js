@@ -73,6 +73,35 @@ test('writeHeartbeatFile carries startedAt forward from a prior write when not p
   });
 });
 
+// daemonPid (2026-09-07, Grimmethy: "the p40 has 2 tasks running on it and the gtx is
+// idle" -- root-caused live to a real duplicate-daemon incident: check_instance_liveness
+// used to trust plain `pid`, which this function overwrites with process.pid on every
+// call -- once that child exits and the parent bash daemon has not yet written its own
+// next "idle" heartbeat, the file showed a dead child pid, and a second daemon was
+// allowed to start under the same instanceId). agent-manager-common.sh's
+// write_heartbeat_file is the only ever WRITER of a fresh daemonPid value (this JS
+// function never has the daemon's own pid to write); this function must only ever carry
+// forward whatever value is already on disk.
+test('writeHeartbeatFile carries daemonPid forward from a prior write, never sets it from its own process.pid', () => {
+  withTempInstancesDir((dir) => {
+    const hbPath = path.join(dir, 'worker-reasoning.json');
+    fs.writeFileSync(hbPath, JSON.stringify({ instanceId: 'worker-reasoning', pid: 999999, daemonPid: 999999, status: 'idle' }));
+    writeHeartbeatFile(dir, 'worker-reasoning', 'working', 'm', 'task-1', 'plan');
+    const hb = readHb(dir, 'worker-reasoning');
+    assert.equal(hb.daemonPid, 999999, 'daemonPid must be carried forward from the prior (daemon-written) value');
+    assert.equal(hb.pid, process.pid, 'pid itself still reflects the currently-writing process, exactly as before');
+    assert.notEqual(hb.daemonPid, hb.pid, 'this test only proves something if the two values actually differ');
+  });
+});
+
+test('writeHeartbeatFile omits daemonPid entirely when no prior heartbeat ever set one (pre-fix file, or a fresh instance)', () => {
+  withTempInstancesDir((dir) => {
+    writeHeartbeatFile(dir, 'worker-reasoning', 'working', 'm', 'task-1', 'plan');
+    const hb = readHb(dir, 'worker-reasoning');
+    assert.equal('daemonPid' in hb, false);
+  });
+});
+
 test('writeHeartbeatFile does not throw when the instances directory does not exist yet', () => {
   const dir = path.join(os.tmpdir(), `heartbeat-test-missing-${Date.now()}`);
   try {
