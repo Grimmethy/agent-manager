@@ -657,36 +657,18 @@ while :; do                                                                     
   # uses), falling back to mtime (oldest first) to keep FIFO fairness within one priority
   # tier, and Infinity for any file whose task/source can't be resolved (parse failure,
   # unregistered source) -- unsortable is worst-case priority, not silently dropped.
+  # This ranking (plus the per-item reasoningTierFor() lane filter that used to live
+  # further down this loop) now lives in src/next-claimable-task.js -- a real tested
+  # module instead of an inline `node -e` block, extracted 2026-09-06 so it could also
+  # carry the operator "assign this task to this worker" pinnedWorker override (see that
+  # file's own header comment) without a second untested inline script growing alongside it.
   items=()                                                                      # no `local` here because we're at script scope (not function), so declare without keyword — PowerShell would use just `$items = @()` directly with no type keyword either.
   pdir="$QUEUE_DIR/pending"                                                    # compute pending dir once — matches task-sources.js's own writeTask() destination (queue/pending), not the old bare "pending/" this script used to read from (which task-sources.js never wrote to, so this claim loop always found nothing).
 
   if [[ -r "$pdir" ]]; then                                                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
     while IFS= read -r name; do
       [[ -n "$name" ]] && items+=("$name")
-    done < <(node -e '
-      try {
-        require(process.argv[1]);
-        const { getRegisteredSource, resolveSourceName } = require(process.argv[2]);
-        const fs = require("fs");
-        const path = require("path");
-        const dir = process.argv[3];
-        const names = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-        const ranked = names.map((name) => {
-          let priority = Infinity;
-          let mtimeMs = 0;
-          try {
-            const full = path.join(dir, name);
-            mtimeMs = fs.statSync(full).mtimeMs;
-            const task = JSON.parse(fs.readFileSync(full, "utf8"));
-            const source = getRegisteredSource(resolveSourceName(task));
-            if (source && typeof source.priority === "number") priority = source.priority;
-          } catch (e) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
-          return { name, priority, mtimeMs };
-        });
-        ranked.sort((a, b) => (a.priority - b.priority) || (a.mtimeMs - b.mtimeMs));
-        ranked.forEach((r) => console.log(r.name));
-      } catch (e) { /* fall through to empty listing -- caller already handles that safely */ }
-    ' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/task-source-registry.js" "$pdir" 2>/dev/null)
+    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" "$IS_REASONING_LANE" 2>/dev/null)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".
@@ -714,27 +696,10 @@ while :; do                                                                     
       # to pick a backend, so this lane split can never disagree with what actually happens
       # once a task is claimed. The Claude lane claims ONLY high-reasoning-tier tasks;
       # every other lane skips them, leaving them free for the Claude lane to pick up
-      # instead of racing for them.
-      if "$claim_succeeded"; then
-        # reasoningTierFor() reads each source's static reasoningTier off the
-        # task-source-registry.js registry (e.g. adhoc's) -- that registry is only
-        # populated as a side effect of requiring task-sources.js (its registerTaskSource()
-        # calls run at module load), so this MUST be required first in this fresh `node -e`
-        # process, or every source would come back with no registered entry and silently
-        # fall through to 'low'. Confirmed live 2026-08-17: requiring model-provider.js
-        # alone here (mirroring the old resolveSourceName one-liner, which has no such
-        # dependency) reported adhoc as 'low' every time.
-        resolved_tier="$(echo "$parsed_payload" | node -e 'try{require(process.argv[1]);const {reasoningTierFor}=require(process.argv[2]);const t=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(reasoningTierFor(t))}catch(e){}' "${PACKAGE_SRC_DIR}/task-sources.js" "${PACKAGE_SRC_DIR}/model-provider.js" 2>/dev/null)"
-        if "$IS_REASONING_LANE"; then
-          if [[ "$resolved_tier" != "high" ]]; then
-            claim_succeeded=false
-          fi
-        else
-          if [[ "$resolved_tier" == "high" ]]; then
-            claim_succeeded=false
-          fi
-        fi
-      fi
+      # instead of racing for them. (2026-09-06: this filter -- along with the
+      # pinnedWorker operator-override check -- now happens inside
+      # src/next-claimable-task.js BEFORE `items` is even built, so `$items` above
+      # already only contains tasks this instance may claim; nothing further to check here.)
 
       if "$claim_succeeded"; then                                               # actual claim action: rename pending/$name -> drafting/${INSTANCE_ID}/$name (use mv because we don't want to COPY — mv is atomic on same filesystem which prevents race where another loop picks up the same draft after we 'claimed' it). Bash's `mv` works for this; equivalent of PowerShell's `Move-Item -Force` which would do identical work under its file-system abstraction but bash doesn't need `-Force`.
         printf '[worker-%s] claiming %s\n' "$INSTANCE_ID" "$name"               # log that we're about to attempt claim — same kind of status emit as PowerShell's `$null = Write-Host "Processing $draftName"` block which prints progress to operator console so they know daemon IS doing something (otherwise they'd wonder if it hung silently).
@@ -749,8 +714,12 @@ while :; do                                                                     
         # Stamp claimedAt (ISO) so the dashboard's chat-preempt age gate knows when THIS
         # lane actually started working the task (heartbeat startedAt is daemon uptime;
         # .model-locks startedAt is per model sub-call). Set-once: a resume keeps the
-        # original. Best-effort, never blocks the claim.
-        node -e 'try{const fs=require("fs"),p=process.argv[1],o=JSON.parse(fs.readFileSync(p,"utf8"));if(!o.claimedAt){o.claimedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(o,null,2));}}catch(e){}' "$new_wpath" 2>/dev/null || true
+        # original. Also clears pinnedWorker (2026-09-06): a one-shot operator assignment
+        # shouldn't keep re-attracting the same task to the same lane on some later
+        # ordinary requeue -- the 'operator-assigned' history event already on this task
+        # (stamped by POST /api/instances/<id>/assign-task) is the permanent record of the
+        # pin, not this live field. Best-effort, never blocks the claim.
+        node -e 'try{const fs=require("fs"),p=process.argv[1],o=JSON.parse(fs.readFileSync(p,"utf8"));let dirty=false;if(!o.claimedAt){o.claimedAt=new Date().toISOString();dirty=true;}if(o.pinnedWorker){delete o.pinnedWorker;dirty=true;}if(dirty)fs.writeFileSync(p,JSON.stringify(o,null,2));}catch(e){}' "$new_wpath" 2>/dev/null || true
         printf '[worker-%s] claimed %s -> %s\n' "$INSTANCE_ID" "$wpath" "$new_wpath"     # log claim action with old+new paths — same information PowerShell's `$null = Write-Host "Claimed $src for $dest"` writes but using file redirection operator to send our printf output directly into stderr (which gets captured by launch.sh later via `nohup ... > /dev/null 2>&1 &` and tee'd into HOME_LOGS directory so user can review claim history later in log files even if their terminal is closed or busy).
 
         # Run the actual plan -> implement -> critique -> (revision) passes against Ornith,

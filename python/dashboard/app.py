@@ -1474,6 +1474,61 @@ def api_instance_recent_tasks(instance_id):
     return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m} for t, at, m in rows]})
 
 
+@app.route("/api/instances/<instance_id>/assign-task", methods=["POST"])
+def api_instance_assign_task(instance_id):
+    """Operator override: pin a specific pending task to a specific worker lane,
+    bypassing the normal priority/reasoningTier claim ranking (src/next-claimable-
+    task.js), and preempt whatever that lane is doing right now so it picks the pinned
+    task up next (2026-09-06, Workers tab, Grimmethy: "I need to be able to select the
+    task I want each worker to run... this should override the automated system...
+    whatever is being worked on should save its current state to the task log and then
+    cancel itself as soon as possible"). "Save current state" is already true
+    continuously (the Node persist hook flushes the whole task JSON to disk on every
+    history event, see task-history.js) -- what this route adds is a labeled
+    operator-preempted history event explaining WHY the in-flight task stopped, instead
+    of it looking like an unexplained infra failure next time someone reads its history.
+
+    Scoped to worker-* lanes only (the ones that actually claim from queue/pending/ via
+    local-worker.sh) -- 'reviewer' and 'watchdog' don't run drafts, so pinning a task to
+    either would be a no-op that just silently confuses the operator."""
+    if instance_id not in _expected_instance_ids() or not instance_id.startswith("worker"):
+        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+
+    body = request.get_json(silent=True) or {}
+    task_id = body.get("taskId")
+    if not task_id:
+        abort(400, description="taskId is required")
+
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    pending_path = qdir / "pending" / f"{task_id}.json"
+    if not pending_path.is_file():
+        abort(404, description=f"'{task_id}' is not in queue/pending/ -- it may already have been claimed")
+
+    try:
+        data = json.loads(pending_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        abort(500, description="could not read the task file")
+    data["pinnedWorker"] = instance_id
+    data.setdefault("history", []).append({
+        "stage": "operator-assigned", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"pinned to {instance_id} by operator override",
+    })
+    pending_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    inst_dir = instances_dir()
+    hb = (read_json_safe(inst_dir / f"{instance_id}.json") if inst_dir else None) or {}
+    preempted = False
+    current_task_id = hb.get("currentTaskId")
+    if current_task_id and current_task_id != task_id:
+        result = _kill_and_requeue_instance(
+            instance_id, f"cancelled by operator -- worker reassigned to {task_id}")
+        preempted = result["killed"]
+
+    return jsonify({"id": task_id, "pinnedTo": instance_id, "preempted": preempted})
+
+
 @app.route("/api/models/usage")
 def api_models_usage():
     """Per-model call volume across EVERY stage, not just 'implement' -- api_models()
@@ -4338,6 +4393,93 @@ def _read_fresh_model_locks(inst_dir: Path) -> dict:
         if data and data.get("instanceId") and data.get("pid"):
             out[data["instanceId"]] = data
     return out
+
+
+def _kill_and_requeue_instance(instance_id: str, note: str) -> dict:
+    """Kill whatever `instance_id` is doing right now and requeue its in-flight task
+    (content untouched -- 'current state' is already continuously checkpointed by the
+    Node persist hook, see task-history.js's setHistoryPersistHook) with a history event
+    explaining why it stopped. Generalizes the reviewer-only legacy kill-and-requeue
+    block below (inside _preempt_pipeline_for_chat) into something usable for ANY worker
+    lane -- unconditionally (no age gate; an explicit operator action always kills),
+    unlike that block's _preempt_decision age check, which is specific to chat-preempt
+    and deliberately left untouched rather than risking a regression there (2026-09-06,
+    for POST /api/instances/<id>/assign-task -- Grimmethy: "whatever is being worked on
+    should save its current state to the task log and then cancel itself as soon as
+    possible").
+
+    Safe to call on a worker-1/worker-reasoning lane even though those normally go
+    through the GPU arbiter for chat-preempt's class-based cancel-below: SIGKILLing the
+    pid directly here, without going through the arbiter, is fine because
+    gpu-arbiter.js's own liveTickets() already self-heals a ticket whose pid has died
+    (`!pidAlive(t.pid)` -> unlink) the next time anything reads tickets -- no phantom
+    "still holding" state is left behind.
+
+    Returns {"killed": bool, "taskId": str|None}."""
+    inst_dir = instances_dir()
+    qdir = queue_dir()
+    if not inst_dir or not inst_dir.is_dir() or not qdir:
+        return {"killed": False, "taskId": None}
+
+    hb = read_json_safe(inst_dir / f"{instance_id}.json") or {}
+    locks = _read_fresh_model_locks(inst_dir)
+    lock = locks.get(instance_id)
+
+    kill_pid = None
+    if lock:
+        try:
+            kill_pid = int(lock.get("pid"))
+        except (TypeError, ValueError):
+            kill_pid = None
+    if kill_pid is None and hb.get("status") in ("working", "queued") \
+            and _is_preemptable_child_pass(hb.get("currentPass")) and hb.get("pid"):
+        pids_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/pids"
+        daemon_pid = None
+        try:
+            daemon_pid = int((pids_dir / f"{instance_id}.pid").read_text().strip())
+        except (OSError, ValueError):
+            pass
+        if daemon_pid is None or int(hb["pid"]) != daemon_pid:
+            kill_pid = int(hb["pid"])
+
+    task_id = hb.get("currentTaskId")
+    if not kill_pid:
+        return {"killed": False, "taskId": task_id}
+
+    if task_id:
+        src = qdir / "drafting" / instance_id / f"{task_id}.json"
+        try:
+            if src.is_file():
+                data = json.loads(src.read_text(encoding="utf-8"))
+                data.setdefault("history", []).append({
+                    "stage": "operator-preempted", "at": datetime.now(timezone.utc).isoformat(),
+                    "detail": note,
+                })
+                src.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except (OSError, ValueError):
+            pass  # best-effort -- still proceed with the kill even if the history stamp failed
+        dst = qdir / "pending" / f"{task_id}.json"
+        try:
+            if src.is_file() and not dst.exists():
+                os.replace(src, dst)
+        except OSError:
+            pass
+
+    try:
+        os.kill(kill_pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if lock:
+        try:
+            for name in os.listdir(inst_dir / ".model-locks"):
+                lp = inst_dir / ".model-locks" / name
+                d = read_json_safe(lp) or {}
+                if d.get("pid") == kill_pid:
+                    lp.unlink()
+        except OSError:
+            pass
+
+    return {"killed": True, "taskId": task_id}
 
 
 def _arbiter_cancel_below(cls: str = "interactive") -> list:
