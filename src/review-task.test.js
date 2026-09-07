@@ -739,3 +739,115 @@ test('reviewTask STILL deterministically blocks a non-decompose manual task citi
   assert.equal(task.reviewProvider, 'deterministic-ungrounded-value');
   assert.equal(captured.length, 0, 'the exemption must be scoped to decompose only, not manual tasks in general');
 });
+
+// --- Deterministic script-extract review gate (2026-09-07, "Ghost in the Machine") ------
+// Real incident: a script-extract decompose move's real implementResponse was 600,794
+// chars (~200K tokens) against this pipeline's 16,384-token PINNED_NUM_CTX -- the
+// reviewer never actually saw the real diff and hallucinated "the draft is empty, no
+// IMPLEMENT diff." verifyDeterministicScriptExtractDraft re-derives the expected
+// extraction fresh and requires an exact byte match instead of asking a model to skim
+// something it structurally cannot fit in context.
+
+function writeHtmlWithFn(repoRoot, relPath, scriptBody) {
+  const abs = path.join(repoRoot, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
+}
+
+test('verifyDeterministicScriptExtractDraft: a byte-exact re-derivation -> ok:true', () => {
+  const { repoRoot } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(html, ['a']);
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'index.html', find: html, replace: extraction.newHtml },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.deepEqual(verifyDeterministicScriptExtractDraft(task, repoRoot), { ok: true });
+});
+
+test('verifyDeterministicScriptExtractDraft: tampered content (does not byte-match a fresh re-derivation) -> ok:false', () => {
+  const { repoRoot } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' }, // tampered
+      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /does not byte-match/);
+});
+
+test('verifyDeterministicScriptExtractDraft: symbols drifted since plan-validation -> ok:false with a clear reason', () => {
+  const { repoRoot } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function somethingElseEntirely() {}\n');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() {}\n' },
+      { mode: 'edit', file: 'index.html', find: 'x', replace: 'y' },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /no longer resolve/);
+});
+
+test('verifyDeterministicScriptExtractDraft: returns null (not applicable) for an ordinary task', () => {
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.equal(verifyDeterministicScriptExtractDraft(baseTask(), '/tmp'), null);
+});
+
+test('reviewTask auto-approves a script-extract move deterministically -- zero model calls, even though the diff is huge', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(html, ['a']);
+  const task = {
+    id: 'script-extract-review-1', domain: 'default', source: 'manual', title: 'test',
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'index.html', find: html, replace: extraction.newHtml },
+    ]),
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-script-extract-approve');
+  assert.equal(captured.length, 0, 'no model call at all -- this is exactly the class of diff too large for the review model\'s own context window');
+});
+
+test('reviewTask deterministically rejects a script-extract move whose diff no longer matches current repo state -- zero model calls', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function somethingElseEntirely() {}\n');
+  const task = {
+    id: 'script-extract-review-2', domain: 'default', source: 'manual', title: 'test',
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() {}\n' },
+      { mode: 'edit', file: 'index.html', find: 'x', replace: 'y' },
+    ]),
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-script-extract-reject');
+  assert.equal(captured.length, 0);
+});
