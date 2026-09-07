@@ -17,13 +17,29 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { pickClaimableTasks, pickNextPendingTask } = require('./next-claimable-task.js');
+const { pickClaimableTasks, pickNextPendingTask, listAssignableTasks } = require('./next-claimable-task.js');
 
 function setupPending() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
   const pendingDir = path.join(root, 'queue', 'pending');
   fs.mkdirSync(pendingDir, { recursive: true });
   return pendingDir;
+}
+
+function setupQueue() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
+  const queueDir = path.join(root, 'queue');
+  fs.mkdirSync(path.join(queueDir, 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(queueDir, 'drafting'), { recursive: true });
+  return queueDir;
+}
+
+function writeDraftingTask(queueDir, lane, id, extra = {}) {
+  const laneDir = path.join(queueDir, 'drafting', lane);
+  fs.mkdirSync(laneDir, { recursive: true });
+  const task = { id, source: 'trouble_log', promptContext: {}, ...extra };
+  fs.writeFileSync(path.join(laneDir, `${id}.json`), JSON.stringify(task, null, 2));
+  return task;
 }
 
 function writeTask(pendingDir, id, extra = {}) {
@@ -128,4 +144,54 @@ test('pickNextPendingTask returns only the single winner, or null when nothing i
 
   writeTask(pendingDir, 'only-one', { source: 'trouble_log' });
   assert.equal(pickNextPendingTask(pendingDir, 'worker-1', { isReasoningLane: false }), 'only-one.json');
+});
+
+// listAssignableTasks -- the Workers tab assign-task dropdown's real candidate source
+// (2026-09-07, Grimmethy: "the only tasks I have access to... are pipeline debrief
+// tasks. The task I want, autodecomp, is in drafting. I need access to the full list of
+// available jobs, they should however be whats available for that specific worker type").
+
+test('listAssignableTasks includes pending/ candidates, tier-filtered same as pickClaimableTasks', () => {
+  const queueDir = setupQueue();
+  writeTask(path.join(queueDir, 'pending'), 'ordinary', { source: 'trouble_log', title: 'Ordinary task' });
+  writeTask(path.join(queueDir, 'pending'), 'reasoning-only', { source: 'adhoc', title: 'Reasoning task' });
+
+  const items = listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false });
+
+  assert.deepEqual(items, [{ id: 'ordinary', title: 'Ordinary task', source: 'trouble_log', location: 'pending' }]);
+});
+
+test('listAssignableTasks includes tier-matching tasks sitting in OTHER lanes\' drafting/, tagged with their location', () => {
+  const queueDir = setupQueue();
+  writeDraftingTask(queueDir, 'worker-reasoning-p40', 'stuck-elsewhere', { source: 'adhoc', title: 'Stuck task' });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items, [{ id: 'stuck-elsewhere', title: 'Stuck task', source: 'adhoc', location: 'drafting:worker-reasoning-p40' }]);
+});
+
+test('listAssignableTasks excludes this instance\'s OWN drafting/ contents -- reassigning to itself is a no-op', () => {
+  const queueDir = setupQueue();
+  writeDraftingTask(queueDir, 'worker-1', 'already-mine', { source: 'trouble_log' });
+  writeDraftingTask(queueDir, 'worker-p40', 'someone-elses', { source: 'trouble_log' });
+
+  const items = listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false });
+
+  assert.deepEqual(items.map((i) => i.id), ['someone-elses']);
+});
+
+test('listAssignableTasks tier-filters drafting-elsewhere candidates the same as pending ones', () => {
+  const queueDir = setupQueue();
+  writeDraftingTask(queueDir, 'worker-reasoning-p40', 'high-tier-elsewhere', { source: 'adhoc' });
+
+  assert.deepEqual(listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false }), []);
+  assert.deepEqual(
+    listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true }).map((i) => i.id),
+    ['high-tier-elsewhere'],
+  );
+});
+
+test('listAssignableTasks: an empty/missing queue dir returns an empty list, not a throw', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
+  assert.deepEqual(listAssignableTasks(path.join(root, 'queue'), 'worker-1', { isReasoningLane: false }), []);
 });
