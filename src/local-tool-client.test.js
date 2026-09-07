@@ -167,10 +167,131 @@ test('listDirectoryTool returns a clear error string (not a throw) for a nonexis
   });
 });
 
-test('TOOLS declares exactly the read-only tools (grep_codebase, read_file, list_directory, list_roots) -- no write/edit/bash tool', () => {
+test('TOOLS declares exactly the read-only tools (grep_codebase, read_file, list_directory, list_roots, read_task, search_tasks) -- no write/edit/bash tool', () => {
   withFixtureRepo((mod) => {
     const names = mod.TOOLS.map((t) => t.function.name).sort();
-    assert.deepEqual(names, ['grep_codebase', 'list_directory', 'list_roots', 'read_file']);
+    assert.deepEqual(names, ['grep_codebase', 'list_directory', 'list_roots', 'read_file', 'read_task', 'search_tasks']);
+  });
+});
+
+// read_task / search_tasks (2026-09-07): task lookup tools for the Chat panel, added
+// alongside the trimmed Send to Chat payload -- see concept-send-to-chat-307f1b.
+function writeTaskFixture(pipelineDir, relDir, id, data = {}) {
+  const full = path.join(pipelineDir, 'queue', relDir);
+  fs.mkdirSync(full, { recursive: true });
+  fs.writeFileSync(path.join(full, `${id}.json`), JSON.stringify({ id, ...data }));
+}
+
+test('readTaskTool with no section returns a task_summary-shaped overview, excluding plan/implement bulk', () => {
+  withFixtureRepo((mod, dir) => {
+    writeTaskFixture(dir, 'blocked', 't1', {
+      title: 'Fix the thing', source: 'adhoc', status: 'blocked', blockedReason: 'ran out of turns',
+      planResponse: 'a huge plan...', implementResponse: 'a huge diff...',
+    });
+    const result = mod.readTaskTool(dir, { taskId: 't1' });
+    assert.equal(result.title, 'Fix the thing');
+    assert.equal(result.blockedReason, 'ran out of turns');
+    assert.equal(result.foundState, 'blocked');
+    assert.equal(result.planResponse, undefined);
+    assert.equal(result.implementResponse, undefined);
+  });
+});
+
+test('readTaskTool with section: "plan" returns just the plan text, windowed', () => {
+  withFixtureRepo((mod, dir) => {
+    const plan = Array.from({ length: 10 }, (_, i) => `plan line ${i + 1}`).join('\n');
+    writeTaskFixture(dir, 'pending', 't2', { planResponse: plan });
+    const result = mod.readTaskTool(dir, { taskId: 't2', section: 'plan' });
+    assert.equal(result.section, 'plan');
+    assert.match(result.content, /^plan line 1\n/);
+    assert.equal(result.totalLines, 10);
+  });
+});
+
+test('readTaskTool with section: "implement"/"blockedReason"/"history" reads the right field', () => {
+  withFixtureRepo((mod, dir) => {
+    writeTaskFixture(dir, 'blocked', 't3', {
+      implementResponse: 'diff content',
+      blockedReason: 'needs a human',
+      history: [{ at: '2026-01-01T00:00:00Z', stage: 'plan-done', detail: 'ok' }],
+    });
+    assert.match(mod.readTaskTool(dir, { taskId: 't3', section: 'implement' }).content, /diff content/);
+    assert.match(mod.readTaskTool(dir, { taskId: 't3', section: 'blockedReason' }).content, /needs a human/);
+    assert.match(mod.readTaskTool(dir, { taskId: 't3', section: 'history' }).content, /plan-done.*ok/);
+  });
+});
+
+test('readTaskTool sections page via offset/limit and truncate past MAX_READ_FILE_CHARS, same as read_file', () => {
+  withFixtureRepo((mod, dir) => {
+    const lines = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join('\n');
+    writeTaskFixture(dir, 'pending', 't4', { planResponse: lines });
+    const windowed = mod.readTaskTool(dir, { taskId: 't4', section: 'plan', offset: 500, limit: 40 });
+    assert.equal(windowed.offset, 500);
+    assert.equal(windowed.content.split('\n').length, 40);
+    assert.equal(windowed.nextOffset, 540);
+
+    writeTaskFixture(dir, 'pending', 't5', { planResponse: 'x'.repeat(9000) });
+    const truncated = mod.readTaskTool(dir, { taskId: 't5', section: 'plan' });
+    assert.equal(truncated.truncated, true);
+    assert.match(truncated.content, /\[truncated: slice exceeded/);
+  });
+});
+
+test('readTaskTool returns a clear error for an unknown task id, and for an unknown section', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+    assert.match(mod.readTaskTool(dir, { taskId: 'nope' }).error, /not found in any queue state/);
+    writeTaskFixture(dir, 'pending', 't6', {});
+    assert.match(mod.readTaskTool(dir, { taskId: 't6', section: 'bogus' }).error, /unknown section/);
+  });
+});
+
+test('searchTasksTool matches an exact substring and a multi-word all-tokens query against title/id', () => {
+  withFixtureRepo((mod, dir) => {
+    writeTaskFixture(dir, 'pending', 'task-alpha', { title: 'Decompose the big file into pieces' });
+    writeTaskFixture(dir, 'pending', 'task-beta', { title: 'Unrelated task' });
+    const exact = mod.searchTasksTool(dir, { query: 'Decompose the big file' });
+    assert.equal(exact.results.length, 1);
+    assert.equal(exact.results[0].id, 'task-alpha');
+
+    const tokens = mod.searchTasksTool(dir, { query: 'file decompose' }); // reordered, still every token present
+    assert.equal(tokens.results.length, 1);
+    assert.equal(tokens.results[0].id, 'task-alpha');
+  });
+});
+
+test('searchTasksTool scopes to a given state, and tags drafting results with their lane', () => {
+  withFixtureRepo((mod, dir) => {
+    writeTaskFixture(dir, 'drafting/worker-reasoning-p40', 'task-gamma', { title: 'autodecomp thing' });
+    writeTaskFixture(dir, 'blocked', 'task-delta', { title: 'autodecomp other thing' });
+
+    const draftingOnly = mod.searchTasksTool(dir, { query: 'autodecomp', state: 'drafting' });
+    assert.equal(draftingOnly.results.length, 1);
+    assert.equal(draftingOnly.results[0].foundState, 'drafting:worker-reasoning-p40');
+
+    const everywhere = mod.searchTasksTool(dir, { query: 'autodecomp' });
+    assert.equal(everywhere.results.length, 2);
+  });
+});
+
+test('searchTasksTool excludes archived tasks by default and includes them when asked', () => {
+  withFixtureRepo((mod, dir) => {
+    writeTaskFixture(dir, 'done/_archived/2026-08', 'task-epsilon', { title: 'old archived thing' });
+    assert.equal(mod.searchTasksTool(dir, { query: 'archived thing' }).results.length, 0);
+    const withArchive = mod.searchTasksTool(dir, { query: 'archived thing', includeArchived: true });
+    assert.equal(withArchive.results.length, 1);
+    assert.equal(withArchive.results[0].foundState, 'archived');
+  });
+});
+
+test('searchTasksTool caps results at 15 and requires a non-empty query', () => {
+  withFixtureRepo((mod, dir) => {
+    for (let i = 0; i < 20; i++) {
+      writeTaskFixture(dir, 'pending', `task-cap-${i}`, { title: 'cap test task' });
+    }
+    const result = mod.searchTasksTool(dir, { query: 'cap test' });
+    assert.equal(result.results.length, 15);
+    assert.match(mod.searchTasksTool(dir, { query: '' }).error, /non-empty "query"/);
   });
 });
 
