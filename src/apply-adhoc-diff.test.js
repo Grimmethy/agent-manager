@@ -220,6 +220,49 @@ test('applyAdhocDiff queues each sub-task and turns the parent into a coordinato
   assert.equal(queued.find((t) => t.title === 'Piece one').dependsOn, undefined);
 });
 
+// premiumPriority propagation (2026-09-07, Grimmethy: "This decompose should be the
+// absolute highest priority job and we need a way to make sure it stays that way until
+// completion" -- confirmed live: the real task this was built for hit exactly this gap,
+// its decompose split producing fresh children with no premiumPriority, silently
+// dropping back to ordinary priority right when the parent stops being the thing that
+// actually gets claimed).
+test('applyAdhocDiff propagates a premiumPriority parent onto every sub-task it decomposes into', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-premium',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    premiumPriority: true,
+    subTaskProposals: [
+      { title: 'Piece one', rawText: 'First piece.' },
+      { title: 'Piece two', rawText: 'Second piece.' },
+    ],
+  };
+
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  assert.equal(queued.length, 2);
+  assert.ok(queued.every((q) => q.premiumPriority === true), 'every child of a premiumPriority parent must itself be premiumPriority');
+});
+
+test('applyAdhocDiff does not add premiumPriority to sub-tasks when the parent was not premium', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-not-premium',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    subTaskProposals: [{ title: 'Piece one', rawText: 'First piece.' }],
+  };
+
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  assert.equal('premiumPriority' in queued[0], false);
+});
+
 test('applyAdhocDiff returns {skipped} without queuing anything when a decompose draft has no surviving sub-task proposals', () => {
   const repoDir = makeRepo();
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
