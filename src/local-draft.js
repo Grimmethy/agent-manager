@@ -917,7 +917,7 @@ function computePlanNumPredict(task) {
 // prior plan to fall back on), else { blocked: false }.
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
-  runOrientPassFn = runOrientPass,
+  runOrientPassFn = runOrientPass, recordModelCall,
 }) {
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
@@ -1006,14 +1006,31 @@ async function runPlanPass(task, {
   const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
+  // Records the plan pass into model-stats.db, same as callImplementModel's own
+  // recordModelCall below in this file -- previously the ONLY stage ever recorded there
+  // at all, leaving the plan stage (and any re-roll -- a second, genuinely separate call)
+  // entirely invisible to every cost/degenerate-rate/token-efficiency stat this pipeline
+  // computes (2026-09-06, Grimmethy: "We need to fix cost tracking before we can even
+  // begin to properly work on this problem"). recordModelCall may be omitted by a test
+  // double, same optional-call convention callImplementModel's callers already rely on.
+  let startedAt = new Date().toISOString();
+  let startMs = Date.now();
   let planResult = await callPlan();
+  if (recordModelCall) {
+    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: planResult, source: task.source, stage: 'plan' });
+  }
   let totalAttempts = planResult.attempts || 1;
   let reRolled = false;
   if (substanceGated && !planResult.degenerate && planIsThin(planResult.response)) {
     // One thin (but not degenerate) roll -- give it exactly one more, then keep whichever
     // of the two rolls carries more content.
     reRolled = true;
+    startedAt = new Date().toISOString();
+    startMs = Date.now();
     const reRoll = await callPlan();
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
+    }
     totalAttempts += reRoll.attempts || 1;
     if (planLen(reRoll) > planLen(planResult)) planResult = reRoll;
   }
@@ -1142,7 +1159,7 @@ function tryDeterministicLiteralEdit(task, attempt) {
 // model choice or the judgment itself -- it only removes a self-review layer already
 // shown, on real data, to almost never do anything.
 async function runCritiqueAndRevision(task, {
-  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt,
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
 }) {
   if (isAdvisoryProseSource(resolveSourceName(task))) {
     task.critiqueOutcome = 'skipped-advisory-prose';
@@ -1151,7 +1168,16 @@ async function runCritiqueAndRevision(task, {
     return;
   }
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
+  let startedAt = new Date().toISOString();
+  let startMs = Date.now();
   const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source, taskId: task.id, stage: 'critique' }), 'critique');
+  // Records the critique (and, when triggered, revise) call into model-stats.db -- see
+  // runPlanPass's own identical comment for the full incident this closes (2026-09-06,
+  // Grimmethy: "We need to fix cost tracking before we can even begin to properly work
+  // on this problem").
+  if (recordModelCall) {
+    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: critiqueResult, source: task.source, stage: 'critique' });
+  }
 
   if (critiqueResult.degenerate) {
     task.critiqueOutcome = 'critique-degenerate';
@@ -1166,7 +1192,12 @@ async function runCritiqueAndRevision(task, {
     // reviewer might want to verify it really addressed those specific points.
     task.critiqueText = critiqueResult.response;
     const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
+    startedAt = new Date().toISOString();
+    startMs = Date.now();
     const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, taskId: task.id, stage: 'revise' }), 'revise');
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reviseResult, source: task.source, stage: 'revise' });
+    }
     if (!reviseResult.degenerate) {
       task.implementResponse = reviseResult.response;
       task.revisionApplied = true;
@@ -1487,6 +1518,14 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
     startedAt: implStartedAt,
     latencyMs: Date.now() - implStartMs,
     result: implResult,
+    // source (2026-09-06, Grimmethy: "We need to fix cost tracking before we can even
+    // begin to properly work on this problem" -- an efficiency analysis found every
+    // per-source cost/degenerate-rate breakdown was blind, because this call never
+    // passed it: 705 of 797 real model_calls rows in a 48h sample had source=NULL,
+    // forcing every prior analysis to guess a source from the task_id string instead of
+    // reading the real field this row already had access to).
+    source: task.source,
+    stage: 'implement',
   });
   // Stamped onto the task itself (not just recorded into model-stats.db, which
   // apply-task.js has no access path back to via just task.abCallId) so its commit
@@ -1697,7 +1736,7 @@ async function runDraftPasses(task, attempt, {
       }
 
       const planOutcome = await runPlanPass(task, {
-        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
+        maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn, recordModelCall,
       });
       if (planOutcome.blocked) {
         return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason };
@@ -1759,7 +1798,7 @@ async function runDraftPasses(task, attempt, {
     }
 
     await runCritiqueAndRevision(task, {
-      maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt,
+      maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
     });
 
     concludeDraft(task);
