@@ -61,6 +61,22 @@
 //      needs pushed toward "implement it directly" instead of "split it"), falling back to
 //      an honest, visible bucket-C leave-for-human stamp if it recurs, rather than staying
 //      invisible forever. Checked before the "already reviewed" skip, same reasoning as D.
+//
+//   F. TURN/CONTEXT BUDGET EXHAUSTED, NOT A DESIGN QUESTION (2026-09-07) -- root-caused
+//      live: adhoc-extract-29-functions-to-analytics-and-discovery-js-and-remove-them-
+//      from-index-html-...-0 wrote a complete, fully-specified extraction script to the
+//      worktree and then ran out of turn/context budget before actually running it --
+//      its own openQuestions said so explicitly ("not any design uncertainty or missing
+//      code... No further code changes or decisions are needed"). This sailed past
+//      CREATE_TASK_RE into bucket C ("genuine design question -- left for a human")
+//      because nothing here recognized "the model told you outright this isn't a
+//      decision, just an unfinished mechanical step" as its own signature. Requeuing
+//      loses the in-progress script (queue/adhoc/ tasks start from a clean worktree), but
+//      that's fine -- the task's rawText/plan/acceptance criteria are untouched and
+//      already fully specify the same mechanical steps, so a clean retry can reproduce
+//      the script from scratch and this time actually execute it, rather than sitting on
+//      a human's queue for a decision that was never really needed. Bounded by the same
+//      MAX_REQUEUES counter every other requeue bucket uses.
 
 const fs = require('fs');
 const path = require('path');
@@ -100,6 +116,12 @@ const INVALID_PREMISE_RE = /\bpremise (?:of this task )?(?:is|appears|seems)[^.]
 // signal drops the task straight to bucket C.
 const CREATE_TASK_RE = /\b(?:create|add|write|build|implement|scaffold|extract|introduce)\b[^.\n]{0,70}\b(?:new )?(?:file|module|script|component|endpoint|route|blueprint|source|helper)\b/i;
 const IN_PROGRESS_RE = /\bgot close\b|\bverified facts\b|\bfor the next pass\b|\bran out of turns\b|working (?:\w+ )?script exists|\bstate so far\b|\bpartial (?:work|implementation) (?:landed|exists)\b/i;
+
+// Bucket F signature: the drafter explicitly says it ran out of turn/context budget mid-
+// mechanical-step AND explicitly disclaims any real design uncertainty -- see the header's
+// own comment on the incident this fixes.
+const BUDGET_EXHAUSTED_RE = /ran out of (?:turn|context)(?:[/ ](?:turn|context))? budget/i;
+const COMPLETABLE_NOT_DESIGN_RE = /no further code changes? or decisions? (?:are |is )?(?:needed|required)|not (?:a|any) design (?:uncertainty|question|decision)|has(?:n'?t| not) (?:yet )?been executed/i;
 
 // Bucket D signature: a draft's own text (or review's account of it) asserted a checkable
 // completion claim that is contradicted by the diff/repo -- the exact shape
@@ -279,6 +301,47 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
     }
 
+    // --- Bucket F: turn/context budget exhausted, not a design question -> requeue ---
+    // Checked BEFORE the "already reviewed" skip below -- same reasoning as D/E: a stale
+    // leave-for-human stamp from before this bucket existed must not shield an
+    // already-triaged task from a fix built specifically for this shape.
+    {
+      const oqF = nc.openQuestions || '';
+      const historyF = Array.isArray(task.history) ? task.history : [];
+      const hasExhaustedF = historyF.some((h) => h && h.stage === 'exhausted');
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (BUDGET_EXHAUSTED_RE.test(oqF) && COMPLETABLE_NOT_DESIGN_RE.test(oqF)
+          && !hasExhaustedF && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket F but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket F (turn/context budget exhausted, not a design question) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: drafter explicitly disclaimed any design uncertainty (ran out of turn/context budget mid-mechanical-step) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
     if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
 
     summary.checked += 1;
@@ -411,6 +474,8 @@ module.exports = {
   DEGENERATE_RE,
   INVALID_PREMISE_RE,
   FALSE_CLAIM_RE,
+  BUDGET_EXHAUSTED_RE,
+  COMPLETABLE_NOT_DESIGN_RE,
 };
 
 if (require.main === module) {
