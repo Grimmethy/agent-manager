@@ -235,6 +235,18 @@ while :; do
     file_decompose_result="$(node "${PACKAGE_SRC_DIR}/file-decompose-to-hub.js" 2>>"${HOME_LOGS}/file-decompose-to-hub.log")"
     printf '[watchdog] file-decompose-to-hub: %s\n' "$file_decompose_result" >&2
 
+    # decompose-move-determinism-backfill (2026-09-07, Grimmethy: "if we could find a way
+    # to make more of this process deterministic so that the model only has to call a
+    # function"): a script-extract move child minted before its symbols happened to
+    # resolve cleanly (or before this mechanism existed) never gets file-decompose-to-hub's
+    # own deterministicApply stamp -- it just keeps burning full LLM plan/implement passes
+    # on a task shape a cheap, already-proven check would resolve for free. This re-checks
+    # each un-stamped child's OWN move (not the whole hub, which can be stale once sibling
+    # moves have landed) and stamps it the moment it's eligible. Disable with
+    # AGENT_MANAGER_DECOMPOSE_DETERMINISM_BACKFILL=false.
+    determinism_backfill_result="$(node "${PACKAGE_SRC_DIR}/decompose-move-determinism-backfill.js" 2>>"${HOME_LOGS}/decompose-move-determinism-backfill.log")"
+    printf '[watchdog] decompose-move-determinism-backfill: %s\n' "$determinism_backfill_result" >&2
+
     # decompose-loop autoroute: a task stuck in needs-clarification/blocked with a
     # `decompose-loop` staleness flag (every draft chose "decompose", never produced pieces)
     # whose target is an OVERSIZED FILE gets an auto-authored moves[] plan (deterministic
