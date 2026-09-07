@@ -354,13 +354,33 @@ async function renderWorkers() {
             ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${bySource[k].length})</option>`).join('')}
           </select>`;
           if (!selectedType || !bySource[selectedType]) return typeSelect;
+          // A native <select> sizes itself to its widest <option> text -- an untruncated
+          // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
+          // pushed this whole control off the right edge of the worker card (2026-09-07,
+          // Grimmethy: "when I open the manual task that has long task names it sets the
+          // selector to the size of the largest... names should be truncated"). Truncate
+          // what's SHOWN; the option's own `title` attribute (native hover tooltip) and
+          // `data-title` (read by setWorkerTask's confirm-dialog text) both still carry
+          // the full, untruncated title -- nothing is actually lost, just not rendered
+          // into the control's own width.
+          const OPTION_LABEL_MAX = 70;
+          const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
           const optionLabel = (t) => {
             const base = t.title || t.id;
-            return t.location && t.location !== 'pending' ? `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}` : base;
+            // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
+            // different lists? they really should share the same task list") -- a task
+            // pending but already pinned to a SIBLING lane (same tier) now shows here
+            // too instead of being invisible; picking it just re-pins it to this lane
+            // instead (no kill needed, nothing is running on it yet, unlike the
+            // "⚠ running on" case below).
+            let full = base;
+            if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+            else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+            return truncateLabel(full);
           };
           const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
             <option value="">(choose a ${escapeHtml(selectedType)} task…)</option>
-            ${bySource[selectedType].map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+            ${bySource[selectedType].map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
           </select>`;
           return typeSelect + taskSelect;
         })() : ''}
