@@ -318,7 +318,7 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
 // SAME prompt reproduces the SAME cutoff deterministically, so retrying identically
 // burns the entire retry budget for zero chance of success. Escalating numPredict
 // (not numCtx -- resolveNumCtx already ignores numPredict and returns the fixed
-// PINNED_NUM_CTX/16384 regardless, so there is always ample headroom left for a
+// PINNED_NUM_CTX/24576 regardless, so there is always ample headroom left for a
 // bigger numPredict on the same prompt) on a truncated retry gives a REAL chance the
 // next attempt actually completes, at the same latency cost the identical-retry
 // approach was already paying either way.

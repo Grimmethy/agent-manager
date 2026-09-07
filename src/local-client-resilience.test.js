@@ -429,7 +429,7 @@ test('majorityVote() falls back to the module default model when no override is 
       const classify = (text) => (text.includes('APPROVE') ? 'approve' : null);
       await majorityVote({ prompt: 'x', classify, n: 3, minAgreeing: 2 }); // no model/numCtx/numPredict passed
       assert.equal(capturedBody.model, 'test-model', 'must fall back to LOCAL_MODEL when no profile override is given');
-      assert.equal(capturedBody.options.num_ctx, 16384, 'must fall back to PINNED_NUM_CTX when no profile override is given');
+      assert.equal(capturedBody.options.num_ctx, 24576, 'must fall back to PINNED_NUM_CTX when no profile override is given');
     }
   );
 });

@@ -519,14 +519,58 @@ test('computeImplementBudget floors implNumCtx at PINNED_NUM_CTX for a normal-si
   assert.equal(b.implNumCtx, PINNED_NUM_CTX, 'a normal prompt gets exactly the pinned value, not the old 8192 floor');
 });
 
-test('computeImplementBudget still grows implNumCtx past the floor for a whole-document source, capped at 32768', () => {
+test('computeImplementBudget still grows implNumCtx past the floor for a whole-document source, capped at EXTENDED_NUM_CTX', () => {
   const { computeImplementBudget } = require('./local-draft.js');
-  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
   // product_spec: implNumPredict ceiling 16000, and a large prompt -> genuine need above the floor
   const task = { source: 'product_spec', planResponse: 'y'.repeat(9000) };
   const big = computeImplementBudget(task, 'z'.repeat(80000));
   assert.ok(big.implNumCtx > PINNED_NUM_CTX, 'a genuinely large document prompt is still allowed to exceed the floor');
-  assert.ok(big.implNumCtx <= 32768, 'still capped at 32768');
+  assert.ok(big.implNumCtx <= EXTENDED_NUM_CTX, 'still capped at EXTENDED_NUM_CTX');
+});
+
+test('ensureHeadroomForExtendedContext unloads the small utility model only when implNumCtx exceeds PINNED_NUM_CTX', async () => {
+  const http = require('http');
+  const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      requests.push(JSON.parse(body));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const prevUrl = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
+  try {
+    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX); // not extended -- must not call out at all
+    assert.equal(requests.length, 0, 'a normal, PINNED_NUM_CTX-sized call must not touch the small model');
+
+    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1); // genuinely extended -- must unload
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].model, 'qwen2.5:3b');
+    assert.equal(requests[0].keep_alive, 0);
+  } finally {
+    process.env.OLLAMA_URL = prevUrl;
+    server.close();
+  }
+});
+
+test('ensureHeadroomForExtendedContext never throws even when the unload call itself fails', async () => {
+  const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const prevUrl = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = 'http://127.0.0.1:1'; // nothing listening -- guaranteed connection failure
+  try {
+    await assert.doesNotReject(() => ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1));
+  } finally {
+    process.env.OLLAMA_URL = prevUrl;
+  }
 });
 
 test('computeImplementBudget gives pipeline_forensics a large implement budget despite a tiny plan', () => {

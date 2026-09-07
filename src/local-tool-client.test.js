@@ -727,7 +727,7 @@ test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when an early 
 
 test('runPlanWithTools forces a wrap-up turn when the starting prompt alone is already near the context ceiling', async () => {
   const summaryTurn = { role: 'assistant', content: 'Best answer given the room I have.\n\nRESOLUTION: needs-human-decision\nnot enough context room to finish.' };
-  const hugePrompt = 'x'.repeat(70000); // ~17,500 tokens at chars/4 -- already past PINNED_NUM_CTX minus the reserve
+  const hugePrompt = 'x'.repeat(100000); // ~25,000 tokens at chars/4 -- already past PINNED_NUM_CTX minus the reserve
   await withMockedChat([summaryTurn], async (mod, _dir, { sentBodies }) => {
     const result = await mod.runPlanWithTools({ prompt: hugePrompt, maxTurns: 50 });
     assert.equal(result.forcedSummary, true);
@@ -750,7 +750,7 @@ test('runPlanWithTools does NOT force a wrap-up turn for a normal-sized conversa
 });
 
 test('runPlanWithTools context-budget wrap-up fires mid-run once accumulated tool output pushes the history past the ceiling, not just at the start', async () => {
-  const bigChunk = 'y'.repeat(30000); // ~7,500 tokens per turn of accumulated content
+  const bigChunk = 'y'.repeat(50000); // ~12,500 tokens per turn of accumulated content
   const growingTurn = { role: 'assistant', content: bigChunk, tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
   const summaryTurn = { role: 'assistant', content: 'Wrapping up now.\n\nRESOLUTION: needs-human-decision\nran out of room mid-investigation.' };
   await withMockedChat([growingTurn, growingTurn, summaryTurn], async (mod) => {
@@ -796,7 +796,7 @@ test('runPlanWithTools uses the real prompt_eval_count from the previous turn to
   // ceiling (dense tool-call JSON/code from EARLIER turns, already summarized/trimmed in
   // visible text but still counted by the real tokenizer). A pure chars/4 re-guess of the
   // current (short) messages array would never catch this; the real anchor does.
-  const shortButHeavy = { role: 'assistant', content: 'ok', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }], _usage: { prompt_eval_count: 15000, eval_count: 5, eval_duration: 1 } };
+  const shortButHeavy = { role: 'assistant', content: 'ok', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }], _usage: { prompt_eval_count: 23000, eval_count: 5, eval_duration: 1 } };
   const summaryTurn = { role: 'assistant', content: 'Wrapping up now.\n\nRESOLUTION: needs-human-decision\nran out of real context room.' };
   await withMockedChat([shortButHeavy, summaryTurn], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 50 });
