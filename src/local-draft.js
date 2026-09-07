@@ -1143,14 +1143,50 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
     return null;
   }
 
+  const groupBChanges = [
+    { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
+    { mode: 'edit', file: ctx.sourceFile, find: html, replace: extraction.newHtml },
+  ];
+
+  // adhoc-domain tasks apply via applyAdhocDiff (apply-task.js's writeArtifact ->
+  // source.apply), which reads task.rawDiff -- a REAL unified diff -- and has never
+  // looked at task.implementResponse at all. Real incident, 2026-09-07: this short-
+  // circuit originally only ever set task.implementResponse to the Group-B JSON above,
+  // so review correctly verified and approved it, then apply silently did nothing at
+  // all ("adhoc agentic draft produced no diff") because task.rawDiff was never set --
+  // the task landed in queue/done/ marked succeeded despite zero real changes reaching
+  // the repo. group-b-worktree-diff.js already exists for exactly this conversion (the
+  // adhoc write-tier's own real diffs are produced the identical way) -- reused here
+  // rather than hand-rolling unified-diff text, so the SAME proven git-apply-verified
+  // path produces it. It also re-confirms the Group-B change still applies cleanly
+  // against real origin/<main> content (not just the repoRoot snapshot read above),
+  // throwing (caught below, falls through to the normal path) if that has ALSO drifted.
+  const { pipelineDir } = getConfig();
+  let rawDiff;
+  try {
+    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: JSON.stringify(groupBChanges), worktreeSuffix: task.id,
+    });
+  } catch (e) {
+    appendHistoryEvent(task, 'advisory', `deterministic script-extract diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+    return null;
+  }
+  if (!rawDiff) {
+    appendHistoryEvent(task, 'advisory', 'deterministic script-extract move produced an empty diff against real origin content -- falling through to the normal drafting path');
+    return null;
+  }
+
   task.planResponse = 'Deterministic script-extract move: every named symbol resolves to a real, unambiguous top-level function declaration via script-extract.js\'s V8-parser oracle -- no search terms or model judgment needed.';
   recordPlan(attempt, { text: task.planResponse, attempts: 0 });
   appendHistoryEvent(task, 'plan-done', 'deterministic script-extract, no model call');
 
-  task.implementResponse = JSON.stringify([
-    { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
-    { mode: 'edit', file: ctx.sourceFile, find: html, replace: extraction.newHtml },
-  ]);
+  // implementResponse (the Group-B JSON) stays -- this is what review's own
+  // verifyDeterministicScriptExtractDraft gate inspects. rawDiff (the real unified diff,
+  // just captured above) is the separate field apply actually consumes for an adhoc task.
+  task.implementResponse = JSON.stringify(groupBChanges);
+  task.rawDiff = rawDiff;
+  task.adhocResolution = 'implemented';
   recordImplement(attempt, { text: task.implementResponse, note: `deterministic script-extract move (${ctx.symbols.length} symbol(s), V8-parser-verified)` });
   appendHistoryEvent(task, 'implement-done', `deterministic script-extract move: ${ctx.symbols.length} symbol(s) moved to ${ctx.newFile}, no model call`);
 
