@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const {
   lastActivityTs, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, findStalenessCandidates,
   buildStalenessEvidenceText, buildStalenessAuditTask, DEFAULT_STALENESS_THRESHOLD_DAYS,
-  candidateFilePaths, findFilesTouchedSince, pickFairCandidate,
+  candidateFilePaths, findFilesTouchedSince, pickFairCandidate, invalidPremiseSignal,
 } = require('./staleness-audit.js');
 const os = require('os');
 const path = require('path');
@@ -417,4 +417,44 @@ test('pickFairCandidate handles an empty candidate list and missing/malformed co
   const candidates = [makeCandidate('t1', 'adhoc', 1000)];
   const coverage = { a: null, b: {}, c: { reportedAt: 'not-a-date', domain: 'adhoc' } };
   assert.doesNotThrow(() => pickFairCandidate(candidates, coverage));
+});
+
+// 2026-09-07, Grimmethy (live-caught via the assign-task investigation): a real
+// file-decompose move task -- "Create python/dashboard/static/js/analytics-and-
+// discovery.js... move these functions OUT of python/dashboard/templates/index.html"
+// -- kept getting flagged invalid-premise/retire purely because its own declared
+// create target legitimately doesn't exist yet, and its OTHER named file (index.html)
+// was invisible to candidateFilePaths' extension allowlist (.html isn't matched),
+// leaving the create target as the only "named" path and trivially satisfying "every
+// named path is absent."
+test('invalidPremiseSignal does not fire on a task whose only named path is its own declared create target (promptContext.newFile)', () => {
+  const dir = makeRepoWithFile('python/dashboard/templates/index.html', 'x', '2026-01-01T00:00:00.000Z');
+  const task = makeTask({
+    title: 'Decompose python/dashboard/templates/index.html -> python/dashboard/static/js/analytics-and-discovery.js',
+    promptContext: {
+      newFile: 'python/dashboard/static/js/analytics-and-discovery.js',
+      rawText: 'Create python/dashboard/static/js/analytics-and-discovery.js. Move these function declarations OUT of python/dashboard/templates/index.html.',
+    },
+  });
+  const result = invalidPremiseSignal(dir, task);
+  assert.deepEqual(result, { hit: false, evidence: [] });
+});
+
+test('invalidPremiseSignal still fires when a task names real (non-create-target) paths that are ALL absent', () => {
+  const dir = makeRepoWithFile('python/dashboard/templates/index.html', 'x', '2026-01-01T00:00:00.000Z');
+  const task = makeTask({
+    promptContext: { rawText: 'Fix the bug in src/totally-made-up-file.js and src/another-fake-one.js.' },
+  });
+  const result = invalidPremiseSignal(dir, task);
+  assert.equal(result.hit, true);
+  assert.match(result.evidence[0], /totally-made-up-file\.js/);
+});
+
+test('invalidPremiseSignal does not fire when a task names a mix of real and missing paths (only the create-target exclusion is special, not "any real path present")', () => {
+  const dir = makeRepoWithFile('src/real-file.js', 'x', '2026-01-01T00:00:00.000Z');
+  const task = makeTask({
+    promptContext: { rawText: 'Update src/real-file.js and also src/does-not-exist.js.' },
+  });
+  const result = invalidPremiseSignal(dir, task);
+  assert.deepEqual(result, { hit: false, evidence: [] });
 });
