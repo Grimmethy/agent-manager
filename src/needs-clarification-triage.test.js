@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE } = require('./needs-clarification-triage.js');
+const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE } = require('./needs-clarification-triage.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-test-'));
@@ -408,5 +408,102 @@ test('bucket E: DRY_RUN=1 reports but does not move the file', async () => {
     assert.equal(s.requeued, 1);
     assert.ok(exists(at(dir, 'needs-clarification', 'te5.json')));
     assert.ok(!exists(at(dir, 'adhoc', 'te5.json')));
+  } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
+});
+
+// Real corpus text, 2026-09-07: adhoc-extract-29-functions-to-analytics-and-discovery-js
+// wrote a complete extraction script, ran out of turn/context budget before running it,
+// and explicitly disclaimed any design uncertainty -- but sailed past CREATE_TASK_RE into
+// bucket C ("genuine design question") because nothing recognized this signature. See the
+// header's own comment on bucket F for the full incident.
+const REAL_BUDGET_EXHAUSTED_OQ = 'I did not get to finish the change. Here is the exact state so nothing is lost:\n\n'
+  + 'Wrote the complete extraction script to the repo root as `_extract_analytics.py`. '
+  + 'The only reason this is uncompleted is that I ran out of context budget immediately after writing the script, before running it '
+  + '-- not any design uncertainty or missing code. The change is fully specified and the script is already in place.\n\n'
+  + 'RESOLUTION: needs-human-decision\n'
+  + 'Blocker: ran out of turn/context budget immediately after writing `_extract_analytics.py` to the repo root; the one missing fact is '
+  + 'simply that the script has not been executed yet. To finish: run `python3 _extract_analytics.py` in the repo root, `rm _extract_analytics.py`, '
+  + 'then run the node --check and grep acceptance checks listed above. No further code changes or decisions are needed.';
+
+test('regexes: BUDGET_EXHAUSTED_RE/COMPLETABLE_NOT_DESIGN_RE match the real corpus text, not a plain design question', () => {
+  assert.ok(BUDGET_EXHAUSTED_RE.test(REAL_BUDGET_EXHAUSTED_OQ));
+  assert.ok(COMPLETABLE_NOT_DESIGN_RE.test(REAL_BUDGET_EXHAUSTED_OQ));
+  assert.ok(!BUDGET_EXHAUSTED_RE.test('Should the widget default to on or off? I need you to decide the product behaviour.'));
+  assert.ok(!COMPLETABLE_NOT_DESIGN_RE.test('Should the widget default to on or off? I need you to decide the product behaviour.'));
+});
+
+test('bucket F: turn/context budget exhausted, not a design question -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf1', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tf1.json')));
+  const moved = read(at(dir, 'adhoc', 'tf1.json'));
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.promptContext.rawText, bigRawText, 'rawText preserved');
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /ran out of turn\/context budget mid-mechanical-step/.test(h.detail)));
+});
+
+test('bucket F: previously stamped leave-for-human is NOT frozen against the new signature', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf2', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-03T00:00:00Z',
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'tf2.json'));
+  assert.equal(moved.ncTriageDecision, undefined, 'stale leave-for-human stamp cleared on requeue');
+});
+
+test('bucket F skipped: already at MAX_REQUEUES -> falls through to leave-for-human', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf3', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+    ncTriageAttempts: 1,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tf3.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 'tf3.json')).ncTriageDecision, 'leave-for-human');
+});
+
+test('bucket F skipped: has an exhausted history event -> bucket C retry-exhausted', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf4', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+    history: [{ stage: 'exhausted', at: '2026-09-01T00:00:00Z' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tf4.json')));
+});
+
+test('bucket F: adhoc/<id>.json already exists -> left in place, not double-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf5', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+  }));
+  fs.writeFileSync(at(dir, 'adhoc', 'tf5.json'), '{"id":"tf5"}');
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tf5.json')));
+});
+
+test('bucket F: DRY_RUN=1 reports but does not move the file', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf6', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
+  }));
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try {
+    const s = await needsClarificationTriage(args(dir));
+    assert.equal(s.requeued, 1);
+    assert.ok(exists(at(dir, 'needs-clarification', 'tf6.json')));
+    assert.ok(!exists(at(dir, 'adhoc', 'tf6.json')));
   } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
 });
