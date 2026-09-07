@@ -734,7 +734,11 @@ function mainPartition() {
 // Writes each task file back in place (recordApplyOutcome -> status/history) before the
 // caller moves it, exactly like the single-task path.
 function mainBatch() {
-  const { repoRoot, pipelineDir, secondBrainDir, brainDumpPath } = getConfig();
+  // applyRepoRoot (see config.js's own comment): the real git-mutating destination,
+  // deliberately separate from repoRoot when AGENT_MANAGER_APPLY_REPO_ROOT is set --
+  // never the shared interactive checkout, so a human's uncommitted work in repoRoot
+  // can't be auto-stashed by this batch's own resetToMain() calls.
+  const { applyRepoRoot, pipelineDir, secondBrainDir, brainDumpPath } = getConfig();
   const paths = process.argv.slice(3);
   const loaded = [];
   const out = [];
@@ -747,7 +751,7 @@ function mainBatch() {
     }
   }
 
-  const { results } = applyDirectToMainBatch(loaded.map((l) => l.task), { repoRoot, pipelineDir, secondBrainDir, brainDumpPath });
+  const { results } = applyDirectToMainBatch(loaded.map((l) => l.task), { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, brainDumpPath });
 
   for (const { task, path: p } of loaded) {
     const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
@@ -768,7 +772,11 @@ function main() {
     return;
   }
 
-  const { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
+  // applyRepoRoot (see config.js's own comment): the real git-mutating destination,
+  // deliberately separate from repoRoot when AGENT_MANAGER_APPLY_REPO_ROOT is set --
+  // never the shared interactive checkout, so a human's uncommitted work in repoRoot
+  // can't be auto-stashed by this apply's own resetToMain() call.
+  const { applyRepoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
 
   let task;
   try {
@@ -782,7 +790,7 @@ function main() {
   // commit locally without pushing -- see applyTask's skipPush param.
   const skipPush = process.env.AGENT_MANAGER_APPLY_SKIP_PUSH === 'true';
 
-  const result = applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush });
+  const result = applyTask(task, { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush });
 
   // Previously this module never wrote taskPath back at all -- a task landing in done/ or
   // blocked/ after this step carried no record it was ever applied: no timestamp, no
