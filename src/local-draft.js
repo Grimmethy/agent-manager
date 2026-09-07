@@ -1100,6 +1100,68 @@ async function runPlanPass(task, {
   return { blocked: false };
 }
 
+// Deterministic script-extract move short-circuit (2026-09-07, "Ghost in the Machine"
+// concept, Grimmethy: "Build the thing please" -- real incident: a script-extract
+// decompose move-child (tasks-and-branches.js) was left to the model as a text-
+// generation task even though this exact extraction is 100% mechanical. The model
+// reinvented a worse, hand-rolled Python brace-scanner, got 8 of 26 symbols right, ran
+// out of context, and correctly escalated rather than claim false success -- but every
+// one of the 26 resolves cleanly via script-extract.js's real V8-parser oracle, confirmed
+// live by re-running it against the actual file). file-decompose-to-hub.js's
+// validatePlan() already ran this exact check at plan-validation time and only stamps
+// promptContext.deterministicApply when every symbol resolved cleanly THEN -- this
+// re-resolves against CURRENT file content (an earlier stacked move on the same branch
+// may have already changed it) rather than trusting a stale plan-time snapshot, and
+// falls through to the normal model-driven path (returns null) if anything has drifted
+// since, exactly the same "advisory-only, never trust a stale check" discipline
+// staticCheckMove's own .py path already uses. Placed even before runPlanPass (unlike
+// tryDeterministicLiteralEdit below, which still lets a plan pass run) since there is no
+// judgment call left at all for this move kind -- skipping the plan/orient passes too,
+// not just implement.
+function tryDeterministicScriptExtractEdit(task, attempt) {
+  const ctx = task.promptContext;
+  if (!(ctx && ctx.deterministicApply === 'script-extract' && ctx.sourceFile && ctx.newFile && Array.isArray(ctx.symbols) && ctx.symbols.length)) {
+    return null;
+  }
+  let repoRoot;
+  try { ({ repoRoot } = getConfig()); } catch { return null; }
+  if (!repoRoot) return null;
+
+  const absSource = path.join(repoRoot, ctx.sourceFile);
+  let html;
+  try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
+
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(html, ctx.symbols);
+  if (!extraction.ok) {
+    // Drifted since plan-validation time (e.g. an earlier stacked move on this same
+    // branch already touched the file) -- fall through to the normal path rather than
+    // trust a check that's no longer true. Advisory only, never a block: the model-
+    // driven path below is exactly what would have run if this short-circuit didn't
+    // exist at all.
+    appendHistoryEvent(task, 'advisory', `deterministic script-extract check no longer holds (${extraction.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}) -- falling through to the normal drafting path`);
+    return null;
+  }
+
+  task.planResponse = 'Deterministic script-extract move: every named symbol resolves to a real, unambiguous top-level function declaration via script-extract.js\'s V8-parser oracle -- no search terms or model judgment needed.';
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+  appendHistoryEvent(task, 'plan-done', 'deterministic script-extract, no model call');
+
+  task.implementResponse = JSON.stringify([
+    { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
+    { mode: 'edit', file: ctx.sourceFile, find: html, replace: extraction.newHtml },
+  ]);
+  recordImplement(attempt, { text: task.implementResponse, note: `deterministic script-extract move (${ctx.symbols.length} symbol(s), V8-parser-verified)` });
+  appendHistoryEvent(task, 'implement-done', `deterministic script-extract move: ${ctx.symbols.length} symbol(s) moved to ${ctx.newFile}, no model call`);
+
+  task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
+  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
+
+  concludeDraft(task);
+  return { succeeded: true, blocked: false };
+}
+
 // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" -- caught
 // live via a Grill-skills adhoc task exhausting both retries because the model couldn't
 // reliably reproduce a 4362-char fixedLiterals block character-for-character in a JSON
@@ -1700,6 +1762,11 @@ async function runDraftPasses(task, attempt, {
       // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
       // existing harness-grounded local-model path below, completely unchanged.
     }
+
+    // Deterministic script-extract move short-circuit -- see
+    // tryDeterministicScriptExtractEdit()'s own header for the full incident.
+    const scriptExtractResult = tryDeterministicScriptExtractEdit(task, attempt);
+    if (scriptExtractResult) return scriptExtractResult;
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact

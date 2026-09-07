@@ -284,3 +284,93 @@ test('det-wiring kill switch restores the LLM wiring child for every move', () =
   const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
   assert.equal(hub.wiringPending, undefined);
 });
+
+// --- script-extract deterministic-apply validation (2026-09-07, "Ghost in the Machine") -
+// Real incident: a script-extract move-child was left to the model even though the move
+// is 100% mechanical -- validatePlan() now runs the same real check at plan-validation
+// time file-decompose-to-hub.js already does for .py moves, using script-extract.js's
+// V8-parser oracle instead of a Python AST check.
+
+function writeHtmlWithScript(dir, relPath, scriptBody) {
+  const abs = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
+}
+
+test('staticCheckScriptExtractMove: every named symbol resolves cleanly -> ok:true', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {\n  return 1;\n}\n');
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    const result = staticCheckScriptExtractMove(dir, 'python/dashboard/templates/index.html', ['renderHardwareTab']);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.missing, []);
+  });
+});
+
+test('staticCheckScriptExtractMove: an unresolvable symbol -> ok:false with the exact reason', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html', 'function realOne() {}\n');
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    const result = staticCheckScriptExtractMove(dir, 'python/dashboard/templates/index.html', ['realOne', 'doesNotExist']);
+    assert.equal(result.ok, false);
+    assert.equal(result.missing.length, 1);
+    assert.match(result.missing[0], /doesNotExist/);
+  });
+});
+
+test('staticCheckScriptExtractMove: returns null (advisory-only) for a non-.html source or a missing file', () => {
+  const dir = tmpRepo();
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    assert.equal(staticCheckScriptExtractMove(dir, 'src/app.py', ['x']), null);
+    assert.equal(staticCheckScriptExtractMove(dir, 'python/dashboard/templates/index.html', ['x']), null, 'file does not exist yet');
+  });
+});
+
+test('validatePlan + fileHub: a script-extract move with every symbol resolvable gets deterministicApply stamped, no LLM instructions in rawText', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {\n  return 1;\n}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'se.json'), JSON.stringify({
+    id: 'decompose-se',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [{ newFile: 'python/dashboard/static/js/hardware.js', kind: 'script-extract', symbols: ['renderHardwareTab'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  const moveFile = adhoc.find((n) => n.includes('hardware-js') && !n.includes('wiring'));
+  const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', moveFile), 'utf8'));
+  assert.equal(move.promptContext.deterministicApply, 'script-extract');
+  assert.equal(move.promptContext.sourceFile, 'python/dashboard/templates/index.html');
+  assert.deepEqual(move.promptContext.symbols, ['renderHardwareTab']);
+});
+
+test('validatePlan + fileHub: an unresolvable symbol in a script-extract move blocks the whole hub (hardProblems), same as the .py path', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html', 'function realOne() {}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'se2.json'), JSON.stringify({
+    id: 'decompose-se2',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [{ newFile: 'python/dashboard/static/js/hardware.js', kind: 'script-extract', symbols: ['realOne', 'ghostFunction'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).blockedHubs, 1); });
+
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')) ? fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length : 0, 0, 'no children filed for a blocked plan');
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.planValidation.ok, false);
+  assert.match(hub.planValidation.problems.join(' '), /ghostFunction/);
+});
+
+test('validatePlan: a script-extract move whose source file does not exist yet stays advisory-only (no deterministicApply, no hardProblems) -- unchanged prior behavior', () => {
+  const dir = tmpRepo();
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'mixed.json'), JSON.stringify({
+    id: 'decompose-mixed2',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [{ newFile: 'python/dashboard/static/js/hardware.js', kind: 'script-extract', symbols: ['renderHardwareTab'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  const moveFile = adhoc.find((n) => n.includes('hardware-js') && !n.includes('wiring'));
+  assert.ok(moveFile, 'the move child must still be filed -- no source file to check against is advisory-only, plan still proceeds');
+  const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', moveFile), 'utf8'));
+  assert.equal(move.promptContext.deterministicApply, undefined);
+});

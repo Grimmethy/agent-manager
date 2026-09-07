@@ -1068,6 +1068,101 @@ test('a task with fixedLiterals but NO file field falls through to the normal im
   });
 });
 
+// --- Deterministic script-extract move short-circuit (2026-09-07, "Ghost in the
+// Machine" concept) -- real incident: a script-extract decompose move-child was left to
+// the model as text generation even though the extraction is 100% mechanical; the model
+// reinvented a worse hand-rolled scanner and got most of it wrong. These prove the
+// short-circuit fires with ZERO model calls (not even the plan pass, unlike the literal-
+// edit short-circuit above, since there is no judgment call left at all for this move
+// kind), and correctly falls through when the file has drifted since plan-validation.
+
+function writeHtmlWithFunctions(dir, relPath, scriptBody) {
+  const abs = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
+}
+
+test('a script-extract move task with every symbol resolvable is applied deterministically -- zero model calls', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {\n  return 1;\n}\nfunction other() {\n  return 2;\n}\n');
+    const task = {
+      id: 'script-extract-test-1', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: {
+        deterministicApply: 'script-extract',
+        sourceFile: 'python/dashboard/templates/index.html',
+        newFile: 'python/dashboard/static/js/hardware.js',
+        symbols: ['renderHardwareTab'],
+      },
+    };
+    let callCount = 0;
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(callCount, 0, 'no model call at all -- not even the plan pass -- for a fully deterministic move');
+    const parsed = JSON.parse(task.implementResponse);
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0].mode, 'create');
+    assert.equal(parsed[0].file, 'python/dashboard/static/js/hardware.js');
+    assert.match(parsed[0].content, /function renderHardwareTab/);
+    assert.equal(parsed[1].mode, 'edit');
+    assert.equal(parsed[1].file, 'python/dashboard/templates/index.html');
+    assert.doesNotMatch(parsed[1].replace, /function renderHardwareTab/, 'the symbol must be removed from the source in the replacement');
+    assert.match(parsed[1].replace, /function other/, 'an un-named symbol must stay behind');
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('a script-extract move task falls through to the normal path when the file has drifted since plan-validation (symbol no longer resolvable)', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    // The symbol named in promptContext is no longer there -- simulates an earlier
+    // stacked move on the same branch already having removed/renamed it.
+    writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function somethingElseEntirely() {}\n');
+    const task = {
+      id: 'script-extract-test-2', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: {
+        deterministicApply: 'script-extract',
+        sourceFile: 'python/dashboard/templates/index.html',
+        newFile: 'python/dashboard/static/js/hardware.js',
+        symbols: ['renderHardwareTab'],
+      },
+    };
+    let callCount = 0;
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+
+    await draftTask(task, {
+      localCall, withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
+      draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'test stub' }),
+    });
+
+    assert.ok(callCount > 0, 'must fall through to the real drafting path, not silently do nothing');
+    const advisory = (task.history || []).find((h) => h.stage === 'advisory' && (h.detail || '').includes('deterministic script-extract check no longer holds'));
+    assert.ok(advisory, 'must record why the deterministic short-circuit declined to fire');
+  });
+});
+
+test('a task without the deterministicApply marker never triggers the script-extract short-circuit', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {}\n');
+    const task = {
+      id: 'script-extract-test-3', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: { rawText: 'ordinary adhoc task, nothing special' },
+    };
+    const localCall = async () => ({ response: PLAN_STUB, degenerate: null, attempts: 1 });
+    await draftTask(task, {
+      localCall, withLockFn: async (d, fn) => fn(),
+      draftAdhocViaHarnessSearchFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
+      draftAdhocViaLocalAgenticFn: async () => ({ applied: false, succeeded: true, reason: 'declined by test stub' }),
+      draftAdhocViaLocalAgenticWriteFn: async () => ({ succeeded: true, blocked: true, blockedReason: 'test stub' }),
+    });
+    assert.equal(task.implementResponse, undefined);
+  });
+});
+
 // Regression, 2026-08-23: caught live -- a staleness_audit task auditing a scanner-
 // originated finding burned all 3 infra-requeue rounds on real local-model timeouts and
 // permanently blocked, needing a human to manually re-derive an answer a regex could give
