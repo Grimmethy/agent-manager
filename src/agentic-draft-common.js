@@ -187,6 +187,22 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
 
   try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup worktree remove failed', worktreeDir, e.message); }
   try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup fs.rmSync failed', worktreeDir, e.message); }
+  // 2026-09-07, Grimmethy (live-caught: "selecting it cleared the queued task but the
+  // decompose task itself didn't get queued"): `git worktree remove` operates on the
+  // WORKING directory and can legitimately fail with "not a working tree" when that
+  // directory is already gone (the normal, harmless case above) -- but it does nothing
+  // for a stale/orphaned ADMINISTRATIVE entry under .git/worktrees/<name>/ whose target
+  // directory is gone for some OTHER reason (e.g. a SIGKILL landing mid a worktree
+  // operation, which chat-preempt/the assign-task override both do routinely and by
+  // design). A corrupted leftover entry there makes the SAME name's next `git worktree
+  // add` fail outright ("fatal: not a git repository: .../.git/worktrees/<name>"),
+  // confirmed live for this exact task's own worktree name -- `git worktree prune` is
+  // the actual, correct cleanup for that case (removes administrative entries whose
+  // target is gone; a no-op, never destructive, when there's nothing stale to prune).
+  // Below DRAFT_FAILURE_RETRY_LIMIT this failure is silently retried by the next tick's
+  // leftover-drafting resume with no visible sign anything went wrong in between -- this
+  // closes the failure class instead of relying on a retry to eventually work around it.
+  try { runGit(['worktree', 'prune'], resolvedRepoRoot); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup worktree prune failed', e.message); }
   try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { console.warn('createAdhocWorktree: pre-cleanup branch -D failed', branchName, e.message); }
 
   try {

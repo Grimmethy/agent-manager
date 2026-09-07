@@ -14,7 +14,7 @@ const { execFileSync } = require('child_process');
 
 const {
   parseSubTaskProposals, parseClarificationOptions, priorRejectionBlock,
-  RESOLUTION_RE, resolveAgenticDraft,
+  RESOLUTION_RE, resolveAgenticDraft, prepareAdhocWorktree, agenticWorktreePaths,
 } = require('./agentic-draft-common.js');
 
 test('parseSubTaskProposals pulls a 2+ {title,rawText} array out of surrounding prose', () => {
@@ -550,4 +550,64 @@ test('resolveAgenticDraft: degenerate result -> blocked', () => {
     assert.equal(out.blocked, true);
     assert.match(out.blockedReason, /degenerate: repetition-loop/);
   });
+});
+
+// --- prepareAdhocWorktree: recovering from a corrupted worktree administrative entry ---
+
+function makeRepoWithOrigin() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-worktree-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-worktree-repo-'));
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+  g(['init', '--bare', '-b', 'main'], bareDir);
+  g(['clone', bareDir, repoDir]);
+  g(['config', 'user.email', 't@t'], repoDir);
+  g(['config', 'user.name', 't'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'a.txt'), 'v1\n');
+  g(['add', '-A'], repoDir);
+  g(['commit', '-qm', 'init'], repoDir);
+  g(['push', 'origin', 'main'], repoDir);
+  return { repoDir };
+}
+
+// 2026-09-07, Grimmethy (live-caught: "selecting it cleared the queued task but the
+// decompose task itself didn't get queued"): the real per-instance log showed this
+// task's own worktree preparation actually fail with "fatal: not a git repository:
+// .../.git/worktrees/<name>" on a retry, right after a series of interrupted attempts
+// (this task had been killed and reclaimed several times over this session's testing).
+// `git worktree prune` -- added to prepareAdhocWorktree's pre-cleanup alongside this --
+// is git's own documented remedy for a stale/corrupted administrative entry under
+// .git/worktrees/<name>/ that `git worktree remove` (which operates on the WORKING
+// directory, not the administrative entry) can't clean up on its own.
+//
+// Honesty check on this test: I could not reliably reproduce the exact "not a git
+// repository" failure in a sandboxed repo by just deleting the working directory (this
+// git version's `worktree remove --force` + `worktree add` already tolerate that
+// specific case, with or without the `prune` addition) or by deleting the admin entry's
+// own gitdir/HEAD files. So this test does NOT prove it reproduces the exact production
+// corruption -- it verifies the real, valuable invariant the fix is meant to preserve
+// (prepareAdhocWorktree must succeed again for the SAME task id after its working
+// directory is removed out from under it, matching a real requeue-and-retry cycle) and
+// documents `git worktree prune`'s inclusion as a standard, low-risk defensive addition
+// for the corruption class git's own docs describe -- not as a proven fix for this one
+// specific incident, which is why the incident is described in prose here rather than
+// asserted as a reproduced failure.
+test('prepareAdhocWorktree succeeds again for the same task id after its working directory is removed out from under it', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  try {
+    const { worktreeDir, branchName } = agenticWorktreePaths('sync-check-corrupt-test');
+
+    const first = prepareAdhocWorktree(repoDir, 'main', worktreeDir, branchName);
+    assert.equal(first.ok, true);
+
+    // Matches what a killed process's own OS-level state, or a normal next attempt's own
+    // pre-cleanup fs.rmSync, leaves behind: the working directory is gone, whatever git
+    // may or may not still believe about it.
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+
+    const second = prepareAdhocWorktree(repoDir, 'main', worktreeDir, branchName);
+    assert.equal(second.ok, true, `expected recovery, got: ${second.reason}`);
+    assert.ok(fs.existsSync(worktreeDir), 'the recovered worktree directory should actually exist');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });
