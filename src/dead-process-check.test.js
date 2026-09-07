@@ -100,16 +100,38 @@ test('restartTargetFor: worker-reasoning-p40 gets the same P40 env treatment as 
   }
 });
 
-test('restartTargetFor: worker-p40 carries NO env field when the P40 vars are not configured -- this is the exact bug scenario (silently falls back to the host model)', () => {
+// 2026-09-07 follow-up (Grimmethy: "let's disable the p40 until I can get a fan on it"
+// -- the card was found thermally throttling, see agent-manager.env's own comment on the
+// incident): when the P40 env is not configured at all, restartTargetFor now refuses to
+// restart worker-p40/worker-reasoning-p40 entirely (returns null, same as an
+// unrecognized instanceId) rather than the earlier behavior of still restarting it
+// WITHOUT the P40 env -- that earlier behavior was itself the original bug this file's
+// other tests cover (silently falling back to the host GPU); simply omitting the env
+// still let a "disabled" P40 lane get resurrected onto the wrong GPU the moment its
+// heartbeat went stale.
+test('restartTargetFor: refuses to restart worker-p40 at all when the P40 vars are not configured (deliberately disabled)', () => {
   const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
   delete process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   delete process.env.AGENT_MANAGER_P40_MODEL;
   try {
-    const target = restartTargetFor('worker-p40');
-    assert.equal('env' in target, false);
+    assert.equal(restartTargetFor('worker-p40'), null);
+    assert.equal(restartTargetFor('worker-reasoning-p40'), null);
   } finally {
     if (prevUrl !== undefined) process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel !== undefined) process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+test('restartTargetFor: refuses to restart worker-p40 when only ONE of the two P40 vars is set (partial config, same as unconfigured)', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  delete process.env.AGENT_MANAGER_P40_MODEL;
+  try {
+    assert.equal(restartTargetFor('worker-p40'), null);
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
     if (prevModel !== undefined) process.env.AGENT_MANAGER_P40_MODEL = prevModel;
   }
 });
