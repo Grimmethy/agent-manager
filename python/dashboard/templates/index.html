@@ -501,6 +501,19 @@ let expandedWorkerId = null;
 // not pipeline state.
 let selectedWorkerTaskType = {};
 
+// Optimistic "pinning in progress" marker for the Workers-tab assign-task override
+// (2026-09-07, Grimmethy: "it took a very long time after you selected the task before
+// it populated as queued"). The assign-task POST itself returns fast (the kill+pin is
+// synchronous server-side), but the WORKER DAEMON reacting to that kill, looping back,
+// and re-claiming is real wall-clock time the dashboard has no way to shorten -- what
+// this closes is the PERCEIVED gap: between the click and the next poll that shows the
+// new currentTaskId, the card used to show nothing different at all, so an assignment
+// that actually completed in ~10s looked indistinguishable from one that hung. Keyed by
+// instanceId -> the assigned taskId; set right after a successful POST, cleared once
+// renderWorkers() observes that instance's currentTaskId actually match (or on a fresh
+// assign to the same instance, which just overwrites it).
+let pendingWorkerAssign = {};
+
 // Raw instance list from the last /api/instances fetch, kept around so the 1s ticking
 // timer below can recompute stale duration client-side without re-polling every second.
 let instancesForTimers = [];
@@ -3369,7 +3382,7 @@ async function renderHardwareTab() {
 
 async function renderMain() {
   try {
-    if (activeTab === 'workers') await renderWorkers();
+    if (activeTab === 'workers') await renderWorkers(true);
     else if (activeTab === 'hardware') await renderHardwareTab();
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
