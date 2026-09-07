@@ -208,6 +208,110 @@ class ApiAssignTaskRouteTest(AssignTaskTestBase):
         )
         self.assertEqual(resp.status_code, 400)
 
+    # 2026-09-07 follow-up, Grimmethy after live-testing the above: "The task I want,
+    # autodecomp, is in drafting." -- the route now also finds a task already claimed by
+    # some OTHER lane instead of only ever looking in pending/.
+
+    def test_assigns_a_task_actively_in_flight_on_a_different_lane(self):
+        (self.queue / "drafting" / "worker-reasoning-p40").mkdir(parents=True)
+        pr = self._spawn()
+        self._hb("worker-reasoning-p40", status="working", pass_="implement", pid=pr.pid, task_id="stuck")
+        self._drafting_task("worker-reasoning-p40", "stuck")
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
+
+        resp = self._post("worker-1", "stuck")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body, {"id": "stuck", "pinnedTo": "worker-1", "preempted": False})
+        self.assertTrue(self._was_killed(pr), "the source lane's in-flight process must be killed")
+        self.assertFalse((self.queue / "drafting" / "worker-reasoning-p40" / "stuck.json").exists())
+        pinned = json.loads((self.queue / "pending" / "stuck.json").read_text())
+        self.assertEqual(pinned["pinnedWorker"], "worker-1")
+        stages = [h["stage"] for h in pinned["history"]]
+        self.assertIn("operator-preempted", stages, "the kill-and-requeue's own history note survives the later pin")
+        self.assertIn("operator-assigned", stages)
+
+    def test_assigns_a_task_sitting_idle_in_another_lanes_drafting_backlog_no_kill(self):
+        (self.queue / "drafting" / "worker-reasoning-p40").mkdir(parents=True)
+        self._drafting_task("worker-reasoning-p40", "backlog-item")
+        # That lane is busy with something ELSE entirely -- backlog-item is not its
+        # currentTaskId, so there is no process to kill for backlog-item specifically.
+        pr = self._spawn()
+        self._hb("worker-reasoning-p40", status="working", pass_="implement", pid=pr.pid, task_id="something-else")
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
+
+        resp = self._post("worker-1", "backlog-item")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(pr.poll(), "the OTHER in-flight task on that lane must not be touched")
+        self.assertFalse((self.queue / "drafting" / "worker-reasoning-p40" / "backlog-item.json").exists())
+        pinned = json.loads((self.queue / "pending" / "backlog-item.json").read_text())
+        self.assertEqual(pinned["pinnedWorker"], "worker-1")
+        stages = [h["stage"] for h in pinned["history"]]
+        self.assertIn("operator-preempted", stages)
+        note = next(h["detail"] for h in pinned["history"] if h["stage"] == "operator-preempted")
+        self.assertIn("backlog", note)
+
+    def test_assigning_a_task_already_in_the_target_lanes_own_drafting_is_a_no_op(self):
+        (self.queue / "drafting" / "worker-1").mkdir(parents=True, exist_ok=True)
+        pr = self._spawn()
+        self._hb("worker-1", status="working", pass_="implement", pid=pr.pid, task_id="mine-already")
+        self._drafting_task("worker-1", "mine-already")
+
+        resp = self._post("worker-1", "mine-already")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"id": "mine-already", "pinnedTo": "worker-1", "preempted": False})
+        self.assertIsNone(pr.poll(), "must not be killed -- it's already the target lane's own task")
+        self.assertTrue((self.queue / "drafting" / "worker-1" / "mine-already.json").exists())
+
+    def test_404_for_a_task_in_neither_pending_nor_any_drafting_dir(self):
+        (self.queue / "drafting" / "worker-reasoning-p40").mkdir(parents=True)
+        self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
+
+        resp = self._post("worker-1", "does-not-exist-anywhere")
+
+        self.assertEqual(resp.status_code, 404)
+
+
+class ApiAssignableTasksRouteTest(AssignTaskTestBase):
+    """GET /api/instances/<id>/assignable-tasks -- shells out to src/next-claimable-
+    task.js's --list-assignable CLI mode (real node subprocess, same as the module's own
+    unit tests exercise the underlying function directly)."""
+
+    def test_lists_pending_plus_cross_lane_drafting_tasks_tier_filtered_by_location(self):
+        (self.queue / "drafting" / "worker-reasoning-p40").mkdir(parents=True)
+        (self.queue / "drafting" / "worker-1").mkdir(parents=True, exist_ok=True)
+        self._pending_task("idle-one", {"source": "trouble_log", "title": "Idle one"})
+        self._drafting_task("worker-reasoning-p40", "elsewhere-one",
+                             {"source": "trouble_log", "title": "Elsewhere one"})
+        # This instance's OWN drafting/ contents must be excluded.
+        self._drafting_task("worker-1", "already-mine", {"source": "trouble_log", "title": "Already mine"})
+
+        resp = self.client.get("/api/instances/worker-1/assignable-tasks")
+
+        self.assertEqual(resp.status_code, 200)
+        items = resp.get_json()["items"]
+        by_id = {i["id"]: i for i in items}
+        self.assertIn("idle-one", by_id)
+        self.assertEqual(by_id["idle-one"]["location"], "pending")
+        self.assertIn("elsewhere-one", by_id)
+        self.assertEqual(by_id["elsewhere-one"]["location"], "drafting:worker-reasoning-p40")
+        self.assertNotIn("already-mine", by_id)
+
+    def test_tier_filters_reasoning_only_tasks_out_of_a_non_reasoning_lanes_list(self):
+        self._pending_task("high-tier", {"source": "adhoc", "title": "High tier"})
+        self._pending_task("low-tier", {"source": "trouble_log", "title": "Low tier"})
+
+        worker1_items = {i["id"] for i in self.client.get("/api/instances/worker-1/assignable-tasks").get_json()["items"]}
+        self.assertNotIn("high-tier", worker1_items)
+        self.assertIn("low-tier", worker1_items)
+
+    def test_404_for_an_unknown_instance(self):
+        resp = self.client.get("/api/instances/worker-does-not-exist/assignable-tasks")
+        self.assertEqual(resp.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

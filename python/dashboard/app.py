@@ -1474,6 +1474,104 @@ def api_instance_recent_tasks(instance_id):
     return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m} for t, at, m in rows]})
 
 
+@app.route("/api/instances/<instance_id>/assignable-tasks")
+def api_instance_assignable_tasks(instance_id):
+    """Candidate list for the Workers tab's assign-task dropdown (2026-09-07, Grimmethy
+    after live-testing the override below: "the only tasks I have access to, no matter
+    the worker, are pipeline debrief tasks. The task I want, autodecomp, is in drafting.
+    I need access to the full list of available jobs, they should however be whats
+    available for that specific worker type"). queue/pending/ alone is too narrow a
+    candidate pool -- the task an operator actually wants to reassign is usually already
+    claimed by some other lane, sitting in ITS queue/drafting/<lane>/.
+
+    Shells out to src/next-claimable-task.js's listAssignableTasks (via its
+    --list-assignable CLI mode), the same way _arbiter_cancel_below already shells out
+    to scripts/gpu-arbiter-cli.js: tier resolution (reasoningTierFor) depends on the
+    real registered task sources + config overrides and must never be re-derived in
+    Python, where it could silently drift from the Node source of truth that
+    local-worker.sh's actual claim loop uses."""
+    if instance_id not in _expected_instance_ids() or not instance_id.startswith("worker"):
+        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"items": []})
+    is_reasoning_lane = instance_id.startswith("worker-reasoning")
+    script = PACKAGE_ROOT / "src" / "next-claimable-task.js"
+    if not script.is_file():
+        return jsonify({"items": []})
+    try:
+        cp = subprocess.run(
+            ["node", str(script), "--list-assignable", str(qdir), instance_id,
+             "true" if is_reasoning_lane else "false"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        items = json.loads((cp.stdout or "[]").strip() or "[]")
+    except Exception as e:  # noqa: BLE001 -- best-effort; an empty list is a safe fallback for a dropdown
+        print(f"[assignable-tasks] failed for {instance_id} (non-fatal): {e}", file=sys.stderr, flush=True)
+        items = []
+    return jsonify({"items": items})
+
+
+def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str) -> dict:
+    """Resolve `task_id` to a real file and, if necessary, move it into pending/ so the
+    normal pin-and-preempt flow below can operate on it uniformly. Extends the original
+    assign-task route (which only ever looked in pending/) to also find a task that's
+    already claimed -- sitting in some OTHER lane's drafting/ -- per the same 2026-09-07
+    feedback the assignable-tasks route above documents: "The task I want, autodecomp,
+    is in drafting."
+
+    Returns {"found": bool, "already_here": bool} -- "already_here" means the task is
+    sitting in `target_instance_id`'s OWN drafting/ (reassigning it to the lane already
+    running/queuing it is a pure no-op, handled by the caller)."""
+    pending_path = qdir / "pending" / f"{task_id}.json"
+    if pending_path.is_file():
+        return {"found": True, "already_here": False}
+
+    drafting_dir = qdir / "drafting"
+    try:
+        lanes = [p.name for p in drafting_dir.iterdir() if p.is_dir()]
+    except OSError:
+        lanes = []
+    for lane in lanes:
+        src = drafting_dir / lane / f"{task_id}.json"
+        if not src.is_file():
+            continue
+        if lane == target_instance_id:
+            return {"found": True, "already_here": True}
+
+        inst_dir = instances_dir()
+        hb = (read_json_safe(inst_dir / f"{lane}.json") if inst_dir else None) or {}
+        if hb.get("currentTaskId") == task_id:
+            # Actively in-flight on `lane` -- kill it and let _kill_and_requeue_instance's
+            # own requeue-to-pending/ do the relocation (content preserved, history
+            # explained) exactly like it already does for the target lane's own
+            # in-flight task below.
+            _kill_and_requeue_instance(lane, f"reassigned to {target_instance_id} by operator override")
+        else:
+            # Just sitting in `lane`'s own drafting/ backlog, not actively running --
+            # nothing to kill; relocate the file directly with the same history note
+            # convention _kill_and_requeue_instance uses.
+            try:
+                data = json.loads(src.read_text(encoding="utf-8"))
+                data.setdefault("history", []).append({
+                    "stage": "operator-preempted", "at": datetime.now(timezone.utc).isoformat(),
+                    "detail": f"removed from {lane}'s backlog by operator override -- reassigned to {target_instance_id}",
+                })
+                src.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except (OSError, ValueError):
+                pass  # best-effort -- still attempt the move even if the history stamp failed
+            dst = qdir / "pending" / f"{task_id}.json"
+            try:
+                if src.is_file() and not dst.exists():
+                    os.replace(src, dst)
+            except OSError:
+                pass
+        return {"found": pending_path.is_file(), "already_here": False}
+
+    return {"found": False, "already_here": False}
+
+
 @app.route("/api/instances/<instance_id>/assign-task", methods=["POST"])
 def api_instance_assign_task(instance_id):
     """Operator override: pin a specific pending task to a specific worker lane,
@@ -1490,7 +1588,14 @@ def api_instance_assign_task(instance_id):
 
     Scoped to worker-* lanes only (the ones that actually claim from queue/pending/ via
     local-worker.sh) -- 'reviewer' and 'watchdog' don't run drafts, so pinning a task to
-    either would be a no-op that just silently confuses the operator."""
+    either would be a no-op that just silently confuses the operator.
+
+    The task doesn't have to already be in pending/ -- per 2026-09-07 feedback ("The
+    task I want, autodecomp, is in drafting"), _relocate_task_to_pending() also finds a
+    task already claimed by some OTHER lane (killing it if it's actively in-flight there,
+    or just relocating it if it's merely sitting in that lane's own drafting/ backlog)
+    and moves it into pending/ first, so everything below operates on it the same way
+    either way."""
     if instance_id not in _expected_instance_ids() or not instance_id.startswith("worker"):
         abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
 
@@ -1502,6 +1607,16 @@ def api_instance_assign_task(instance_id):
     qdir = queue_dir()
     if not qdir:
         abort(404)
+
+    relocated = _relocate_task_to_pending(qdir, task_id, instance_id)
+    if relocated["already_here"]:
+        # Operator "reassigned" a task to the lane already running/queuing it -- nothing
+        # to preempt, nothing to relocate, matching the existing already-running guard's
+        # spirit below for the plain-pending case.
+        return jsonify({"id": task_id, "pinnedTo": instance_id, "preempted": False})
+    if not relocated["found"]:
+        abort(404, description=f"'{task_id}' was not found in pending/ or any worker's drafting/")
+
     pending_path = qdir / "pending" / f"{task_id}.json"
     if not pending_path.is_file():
         abort(404, description=f"'{task_id}' is not in queue/pending/ -- it may already have been claimed")
