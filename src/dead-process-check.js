@@ -81,6 +81,24 @@ function p40EnvFor(instanceId) {
 
 function restartTargetFor(instanceId) {
   if (instanceId.startsWith('worker-')) {
+    // 2026-09-07 follow-up (Grimmethy: "let's disable the p40 until I can get a fan on
+    // it" -- the card was found thermally throttling, 89C/98% util with SW Thermal
+    // Slowdown active, SM clock at ~40-65% of rated speed): a worker-p40/worker-
+    // reasoning-p40 heartbeat can keep existing (and go stale) for a while after the
+    // lane is deliberately taken offline -- without this check, this function would
+    // still hand back an ordinary restart target for it (p40EnvFor above already
+    // returns null when the P40 vars aren't configured, but that only ever controlled
+    // whether the SPAWNED process got P40 env, not whether it should be spawned AT ALL).
+    // The watchdog would then silently restart a "disabled" P40 lane as an ordinary
+    // local-GPU worker, fighting worker-1/worker-reasoning/reviewer for the host GPU's
+    // own single-flight lock -- exactly the wrong-GPU-contention failure class this
+    // whole investigation started from, just reached a different way. Refuse instead:
+    // no restart rule at all for either P40 instance while its env isn't configured,
+    // matching launch.sh's own start_bg gate (same condition decides whether the lane
+    // starts in the first place).
+    if ((instanceId === 'worker-p40' || instanceId === 'worker-reasoning-p40') && !p40EnvFor(instanceId)) {
+      return null;
+    }
     const env = p40EnvFor(instanceId);
     return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid`, ...(env ? { env } : {}) };
   }
