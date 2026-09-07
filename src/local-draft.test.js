@@ -1082,9 +1082,29 @@ function writeHtmlWithFunctions(dir, relPath, scriptBody) {
   fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
 }
 
+// captureGroupBDiffInWorktree (group-b-worktree-diff.js) does REAL git worktree
+// operations against origin/<main> -- turns withFixtureRepo's plain tmp dir into a real
+// git repo with a real origin remote, same pattern group-b-worktree-diff.test.js's own
+// makeRepoWithOrigin() already establishes, just targeting an EXISTING directory (the
+// one withFixtureRepo already set AGENT_MANAGER_REPO_ROOT to) instead of a fresh one.
+function makeGitOriginFor(dir) {
+  const { execFileSync } = require('child_process');
+  const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-draft-script-extract-origin-'));
+  git(['init', '--bare', '-b', 'master', bareDir]);
+  git(['init', '-b', 'master'], dir);
+  git(['config', 'user.email', 'test@example.com'], dir);
+  git(['config', 'user.name', 'Test'], dir);
+  git(['remote', 'add', 'origin', bareDir], dir);
+  git(['add', '-A'], dir);
+  git(['commit', '-m', 'init'], dir);
+  git(['push', 'origin', 'master'], dir);
+}
+
 test('a script-extract move task with every symbol resolvable is applied deterministically -- zero model calls', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {\n  return 1;\n}\nfunction other() {\n  return 2;\n}\n');
+    makeGitOriginFor(dir);
     const task = {
       id: 'script-extract-test-1', domain: 'adhoc', source: 'manual', title: 'test',
       promptContext: {
@@ -1112,6 +1132,13 @@ test('a script-extract move task with every symbol resolvable is applied determi
     assert.doesNotMatch(parsed[1].replace, /function renderHardwareTab/, 'the symbol must be removed from the source in the replacement');
     assert.match(parsed[1].replace, /function other/, 'an un-named symbol must stay behind');
     assert.equal(task.status, 'needs-review');
+    // Real incident, 2026-09-07: implementResponse alone used to be treated as "the
+    // change" -- but adhoc tasks apply via task.rawDiff (applyAdhocDiff), which was
+    // never set, so review approved a change apply then silently did nothing with.
+    assert.ok(task.rawDiff, 'task.rawDiff must be set -- this is the field adhoc apply actually reads');
+    assert.match(task.rawDiff, /diff --git/);
+    assert.match(task.rawDiff, /hardware\.js/);
+    assert.equal(task.adhocResolution, 'implemented');
   });
 });
 
