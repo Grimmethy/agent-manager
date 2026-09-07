@@ -489,6 +489,18 @@ let workersTypeFilter = 'all';
 // not persisted -- same glance-time-only treatment as workersTypeFilter above.
 let expandedWorkerId = null;
 
+// Which task TYPE (source) a worker's "assign a task" dropdown is currently drilled into
+// (2026-09-07 follow-up, Grimmethy after the assignable-tasks list came back non-empty:
+// "I should get a list of available task types that each shows a count of how many tasks
+// of that type are available. Then, when I click on a job type I should get the list of
+// available jobs of that category" -- a flat list of everything a worker could claim,
+// with pipeline_debrief's real backlog often dozens deep, buried the one task an operator
+// actually wanted among many of one noisy type). Keyed by instanceId; absent/'' means
+// "showing the type picker, not a task list yet." Same glance-time-only, not-persisted
+// treatment as workersTypeFilter/expandedWorkerId above -- this is a UI drill-down state,
+// not pipeline state.
+let selectedWorkerTaskType = {};
+
 // Raw instance list from the last /api/instances fetch, kept around so the 1s ticking
 // timer below can recompute stale duration client-side without re-polling every second.
 let instancesForTimers = [];

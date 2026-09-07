@@ -228,6 +228,12 @@ async function setWorkerTask(instanceId, taskId, taskTitle, sourceLane) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ taskId }),
   });
+  // Back to the type picker for this card's next assignment, rather than staying
+  // drilled into whatever type was just used -- the confirm() above already gated
+  // this on the operator actually going through with it (a decline returns before
+  // this point and leaves the drill-down as-is, so re-picking another task of the
+  // same type doesn't require re-choosing the type too).
+  delete selectedWorkerTaskType[instanceId];
   await renderWorkers();
 }
 
@@ -333,14 +339,30 @@ async function renderWorkers() {
         })()}
         ${canAssignTask(inst) ? (() => {
           const items = assignableByInstance[inst.instanceId] || [];
+          // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
+          // etc first, rather than one flat list where a deep single-type backlog
+          // buries everything else (see selectedWorkerTaskType's own header comment).
+          const bySource = {};
+          items.forEach((t) => {
+            const key = t.source || 'unknown';
+            (bySource[key] = bySource[key] || []).push(t);
+          });
+          const sourceKeys = Object.keys(bySource).sort();
+          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+          const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
+            <option value="">(assign a task…)</option>
+            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${bySource[k].length})</option>`).join('')}
+          </select>`;
+          if (!selectedType || !bySource[selectedType]) return typeSelect;
           const optionLabel = (t) => {
-            const base = (t.title || t.id) + (t.source ? ' [' + t.source + ']' : '');
+            const base = t.title || t.id;
             return t.location && t.location !== 'pending' ? `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}` : base;
           };
-          return `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers">
-            <option value="">(assign a task…)</option>
-            ${items.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+          const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
+            <option value="">(choose a ${escapeHtml(selectedType)} task…)</option>
+            ${bySource[selectedType].map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}">${escapeHtml(optionLabel(t))}</option>`).join('')}
           </select>`;
+          return typeSelect + taskSelect;
         })() : ''}
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
@@ -373,6 +395,15 @@ async function renderWorkers() {
   main.querySelectorAll('.worker-model-select').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
     sel.onchange = (e) => { e.stopPropagation(); setWorkerModel(sel.dataset.instanceId, sel.value); };
+  });
+  main.querySelectorAll('.worker-type-select').forEach((sel) => {
+    sel.onclick = (e) => e.stopPropagation();
+    sel.onchange = (e) => {
+      e.stopPropagation();
+      if (sel.value) selectedWorkerTaskType[sel.dataset.instanceId] = sel.value;
+      else delete selectedWorkerTaskType[sel.dataset.instanceId];
+      renderWorkers();
+    };
   });
   main.querySelectorAll('.worker-task-select').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
