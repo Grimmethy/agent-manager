@@ -862,6 +862,41 @@ test('a non-adhoc/research task locks around EVERY real call (plan, implement, c
   });
 });
 
+// 2026-09-06, Grimmethy: "We need to fix cost tracking before we can even begin to
+// properly work on this problem" -- an efficiency analysis found recordModelCall was
+// ONLY ever invoked from the implement stage: model-stats.db (every cost/degenerate-
+// rate/token stat this pipeline computes) was blind to plan, critique, and revise calls
+// entirely -- 98.6% of all real rows were stage="implement" regardless of what call
+// actually produced them. Proves all three real calls this task shape reaches (plan,
+// implement, critique -- no revision, since critique found no issues) now get recorded,
+// each with its own correct stage and the task's real source (also previously dropped:
+// callImplementModel's own recordModelCall call never passed `source` either).
+test('recordModelCall is invoked for the plan and critique stages too, not just implement (the cost-tracking blind spot)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'default-test-2', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'a note to classify', tags: [] } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 }; // implement
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+    const recorded = [];
+    const recordModelCall = (call) => { recorded.push(call); return 'fake-call-id'; };
+
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), recordModelCall });
+
+    const stages = recorded.map((c) => c.stage);
+    assert.deepEqual(stages, ['plan', 'implement', 'critique'], 'each real call recorded, in order, with its own real stage');
+    for (const call of recorded) {
+      assert.equal(call.source, 'brain_dump_sort', `${call.stage} call must carry the task's real source, not null`);
+      assert.equal(call.taskId, 'default-test-2');
+      assert.ok(call.result, `${call.stage} call must carry its real result`);
+    }
+  });
+});
+
 // Regression, 2026-08-23: caught live -- arch_import drafts routinely fabricated
 // plausible-looking file paths/APIs even when archImportImplementPrompt explicitly told
 // the model to output the empty string on a genuine zero-hit search. Since queries with
