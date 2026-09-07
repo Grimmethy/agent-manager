@@ -127,6 +127,50 @@ fi
 if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"
 
+  # Pre-warm the main local model BEFORE any worker daemon can claim a task (2026-09-07,
+  # Grimmethy: "We need to stop the model from being unloaded... The 27b should not be
+  # unloaded unless the pipeline is shut down" -- root-caused live). OLLAMA_KEEP_ALIVE=-1
+  # already means Ollama never expires a resident model on its own; the real cause of the
+  # model "getting unloaded" was LOAD ORDER, not keep-alive -- confirmed live by direct
+  # measurement: loading LOCAL_MODEL (qwen3.8:27b, ~17.5GB) fresh into an EMPTY GPU, then
+  # loading the small brain_dump_sort utility model (qwen2.5:3b, ~2.7GB) on top, leaves
+  # both resident simultaneously (20.2GB of 24.5GB used, ~3.8GB headroom -- confirmed via
+  # `ollama ps` and nvidia-smi). But loading them in the OPPOSITE order evicts the small
+  # one the moment the big model's own load needs its conservative peak-VRAM safety
+  # margin -- and brain_dump_sort is this pipeline's single highest-volume task type (117
+  # of 117 tasks completed in one real 5-hour window), so on a cold pipeline start it is
+  # very likely to claim first and load the SMALL model into an empty GPU before any real
+  # task ever asks for the big one, guaranteeing the big model's own first load evicts it.
+  # This blocking pre-warm (a real /api/generate call, not just a HEAD/tags probe -- only
+  # a real generate call actually forces Ollama to load tensors, per this session's own
+  # measurement showing GET /api/tags never touches the load path at all) forces the
+  # canonical LOCAL_MODEL to be the FIRST thing loaded, every single pipeline start,
+  # before worker-1/worker-reasoning/reviewer get a chance to claim anything -- eliminating
+  # the ordering hazard at its source rather than reacting to it after the fact. Costs
+  # real wall-clock time at every launch (measured ~100-115s for a cold load of this
+  # model under real memory pressure) -- accepted as a one-time-per-launch cost, not a
+  # per-tick one. Best-effort: a failure or timeout here logs a warning and lets the
+  # daemons start anyway (today's pre-existing behavior), never blocks launch.sh forever
+  # or hard-fails the whole pipeline over a warm-up call.
+  if [[ -n "${LOCAL_MODEL:-}" ]]; then
+    printf '[launch] pre-warming local model %s (keeps it loaded first, before any task can evict it) -- this can take ~100s...\n' "$LOCAL_MODEL"
+    warm_started_at=$(date +%s)
+    if curl -s -m 180 "${OLLAMA_URL:-http://localhost:11434}/api/generate" \
+      -d "$(node -e 'console.log(JSON.stringify({model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1}))' "$LOCAL_MODEL")" \
+      -o /dev/null -w '%{http_code}' > /tmp/agent-manager-prewarm-http-code 2>/dev/null; then
+      warm_code="$(cat /tmp/agent-manager-prewarm-http-code 2>/dev/null)"
+      warm_elapsed=$(( $(date +%s) - warm_started_at ))
+      if [[ "$warm_code" == "200" ]]; then
+        printf '[launch] local model pre-warm succeeded (HTTP 200, %ss) -- %s is now resident and protected by keep_alive=-1\n' "$warm_elapsed" "$LOCAL_MODEL"
+      else
+        printf '[launch] local model pre-warm returned HTTP %s after %ss -- continuing anyway, workers will load it lazily on first real use\n' "$warm_code" "$warm_elapsed"
+      fi
+    else
+      printf '[launch] local model pre-warm failed/timed out after 180s -- continuing anyway, workers will load it lazily on first real use\n'
+    fi
+    rm -f /tmp/agent-manager-prewarm-http-code
+  fi
+
   bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_REPO_ROOT" >/dev/null 2>&1 || true
 
   start_bg "worker-1" "${PID_DIR}/worker-1.pid" "${LOG_DIR}/worker-1.log" \
