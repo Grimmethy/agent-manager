@@ -16,6 +16,14 @@ const path = require('path');
 // a task pinned to THIS instance always wins, skipping the tier filter and priority
 // sort entirely (that's the override); a task pinned to ANY OTHER instance is excluded
 // from this instance's candidate list so a faster-polling lane can't steal it first.
+//
+// listAssignableTasks() (2026-09-07, Grimmethy after live-testing the above: "the only
+// tasks I have access to... are pipeline debrief tasks. The task I want, autodecomp, is
+// in drafting. I need access to the full list of available jobs, they should however be
+// whats available for that specific worker type") backs the Workers tab's assign-task
+// dropdown: pending/ alone is too narrow a candidate pool -- the task an operator wants
+// to reassign is usually already claimed by some other lane -- so this also surfaces
+// every OTHER lane's queue/drafting/ contents, tier-filtered the same way.
 
 function readTaskSafe(fullPath) {
   let mtimeMs = 0;
@@ -23,6 +31,26 @@ function readTaskSafe(fullPath) {
   let task = null;
   try { task = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch (_) { /* corrupt/partial write -- still listed, worst priority, matching prior behavior */ }
   return { task, mtimeMs };
+}
+
+// Shared by pickClaimableTasks (claim ranking) and listAssignableTasks (the operator's
+// "what could I assign here" dropdown) so the two can never disagree about which tasks
+// belong on a given lane -- both must ask model-provider.js's reasoningTierFor(), never
+// re-derive tier some other way. Requires task-sources.js itself (not just
+// model-provider.js) -- registerTaskSource() calls populate task-source-registry.js's
+// registry as a load-time side effect that reasoningTierFor() depends on to resolve a
+// source's registered tier; skipping this require silently defaults every task to 'low'
+// (confirmed live 2026-09-07: listAssignableTasks originally omitted this and inverted
+// every tier filter as a result -- caught by testing against the real queue before
+// shipping, not by the unit tests, which mock the registry away).
+function resolvesToTier(task, isReasoningLane) {
+  require('./task-sources.js');
+  const { reasoningTierFor } = require('./model-provider.js');
+  let tier = 'low';
+  if (task) {
+    try { tier = reasoningTierFor(task); } catch (_) { /* default 'low' */ }
+  }
+  return isReasoningLane ? tier === 'high' : tier !== 'high';
 }
 
 // Returns every filename in pendingDir this instance may claim, in claim-attempt order:
@@ -45,7 +73,6 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
   // alone reported every source as 'low' every time).
   require('./task-sources.js');
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-  const { reasoningTierFor } = require('./model-provider.js');
 
   const pinned = [];
   const rankable = [];
@@ -59,15 +86,13 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
     }
 
     let priority = Infinity;
-    let tier = 'low';
     if (task) {
       try {
         const source = getRegisteredSource(resolveSourceName(task));
         if (source && typeof source.priority === 'number') priority = source.priority;
       } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
-      try { tier = reasoningTierFor(task); } catch (_) { /* default 'low' */ }
     }
-    if (isReasoningLane ? tier !== 'high' : tier === 'high') continue;
+    if (!resolvesToTier(task, isReasoningLane)) continue;
     rankable.push({ name, priority, mtimeMs });
   }
 
@@ -84,20 +109,103 @@ function pickNextPendingTask(pendingDir, instanceId, opts) {
   return first || null;
 }
 
-module.exports = { pickClaimableTasks, pickNextPendingTask };
+// The Workers tab's "assign a task to this worker" dropdown (2026-09-06/07, Grimmethy:
+// "I need access to the full list of available jobs, they should however be whats
+// available for that specific worker type"). pickClaimableTasks() alone isn't enough for
+// this: it only looks at queue/pending/, but the task an operator actually wants to
+// reassign is usually already claimed -- sitting in some OTHER lane's
+// queue/drafting/<lane>/ (either actively running there, or just queued as that lane's
+// own backlog; local-worker.sh processes several leftover drafting items per tick before
+// claiming anything new). This lists BOTH: pending/ candidates (same tier filter
+// pickClaimableTasks applies) plus every OTHER lane's drafting/ contents (never this
+// instance's own -- reassigning a task to the lane already running it is a pure no-op
+// the assign route already short-circuits, no point cluttering the list with it), each
+// tagged with `location` so the dashboard can label a stolen in-flight task distinctly
+// from idle pending work.
+function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } = {}) {
+  const out = [];
+
+  const pendingDir = path.join(queueDir, 'pending');
+  let pendingNames = [];
+  try {
+    pendingNames = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  } catch (_) { /* no pending/ dir yet */ }
+  for (const name of pendingNames) {
+    const { task } = readTaskSafe(path.join(pendingDir, name));
+    if (!task) continue;
+    if (task.pinnedWorker && task.pinnedWorker !== instanceId) continue; // pinned elsewhere -- not really "available" to offer here
+    if (!resolvesToTier(task, isReasoningLane)) continue;
+    out.push({
+      id: task.id || name.replace(/\.json$/, ''),
+      title: task.title || null,
+      source: task.source || null,
+      location: 'pending',
+    });
+  }
+
+  const draftingDir = path.join(queueDir, 'drafting');
+  let lanes = [];
+  try {
+    lanes = fs.readdirSync(draftingDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name !== instanceId)
+      .map((e) => e.name);
+  } catch (_) { /* no drafting/ dir yet */ }
+  for (const lane of lanes) {
+    const laneDir = path.join(draftingDir, lane);
+    let names = [];
+    try {
+      names = fs.readdirSync(laneDir).filter((f) => f.endsWith('.json'));
+    } catch (_) { continue; }
+    for (const name of names) {
+      const { task } = readTaskSafe(path.join(laneDir, name));
+      if (!task) continue;
+      if (!resolvesToTier(task, isReasoningLane)) continue;
+      out.push({
+        id: task.id || name.replace(/\.json$/, ''),
+        title: task.title || null,
+        source: task.source || null,
+        location: `drafting:${lane}`,
+      });
+    }
+  }
+
+  return out;
+}
+
+module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks };
 
 // --- CLI --------------------------------------------------------------------------
-// Usage: node next-claimable-task.js <pendingDir> <instanceId> <isReasoningLane:true|false>
-// Prints one claimable filename per line, in claim-attempt order (same contract the
-// removed inline `node -e` script had) -- local-worker.sh consumes this via
-// `while IFS= read -r name; do items+=("$name"); done < <(node ...)`.
+// Two modes:
+//
+//   node next-claimable-task.js <pendingDir> <instanceId> <isReasoningLane:true|false>
+//     Prints one claimable filename per line, in claim-attempt order (same contract the
+//     removed inline `node -e` script had) -- local-worker.sh consumes this via
+//     `while IFS= read -r name; do items+=("$name"); done < <(node ...)`.
+//
+//   node next-claimable-task.js --list-assignable <queueDir> <instanceId> <isReasoningLane:true|false>
+//     Prints a single JSON array of {id, title, source, location} to stdout -- the
+//     dashboard (python/dashboard/app.py's GET /api/instances/<id>/assignable-tasks)
+//     shells out to this exactly the way it already shells out to
+//     scripts/gpu-arbiter-cli.js for gpu-arbiter.js logic, so tier resolution can never
+//     drift between the two languages.
 if (require.main === module) {
-  const [pendingDir, instanceId, isReasoningLaneArg] = process.argv.slice(2);
-  try {
-    const items = pickClaimableTasks(pendingDir, instanceId, { isReasoningLane: isReasoningLaneArg === 'true' });
-    for (const name of items) console.log(name);
-  } catch (e) {
-    // Best-effort, matching the removed inline script's own catch-and-fall-through --
-    // caller already handles an empty listing safely.
+  if (process.argv[2] === '--list-assignable') {
+    const [queueDir, instanceId, isReasoningLaneArg] = process.argv.slice(3);
+    try {
+      const items = listAssignableTasks(queueDir, instanceId, { isReasoningLane: isReasoningLaneArg === 'true' });
+      process.stdout.write(JSON.stringify(items));
+    } catch (e) {
+      process.stderr.write(`next-claimable-task --list-assignable: ${e.message}\n`);
+      process.stdout.write('[]');
+    }
+  } else {
+    const [pendingDir, instanceId, isReasoningLaneArg] = process.argv.slice(2);
+    try {
+      const items = pickClaimableTasks(pendingDir, instanceId, { isReasoningLane: isReasoningLaneArg === 'true' });
+      for (const name of items) console.log(name);
+    } catch (e) {
+      // Best-effort, matching the removed inline script's own catch-and-fall-through --
+      // caller already handles an empty listing safely.
+    }
   }
 }
