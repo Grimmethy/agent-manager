@@ -75,6 +75,23 @@ function getConfig() {
   }
 
   const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
+  // applyRepoRoot (2026-09-07, Grimmethy: "I'd love to fix the auto-stash situation...
+  // it wasn't enough of an issue before the second GPU was plugged in"): git-runner.js's
+  // resetToMain() runs `git stash push -u` + `git reset --hard origin/<main>` against
+  // repoRoot on every apply -- necessary for a clean apply, but repoRoot is also the SAME
+  // directory a human edits live in interactive sessions. That collision has repeatedly
+  // stashed real uncommitted work mid-session (documented in git-runner.js's own header:
+  // "this repo is sometimes edited live in the same working tree the pipeline operates
+  // on"), and a second GPU raised real task throughput enough that resetToMain() now
+  // fires often enough to make the collision a routine occurrence rather than a rare one.
+  // AGENT_MANAGER_APPLY_REPO_ROOT lets apply-task.js's own destructive git operations
+  // (and the file writes that precede them -- see applyTask's own `repoRoot` param,
+  // which both writeArtifact and createRealGitRunner share) target a SEPARATE, dedicated
+  // worktree instead, while every OTHER consumer of `repoRoot` (grounding, harness
+  // search, the dashboard) keeps reading the shared interactive checkout exactly as
+  // before -- unset, this defaults to `repoRoot` so nothing changes for a deployment
+  // that hasn't set up a dedicated apply worktree.
+  const applyRepoRoot = process.env.AGENT_MANAGER_APPLY_REPO_ROOT || repoRoot;
   const secondBrainDir = process.env.SECOND_BRAIN_DIR || null;
   const grepAllowedDirs = (process.env.AGENT_MANAGER_GREP_DIRS || 'frontend/src,backend/src')
     .split(',')
@@ -326,7 +343,7 @@ function getConfig() {
   });
 
   return {
-    repoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
+    repoRoot, applyRepoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
     troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,

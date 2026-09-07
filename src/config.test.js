@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { resolveGraphPath } = require('./config.js');
+const { resolveGraphPath, getConfig } = require('./config.js');
 
 function makeRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'config-resolve-graph-test-'));
@@ -55,4 +55,47 @@ test('resolveGraphPath does not throw when .agent-manager-cache/ exists but is e
   const repoRoot = makeRepo();
   fs.mkdirSync(path.join(repoRoot, '.agent-manager-cache'), { recursive: true });
   assert.equal(resolveGraphPath(repoRoot), path.join(repoRoot, 'graphify-out', 'graph.json'));
+});
+
+// --- getConfig().applyRepoRoot (2026-09-07) ----------------------------------------------
+// Grimmethy: "I'd love to fix the auto-stash situation... it wasn't enough of an issue
+// before the second GPU was plugged in" -- resetToMain() in git-runner.js auto-stashes
+// (git-runner.js's own header: "this repo is sometimes edited live in the same working
+// tree the pipeline operates on") whenever apply-task.js resets repoRoot to origin/main.
+// AGENT_MANAGER_APPLY_REPO_ROOT lets apply-task.js's own destructive git operations
+// target a separate, dedicated worktree instead, while every other repoRoot consumer
+// (grounding, harness search, the dashboard) is unaffected.
+
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) saved[k] = process.env[k];
+  Object.assign(process.env, vars);
+  try {
+    return fn();
+  } finally {
+    for (const k of Object.keys(vars)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+test('getConfig().applyRepoRoot defaults to repoRoot when AGENT_MANAGER_APPLY_REPO_ROOT is unset', () => {
+  const repoRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_APPLY_REPO_ROOT: undefined }, () => {
+    delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+    const cfg = getConfig();
+    assert.equal(cfg.applyRepoRoot, repoRoot);
+    assert.equal(cfg.repoRoot, repoRoot);
+  });
+});
+
+test('getConfig().applyRepoRoot uses AGENT_MANAGER_APPLY_REPO_ROOT when set, independent of repoRoot', () => {
+  const repoRoot = makeRepo();
+  const applyRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_APPLY_REPO_ROOT: applyRoot }, () => {
+    const cfg = getConfig();
+    assert.equal(cfg.applyRepoRoot, applyRoot);
+    assert.equal(cfg.repoRoot, repoRoot, 'repoRoot itself must stay pointed at the shared checkout for every other consumer');
+  });
 });
