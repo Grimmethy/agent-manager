@@ -306,9 +306,29 @@ function alreadyImplementedSignal(repoRoot, task) {
 // file. "The premise contradicts the codebase." Only fires when there is at least one
 // named path and every one is absent -- otherwise silent (a task naming zero paths, or a
 // mix, is not evidence of an invalid premise).
+//
+// 2026-09-07, Grimmethy (live-caught via the assign-task investigation: a file-decompose
+// move task -- "Create python/dashboard/static/js/analytics-and-discovery.js... move
+// these 29 function declarations OUT of python/dashboard/templates/index.html" -- kept
+// getting flagged invalid-premise/retire, disposition high-confidence, purely because
+// its create target legitimately doesn't exist yet: candidateFilePaths()'s underlying
+// extractFilePaths() (fact-checker.js) only matches js/jsx/ts/tsx/py/json/md/csv
+// extensions, so the task's OTHER named file (index.html, which very much exists) was
+// never even a candidate, leaving the create target as the ONLY named path and
+// "1 missing out of 1 named" trivially satisfied the "every named path is absent"
+// condition. This is the exact "a create target correctly resolving as missing is
+// normal, not fabrication" distinction fact-checker.js's own alreadyImplementedSignal-
+// adjacent comment already documents (2026-08-20, a Group-B create-target false
+// positive) -- that lesson just never propagated to this second, independent
+// implementation. file-decompose-to-hub.js/file-decompose-plan-pass.js/local-draft.js/
+// review-task.js already share one canonical field name for "this task's own declared
+// creation target" (promptContext.newFile) -- excluding it here, the same way an
+// already-known create target is excluded elsewhere, closes the false positive without
+// weakening the check for every task that doesn't set it.
 function invalidPremiseSignal(repoRoot, task) {
   if (!repoRoot) return { hit: false, evidence: [] };
-  const named = candidateFilePaths(task);
+  const ownCreateTarget = task.promptContext && task.promptContext.newFile;
+  const named = candidateFilePaths(task).filter((p) => p !== ownCreateTarget);
   if (named.length === 0) return { hit: false, evidence: [] };
   const missing = named.filter((p) => !resolveAgainstRepo(repoRoot, p));
   if (missing.length !== named.length) return { hit: false, evidence: [] };
