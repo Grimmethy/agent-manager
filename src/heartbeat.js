@@ -22,6 +22,7 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
   fs.mkdirSync(instancesDir, { recursive: true });
   const now = new Date().toISOString();
   let stateSince = now;
+  let daemonPid;
   try {
     const prev = JSON.parse(fs.readFileSync(hbPath, 'utf8'));
     const prevKey = `${prev.status}|${prev.currentPass || ''}|${prev.currentTaskId || ''}`;
@@ -32,6 +33,21 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
     // to whatever the file already recorded so a mid-task heartbeat write never blanks
     // out the worker's own uptime display.
     if (!startedAt && prev.startedAt) startedAt = prev.startedAt;
+    // daemonPid (2026-09-07, Grimmethy: "the p40 has 2 tasks running on it and the gtx
+    // is idle" -- root-caused live to a DIFFERENT, deeper bug than the P40 routing one:
+    // this `pid` field is overwritten with THIS NODE CHILD's own process.pid every time
+    // a real call is in flight, clobbering whatever the parent bash daemon last recorded
+    // there (agent-manager-common.sh's write_heartbeat_file, using its own stable $$).
+    // check_instance_liveness's "is this instance already claimed" guard reads that same
+    // `pid` field -- so the moment a child exits (task done) and the daemon hasn't yet
+    // looped back to write a fresh "idle" heartbeat, the file shows a now-dead child pid,
+    // and the guard wrongly concludes the instance is unclaimed. Confirmed live: every
+    // worker-* lane had TWO concurrent local-worker.sh processes running simultaneously.
+    // daemonPid is a SEPARATE field only the bash wrapper ever sets -- this function
+    // (only ever called from a spawned child, never the daemon itself) must carry
+    // forward whatever value is already on disk rather than setting its own, so the
+    // child's own pid never leaks into the field the liveness guard actually trusts.
+    if (prev.daemonPid != null) daemonPid = prev.daemonPid;
   } catch (e) {
     // missing/corrupt heartbeat file -- fresh state, nothing to preserve.
   }
@@ -41,6 +57,7 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
     lastHeartbeat: now, stateSince,
   };
   if (startedAt) hb.startedAt = startedAt;
+  if (daemonPid != null) hb.daemonPid = daemonPid;
   fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
 }
 
