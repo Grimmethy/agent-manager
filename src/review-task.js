@@ -154,19 +154,39 @@ function isEffectivelyEmpty(trimmed) {
 function verifyDeterministicScriptExtractDraft(task, repoRoot) {
   const ctx = task.promptContext;
   if (!(ctx && ctx.deterministicApply === 'script-extract')) return null;
+  // 2026-09-07, Grimmethy ("review blocked the decompose task again, forensic analysis
+  // mode"), root-caused live: promptContext.deterministicApply describes TASK-level
+  // ELIGIBILITY (set once, persists across every future attempt) -- it does NOT mean
+  // THIS specific draft attempt actually went through local-draft.js's
+  // tryDeterministicScriptExtractEdit short-circuit. That short-circuit already falls
+  // through to the normal agentic drafting path (returns null, advisory-only) whenever
+  // its own re-derivation drifts from current repo state -- confirmed exactly this
+  // happened for the real stuck task: its history shows "implement-started ... adhoc:
+  // local-agentic-write (multi-turn edit/write/run_bash...)" (the NORMAL agentic path,
+  // producing a 108,459-char transcript), yet this gate still ran the byte-exact
+  // Group-B JSON check against it and hard-rejected with "implementResponse is not
+  // valid JSON" -- rejecting a genuine agentic draft purely because it was never
+  // SUPPOSED to be JSON in the first place, with zero real review of its actual content.
+  // A shape mismatch here means ONLY "this draft did not take the deterministic path" --
+  // return null (this gate does not apply) so it falls through to the NORMAL review
+  // path below, which can fact-check/vote on it like any other agentic draft, same
+  // "advisory-only, never trust a stale assumption" discipline the draft side of this
+  // exact feature already uses. Once the shape IS confirmed to genuinely be Group-B
+  // JSON, a CONTENT mismatch (checked further below) is a different, more specific
+  // signal -- that stays a hard reject, unchanged.
   let parsed;
   try { parsed = JSON.parse(task.implementResponse); } catch {
-    return { ok: false, reason: 'implementResponse is not valid JSON' };
+    return null;
   }
   if (!Array.isArray(parsed) || parsed.length !== 2) {
-    return { ok: false, reason: `expected exactly 2 Group-B changes (create + edit), got ${Array.isArray(parsed) ? parsed.length : typeof parsed}` };
+    return null;
   }
   const [createChange, editChange] = parsed;
   if (!(createChange && createChange.mode === 'create' && createChange.file === ctx.newFile)) {
-    return { ok: false, reason: `first change must be {mode:"create", file:"${ctx.newFile}"}` };
+    return null;
   }
   if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) {
-    return { ok: false, reason: `second change must be {mode:"edit", file:"${ctx.sourceFile}"}` };
+    return null;
   }
   let html;
   try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
