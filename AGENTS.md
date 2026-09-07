@@ -50,6 +50,72 @@ than making arbitrary [numbers]"*. Treat this as a standing preference, not a on
   evidence itself as something worth closing (usually via the logging point above), not
   just something to route around this one time.
 
+## Third principle: "ghost in the machine" — a model call is a last resort, not a default
+
+Named and tracked as its own concept row (`concepts.json`, `concept-ghost-in-the-machine-0dbeea`
+— read it with `require('./src/concepts.js').getConceptTimeline(pipelineDir, 'concept-ghost-in-the-machine-0dbeea', ...)`
+before extending this pattern, it has the fuller incident history). The distinction that
+matters:
+
+- A **ghost-in-the-machine fix** makes the model more likely to behave correctly (a better
+  instruction, a pointer to a tool, a stronger warning) without removing it from the step.
+  It still trusts a stochastic process to reliably do, every time, something that could
+  instead be done with 100% certainty by code.
+- A **systematic fix** removes the model from the step entirely wherever the step is
+  actually deterministic, leaving it only the genuinely judgment-requiring residue (if
+  any).
+
+**When authoring a task shape, a prompt, or a plan/implement pass, ask first: is the thing
+I'm about to ask the model to do actually mechanical?** A "move these named symbols
+verbatim," "apply this exact rename," "run this fixed validation command" step is not a
+judgment call — writing a prompt asking the model to plan or narrate it is optimizing the
+wrong half of the problem. Concrete precedent for both the win and the trap:
+
+- `local-draft.js`'s `tryDeterministicScriptExtractEdit` + `script-extract.js`'s real
+  V8-parser oracle skip the plan/implement passes ENTIRELY (zero model calls, byte-exact,
+  machine-verified) for a file-decompose script-extract move once its symbols resolve
+  unambiguously — `review-task.js` has a matching deterministic auto-approve gate so the
+  saving isn't undone at review either. Before this landed, the exact same task shape
+  reliably burned full LLM plan+implement attempts hand-rolling a worse version of a check
+  that already existed (`scripts/extract-core-ui.js`) — confirmed live: 11 of 26 symbols
+  in one such move got misreported "not found" by the model's own scanner when every one
+  resolved cleanly via the real tool.
+- **A deterministic-eligibility check must be a standing mechanism, not a one-time
+  stamp.** `file-decompose-to-hub.js`'s `validatePlan()` only computes eligibility ONCE,
+  when a hub's children are first materialized. A child minted before its symbols happened
+  to resolve cleanly never got a second chance — confirmed live 2026-09-07: a stuck move
+  task blocked "Plan pass degenerate: truncated" across 6 draft cycles / ~3 hours even
+  though its own symbols resolved cleanly the whole time, simply because nothing ever
+  re-checked. `decompose-move-determinism-backfill.js` (a watchdog sweep, same cadence as
+  `file-decompose-to-hub.js`'s own sweep in `queue-watcher.sh`) is the fix, and the pattern
+  generalizes: **when you add a deterministic-eligibility flag, also ask what re-evaluates
+  it for a task that already exists** — a sibling task landing, a file edited by hand, or a
+  tool getting fixed can all flip eligibility after creation, and a check that only ever
+  runs once silently stops protecting anything the moment the world changes.
+- For the residue that genuinely isn't deterministic-eligible (yet, or ever — a
+  flask-blueprint/.py move, an ambiguous symbol), don't leave the model's prompt asking it
+  to re-derive work the request already fully specifies. `prompts.js`'s
+  `decomposeMoveDirective` (and the sibling `brainDumpDirective` just above it) is the
+  pattern: tell the model explicitly "the request already IS the plan, don't re-list a
+  step per item" rather than silently hoping a generic "write a numbered PLAN" instruction
+  doesn't provoke a runaway, unbounded re-enumeration. This is itself still only a
+  ghost-in-the-machine mitigation, not a systematic fix — reach for it only for the
+  residue a real deterministic check has already ruled out, never as a substitute for
+  building that check.
+- Other real deterministic short-circuits already in this codebase, worth checking before
+  writing a NEW model-driven pass for something that resembles them:
+  `runStalenessFastpath` (`local-draft.js`, re-runs a staleness rule deterministically
+  instead of asking the model to re-judge it), `staticCheckMove`/
+  `staticCheckScriptExtractMove` (`file-decompose-to-hub.js`, AST/V8-parser-verified
+  symbol resolution), `deterministic-recheck-registry.js` (the seam a plugin's own
+  scanner rules re-run through).
+
+**Retroactive audit is part of this too, not just new code.** When you land a
+ghost-in-the-machine mitigation (a prompt nudge, a closed list, a stronger warning) for a
+recurring model failure, name in the writeup whether it's actually masking an underlying
+deterministic step — if it is, that's a `writeSideFindingInbox()` entry tagged
+`conceptId: 'concept-ghost-in-the-machine-0dbeea'`, not a closed loop.
+
 ## Concept research: give a named topic the same treatment, tag it as it flows through
 
 Twice this session (2026-09-06), a narrow topic (chat-context-trimming, then
