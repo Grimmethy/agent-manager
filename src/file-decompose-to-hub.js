@@ -95,6 +95,32 @@ function staticCheckMove(repoRoot, sourceFile, symbols) {
   }
 }
 
+// Same idea as staticCheckMove above, for a script-extract move: does every named symbol
+// resolve to a real, unambiguous top-level function in the source template's inline
+// <script> block, via script-extract.js's real V8-parser oracle (the same logic
+// scripts/extract-core-ui.js already uses)? Returns null when it can't check (non-.html
+// source, missing file) -- advisory-only, same convention as the .py path.
+//
+// 2026-09-07 ("Ghost in the Machine" concept): this is what lets a script-extract move
+// get caught HERE, at plan-validation time, instead of after a wasted multi-tier LLM
+// drafting attempt -- real incident: 11 of 26 symbols in the tasks-and-branches.js move
+// were reported "not found" by a model's own hand-rolled scanner, when in fact every one
+// of the 26 resolves cleanly via this exact check (confirmed live re-running it against
+// the real file). A hard problem here blocks the whole plan for a human to fix the
+// symbol list, exactly like the .py path's own "not defined at module scope" hard-stop.
+function staticCheckScriptExtractMove(repoRoot, sourceFile, symbols) {
+  if (!/\.html$/.test(sourceFile)) return null;
+  const abs = path.join(repoRoot, sourceFile);
+  if (!fs.existsSync(abs)) return null;
+  let html;
+  try { html = fs.readFileSync(abs, 'utf8'); } catch { return null; }
+  const { locateFunctions } = require('./script-extract.js');
+  const located = locateFunctions(html, symbols);
+  if (located.error) return { ok: false, missing: symbols, resolvable: false };
+  const missing = located.results.filter((r) => r.status !== 'OK').map((r) => `${r.name} (${r.status})`);
+  return { ok: missing.length === 0, missing, resolvable: true };
+}
+
 // { ok, hardProblems:[str], moveMeta:[{ sharedDeps:[], neededImports:[] }] }
 // hardProblems block the whole plan (hub filed blocked, no children). Shared deps do not
 // block -- they are threaded into the move + wiring prompts.
@@ -109,6 +135,20 @@ function validatePlan(repoRoot, request) {
     const meta = { sharedDeps: [], neededImports: [] };
     if (symbols.length === 0) {
       hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(`${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`);
+        } else {
+          // Every symbol resolves cleanly -- this move can skip the model entirely at
+          // apply time (see local-draft.js's tryDeterministicScriptExtractEdit).
+          meta.deterministicApplyOk = true;
+        }
+      }
       moveMeta.push(meta);
       continue;
     }
@@ -288,6 +328,12 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   moves.forEach((move, i) => {
     const id = `adhoc-decompose-${planSlug}-${String(i + 1).padStart(2, '0')}-${slugify(path.basename(move.newFile))}`.slice(0, 120);
     moveIds.push(id);
+    // Deterministic apply (2026-09-07, "Ghost in the Machine" concept): a script-extract
+    // move validatePlan() already confirmed resolves every symbol cleanly skips the model
+    // entirely at draft time -- see local-draft.js's tryDeterministicScriptExtractEdit.
+    // symbols/sourceFile are stashed here (not just baked into the prose rawText) so that
+    // check has real structured data to act on without re-parsing English.
+    const deterministic = move.kind === 'script-extract' && validation.moveMeta[i] && validation.moveMeta[i].deterministicApplyOk;
     const record = {
       id,
       domain: 'adhoc',
@@ -299,6 +345,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
         decomposedFrom: `file-decompose-hub-${planSlug}`,
         moveIndex: i,
         newFile: move.newFile,
+        ...(deterministic ? { deterministicApply: 'script-extract', sourceFile: request.sourceFile, symbols: move.symbols } : {}),
       },
     };
     if (stacked) {
@@ -397,7 +444,7 @@ function sweep({ pipelineDir, repoRoot, force = false, now = Date.now() } = {}) 
   return summary;
 }
 
-module.exports = { sweep, moveRawText, wiringRawText, validatePlan, staticCheckMove };
+module.exports = { sweep, moveRawText, wiringRawText, validatePlan, staticCheckMove, staticCheckScriptExtractMove };
 
 if (require.main === module) {
   const force = process.argv.includes('--force');
