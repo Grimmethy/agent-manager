@@ -54,9 +54,35 @@ const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId ag
 // reference's $RESTART_MAP is -- this deployment only ever creates a small, fixed set of
 // instances, so there's no real "any worker-N" generality to preserve beyond the one
 // literal worker-1 already handles via the worker- prefix check below.
+// worker-p40 / worker-reasoning-p40 (2026-09-07, Grimmethy: "the p40 has 2 tasks running
+// on it and the gtx is idle" -- root-caused live): launch.sh's own start_bg() calls for
+// these two instances wrap them in `env OLLAMA_URL="$AGENT_MANAGER_P40_OLLAMA_URL"
+// LOCAL_MODEL="$AGENT_MANAGER_P40_MODEL" AGENT_MANAGER_GPU_YIELD_APPS=` (see its own
+// comment on why -- routes this ONE lane's Ollama traffic to the passthrough VM's own
+// Ollama instance instead of the host's), but this function -- the ONLY other place a
+// worker-p40*/worker-reasoning-p40 process ever gets spawned, via queue-watcher.sh's
+// dead-process-check restart path -- never carried that env at all. Confirmed live: two
+// real worker-p40 processes (pids 2830879, restarted by the watchdog per
+// queue-watchdog.log's own "restarted worker-p40 ... new pid 2830879" line, and a second
+// duplicate 3433178) were BOTH running with LOCAL_MODEL=qwen3.8:27b-q4_K_M (the HOST's
+// model, not the P40's qwen3.8-p40:27b-q4_K_M) -- silently fighting worker-1/reviewer for
+// the host GPU's single-flight lock instead of using the P40 at all, every time since
+// their last watchdog-triggered restart. Mirrors launch.sh's own gate exactly (both P40
+// env vars must be set, or this lane is skipped -- same condition launch.sh itself uses
+// to decide whether to start these lanes in the first place) so a restart can never
+// diverge from what a fresh `launch.sh` would have produced.
+function p40EnvFor(instanceId) {
+  if (instanceId !== 'worker-p40' && instanceId !== 'worker-reasoning-p40') return null;
+  const url = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const model = process.env.AGENT_MANAGER_P40_MODEL;
+  if (!url || !model) return null;
+  return { OLLAMA_URL: url, LOCAL_MODEL: model, AGENT_MANAGER_GPU_YIELD_APPS: '' };
+}
+
 function restartTargetFor(instanceId) {
   if (instanceId.startsWith('worker-')) {
-    return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid` };
+    const env = p40EnvFor(instanceId);
+    return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid`, ...(env ? { env } : {}) };
   }
   if (instanceId === 'reviewer') {
     return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };
@@ -153,6 +179,7 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
         script: target.script,
         args: target.args,
         pidfileName: target.pidfileName,
+        ...(target.env ? { env: target.env } : {}),
       });
       cooldowns[hb.instanceId] = now;
       cooldownsChanged = true;
