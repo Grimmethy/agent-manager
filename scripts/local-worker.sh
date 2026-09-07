@@ -628,6 +628,24 @@ while :; do                                                                     
   # own "orphaned claim: recovered automatically at the next worker startup" behavior,
   # except run every tick (not just at startup) so it also self-heals from an interrupted
   # draft call without a full process restart being needed.
+  #
+  # Oldest-mtime-first (2026-09-07, Grimmethy: "the decompose job... dig in and fix the
+  # systemic issue" -- root-caused live): this loop used to list the directory with a
+  # plain `ls -1` (alphabetical) and `break` out of the WHOLE resume pass the moment any
+  # ONE item hit an infra-shaped failure (the very next lines below) -- fine for pacing
+  # within a single tick, but alphabetical order is a stable ranking that has nothing to
+  # do with arrival time. Confirmed live: worker-reasoning-p40's own drafting/ folder had
+  # 7 genuinely stuck leftover items spanning 08:50-13:52 -- the OLDEST (08:50) had a
+  # single failed attempt and hadn't been touched since, while the NEWEST arrival (13:52,
+  # whose name happened to sort alphabetically first) was the one getting retried every
+  # single tick. Any freshly-claimed leftover with an alphabetically-earlier name
+  # permanently cuts the line ahead of a much older item still waiting its bounded-retry
+  # turn -- a real starvation bug, not just an ordering nicety: the older item's
+  # DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT bookkeeping can never advance
+  # (and therefore can never resolve to blocked/requeued/succeeded and free itself) if it
+  # never gets a turn at all. `ls -1tr` (mtime, reversed -> oldest first) matches this
+  # pipeline's own existing "oldest-first" fairness convention (pending/'s own mtime-sort
+  # claim ranking, next-claimable-task.js) instead of an accidental alphabetical ordering.
   drafting_instance_dir="${QUEUE_DIR}/drafting/${INSTANCE_ID}"
   if [[ -d "$drafting_instance_dir" ]]; then
     while IFS= read -r name; do
@@ -651,7 +669,7 @@ while :; do                                                                     
         printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of resuming more leftover items\n' "$INSTANCE_ID" >&2
         break
       fi
-    done < <(ls -1 "$drafting_instance_dir" 2>/dev/null)
+    done < <(ls -1tr "$drafting_instance_dir" 2>/dev/null)
   fi
 
   # Read pending/ directory listing for work items to claim, PRIORITY-SORTED (fix,
