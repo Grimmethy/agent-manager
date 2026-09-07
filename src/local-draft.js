@@ -1890,6 +1890,18 @@ async function main() {
     return;
   }
 
+  // Defense-in-depth (2026-09-07): scripts/local-worker.sh's own claim step already
+  // deletes pinnedWorker the moment it `mv`s a task out of pending/ (a one-shot operator
+  // assignment shouldn't keep re-attracting the same task to the same lane on some later
+  // ordinary requeue -- see that script's own comment). That happens in a separate bash+
+  // node subprocess before this process even starts, so it can't be un-done here -- but
+  // stripping it again from THIS process's own in-memory copy costs nothing and closes
+  // off any path (a resumed leftover-drafting item that skipped the claim step, a future
+  // code path that reads the task some other way) where a stale pin could survive into
+  // whatever writeTaskJson persists next, instead of being a live guess about which path
+  // missed it.
+  if (task.pinnedWorker) delete task.pinnedWorker;
+
   // Flush every Pipeline-History checkpoint to disk the moment it's recorded, so a long
   // draft's progress (draft-started, plan-done, harness-search, implement-done, ...) shows
   // up in the dashboard while the draft is still running -- and survives the worker being
@@ -1899,7 +1911,30 @@ async function main() {
     try { writeTaskJson(taskPath, task); } catch (_) { /* best-effort */ }
   });
 
-  const result = await draftTask(task);
+  // 2026-09-07 (Grimmethy, live-testing the Workers-tab assign-task override: "kicking
+  // out the old task but not loading in the task I selected"): root-caused via
+  // local-worker-<instance>.log -- draftTask() CAN throw uncaught (confirmed live:
+  // "Error: gpu-arbiter: cancelled while waiting", "'draft' ticket ... timed out waiting
+  // to reach the head of the queue", both real outcomes of chat-preempt's/assign-task's
+  // own cancel/kill mechanisms doing exactly what they're supposed to do to a lower-
+  // priority in-flight call). Before this fix, an uncaught rejection here meant `main()`
+  // died before EVER reaching the process.stdout.write below -- local-worker.sh's
+  // `draft_result="$(node local-draft.js ...)"` captured empty stdout, and its own
+  // visible "draft call failed for X: %s" log line printed that empty string, hiding the
+  // real reason in a different log file (LOG_FILE, this call's stderr) an operator would
+  // have to already know to go look at. Catching it here and returning the same
+  // {succeeded:false, reason} shape the two parse-error branches above already use means
+  // the real reason always reaches BOTH the visible per-tick log line and (via
+  // local-worker.sh's normal draft_succeeded===false handling) the task's own retry/
+  // infra-requeue bookkeeping, instead of a crash bypassing that entirely.
+  let result;
+  try {
+    result = await draftTask(task);
+  } catch (e) {
+    result = { succeeded: false, reason: `draftTask threw: ${e && e.message ? e.message : e}` };
+    process.stdout.write(JSON.stringify(result));
+    return;
+  }
   // Persist whatever pass results/status landed on the task, even when blocked -- so the
   // caller can move the file and the blocked reason travels with it.
   if (result.succeeded) {
