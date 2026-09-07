@@ -234,6 +234,7 @@ async function setWorkerTask(instanceId, taskId, taskTitle, sourceLane) {
   // this point and leaves the drill-down as-is, so re-picking another task of the
   // same type doesn't require re-choosing the type too).
   delete selectedWorkerTaskType[instanceId];
+  pendingWorkerAssign[instanceId] = taskId;
   await renderWorkers();
 }
 
@@ -259,7 +260,26 @@ function renderRecentTasksList(tasks) {
     </li>`).join('')}</ul>`;
 }
 
-async function renderWorkers() {
+// isPoll (2026-09-07, Grimmethy: "please fix the dropdown reset on poll thing, that
+// is extraordinarily irritating and has bit me several times"): the 5s refresh()
+// cycle (index.html's renderMain(), 'workers' branch) used to call this unconditionally,
+// and every call does a full main.innerHTML replace of all worker cards -- including
+// every <select> element. Replacing a <select> DOM node while its native dropdown
+// popup is open (or while it simply has focus mid-choice) yanks the control out from
+// under the operator, closing the popup / resetting the visible selection, even though
+// selectedWorkerTaskType itself was never actually cleared. Every INTERACTION-driven
+// call site (type-select onchange, task-select onchange via setWorkerTask, expand
+// toggle, filter click, model-select onchange) calls this directly and must still run
+// so the UI reflects what the operator just did -- only the poll-driven call (isPoll
+// === true) is skipped, and only when focus is currently inside one of this tab's own
+// selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
+async function renderWorkers(isPoll) {
+  if (isPoll) {
+    const active = document.activeElement;
+    if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
+      return;
+    }
+  }
   const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
@@ -297,6 +317,18 @@ async function renderWorkers() {
   const fetchedAt = Date.now();
   instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
   instancesForTimers = instances;
+  // Clear the optimistic pending-assign marker the moment real data confirms it --
+  // either the pin took (currentTaskId now matches) or the operator/pipeline moved on
+  // to something else for this instance since (a stale marker pointing at a taskId this
+  // instance is no longer even working toward would be actively misleading, worse than
+  // no marker at all).
+  instances.forEach((inst) => {
+    // Any real currentTaskId -- matching the pin (success) or not (moved on to
+    // something else meanwhile) -- means the "waiting to pick this up" state is over.
+    if (pendingWorkerAssign[inst.instanceId] && inst.currentTaskId) {
+      delete pendingWorkerAssign[inst.instanceId];
+    }
+  });
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
       <div>
@@ -349,11 +381,21 @@ async function renderWorkers() {
           });
           const sourceKeys = Object.keys(bySource).sort();
           const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+          // Keep the previously-picked type visible even if its bucket happens to be
+          // empty on THIS particular poll (its last task just got claimed elsewhere, or
+          // this instance's own assignable-tasks fetch above hit its catch and fell back
+          // to [] for one cycle) -- 2026-09-07, same complaint as isPoll above: a
+          // transient empty bucket used to collapse the whole drill-down back to the
+          // type-only picker, which looked identical to "your selection got reset" even
+          // though selectedWorkerTaskType was never actually cleared.
+          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+          sourceKeys.sort();
           const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
             <option value="">(assign a task…)</option>
-            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${bySource[k].length})</option>`).join('')}
+            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
           </select>`;
-          if (!selectedType || !bySource[selectedType]) return typeSelect;
+          if (!selectedType) return typeSelect;
+          const tasksOfSelectedType = bySource[selectedType] || [];
           // A native <select> sizes itself to its widest <option> text -- an untruncated
           // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
           // pushed this whole control off the right edge of the worker card (2026-09-07,
@@ -379,8 +421,8 @@ async function renderWorkers() {
             return truncateLabel(full);
           };
           const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
-            <option value="">(choose a ${escapeHtml(selectedType)} task…)</option>
-            ${bySource[selectedType].map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+            <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+            ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
           </select>`;
           return typeSelect + taskSelect;
         })() : ''}
@@ -393,6 +435,7 @@ async function renderWorkers() {
       <div class="meta">
         pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
         ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
+        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
       ${expandedWorkerId === inst.instanceId ? `
