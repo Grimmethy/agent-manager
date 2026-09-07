@@ -467,9 +467,69 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   return { succeeded: true, blocked: false, ...meta };
 }
 
+const PRIOR_INVESTIGATION_RESPONSE_CAP = 1500;
+
+// Build a compact "here is what a read-only investigation already found" map from a
+// multi-turn read-only pass's transcript, for forwarding into a later write-capable
+// prompt. Moved here 2026-09-06 from the deleted local-agentic-draft.js (adhoc's own
+// tier-2 read-only pass) when that tier was removed from the adhoc ladder (see
+// local-draft.js's draftAdhocBranch header for why) -- orient-pass.js's own read-only
+// investigation (component 3, unrelated to the adhoc tier ladder) still needs this, so
+// it moved to this shared module instead of being deleted with its original caller.
+// Deliberately does NOT use draft-attempt-record.js's summariseToolCalls() -- that strips
+// every arg VALUE (paths, queries), which is exactly what the downstream write prompt
+// needs here. Returns '' when there is nothing worth carrying.
+function summariseInvestigation(responseText, toolCallLog) {
+  const log = Array.isArray(toolCallLog) ? toolCallLog : [];
+  const trimmed = (responseText || '').trim();
+  if (log.length === 0 && trimmed.length < 200) return '';
+
+  const filesRead = [];
+  const grepsWithHits = [];
+  const grepsEmpty = [];
+  const toolErrors = [];
+  for (const entry of log) {
+    if (!entry || !entry.tool) continue;
+    const args = entry.args || {};
+    const res = entry.result;
+    const errored = !!(res && typeof res === 'object' && res.error);
+    if (entry.tool === 'read_file') {
+      const p = args.path || (res && res.path);
+      if (!p) continue;
+      if (errored) toolErrors.push(`read_file ${p}: ${String(res.error).slice(0, 120)}`);
+      else if (!filesRead.includes(p)) filesRead.push(p);
+    } else if (entry.tool === 'grep_codebase') {
+      const q = args.query != null ? String(args.query) : '';
+      const label = `"${q}"${args.dir ? ` in ${args.dir}` : ''}`;
+      const hits = Array.isArray(res) ? res.length : 0;
+      if (hits > 0) {
+        if (!grepsWithHits.some((g) => g.startsWith(label))) grepsWithHits.push(`${label} -> ${hits} hit(s)`);
+      } else if (!errored && !grepsEmpty.includes(label)) {
+        grepsEmpty.push(label);
+      }
+    }
+  }
+
+  const lines = [];
+  if (trimmed) {
+    lines.push('What the read-only pass concluded (it did NOT reach a RESOLUTION):');
+    lines.push(trimmed.length > PRIOR_INVESTIGATION_RESPONSE_CAP
+      ? `${trimmed.slice(0, PRIOR_INVESTIGATION_RESPONSE_CAP)}\n...[truncated]`
+      : trimmed);
+    lines.push('');
+  }
+  if (filesRead.length) lines.push(`Files already read: ${filesRead.join(', ')}`);
+  if (grepsWithHits.length) lines.push(`Searches that found something: ${grepsWithHits.join('; ')}`);
+  if (grepsEmpty.length) lines.push(`Searches that returned NOTHING (do not repeat these): ${grepsEmpty.join('; ')}`);
+  if (toolErrors.length) lines.push(`Tool errors it hit: ${toolErrors.join('; ')}`);
+
+  return lines.join('\n').trim();
+}
+
 module.exports = {
   GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock,
   RESOLUTION_RE, parseSubTaskProposals, parseClarificationOptions,
   agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree,
   runAgenticDraftInWorktree, resolveAgenticDraft,
+  summariseInvestigation,
 };
