@@ -139,6 +139,53 @@ function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
 
+// Deterministic review gate for a script-extract decompose move (see local-draft.js's
+// tryDeterministicScriptExtractEdit). Real incident, 2026-09-07: the implement pass
+// already re-verifies every symbol via a real V8-parser oracle before constructing the
+// diff -- there is no judgment call left for a model to make -- but the diff itself can
+// be far too large for the review model's own context window to hold at all. Confirmed
+// live: a real 26-symbol move produced a 600,794-char implementResponse (~200K tokens)
+// against this pipeline's 16,384-token PINNED_NUM_CTX -- the reviewer never actually saw
+// the real content and hallucinated "the draft is empty, no IMPLEMENT diff." Re-deriving
+// the expected extraction fresh from CURRENT repo state and requiring an exact byte
+// match is a strictly STRONGER guarantee than an LLM skim of a diff it can't even fit in
+// context -- same "don't ask a model to verify what code can verify with certainty"
+// principle as this pipeline's other deterministic gates just above/below this one.
+function verifyDeterministicScriptExtractDraft(task, repoRoot) {
+  const ctx = task.promptContext;
+  if (!(ctx && ctx.deterministicApply === 'script-extract')) return null;
+  let parsed;
+  try { parsed = JSON.parse(task.implementResponse); } catch {
+    return { ok: false, reason: 'implementResponse is not valid JSON' };
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 2) {
+    return { ok: false, reason: `expected exactly 2 Group-B changes (create + edit), got ${Array.isArray(parsed) ? parsed.length : typeof parsed}` };
+  }
+  const [createChange, editChange] = parsed;
+  if (!(createChange && createChange.mode === 'create' && createChange.file === ctx.newFile)) {
+    return { ok: false, reason: `first change must be {mode:"create", file:"${ctx.newFile}"}` };
+  }
+  if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) {
+    return { ok: false, reason: `second change must be {mode:"edit", file:"${ctx.sourceFile}"}` };
+  }
+  let html;
+  try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
+    return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+  }
+  const { buildExtraction } = require('./script-extract.js');
+  const fresh = buildExtraction(html, ctx.symbols);
+  if (!fresh.ok) {
+    return { ok: false, reason: `symbols no longer resolve against current repo state: ${fresh.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}` };
+  }
+  if (createChange.content !== fresh.newFileContent) {
+    return { ok: false, reason: 'create content does not byte-match a fresh re-derivation of the same extraction' };
+  }
+  if (editChange.find !== html || editChange.replace !== fresh.newHtml) {
+    return { ok: false, reason: 'edit find/replace does not byte-match a fresh re-derivation of the same extraction' };
+  }
+  return { ok: true };
+}
+
 const NON_IMPL_PATTERNS = [
   /"mode"\s*:\s*"read"/,
   /^(let me|i need to|i will|i'll|i am going to|i'm going to)\s+(read|check|look at|search|verify|examine|understand)\b/i,
@@ -456,6 +503,23 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck);
+  if (scriptExtractVerdict) {
+    if (scriptExtractVerdict.ok) {
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-script-extract-approve';
+      task.localVerdict = 'Auto-approved: this diff is a re-derivable, byte-exact extraction (script-extract.js\'s V8-parser oracle) -- no local-model review call spent (the diff is also far too large to fit in the review model\'s own context window, which is why this gate exists rather than an LLM skim).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', 'deterministic-script-extract-approve');
+      return { succeeded: true, verdict: 'approved', factCheckVerdict };
+    }
+    const reason = `Deterministic gate: this script-extract move's diff no longer matches a fresh re-derivation from current repo state -- ${scriptExtractVerdict.reason}. No local-model review call spent (this diff is also far too large for the review model's context window regardless).`;
+    task.reviewProvider = 'deterministic-script-extract-reject';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   const trimmedImplResponse = (task.implementResponse || '').trim();
   const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
 
@@ -667,7 +731,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS };
+module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft };
 
 if (require.main === module) {
   main();
