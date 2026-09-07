@@ -489,6 +489,18 @@ let workersTypeFilter = 'all';
 // not persisted -- same glance-time-only treatment as workersTypeFilter above.
 let expandedWorkerId = null;
 
+// Which task TYPE (source) a worker's "assign a task" dropdown is currently drilled into
+// (2026-09-07 follow-up, Grimmethy after the assignable-tasks list came back non-empty:
+// "I should get a list of available task types that each shows a count of how many tasks
+// of that type are available. Then, when I click on a job type I should get the list of
+// available jobs of that category" -- a flat list of everything a worker could claim,
+// with pipeline_debrief's real backlog often dozens deep, buried the one task an operator
+// actually wanted among many of one noisy type). Keyed by instanceId; absent/'' means
+// "showing the type picker, not a task list yet." Same glance-time-only, not-persisted
+// treatment as workersTypeFilter/expandedWorkerId above -- this is a UI drill-down state,
+// not pipeline state.
+let selectedWorkerTaskType = {};
+
 // Raw instance list from the last /api/instances fetch, kept around so the 1s ticking
 // timer below can recompute stale duration client-side without re-polling every second.
 let instancesForTimers = [];
@@ -1720,11 +1732,17 @@ function renderTaskDetailModal(task) {
     link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
   if (task.needsClarification) wireClarificationPicker(task.id);
-  // "Send to Chat" button handler (declared in the modal HTML above). Dumps this task's
-  // key context (title / source / blocked reason / request brief / plan / implement
-  // response) into the System Chat panel as one user message via sendTextToChat (POST
-  // /api/chat/inject -- records the turn, no model call), then reloads the active session
-  // so the injected turn shows immediately.
+  // "Send to Chat" button handler (declared in the modal HTML above). 2026-09-07: used
+  // to dump this task's title/source/blockedReason/request/plan/implement text into the
+  // System Chat panel as one user message -- measured live at ~13k chars / a real
+  // 10,713-token first turn (65% of the local chat's 16,384-token window,
+  // instances/context-budget-audit.log), most of which the conversation often never
+  // needed. Now injects just the id + title; the model has real lookup tools
+  // (read_task/search_tasks, local-tool-client.js) to pull the rest -- summary first,
+  // then one specific section (plan/implement/history/blockedReason) only if a question
+  // actually needs it -- instead of paying for the whole blob on every single click. See
+  // concept-send-to-chat-307f1b's research for the two gaps this closes (no lookup tool
+  // existed, no search existed) and the plan behind this change.
   const taskSendToChatBtn = document.getElementById('task-send-to-chat');
   if (taskSendToChatBtn) {
     taskSendToChatBtn.onclick = async () => {
@@ -1732,11 +1750,6 @@ function renderTaskDetailModal(task) {
       try {
         const parts = [`# ${task.id}`];
         if (task.title) parts.push('title: ' + task.title);
-        if (task.source) parts.push('source: ' + task.source);
-        if (task.blockedReason) parts.push('blocked: ' + task.blockedReason);
-        if (task.promptContext && task.promptContext.requestText) parts.push('request:\n' + task.promptContext.requestText);
-        if (task.planResponse) parts.push('plan:\n' + task.planResponse);
-        if (task.implementResponse) parts.push('implement:\n' + task.implementResponse);
         await sendTextToChat(parts.join('\n\n')); // POSTs, expands the panel, re-renders; throws on !ok
         try { chatSession = await fetchJson('/api/chat/active'); chatRender(); } catch (e) { /* leave the panel as-is */ }
         showToast('Sent to chat', 'info');
