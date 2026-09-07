@@ -1186,8 +1186,16 @@ async function renderAdhocTasksTab() {
 // reasoning as Brain Dump's own per-entry lazy behaviors: cheap by default, real cost
 // only paid when a human actually wants to look.
 
+// Lifecycle (2026-09-06, Grimmethy: "I envision them as a sort of hub we can return to
+// and develop and optimize over time"): 'shelved'/'shipped' are stable, deliberate
+// terminal-for-now states (src/concepts.js's STABLE_CONCEPT_STATUSES) -- badged
+// distinctly from the growing/active statuses so the default view doesn't read a
+// deliberately-parked concept as just another open item.
+const CONCEPT_STABLE_STATUSES = new Set(['shelved', 'shipped']);
+
 function renderConceptCard(concept) {
-  const statusBadge = `<span class="badge idle">${escapeHtml(concept.status || 'open')}</span>`;
+  const isStable = CONCEPT_STABLE_STATUSES.has(concept.status);
+  const statusBadge = `<span class="badge ${isStable ? 'ok' : 'idle'}">${escapeHtml(concept.status || 'open')}</span>`;
   const researchChip = concept.researchForkCount > 0
     ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px">🔬 researched ${concept.researchForkCount}×</span>`
     : '';
@@ -1196,19 +1204,37 @@ function renderConceptCard(concept) {
   const buildChip = (scratch + adapted) > 0
     ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
     : '';
+  // linkedTaskCount (2026-09-06): a deterministic backfill match (a done task's own
+  // title/rawText literally named this concept) -- see src/concept-tally-backfill.js.
+  // Kept visually distinct from buildChip above: this is a real, verified signal (an
+  // exact phrase match), not a self-report, so it earns a plain accent tone instead of
+  // the warn-colored "unverified" styling.
+  const linkedChip = concept.linkedTaskCount > 0
+    ? `<span title="Done tasks whose own title or text named this concept by name -- a deterministic match, not self-reported" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--accent);border-radius:3px;color:var(--accent);font-size:11px">📎 ${concept.linkedTaskCount} linked task${concept.linkedTaskCount === 1 ? '' : 's'}</span>`
+    : '';
+  const shelveNote = concept.status === 'shelved'
+    ? `<div class="row meta" style="margin-top:4px"><span>⏸ Shelved: ${escapeHtml(concept.shelvedReason || '')}${concept.revisitCondition ? ` — revisit when: ${escapeHtml(concept.revisitCondition)}` : ''}</span></div>`
+    : '';
+  const lifecycleButtons = isStable
+    ? `<button class="secondary" data-reopen-concept="${escapeAttr(concept.id)}">Reopen</button>`
+    : `<button class="secondary" data-shelve-concept="${escapeAttr(concept.id)}">Shelve</button>
+       <button class="secondary" data-ship-concept="${escapeAttr(concept.id)}">Ship</button>`;
   return `
     <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
       <div class="row">
-        <span class="text"><strong>${escapeHtml(concept.name)}</strong>${researchChip}${buildChip}</span>
+        <span class="text"><strong>${escapeHtml(concept.name)}</strong>${researchChip}${buildChip}${linkedChip}</span>
         ${statusBadge}
       </div>
       <div class="row meta"><span>${escapeHtml(concept.description || '')}</span></div>
+      ${shelveNote}
       <div class="row" style="margin-top:8px">
         <span></span>
         <span>
           <button class="secondary" data-view-timeline="${escapeAttr(concept.id)}">View timeline</button>
+          ${lifecycleButtons}
         </span>
       </div>
+      <div class="concept-shelve-form" data-shelve-form-for="${escapeAttr(concept.id)}" hidden></div>
       <div class="concept-timeline" data-timeline-for="${escapeAttr(concept.id)}" hidden></div>
     </div>
   `;
@@ -1271,6 +1297,48 @@ async function renderConceptsTab() {
       } catch (e) {
         panel.innerHTML = `<div class="empty">Error loading timeline: ${e.message}</div>`;
       }
+    };
+  });
+
+  // Shelve/Reopen/Ship (2026-09-06): shelving needs a real reason (and an optional
+  // revisit condition), so it opens an inline form -- same lightweight pattern as the
+  // "+ New Concept" form above -- rather than a bare confirm(), since "why" is the whole
+  // point of the field (see src/concepts.js's shelveConcept: it refuses without one).
+  main.querySelectorAll('[data-shelve-concept]').forEach((btn) => {
+    btn.onclick = () => {
+      const id = btn.dataset.shelveConcept;
+      const form = main.querySelector(`[data-shelve-form-for="${CSS.escape(id)}"]`);
+      if (!form.hidden) { form.hidden = true; return; }
+      form.hidden = false;
+      form.innerHTML = `
+        <div class="row" style="margin-top:6px;gap:6px">
+          <input type="text" placeholder="Why are you shelving this? (required)" class="concept-shelve-reason" style="flex:1">
+          <input type="text" placeholder="Revisit when... (optional)" class="concept-shelve-revisit" style="flex:1">
+          <button data-shelve-confirm="${escapeAttr(id)}">Confirm shelve</button>
+        </div>
+      `;
+      form.querySelector('[data-shelve-confirm]').onclick = async () => {
+        const reason = form.querySelector('.concept-shelve-reason').value.trim();
+        if (!reason) return;
+        const revisitCondition = form.querySelector('.concept-shelve-revisit').value.trim() || null;
+        await fetch(`/api/concepts/${encodeURIComponent(id)}/shelve`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason, revisitCondition }),
+        });
+        renderConceptsTab();
+      };
+    };
+  });
+  main.querySelectorAll('[data-ship-concept]').forEach((btn) => {
+    btn.onclick = async () => {
+      await fetch(`/api/concepts/${encodeURIComponent(btn.dataset.shipConcept)}/ship`, { method: 'POST' });
+      renderConceptsTab();
+    };
+  });
+  main.querySelectorAll('[data-reopen-concept]').forEach((btn) => {
+    btn.onclick = async () => {
+      await fetch(`/api/concepts/${encodeURIComponent(btn.dataset.reopenConcept)}/reopen`, { method: 'POST' });
+      renderConceptsTab();
     };
   });
 }

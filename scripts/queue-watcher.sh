@@ -158,6 +158,17 @@ while :; do
     task_log_result="$(node "${PACKAGE_SRC_DIR}/task-log-reconcile.js" 2>>"${HOME_LOGS}/task-log-reconcile.log")"
     printf '[watchdog] task-log-reconcile: %s\n' "$task_log_result" >&2
 
+    # Concept build-tally backfill (2026-09-06, Grimmethy: "I envision them as a sort of
+    # hub we can return to and develop and optimize over time"): links a shipped done/
+    # task to any tracked concept whose name it mentions verbatim -- the only backfill
+    # signal deterministic enough to trust without a model judgment call. Bounded by its
+    # own wall-clock budget + a state file (queue/concept-tally-backfill-state.json) that
+    # remembers every task id already checked, the same discipline task-log-reconcile.js
+    # above needs -- see _concept_task_history_rows in app.py for the real 73s/6,077-file
+    # unbounded-scan hazard this budget exists to never repeat, even on its first run.
+    concept_backfill_result="$(node "${PACKAGE_SRC_DIR}/concept-tally-backfill.js" 2>>"${HOME_LOGS}/concept-tally-backfill.log")"
+    printf '[watchdog] concept-tally-backfill: %s\n' "$concept_backfill_result" >&2
+
     # Auto-confirm review: queue/awaiting-confirm/ is no longer a pure human gate. A held
     # task (a Group B delete batch, or a pipeline_forensics root-cause report) gets a small
     # local CONFIRM/DENY majority vote -- confident CONFIRM moves it back to approved/ for a

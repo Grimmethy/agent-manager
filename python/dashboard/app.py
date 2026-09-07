@@ -3599,6 +3599,79 @@ def api_concepts_create():
     return jsonify(concept)
 
 
+CONCEPT_STABLE_STATUSES = ("shelved", "shipped")
+
+
+def _find_concept_or_404(concepts: list, concept_id: str) -> dict:
+    concept = next((c for c in concepts if c.get("id") == concept_id), None)
+    if not concept:
+        abort(404, description=f"no concept with id {concept_id}")
+    return concept
+
+
+@app.route("/api/concepts/<concept_id>/shelve", methods=["POST"])
+def api_concepts_shelve(concept_id):
+    """Parks a concept deliberately -- mirrors src/concepts.js's shelveConcept() exactly
+    (this dashboard's concept CRUD is a parallel Python-native implementation, same as
+    api_concepts_create above, not a Node subprocess call). Requires a real reason: the
+    whole point is capturing WHY a future session shouldn't have to re-derive the same
+    judgment call from scratch (2026-09-06, real incident: Task Atomization was scoped
+    as "a job for a whole day of work" and shelved for exactly that reason, with no way
+    to record it before this)."""
+    body = request.get_json(silent=True) or {}
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        abort(400, description="reason is required")
+    revisit_condition = (body.get("revisitCondition") or "").strip() or None
+
+    concepts = read_concepts()
+    concept = _find_concept_or_404(concepts, concept_id)
+    if concept.get("status") in CONCEPT_STABLE_STATUSES:
+        abort(409, description=f"concept is already {concept.get('status')} -- reopen it first")
+
+    concept["statusBeforeShelve"] = concept.get("status")
+    concept["status"] = "shelved"
+    concept["shelvedAt"] = datetime.now(timezone.utc).isoformat()
+    concept["shelvedReason"] = reason
+    concept["revisitCondition"] = revisit_condition
+    write_concepts(concepts)
+    return jsonify(concept)
+
+
+@app.route("/api/concepts/<concept_id>/reopen", methods=["POST"])
+def api_concepts_reopen(concept_id):
+    """The only way out of 'shelved' (or 'shipped', for the rare "actually, more to do
+    here" case) -- restores whatever status the concept held right before it was
+    shelved, defaulting to 'researched' for a shipped concept reopened with no prior
+    shelve on record. Mirrors src/concepts.js's reopenConcept()."""
+    concepts = read_concepts()
+    concept = _find_concept_or_404(concepts, concept_id)
+    if concept.get("status") not in CONCEPT_STABLE_STATUSES:
+        abort(409, description="concept is not shelved or shipped")
+
+    concept["status"] = concept.pop("statusBeforeShelve", None) or "researched"
+    concept.pop("shelvedAt", None)
+    concept.pop("shelvedReason", None)
+    concept.pop("revisitCondition", None)
+    write_concepts(concepts)
+    return jsonify(concept)
+
+
+@app.route("/api/concepts/<concept_id>/ship", methods=["POST"])
+def api_concepts_ship(concept_id):
+    """The concept's work is genuinely done, not just "some work happened" (which
+    'in-progress' already means) -- mirrors src/concepts.js's shipConcept()."""
+    concepts = read_concepts()
+    concept = _find_concept_or_404(concepts, concept_id)
+    if concept.get("status") in CONCEPT_STABLE_STATUSES:
+        abort(409, description=f"concept is already {concept.get('status')}")
+
+    concept["status"] = "shipped"
+    concept["shippedAt"] = datetime.now(timezone.utc).isoformat()
+    write_concepts(concepts)
+    return jsonify(concept)
+
+
 CONCEPT_TASK_SCAN_BUDGET_SECONDS = 1.5
 
 

@@ -117,6 +117,77 @@ class ConceptsRoutesTest(unittest.TestCase):
         self.assertEqual(data["rows"][0]["kind"], "task")
         self.assertEqual(data["rows"][0]["summary"], "Implement thing")
 
+    # --- Lifecycle: shelve/reopen/ship (2026-09-06) ---------------------------------
+    # Real registry data confirmed 14 of 16 concepts were stuck at 'researched' forever
+    # with no way to distinguish "deliberately parked" from "forgotten." Mirrors
+    # src/concepts.js's shelveConcept/reopenConcept/shipConcept exactly.
+
+    def test_shelve_requires_a_reason(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "researched"}])
+        resp = self.client.post("/api/concepts/concept-x/shelve", json={})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_shelve_stashes_prior_status_and_stamps_reason(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "researched"}])
+        resp = self.client.post("/api/concepts/concept-x/shelve", json={
+            "reason": "a day of work, backlog takes priority",
+            "revisitCondition": "reasoning-bench gives a real P40 number",
+        })
+        self.assertEqual(resp.status_code, 200)
+        concept = resp.get_json()
+        self.assertEqual(concept["status"], "shelved")
+        self.assertEqual(concept["statusBeforeShelve"], "researched")
+        self.assertEqual(concept["shelvedReason"], "a day of work, backlog takes priority")
+        self.assertEqual(concept["revisitCondition"], "reasoning-bench gives a real P40 number")
+        self.assertIn("shelvedAt", concept)
+
+    def test_shelve_refuses_an_already_shelved_or_shipped_concept(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "shipped"}])
+        resp = self.client.post("/api/concepts/concept-x/shelve", json={"reason": "x"})
+        self.assertEqual(resp.status_code, 409)
+
+    def test_shelve_404s_for_an_unknown_concept(self):
+        resp = self.client.post("/api/concepts/concept-does-not-exist/shelve", json={"reason": "x"})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_reopen_restores_prior_status_and_clears_shelve_fields(self):
+        self._write_concepts([{
+            "id": "concept-x", "slug": "x", "name": "X", "status": "shelved",
+            "statusBeforeShelve": "in-progress", "shelvedAt": "2026-09-06T00:00:00Z",
+            "shelvedReason": "paused", "revisitCondition": "later",
+        }])
+        resp = self.client.post("/api/concepts/concept-x/reopen")
+        self.assertEqual(resp.status_code, 200)
+        concept = resp.get_json()
+        self.assertEqual(concept["status"], "in-progress")
+        self.assertNotIn("statusBeforeShelve", concept)
+        self.assertNotIn("shelvedAt", concept)
+        self.assertNotIn("shelvedReason", concept)
+        self.assertNotIn("revisitCondition", concept)
+
+    def test_reopen_a_shipped_concept_with_no_prior_shelve_defaults_to_researched(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "shipped"}])
+        resp = self.client.post("/api/concepts/concept-x/reopen")
+        self.assertEqual(resp.get_json()["status"], "researched")
+
+    def test_reopen_refuses_a_concept_that_is_not_shelved_or_shipped(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "researched"}])
+        resp = self.client.post("/api/concepts/concept-x/reopen")
+        self.assertEqual(resp.status_code, 409)
+
+    def test_ship_sets_status_and_stamps_shippedAt(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "in-progress"}])
+        resp = self.client.post("/api/concepts/concept-x/ship")
+        self.assertEqual(resp.status_code, 200)
+        concept = resp.get_json()
+        self.assertEqual(concept["status"], "shipped")
+        self.assertIn("shippedAt", concept)
+
+    def test_ship_refuses_an_already_shelved_or_shipped_concept(self):
+        self._write_concepts([{"id": "concept-x", "slug": "x", "name": "X", "status": "shelved"}])
+        resp = self.client.post("/api/concepts/concept-x/ship")
+        self.assertEqual(resp.status_code, 409)
+
     def test_timeline_truncates_the_slow_scan_under_a_hard_time_budget_and_flags_it(self):
         # Regression test for the real 73s live incident (2026-09-06): an unbounded
         # glob over a large done/ directory must never hang the request. Forces the
