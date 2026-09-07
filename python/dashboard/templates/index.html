@@ -1598,7 +1598,20 @@ function renderTaskDetailModal(task) {
   // so a follow-up can be had about it. Button sits in the modal's top action area, same
   // .secondary style as Discuss/Edit/Delete. Wired below (task-send-to-chat) rather than
   // inlined so the multi-line payload isn't quote-escaping trouble in an onclick string.
-  html += `<div style="margin:8px 0 4px"><button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button></div>`;
+  // Premium Priority toggle (2026-09-07, Grimmethy: "I'll need a way in app to be able
+  // to set that premium priority slot for any specific task. I am getting tired of
+  // manually selecting it for the worker queue every pass.") -- POSTs
+  // /api/task-anywhere/<id>/premium-priority, which finds the task wherever it currently
+  // sits (pending/blocked/needs-clarification/drafting/adhoc) and stamps/clears
+  // task.premiumPriority; next-claimable-task.js's effectivePriority() then sorts it
+  // ahead of EVERY other task, every tick, until this is turned off again or the task
+  // reaches done -- unlike the Workers tab's per-instance assign-task pin (one-shot,
+  // cleared the moment it's claimed), this is meant to be "set once, forget it."
+  const premiumOn = !!task.premiumPriority;
+  html += `<div style="margin:8px 0 4px">`
+    + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
+    + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + `</div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
   // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
@@ -1770,6 +1783,27 @@ function renderTaskDetailModal(task) {
         showToast('Could not send to chat: ' + e.message);
       } finally {
         taskSendToChatBtn.disabled = false;
+      }
+    };
+  }
+  const taskPremiumPriorityBtn = document.getElementById('task-premium-priority');
+  if (taskPremiumPriorityBtn) {
+    taskPremiumPriorityBtn.onclick = async () => {
+      taskPremiumPriorityBtn.disabled = true;
+      try {
+        const nextEnabled = !premiumOn;
+        const res = await fetch(`/api/task-anywhere/${encodeURIComponent(task.id)}/premium-priority`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: nextEnabled }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
+        task.premiumPriority = nextEnabled;
+        renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
+      } catch (e) {
+        showToast('Could not update premium priority: ' + e.message);
+        taskPremiumPriorityBtn.disabled = false;
       }
     };
   }
