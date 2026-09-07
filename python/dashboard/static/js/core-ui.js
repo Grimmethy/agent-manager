@@ -209,10 +209,18 @@ function canAssignTask(inst) {
 // src/next-claimable-task.js's claim ranking picks up ahead of everything else next
 // tick, and preempts whatever that worker is doing right now so it can pick the pinned
 // task up immediately instead of waiting for its current pass to finish on its own.
-async function setWorkerTask(instanceId, taskId, taskTitle) {
+//
+// `sourceLane` (2026-09-07 follow-up, Grimmethy after live-testing the above: "The task
+// I want, autodecomp, is in drafting") is set when the picked task is being STOLEN from
+// another lane's drafting/ rather than idle in pending/ -- a more consequential action
+// (it stops that other lane's real work too), so the confirm names both sides.
+async function setWorkerTask(instanceId, taskId, taskTitle, sourceLane) {
   if (!taskId) return;
   const label = taskTitle ? `"${taskTitle}" (${taskId})` : taskId;
-  if (!confirm(`Assign ${label} to ${instanceId}? If it's currently working on something else, that task will be cancelled and requeued.`)) {
+  const msg = sourceLane
+    ? `Assign ${label} to ${instanceId}? This will stop ${sourceLane}'s current work on it and hand it to ${instanceId}. If ${instanceId} is currently working on something else, that task will also be cancelled and requeued.`
+    : `Assign ${label} to ${instanceId}? If it's currently working on something else, that task will be cancelled and requeued.`;
+  if (!confirm(msg)) {
     return;
   }
   await fetch(`/api/instances/${encodeURIComponent(instanceId)}/assign-task`, {
@@ -246,21 +254,32 @@ function renderRecentTasksList(tasks) {
 }
 
 async function renderWorkers() {
-  const [instances, workerModels, costSummary, recentTasks, pendingTasks] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
     // Only fetch for whichever card is currently expanded -- no point loading this for
     // every instance on every 5s poll when at most one card shows it at a time.
     expandedWorkerId ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/recent-tasks`) : Promise.resolve(null),
-    // Candidate list for the per-worker "assign task" override dropdown -- capped so a
-    // large backlog doesn't mean re-fetching/re-rendering hundreds of <option>s every
-    // 5s poll; queue/pending/ only (real, claimable tasks -- not adhoc/research's
-    // pre-materialization staging, which task-sources.js hasn't turned into a real
-    // task yet).
-    fetchJson('/api/queue/pending?limit=200'),
   ]);
-  const pendingItems = pendingTasks.items || [];
+  // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
+  // follow-up, Grimmethy after live-testing the override: "the only tasks I have
+  // access to... are pipeline debrief tasks. The task I want, autodecomp, is in
+  // drafting. I need access to the full list of available jobs, they should however be
+  // whats available for that specific worker type"). Per-instance now, not one shared
+  // list: /api/instances/<id>/assignable-tasks tier-filters for THAT lane and also
+  // surfaces tasks already claimed by other lanes (queue/drafting/<lane>/), not just
+  // queue/pending/ -- a plain worker-model-style shared list can't express either of
+  // those. Fetched only for worker-* instances (canAssignTask), in parallel.
+  const assignableByInstance = {};
+  await Promise.all(instances.filter(canAssignTask).map(async (inst) => {
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
   const overrides = workerModels.overrides || {};
   // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
   // sense to track it?" -> Workers tab): AGENT_MANAGER_INSTANCE_ID is stamped onto every
@@ -312,10 +331,17 @@ async function renderWorkers() {
           }
           return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
         })()}
-        ${canAssignTask(inst) ? `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific pending task to this worker, overriding the automated priority/tier claim order">
-          <option value="">(assign a task…)</option>
-          ${pendingItems.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}">${escapeHtml(t.title || t.id)}${t.source ? ' [' + escapeHtml(t.source) + ']' : ''}</option>`).join('')}
-        </select>` : ''}
+        ${canAssignTask(inst) ? (() => {
+          const items = assignableByInstance[inst.instanceId] || [];
+          const optionLabel = (t) => {
+            const base = (t.title || t.id) + (t.source ? ' [' + t.source + ']' : '');
+            return t.location && t.location !== 'pending' ? `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}` : base;
+          };
+          return `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers">
+            <option value="">(assign a task…)</option>
+            ${items.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+          </select>`;
+        })() : ''}
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
@@ -353,10 +379,12 @@ async function renderWorkers() {
     sel.onchange = async (e) => {
       e.stopPropagation();
       const taskId = sel.value;
-      const title = sel.selectedOptions[0] && sel.selectedOptions[0].dataset.title;
+      const opt = sel.selectedOptions[0];
+      const title = opt && opt.dataset.title;
+      const sourceLane = opt && opt.dataset.sourceLane ? opt.dataset.sourceLane : null;
       sel.value = ''; // reset immediately -- confirm() may be declined, and a real
       // assignment triggers a full renderWorkers() re-render anyway.
-      await setWorkerTask(sel.dataset.instanceId, taskId, title);
+      await setWorkerTask(sel.dataset.instanceId, taskId, title, sourceLane);
     };
   });
   main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
