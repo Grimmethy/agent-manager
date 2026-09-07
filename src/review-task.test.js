@@ -809,6 +809,70 @@ test('verifyDeterministicScriptExtractDraft: returns null (not applicable) for a
   assert.equal(verifyDeterministicScriptExtractDraft(baseTask(), '/tmp'), null);
 });
 
+// The real incident, 2026-09-07, Grimmethy ("review blocked the decompose task again --
+// forensic analysis mode"): promptContext.deterministicApply describes TASK-level
+// eligibility, set once and persisted -- it does NOT mean THIS attempt's implementResponse
+// actually came from the deterministic short-circuit. That short-circuit already falls
+// through to the NORMAL agentic drafting path (local-draft.js's own tryDeterministic
+// ScriptExtractEdit, advisory-only) whenever ITS OWN re-derivation drifts -- so a
+// deterministicApply task can perfectly legitimately carry a normal, non-JSON agentic
+// implementResponse. Before this fix, every one of these branches returned {ok:false,
+// reason}, which reviewTask's own caller treats identically to {ok:true} for "the gate
+// applies" (only a literal null skips it) -- so a genuine agentic draft got hard-rejected
+// with "implementResponse is not valid JSON" and zero real review of its actual content.
+// Confirmed live against the real stuck task: exactly this happened (history shows
+// "implement-started ... adhoc: local-agentic-write", a 108,459-char agentic transcript,
+// rejected by this gate purely on shape).
+test('verifyDeterministicScriptExtractDraft: a non-JSON agentic implementResponse on a deterministicApply task returns null (falls through to normal review), not a hard reject', () => {
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: 'Let me look at the file first.\n\n<read_file>...</read_file>\n\nHere is the diff:\n--- a/index.html\n+++ b/index.html\n',
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.equal(verifyDeterministicScriptExtractDraft(task, '/tmp'), null);
+});
+
+test('verifyDeterministicScriptExtractDraft: valid JSON but the wrong array length falls through (null), not a hard reject', () => {
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([{ mode: 'create', file: 'a.js', content: 'x' }]), // only 1, not the required 2
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.equal(verifyDeterministicScriptExtractDraft(task, '/tmp'), null);
+});
+
+test('verifyDeterministicScriptExtractDraft: valid 2-element JSON but the wrong change shape (not create+edit of the right files) falls through (null)', () => {
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'wrong-file.js', content: 'x' }, // file does not match ctx.newFile
+      { mode: 'edit', file: 'index.html', find: 'x', replace: 'y' },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.equal(verifyDeterministicScriptExtractDraft(task, '/tmp'), null);
+});
+
+// Once the shape genuinely IS confirmed Group-B JSON, a content/drift mismatch stays a
+// real hard reject -- unchanged by this fix (covered by the "tampered content" and
+// "symbols drifted" tests above); this test just makes the boundary explicit.
+test('verifyDeterministicScriptExtractDraft: correctly-shaped Group-B JSON that byte-mismatches still hard-rejects (ok:false), only the SHAPE checks became advisory', () => {
+  const { repoRoot } = makeFixture();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' },
+      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
+  assert.notEqual(result, null);
+  assert.equal(result.ok, false);
+});
+
 test('reviewTask auto-approves a script-extract move deterministically -- zero model calls, even though the diff is huge', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
