@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { deadProcessCheck } = require('./dead-process-check.js');
+const { deadProcessCheck, restartTargetFor } = require('./dead-process-check.js');
 
 function tempInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'));
@@ -59,6 +59,99 @@ test('a genuinely dead worker (pid gone, stale heartbeat) still produces a resta
   assert.equal(actions[0].instanceId, 'worker-1');
   assert.equal(actions[0].action, 'restart');
   assert.match(actions[0].reason, /process confirmed gone/);
+});
+
+// restartTargetFor's P40 env (2026-09-07, Grimmethy: "the p40 has 2 tasks running on it
+// and the gtx is idle" -- root-caused live: a watchdog-restarted worker-p40 process was
+// found actually running with LOCAL_MODEL=qwen3.8:27b-q4_K_M, the HOST's model, because
+// this restart path never carried launch.sh's own OLLAMA_URL/LOCAL_MODEL wrapping for
+// this lane). Mutates/restores process.env directly (not a mocked getter) since
+// restartTargetFor reads it the same simple way production code does.
+
+test('restartTargetFor: worker-p40 carries the P40 env when both AGENT_MANAGER_P40_* vars are set', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
+  try {
+    const target = restartTargetFor('worker-p40');
+    assert.deepEqual(target.env, {
+      OLLAMA_URL: 'http://192.168.122.29:11434',
+      LOCAL_MODEL: 'qwen3.8-p40:27b-q4_K_M',
+      AGENT_MANAGER_GPU_YIELD_APPS: '',
+    });
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+test('restartTargetFor: worker-reasoning-p40 gets the same P40 env treatment as worker-p40', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
+  try {
+    const target = restartTargetFor('worker-reasoning-p40');
+    assert.equal(target.env.LOCAL_MODEL, 'qwen3.8-p40:27b-q4_K_M');
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+test('restartTargetFor: worker-p40 carries NO env field when the P40 vars are not configured -- this is the exact bug scenario (silently falls back to the host model)', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  delete process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  delete process.env.AGENT_MANAGER_P40_MODEL;
+  try {
+    const target = restartTargetFor('worker-p40');
+    assert.equal('env' in target, false);
+  } finally {
+    if (prevUrl !== undefined) process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel !== undefined) process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+test('restartTargetFor: an ordinary worker (worker-1, worker-reasoning) never carries a P40 env, even when the P40 vars happen to be set', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
+  try {
+    assert.equal('env' in restartTargetFor('worker-1'), false);
+    assert.equal('env' in restartTargetFor('worker-reasoning'), false);
+    assert.equal('env' in restartTargetFor('reviewer'), false);
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+test('deadProcessCheck: a dead worker-p40\'s emitted restart action includes the P40 env end-to-end', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
+  try {
+    const dir = tempInstancesDir();
+    const staleTime = new Date(Date.now() - 400_000).toISOString();
+    writeHeartbeat(dir, 'worker-p40', { pid: 999999, lastHeartbeat: staleTime });
+    const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+    const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].instanceId, 'worker-p40');
+    assert.deepEqual(actions[0].env, {
+      OLLAMA_URL: 'http://192.168.122.29:11434',
+      LOCAL_MODEL: 'qwen3.8-p40:27b-q4_K_M',
+      AGENT_MANAGER_GPU_YIELD_APPS: '',
+    });
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
 });
 
 // Regression, 2026-08-23: caught live -- local-client.js's majorityVote() fix (a single
