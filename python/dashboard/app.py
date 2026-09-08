@@ -1637,6 +1637,109 @@ def api_instance_recent_tasks(instance_id):
     return jsonify({"tasks": results})
 
 
+PIPELINE_HISTORY_LOG_FILENAME = "pipeline-history.log"
+
+
+def _read_pipeline_history_events(instances_d, event_type, instance_id=None, limit=200):
+    """Reads <instancesDir>/pipeline-history.log (src/pipeline-history.js's unified
+    NDJSON writer -- see that file's own header for why the previously-separate
+    degenerate/hard-failure/context-budget/fact-check-block logs were consolidated into
+    one stream discriminated by `type`) for events of one `type`, newest first.
+    `instance_id`, when given, filters to that field -- added to hard-failure/degenerate
+    entries 2026-09-08 specifically so a failed run can be attributed to the worker that
+    produced it (see local-client.js's logHardFailureAudit/logDegenerateAudit wrapper
+    comments)."""
+    if not instances_d:
+        return []
+    path = instances_d / PIPELINE_HISTORY_LOG_FILENAME
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    results = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") != event_type:
+            continue
+        if instance_id is not None and ev.get("instanceId") != instance_id:
+            continue
+        results.append(ev)
+        if len(results) >= limit:
+            break
+    return results
+
+
+@app.route("/api/instances/<instance_id>/run-log")
+def api_instance_run_log(instance_id):
+    """Every real attempt this instance made to run a model, not just the ones that
+    reached a reviewed/completed task state (2026-09-08, Grimmethy: "This looks like
+    it's only showing fully completed tasks. I want to see a log of every time an agent
+    is run and the outcome of that run."). recent-tasks (above) is deliberately
+    'terminal task state only'; this is the raw call-level trail, merging:
+
+      - every model_calls row this instance made (regardless of its own outcome column
+        -- see _recent_task_ids_for_instance's own header for why that column alone
+        under-reports), with 'pending'/'in-progress' shown instead of a blank outcome
+        when the owning task hasn't resolved to a real terminal state yet;
+      - every hard-failure (timeout/connection-refused/non-200) entry this instance
+        logged, which never reaches model_calls at all -- local-client.js's call() only
+        invokes recordCall on a response it actually got back, so an errored-out call
+        never gets that far (see logHardFailureAudit's own header). This is exactly the
+        class of run that was invisible before this route existed: worker-1's real
+        state during the 2026-09-08 GPU-contention incident was dozens of back-to-back
+        OLLAMA_TIMEOUTs that the terminal-state-only recent-tasks view had no way to
+        show at all -- it just looked stale.
+
+    Merged and sorted by timestamp, newest first."""
+    limit = min(max(request.args.get("limit", 30, type=int) or 30, 1), 100)
+    qdir = queue_dir()
+    db_path = model_stats_db_path()
+    runs = []
+    if db_path and db_path.is_file():
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            if _has_instance_id_column(conn):
+                rows = conn.execute("""
+                    SELECT task_id, stage, model, started_at, outcome, latency_ms
+                    FROM model_calls
+                    WHERE instance_id = ?
+                    ORDER BY started_at DESC
+                    LIMIT ?
+                """, (instance_id, limit * 2)).fetchall()
+                for task_id, stage, model, started_at, outcome, latency_ms in rows:
+                    resolved_outcome = outcome
+                    if not resolved_outcome:
+                        rec, state = (_find_task_record_anywhere(qdir, task_id) if qdir else (None, None))
+                        if rec and state in ("done", "archived", "superseded"):
+                            resolved_outcome = rec.get("terminalDisposition") or rec.get("status") or "resolved"
+                        elif rec:
+                            resolved_outcome = "in-progress"
+                        else:
+                            resolved_outcome = "pending"
+                    runs.append({
+                        "at": started_at, "taskId": task_id, "stage": stage, "model": model,
+                        "kind": "call", "outcome": resolved_outcome, "latencyMs": latency_ms,
+                    })
+        finally:
+            conn.close()
+    for ev in _read_pipeline_history_events(instances_dir(), "hard-failure", instance_id=instance_id, limit=limit * 2):
+        runs.append({
+            "at": ev.get("at"), "taskId": ev.get("taskId"), "stage": ev.get("stage"),
+            "model": ev.get("model"), "kind": "failed", "outcome": ev.get("code") or "error",
+            "detail": ev.get("message"),
+        })
+    runs.sort(key=lambda r: r.get("at") or "", reverse=True)
+    return jsonify({"runs": runs[:limit]})
+
+
 @app.route("/api/instances/<instance_id>/assignable-tasks")
 def api_instance_assignable_tasks(instance_id):
     """Candidate list for the Workers tab's assign-task dropdown (2026-09-07, Grimmethy

@@ -260,6 +260,26 @@ function renderRecentTasksList(tasks) {
     </li>`).join('')}</ul>`;
 }
 
+// Per-instance run log (2026-09-08, see expandedIsWorker's own header comment above for
+// the "recent-tasks only shows terminal state" gap this closes). Each row is either a
+// real model_calls attempt ('call' -- outcome resolved from the owning task's current
+// record when the call row's own outcome column is blank) or a hard-failure log entry
+// ('failed' -- a call that never got a usable response at all, so no task-level outcome
+// exists for it yet).
+function renderRunLogList(runs) {
+  if (!runs.length) return '<div class="meta">No runs recorded for this instance yet.</div>';
+  return `<ul class="recent-tasks-list">${runs.map(r => {
+    const failed = r.kind === 'failed';
+    const pending = r.outcome === 'pending' || r.outcome === 'in-progress';
+    const color = failed ? '--bad' : pending ? '--muted' : COMPLETED_TASKS_OUTCOME_OK_RE.test(r.outcome || '') ? '--ok' : '--bad';
+    const label = failed ? `FAILED: ${r.outcome || 'error'}` : (r.outcome || '?');
+    return `<li><a href="#" data-open-task-anywhere="${escapeAttr(r.taskId || '')}">${escapeHtml(r.taskId || '(unknown task)')}</a>
+      <span class="meta"><strong style="color:var(${color})">${escapeHtml(label)}</strong>${r.stage ? ' · ' + escapeHtml(r.stage) : ''}${r.model ? ' · ' + escapeHtml(r.model) : ''}${r.latencyMs != null ? ' · ' + (r.latencyMs / 1000).toFixed(1) + 's' : ''} · ${r.at ? fmtAge((Date.now() - new Date(r.at).getTime()) / 1000) + ' ago' : ''}</span>
+      ${failed && r.detail ? `<div class="meta" style="opacity:0.75">${escapeHtml(r.detail.slice(0, 160))}</div>` : ''}
+    </li>`;
+  }).join('')}</ul>`;
+}
+
 // Global "all tasks completed" log (2026-09-08, Grimmethy: "an in app representation of
 // that all tasks completed log under the workers... only loads the most recent 25 tasks
 // until I scroll to the bottom") -- see completedTasksLog's own header comment
@@ -338,13 +358,24 @@ async function renderWorkers(isPoll) {
       return;
     }
   }
+  // run-log vs recent-tasks (2026-09-08, Grimmethy: "This looks like it's only showing
+  // fully completed tasks. I want to see a log of every time an agent is run and the
+  // outcome of that run."): a drafting worker's real activity includes attempts that
+  // never reach a terminal task state at all (a hard OLLAMA_TIMEOUT, mid-GPU-contention,
+  // never produces a usable response) -- /api/instances/<id>/run-log surfaces those too,
+  // merged with every model_calls row regardless of outcome. reviewer has no equivalent
+  // call-level data (review-task.js's majorityVote never calls recordCall, see that
+  // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
+  const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
   const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
     // Only fetch for whichever card is currently expanded -- no point loading this for
     // every instance on every 5s poll when at most one card shows it at a time.
-    expandedWorkerId ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/recent-tasks`) : Promise.resolve(null),
+    expandedWorkerId
+      ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
+      : Promise.resolve(null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -509,8 +540,8 @@ async function renderWorkers(isPoll) {
       </div>
       ${expandedWorkerId === inst.instanceId ? `
       <div class="worker-recent-tasks">
-        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Last 10 completed tasks'}</div>
-        ${recentTasks ? renderRecentTasksList(recentTasks.tasks || []) : '<div class="meta">Loading…</div>'}
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
   `).join('')) + renderCompletedTasksSection();

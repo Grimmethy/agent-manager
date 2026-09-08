@@ -272,5 +272,123 @@ class TestWorkerRecentTasksReadsRealHistoryNotOutcomeColumn(CompletedTasksLogTes
         self.assertEqual(resp.get_json(), {"tasks": []})
 
 
+def _make_model_calls_db_with_latency(db_path, rows):
+    """rows: (call_id, task_id, instance_id, started_at, outcome, latency_ms, stage)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE model_calls (
+            call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT,
+            started_at TEXT NOT NULL, outcome TEXT, outcome_stage TEXT, outcome_at TEXT,
+            instance_id TEXT, latency_ms INTEGER
+        )
+    """)
+    for call_id, task_id, instance_id, started_at, outcome, latency_ms, stage in rows:
+        conn.execute(
+            "INSERT INTO model_calls (call_id, task_id, instance_id, started_at, model, outcome, latency_ms, stage) VALUES (?, ?, ?, ?, 'qwen2.5:3b', ?, ?, ?)",
+            (call_id, task_id, instance_id, started_at, outcome, latency_ms, stage),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestInstanceRunLog(CompletedTasksLogTestBase):
+    """Covers GET /api/instances/<id>/run-log (2026-09-08, Grimmethy: "This looks like
+    it's only showing fully completed tasks. I want to see a log of every time an agent
+    is run and the outcome of that run.") -- merges real model_calls attempts (any
+    outcome, resolved against the task's own current record when blank) with
+    hard-failure pipeline-history.log entries (timeouts/errors that never reach
+    model_calls at all, since local-client.js's call() only records a call it actually
+    got a response for)."""
+
+    def setUp(self):
+        super().setUp()
+        self._db_tmp = TemporaryDirectory()
+        self.db_path = Path(self._db_tmp.name) / "model-stats.db"
+        self.instances_dir = self.queue.parent / "instances"
+        self.instances_dir.mkdir(parents=True, exist_ok=True)
+        self._patches.append(mock.patch.object(app, "model_stats_db_path", return_value=self.db_path))
+        self._patches.append(mock.patch.object(app, "instances_dir", return_value=self.instances_dir))
+        for p in self._patches[-2:]:
+            p.start()
+
+    def tearDown(self):
+        self._db_tmp.cleanup()
+        super().tearDown()
+
+    def _write_history_log(self, events):
+        path = self.instances_dir / "pipeline-history.log"
+        with path.open("w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+    def test_includes_both_calls_and_hard_failures_sorted_by_time(self):
+        self._write_done("done-task", extra={"terminalDisposition": "merged"})
+        _make_model_calls_db_with_latency(self.db_path, [
+            ("c1", "done-task", "worker-1", "2026-09-08T05:00:00Z", "approved", 4200, "implement"),
+        ])
+        self._write_history_log([
+            {"type": "hard-failure", "at": "2026-09-08T05:10:00Z", "instanceId": "worker-1",
+             "taskId": "stuck-task", "stage": "implement", "model": "qwen2.5:3b",
+             "code": "OLLAMA_TIMEOUT", "message": "Ollama request timed out after 240000ms"},
+        ])
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        data = resp.get_json()
+        self.assertEqual(len(data["runs"]), 2)
+        # newest (the failure) first
+        self.assertEqual(data["runs"][0]["kind"], "failed")
+        self.assertEqual(data["runs"][0]["outcome"], "OLLAMA_TIMEOUT")
+        self.assertEqual(data["runs"][0]["taskId"], "stuck-task")
+        self.assertEqual(data["runs"][1]["kind"], "call")
+        self.assertEqual(data["runs"][1]["outcome"], "approved")
+        self.assertEqual(data["runs"][1]["latencyMs"], 4200)
+
+    def test_hard_failures_for_other_instances_are_excluded(self):
+        self._write_history_log([
+            {"type": "hard-failure", "at": "2026-09-08T05:10:00Z", "instanceId": "worker-reasoning",
+             "taskId": "not-mine", "code": "OLLAMA_TIMEOUT", "message": "timed out"},
+        ])
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        self.assertEqual(resp.get_json()["runs"], [])
+
+    def test_call_with_blank_outcome_resolves_from_the_task_current_state(self):
+        self._write_done("resolved-noop", extra={"terminalDisposition": None, "status": "noop"})
+        _make_model_calls_db_with_latency(self.db_path, [
+            ("c1", "resolved-noop", "worker-1", "2026-09-08T05:00:00Z", None, 1000, "implement"),
+        ])
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        runs = resp.get_json()["runs"]
+        self.assertEqual(runs[0]["outcome"], "noop")
+
+    def test_call_for_a_task_not_found_anywhere_is_pending(self):
+        _make_model_calls_db_with_latency(self.db_path, [
+            ("c1", "nowhere-task", "worker-1", "2026-09-08T05:00:00Z", None, 1000, "orient"),
+        ])
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        runs = resp.get_json()["runs"]
+        self.assertEqual(runs[0]["outcome"], "pending")
+
+    def test_limit_is_respected_across_merged_sources(self):
+        rows = [(f"c{i}", f"t{i}", "worker-1", f"2026-09-08T05:{i:02d}:00Z", "approved", 100, "implement") for i in range(10)]
+        _make_model_calls_db_with_latency(self.db_path, rows)
+        for r in rows:
+            self._write_done(r[1], extra={"terminalDisposition": "merged"})
+        resp = self.client.get("/api/instances/worker-1/run-log?limit=3")
+        self.assertEqual(len(resp.get_json()["runs"]), 3)
+
+    def test_missing_history_log_file_does_not_error(self):
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["runs"], [])
+
+    def test_malformed_history_log_line_is_skipped(self):
+        path = self.instances_dir / "pipeline-history.log"
+        path.write_text("not json\n" + json.dumps({
+            "type": "hard-failure", "at": "2026-09-08T05:10:00Z", "instanceId": "worker-1",
+            "taskId": "t", "code": "OLLAMA_TIMEOUT", "message": "x",
+        }) + "\n", encoding="utf-8")
+        resp = self.client.get("/api/instances/worker-1/run-log")
+        self.assertEqual(len(resp.get_json()["runs"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
