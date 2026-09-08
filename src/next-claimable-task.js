@@ -237,6 +237,38 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
     }
   }
 
+  // queue/adhoc/ (2026-09-08, Grimmethy: "I also can't see the target when I try to
+  // select it in the workers task select field" -- root-caused live: this function only
+  // ever scanned pending/ and other lanes' drafting/, never adhoc/ itself, even though
+  // adhoc/ is the single highest-volume holding pen in the whole pipeline (task-sources.js's
+  // nextAdhocTask() reads a candidate from here on demand rather than a file ever being
+  // written into pending/ for it) -- so nothing living there could ever show up in the
+  // assign-task dropdown, decompose children included. Same tier filter, same shape as the
+  // pending/ block above; sorted premiumPriority-first to match nextAdhocTask()'s own
+  // now-fixed sort so the dropdown's ordering doesn't silently disagree with what the
+  // automatic claim path would actually pick next.
+  const adhocDir = path.join(queueDir, 'adhoc');
+  let adhocNames = [];
+  try {
+    adhocNames = fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'));
+  } catch (_) { /* no adhoc/ dir yet */ }
+  const adhocRows = [];
+  for (const name of adhocNames) {
+    const { task } = readTaskSafe(path.join(adhocDir, name));
+    if (!task) continue;
+    if (!resolvesToTier(task, isReasoningLane)) continue;
+    adhocRows.push({
+      id: task.id || name.replace(/\.json$/, ''),
+      title: task.title || null,
+      source: task.source || null,
+      location: 'adhoc',
+      pinnedTo: (task.pinnedWorker && task.pinnedWorker !== instanceId) ? task.pinnedWorker : null,
+      premiumPriority: !!task.premiumPriority,
+    });
+  }
+  adhocRows.sort((a, b) => (a.premiumPriority === b.premiumPriority ? 0 : (a.premiumPriority ? -1 : 1)));
+  out.push(...adhocRows);
+
   return out;
 }
 

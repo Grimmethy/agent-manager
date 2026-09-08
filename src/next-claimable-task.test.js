@@ -297,6 +297,58 @@ test('listAssignableTasks tier-filters drafting-elsewhere candidates the same as
   );
 });
 
+// queue/adhoc/ (2026-09-08, Grimmethy: "I also can't see the target when I try to select
+// it in the workers task select field" -- root-caused live: this function never scanned
+// adhoc/ at all, only pending/ and other lanes' drafting/, even though adhoc/ is the
+// single highest-volume holding pen in the whole pipeline and nextAdhocTask() reads a
+// candidate from it on demand rather than ever writing a file into pending/ first).
+function writeAdhocTask(queueDir, id, extra = {}) {
+  const adhocDir = path.join(queueDir, 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  const task = { id, source: 'manual', promptContext: {}, ...extra };
+  fs.writeFileSync(path.join(adhocDir, `${id}.json`), JSON.stringify(task, null, 2));
+  return task;
+}
+
+test('listAssignableTasks includes queue/adhoc/ candidates, tagged with location:adhoc', () => {
+  const queueDir = setupQueue();
+  writeAdhocTask(queueDir, 'adhoc-decompose-child', { title: 'A stacked file-decompose move child', atomic: true });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items, [{ id: 'adhoc-decompose-child', title: 'A stacked file-decompose move child', source: 'manual', location: 'adhoc', pinnedTo: null, premiumPriority: false }]);
+});
+
+test('listAssignableTasks tier-filters adhoc/ candidates the same as pending/drafting ones', () => {
+  const queueDir = setupQueue();
+  writeAdhocTask(queueDir, 'adhoc-high-tier', {});
+
+  assert.deepEqual(listAssignableTasks(queueDir, 'worker-1', { isReasoningLane: false }), []);
+  assert.deepEqual(
+    listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true }).map((i) => i.id),
+    ['adhoc-high-tier'],
+  );
+});
+
+test('listAssignableTasks tags an adhoc/ task pinned to a SIBLING lane with pinnedTo, same as pending', () => {
+  const queueDir = setupQueue();
+  writeAdhocTask(queueDir, 'adhoc-pinned-elsewhere', { pinnedWorker: 'worker-reasoning' });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning-p40', { isReasoningLane: true });
+
+  assert.deepEqual(items, [{ id: 'adhoc-pinned-elsewhere', title: null, source: 'manual', location: 'adhoc', pinnedTo: 'worker-reasoning', premiumPriority: false }]);
+});
+
+test('listAssignableTasks sorts premiumPriority adhoc/ candidates ahead of ordinary ones', () => {
+  const queueDir = setupQueue();
+  writeAdhocTask(queueDir, 'adhoc-ordinary', {});
+  writeAdhocTask(queueDir, 'adhoc-premium', { premiumPriority: true });
+
+  const items = listAssignableTasks(queueDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items.map((i) => i.id), ['adhoc-premium', 'adhoc-ordinary']);
+});
+
 test('listAssignableTasks: an empty/missing queue dir returns an empty list, not a throw', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
   assert.deepEqual(listAssignableTasks(path.join(root, 'queue'), 'worker-1', { isReasoningLane: false }), []);
