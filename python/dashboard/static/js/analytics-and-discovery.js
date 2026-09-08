@@ -499,7 +499,7 @@ function renderDeepDiveItems(items) {
   return items.map((it) => `
     <div class="worker-card">
       <div class="row">
-        <span class="id">${escapeHtml(it.title)}</span>
+        <span class="id">${escapeHtmlBright(it.title)}</span>
         <span class="badge ${it.rating === 'Use' ? 'ok' : it.rating === 'Adapt' ? 'warn' : 'idle'}">${escapeHtml(it.rating || '')}</span>
       </div>
       <div class="meta">${escapeHtml(it.community || '')}${it.files ? ' · ' + escapeHtml(it.files) : ''}</div>
@@ -639,12 +639,12 @@ async function renderDiscoveryTab() {
     // Whichever field carries the run's actual outcome -- same signal priority as
     // _adhoc_task_excerpt server-side.
     const result = t.blockedReason
-      ? `<span style="color:var(--bad)">${escapeHtml(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
+      ? `<span style="color:var(--bad)">${escapeHtmlBright(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
       : t.doneMarker
         ? escapeHtml(t.doneMarker)
         : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
     return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout (plan, draft, review verdicts)">
-      <td>${escapeHtml(t.title)}</td>
+      <td>${escapeHtmlBright(t.title)}</td>
       <td>${stateBadge(t.state)}</td>
       <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
       <td class="meta">${result}</td>
@@ -657,7 +657,7 @@ async function renderDiscoveryTab() {
   const candidateRows = d.candidates.map(c => `
     <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
       <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
-      <td>${escapeHtml(c.title)}</td>
+      <td>${escapeHtmlBright(c.title)}</td>
       <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
       <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
     </tr>`).join('');
@@ -701,7 +701,7 @@ function openDiscoveryCandidate(id) {
   if (!c) return;
   const content = document.getElementById('modal-content');
   content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button>`
-    + `<h2>AC-${String(c.id).padStart(3, '0')} · ${escapeHtml(c.title)}</h2>`
+    + `<h2>AC-${String(c.id).padStart(3, '0')} · ${escapeHtmlBright(c.title)}</h2>`
     + `<pre>${escapeHtml(c.content)}</pre>`;
   document.getElementById('modal-backdrop').classList.add('open');
 }
@@ -722,7 +722,7 @@ async function openJobLog(source) {
   };
   const rows = (data.runs || []).map((r) => `
     <tr class="clickable" data-task-id="${escapeAttr(r.id)}" title="Open this run's task log">
-      <td>${escapeHtml(r.title || r.id)}</td>
+      <td>${escapeHtmlBright(r.title || r.id)}</td>
       <td>${stateBadge(r.state)}</td>
       <td>${r.at ? new Date(r.at).toLocaleString() : ''}</td>
       <td class="meta">${escapeHtml((r.outcome || '').slice(0, 140))}${(r.outcome || '').length > 140 ? '…' : ''}</td>
@@ -751,7 +751,10 @@ async function openJobLog(source) {
 // with no internal hard-wrapping, so this is a no-op there -- purely additive for the
 // concept-description case this was actually reported against.
 function renderReportMarkdown(md) {
-  const lines = escapeHtml(md).split('\n');
+  // Long-word brightness rule (core-ui.js's escapeHtmlBright/markLongWords/
+  // unmarkToBrightSpans): mark BEFORE escaping so sentinels survive every other
+  // transform in this function untouched, unmark as the LAST step below.
+  const lines = escapeHtml(markLongWords(md)).split('\n');
   let html = '';
   let inList = false;
   let para = null;
@@ -774,7 +777,7 @@ function renderReportMarkdown(md) {
   }
   closePara();
   closeList();
-  return html;
+  return unmarkToBrightSpans(html);
 }
 
 async function openReportDetail(period, filename) {

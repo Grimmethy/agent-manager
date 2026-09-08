@@ -14,6 +14,13 @@
        background"). */
     --link: #8fc4ff;
   }
+  /* Long-word brightness rule (2026-09-08, Grimmethy: "any words 6 or more letters long
+     are formatted to be 10% more bright"), prose text only -- see core-ui.js's
+     escapeHtmlBright()/markLongWords()/unmarkToBrightSpans(). filter:brightness() scales
+     each color channel of the ALREADY-applied text color, so it works correctly regardless
+     of theme or which color (--text, --link, --warn, ...) a given element already uses --
+     no per-color math needed here. */
+  .hl-bright { filter: brightness(1.1); }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
   a { color: var(--link); }
@@ -777,7 +784,7 @@ async function renderAdhocTasksTab() {
       ? `<div class="meta" style="color:var(--warn)">⏳ depends on: ${t.dependsOn.map((d) => `${escapeHtml(d.id)}${d.satisfied ? ' (merged)' : ' (not yet merged)'}`).join(', ')}</div>`
       : '';
     return `<tr class="${rowClass}" data-id="${escapeAttr(t.id)}">
-      <td>${escapeHtml(t.title)}${excerptHtml}${dependsHtml}</td>
+      <td>${escapeHtmlBright(t.title)}${excerptHtml}${dependsHtml}</td>
       <td><span class="badge ${badgeClass}">${escapeHtml(adhocStateLabel(t.state))}</span>${isAwaitingConfirm ? ' <strong>-- needs your review</strong>' : ''}</td>
       <td>${escapeHtml(when)}</td>
     </tr>`;
@@ -1006,7 +1013,7 @@ function renderDraftAttempts(task) {
     const when = a.at ? new Date(a.at).toLocaleString() : '';
     const outcome = a.outcome || '?';
     const summary = `<summary>#${a.attemptNo} · <span class="da-outcome-${escapeHtml(outcome)}">${escapeHtml(outcome)}</span>`
-      + `${a.blockedReason ? ` — ${escapeHtml(String(a.blockedReason).slice(0, 120))}` : ''}`
+      + `${a.blockedReason ? ` — ${escapeHtmlBright(String(a.blockedReason).slice(0, 120))}` : ''}`
       + ` <span class="meta">${escapeHtml(when)}</span></summary>`;
 
     if (a.collapsed) {
@@ -1174,7 +1181,7 @@ function renderSubTaskChecklist(task) {
   const rows = subs.map((st) => {
     const [cls, label] = SUBTASK_STATUS_META[st.status] || ['idle', st.status || 'pending'];
     return `<div class="task-history-row"><span class="badge ${cls}">${escapeHtml(label)}</span> `
-      + `${taskLink(st.id)} ${escapeHtml(st.title || '')}</div>`;
+      + `${taskLink(st.id)} ${escapeHtmlBright(st.title || '')}</div>`;
   }).join('');
   return `<div class="field-label">Sub-tasks (${done} / ${total})</div>`
     + `<div class="bar-track" style="margin:2px 0 8px"><div class="bar-fill" style="width:${pct}%; background:var(--ok)"></div></div>`
@@ -1205,7 +1212,7 @@ function renderTaskDetailModal(task) {
     + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
     + `</div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
-  html += `<div><strong>${escapeHtml(task.title || '')}</strong></div>`;
+  html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
   // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
   // able to click into the hub task from the top of the sub task's task log") -- the
   // inverse of renderSubTaskChecklist just below (which shows a hub's children): a
@@ -1268,7 +1275,7 @@ function renderTaskDetailModal(task) {
     }
   }
   html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
-  if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtml(task.blockedReason)}</div>`;
+  if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtmlBright(task.blockedReason)}</div>`;
   if (task.branch) html += `<div class="field-label">Branch</div><div>${task.branch}</div>`;
   if (task.promptContext && task.promptContext.prefetchedPaths && task.promptContext.prefetchedPaths.length) {
     html += `<div class="field-label">Prefetched Paths</div><div>${task.promptContext.prefetchedPaths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
@@ -1299,7 +1306,7 @@ function renderTaskDetailModal(task) {
   // conclusion. The bottom-of-modal block is then skipped (reportShown).
   let reportShown = false;
   if (PROSE_REPORT_SOURCES.has(task.source) && task.implementResponse) {
-    html += `<div class="field-label">Root-Cause Report</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+    html += `<div class="field-label">Root-Cause Report</div><pre>${escapeHtmlBright(task.implementResponse)}</pre>`;
     reportShown = true;
   }
   if (task.needsClarification) html += renderClarificationPicker(task);
@@ -1338,9 +1345,9 @@ function renderTaskDetailModal(task) {
   // section and the timeline is the only hint anything ran. Say it explicitly.
   const emptyPlan = !task.planResponse && /plan pass degenerate/i.test(task.blockedReason || '');
   const emptyImpl = !task.implementResponse && /implement pass degenerate/i.test(task.blockedReason || '');
-  if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtml(task.planResponse)}</pre>`;
+  if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtmlBright(task.planResponse)}</pre>`;
   else if (emptyPlan) html += `<div class="field-label">Plan</div><pre class="meta">(the plan pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
-  if (task.implementResponse && !reportShown) html += `<div class="field-label">Implement</div><pre>${escapeHtml(task.implementResponse)}</pre>`;
+  if (task.implementResponse && !reportShown) html += `<div class="field-label">Implement</div><pre>${escapeHtmlBright(task.implementResponse)}</pre>`;
   else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   content.innerHTML = html;
   backdrop.classList.add('open');
@@ -1463,7 +1470,7 @@ function renderDesignDecisionPicker(task) {
   const nc = task.needsClarification;
   let html = `<div class="field-label">⚠ Needs a Human Decision</div>`;
   html += `<div class="meta">The agentic draft investigated this for real and has genuine open questions it shouldn't guess at:</div>`;
-  html += `<div class="grill-session" style="margin-top:8px; white-space:pre-wrap">${escapeHtml(nc.openQuestions || '')}</div>`;
+  html += `<div class="grill-session" style="margin-top:8px; white-space:pre-wrap">${escapeHtmlBright(nc.openQuestions || '')}</div>`;
 
   // Multiple-choice shortcut (2026-08-24, Grimmethy: "build in some multiple choice
   // options into the task log... reduce the friction caused by pausing the pipeline to
@@ -1477,7 +1484,7 @@ function renderDesignDecisionPicker(task) {
     html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
     html += nc.options.map((o, i) => `
       <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
-        <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtml(o.description)}</span>
+        <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtmlBright(o.description)}</span>
       </button>`).join('');
     html += `</div>`;
   }
@@ -1513,11 +1520,11 @@ function renderClarificationPicker(task) {
       html += `<div class="grill-session" style="margin-top:8px;border:1px solid var(--warn)">`;
       html += `<div class="field-label">Suggested (${confidenceLabel})</div>`;
       html += `<div>${s.paths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
-      if (s.rationale) html += `<div class="meta" style="margin-top:6px">${escapeHtml(s.rationale)}</div>`;
+      if (s.rationale) html += `<div class="meta" style="margin-top:6px">${escapeHtmlBright(s.rationale)}</div>`;
       html += `<button type="button" class="action clarify-accept-suggestion-btn" data-suggested-paths="${escapeAttr(JSON.stringify(s.paths))}" style="margin-top:8px">Accept Suggestion</button>`;
       html += `</div>`;
     } else {
-      html += `<div class="grill-session" style="margin-top:8px"><div class="field-label">Suggestion attempted</div><div class="meta">The model couldn't find a match either${s.rationale ? ': ' + escapeHtml(s.rationale) : '.'}</div></div>`;
+      html += `<div class="grill-session" style="margin-top:8px"><div class="field-label">Suggestion attempted</div><div class="meta">The model couldn't find a match either${s.rationale ? ': ' + escapeHtmlBright(s.rationale) : '.'}</div></div>`;
     }
   }
   if (nc.reason === 'ambiguous' && nc.candidates) {
@@ -1818,7 +1825,7 @@ async function renderBranchesTab() {
     return `
     <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
       <div class="row">
-        <span class="id">${escapeHtml(b.title)}</span>
+        <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
           ${hubBadge}
           ${conflictBadge}
@@ -1896,16 +1903,16 @@ async function renderBranchesTab() {
 async function renderBranchDetailModal(b) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
-  content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2><div class="meta">Loading history...</div>`;
+  content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2><div class="meta">Loading history...</div>`;
   backdrop.classList.add('open');
   let data;
   try {
     data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`);
   } catch (e) {
-    content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
+    content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
     return;
   }
-  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtml(b.title)}</h2>`;
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2>`;
   html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
@@ -1923,11 +1930,11 @@ async function renderBranchDetailModal(b) {
     } else {
       html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
     }
-    html += `<div class="meta">${escapeHtml(hub.title || hub.id)} · ${p.done}/${p.total} task(s) done`
+    html += `<div class="meta">${escapeHtmlBright(hub.title || hub.id)} · ${p.done}/${p.total} task(s) done`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
-    if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtml(hub.blockedReason)}</div>`;
+    if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
     html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
-      `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(st.title || st.id)}</span> `
+      `<div class="task-history-row"><span class="task-history-stage">${escapeHtmlBright(st.title || st.id)}</span> `
       + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span></div>`
     ).join('') + `</div>`;
     const checks = (hub.integrationGate || {}).checks;
@@ -3602,7 +3609,7 @@ function renderBrainDumpCard(entry) {
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
-        <span class="text">${serialBadge}${escapeHtml(entry.rawText)}${countChip}${raisedByBadge}</span>
+        <span class="text">${serialBadge}${escapeHtmlBright(entry.rawText)}${countChip}${raisedByBadge}</span>
         ${statusBadge}
       </div>
       <div class="row meta">
@@ -3634,7 +3641,7 @@ function renderBrainDumpDiscussCard(entry, session) {
   if (!session) {
     return `
       <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
-        <div class="row"><span class="text">${serialBadge}${escapeHtml(entry.rawText)}</span></div>
+        <div class="row"><span class="text">${serialBadge}${escapeHtmlBright(entry.rawText)}</span></div>
         <div class="row" style="margin-top:8px"><span class="empty">Starting conversation...</span><button type="button" class="secondary" data-discuss-cancel="${escapeAttr(entry.id)}" title="Abort starting this conversation">Cancel</button></div>
       </div>
     `;
@@ -3882,10 +3889,10 @@ function grillRenderTranscript(transcript, session) {
       const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
       const stamp = m ? `${m[1]}:${m[2]}:${m[3]}` : String(t.timestamp).slice(11, 19);
       body = String(t.text).split(/\n{2,}/).map(seg =>
-        `<p><span class="grill-seg-ts">${escapeHtml(stamp)}</span>${escapeHtml(seg)}</p>`
+        `<p><span class="grill-seg-ts">${escapeHtml(stamp)}</span>${escapeHtmlBright(seg)}</p>`
       ).join('');
     } else {
-      body = escapeHtml(t.text);
+      body = escapeHtmlBright(t.text);
     }
     return `<div class="${cls}"><div class="grill-msg-role">${escapeHtml(roleLabel)}</div><div class="grill-msg-text">${body}</div></div>`;
   }).join('');

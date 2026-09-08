@@ -290,7 +290,7 @@ const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-
 
 function renderCompletedTasksSection() {
   const rows = completedTasksLog.map(t => `
-    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtml(t.title || t.taskId)}</a>
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtmlBright(t.title || t.taskId)}</a>
       <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('');
   const footer = completedTasksExhausted
@@ -1221,9 +1221,14 @@ async function renderQueueTab(state) {
             ? '<span style="color:var(--bad)">🗑 contains a delete</span>'
           : state === 'coordinating'
             ? (t.coordinatorBlocked
-              ? `<span style="color:var(--bad)" title="${escapeAttr(t.blockedReason || '')}">⛔ stuck ${t.progress ? `at ${t.progress.done}/${t.progress.total}` : ''}${t.coordinatorBlocked.escalated ? ' — needs a human' : ''}: ${escapeHtml((t.blockedReason || '').slice(0, 90))}</span>`
+              ? `<span style="color:var(--bad)" title="${escapeAttr(t.blockedReason || '')}">⛔ stuck ${t.progress ? `at ${t.progress.done}/${t.progress.total}` : ''}${t.coordinatorBlocked.escalated ? ' — needs a human' : ''}: ${escapeHtmlBright((t.blockedReason || '').slice(0, 90))}</span>`
               : `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`)
-            : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtml(t.blockedReason).slice(0, 80) + '</span>' : (t.branch || t.doneMarker || ''));
+            // 2026-09-08: was escapeHtml(t.blockedReason).slice(0, 80) -- sliced the
+            // escaped output, not the raw text. Harmless before (worst case: a cut
+            // HTML entity), but would slice straight through a <span> tag once brightening
+            // wraps long words, producing broken markup. Slice the raw text first instead,
+            // matching the sibling branch just above.
+            : (t.blockedReason ? '<span style="color:var(--bad)">' + escapeHtmlBright(t.blockedReason.slice(0, 80)) + '</span>' : (t.branch || t.doneMarker || ''));
     // Dead-adhoc-task flag (adhoc-staleness-flag.js). Chip + evidence tooltip; the
     // retire action is the row's existing Archive/Reject button, plus a Keep to dismiss.
     const sf = t.stalenessFlag;
@@ -1261,7 +1266,7 @@ async function renderQueueTab(state) {
     return `${familyHeaderRow}
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       ${hubIdCell}
-      <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
+      <td>${escapeHtmlBright(t.title || '')}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
       <td>${staleChip}${trimChip}${detailCell}</td>
       ${showArchiveRequeue ? `<td>
@@ -1359,6 +1364,34 @@ async function renderQueueTab(state) {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Long-word brightness rule (2026-09-08, Grimmethy: "any words 6 or more letters long are
+// formatted to be 10% more bright"), scoped to PROSE text only (descriptions, report
+// content, chat messages, task titles) -- never task IDs, buttons, badges, nav labels, or
+// other structured/dense text, where nearly every "word" would qualify and the effect
+// would be noise, not emphasis. Sentinels use two Unicode Private-Use-Area code points
+// (built via String.fromCharCode so this source file stays plain ASCII) -- guaranteed
+// absent from real prose and never HTML-special, so they pass through escapeHtml()
+// completely untouched. Marking must happen BEFORE escaping (so word-boundary matching
+// never has to reason about already-inserted <span> tags) and unmarking must be the LAST
+// step of whatever HTML a caller builds (after any other markup generation).
+const LONG_WORD_RE = /[A-Za-z]{6,}/g;
+const MARK_OPEN = String.fromCharCode(0xE000);
+const MARK_CLOSE = String.fromCharCode(0xE001);
+
+function markLongWords(raw) {
+  return String(raw == null ? '' : raw).replace(LONG_WORD_RE, (w) => MARK_OPEN + w + MARK_CLOSE);
+}
+
+function unmarkToBrightSpans(html) {
+  return html.split(MARK_OPEN).join('<span class="hl-bright">').split(MARK_CLOSE).join('</span>');
+}
+
+// Drop-in replacement for escapeHtml() at prose call sites: identical output for text with
+// no 6+ letter words, brightened spans otherwise.
+function escapeHtmlBright(raw) {
+  return unmarkToBrightSpans(escapeHtml(markLongWords(raw)));
 }
 
 function adhocStateBadgeClass(state) {
