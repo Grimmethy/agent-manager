@@ -975,6 +975,28 @@ test('nextAdhocTask picks an atomic (file-decompose child) candidate ahead of an
   assert.equal(task.id, 'adhoc-decompose-hub-x-02-child', 'the atomic decompose child must win despite its newer mtime');
 });
 
+// premiumPriority (2026-09-08, Grimmethy: "I just watched 2 tasks get picked instead of
+// the target. I also can't see the target when I try to select it in the workers task
+// select field." -- root-caused live: this sort never looked at premiumPriority at all,
+// so the operator-set "keep this at the front of the WHOLE queue" flag was silently
+// inert on the real automatic claim path). Must outrank BOTH an ordinary task's mtime
+// AND the atomic/decompose-child bump above -- premiumPriority is the top-level override.
+test('nextAdhocTask picks a premiumPriority candidate ahead of an atomic decompose child and an older ordinary task', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });
+  writeAdhocFile(dir, 'b-decompose-child.json', {
+    id: 'adhoc-decompose-hub-x-02-child', title: 'A stacked file-decompose move child', atomic: true,
+  });
+  writeAdhocFile(dir, 'c-premium.json', {
+    id: 'adhoc-premium-1', title: 'Operator-pinned to the front', premiumPriority: true,
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-premium-1', 'premiumPriority must win over both atomic and mtime ordering');
+});
+
 test('nextAdhocTask still applies oldest-first FIFO within each tier (two ordinary tasks, or two decompose children)', () => {
   const dir = makeAdhocFixtureRepo();
   writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });
