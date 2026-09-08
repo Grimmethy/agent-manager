@@ -69,6 +69,22 @@ const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 
+// 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
+// incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
+// worker-reasoning's qwen3.8:27b-q4_K_M generating concurrently on the same physical
+// GPU). Same OLLAMA_URL default local-client.js/local-tool-client.js already use for the
+// real call itself -- this process's own env IS the real endpoint it's about to hit, so
+// reading it here (rather than threading a new param through) is exact by construction.
+function localOllamaLockKey() {
+  const url = process.env.OLLAMA_URL || 'http://localhost:11434';
+  try {
+    const u = new URL(url);
+    return `ollama-${u.hostname}-${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+  } catch {
+    return `ollama-${url}`;
+  }
+}
+
 // 2026-09-08, Second Brain [[dspy-refine]] research: dspy.Refine deliberately samples
 // EVERY retry at temperature=1.0 (a distinct rollout_id per attempt) specifically to
 // avoid attempts collapsing into near-identical repeats -- confirmed against the real
@@ -593,6 +609,15 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // own withLockFn spy. gpu-arbiter.js wraps single-flight-lock.js's flock and adds the
   // cross-lane priority ordering + cancellation this used to lack.
   const usingInjectedLock = withLockFn !== defaultWithLock;
+  // lockKey (2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for
+  // the incident): the per-model default lets two DIFFERENT models generate concurrently
+  // on the SAME physical GPU, which starved worker-1's light qwen2.5:3b into dozens of
+  // hard OLLAMA_TIMEOUTs while worker-reasoning's heavy qwen3.8:27b-q4_K_M ran alongside
+  // it. localOllamaLockKey() resolves to the actual Ollama ENDPOINT this call is going
+  // to (this process's own OLLAMA_URL), so both draft-class calls below now serialize
+  // against any other local model hitting that SAME endpoint, while a call to a genuinely
+  // different endpoint (e.g. the P40 VM's AGENT_MANAGER_P40_OLLAMA_URL, which sets its own
+  // OLLAMA_URL for that lane) still runs fully independently, exactly as before.
   const maybeLocked = (isLocal, fn, pass) => {
     if (!isLocal) return fn();
     if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', resolvedLabel, task.id, pass);
@@ -601,12 +626,15 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
       return fn();
     };
     if (usingInjectedLock) return withLockFn(instancesDir, run, resolvedLabel);
-    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: resolvedLabel, taskId: task.id, phase: pass }, run);
+    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: resolvedLabel, lockKey: localOllamaLockKey(), taskId: task.id, phase: pass }, run);
   };
 
-  // Same as maybeLocked but keyed on an EXPLICIT model tag, so a sub-call on a different
-  // model (e.g. the plan-critique's qwen2.5:3b) takes its OWN single-flight lock and runs
-  // in parallel with a main-model draft instead of queueing behind it.
+  // Same as maybeLocked but keyed on an EXPLICIT model tag for heartbeat/display purposes
+  // -- the real serialization key is still localOllamaLockKey() (the shared endpoint), not
+  // this model tag, so a sub-call on a different model (e.g. the plan-critique's
+  // qwen2.5:3b) no longer runs in parallel with a main-model draft on the SAME physical
+  // GPU (that was the exact class of concurrency this fix closes); it still runs in
+  // parallel with a draft on a genuinely SEPARATE endpoint.
   const maybeLockedOn = (model, fn, pass) => {
     const key = model || resolvedLabel;
     if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', key, task.id, pass);
@@ -615,7 +643,7 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
       return fn();
     };
     if (usingInjectedLock) return withLockFn(instancesDir, run, key);
-    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: key, taskId: task.id, phase: pass }, run);
+    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: key, lockKey: localOllamaLockKey(), taskId: task.id, phase: pass }, run);
   };
 
   return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn };
@@ -2010,7 +2038,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey };
 
 if (require.main === module) {
   main();
