@@ -39,7 +39,7 @@ class LocalToolClientError(RuntimeError):
 
 def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
                          allow_write: bool = False, primary_root: str = None,
-                         extra_roots: list = None) -> dict:
+                         extra_roots: list = None, allow_amplification: bool = False) -> dict:
     """Returns local-tool-client.js's own result shape:
     {response, toolCallLog, turnsUsed, toolsDisabled}.
 
@@ -61,6 +61,8 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
         request["primaryRoot"] = primary_root
     if extra_roots:
         request["extraRoots"] = list(extra_roots)
+    if allow_amplification:
+        request["allowAmplification"] = True
 
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     try:
@@ -98,7 +100,7 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
 def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns: int = 5,
                             source: str = None, allow_write: bool = False,
                             primary_root: str = None, extra_roots: list = None,
-                            force_summary_on_cap: bool = False):
+                            force_summary_on_cap: bool = False, allow_amplification: bool = False):
     """Generator sibling of run_plan_with_tools for the Chat panel's live-streamed replies
     (2026-08-26, Grimmethy: "vastly improve the chat system... Open WebUI" investigation --
     Open WebUI streams tokens over Socket.IO/SSE as they generate instead of blocking for
@@ -124,6 +126,8 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
         request["extraRoots"] = list(extra_roots)
     if force_summary_on_cap:
         request["forceSummaryOnCap"] = True
+    if allow_amplification:
+        request["allowAmplification"] = True
 
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     tmp_path.write_text(json.dumps(request), encoding="utf-8")

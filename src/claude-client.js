@@ -33,6 +33,8 @@ const { detectDegenerate } = require('./local-client.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
+const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
@@ -86,7 +88,7 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, conceptId = null }) {
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
   assertSubscriptionAuthAvailable();
   // cwd lets a caller run this against a real project directory instead of the
   // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
@@ -101,6 +103,9 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header) --
   // same treatment as local-client.js's callOnce(), the sibling chokepoint.
   let effectivePrompt = allowSideFindings ? injectSideFindingInstruction(prompt) : prompt;
+  // Incident Amplification (2026-09-08) -- opt-in, default false, same reasoning as
+  // local-client.js's callOnce().
+  if (allowAmplification) effectivePrompt = injectAmplificationInstruction(effectivePrompt);
   if (conceptId) effectivePrompt = injectConceptBuildInstruction(effectivePrompt);
   const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const args = [
@@ -240,6 +245,19 @@ async function call(opts, maxRetries = 2) {
         const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || null;
         for (const finding of findings) {
           writeSideFindingInbox(finding, { source: opts.source || 'claude', taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
+    if (opts.allowAmplification && result.response && result.response.includes('AMPLIFY:')) {
+      const { cleanText, requests } = extractAmplificationRequests(result.response);
+      result = { ...result, response: cleanText };
+      if (requests.length) {
+        const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || null;
+        for (const req of requests) {
+          runAmplificationSweep({
+            rootCauseSummary: req.rootCauseSummary, query: req.query, dir: req.dir,
+            excludeFiles: req.exclude, pipelineDir, source: opts.source || 'claude', taskId: opts.taskId,
+          });
         }
       }
     }

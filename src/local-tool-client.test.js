@@ -1375,3 +1375,51 @@ test('runPlanWithTools with allowSideFindings:false never extracts even if the r
     assert.equal(sideFindingInboxFiles(dir).length, 0);
   });
 });
+
+// --- incident amplification (2026-09-08) -----------------------------------------------
+
+test('runPlanWithTools does not inject AMPLIFY by default (allowAmplification defaults false)', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'do the task' });
+    assert.doesNotMatch(sentBodies[0].messages[0].content, /AMPLIFY:/);
+  });
+});
+
+test('runPlanWithTools injects AMPLIFY into the first message when allowAmplification is true', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'do the task', allowAmplification: true });
+    assert.match(sentBodies[0].messages[0].content, /AMPLIFY:/);
+  });
+});
+
+test('runPlanWithTools extracts an AMPLIFY block from the final response, runs a real sweep, and files one side-finding per matched site', async () => {
+  const prevGrepDirs = process.env.AGENT_MANAGER_GREP_DIRS;
+  process.env.AGENT_MANAGER_GREP_DIRS = '.';
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: "Real answer here.\n\nAMPLIFY: root cause\nQUERY: status: '\nDIR: ." },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'site-a.js'), "status: 'requeued'\n");
+      const result = await mod.runPlanWithTools({ prompt: 'go', source: 'chat', allowAmplification: true });
+      assert.equal(result.response.includes('AMPLIFY'), false);
+      assert.match(result.response, /Real answer here\./);
+      const files = sideFindingInboxFiles(dir);
+      assert.equal(files.length, 1);
+      assert.match(files[0].title, /site-a\.js/);
+      assert.equal(files[0].source, 'chat');
+    });
+  } finally {
+    if (prevGrepDirs === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS;
+    else process.env.AGENT_MANAGER_GREP_DIRS = prevGrepDirs;
+  }
+});
+
+test('runPlanWithTools with allowAmplification not set never extracts even if the response happens to contain the marker text', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'AMPLIFY: should not be extracted\nQUERY: x' },
+  ], async (mod, dir) => {
+    const result = await mod.runPlanWithTools({ prompt: 'classify this' });
+    assert.match(result.response, /AMPLIFY: should not be extracted/);
+    assert.equal(sideFindingInboxFiles(dir).length, 0);
+  });
+});

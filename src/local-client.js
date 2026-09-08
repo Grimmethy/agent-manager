@@ -17,6 +17,8 @@ const gpuCapacity = require('./gpu-capacity.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
+const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 
@@ -190,7 +192,7 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, conceptId = null }) {
+async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
@@ -199,6 +201,12 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // (`format` set) -- a constrained decode literally cannot emit free text, so the
   // instruction would just be wasted prompt tokens.
   let effectivePrompt = (allowSideFindings && !format) ? injectSideFindingInstruction(prompt) : prompt;
+  // Incident Amplification (2026-09-08, see incident-amplification-marker.js's own
+  // header): unlike SIDE-FINDING, this is opt-in (default false) -- it's a heavier,
+  // deliberate action (a real broad grep sweep + N filed brain-dump entries), not a cheap
+  // flag, so it shouldn't be prompted on every routine call, only where a caller has
+  // explicitly opted in (the Chat panel).
+  if (allowAmplification && !format) effectivePrompt = injectAmplificationInstruction(effectivePrompt);
   // Concept-build self-report (2026-09-06, see concepts.js's own header): only injected
   // when the CALLER opted this specific task into concept tracking (conceptId set) --
   // unlike side-finding, never on by default, since this is a deliberate audit tag, not
@@ -374,6 +382,19 @@ async function call(opts, maxRetries = 2) {
         const pipelineDir = resolvePipelineDir();
         for (const finding of findings) {
           writeSideFindingInbox(finding, { source: opts.source, taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
+    if (opts.allowAmplification && result.response && result.response.includes('AMPLIFY:')) {
+      const { cleanText, requests } = extractAmplificationRequests(result.response);
+      result = { ...result, response: cleanText };
+      if (requests.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const req of requests) {
+          runAmplificationSweep({
+            rootCauseSummary: req.rootCauseSummary, query: req.query, dir: req.dir,
+            excludeFiles: req.exclude, pipelineDir, source: opts.source, taskId: opts.taskId,
+          });
         }
       }
     }
