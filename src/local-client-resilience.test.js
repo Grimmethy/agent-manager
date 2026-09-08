@@ -21,6 +21,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 function withServer(handler, fn) {
   return new Promise((resolve, reject) => {
@@ -452,6 +455,43 @@ test('majorityVote() does NOT early-exit when only 1 vote has landed so far', as
       assert.equal(requestCount, 3, 'a single vote (count=1) must not trigger the early-exit -- all 3 calls still happen since nothing reached minAgreeing until the 3rd');
       assert.equal(result.verdict, 'reject'); // 2 REJECT vs 1 APPROVE
       assert.equal(result.confident, true);
+    }
+  );
+});
+
+// 2026-09-08, Second Brain [[dspy]] research applied: end-to-end confirmation that a real
+// hard call failure gets tagged and logged with a distinguishing code, not just re-thrown
+// silently. Uses its own real AGENT_MANAGER_REPO_ROOT (unlike freshLocalClient above,
+// which deliberately sets '' to skip the in-flight lock) so instances/hard-failure-audit.log
+// actually has somewhere to write.
+test('call() logs a tagged hard-failure entry to instances/hard-failure-audit.log on every failed attempt', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{"error":"always down"}'); });
+    },
+    async (base) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-hard-failure-test-'));
+      process.env.OLLAMA_URL = base;
+      process.env.LOCAL_MODEL = 'test-model';
+      process.env.ORNITH_TIMEOUT_MS = '5000';
+      process.env.AGENT_MANAGER_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+      delete require.cache[require.resolve('./local-client.js')];
+      const { call } = require('./local-client.js');
+
+      await assert.rejects(() => call({ prompt: 'x', think: false, source: 'pipeline_debrief', taskId: 't1', stage: 'implement' }, 1));
+
+      const logPath = path.join(dir, 'instances', 'hard-failure-audit.log');
+      assert.ok(fs.existsSync(logPath), 'the hard-failure audit log must exist after every attempt fails');
+      const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      assert.equal(lines.length, 2, 'one line per attempt (maxRetries=1 means 2 attempts total)');
+      for (const line of lines) {
+        assert.equal(line.code, 'OLLAMA_HTTP_ERROR');
+        assert.equal(line.statusCode, 503);
+        assert.equal(line.source, 'pipeline_debrief');
+        assert.equal(line.stage, 'implement');
+      }
     }
   );
 });

@@ -75,6 +75,37 @@ function logDegenerateAudit(entry) {
   }
 }
 
+// 2026-09-08, Second Brain [[dspy]] research applied (dspy/utils/exceptions.py's typed
+// LMError hierarchy, plus ollama-http.js's new OLLAMA_ERROR_CODES tagging): a HARD call
+// failure (timeout, connection refused, non-200) used to just get re-thrown after
+// call()'s retries were exhausted, with zero persistent trail -- unlike degenerate OUTPUT
+// just above, which this same file already logs per-attempt. This session diagnosed
+// THREE completely different root causes (P40 thermal throttling, host RAM starvation, a
+// model load-order eviction bug) that all surfaced as the identical generic symptom
+// ("Ollama request timed out") and each needed a fresh, multi-hour LIVE investigation to
+// tell apart. One NDJSON line per hard-failed attempt (not just the final re-thrown
+// error), tagged with ollama-http.js's own error `code`, means the NEXT occurrence of
+// this symptom is a `grep instances/hard-failure-audit.log` away from knowing which of
+// the known classes it is, or that it's a genuinely new one -- same "make it grep-able
+// instead of manual archaeology" discipline as logDegenerateAudit and every other audit
+// log this pipeline has accumulated. Deliberately a SEPARATE file from degenerate-audit.log
+// -- a call that never got a response at all and a call that got a real-but-bad response
+// are different failure classes with different fixes.
+function logHardFailureAudit(entry) {
+  try {
+    const pipelineDir = resolvePipelineDir();
+    if (!pipelineDir) return;
+    const dir = path.join(pipelineDir, 'instances');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, 'hard-failure-audit.log'),
+      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+    );
+  } catch {
+    // best-effort audit trail -- must never break the real call
+  }
+}
+
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
 // should be fully interchangeable and their names should not be hardcoded anywhere") --
@@ -336,6 +367,11 @@ async function call(opts, maxRetries = 2) {
       result = await callOnce(callOpts);
     } catch (e) {
       lastError = e;
+      logHardFailureAudit({
+        source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+        model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode,
+      });
       continue;
     }
     gotAnyResponse = true;
@@ -468,7 +504,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, KEEP_ALIVE };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

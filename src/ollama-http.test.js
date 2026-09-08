@@ -10,7 +10,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { postJson } = require('./ollama-http.js');
+const { postJson, OLLAMA_ERROR_CODES } = require('./ollama-http.js');
 
 function withServer(handler, fn) {
   return new Promise((resolve, reject) => {
@@ -105,6 +105,97 @@ test('postJson rejects (rather than crashing the process) when the response stre
       await assert.rejects(() => postJson(`${base}/api/generate`, { a: 1 }, 5000));
     }
   );
+});
+
+// 2026-09-08, Second Brain [[dspy]] research applied: this session diagnosed 3 completely
+// different root causes that all surfaced as the identical generic "Ollama request timed
+// out" message, each needing a fresh multi-hour live investigation to tell apart. These
+// tests confirm every real failure path now carries a distinguishing `code`, so a future
+// occurrence is a `grep` away from knowing which known class it is.
+test('postJson tags a non-200 response with OLLAMA_HTTP_ERROR and the real statusCode', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{"error":"down"}'); });
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+        assert.fail('must reject');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.HTTP_ERROR);
+        assert.equal(e.statusCode, 503);
+      }
+    }
+  );
+});
+
+test('postJson tags an unparseable 200 response with OLLAMA_BAD_JSON', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('not json'); });
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+        assert.fail('must reject');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.BAD_JSON);
+      }
+    }
+  );
+});
+
+test('postJson tags a mid-body disconnect with a distinguishing code (STREAM_ERROR or CONNECTION_ERROR -- Node routes a server-destroyed socket through either depending on timing, never left untagged)', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write('{"partial":');
+        res.destroy(new Error('simulated ECONNRESET mid-body'));
+      });
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+        assert.fail('must reject');
+      } catch (e) {
+        assert.ok(
+          [OLLAMA_ERROR_CODES.STREAM_ERROR, OLLAMA_ERROR_CODES.CONNECTION_ERROR].includes(e.code),
+          `expected a mid-transfer disconnect code, got ${e.code}`,
+        );
+      }
+    }
+  );
+});
+
+test('postJson tags a socket timeout with OLLAMA_TIMEOUT and the real timeoutMs', async () => {
+  await withServer(
+    (req, res) => {
+      // never respond -- forces the client-side socket timeout
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 200);
+        assert.fail('must reject');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT);
+        assert.equal(e.timeoutMs, 200);
+      }
+    }
+  );
+});
+
+test('postJson tags a request-level connection error (nothing listening) with OLLAMA_CONNECTION_ERROR', async () => {
+  try {
+    await postJson('http://127.0.0.1:1/api/generate', { a: 1 }, 5000); // port 1 -- guaranteed nothing listens
+    assert.fail('must reject');
+  } catch (e) {
+    assert.equal(e.code, OLLAMA_ERROR_CODES.CONNECTION_ERROR);
+    assert.ok(e.nodeCode, 'the underlying Node error code (e.g. ECONNREFUSED) is preserved');
+  }
 });
 
 test('postJson works with no extraHeaders (backward compatible)', async () => {
