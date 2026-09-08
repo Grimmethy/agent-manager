@@ -357,11 +357,55 @@ test('staticCheckScriptExtractMove: an unresolvable symbol -> ok:false with the 
   });
 });
 
-test('staticCheckScriptExtractMove: returns null (advisory-only) for a non-.html source or a missing file', () => {
+test('staticCheckScriptExtractMove: returns null (advisory-only) for an unsupported source type or a missing file', () => {
   const dir = tmpRepo();
   withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
     assert.equal(staticCheckScriptExtractMove(dir, 'src/app.py', ['x']), null);
     assert.equal(staticCheckScriptExtractMove(dir, 'python/dashboard/templates/index.html', ['x']), null, 'file does not exist yet');
+    assert.equal(staticCheckScriptExtractMove(dir, 'src/does-not-exist.js', ['x']), null, 'a real .js extension but a missing file');
+  });
+});
+
+// 2026-09-08, Grimmethy: "Yes, please build it" -- root-caused live: a review-task.js
+// (plain .js) decompose had every move fall back to move.kind:'module-extract' (no
+// deterministic apply path at all) purely because this function was gated on `.html`.
+function writeJs(dir, relPath, content) {
+  const abs = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, content);
+}
+
+test('staticCheckScriptExtractMove: a plain .js source is now checkable too (every symbol resolves cleanly -> ok:true)', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'src/review-task.js', "'use strict';\n\nfunction isEmptyApprovalSource() {\n  return true;\n}\n\nfunction isAdvisoryProseSource() {\n  return false;\n}\n");
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    const result = staticCheckScriptExtractMove(dir, 'src/review-task.js', ['isEmptyApprovalSource', 'isAdvisoryProseSource']);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.missing, []);
+  });
+});
+
+test('staticCheckScriptExtractMove: a plain .js source with an unresolvable symbol -> ok:false with the exact reason', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'src/review-task.js', 'function realOne() {}\n');
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    const result = staticCheckScriptExtractMove(dir, 'src/review-task.js', ['realOne', 'doesNotExist']);
+    assert.equal(result.ok, false);
+    assert.equal(result.missing.length, 1);
+    assert.match(result.missing[0], /doesNotExist/);
+  });
+});
+
+test('staticCheckScriptExtractMove: .mjs and .cjs sources are also checkable', () => {
+  const dir = tmpRepo();
+  for (const ext of ['.mjs', '.cjs']) {
+    writeJs(dir, `src/thing${ext}`, 'function realOne() {}\n');
+  }
+  withEnv(dir, {}, ({ staticCheckScriptExtractMove }) => {
+    for (const ext of ['.mjs', '.cjs']) {
+      const result = staticCheckScriptExtractMove(dir, `src/thing${ext}`, ['realOne']);
+      assert.equal(result.ok, true, `${ext} should resolve cleanly`);
+    }
   });
 });
 
@@ -381,6 +425,24 @@ test('validatePlan + fileHub: a script-extract move with every symbol resolvable
   assert.equal(move.promptContext.deterministicApply, 'script-extract');
   assert.equal(move.promptContext.sourceFile, 'python/dashboard/templates/index.html');
   assert.deepEqual(move.promptContext.symbols, ['renderHardwareTab']);
+});
+
+test('validatePlan + fileHub: a plain .js source script-extract move ALSO gets deterministicApply stamped, no LLM instructions in rawText', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'src/review-task.js', "'use strict';\n\nfunction isEmptyApprovalSource() {\n  return true;\n}\n");
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'se3.json'), JSON.stringify({
+    id: 'decompose-se3',
+    sourceFile: 'src/review-task.js',
+    moves: [{ newFile: 'src/lib/review-validation.js', kind: 'script-extract', symbols: ['isEmptyApprovalSource'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  const moveFile = adhoc.find((n) => n.includes('review-validation-js') && !n.includes('wiring'));
+  const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', moveFile), 'utf8'));
+  assert.equal(move.promptContext.deterministicApply, 'script-extract');
+  assert.equal(move.promptContext.sourceFile, 'src/review-task.js');
+  assert.deepEqual(move.promptContext.symbols, ['isEmptyApprovalSource']);
 });
 
 test('validatePlan + fileHub: an unresolvable symbol in a script-extract move blocks the whole hub (hardProblems), same as the .py path', () => {

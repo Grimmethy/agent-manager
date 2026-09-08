@@ -96,10 +96,11 @@ function staticCheckMove(repoRoot, sourceFile, symbols) {
 }
 
 // Same idea as staticCheckMove above, for a script-extract move: does every named symbol
-// resolve to a real, unambiguous top-level function in the source template's inline
-// <script> block, via script-extract.js's real V8-parser oracle (the same logic
-// scripts/extract-core-ui.js already uses)? Returns null when it can't check (non-.html
-// source, missing file) -- advisory-only, same convention as the .py path.
+// resolve to a real, unambiguous top-level function in the source's inline <script> block
+// (HTML) or the source file itself (plain .js/.mjs/.cjs), via script-extract.js's real
+// V8-parser oracle (the same logic scripts/extract-core-ui.js already uses)? Returns null
+// when it can't check (unsupported source type, missing file) -- advisory-only, same
+// convention as the .py path.
 //
 // 2026-09-07 ("Ghost in the Machine" concept): this is what lets a script-extract move
 // get caught HERE, at plan-validation time, instead of after a wasted multi-tier LLM
@@ -108,14 +109,23 @@ function staticCheckMove(repoRoot, sourceFile, symbols) {
 // of the 26 resolves cleanly via this exact check (confirmed live re-running it against
 // the real file). A hard problem here blocks the whole plan for a human to fix the
 // symbol list, exactly like the .py path's own "not defined at module scope" hard-stop.
+//
+// 2026-09-08, Grimmethy: "Yes, please build it" -- extended past .html. Root-caused live:
+// a review-task.js (plain .js) decompose had every one of its moves fall back to
+// move.kind:'module-extract' (the one category with NO deterministic apply path at all),
+// purely because this function's own `.html`-only gate made it return null before
+// moveTemplateFor's kind assignment even had a chance to matter -- see script-extract.js's
+// own header for the fuller incident. script-extract.js's V8-oracle technique has nothing
+// HTML-specific in it; only the <script>-block-finding step did.
 function staticCheckScriptExtractMove(repoRoot, sourceFile, symbols) {
-  if (!/\.html$/.test(sourceFile)) return null;
+  const isHtml = /\.html?$/.test(sourceFile);
+  if (!isHtml && !/\.(js|mjs|cjs)$/.test(sourceFile)) return null;
   const abs = path.join(repoRoot, sourceFile);
   if (!fs.existsSync(abs)) return null;
   let html;
   try { html = fs.readFileSync(abs, 'utf8'); } catch { return null; }
   const { locateFunctions } = require('./script-extract.js');
-  const located = locateFunctions(html, symbols);
+  const located = locateFunctions(html, symbols, { isHtml });
   if (located.error) return { ok: false, missing: symbols, resolvable: false };
   const missing = located.results.filter((r) => r.status !== 'OK').map((r) => `${r.name} (${r.status})`);
   return { ok: missing.length === 0, missing, resolvable: true };

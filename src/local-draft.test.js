@@ -1187,6 +1187,55 @@ test('a script-extract move task with every symbol resolvable is applied determi
   });
 });
 
+// 2026-09-08, Grimmethy: "Yes, please build it" -- a plain .js source now ALSO gets this
+// deterministic short-circuit (was model-driven agentic-write only, no deterministic
+// apply path at all -- see script-extract.js's own header for the review-task.js
+// incident this fixes).
+function writeJsWithFunctions(dir, relPath, content) {
+  const abs = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, content);
+}
+
+test('a script-extract move task on a PLAIN .js source is applied deterministically -- zero model calls', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeJsWithFunctions(dir, 'src/review-task.js',
+      "'use strict';\n\nfunction isEmptyApprovalSource() {\n  return true;\n}\n\nfunction keepMe() {\n  return 2;\n}\n\nmodule.exports = { isEmptyApprovalSource, keepMe };\n");
+    makeGitOriginFor(dir);
+    const task = {
+      id: 'script-extract-js-test-1', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: {
+        deterministicApply: 'script-extract',
+        sourceFile: 'src/review-task.js',
+        newFile: 'src/lib/review-validation.js',
+        symbols: ['isEmptyApprovalSource'],
+      },
+    };
+    let callCount = 0;
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(callCount, 0, 'no model call at all for a fully deterministic plain-.js move either');
+    const parsed = JSON.parse(task.implementResponse);
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0].mode, 'create');
+    assert.equal(parsed[0].file, 'src/lib/review-validation.js');
+    assert.match(parsed[0].content, /function isEmptyApprovalSource/);
+    assert.equal(parsed[1].mode, 'edit');
+    assert.equal(parsed[1].file, 'src/review-task.js');
+    assert.doesNotMatch(parsed[1].replace, /function isEmptyApprovalSource/, 'the symbol must be removed from the source in the replacement');
+    assert.match(parsed[1].replace, /function keepMe/, 'an un-named symbol must stay behind');
+    assert.match(parsed[1].replace, /^'use strict';/, 'content before the moved function must be preserved');
+    assert.ok(task.rawDiff, 'task.rawDiff must be set -- this is the field adhoc apply actually reads');
+    assert.match(task.rawDiff, /diff --git/);
+    assert.match(task.rawDiff, /review-validation\.js/);
+    assert.equal(task.adhocResolution, 'implemented');
+  });
+});
+
 test('a script-extract move task falls through to the normal path when the file has drifted since plan-validation (symbol no longer resolvable)', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     // The symbol named in promptContext is no longer there -- simulates an earlier

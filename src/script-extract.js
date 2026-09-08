@@ -20,6 +20,21 @@
 // header: it eliminates the "hand-rolled lexer desyncs on a template literal / regex
 // literal" bug class by construction, since V8 understands every real JS construct with
 // full fidelity no hand-rolled state machine can match.
+//
+// 2026-09-08, Grimmethy: "Yes, please build it" -- extended to plain .js/.mjs/.cjs source
+// files, not just JS embedded in an HTML <script> block. Root-caused live: a file-
+// decompose hub splitting src/review-task.js (a plain .js file) had every one of its
+// moves fall back to move.kind:'module-extract' -- the ONLY category with no deterministic
+// apply path at all -- purely because moveTemplateFor (file-decompose-plan-pass.js) and
+// staticCheckScriptExtractMove (file-decompose-to-hub.js) both hard-gated this whole
+// mechanism on `.html`. The V8-oracle technique above has nothing HTML-specific in it --
+// locateFunction/parsesCleanly/findParamsClose/findBodyClose already operate on a plain
+// string of JS. The ONLY genuinely HTML-specific work was finding/rewriting the <script>
+// block itself; every function below now takes an `isHtml` option (default true, so every
+// existing caller's behavior is byte-for-byte unchanged) that skips straight to treating
+// the WHOLE source as one script scope when false -- exactly the fix this exact incident
+// needed: a plain .js decompose can now skip the model-driven agentic-write tier entirely
+// for its actual symbol moves, the same way an .html decompose already could.
 
 const vm = require('vm');
 
@@ -38,6 +53,8 @@ function findScriptBlocks(html) {
   return blocks;
 }
 
+// Name is historical (predates plain-.js source support) -- purely a line-counter over
+// whatever text it's given, no HTML-specific behavior at all.
 function htmlLineFor(html, offset) {
   return html.slice(0, offset).split('\n').length;
 }
@@ -108,12 +125,22 @@ function locateFunction(body, name) {
 // a future target with more than one would need each searched in turn, not built here
 // since it isn't the current real shape. Returns per-name results plus the resolved
 // ranges (sorted by position, with an overlap check) -- pure, no file I/O.
-function locateFunctions(html, names) {
-  const blocks = findScriptBlocks(html);
-  if (blocks.length === 0) {
-    return { ok: false, error: 'no inline (non-src) <script> block found', results: [], ranges: [], block: null };
+//
+// isHtml:false (2026-09-08): `source` is a plain .js/.mjs/.cjs file, not JS embedded in
+// HTML -- the "block" is simply the whole file (offset 0, line 1). Every step below
+// (locateFunction, the V8 oracle, overlap detection) already operates on `block.body` as
+// an opaque string with no HTML assumptions baked in; only the block-FINDING step differs.
+function locateFunctions(source, names, { isHtml = true } = {}) {
+  let block;
+  if (isHtml) {
+    const blocks = findScriptBlocks(source);
+    if (blocks.length === 0) {
+      return { ok: false, error: 'no inline (non-src) <script> block found', results: [], ranges: [], block: null };
+    }
+    [block] = blocks;
+  } else {
+    block = { body: source, bodyStart: 0, openLine: 1 };
   }
-  const block = blocks[0];
 
   const results = [];
   const ranges = [];
@@ -123,8 +150,8 @@ function locateFunctions(html, names) {
       results.push({ name, status: loc.problem });
       continue;
     }
-    const startLine = htmlLineFor(html, block.bodyStart + loc.start);
-    const endLine = htmlLineFor(html, block.bodyStart + loc.end);
+    const startLine = htmlLineFor(source, block.bodyStart + loc.start);
+    const endLine = htmlLineFor(source, block.bodyStart + loc.end);
     ranges.push({ name, start: loc.start, end: loc.end, startLine, endLine });
     results.push({ name, status: 'OK', startLine, endLine });
   }
@@ -141,13 +168,19 @@ function locateFunctions(html, names) {
   return { ok, results, ranges, block };
 }
 
-// Pure extraction: given the full HTML text and an ordered list of function names, either
-// resolves ALL of them cleanly and returns the new file content + rewritten HTML, or
-// returns ok:false with the exact per-name problems -- never a partial result. This is
-// what both the CLI's --write and the deterministic apply path share; neither one ever
-// writes anything unless every symbol resolved.
-function buildExtraction(html, names, { newFileUrl } = {}) {
-  const located = locateFunctions(html, names);
+// Pure extraction: given the full source text and an ordered list of function names,
+// either resolves ALL of them cleanly and returns the new file content + rewritten
+// original, or returns ok:false with the exact per-name problems -- never a partial
+// result. This is what both the CLI's --write and the deterministic apply path share;
+// neither one ever writes anything unless every symbol resolved.
+//
+// isHtml:false (2026-09-08): `source` is a plain .js/.mjs/.cjs file. The located block IS
+// the whole file (bodyStart 0), so the rewritten body already IS the new whole-file
+// content -- there is no <script> tag or insertion point to rewrite. Returned as
+// `newSource` (not `newHtml`, which stays HTML-specific) so a caller can't mistake one
+// shape for the other.
+function buildExtraction(html, names, { newFileUrl, isHtml = true } = {}) {
+  const located = locateFunctions(html, names, { isHtml });
   if (!located.ok) {
     return { ok: false, problems: located.results.filter((r) => r.status !== 'OK'), results: located.results };
   }
@@ -164,6 +197,10 @@ function buildExtraction(html, names, { newFileUrl } = {}) {
     newBody = newBody.slice(0, r.start) + newBody.slice(end);
   }
   newBody = newBody.replace(/\n{3,}/g, '\n\n');
+
+  if (!isHtml) {
+    return { ok: true, newFileContent, newSource: newBody, results: located.results };
+  }
 
   const before = html.slice(0, block.bodyStart);
   const after = html.slice(block.bodyStart + block.body.length);

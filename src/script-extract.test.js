@@ -130,6 +130,71 @@ test('buildExtraction returns ok:false with the exact per-name problems when any
   assert.equal(extraction.newFileContent, undefined, 'must not construct a partial result');
 });
 
+// --- isHtml:false -- plain .js/.mjs/.cjs source, not embedded in HTML ------------------
+// 2026-09-08, Grimmethy: "Yes, please build it" -- root-caused live: a file-decompose hub
+// splitting src/review-task.js (a plain .js file) had every move fall back to the ONE
+// category with no deterministic apply path at all, purely because this whole mechanism
+// was gated on `.html`. See script-extract.js's own header for the full incident.
+
+test('locateFunctions with isHtml:false treats the WHOLE source as one script scope, no <script> block required', () => {
+  const js = 'function a() { return 1; }\n\nfunction b() { return 2; }\n';
+  const result = locateFunctions(js, ['a', 'b'], { isHtml: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.results.every((r) => r.status === 'OK'), true);
+  assert.equal(result.block.bodyStart, 0);
+  assert.equal(result.block.body, js);
+});
+
+test('locateFunctions with isHtml:false (default true unchanged) still requires a real function, reporting the same problem shape', () => {
+  const js = 'function a() { return 1; }\n';
+  const result = locateFunctions(js, ['a', 'missing'], { isHtml: false });
+  assert.equal(result.ok, false);
+  assert.equal(result.results.find((r) => r.name === 'missing').status, 'declaration not found at top level');
+});
+
+test('buildExtraction with isHtml:false returns newSource (the whole rewritten file), not newHtml', () => {
+  const js = 'function a() { return 1; }\n\nfunction b() { return 2; }\n\nfunction c() { return 3; }\n';
+  const extraction = buildExtraction(js, ['a', 'c'], { isHtml: false });
+  assert.equal(extraction.ok, true);
+  assert.equal(extraction.newHtml, undefined, 'must not populate the HTML-specific field for a plain JS source');
+  assert.match(extraction.newFileContent, /function a/);
+  assert.match(extraction.newFileContent, /function c/);
+  assert.doesNotMatch(extraction.newFileContent, /function b/);
+  assert.doesNotMatch(extraction.newSource, /function a/);
+  assert.doesNotMatch(extraction.newSource, /function c/);
+  assert.match(extraction.newSource, /function b/, 'the function NOT named must stay behind');
+});
+
+test('buildExtraction with isHtml:false preserves content before/after the moved functions exactly, including requires and exports', () => {
+  const js = [
+    "'use strict';",
+    '',
+    "const fs = require('fs');",
+    '',
+    'function keep() { return 0; }',
+    '',
+    'function moveMe() { return 1; }',
+    '',
+    'module.exports = { keep, moveMe };',
+    '',
+  ].join('\n');
+  const extraction = buildExtraction(js, ['moveMe'], { isHtml: false });
+  assert.equal(extraction.ok, true);
+  assert.match(extraction.newSource, /^'use strict';/);
+  assert.match(extraction.newSource, /require\('fs'\)/);
+  assert.match(extraction.newSource, /function keep/);
+  assert.doesNotMatch(extraction.newSource, /function moveMe/);
+  assert.match(extraction.newSource, /module\.exports = \{ keep, moveMe \};/, 'export list itself is left untouched -- wiring is a separate step');
+  assert.match(extraction.newFileContent, /function moveMe/);
+});
+
+test('buildExtraction with isHtml:false never inserts a <script> tag (there is no such concept for a plain module)', () => {
+  const js = 'function a() { return 1; }\n';
+  const extraction = buildExtraction(js, ['a'], { isHtml: false, newFileUrl: '/static/js/x.js' });
+  assert.equal(extraction.ok, true);
+  assert.doesNotMatch(extraction.newSource, /<script/);
+});
+
 // Regression, real incident (2026-09-07): 11 of 26 symbols in a real decompose move were
 // reported "not found" by a model's own hand-rolled scanner; every one of the 26 actually
 // resolves cleanly via this module. Proves the oracle approach handles a realistic mix of
