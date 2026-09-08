@@ -13,6 +13,7 @@ that make no model call at all).
 Run: .venv/bin/python -m unittest python.dashboard.test_completed_tasks_log -v
 """
 import json
+import sqlite3
 import sys
 import time
 import unittest
@@ -180,6 +181,94 @@ class TestReviewerRecentTasksReadsRealHistory(CompletedTasksLogTestBase):
         with mock.patch.object(app, "model_stats_db_path", return_value=None):
             resp = self.client.get("/api/instances/worker-1/recent-tasks")
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"tasks": []})
+
+
+def _make_model_calls_db(db_path, rows):
+    """rows: list of (call_id, task_id, instance_id, started_at, outcome) -- outcome may
+    be None, matching a call that never got a review-time recordOutcome (see
+    _recent_task_ids_for_instance's own header for why that's the common real case)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE model_calls (
+            call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT,
+            started_at TEXT NOT NULL, outcome TEXT, outcome_stage TEXT, outcome_at TEXT,
+            instance_id TEXT
+        )
+    """)
+    for call_id, task_id, instance_id, started_at, outcome in rows:
+        conn.execute(
+            "INSERT INTO model_calls (call_id, task_id, instance_id, started_at, model, outcome) VALUES (?, ?, ?, ?, 'qwen2.5:3b', ?)",
+            (call_id, task_id, instance_id, started_at, outcome),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestWorkerRecentTasksReadsRealHistoryNotOutcomeColumn(CompletedTasksLogTestBase):
+    """The bug (2026-09-08, Grimmethy: "Worker-1 and Worker-reasoning have the same
+    problem. All task history information is stale."): outcome/outcome_stage are only
+    populated on a model_calls row when review-task.js's recordModelOutcome actually
+    runs against it (a reviewed approve/reject verdict) -- a draft that resolves as a
+    no-op/stale-task short-circuit or any other non-reviewed terminal path leaves those
+    columns NULL forever, even though the task itself reached a real terminal state.
+    Confirmed live: worker-1's real db had its last outcome='approved' row from ~5 hours
+    before the report, while a much more recent call for the same worker existed with
+    outcome IS NULL because that call's real resolution was a stale-task no-op."""
+
+    def setUp(self):
+        super().setUp()
+        self._db_tmp = TemporaryDirectory()
+        self.db_path = Path(self._db_tmp.name) / "model-stats.db"
+        self._patches.append(mock.patch.object(app, "model_stats_db_path", return_value=self.db_path))
+        self._patches[-1].start()
+
+    def tearDown(self):
+        self._db_tmp.cleanup()
+        super().tearDown()
+
+    def test_null_outcome_call_still_surfaces_the_tasks_real_current_state(self):
+        self._write_done("recent-noop", history=[
+            {"stage": "applied", "at": "2026-09-08T05:23:00Z"},
+            {"stage": "noop", "at": "2026-09-08T05:23:51Z"},
+        ], extra={"terminalDisposition": None, "status": "noop", "draftModel": "qwen3.8:27b-q4_K_M"})
+        _make_model_calls_db(self.db_path, [
+            ("c-old", "old-approved-task", "worker-1", "2026-09-08T00:31:00Z", "approved"),
+            ("c-new", "recent-noop", "worker-1", "2026-09-08T05:15:00Z", None),
+        ])
+        resp = self.client.get("/api/instances/worker-1/recent-tasks")
+        data = resp.get_json()
+        # The stale outcome='approved' row must not win just because it's the only one
+        # with a non-null outcome column -- the real most-recent activity (by started_at)
+        # comes first, with its outcome read from the task's own current record.
+        self.assertEqual(data["tasks"][0]["taskId"], "recent-noop")
+        self.assertEqual(data["tasks"][0]["outcome"], "noop")
+
+    def test_task_still_in_flight_is_excluded_not_treated_as_completed(self):
+        # No queue/done/ file at all for this task_id -- it's not found anywhere, so it
+        # must be skipped rather than surfaced with blank/garbage fields.
+        _make_model_calls_db(self.db_path, [
+            ("c1", "still-drafting-task", "worker-1", "2026-09-08T05:30:00Z", None),
+        ])
+        resp = self.client.get("/api/instances/worker-1/recent-tasks")
+        self.assertEqual(resp.get_json()["tasks"], [])
+
+    def test_only_returns_tasks_for_the_requested_instance(self):
+        self._write_done("mine", extra={"draftModel": "qwen2.5:3b"})
+        self._write_done("theirs", extra={"draftModel": "qwen3.8:27b-q4_K_M"}, mtime_offset=1)
+        _make_model_calls_db(self.db_path, [
+            ("c1", "mine", "worker-1", "2026-09-08T05:00:00Z", "approved"),
+            ("c2", "theirs", "worker-reasoning", "2026-09-08T05:01:00Z", "approved"),
+        ])
+        resp = self.client.get("/api/instances/worker-1/recent-tasks")
+        self.assertEqual([t["taskId"] for t in resp.get_json()["tasks"]], ["mine"])
+
+    def test_no_instance_id_column_degrades_to_empty_list(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT, started_at TEXT)")
+        conn.commit()
+        conn.close()
+        resp = self.client.get("/api/instances/worker-1/recent-tasks")
         self.assertEqual(resp.get_json(), {"tasks": []})
 
 
