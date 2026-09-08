@@ -196,21 +196,34 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
     return { stage: 'applied-direct', detail: `directToMain apply: ${detail}`.slice(0, 200) };
   }
 
-  // 3. An agent/<id> branch still around?
+  // 3. An agent/<id> branch still around? A stacked file-decompose sub-task (see
+  //    file-decompose-to-hub.js) shares ONE branch across its whole move sequence --
+  //    record.stacked.branch, e.g. "agent/decompose-<plan-slug>" -- NOT agent/<own id>.
+  //    2026-09-08, root-caused live: this fell straight through to the 'abandoned'
+  //    verdict below for a real, still-open, reviewed stacked sub-task, because
+  //    buildShipContext's branchAhead map is keyed by the REAL branch name (shared
+  //    across the whole stack), which never matches an individual sub-task's own id --
+  //    `ctx.branchAhead.has(taskId)` was structurally guaranteed false for every stacked
+  //    sub-task that ever existed, not just this one. Prefer the real branch name when
+  //    the record carries one; fall back to agent/<taskId> for a normal (non-stacked)
+  //    apply, unchanged from before.
   if (taskId) {
+    const realBranch = record.stacked && record.stacked.branch;
+    const branchKey = realBranch ? realBranch.replace(/^agent\//, '') : taskId;
+    const branchLabel = realBranch || `agent/${taskId}`;
     let exists = false;
     let ahead = 0;
     if (ctx) {
-      exists = ctx.branchAhead.has(taskId);
-      ahead = ctx.branchAhead.get(taskId) || 0;
+      exists = ctx.branchAhead.has(branchKey);
+      ahead = ctx.branchAhead.get(branchKey) || 0;
     } else if (repoRoot) {
-      ({ exists, ahead } = branchAheadCount(git, repoRoot, mainBranch, `agent/${taskId}`));
+      ({ exists, ahead } = branchAheadCount(git, repoRoot, mainBranch, branchLabel));
     }
     if (exists && ahead > 0) {
-      return { stage: 'pending-merge', detail: `agent/${taskId} is ${ahead} commit(s) ahead of ${mainBranch}, not merged` };
+      return { stage: 'pending-merge', detail: `${branchLabel} is ${ahead} commit(s) ahead of ${mainBranch}, not merged` };
     }
     if (exists && ahead === 0) {
-      return { stage: 'merged', detail: `agent/${taskId} fully contained in ${mainBranch} (branch not ahead)` };
+      return { stage: 'merged', detail: `${branchLabel} fully contained in ${mainBranch} (branch not ahead)` };
     }
   }
 
