@@ -6,8 +6,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const { execFileSync } = require('child_process');
 const {
   autoConfirmReview, classifyVote, parseDeleteItems, buildForensicsConfirmPrompt, buildDebriefConfirmPrompt,
+  gatherDeleteReferences,
 } = require('./auto-confirm-review.js');
 
 function makePipeline() {
@@ -243,4 +245,46 @@ test('kill switch: AGENT_MANAGER_AUTO_CONFIRM_REVIEW=false returns early, touche
     if (prev === undefined) delete process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW;
     else process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW = prev;
   }
+});
+
+// --- gatherDeleteReferences: stacked-branch grounding (2026-09-08 incident) -------------
+// A stacked task's delete-reference scan used to always grep repoRoot's plain working tree
+// (main) -- a real reference to the file-being-deleted, added by a sibling task and sitting
+// only on the shared stacked branch, was invisible, making a delete look safer than it is.
+
+function makeGitRepoWithStackedBranch() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'auto-confirm-stacked-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'auto-confirm-stacked-repo-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, repoDir]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+  fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'src', 'old-module.js'), '// to be deleted\n');
+  execFileSync('git', ['add', '-A'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: repoDir });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-family'], { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'src', 'new-caller.js'), "const oldModule = require('./old-module.js');\n");
+  execFileSync('git', ['add', 'src/new-caller.js'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling adds a real reference'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-family'], { cwd: repoDir });
+  execFileSync('git', ['checkout', 'main'], { cwd: repoDir });
+
+  return repoDir;
+}
+
+test('gatherDeleteReferences finds a stacked task\'s sibling-added reference living only on the stacked branch', () => {
+  const repoRoot = makeGitRepoWithStackedBranch();
+  const task = { id: 't-stacked', stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 } };
+  const refs = gatherDeleteReferences(repoRoot, ['src'], ['src/old-module.js'], task);
+  assert.match(refs['src/old-module.js'], /possible reference line/);
+  assert.match(refs['src/old-module.js'], /new-caller\.js/);
+});
+
+test('gatherDeleteReferences reports no references for a NON-stacked task (the sibling reference only exists on another branch)', () => {
+  const repoRoot = makeGitRepoWithStackedBranch();
+  const refs = gatherDeleteReferences(repoRoot, ['src'], ['src/old-module.js']);
+  assert.match(refs['src/old-module.js'], /no references found/);
 });

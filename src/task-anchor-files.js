@@ -19,6 +19,7 @@
 const fs = require('fs');
 const path = require('path');
 const { extractForbiddenPaths } = require('./adhoc-diff-sanity.js');
+const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 
 const DEFAULT_PREFIXES = ['', 'src/', 'python/', 'python/dashboard/', 'python/dashboard/templates/', 'scripts/', 'lib/', 'docs/', 'docs/adr/'];
 const MAX_FILES = 6;
@@ -247,14 +248,23 @@ function taskAnchorFiles(task, repoRoot, { maxFiles = MAX_FILES, maxCharsPerFile
 
   const idents = taskIdentifiers(rawText);
   const preferTailGlobal = WINDOW_TAIL_CUES.test(rawText);
+  // 2026-09-08, root-caused live: this used to always read whatever's checked out at
+  // repoRoot on disk (usually main). For a stacked task, the file its sibling already
+  // committed can genuinely only exist on the shared stacked branch -- reading main gave
+  // a false "this file/symbol doesn't exist" grounding straight into the plan/implement
+  // prompt. null for any non-stacked task (the overwhelming majority), so behavior there
+  // is unchanged.
+  const groundingRef = resolveGroundingRef(task, repoRoot);
   const out = [];
   for (const rel of ordered) {
     if (out.length >= maxFiles) break;
     if (isForbidden(rel)) continue;
     const full = withinRoot(repoRoot, rel);
     if (!full) continue;
-    let content;
-    try { content = fs.readFileSync(full, 'utf8'); } catch { continue; }
+    let content = groundingRef ? readFileAtRef(repoRoot, groundingRef, rel) : null;
+    if (content === null) {
+      try { content = fs.readFileSync(full, 'utf8'); } catch { continue; }
+    }
     const hitLines = harnessHitLinesFor(task, rel, content);
     out.push({
       path: rel,

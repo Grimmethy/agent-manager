@@ -419,8 +419,26 @@ function isNamedServiceUrl(url, sourceText) {
 // hiccup would be worse than the false positive this exists to fix.
 const REPO_GREP_TIMEOUT_MS = 15_000;
 
-function existsLiterallyInRepo(value, repoRoot) {
+// 2026-09-08, root-caused live: this git-grep runs against repoRoot's plain WORKING TREE
+// checkout -- for a stacked task, that's whatever branch happens to be checked out there
+// (usually main), never the shared stacked branch a sibling task may have already
+// committed the cited value to. A stacked task correctly citing a sibling's real,
+// committed-but-unmerged value used to get "cites a value that appears nowhere in its real
+// grounding source" -- this gate's own comments call that "almost never a false positive,"
+// so the false positive was silent and hard-blocking. `ref`, when given (from
+// resolveGroundingRef -- null for any non-stacked task, so behavior there is unchanged),
+// checks the stacked branch's real tip via git's object database instead of the working
+// tree.
+function existsLiterallyInRepo(value, repoRoot, ref) {
   if (!repoRoot) return false;
+  if (ref) {
+    try {
+      const { grepAtRef } = require('./stacked-grounding.js');
+      return grepAtRef(repoRoot, ref, value) !== '';
+    } catch (e) {
+      return false; // could not confirm against the stacked ref -- treat as unconfirmed, not grounded.
+    }
+  }
   const { execFileSync } = require('child_process');
   try {
     execFileSync('git', ['grep', '-q', '-F', '-e', value], {
@@ -461,7 +479,7 @@ function stripUnchangedDiffLines(text) {
   }).join('\n');
 }
 
-function checkGroundedValues(draftText, sourceText, repoRoot) {
+function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
   const scannableText = stripUnchangedDiffLines(draftText);
@@ -474,7 +492,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
     if (PLACEHOLDER_RE.test(url)) continue;
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
-    if (existsLiterallyInRepo(url, repoRoot)) continue;
+    if (existsLiterallyInRepo(url, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-url', detail: url });
   }
 
@@ -484,7 +502,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
     if (newlyDeclared.has(field)) continue;
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
-    if (existsLiterallyInRepo(field, repoRoot)) continue;
+    if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });
   }
 
@@ -495,11 +513,11 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
 // this task; when provided, the grounded-value check runs against it.
-function checkDraft(draftText, repoRoot, sourceText, extraRoots = []) {
+function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
-  const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot);
+  const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
   const createModeTargets = extractCreateModeTargets(draftText);
   const commitChecks = checkCommitClaims(draftText, repoRoot);
 

@@ -15,6 +15,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
+const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
@@ -241,9 +242,16 @@ function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
 async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repoRoot, retriedForTurnBudget = false } = {}) {
   const resolvedRepoRoot = repoRoot || getConfig().repoRoot;
   const mainBranch = detectDefaultBranch(resolvedRepoRoot);
+  // 2026-09-08, root-caused live: a stacked task's worktree used to be built from
+  // origin/<mainBranch> unconditionally, so it could never see a sibling's already-
+  // committed work still sitting only on the shared (not-yet-merged) stacked branch --
+  // reported real files as "absent." resolveGroundingRef returns null for any non-stacked
+  // task (the overwhelming majority), so this falls straight through to the old behavior
+  // there; it only diverges when task.stacked.branch genuinely exists on origin.
+  const groundingBranch = resolveGroundingRef(task, resolvedRepoRoot) || mainBranch;
   const { worktreeDir, branchName } = agenticWorktreePaths(task.id);
 
-  const prep = prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchName);
+  const prep = prepareAdhocWorktree(resolvedRepoRoot, groundingBranch, worktreeDir, branchName);
   if (!prep.ok) return { succeeded: false, reason: prep.reason };
 
   try {

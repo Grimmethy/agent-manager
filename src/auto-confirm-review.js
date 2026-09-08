@@ -36,6 +36,7 @@ const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { batchContainsDeleteMode } = require('./apply-group-b.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { resolveGroundingRef, grepAtRef } = require('./stacked-grounding.js');
 
 const AUTO_CONFIRM_VOTES = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_VOTES) || 3;
 const AUTO_CONFIRM_MIN_AGREEING = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_MIN_AGREEING) || 2;
@@ -171,11 +172,18 @@ function parseDeleteItems(implementResponse) {
 // Deterministic reference scan: for each file being deleted, grep its repo-relative path
 // and its basename-sans-extension across grepDirs, excluding the file itself. Returns a
 // { file -> summary string } map fed into the prompt so the model isn't guessing.
-function gatherDeleteReferences(repoRoot, grepDirs, deleteFiles) {
+// 2026-09-08: `task`, when given and stacked, scans the shared stacked branch's own tip
+// (via git grep against the ref, same object-database read stacked-grounding.js's other
+// consumers use) instead of repoRoot's plain working tree -- otherwise a delete proposed
+// on a stacked branch could look unreferenced just because the referencing sibling file
+// hasn't been merged to main yet. null for any non-stacked task, so behavior there is
+// unchanged (plain filesystem `grep`, exactly as before).
+function gatherDeleteReferences(repoRoot, grepDirs, deleteFiles, task) {
   const dirs = (grepDirs && grepDirs.length ? grepDirs : ['src', 'python', 'scripts', 'docs'])
     .filter((d) => {
       try { return fs.existsSync(path.join(repoRoot, d)); } catch { return false; }
     });
+  const groundingRef = task ? resolveGroundingRef(task, repoRoot) : null;
   const out = {};
   for (const rel of deleteFiles) {
     const base = path.basename(rel).replace(/\.[^.]+$/, '');
@@ -183,6 +191,15 @@ function gatherDeleteReferences(repoRoot, grepDirs, deleteFiles) {
     const hits = [];
     for (const needle of needles) {
       if (!needle || needle.length < 3) continue;
+      if (groundingRef) {
+        try {
+          const raw = grepAtRef(repoRoot, groundingRef, needle, dirs);
+          for (const line of raw.split('\n')) {
+            if (line.trim() && !line.startsWith(`${rel}:`)) hits.push(line.trim());
+          }
+        } catch { /* could not confirm against the stacked ref -- fall through to no hits for this needle */ }
+        continue;
+      }
       try {
         const raw = execFileSync(
           'grep',
@@ -310,7 +327,7 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       prompt = buildDebriefConfirmPrompt(task);
       gateStamp = 'debriefReportConfirmedAt';
     } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
-      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file));
+      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file), task);
       prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
       gateStamp = 'deleteConfirmedAt';
     } else {

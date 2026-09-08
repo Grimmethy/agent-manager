@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { taskAnchorFiles, resolveBareFilename, backtickIdentifiers } = require('./task-anchor-files.js');
 
 function makeRepo(files) {
@@ -210,4 +211,55 @@ test('backtickIdentifiers extracts every distinct backtick-quoted name, in first
 
 test('backtickIdentifiers returns [] when the task names nothing in backticks', () => {
   assert.deepEqual(backtickIdentifiers('fix the bug in foo.js'), []);
+});
+
+// --- stacked-branch grounding (2026-09-08 incident) -------------------------------------
+// A stacked task's anchor file used to always be read from whatever's checked out on disk
+// at repoRoot (usually main) -- a sibling task's already-committed file, sitting only on
+// the shared stacked branch, read as "does not exist" and got silently dropped from the
+// grounding, since the read failure just `continue`s past that file.
+
+function makeGitRepoWithStackedBranch() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-stacked-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-stacked-repo-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, repoDir]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'README.md'), 'test');
+  execFileSync('git', ['add', 'README.md'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: repoDir });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-family'], { cwd: repoDir });
+  fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'src', 'sibling-new-file.js'), 'module.exports = { SIBLING_MARKER: true };\n');
+  execFileSync('git', ['add', 'src/sibling-new-file.js'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling commit'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-family'], { cwd: repoDir });
+  execFileSync('git', ['checkout', 'main'], { cwd: repoDir });
+
+  return repoDir;
+}
+
+test('taskAnchorFiles reads a stacked task\'s named file from its own stacked branch, not main', () => {
+  const dir = makeGitRepoWithStackedBranch();
+  const task = {
+    source: 'manual',
+    promptContext: { rawText: 'Wire up src/sibling-new-file.js.', prefetchedPaths: ['src/sibling-new-file.js'] },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const files = taskAnchorFiles(task, dir);
+  assert.deepEqual(files.map((f) => f.path), ['src/sibling-new-file.js']);
+  assert.match(files[0].content, /SIBLING_MARKER/);
+});
+
+test('taskAnchorFiles falls back to the plain working tree for a NON-stacked task (unchanged behavior)', () => {
+  const dir = makeGitRepoWithStackedBranch();
+  const task = {
+    source: 'manual',
+    promptContext: { rawText: 'Wire up src/sibling-new-file.js.', prefetchedPaths: ['src/sibling-new-file.js'] },
+  };
+  const files = taskAnchorFiles(task, dir);
+  assert.deepEqual(files, [], 'a non-stacked task reading main should never see a file that only exists on some other branch');
 });
