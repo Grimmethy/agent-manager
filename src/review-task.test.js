@@ -657,6 +657,33 @@ test('reviewTask deterministically rejects a draft citing a URL not present anyw
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known hallucinated URL');
 });
 
+// 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: this
+// gate's own header comment calls itself "high-precision, almost never a false positive,"
+// but this session found 4 confirmed false positives against that exact claim, discovered
+// only by manually grepping every historical hard-block. One NDJSON line per hard block
+// means the next investigation is `grep instances/fact-check-audit.log`, not archaeology
+// across queue/done/.
+test('reviewTask appends one NDJSON line to instances/fact-check-audit.log every time the ungrounded-value gate hard-blocks', async () => {
+  const { repoRoot, domainsPath, dir } = makeFixture();
+  const task = {
+    id: 'audit-log-test-1', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Real findings, citing https://totally-made-up-source.example-nonexistent.test/page for support.',
+    promptContext: { body: 'Some real grounding text with no URLs in it at all.' },
+  };
+  await reviewTask(task, { repoRoot, domainsPath, pipelineDir: dir, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+
+  const logPath = path.join(dir, 'instances', 'fact-check-audit.log');
+  assert.ok(fs.existsSync(logPath), 'the audit log must exist after a hard block');
+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].taskId, 'audit-log-test-1');
+  assert.equal(lines[0].source, 'adhoc', 'resolveSourceName maps a manual/default task to its real registered source name');
+  assert.ok(lines[0].at, 'each entry carries its own real timestamp');
+  assert.ok(Array.isArray(lines[0].flags) && lines[0].flags.length > 0);
+  assert.equal(lines[0].flags[0].type, 'ungrounded-url');
+});
+
 test('reviewTask reaches the real vote when every URL in the draft actually appears in its grounding source', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = {

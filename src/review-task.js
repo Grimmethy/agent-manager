@@ -139,6 +139,34 @@ function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
 }
 
+// 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: DSPy's
+// optimizer family compiles a signature against a real, labeled corpus of outcomes rather
+// than trusting a hand-tuned heuristic's own self-assessment. fact-checker.js's own header
+// comment calls the ungrounded-url/ungrounded-field gate "high-precision, almost never a
+// false positive" -- but this session's own investigation found 4 confirmed false
+// positives against that exact claim (a newly-declared constant, a real field outside the
+// diff's touched files, a field on an unchanged diff context line, a self-invented shell
+// echo marker), discovered only by manually grepping every historical hard-block and
+// hand-auditing each one -- there was no standing record of this gate's own real
+// true/false-positive rate at all. One NDJSON line per hard block (not just the terminal
+// verdict already in the task's own history) means a future audit is `grep`, not manual
+// archaeology across queue/done/ -- same discipline local-client.js's degenerate-audit.log
+// and local-tool-client.js's context-budget-audit.log already established for their own
+// gates. Best-effort: must never affect the real review outcome.
+function logFactCheckAudit(pipelineDir, entry) {
+  try {
+    if (!pipelineDir) return;
+    const dir = path.join(pipelineDir, 'instances');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, 'fact-check-audit.log'),
+      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+    );
+  } catch {
+    // best-effort audit trail -- must never break the real review
+  }
+}
+
 // Deterministic review gate for a script-extract decompose move (see local-draft.js's
 // tryDeterministicScriptExtractEdit). Real incident, 2026-09-07: the implement pass
 // already re-verifies every symbol via a real V8-parser oracle before constructing the
@@ -518,6 +546,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
     task.reviewProvider = 'deterministic-ungrounded-value';
+    logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: highPrecisionFlags });
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };

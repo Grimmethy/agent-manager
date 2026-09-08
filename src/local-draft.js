@@ -69,6 +69,19 @@ const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 
+// 2026-09-08, Second Brain [[dspy-refine]] research: dspy.Refine deliberately samples
+// EVERY retry at temperature=1.0 (a distinct rollout_id per attempt) specifically to
+// avoid attempts collapsing into near-identical repeats -- confirmed against the real
+// dspy source, not assumed. Every retry-capable call site below (the plan re-roll,
+// implement-retry) used the exact same fixed 0.4 as the first attempt, with no diversity
+// mechanism at all -- a second real incident (arch-import-review-ac-4, three retries at
+// the same temperature reproducing the same truncated-JSON split three times running)
+// makes the cost of that concrete, not just theoretical. Scoped to retry-capable call
+// sites ONLY (a call that has ALREADY failed once) -- never the first attempt, so a
+// currently-succeeding first try never regresses; more sampling diversity on a call that
+// already failed can only help, never hurt.
+const RETRY_TEMPERATURE = 1.0;
+
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
 // buildPlanPrompt/buildImplementPrompt (prompts.js), which look the builder up by source
@@ -405,14 +418,36 @@ function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '
 // with well-formed sub-candidates (a real, distinguishable failure -- blocked outright,
 // same "fail loud, don't silently downgrade" treatment RESOLUTION: decompose's own
 // invalid-JSON case gets); { candidates } on a genuine, well-formed split.
+//
+// 2026-09-08, Second Brain [[dspy-signatures]] research applied: DSPy validates a call's
+// output SHAPE deterministically before ever considering the call complete, rather than
+// scanning free text after the fact and hoping a heuristic classifies it correctly --
+// root-caused live (arch-import-review-ac-4) that this function's own "malformed JSON is
+// a separate failure mode, not this check's job" carve-out was silently absorbing a REAL
+// split attempt: the model's response genuinely began `{"mode":"split","candidates":[...`
+// but got cut off mid-JSON (numPredict exhausted mid-response), so JSON.parse threw and
+// this returned null -- indistinguishable from "never attempted a split at all". The
+// truncated response then fell through as ordinary prose, got scanned by fact-checker's
+// ALL-CAPS-field heuristic (unrelated to this check), and blocked on hallucinated-looking
+// constant names three retries running before exhausting -- the REAL failure (ran out of
+// output budget mid-split) was never surfaced at all. SPLIT_MODE_MARKER_RE recognizes
+// "this was clearly attempting mode:split" even when the JSON is broken, so a truncated
+// split attempt gets its own loud, distinguishable, actionable failure (the existing
+// `invalid: true` path below) instead of silently masquerading as plain prose.
+const SPLIT_MODE_MARKER_RE = /"mode"\s*:\s*"split"/;
+
 function parseCandidateSplit(implementResponse) {
   const trimmed = (implementResponse || '').trim();
   if (!trimmed || trimmed === '""' || trimmed === "''") return null;
+  const looksLikeSplitAttempt = SPLIT_MODE_MARKER_RE.test(trimmed);
   let parsed;
   try {
     parsed = parseJsonMaybeFenced(trimmed);
   } catch {
-    return null; // malformed JSON is a separate, pre-existing failure mode -- not this check's job
+    if (looksLikeSplitAttempt) {
+      return { invalid: true, reason: 'Implement pass appears to have attempted mode "split" (the response contains "mode":"split") but the JSON is truncated or malformed and could not be parsed -- likely ran out of output budget mid-response. Retry with fewer/shorter sub-candidates, or increase the implement budget.' };
+    }
+    return null; // malformed JSON with no split marker is a separate, pre-existing failure mode -- not this check's job
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.mode !== 'split') return null;
   const raw = Array.isArray(parsed.candidates) ? parsed.candidates : [];
@@ -969,7 +1004,7 @@ async function runPlanPass(task, {
   delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
 
   const planNumPredict = computePlanNumPredict(task);
-  const callPlan = () => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature: 0.4, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
+  const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
   // Records the plan pass into model-stats.db, same as callImplementModel's own
@@ -993,7 +1028,7 @@ async function runPlanPass(task, {
     reRolled = true;
     startedAt = new Date().toISOString();
     startMs = Date.now();
-    const reRoll = await callPlan();
+    const reRoll = await callPlan(RETRY_TEMPERATURE);
     if (recordModelCall) {
       recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
     }
@@ -1514,7 +1549,7 @@ async function finalizeCandidateFulfillment(task, {
       correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
     }
     const retryPrompt = `${implPrompt}\n\n${correction}`;
-    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
@@ -1975,7 +2010,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE };
 
 if (require.main === module) {
   main();
