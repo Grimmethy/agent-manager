@@ -124,3 +124,39 @@ test('logDegenerateAudit is advisory: a broken pipelineDir never throws or break
   const mod = require('./local-client.js');
   assert.doesNotThrow(() => mod.logDegenerateAudit({ source: 'x' }));
 });
+
+// --- logHardFailureAudit (2026-09-08, Second Brain [[dspy]] research applied) -----------
+// Same shape/discipline as logDegenerateAudit above, for the OTHER half of a call's
+// possible outcomes: never getting a response at all. This session diagnosed 3 completely
+// different root causes that all surfaced as the identical generic "Ollama request timed
+// out" symptom, each needing a fresh multi-hour live investigation -- one NDJSON line per
+// hard-failed attempt, tagged with ollama-http.js's own error `code`, closes that gap.
+
+function readHardFailureAuditLog(dir) {
+  const p = path.join(dir, 'instances', 'hard-failure-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('logHardFailureAudit appends one well-formed NDJSON line per call, never throwing on a real pipelineDir', () => {
+  withFixtureRepo((mod, dir) => {
+    mod.logHardFailureAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 1, code: 'OLLAMA_TIMEOUT', timeoutMs: 150000 });
+    mod.logHardFailureAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 2, code: 'OLLAMA_TIMEOUT', timeoutMs: 150000 });
+    const lines = readHardFailureAuditLog(dir);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].code, 'OLLAMA_TIMEOUT');
+    assert.equal(lines[0].timeoutMs, 150000);
+    assert.ok(lines[0].at, 'each entry carries its own real timestamp');
+    assert.equal(lines[1].attempt, 2);
+  });
+});
+
+test('logHardFailureAudit is advisory: a broken pipelineDir never throws or breaks the caller', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-test-broken-hf-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = path.join(dir, 'does-not-exist-and-is-a-file');
+  fs.writeFileSync(process.env.AGENT_MANAGER_REPO_ROOT, 'x');
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  delete require.cache[require.resolve('./local-client.js')];
+  const mod = require('./local-client.js');
+  assert.doesNotThrow(() => mod.logHardFailureAudit({ source: 'x' }));
+});

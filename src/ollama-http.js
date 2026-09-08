@@ -30,6 +30,46 @@
 
 const http = require('http');
 
+// 2026-09-08, Second Brain [[dspy]] research applied (dspy/utils/exceptions.py's LMError
+// hierarchy -- LMTimeoutError, LMRateLimitError, ContextWindowExceededError, etc. -- each
+// carrying structured metadata, not just a string message): this session diagnosed THREE
+// completely different root causes (P40 GPU thermal throttling, host RAM starvation from
+// a VM's static allocation, a model load-order eviction bug) that all surfaced as the
+// exact same generic symptom -- "Ollama request timed out" -- and each required a fresh,
+// multi-hour LIVE investigation to tell apart, because nothing here classified WHY a call
+// failed, only THAT it failed. A small, named set of failure codes (matching this
+// pipeline's own real observed failure classes, not DSPy's whole commercial-API-oriented
+// hierarchy -- no auth/billing/rate-limit concerns against a single local Ollama
+// instance) means the NEXT time this symptom shows up, a log line already says which of
+// the known classes it is, or that it's a genuinely new one, instead of starting the
+// investigation from zero. Plain properties on the standard Error object (not a custom
+// class hierarchy) -- lower-risk, and every existing `catch (e) { ... e.message ... }`
+// call site keeps working unchanged; `e.code`/`e.timeoutMs`/`e.statusCode` are additive.
+const OLLAMA_ERROR_CODES = {
+  HTTP_ERROR: 'OLLAMA_HTTP_ERROR', // non-200 response
+  BAD_JSON: 'OLLAMA_BAD_JSON', // 200 response, body didn't parse
+  STREAM_ERROR: 'OLLAMA_STREAM_ERROR', // connection dropped mid-body (ECONNRESET/EPIPE/etc.)
+  TIMEOUT: 'OLLAMA_TIMEOUT', // socket timeout -- the one with 3 confirmed different root causes this session
+  CONNECTION_ERROR: 'OLLAMA_CONNECTION_ERROR', // request-level error before/without a response (ECONNREFUSED/DNS/etc.)
+};
+
+function taggedError(message, code, extra) {
+  const err = new Error(message);
+  err.code = code;
+  if (extra) Object.assign(err, extra);
+  return err;
+}
+
+// req.destroy(err) (the timeout handler below) closes the socket and, per Node's own
+// documented behavior, re-emits that SAME error object via req's 'error' event -- so
+// without this check, req.on('error') below would unconditionally re-wrap an
+// already-tagged OLLAMA_TIMEOUT error as OLLAMA_CONNECTION_ERROR, discarding its real
+// code and timeoutMs. Confirmed live via this file's own tests: the timeout path only
+// reports correctly once already-tagged errors pass through unchanged here.
+function isAlreadyTagged(e) {
+  return !!(e && Object.values(OLLAMA_ERROR_CODES).includes(e.code));
+}
+
 /**
  * @param {string} urlString - Full URL to POST to.
  * @param {object} bodyObj - JSON body.
@@ -83,10 +123,10 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`));
+          reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode }));
           return;
         }
-        try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Ollama returned unparseable JSON: ${e.message}`)); }
+        try { resolve(JSON.parse(data)); } catch (e) { reject(taggedError(`Ollama returned unparseable JSON: ${e.message}`, OLLAMA_ERROR_CODES.BAD_JSON)); }
       });
       // Without this, a connection reset (or any other stream error) arriving AFTER
       // headers but mid-body has no listener on `res` itself (only `req` was covered
@@ -99,10 +139,10 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       // never matches local-worker.sh's INFRA_FAILURE_PATTERN regex either, so every one
       // of these permanently blocked instead of going through the bounded infra-requeue
       // path a real "ECONNRESET"-bearing Error would have qualified for.
-      res.on('error', reject);
+      res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
     });
-    req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${timeoutMs}ms`)); });
-    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
+    req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
     req.write(payload);
     req.end();
   });
@@ -139,8 +179,8 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
       if (res.statusCode !== 200) {
         let data = '';
         res.on('data', (c) => { data += c; });
-        res.on('end', () => reject(new Error(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`)));
-        res.on('error', reject);
+        res.on('end', () => reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode })));
+        res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
         return;
       }
       let buf = '';
@@ -152,23 +192,23 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
           const line = buf.slice(0, idx).trim();
           buf = buf.slice(idx + 1);
           if (!line) continue;
-          try { onLine(JSON.parse(line)); } catch (e) { reject(new Error(`Ollama returned unparseable NDJSON line: ${e.message}`)); }
+          try { onLine(JSON.parse(line)); } catch (e) { reject(taggedError(`Ollama returned unparseable NDJSON line: ${e.message}`, OLLAMA_ERROR_CODES.BAD_JSON)); }
         }
       });
       res.on('end', () => {
         const line = buf.trim();
         if (line) {
-          try { onLine(JSON.parse(line)); } catch (e) { reject(new Error(`Ollama returned unparseable NDJSON line: ${e.message}`)); }
+          try { onLine(JSON.parse(line)); } catch (e) { reject(taggedError(`Ollama returned unparseable NDJSON line: ${e.message}`, OLLAMA_ERROR_CODES.BAD_JSON)); }
         }
         resolve();
       });
-      res.on('error', reject);
+      res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
     });
-    req.on('timeout', () => { req.destroy(new Error(`Ollama request timed out after ${timeoutMs}ms`)); });
-    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
+    req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
     req.write(payload);
     req.end();
   });
 }
 
-module.exports = { postJson, postJsonStream };
+module.exports = { postJson, postJsonStream, OLLAMA_ERROR_CODES };
