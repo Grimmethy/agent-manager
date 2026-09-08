@@ -2355,39 +2355,56 @@ def api_queue_state(state):
                 data = read_json_safe(f)
                 if data and (not source_filter or data.get("source") == source_filter):
                     by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
-        children_of = {}
+        explicit_parent = {}
         for tid, entry in by_id.items():
             parent = entry.get("parentHub")
             # A dangling/self/foreign parentHub (parent not among today's coordinating
-            # records -- already resolved and moved on, or a cycle) is treated as a root
-            # rather than dropped, so it never silently vanishes from the tab.
+            # records -- already resolved and moved on, or a cycle) is not used.
             if parent and parent in by_id and parent != tid:
-                children_of.setdefault(parent, []).append(tid)
-            else:
-                children_of.setdefault(None, []).append(tid)
+                explicit_parent[tid] = parent
+        # Fallback: a hub id sitting in another hub's subTasks[] is ALSO a real parent link
+        # -- rewireCoordinatorParent() (src/decompose-loop-autoroute.js) has rewritten
+        # subTasks entries to point at a rescuing hub since before `parentHub` existed
+        # (2026-09-08), so real families already live in the data this way with no backfill
+        # needed; explicit `parentHub` wins when both are present.
+        derived_parent = {}
+        for tid, entry in by_id.items():
+            for st in entry.get("subTasks") or []:
+                sid = st.get("id") if isinstance(st, dict) else None
+                if sid and sid in by_id and sid != tid:
+                    derived_parent.setdefault(sid, tid)
+
+        children_of = {}
+        for tid in by_id:
+            parent = explicit_parent.get(tid) or derived_parent.get(tid)
+            children_of.setdefault(parent, []).append(tid)
         for kids in children_of.values():
             kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
 
         ordered = []
         visited = set()
 
-        def walk(tid, depth):
+        def walk(tid, depth, family_label):
             if tid in visited:
                 return
             visited.add(tid)
             entry = dict(by_id[tid])
             entry["hubDepth"] = depth
+            # hubFamily: the topmost hub's own title, carried onto every descendant so the
+            # frontend can render a family-header row even on a page that doesn't include
+            # the root itself.
+            entry["hubFamily"] = family_label if depth > 0 else entry.get("title") or tid
             ordered.append(entry)
             for child_id in children_of.get(tid, []):
-                walk(child_id, depth + 1)
+                walk(child_id, depth + 1, entry["hubFamily"])
 
         for root_id in children_of.get(None, []):
-            walk(root_id, 0)
+            walk(root_id, 0, None)
         # Any hub left unvisited only happens via a parentHub cycle -- append as a root so
         # it still shows up instead of disappearing.
         for tid in by_id:
             if tid not in visited:
-                walk(tid, 0)
+                walk(tid, 0, None)
 
         total = len(ordered)
         page = ordered[offset:offset + limit] if limit is not None else ordered[offset:]

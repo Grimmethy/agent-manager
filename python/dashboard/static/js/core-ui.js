@@ -1182,6 +1182,12 @@ async function renderQueueTab(state) {
     } catch (e) { /* badges just won't render */ }
   }
 
+  // Hub Tasks family header (2026-09-08, Grimmethy: "a top hub level label ... to show the
+  // name of the entire family of hubs"): api_queue_state stamps hubFamily on every hub in a
+  // family (the topmost hub's own title), so a muted-blue divider row can be inserted the
+  // first time a new family appears in the (already hierarchy-ordered) list -- works even
+  // when a page starts mid-family, since every row carries its family's label, not just roots.
+  let lastHubFamily = null;
   const rows = tasks.map(t => {
     const isPrompt = showApply && approvalModeBySource[t.source] === 'prompt';
     // Orange left-border + ⚠ prefix on every row here -- the actual ask (Discuss session
@@ -1247,7 +1253,12 @@ async function renderQueueTab(state) {
     const hubIdCell = state === 'coordinating' && t.hubDepth
       ? `<td style="padding-left:${t.hubDepth * 14 + 4}px">↳ ${t.id}</td>`
       : `<td>${t.id}</td>`;
-    return `
+    let familyHeaderRow = '';
+    if (state === 'coordinating' && t.hubFamily && t.hubFamily !== lastHubFamily) {
+      familyHeaderRow = `<tr><td colspan="4" style="background:rgba(91,157,255,0.14);color:var(--link);font-weight:600;padding:6px 8px;border-top:1px solid var(--border)">🗂 ${escapeHtml(t.hubFamily)}</td></tr>`;
+      lastHubFamily = t.hubFamily;
+    }
+    return `${familyHeaderRow}
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
       ${hubIdCell}
       <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
