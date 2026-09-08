@@ -133,9 +133,8 @@ test('checkAndEscalate does not write a forensics-request file while the long-wi
     const { recordRequeueCause } = require('./requeue-attribution-client.js');
     const now = Date.now();
     const signature = 'belowthreshold1234567';
-    // Only 2 occurrences -- below ESCALATION_LONG_THRESHOLD (3).
+    // Only 1 occurrence -- below ESCALATION_LONG_THRESHOLD (2).
     recordRequeueCause({ taskId: 't-0', signature, requeueWriter: 'test' });
-    recordRequeueCause({ taskId: 't-1', signature, requeueWriter: 'test' });
     ra.checkAndEscalate(signature, 't-latest', { repoRoot: dir, now });
     assert.equal(fs.existsSync(path.join(dir, 'queue', 'forensics-requests')), false);
   });

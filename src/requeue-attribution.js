@@ -131,9 +131,18 @@ async function classifyViaFallbackModel(reasonText, callModel) {
 // A documented v1 simplification, not the literal Workbook math -- upgrading to a real
 // share-of-total-volume denominator is a legitimate later pass once more history
 // accumulates, not a v1 requirement (the concept's own text explicitly allows this).
+//
+// 2026-09-08, Grimmethy: "this system should be aggressive... we lose a ton of machine
+// time to these requeues. If we can reduce them before they even happen we gain a huge
+// efficiency boost." -- revises the original "least-aggressive tier, live from day one"
+// starting point down from 3 to 2: two real occurrences of the same signature within 3
+// days is already worth a forensics look, rather than waiting for a third. Deliberately
+// NOT dropping to 1 -- that would remove the "confirmed pattern, not a one-off" signal
+// this dual-window shape exists to provide in the first place, and would burn forensics'
+// own investigation budget on flukes. Short-window stays at its already-minimal floor.
 const ESCALATION_LONG_WINDOW_MS = 3 * 24 * 3600 * 1000;
 const ESCALATION_SHORT_WINDOW_MS = 6 * 3600 * 1000;
-const ESCALATION_LONG_THRESHOLD = 3;
+const ESCALATION_LONG_THRESHOLD = 2;
 const ESCALATION_SHORT_THRESHOLD = 1;
 
 // Writes queue/forensics-requests/requeue-attribution-<sig>.json once a signature's burn
