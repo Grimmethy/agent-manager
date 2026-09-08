@@ -21,6 +21,8 @@ const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
+const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
@@ -1188,7 +1190,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, taskId = null, stage = null, conceptId = null }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -1251,6 +1253,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   if (allowSideFindings && messages.length) {
     messages[0] = { ...messages[0], content: injectSideFindingInstruction(messages[0].content) };
   }
+  // Incident Amplification (2026-09-08) -- opt-in, default false (unlike SIDE-FINDING,
+  // this is a heavier, deliberate action; see incident-amplification-marker.js's own
+  // header). Threaded through from the Chat panel only, matching how both real
+  // precedent incidents this session actually started.
+  if (allowAmplification && messages.length) {
+    messages[0] = { ...messages[0], content: injectAmplificationInstruction(messages[0].content) };
+  }
   // Concept-build self-report (2026-09-06, see concepts.js's own header): only injected
   // when the caller opted this session into concept tracking (conceptId set).
   if (conceptId && messages.length) {
@@ -1287,6 +1296,18 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       if (findings.length) {
         for (const finding of findings) {
           writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir });
+        }
+      }
+    }
+    if (allowAmplification && merged.response && merged.response.includes('AMPLIFY:')) {
+      const { cleanText, requests } = extractAmplificationRequests(merged.response);
+      merged.response = cleanText;
+      if (requests.length) {
+        for (const req of requests) {
+          runAmplificationSweep({
+            rootCauseSummary: req.rootCauseSummary, query: req.query, dir: req.dir,
+            root: primaryRoot, excludeFiles: req.exclude, pipelineDir, source, taskId, stage,
+          });
         }
       }
     }

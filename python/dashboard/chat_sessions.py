@@ -218,7 +218,7 @@ def _send_claude(session: dict, message: str) -> str:
         message, model=session.get("model"), effort=session.get("effort"),
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
-        add_dirs=roots[1:],
+        add_dirs=roots[1:], allow_amplification=True,
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
@@ -321,6 +321,7 @@ def _stream_local(session: dict, message: str):
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
+        allow_amplification=True,
     ):
         if event.get("type") == "chunk":
             yield event["text"]

@@ -488,6 +488,67 @@ test('call() extracts a SIDE-FINDING block from the response, returns cleaned te
   });
 });
 
+// --- incident amplification (2026-09-08) -----------------------------------------------
+
+test('callOnce does not inject AMPLIFY by default (allowAmplification defaults false)', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'do the task' }); },
+    );
+    assert.doesNotMatch(capturedArgs[1], /AMPLIFY:/);
+  });
+});
+
+test('callOnce injects AMPLIFY when allowAmplification is true', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    let capturedArgs = null;
+    await withMockedClient(
+      (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+      async ({ callOnce }) => { await callOnce({ prompt: 'do the task', allowAmplification: true }); },
+    );
+    assert.match(capturedArgs[1], /AMPLIFY:/);
+  });
+});
+
+test('call() extracts an AMPLIFY block, runs a real sweep, and files one side-finding per matched site', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-ia-test-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-ia-root-'));
+  fs.writeFileSync(path.join(root, 'site-a.js'), "status: 'requeued'\n");
+  await withEnv({
+    CLAUDE_CODE_OAUTH_TOKEN: 'fake-token', AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: root,
+    AGENT_MANAGER_GREP_DIRS: '.',
+  }, async () => {
+    await withMockedClient(
+      () => JSON.stringify({ result: `Real answer.\n\nAMPLIFY: root cause\nQUERY: status: '\nDIR: .` }),
+      async ({ call }) => {
+        const result = await call({ prompt: 'go', source: 'chat', allowAmplification: true });
+        assert.equal(result.response.includes('AMPLIFY'), false);
+        assert.match(result.response, /Real answer\./);
+      },
+    );
+    const files = sideFindingInboxFiles(dir);
+    assert.equal(files.length, 1);
+    assert.match(files[0].title, /site-a\.js/);
+    assert.equal(files[0].source, 'chat');
+  });
+});
+
+test('call() never extracts AMPLIFY when allowAmplification is not set, even if the response happens to contain the marker text', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-client-ia-test-'));
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token', AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: dir }, async () => {
+    await withMockedClient(
+      () => JSON.stringify({ result: 'AMPLIFY: should not be extracted\nQUERY: x' }),
+      async ({ call }) => {
+        const result = await call({ prompt: 'go', source: 'chat' });
+        assert.match(result.response, /AMPLIFY: should not be extracted/);
+      },
+    );
+    assert.equal(sideFindingInboxFiles(dir).length, 0);
+  });
+});
+
 // --- concept-build self-report (2026-09-06) -------------------------------------------
 
 test('callOnce does NOT inject CONCEPT-BUILD when no conceptId is given', async () => {
