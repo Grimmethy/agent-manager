@@ -260,6 +260,64 @@ function renderRecentTasksList(tasks) {
     </li>`).join('')}</ul>`;
 }
 
+// Global "all tasks completed" log (2026-09-08, Grimmethy: "an in app representation of
+// that all tasks completed log under the workers... only loads the most recent 25 tasks
+// until I scroll to the bottom") -- see completedTasksLog's own header comment
+// (index.html) for why this is accumulated JS state rather than DOM state: renderWorkers
+// fully replaces #main on every 5s poll, and re-rendering the SAME accumulated array each
+// time produces identical HTML for this section so the replace is invisible.
+const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-merge)$/;
+
+function renderCompletedTasksSection() {
+  const rows = completedTasksLog.map(t => `
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtml(t.title || t.taskId)}</a>
+      <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
+    </li>`).join('');
+  const footer = completedTasksExhausted
+    ? (completedTasksLog.length ? '<div class="meta" style="text-align:center; padding:8px">No more tasks.</div>' : '<div class="meta">No completed tasks yet.</div>')
+    : `<div id="completed-tasks-sentinel" style="height:1px"></div>${completedTasksLoading ? '<div class="meta" style="text-align:center; padding:8px">Loading…</div>' : ''}`;
+  return `
+    <div class="completed-tasks-log" style="margin-top:24px">
+      <div class="meta" style="font-weight:600; margin-bottom:8px">All tasks completed</div>
+      <ul class="recent-tasks-list">${rows}</ul>
+      ${footer}
+    </div>
+  `;
+}
+
+// isPoll-safe: called after every renderWorkers() render since the sentinel node (and any
+// prior observer's target) is torn down and rebuilt along with the rest of #main.
+function setupCompletedTasksObserver() {
+  if (completedTasksObserver) completedTasksObserver.disconnect();
+  const sentinel = document.getElementById('completed-tasks-sentinel');
+  if (!sentinel) return;
+  completedTasksObserver = new IntersectionObserver((entries) => {
+    if (entries[0].isIntersecting) loadMoreCompletedTasks();
+  }, { root: null, rootMargin: '200px' });
+  completedTasksObserver.observe(sentinel);
+}
+
+// completedTasksLoading guards a fast scroll-to-bottom firing the IntersectionObserver
+// callback more than once before state updates from the first in-flight fetch land.
+async function loadMoreCompletedTasks() {
+  if (completedTasksLoading || completedTasksExhausted) return;
+  completedTasksLoading = true;
+  try {
+    const url = '/api/tasks/completed?limit=25' + (completedTasksNextCursor ? `&before=${encodeURIComponent(completedTasksNextCursor)}` : '');
+    const data = await fetchJson(url);
+    const rows = data.tasks || [];
+    completedTasksLog = completedTasksLog.concat(rows);
+    completedTasksNextCursor = data.nextCursor || null;
+    if (!data.nextCursor || rows.length === 0) completedTasksExhausted = true;
+  } catch (e) {
+    // best-effort -- leave state as-is, the sentinel is still present so the next scroll
+    // (or the next poll, if it's still on-screen) retries.
+  } finally {
+    completedTasksLoading = false;
+  }
+  if (activeTab === 'workers') await renderWorkers();
+}
+
 // isPoll (2026-09-07, Grimmethy: "please fix the dropdown reset on poll thing, that
 // is extraordinarily irritating and has bit me several times"): the 5s refresh()
 // cycle (index.html's renderMain(), 'workers' branch) used to call this unconditionally,
@@ -344,6 +402,12 @@ async function renderWorkers(isPoll) {
   `;
   const shown = instances.filter(inst => workersTypeFilter === 'all' || laneForInstance(inst) === workersTypeFilter);
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
+  // Preserve scroll position across the full innerHTML replace below -- same isPoll
+  // "don't yank state out from under the operator" reasoning as the dropdown guard
+  // above, needed here because the completed-tasks log (renderCompletedTasksSection)
+  // can push #main well past one screen, and a poll landing mid-scroll would otherwise
+  // silently reset the operator back to the top every 5s.
+  const scrollY = window.scrollY;
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
@@ -449,7 +513,12 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? renderRecentTasksList(recentTasks.tasks || []) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join(''));
+  `).join('')) + renderCompletedTasksSection();
+  window.scrollTo(0, scrollY);
+  setupCompletedTasksObserver();
+  if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {
+    loadMoreCompletedTasks();
+  }
   main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
