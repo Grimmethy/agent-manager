@@ -1869,6 +1869,7 @@ async function renderBranchesTab() {
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
         <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="secondary" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
       </div>
     </div>
   `;
@@ -1876,9 +1877,10 @@ async function renderBranchesTab() {
 
   main.querySelectorAll('[data-open-branch]').forEach((card) => {
     card.onclick = (e) => {
-      // Don't hijack the Merge button's own click -- that has its own handler and
-      // confirm() flow below, opening the history modal underneath it would be surprising.
-      if (e.target.closest('[data-merge-branch]')) return;
+      // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
+      // and confirm() flow below, opening the history modal underneath it would be
+      // surprising.
+      if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]')) return;
       const b = branches.find((x) => x.branch === card.dataset.openBranch);
       if (b) renderBranchDetailModal(b);
     };
@@ -1917,6 +1919,29 @@ async function renderBranchesTab() {
         }
       } catch (e) {
         alert('Merge failed: ' + e.message);
+        await renderBranchesTab();
+      }
+    };
+  });
+
+  // Discard (2026-09-08, see api_git_discard_branch's own header for the incident this
+  // closes) -- for a branch you've decided NOT to merge: permanently deletes the remote
+  // ref and archives its task, so it actually stops showing here instead of just being
+  // hidden or forgotten about.
+  main.querySelectorAll('[data-discard-branch]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const branch = btn.dataset.discardBranch;
+      if (!confirm(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Discarding...';
+      try {
+        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/discard`, { method: 'POST' });
+        const result = await resp.json();
+        if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        await renderBranchesTab();
+      } catch (e) {
+        alert('Discard failed: ' + e.message);
         await renderBranchesTab();
       }
     };
