@@ -952,6 +952,45 @@ def _has_hypothetical_cost_column(conn: sqlite3.Connection) -> bool:
     return bool(row and row[0])
 
 
+def task_links_db_path() -> Path | None:
+    """Task Linking's storage (2026-09-08) -- mirrors model_stats_db_path()'s own
+    resolution exactly (env override, else a flat file in pipelineDir)."""
+    override = os.environ.get("AGENT_MANAGER_TASK_LINKS_DB_PATH")
+    if override:
+        return Path(override)
+    d = get_pipeline_dir()
+    return (d / "task-links.db") if d else None
+
+
+def _incoming_task_links(task_id: str) -> list:
+    """Reverse lookup -- "everything that links TO this task" -- the one relationship in
+    the task detail modal that can't be read from the task's own JSON (it lives in a
+    DIFFERENT task's links[], written via task-links-client.js's recordLink()). Returns []
+    (not None) when the db doesn't exist yet or the table is empty, so the frontend's
+    Related Tasks section can treat "no incoming links" the same whether Task Linking has
+    never been used yet or genuinely has nothing pointing at this task -- unlike
+    _task_cost_summary's None-vs-real-data distinction, there's no meaningful third state
+    here worth telling apart."""
+    db_path = task_links_db_path()
+    if not db_path or not db_path.is_file():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT source_id, type, label, created_at FROM task_links "
+            "WHERE target_id = ? ORDER BY created_at DESC",
+            (task_id,),
+        ).fetchall()
+        return [
+            {"sourceId": r[0], "type": r[1], "label": r[2], "createdAt": r[3]}
+            for r in rows
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
 def second_brain_dir() -> Path | None:
     """Same SECOND_BRAIN_DIR env var local-worker.ps1 / src/config.js already read --
     kept in sync by hand since this dashboard is Python, not Node. Falls back to reading
@@ -2676,7 +2715,7 @@ def api_task_detail(state, task_id):
             for candidate in drafting_root.rglob(f"{task_id}.json"):
                 data = read_json_safe(candidate)
                 if data:
-                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id)})
         abort(404)
 
     if state not in QUEUE_STATES:
@@ -2685,7 +2724,7 @@ def api_task_detail(state, task_id):
     data = read_json_safe(f)
     if not data:
         abort(404)
-    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id)})
 
 
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
@@ -3205,10 +3244,10 @@ def api_task_anywhere(task_id):
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id)})
 
     def _payload(data, found_state):
-        return jsonify({**data, "_foundState": found_state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id)})
+        return jsonify({**data, "_foundState": found_state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id)})
 
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")

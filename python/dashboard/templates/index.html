@@ -1188,6 +1188,32 @@ function renderSubTaskChecklist(task) {
     + `<div class="task-history">${rows}</div>`;
 }
 
+// Related Tasks (2026-09-08, Task Linking concept): renders task.links[] (outgoing --
+// this task's own weak/general "mention"-class references, written via task-links-client
+// .js's recordLink()) and task._incomingLinks (reverse -- everything that links TO this
+// task, from app.py's _incoming_task_links() enrichment, since that can't be read from
+// this task's own JSON). Deliberately additive, not a replacement for the "Part of Hub"
+// backlink above or renderSubTaskChecklist below -- those cover the STRONG-semantic
+// relationships (decomposedFrom/subTasks), links[] covers the weak/general class only.
+function renderRelatedTasks(task) {
+  const outgoing = Array.isArray(task.links) ? task.links : [];
+  const incoming = Array.isArray(task._incomingLinks) ? task._incomingLinks : [];
+  if (!outgoing.length && !incoming.length) return '';
+  const row = (id, type, label) =>
+    `<div class="task-history-row">${taskLink(id)} <span class="meta">${escapeHtml(type)}${label ? ` — ${escapeHtmlBright(label)}` : ''}</span></div>`;
+  let html = `<div class="field-label">Related Tasks</div><div class="task-history">`;
+  if (outgoing.length) {
+    html += `<div class="meta" style="margin:4px 0 2px">Links to</div>`
+      + outgoing.map((l) => row(l.targetId, l.type, l.label)).join('');
+  }
+  if (incoming.length) {
+    html += `<div class="meta" style="margin:6px 0 2px">Linked from</div>`
+      + incoming.map((l) => row(l.sourceId, l.type, l.label)).join('');
+  }
+  html += `</div>`;
+  return html;
+}
+
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
@@ -1226,6 +1252,7 @@ function renderTaskDetailModal(task) {
     html += `<div class="field-label">Part of Hub</div><div>${taskLink(task.promptContext.decomposedFrom)}</div>`;
   }
   html += renderSubTaskChecklist(task);
+  html += renderRelatedTasks(task);
   // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
   // bit of meta data. How much machine time was spent on the task and a list of all the
   // files it touched") -- totalLatencyMs sums real wall-clock time across every model
