@@ -247,11 +247,16 @@ function buildWriteAgenticPrompt(task) {
     'Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
     '',
-    'If RESOLUTION: needs-human-decision -- follow it with the specific open question(s), plainly stated, and enough real context for a human to answer without re-investigating. Then, if the answer space is a small number of genuinely distinct choices, ALSO give 2-4 options in exactly this format:',
+    'If RESOLUTION: needs-human-decision -- the VERY NEXT line MUST be exactly one of these three (2026-09-08, root-caused live: free-text blocker descriptions were unreliably auto-classified by phrase-matching after the fact, so a real budget-exhaustion case worded differently than expected kept getting misrouted to a human as a "design question" -- this line removes the guesswork):',
+    'BLOCKER-TYPE: design-question',
+    'BLOCKER-TYPE: budget-exhausted',
+    'BLOCKER-TYPE: infra-error',
+    '-- design-question: implementing genuinely requires a product/design decision only a human should make (which of several reasonable approaches, what data to keep, etc). budget-exhausted: you know exactly what to do and how to do it, but ran out of turns/tool-calls before finishing the writes -- NOT a design question, even if you are unsure how to phrase that. infra-error: a tool or environment failure (a command that should work did not, a file operation failed) unrelated to any decision.',
+    'After the BLOCKER-TYPE line, follow with the specific open question(s) or blocker, plainly stated, and enough real context for a human (or a fresh pass, for budget-exhausted) to act without re-investigating. Then, if BLOCKER-TYPE is design-question AND the answer space is a small number of genuinely distinct choices, ALSO give 2-4 options in exactly this format:',
     'OPTIONS:',
     '1. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
     '2. <short label, under 8 words> :: <one-sentence description of what choosing this means>',
-    '(a free-text "Other" answer is always available separately -- do not add an "other" option yourself. If the answer space is open-ended, omit OPTIONS entirely.)',
+    '(a free-text "Other" answer is always available separately -- do not add an "other" option yourself. If the answer space is open-ended, omit OPTIONS entirely. OPTIONS never applies to budget-exhausted or infra-error.)',
   ].join('\n');
 }
 

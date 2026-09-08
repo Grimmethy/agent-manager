@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE } = require('./needs-clarification-triage.js');
+const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE, BLOCKER_TYPE_BUDGET_EXHAUSTED_RE } = require('./needs-clarification-triage.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-test-'));
@@ -506,4 +506,48 @@ test('bucket F: DRY_RUN=1 reports but does not move the file', async () => {
     assert.ok(exists(at(dir, 'needs-clarification', 'tf6.json')));
     assert.ok(!exists(at(dir, 'adhoc', 'tf6.json')));
   } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
+});
+
+// --- BLOCKER-TYPE tag (2026-09-08) -- see the header's own comment on
+// BLOCKER_TYPE_BUDGET_EXHAUSTED_RE for the real incident: a second real corpus response
+// worded "not a design question -- a pass-budget overrun" / "no tool budget left" matched
+// COMPLETABLE_NOT_DESIGN_RE but NOT BUDGET_EXHAUSTED_RE, and fell through to bucket C.
+// local-agentic-write-draft.js's prompt now requires an explicit BLOCKER-TYPE line;
+// this bucket now recognizes it directly, bypassing the phrase-pair heuristic entirely.
+
+const REAL_BLOCKER_TYPE_OQ = 'I was unable to complete this pass. I oriented fully and built a correct extraction plan, '
+  + 'but I have no tool budget left to write the file or delete the functions from the template. No files were created or modified.\n\n'
+  + 'RESOLUTION: needs-human-decision\n'
+  + 'BLOCKER-TYPE: budget-exhausted\n'
+  + 'Open blocker (not a design question -- a pass-budget overrun): the extraction approach is sound; what is missing is the remaining '
+  + 'turns to execute the writes and validate. A fresh pass starting from the already-computed line map should complete it.';
+
+test('regexes: BLOCKER_TYPE_BUDGET_EXHAUSTED_RE matches the explicit tag even when the old phrase-pair would not', () => {
+  assert.ok(BLOCKER_TYPE_BUDGET_EXHAUSTED_RE.test(REAL_BLOCKER_TYPE_OQ));
+  assert.ok(!BUDGET_EXHAUSTED_RE.test(REAL_BLOCKER_TYPE_OQ), 'confirms the old regex genuinely misses this real corpus wording ("no tool budget left", not "ran out of turn/context budget")');
+});
+
+test('bucket F: BLOCKER-TYPE: budget-exhausted alone triggers the requeue, without needing the phrase-pair to also match', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tf7', {
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_BLOCKER_TYPE_OQ },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tf7.json')));
+  const moved = read(at(dir, 'adhoc', 'tf7.json'));
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /ran out of turn\/context budget mid-mechanical-step/.test(h.detail)));
+});
+
+test('bucket F: BLOCKER-TYPE: design-question is NOT treated as budget-exhausted', async () => {
+  const dir = makePipeline();
+  const designOq = 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: design-question\nShould the license gate call Stripe live, or stub it?';
+  held(dir, baseTask('tf8', {
+    needsClarification: { reason: 'design-decision', openQuestions: designOq },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tf8.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 'tf8.json')).ncTriageDecision, 'leave-for-human');
 });
