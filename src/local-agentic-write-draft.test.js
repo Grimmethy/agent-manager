@@ -95,6 +95,27 @@ test('detectExternalDependency returns null for an ordinary local code task', ()
   assert.equal(detectExternalDependency({}), null);
 });
 
+// 2026-09-08, root-caused live (adhoc-brain-dump-bd-...-reviewer-3-3-real-inconclusive-
+// votes-are...): a task about tightening a review-vote config threshold got wrongly
+// blocked because its own PLAN said "token counts" -- this codebase's own pervasive
+// LLM-metrics vocabulary, unrelated to auth. The bare "tokens?" alternative is gone;
+// only a qualified compound phrase (api/auth/access/bearer/session/oauth token(s)) still
+// matches, the same discipline "api[\s_-]?keys?" already used (never a bare "key").
+test('detectExternalDependency does NOT false-positive on "token counts" / LLM-metrics token vocabulary', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({ planResponse: 'they read/report model_calls and token counts but do not make the pass/reject decision' }), null);
+  assert.equal(detectExternalDependency({ title: 'Reduce the promptTok/evalTok climb in 3-call tasks' }), null);
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'tighten the tokens used per implement pass' } }), null);
+});
+
+test('detectExternalDependency still matches a real auth/API token reference', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({ title: 'Store the API token in a secrets manager' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'you will need an OAuth token to call this' } }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ planResponse: 'generate a personal access token from GitHub settings' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }), 'credentials/API keys/tokens/secrets');
+});
+
 test('write tier: a task requiring an external resource is blocked with needsClarification BEFORE any model call', async () => {
   await withRepo(async () => {
     const { draftAdhocViaLocalAgenticWrite } = freshModule();

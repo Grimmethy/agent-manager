@@ -58,11 +58,25 @@ function isEnabled() {
 // is knowable before the first model call, in O(markers) string work. Each marker carries
 // a human-readable label (not a dumped regex source) so the blockedReason names the actual
 // pattern that matched.
+// 2026-09-08, Grimmethy: "Next blocked task" -- root-caused live (adhoc-brain-dump-bd-
+// ...-reviewer-3-3-real-inconclusive-votes-are...): a task about tightening a review-vote
+// config threshold, with NOTHING external-dependency-shaped in it at all, got wrongly
+// blocked because its own PLAN mentioned "token counts" (this codebase's own pervasive
+// LLM-metrics vocabulary -- prompt_eval_count/eval_count/promptTok/evalTok, used
+// constantly in agent-manager's OWN self-referential tasks) and the bare `\btokens?\b`
+// marker below couldn't distinguish that from an AUTH token. DSPy check (per instruction,
+// same principle as the two fixes earlier today): dspy.ai's Signature docs favor a typed
+// Literal constraint that "pins down" a value so the model can't drift outside a small,
+// unambiguous set, over free-text matching that has to disambiguate an overloaded word
+// after the fact -- this heuristic runs BEFORE any model call so there's no Literal field
+// to constrain, but the same discipline applies to the regex itself: "tokens?" bare is
+// exactly the ambiguous case a Literal type would forbid, so it's now qualified the same
+// way "api[\s_-]?keys?" already was (never a bare "key").
 const EXTERNAL_DEP_MARKERS = [
   { label: 'creating a new repo', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
   { label: 'hosting/deploying/publishing', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
   { label: 'a git remote operation', re: /\bgit\s+(remote|push|clone)\b/i },
-  { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|tokens?|secrets?)\b/i },
+  { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
   { label: 'a network/third-party service call', re: /\b(network|internet|external\s+api|third[\s_-]?party\s+service)\b/i },
 ];
 
