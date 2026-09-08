@@ -506,6 +506,56 @@ test('draftDoneDetail summarises whatever the branch stamped, and is undefined w
   assert.equal(draftDoneDetail({ draftModel: 'qwen' }), 'qwen');
 });
 
+// 2026-09-08, Grimmethy: "fix worker-1" -- localOllamaLockKey resolves to the real Ollama
+// endpoint this process's own calls actually target (same OLLAMA_URL default local-client.js
+// itself uses), which is what maybeLocked/maybeLockedOn now pass as gpu-arbiter.js's
+// lockKey so two DIFFERENT models sharing the same physical GPU serialize against each
+// other again (see gpu-arbiter.js's own header for the full incident).
+test('localOllamaLockKey resolves to the default localhost endpoint when OLLAMA_URL is unset', () => {
+  const prev = process.env.OLLAMA_URL;
+  delete process.env.OLLAMA_URL;
+  try {
+    const { localOllamaLockKey } = require('./local-draft.js');
+    assert.equal(localOllamaLockKey(), 'ollama-localhost-11434');
+  } finally {
+    if (prev !== undefined) process.env.OLLAMA_URL = prev; else delete process.env.OLLAMA_URL;
+  }
+});
+
+test('localOllamaLockKey resolves a real OLLAMA_URL override to its own host:port', () => {
+  const prev = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = 'http://10.0.0.5:11500';
+  try {
+    const { localOllamaLockKey } = require('./local-draft.js');
+    assert.equal(localOllamaLockKey(), 'ollama-10.0.0.5-11500');
+  } finally {
+    if (prev !== undefined) process.env.OLLAMA_URL = prev; else delete process.env.OLLAMA_URL;
+  }
+});
+
+test('localOllamaLockKey gives the P40 VM lane its own distinct key from the default local endpoint', () => {
+  const prev = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = 'http://p40-vm.internal:11434';
+  try {
+    const { localOllamaLockKey } = require('./local-draft.js');
+    assert.equal(localOllamaLockKey(), 'ollama-p40-vm.internal-11434');
+    assert.notEqual(localOllamaLockKey(), 'ollama-localhost-11434');
+  } finally {
+    if (prev !== undefined) process.env.OLLAMA_URL = prev; else delete process.env.OLLAMA_URL;
+  }
+});
+
+test('localOllamaLockKey never throws on a malformed OLLAMA_URL, falling back to a raw-string key', () => {
+  const prev = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = 'not a url';
+  try {
+    const { localOllamaLockKey } = require('./local-draft.js');
+    assert.equal(localOllamaLockKey(), 'ollama-not a url');
+  } finally {
+    if (prev !== undefined) process.env.OLLAMA_URL = prev; else delete process.env.OLLAMA_URL;
+  }
+});
+
 // 2026-08-31: implNumCtx used to vary per-prompt (usually landing on an 8192 floor), so a
 // draft's implement pass flipped num_ctx away from the plan pass's PINNED_NUM_CTX and
 // Ollama fully reloaded the model (~55-100s) while holding the single-flight GPU lock ->

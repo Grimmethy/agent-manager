@@ -168,3 +168,61 @@ test('classRank: unknown class falls back to the default (draft)', () => {
   assert.equal(arb.classRank('audit'), 3);
   assert.equal(arb.classRank('nonsense'), arb.classRank('draft'));
 });
+
+// 2026-09-08, Grimmethy: "fix worker-1" -- root-caused live: two DIFFERENT models
+// (worker-1's qwen2.5:3b, worker-reasoning's qwen3.8:27b-q4_K_M) generating concurrently
+// on the SAME physical GPU starved the light one into repeated hard OLLAMA_TIMEOUTs.
+// lockKey lets a caller serialize two calls that pass DIFFERENT `model` values against
+// each other (same physical resource) while a caller that omits lockKey keeps the
+// original per-model behavior (two different models run fully independently), and the
+// ticket still records `model` for display even though it's no longer the lock key.
+test('lockKey: two different models serialize against each other when they share a lockKey', async () => {
+  const inst = tmpInst();
+  const holder = child(`
+    const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', lockKey: 'shared-endpoint', taskId: 'w1' });
+    setTimeout(() => { h.release(); process.exit(0); }, 900);
+  `);
+  await sleep(300); // let it acquire
+
+  const waiter = child(`
+    const s = Date.now();
+    const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-b', lockKey: 'shared-endpoint', taskId: 'w2' });
+    process.stdout.write(String(Date.now() - s));
+    h.release();
+  `);
+  const [wr] = await Promise.all([waitExit(waiter), waitExit(holder)]);
+  const waited = Number(wr.out);
+  assert.ok(waited >= 500, `model-b should have waited behind model-a's shared-endpoint lock, waited ${waited}ms (child err: ${wr.err})`);
+});
+
+test('lockKey: two different models do NOT serialize when each keeps its own default (model-keyed) lock', async () => {
+  const inst = tmpInst();
+  const holder = child(`
+    const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', taskId: 'w1' });
+    setTimeout(() => { h.release(); process.exit(0); }, 900);
+  `);
+  await sleep(300);
+
+  const other = child(`
+    const s = Date.now();
+    const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-b', taskId: 'w2' });
+    process.stdout.write(String(Date.now() - s));
+    h.release();
+  `);
+  const [orr] = await Promise.all([waitExit(other), waitExit(holder)]);
+  const waited = Number(orr.out);
+  assert.ok(waited < 500, `model-b should NOT have waited for model-a's separate lock, waited ${waited}ms (child err: ${orr.err})`);
+});
+
+test('lockKey: ticket dir/liveTickets are keyed on lockKey, not model, and the ticket still records model', async () => {
+  const inst = tmpInst();
+  let live;
+  await arb.withGpu(inst, { cls: 'draft', model: 'model-a', lockKey: 'shared-endpoint', taskId: 't1' }, async () => {
+    live = arb.liveTickets(inst, 'shared-endpoint');
+    assert.equal(live.length, 1);
+    assert.equal(live[0].model, 'model-a');
+    // Nothing under the model-a-only ticket dir -- it was never used as the key.
+    assert.deepEqual(arb.liveTickets(inst, 'model-a'), []);
+  });
+  assert.deepEqual(arb.liveTickets(inst, 'shared-endpoint'), []);
+});
