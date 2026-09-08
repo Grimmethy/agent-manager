@@ -38,6 +38,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
 const { checkDraft } = require('./fact-checker.js');
 const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
@@ -153,18 +154,12 @@ function isEffectivelyEmpty(trimmed) {
 // archaeology across queue/done/ -- same discipline local-client.js's degenerate-audit.log
 // and local-tool-client.js's context-budget-audit.log already established for their own
 // gates. Best-effort: must never affect the real review outcome.
+// 2026-09-08: now a thin wrapper over pipeline-history.js's unified writer -- see that
+// file's own header for why the 4 separately-invented per-class log files (this one
+// included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
+// dspy.settings.GLOBAL_HISTORY. Same call signature as before; no call site changed.
 function logFactCheckAudit(pipelineDir, entry) {
-  try {
-    if (!pipelineDir) return;
-    const dir = path.join(pipelineDir, 'instances');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, 'fact-check-audit.log'),
-      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-    );
-  } catch {
-    // best-effort audit trail -- must never break the real review
-  }
+  logPipelineEvent(pipelineDir, 'fact-check-block', entry);
 }
 
 // Deterministic review gate for a script-extract decompose move (see local-draft.js's

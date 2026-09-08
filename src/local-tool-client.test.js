@@ -811,10 +811,13 @@ test('runPlanWithTools uses the real prompt_eval_count from the previous turn to
 // done_reason:"length" truncation, so a later investigation reads a file instead of
 // reconstructing turn-by-turn state from a transcript's own visible text. -----------
 
+// 2026-09-08: logContextAudit now writes into pipeline-history.js's unified
+// instances/pipeline-history.log (type:'context-budget') -- see that module's own header
+// for why the 4 separately-invented per-class log files were consolidated.
 function readAuditLog(dir) {
-  const p = path.join(dir, 'instances', 'context-budget-audit.log');
+  const p = path.join(dir, 'instances', 'pipeline-history.log');
   if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type === 'context-budget');
 }
 
 test('logContextAudit appends one well-formed NDJSON line per call, never throwing on a bad pipelineDir', () => {
