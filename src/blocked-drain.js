@@ -24,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const { signatureForTask } = require('./pipeline-self-audit.js');
 const { signatureForClarificationTask } = require('./pipeline-forensics.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 // Re-derives each stuck task's signature fresh (not by matching on a stored field -- none
 // exists on the tasks that predate the fix that found them) using the SAME categorization
@@ -96,11 +97,13 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
         requeuedForSignatures: [...already, signature],
         status: 'pending',
         createdAt: nowIso,
-        history: [{
-          status: 'pending', at: nowIso,
-          note: `auto-requeued from ${dir}/: the fix for "${signature}" was confirmed and applied`,
-        }],
+        history: [],
       };
+      // 2026-09-08, Grimmethy: "establish a single, documented task log template" -- see
+      // context-trim-sweep.js's identical fix for the full incident this closes (a
+      // different, undocumented { status, at, note } vocabulary here vs every other
+      // stage-transition writer's canonical { stage, at, detail }, task-history.js).
+      appendHistoryEvent(fresh, 'pending', `auto-requeued from ${dir}/: the fix for "${signature}" was confirmed and applied`);
 
       const destPath = path.join(pendingDir, name);
       if (fs.existsSync(destPath)) continue; // already has a pending entry -- don't clobber it

@@ -73,6 +73,27 @@ class ConceptsRoutesTest(unittest.TestCase):
         on_disk = json.loads((self.pipeline_dir / "concepts.json").read_text())
         self.assertEqual(len(on_disk["concepts"]), 1)
 
+    # 2026-09-08: `kind` distinguishes a reference/template document (rendered with real
+    # markdown, index.html's renderConceptCard) from every existing concept's narrative
+    # finding (rendered as plain escaped text) -- mirrors src/concepts.js's own
+    # createConcept(). Omitted entirely unless explicitly 'reference'.
+    def test_create_concept_with_kind_reference_persists_it(self):
+        resp = self.client.post("/api/concepts", json={"name": "Task Record Reference", "description": "x", "kind": "reference"})
+        concept = resp.get_json()
+        self.assertEqual(concept["kind"], "reference")
+        on_disk = json.loads((self.pipeline_dir / "concepts.json").read_text())
+        self.assertEqual(on_disk["concepts"][0]["kind"], "reference")
+
+    def test_create_concept_without_kind_omits_the_field(self):
+        resp = self.client.post("/api/concepts", json={"name": "Ordinary finding"})
+        concept = resp.get_json()
+        self.assertNotIn("kind", concept)
+
+    def test_create_concept_ignores_an_unrecognized_kind_value(self):
+        resp = self.client.post("/api/concepts", json={"name": "Something else", "kind": "bogus"})
+        concept = resp.get_json()
+        self.assertNotIn("kind", concept)
+
     def test_create_concept_requires_a_name(self):
         resp = self.client.post("/api/concepts", json={"description": "no name given"})
         self.assertEqual(resp.status_code, 400)

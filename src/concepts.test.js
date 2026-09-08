@@ -52,6 +52,29 @@ test('createConcept defaults createdBy to manual', () => {
   assert.equal(concept.createdBy, 'manual');
 });
 
+// 2026-09-08: `kind` distinguishes a reference/template document (rendered with real
+// markdown) from every existing concept's narrative finding (rendered as plain escaped
+// text) -- see index.html's renderConceptCard. Omitted entirely (not even `kind:
+// undefined` on the object) for the ordinary case, so existing concepts and every
+// caller that doesn't pass it are byte-for-byte unaffected.
+test('createConcept persists kind:\'reference\' when passed, and omits the field entirely otherwise', () => {
+  const dir = tmpDir();
+  const ref = createConcept({ name: 'Task Record Reference', description: 'x', kind: 'reference' }, dir);
+  assert.equal(ref.kind, 'reference');
+  const onDiskRef = findConcept(loadConcepts(dir), ref.id);
+  assert.equal(onDiskRef.kind, 'reference');
+
+  const normal = createConcept({ name: 'Ordinary finding', description: 'y' }, dir);
+  assert.equal(normal.kind, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(normal, 'kind'), false);
+});
+
+test('createConcept ignores an unrecognized kind value -- only \'reference\' is a real kind today', () => {
+  const dir = tmpDir();
+  const concept = createConcept({ name: 'Something else', description: 'z', kind: 'bogus' }, dir);
+  assert.equal(concept.kind, undefined);
+});
+
 test('createConcept is idempotent on the slugified name -- a second organic creation returns the existing row', () => {
   const dir = tmpDir();
   const first = createConcept({ name: 'Dependency Ordering' }, dir, { createdBy: 'manual' });

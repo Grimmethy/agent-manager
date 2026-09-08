@@ -59,7 +59,15 @@ function slugify(name) {
 // Idempotent on the slugified name -- a second research fork "creating" a concept that
 // already exists (organic-creation path, no coordination between callers) must return
 // the existing row unchanged, never a duplicate.
-function createConcept({ name, description }, pipelineDir, { createdBy } = {}) {
+// 2026-09-08, Grimmethy: "establish a single, documented task log template ... a blank
+// template that can be viewed in the concepts tab" -- every existing concept is a
+// narrative research finding (a flat prose `description`, rendered as plain escaped
+// text, no markdown). `kind` distinguishes a REFERENCE document (a schema/template, not
+// a finding) so the dashboard can render it with real headers/lists instead -- see
+// index.html's renderConceptCard. Omitted (undefined) for every existing caller and
+// every concept created before this, which is the point: a concept with no `kind` keeps
+// today's exact rendering, unaffected.
+function createConcept({ name, description, kind }, pipelineDir, { createdBy } = {}) {
   const data = loadConcepts(pipelineDir);
   const slug = slugify(name);
   const existing = data.concepts.find((c) => c && c.slug === slug);
@@ -78,6 +86,7 @@ function createConcept({ name, description }, pipelineDir, { createdBy } = {}) {
     builtFromScratchCount: 0,
     adaptedFromResourceCount: 0,
   };
+  if (kind === 'reference') concept.kind = 'reference';
   data.concepts.push(concept);
   writeConcepts(pipelineDir, data);
   return concept;
