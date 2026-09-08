@@ -1321,9 +1321,18 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const leadIn = reason === 'context'
       ? 'This conversation has grown too large to safely continue -- you are nearly out of context room and can no longer call tools.'
       : 'You are out of turns and can no longer call tools.';
+    // budgetWarning (2026-09-08, root-caused live): a real forced-summary turn with
+    // reason:'context' answered RESOLUTION: decompose and got cut off mid-string writing
+    // its second sub-task's rawText -- exactly the moment remaining room is tightest is
+    // also the moment this prompt used to ask for the MOST verbose possible answer. Only
+    // added for reason:'context' (not 'turns', where context room is unaffected) --
+    // running out of TURNS with plenty of context left doesn't need this constraint.
+    const budgetWarning = reason === 'context'
+      ? ' You have very little context room left, so be CONCISE: if you use RESOLUTION: decompose, keep each sub-task rawText to 2-3 sentences -- a short answer that finishes beats a long one that gets cut off.'
+      : '';
     messages.push({
       role: 'user',
-      content: `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`,
+      content: `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`,
     });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
