@@ -123,6 +123,20 @@ const IN_PROGRESS_RE = /\bgot close\b|\bverified facts\b|\bfor the next pass\b|\
 const BUDGET_EXHAUSTED_RE = /ran out of (?:turn|context)(?:[/ ](?:turn|context))? budget/i;
 const COMPLETABLE_NOT_DESIGN_RE = /no further code changes? or decisions? (?:are |is )?(?:needed|required)|not (?:a|any) design (?:uncertainty|question|decision)|has(?:n'?t| not) (?:yet )?been executed/i;
 
+// 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js): the drafter's
+// own text said "not a design question -- a pass-budget overrun," which matches
+// COMPLETABLE_NOT_DESIGN_RE but NOT BUDGET_EXHAUSTED_RE (worded "no tool budget left" /
+// "pass-budget overrun," not "ran out of turn/context budget") -- fell through to bucket C
+// as a "genuine design question." Chasing more phrasings is a losing regex arms race
+// (Second Brain [[dspy-signatures]] research: DSPy constrains an output field's
+// vocabulary with Literal[...] rather than inferring meaning from free text after the
+// fact). local-agentic-write-draft.js's own prompt contract now requires an explicit,
+// fixed-vocabulary `BLOCKER-TYPE:` line immediately after `RESOLUTION: needs-human-
+// decision` -- when present, it is authoritative and bypasses BOTH regexes above entirely
+// (a task from an older draft, or a path that doesn't emit the tag, still falls back to
+// the phrase-matching pair).
+const BLOCKER_TYPE_BUDGET_EXHAUSTED_RE = /BLOCKER-TYPE:\s*budget-exhausted\b/i;
+
 // Bucket D signature: a draft's own text (or review's account of it) asserted a checkable
 // completion claim that is contradicted by the diff/repo -- the exact shape
 // adhoc-diff-sanity.js's adhocNoChangesClaimProblem and the false-test-count/
@@ -310,8 +324,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       const historyF = Array.isArray(task.history) ? task.history : [];
       const hasExhaustedF = historyF.some((h) => h && h.stage === 'exhausted');
       const id0 = task.id || name.replace(/\.json$/, '');
-      if (BUDGET_EXHAUSTED_RE.test(oqF) && COMPLETABLE_NOT_DESIGN_RE.test(oqF)
-          && !hasExhaustedF && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      const isBudgetExhausted = BLOCKER_TYPE_BUDGET_EXHAUSTED_RE.test(oqF)
+        || (BUDGET_EXHAUSTED_RE.test(oqF) && COMPLETABLE_NOT_DESIGN_RE.test(oqF));
+      if (isBudgetExhausted && !hasExhaustedF && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket F but ${id0}.json already in adhoc/ -- already handled, skipping`);
@@ -476,6 +491,7 @@ module.exports = {
   FALSE_CLAIM_RE,
   BUDGET_EXHAUSTED_RE,
   COMPLETABLE_NOT_DESIGN_RE,
+  BLOCKER_TYPE_BUDGET_EXHAUSTED_RE,
 };
 
 if (require.main === module) {
