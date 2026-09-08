@@ -265,8 +265,9 @@ function main() {
   // assembly) same as reasoningTierFor()'s own established try/catch treatment of the
   // identical getConfig() call.
   let repoRoot = null;
+  let pipelineDir = null;
   try {
-    ({ repoRoot } = getConfig());
+    ({ repoRoot, pipelineDir } = getConfig());
   } catch (e) {
     console.warn(`[get-grounding-source] getConfig() failed, repoRoot will remain null: ${e?.message ?? e}`);
   }
@@ -315,6 +316,41 @@ function main() {
     // correctly and found something real would still get rejected as "unverifiable".
     if (task.toolCallLog && task.toolCallLog.length > 0) {
       parts.push(JSON.stringify(task.toolCallLog));
+    }
+
+    // 2026-09-08, Second Brain [[dspy-signatures]]/adapter research applied: DSPy's
+    // ChatAdapter grounds a call's output against a structured, clearly-delineated field
+    // value -- never by re-parsing free-form narration for hints. local-agentic-write's
+    // multi-turn transcript (a DIFFERENT mechanism from toolCallLog just above -- see
+    // local-agentic-write-draft.js) lives in a SEPARATE queue/worklogs/<id>.json file, not
+    // on the task object at all, so its real run_bash stdout was invisible to grounding
+    // entirely. Root-caused live: a draft's own agentic run genuinely executed `node
+    // --check newfile.js && echo NEWFILE_OK`, got real stdout `...\nNEWFILE_OK\n` back,
+    // and correctly cited that real result in its final summary -- but the summary
+    // PARAPHRASED it ("printed `NEWFILE_OK` (exit 0)") rather than repeating the literal
+    // shell syntax, so no regex chasing one specific phrasing (this file's own prior fix:
+    // fact-checker.js's echo-marker carve-out) can generalize to every way a model might
+    // narrate a real result. Folding the worklog's own real, already-executed tool output
+    // directly into the grounding source means ANY citation of a real printed value is
+    // recognized via plain `sourceText.includes()`, regardless of how the final summary
+    // phrases it -- the same DSPy principle (ground against the real structured data, not
+    // a guess about the narration's intent) applied without needing the model to change
+    // its own behavior at all. Best-effort: a missing/malformed worklog must never break
+    // grounding assembly, same discipline as every other block in this function.
+    if (pipelineDir) {
+      try {
+        const worklogPath = path.join(pipelineDir, 'queue', 'worklogs', `${task.id}.json`);
+        if (fs.existsSync(worklogPath)) {
+          const worklog = JSON.parse(fs.readFileSync(worklogPath, 'utf8'));
+          for (const tier of worklog.tiers || []) {
+            for (const call of tier.calls || []) {
+              if (call.resultPreview) parts.push(String(call.resultPreview));
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[get-grounding-source] worklog read failed for ${task.id}, continuing without it: ${e?.message ?? e}`);
+      }
     }
 
     const sourceName = resolveSourceName(task);
