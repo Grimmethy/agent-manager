@@ -28,6 +28,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { isCandidateFulfillmentSource } = require('./local-draft.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
+const { classifyRequeue } = require('./requeue-attribution.js');
 
 const FLAG_TTL_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_FLAG_TTL_DAYS || 3) * 24 * 60 * 60 * 1000;
 const KEEP_COOLDOWN_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS || 21) * 24 * 60 * 60 * 1000;
@@ -257,6 +258,10 @@ async function sweep({ pipelineDir, repoRoot, dryRun = false, now = Date.now() }
 
       const destPath = path.join(pendingDir, path.basename(filePath));
       if (fs.existsSync(destPath)) { summary.skipped += 1; continue; }
+
+      try {
+        await classifyRequeue(task, { reasonHint: improvements, requeueWriter: 'context-trim-sweep', repoRoot, now });
+      } catch { /* classification must never block the real requeue */ }
 
       fs.mkdirSync(pendingDir, { recursive: true });
       fs.writeFileSync(destPath, JSON.stringify(fresh, null, 2));
