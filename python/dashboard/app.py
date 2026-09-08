@@ -3368,6 +3368,23 @@ def api_summary():
     for state in QUEUE_STATES:
         state_dir = qdir / state
         counts[state] = len(list(state_dir.glob("*.json"))) if state_dir.is_dir() else 0
+    # "Done" headline split (2026-08-25, "24 of 25 'shipped' tasks produced zero
+    # code"): a raw queue/done/ count treats no-ops -- 0-char drafts closed by
+    # deterministic-empty-approve or a 3/3 vote on nothing -- as shipped, so the
+    # effective ship rate reads 25/25 when it is really 1/25. doneShipped only counts
+    # records _is_real_ship() says actually merged code; doneNoop is the rest, so a
+    # consumer can show BOTH numbers instead of one misleading "completed" total.
+    done_dir = qdir / "done"
+    shipped = noop = 0
+    if done_dir.is_dir():
+        for f in done_dir.glob("*.json"):
+            rec = read_json_safe(f)
+            if isinstance(rec, dict) and _is_real_ship(rec):
+                shipped += 1
+            else:
+                noop += 1
+    counts["doneShipped"] = shipped
+    counts["doneNoop"] = noop
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
@@ -5858,6 +5875,29 @@ _TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
 # Task states a hub child is "finished" in, for progress + readiness (mirrors
 # coordinator-sweep.js's TERMINAL_GOOD).
 _HUB_CHILD_DONE = {"done", "merged", "gone", "abandoned"}
+
+
+def _is_real_ship(rec):
+    """Whether a done-queue task REALLY shipped code (2026-08-25, "24 of 25 'shipped'
+    tasks produced zero code" -- 24 ended with 'no candidates in implement response --
+    nothing to apply', closed by deterministic-empty-approve or a 3/3 vote on a 0-char
+    draft). True only when the record's own terminalDisposition is 'merged' AND its
+    history has an 'applied' stage whose detail is non-empty and is not a no-op marker;
+    anything else is a no-op and must not count toward the shipped headline, or every
+    dashboard/SLO reading queue/done/ as 'shipped' over-reports by ~24x."""
+    if not isinstance(rec, dict) or rec.get("terminalDisposition") != "merged":
+        return False
+    noop_markers = ("nothing to apply", "no candidates", "noop")
+    for h in rec.get("history") or []:
+        if not isinstance(h, dict) or h.get("stage") != "applied":
+            continue
+        detail = (h.get("detail") or "").strip()
+        if not detail:
+            return False
+        if any(marker in detail.lower() for marker in noop_markers):
+            return False
+        return True
+    return False
 
 
 def _find_task_record_anywhere(qdir, task_id):
