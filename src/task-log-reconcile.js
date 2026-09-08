@@ -17,14 +17,17 @@
 // Flags:
 //   --report     print the pending-merge and abandoned lists to stderr (for a human audit)
 //   --backfill   ignore the state file, walk every record including the dated
-//                queue/done/_archived/<YYYY-MM>/ buckets, and `git fetch origin` first
-//   --fetch      `git fetch origin` before resolving (default off -- trusts local refs)
+//                queue/done/_archived/<YYYY-MM>/ buckets
+//   --no-fetch   skip the `git fetch origin` before resolving (default: always fetch, see
+//                2026-09-08 fix below -- this is the explicit opt-out for an intentionally
+//                offline/sandboxed run, not the normal path)
 //   --dry-run    resolve and report, write nothing (state file included)
-//   --reclassify one-shot: re-resolve records ALREADY closed as `noop`, so a review that was
-//                a clean FALSE-POSITIVE dismissal (recorded before the `dismissed` stage
-//                existed) is split back out. Implies --backfill enumeration. Idempotent: a
-//                second run finds nothing left to move. Run once, after the plugin that
-//                stamps record.reviewDisposition is deployed.
+//   --reclassify one-shot: re-resolve records ALREADY closed as `noop` or `abandoned` -- a
+//                `noop` may have been a clean FALSE-POSITIVE review dismissal (recorded
+//                before the `dismissed` stage existed), and an `abandoned` may have been a
+//                false "branch gone" read from a stale local ref cache (2026-09-08 fix
+//                below). Implies --backfill enumeration. Idempotent: a second run finds
+//                nothing left to move.
 
 const fs = require('fs');
 const path = require('path');
@@ -89,19 +92,37 @@ function candidateRecords(doneDir, { backfill, state }) {
   return out;
 }
 
-function reconcile({ pipelineDir, repoRoot, argv = [] }) {
+function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
   const report = argv.includes('--report');
   const reclassify = argv.includes('--reclassify');
   const backfill = argv.includes('--backfill') || reclassify;
   const dryRun = argv.includes('--dry-run');
-  const doFetch = backfill || argv.includes('--fetch');
+  // 2026-09-08, Grimmethy: root-caused live a false "abandoned -- branch gone, work
+  // lost" verdict on TWO separate, genuinely still-open agent/<id> branches. Both were
+  // real, reviewed, tested work -- confirmed alive on origin the whole time -- but this
+  // routine tick had never fetched, so buildShipContext()'s git for-each-ref only ever
+  // saw whatever refs/remotes/origin/agent/* happened to already be cached locally,
+  // which one sibling apply's own git operations on this SAME shared repoRoot can
+  // perturb between ticks (confirmed: one of the two read correctly as pending-merge on
+  // one tick, then flipped to abandoned 17 minutes later with no merge in between).
+  // `abandoned` is a STABLE_TERMINAL_STAGE -- once wrong, it never self-heals. Fetch is
+  // now unconditional on every tick (still cheap/bounded/best-effort, same as before) so
+  // the routine path is never working from a staler view of origin than a --backfill run
+  // would have used. `--no-fetch` is the explicit opt-out for a sandboxed/offline run
+  // that wants to trust local refs on purpose.
+  const doFetch = !argv.includes('--no-fetch');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
   // Under --reclassify, records already closed as `noop` are re-resolved (a FALSE-POSITIVE
-  // dismissal recorded before the `dismissed` stage existed). Nothing else re-opens.
-  const allowReopenFrom = reclassify ? new Set(['noop']) : undefined;
+  // dismissal recorded before the `dismissed` stage existed). `abandoned` reopens too, as
+  // of the same 2026-09-08 fix above -- a wrong "work lost" verdict deserves the same
+  // audit-triggered correction path noop already had; re-resolving it now runs against a
+  // freshly-fetched ctx, so a genuinely still-open branch reclassifies correctly instead
+  // of being re-confirmed as lost by the same stale-ref bug that produced it.
+  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
 
   if (doFetch && repoRoot) {
-    try { execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }); } catch { /* offline -- use local refs */ }
+    const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+    try { fetch(); } catch { /* offline -- use local refs */ }
   }
 
   const state = loadState(pipelineDir);
