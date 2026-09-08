@@ -661,9 +661,11 @@ test('reviewTask deterministically rejects a draft citing a URL not present anyw
 // gate's own header comment calls itself "high-precision, almost never a false positive,"
 // but this session found 4 confirmed false positives against that exact claim, discovered
 // only by manually grepping every historical hard-block. One NDJSON line per hard block
-// means the next investigation is `grep instances/fact-check-audit.log`, not archaeology
-// across queue/done/.
-test('reviewTask appends one NDJSON line to instances/fact-check-audit.log every time the ungrounded-value gate hard-blocks', async () => {
+// (now in pipeline-history.js's unified instances/pipeline-history.log, type:'fact-check-
+// block' -- see that module's own header for why the 4 separately-invented per-class log
+// files were consolidated) means the next investigation is `grep`, not archaeology across
+// queue/done/.
+test('reviewTask appends one NDJSON line to the unified pipeline-history.log every time the ungrounded-value gate hard-blocks', async () => {
   const { repoRoot, domainsPath, dir } = makeFixture();
   const task = {
     id: 'audit-log-test-1', domain: 'default', source: 'manual',
@@ -673,10 +675,11 @@ test('reviewTask appends one NDJSON line to instances/fact-check-audit.log every
   };
   await reviewTask(task, { repoRoot, domainsPath, pipelineDir: dir, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
 
-  const logPath = path.join(dir, 'instances', 'fact-check-audit.log');
-  assert.ok(fs.existsSync(logPath), 'the audit log must exist after a hard block');
+  const logPath = path.join(dir, 'instances', 'pipeline-history.log');
+  assert.ok(fs.existsSync(logPath), 'the unified pipeline history log must exist after a hard block');
   const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, 'fact-check-block');
   assert.equal(lines[0].taskId, 'audit-log-test-1');
   assert.equal(lines[0].source, 'adhoc', 'resolveSourceName maps a manual/default task to its real registered source name');
   assert.ok(lines[0].at, 'each entry carries its own real timestamp');

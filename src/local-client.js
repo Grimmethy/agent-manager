@@ -18,6 +18,7 @@ const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -55,24 +56,14 @@ function resolvePipelineDir() {
 // "does this always hit the same numPredict ceiling, or does it vary" required manually
 // cross-referencing model-stats.db against each task's own JSON, one at a time. One NDJSON
 // line per degenerate attempt (not just the final one) means that's `grep` from now on.
-// Same file-writing shape as logContextAudit (best-effort, must never break the real call),
-// deliberately a SEPARATE log file (degenerate-audit.log, not context-budget-audit.log) --
-// a numPredict-too-small truncation and a context-window-overflow truncation are different
-// failure classes with different fixes, and conflating them in one file would just
-// reintroduce the same "which one was this" archaeology this exists to remove.
+// Same file-writing shape as logContextAudit (best-effort, must never break the real call).
+// 2026-09-08: now a thin wrapper over pipeline-history.js's unified writer -- see that
+// file's own header for why the 4 separately-invented per-class log files (this one
+// included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
+// dspy.settings.GLOBAL_HISTORY. Same call signature as before this change; no call site
+// anywhere in this file needed to change.
 function logDegenerateAudit(entry) {
-  try {
-    const pipelineDir = resolvePipelineDir();
-    if (!pipelineDir) return;
-    const dir = path.join(pipelineDir, 'instances');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, 'degenerate-audit.log'),
-      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-    );
-  } catch {
-    // best-effort audit trail -- must never break the real call
-  }
+  logPipelineEvent(resolvePipelineDir(), 'degenerate', entry);
 }
 
 // 2026-09-08, Second Brain [[dspy]] research applied (dspy/utils/exceptions.py's typed
@@ -90,20 +81,10 @@ function logDegenerateAudit(entry) {
 // instead of manual archaeology" discipline as logDegenerateAudit and every other audit
 // log this pipeline has accumulated. Deliberately a SEPARATE file from degenerate-audit.log
 // -- a call that never got a response at all and a call that got a real-but-bad response
-// are different failure classes with different fixes.
+// are different failure classes with different fixes. 2026-09-08: now a thin wrapper over
+// pipeline-history.js's unified writer, same reasoning as logDegenerateAudit above.
 function logHardFailureAudit(entry) {
-  try {
-    const pipelineDir = resolvePipelineDir();
-    if (!pipelineDir) return;
-    const dir = path.join(pipelineDir, 'instances');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, 'hard-failure-audit.log'),
-      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-    );
-  } catch {
-    // best-effort audit trail -- must never break the real call
-  }
+  logPipelineEvent(resolvePipelineDir(), 'hard-failure', entry);
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';

@@ -16,6 +16,7 @@ const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
@@ -1067,18 +1068,14 @@ function estimateContextTokens(messages, real, realAtLength) {
 // a write failure here must never break the real call, same contract every other
 // best-effort audit trail in this codebase (side-finding.js's inbox, model-stats-client's
 // _run_event) already holds itself to.
+// 2026-09-08: now a thin wrapper over pipeline-history.js's unified writer -- see that
+// file's own header for why the 4 separately-invented per-class log files (this one
+// included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
+// dspy.settings.GLOBAL_HISTORY. Same call signature as before; no call site changed.
 function logContextAudit(entry) {
-  try {
-    const { pipelineDir } = getConfig();
-    const dir = path.join(pipelineDir, 'instances');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, 'context-budget-audit.log'),
-      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-    );
-  } catch {
-    // best-effort audit trail -- must never break the real call
-  }
+  let pipelineDir = null;
+  try { ({ pipelineDir } = getConfig()); } catch { /* best-effort -- see logPipelineEvent */ }
+  logPipelineEvent(pipelineDir, 'context-budget', entry);
 }
 
 // Kill switch is set: drop to local-client.js's plain /api/generate call() -- no tools,
