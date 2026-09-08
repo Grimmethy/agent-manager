@@ -155,6 +155,28 @@ test('resolveDisposition: allowReopenFrom does not re-open merged/filed/etc', ()
   assert.equal(resolveDisposition(r, { ctx: ctx(), allowReopenFrom: new Set(['noop']) }), null);
 });
 
+// 2026-09-08: root-caused live a false "abandoned -- branch gone, work lost" verdict on
+// two genuinely still-open branches, caused by a stale local ref cache (the routine
+// reconcile tick never fetched). `abandoned` tail is stable by default (same as before --
+// the fix is NOT auto-reopening it every tick), but --reclassify's allowReopenFrom now
+// includes it so a fresh, correctly-fetched ctx can un-stick a wrong verdict, the same
+// audit-triggered correction path `noop` already had.
+test('resolveDisposition: an abandoned tail is stable by default, but allowReopenFrom(\'abandoned\') re-resolves it correctly once ctx shows the branch is real', () => {
+  const r = { id: 'real-branch-1', history: [{ stage: 'created' }, { stage: 'applied', detail: 'agent/real-branch-1' }, { stage: 'abandoned', detail: 'applied to agent/real-branch-1 -- branch gone, not on master: work lost' }] };
+  // Without the opt-in, the wrong verdict stays frozen forever (this IS the bug's shape).
+  assert.equal(resolveDisposition(r, { ctx: ctx({ branches: { 'real-branch-1': 2 } }) }), null, 'abandoned tail is stable without the opt-in, even though ctx now shows it');
+  // With --reclassify's opt-in and a ctx that reflects the branch's real state (as a fresh
+  // fetch would produce), it corrects to pending-merge instead of re-confirming abandoned.
+  const out = resolveDisposition(r, { ctx: ctx({ branches: { 'real-branch-1': 2 } }), allowReopenFrom: new Set(['noop', 'abandoned']) });
+  assert.equal(out.stage, 'pending-merge');
+});
+
+test('resolveDisposition: allowReopenFrom(\'abandoned\') re-confirms abandoned (idempotent) when the branch genuinely is gone', () => {
+  const r = { id: 'truly-gone-1', history: [{ stage: 'created' }, { stage: 'applied', detail: 'agent/truly-gone-1' }, { stage: 'abandoned', detail: 'x' }] };
+  const out = resolveDisposition(r, { ctx: ctx(), allowReopenFrom: new Set(['noop', 'abandoned']) });
+  assert.equal(out.stage, 'abandoned', 're-resolving a genuinely gone branch must still land on abandoned, not flip incorrectly');
+});
+
 test('trailer detection wins over a still-present ahead branch (hand-applied, branch left behind)', () => {
   const out = resolveDisposition({ id: 'ac-110', ...applied('agent/ac-110') },
     { ctx: ctx({ onMain: { 'ac-110': 'deadbeefcafe' }, branches: { 'ac-110': 1 } }) });
