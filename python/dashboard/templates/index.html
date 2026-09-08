@@ -519,6 +519,26 @@ let pendingWorkerAssign = {};
 // timer below can recompute stale duration client-side without re-polling every second.
 let instancesForTimers = [];
 
+// "All tasks completed" log under the Workers tab (2026-09-08, Grimmethy: "I really need
+// an in app representation of that all tasks completed log under the workers. Make sure
+// it only loads the most recent 25 tasks until I scroll to the bottom.") backed by
+// GET /api/tasks/completed (cursor-paginated -- see _scan_recently_completed_tasks in
+// app.py). Kept as accumulated JS STATE, not DOM state, specifically because renderWorkers
+// does a full main.innerHTML replace on every 5s poll (see isPoll's own header comment a
+// few hundred lines below for the established anti-pattern this file already had to fix
+// once for the assign-task dropdowns) -- re-rendering the SAME accumulated list from this
+// array on every poll produces byte-identical HTML for this section, so the replace is
+// invisible to the operator even though the DOM node itself is torn down and rebuilt each
+// time. completedTasksNextCursor is the `before` cursor for the next page (null once the
+// server reports no more). completedTasksLoading guards against IntersectionObserver
+// firing a second fetch for the same page while the first is still in flight (a fast
+// scroll-to-bottom can otherwise trigger the callback more than once before state updates).
+let completedTasksLog = [];
+let completedTasksNextCursor = null;
+let completedTasksLoading = false;
+let completedTasksExhausted = false;
+let completedTasksObserver = null;
+
 // Ticks every second independent of the 5s /api/instances poll, so "stale for" reads as a
 // live counter instead of jumping in 5s increments. Computed purely from lastHeartbeat +
 // staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
