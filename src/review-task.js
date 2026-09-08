@@ -555,6 +555,25 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // reverts-a-prior-fix (2026-09-08, root-caused live via change-review-fix-ac-1 -- see
+  // fact-checker.js's checkRevertsAPriorFix header for the full incident): a Group B edit
+  // that git history shows is reverting toward code an earlier commit of THIS pipeline's
+  // own (AC-\d+-marked) removed is very likely undoing an already-confirmed fix without
+  // knowing it -- the same "high-precision, disqualifying, no review call spent" tier as
+  // ungrounded-url/ungrounded-field above, not merely advisory context a vote (which only
+  // ever checks fidelity to the CURRENT finding, never the target line's own history)
+  // could ignore or miss entirely.
+  const revertFlags = isProposalNotClaim ? [] : (factCheck.flags || []).filter((f) => f.type === 'reverts-a-prior-fix');
+  if (revertFlags.length > 0) {
+    const detail = revertFlags.map((f) => f.detail).join('; ');
+    const reason = `Deterministic gate: this edit reverts code that git history shows was itself the deliberate resolution of an earlier confirmed fix in this pipeline -- ${detail}. Not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to be undoing a confirmed prior fix; needs a human to judge whether the earlier fix should actually be reversed.`;
+    task.reviewProvider = 'deterministic-reverts-a-prior-fix';
+    logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: revertFlags });
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck);
   if (scriptExtractVerdict) {
     if (scriptExtractVerdict.ok) {

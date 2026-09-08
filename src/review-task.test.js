@@ -658,6 +658,71 @@ test('reviewTask deterministically rejects a draft citing a URL not present anyw
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known hallucinated URL');
 });
 
+// reverts-a-prior-fix (2026-09-08, root-caused live via change-review-fix-ac-1 -- see
+// fact-checker.js's checkRevertsAPriorFix header for the full incident) ------------------
+
+function makeGitFixtureWithPriorFix() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-revert-test-'));
+  const repoRoot = path.join(dir, 'repo');
+  fs.mkdirSync(repoRoot, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: repoRoot });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoRoot });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoRoot });
+  const filePath = path.join(repoRoot, 'sweep.js');
+  fs.writeFileSync(filePath, "  for (const dir of DIRS) {\n    try { names = fs.readdirSync(dir); } catch { continue; }\n  }\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'initial sweep loop'], { cwd: repoRoot });
+  fs.writeFileSync(filePath, "  for (const dir of DIRS) {\n    try { names = fs.readdirSync(dir); } catch (err) { if (err.code === 'ENOENT') continue; console.error(err); throw err; }\n  }\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'AC-164 · Bare catch swallows non-ENOENT filesystem errors'], { cwd: repoRoot });
+  const domainsPath = path.join(dir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
+  return { repoRoot, domainsPath };
+}
+
+test('reviewTask deterministically blocks a draft that reverts toward code removed by a prior AC-marked fix -- no review call spent', async () => {
+  const { repoRoot, domainsPath } = makeGitFixtureWithPriorFix();
+  const task = {
+    id: 'revert-test', domain: 'default', source: 'change_review_fix',
+    title: 'test', planResponse: 'plan',
+    implementResponse: JSON.stringify([{
+      file: 'sweep.js', mode: 'edit',
+      find: "console.error(err); throw err; }",
+      replace: "console.error(err); continue; }",
+    }]),
+    promptContext: { body: 'Some grounding text.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-reverts-a-prior-fix');
+  assert.match(result.blockedReason, /reverts-a-prior-fix|reverts toward/);
+  assert.match(result.blockedReason, /AC-164/);
+  assert.equal(captured.length, 0, 'no review call should be spent voting on a draft already known to revert a confirmed fix');
+});
+
+test('reviewTask does NOT block an edit near a prior AC-marked fix that is not actually a revert', async () => {
+  const { repoRoot, domainsPath } = makeGitFixtureWithPriorFix();
+  const task = {
+    id: 'not-a-revert-test', domain: 'default', source: 'change_review_fix',
+    title: 'test', planResponse: 'plan',
+    implementResponse: JSON.stringify([{
+      file: 'sweep.js', mode: 'edit',
+      find: "console.error(err); throw err; }",
+      replace: "logHardFailureAudit({ code: err.code }); throw err; }",
+    }]),
+    promptContext: { body: 'Some grounding text.' },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-reverts-a-prior-fix');
+  assert.equal(result.verdict, 'approved');
+});
+
 // stacked-branch grounding (2026-09-08 incident) -----------------------------------------
 // A stacked task correctly citing a sibling's real, committed-but-unmerged value used to be
 // hard-blocked here -- the git-grep fallback inside checkGroundedValues ran against

@@ -228,6 +228,134 @@ function checkCommitClaims(text, repoRoot) {
   });
 }
 
+// reverts-a-prior-fix (2026-09-08) -- root-caused live: change-review-fix-ac-1 auto-
+// drafted (and 2/3-voted APPROVE) a revert of src/decompose-loop-autoroute.js's `throw
+// err` back to `continue`, unaware that `throw` was itself the deliberate resolution of a
+// DIFFERENT, already-confirmed finding (AC-164, commit 2ef15813) -- change_review flagged
+// the same hunk as a "regression" 4 days later with no memory of that history. Grimmethy:
+// "That fix seems ghost in the machine to me... fixing the mechanism... stop more
+// problems like this from arising." This is the deterministic, git-grounded gate: for a
+// Group B `mode: 'edit'` item, find the most recent real commit that touched the exact
+// lines being edited (git log -L, same subprocess-call shape/timeout/fail-open contract
+// as checkCommitClaims above), and if that commit's subject carries this pipeline's own
+// autonomous-fix marker (AC-\d+, confirmed on real fix commits both directly and via
+// their PR-merge title) AND the proposed `replace` text substantially reuses what that
+// commit REMOVED, this edit is very likely undoing a confirmed fix without knowing it.
+
+const AC_MARKER_RE = /\bAC-\d+\b/;
+// Below this many non-whitespace characters, the isolated "changed span" (see
+// extractChangedSpan below) is too generic to trust as evidence on its own (a bare "}" or
+// ";" reappearing means nothing) -- root-caused live: comparing find/replace's FULL text
+// against the prior fix's full removed text (a naive longest-common-substring over both
+// whole strings) scored only 12 chars on the real AC-1 case, UNDER a reasonable 20-char
+// bar, because AC-1's replace shares a long, boilerplate console.error(...) call with its
+// own find that has nothing to do with the actual revert -- the real signal (find's
+// "throw err" changing to replace's "continue") is a short, specific token diluted by
+// that shared boilerplate in a whole-text comparison. Isolating just the changed span
+// first removes the dilution, so a much smaller minimum on THAT span is still precise.
+const MIN_CHANGED_SPAN_CHARS = 4;
+
+// Byte offset -> 1-indexed [startLine, endLine] the substring spans in `fileText`.
+function lineRangeOf(fileText, substring) {
+  const idx = fileText.indexOf(substring);
+  if (idx === -1) return null;
+  const startLine = fileText.slice(0, idx).split('\n').length;
+  const endLine = startLine + substring.split('\n').length - 1;
+  return { startLine, endLine };
+}
+
+// Strips the longest common prefix and suffix shared by `oldText`/`newText`, leaving just
+// the substantive middle each side changed -- e.g. find "...); throw err; }" / replace
+// "...); continue; }" isolates to { oldMiddle: "throw err", newMiddle: "continue" },
+// discarding the shared console.error(...) boilerplate around it. This is the actual
+// "what did this edit change" signal -- comparing find/replace's FULL text against a
+// prior commit's full removed text dilutes on shared boilerplate (see
+// MIN_CHANGED_SPAN_CHARS's own comment for the real case this fixes).
+function extractChangedSpan(oldText, newText) {
+  let i = 0;
+  while (i < oldText.length && i < newText.length && oldText[i] === newText[i]) i += 1;
+  let j = 0;
+  while (
+    j < oldText.length - i && j < newText.length - i
+    && oldText[oldText.length - 1 - j] === newText[newText.length - 1 - j]
+  ) j += 1;
+  return {
+    oldMiddle: oldText.slice(i, oldText.length - j).trim(),
+    newMiddle: newText.slice(i, newText.length - j).trim(),
+  };
+}
+
+function normalizeCode(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+const GIT_LOG_LINE_RANGE_TIMEOUT_MS = 15_000;
+
+// Best-effort: any git/env failure (no repo, git missing, timeout, file not found) skips
+// this item silently -- same "unknown, never a false flag" contract checkCommitClaims
+// establishes. Returns null on no-history-found or any failure, else { hash, subject,
+// removedText }.
+function findPriorFixForRange(file, startLine, endLine, repoRoot) {
+  const { execFileSync } = require('child_process');
+  let out;
+  try {
+    out = execFileSync('git', [
+      'log', '-L', `${startLine},${endLine}:${file}`, '-1', '--format=COMMIT:%H%nSUBJECT:%s',
+    ], { cwd: repoRoot, timeout: GIT_LOG_LINE_RANGE_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    return null;
+  }
+  const hashMatch = out.match(/^COMMIT:([0-9a-f]+)$/m);
+  const subjectMatch = out.match(/^SUBJECT:(.*)$/m);
+  if (!hashMatch || !subjectMatch) return null;
+  const removedText = out.split('\n')
+    .filter((l) => l.startsWith('-') && !l.startsWith('---'))
+    .map((l) => l.slice(1))
+    .join('\n');
+  return { hash: hashMatch[1], subject: subjectMatch[1], removedText };
+}
+
+function checkRevertsAPriorFix(implementResponse, repoRoot) {
+  let items;
+  try {
+    items = JSON.parse(implementResponse);
+  } catch (e) {
+    return []; // not Group B JSON (Group A / candidate-split / etc.) -- nothing to check
+  }
+  if (!Array.isArray(items)) items = [items];
+
+  const flags = [];
+  for (const item of items) {
+    if (!item || item.mode !== 'edit' || !item.file || !item.find || !item.replace) continue;
+
+    const fullPath = path.join(repoRoot, item.file);
+    let fileText;
+    try { fileText = fs.readFileSync(fullPath, 'utf8'); } catch (e) { continue; }
+
+    const range = lineRangeOf(fileText, item.find);
+    if (!range) continue; // find doesn't match the current file -- a different check's problem
+
+    const prior = findPriorFixForRange(item.file, range.startLine, range.endLine, repoRoot);
+    if (!prior || !AC_MARKER_RE.test(prior.subject)) continue;
+
+    // Isolate what THIS edit actually changes (strip shared boilerplate around it), then
+    // check whether that specific new text is exactly what the prior confirmed fix
+    // removed -- not just "some substring overlaps somewhere," which would false-positive
+    // on any two lines sharing a `}` or `;`.
+    const { newMiddle } = extractChangedSpan(normalizeCode(item.find), normalizeCode(item.replace));
+    if (newMiddle.length < MIN_CHANGED_SPAN_CHARS) continue;
+    if (!normalizeCode(prior.removedText).includes(newMiddle)) continue;
+
+    flags.push({
+      type: 'reverts-a-prior-fix',
+      detail: `${item.file}:${range.startLine} -- reverts toward code removed by ${prior.hash.slice(0, 8)} ("${prior.subject}")`,
+      commit: prior.hash,
+      subject: prior.subject,
+    });
+  }
+  return flags;
+}
+
 function extractClaimedRelationships(text) {
   const out = [];
   let match;
@@ -520,6 +648,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
   const createModeTargets = extractCreateModeTargets(draftText);
   const commitChecks = checkCommitClaims(draftText, repoRoot);
+  const revertChecks = checkRevertsAPriorFix(draftText, repoRoot);
 
   // isCreateTarget is stamped onto fileChecks itself (not just used to filter `flags`
   // below) because buildVerdictPrompt (review-task.js) hands the REVIEWER MODEL the raw
@@ -567,8 +696,9 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
     flags.push({ type: 'unscoped-heavy-change', detail: blastRadiusFlag.note });
   }
   flags.push(...groundedFlags);
+  flags.push(...revertChecks);
 
-  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks };
+  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks };
 }
 
 module.exports = {
@@ -578,6 +708,7 @@ module.exports = {
   checkBlastRadiusBias,
   checkGroundedValues,
   checkCommitClaims,
+  checkRevertsAPriorFix,
   extractFilePaths,
   extractCreateModeTargets,
   extractClaimedRelationships,
