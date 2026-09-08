@@ -67,6 +67,8 @@ const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
 const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
@@ -1345,16 +1347,48 @@ async function runCritiqueAndRevision(task, {
 // for the OTHER load-order case. Best-effort: a failed unload just means the upcoming
 // extended-context call may itself trigger Ollama's own eviction instead, no worse than
 // before this existed, so this must never throw or block the real call.
-async function ensureHeadroomForExtendedContext(implNumCtx) {
-  if (!(implNumCtx > PINNED_NUM_CTX)) return;
+//
+// 2026-09-08, Grimmethy: "I'd like to see an audit log for this error. Please harden the
+// eviction path" -- root-caused live: worker-1 and worker-reasoning both stacked up
+// repeated OLLAMA_TIMEOUTs (150s ceiling) while `ollama ps` showed ZERO models resident
+// and a fresh llama-server was cold-loading the 27B model's tensors from disk. This
+// function was the prime suspect (evicts the small model to make room, best-effort and
+// entirely UNLOGGED, so there was no way to confirm it after the fact) but couldn't be
+// proven from the audit trail that existed at the time. Two changes:
+//   1. logPipelineEvent (unified NDJSON stream, same as hard-failure/degenerate/
+//      context-budget) now records every real eviction attempt -- taskId, source,
+//      implNumCtx, the model evicted, and whether the eviction call itself succeeded --
+//      so the NEXT time this exact symptom recurs, `grep model-eviction
+//      instances/pipeline-history.log` answers "was this the cause?" directly instead of
+//      needing a live nvidia-smi/journalctl investigation to infer it.
+//   2. Returns `{ evicted }` so the caller can warn its own next real call that a cold
+//      reload is now likely -- see callImplementModel's own coldLoadExpected use just
+//      below, which adds a generous timeout bump specifically for that one call instead
+//      of leaving it to race the same 150-240s ceiling a fresh multi-minute tensor load
+//      from disk has no chance of finishing inside.
+async function ensureHeadroomForExtendedContext(implNumCtx, task) {
+  if (!(implNumCtx > PINNED_NUM_CTX)) return { evicted: false };
   const smallModel = getModelProfile('brain-dump-cheap-local')?.model;
-  if (!smallModel) return;
+  if (!smallModel) return { evicted: false };
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+  let succeeded = false;
+  let errorMessage = null;
   try {
     await postJson(`${ollamaUrl}/api/generate`, { model: smallModel, keep_alive: 0 }, 10_000);
-  } catch (_err) {
-    // best-effort -- see comment above.
+    succeeded = true;
+  } catch (err) {
+    // best-effort -- see comment above -- but still logged below either way.
+    errorMessage = String((err && err.message) || err).slice(0, 300);
   }
+  try {
+    const { pipelineDir } = getConfig();
+    logPipelineEvent(pipelineDir, 'model-eviction', {
+      taskId: task && task.id, source: task && task.source, implNumCtx,
+      evictedModel: smallModel, succeeded, errorMessage,
+      instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null,
+    });
+  } catch { /* best-effort -- see logPipelineEvent's own header */ }
+  return { evicted: succeeded };
 }
 
 // Token budget for the implement pass: how many tokens it may generate (implNumPredict),
@@ -1596,11 +1630,20 @@ async function finalizeCandidateFulfillment(task, {
 // LOCAL_AB_MODELS overrides that -- runs it under the lock when it's local, records the
 // call into model-stats.db, and stamps task.abCallId / task.draftModel. Returns the raw
 // call result (which may carry `degenerate`); the caller owns what to do with it.
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget }) {
+async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected = false }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
   const implStartMs = Date.now();
+  // coldLoadExpected (2026-09-08, see ensureHeadroomForExtendedContext's own header for
+  // the incident): ensureHeadroomForExtendedContext just evicted the small model to make
+  // room for THIS call, so a cold multi-minute tensor reload from disk is now likely --
+  // give this one call extra headroom on top of the normal throughput-based ceiling
+  // rather than let it race the same 150-240s window a fresh load has no chance of
+  // finishing inside. COLD_LOAD_TIMEOUT_BUMP_MS (3 min) is a real observed load time for
+  // the 18GB q4_K_M model this eviction path exists for.
+  const COLD_LOAD_TIMEOUT_BUMP_MS = 180_000;
+  const coldLoadTimeoutMs = coldLoadExpected ? PER_CALL_TIMEOUT_CEILING_MS + COLD_LOAD_TIMEOUT_BUMP_MS : undefined;
 
   // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
   // local-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
@@ -1641,7 +1684,7 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
       model: abModel,
     }), 'implement');
   } else {
-    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement' }), 'implement');
+    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement', timeoutMs: coldLoadTimeoutMs }), 'implement');
   }
 
   // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -1717,14 +1760,14 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const implPrompt = buildImplementPrompt(task, task.planResponse);
   const budget = computeImplementBudget(task, implPrompt);
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
-  await ensureHeadroomForExtendedContext(implNumCtx);
+  const { evicted: coldLoadExpected } = await ensureHeadroomForExtendedContext(implNumCtx, task);
 
   // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
   // have. A single implement call can legitimately run close to its timeout; with the
   // persist hook this makes a draft killed mid-call show 'implement-started' rather than
   // ending at 'plan-done'.
   appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
-  const implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
+  const implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected });
 
   if (implResult.degenerate) {
     const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
@@ -2038,7 +2081,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel };
 
 if (require.main === module) {
   main();

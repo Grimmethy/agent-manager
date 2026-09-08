@@ -598,29 +598,107 @@ test('ensureHeadroomForExtendedContext unloads the small utility model only when
   const prevUrl = process.env.OLLAMA_URL;
   process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
   try {
-    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX); // not extended -- must not call out at all
+    const notExtended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX); // not extended -- must not call out at all
     assert.equal(requests.length, 0, 'a normal, PINNED_NUM_CTX-sized call must not touch the small model');
+    assert.equal(notExtended.evicted, false);
 
-    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1); // genuinely extended -- must unload
+    const extended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1); // genuinely extended -- must unload
     assert.equal(requests.length, 1);
     assert.equal(requests[0].model, 'qwen2.5:3b');
     assert.equal(requests[0].keep_alive, 0);
+    assert.equal(extended.evicted, true, 'a successful eviction call must report evicted:true so the next real call can bump its timeout');
   } finally {
     process.env.OLLAMA_URL = prevUrl;
     server.close();
   }
 });
 
-test('ensureHeadroomForExtendedContext never throws even when the unload call itself fails', async () => {
+test('ensureHeadroomForExtendedContext never throws even when the unload call itself fails, and reports evicted:false', async () => {
   const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
   const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
   const prevUrl = process.env.OLLAMA_URL;
   process.env.OLLAMA_URL = 'http://127.0.0.1:1'; // nothing listening -- guaranteed connection failure
   try {
-    await assert.doesNotReject(() => ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1));
+    const result = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1);
+    assert.equal(result.evicted, false, 'a failed eviction call must not claim it evicted anything');
   } finally {
     process.env.OLLAMA_URL = prevUrl;
   }
+});
+
+// 2026-09-08, Grimmethy: "I'd like to see an audit log for this error. Please harden the
+// eviction path" -- root-caused live: worker-1/worker-reasoning stacked up repeated
+// OLLAMA_TIMEOUTs while a fresh llama-server cold-loaded the 27B model's tensors from
+// disk, and this eviction call (the prime suspect) was entirely unlogged, so it couldn't
+// be confirmed from the audit trail at the time. Every real attempt now writes a
+// 'model-eviction' event to the same unified pipeline-history.log every other audit
+// class uses.
+test('ensureHeadroomForExtendedContext logs a model-eviction event to pipeline-history.log on both success and failure', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const http = require('http');
+  const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
+  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  const { readPipelineHistory } = require('./pipeline-history.js');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensure-headroom-audit-'));
+  const prevRepoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  const prevPipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  delete require.cache[require.resolve('./config.js')];
+
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const prevUrl = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
+  try {
+    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1, { id: 't-1', source: 'product_spec' });
+    const events = readPipelineHistory(dir, { type: 'model-eviction' });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].taskId, 't-1');
+    assert.equal(events[0].source, 'product_spec');
+    assert.equal(events[0].evictedModel, 'qwen2.5:3b');
+    assert.equal(events[0].succeeded, true);
+    assert.equal(events[0].implNumCtx, PINNED_NUM_CTX + 1);
+  } finally {
+    process.env.OLLAMA_URL = prevUrl;
+    server.close();
+    if (prevRepoRoot !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = prevRepoRoot; else delete process.env.AGENT_MANAGER_REPO_ROOT;
+    if (prevPipelineDir !== undefined) process.env.AGENT_MANAGER_PIPELINE_DIR = prevPipelineDir; else delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+    delete require.cache[require.resolve('./config.js')];
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 2026-09-08, same incident as ensureHeadroomForExtendedContext's own header -- confirms
+// the OTHER half of the wiring: coldLoadExpected actually reaches the real model call as
+// a bumped timeoutMs, not just that ensureHeadroomForExtendedContext reports it.
+test('callImplementModel passes a bumped timeoutMs to the real call when coldLoadExpected is true, and none when false', async () => {
+  const { callImplementModel } = require('./local-draft.js');
+  const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
+  const receivedOpts = [];
+  const resolvedLocalCall = async (opts) => { receivedOpts.push(opts); return { response: 'ok', degenerate: null }; };
+  const ctx = {
+    maybeLocked: (isLocal, fn) => fn(),
+    resolvedCallIsLocal: true,
+    resolvedLocalCall,
+    profileSupportsThink: true,
+  };
+  const budget = { hasFixedLiterals: false, implNoThink: false, implNumPredict: 1200, implNumCtx: 30000, allowEmptyImplement: false };
+  const task = { id: 't-1', source: 'product_spec' };
+  const recordModelCall = () => 'call-id-1';
+
+  await callImplementModel(task, ctx, { recordModelCall, implPrompt: 'do it', budget, coldLoadExpected: true });
+  assert.equal(receivedOpts[0].timeoutMs, PER_CALL_TIMEOUT_CEILING_MS + 180_000, 'coldLoadExpected:true must bump the timeout past the normal ceiling');
+
+  await callImplementModel(task, ctx, { recordModelCall, implPrompt: 'do it', budget, coldLoadExpected: false });
+  assert.equal(receivedOpts[1].timeoutMs, undefined, 'coldLoadExpected:false (the normal case) must leave timeoutMs unset, falling back to the usual throughput-based resolution');
 });
 
 test('computeImplementBudget gives pipeline_forensics a large implement budget despite a tiny plan', () => {
