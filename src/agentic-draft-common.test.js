@@ -375,6 +375,82 @@ test('resolveAgenticDraft(needs-human-decision): forcedSummary + zero edits but 
   });
 });
 
+// --- BLOCKER-TYPE tag (2026-09-08) -- see agentic-draft-common.js's own header comment
+// on BLOCKER_TYPE_RE for the real incident: neither RERUN_NOT_A_QUESTION_RE's wording nor
+// the forcedSummary/capturedDiff structural gates fired for a response worded "not a
+// design question -- a pass-budget overrun" with zero edits and no forced cutoff. The
+// explicit tag is authoritative and bypasses both heuristics entirely.
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: budget-exhausted, no forcedSummary, zero edits, wording that would NOT match the old regex -> still a retryable block', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'blocker-type-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        // Deliberately worded so RERUN_NOT_A_QUESTION_RE would NOT match ("not a design
+        // question" not "no design question"; "should complete" not "can/could/will
+        // complete") -- the tag alone must be enough.
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: budget-exhausted\nOpen blocker (not a design question -- a pass-budget overrun): I oriented fully but have no tool budget left to write the file. A fresh pass starting from the computed line map should complete it.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'grep_codebase' }, { tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: budget-exhausted/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: budget-exhausted WITH partial work landed -> continuation, not a human hold', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'blocker-type-2' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: budget-exhausted\nGot partway through; ran low on tool calls before finishing the remaining edits.' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: budget-exhausted with partial work landed/);
+    assert.equal(task.isAgenticContinuation, true);
+    assert.equal(task.agenticContinuationCount, 1);
+    assert.match(task.priorPartialDiff, /a\.txt/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: design-question still routes to a human -- the tag does not force everything into a retry', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'blocker-type-3' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: design-question\nShould the license gate call Stripe live, or stub it?' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.notEqual(task.turnBudgetExhausted, true);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): no BLOCKER-TYPE tag at all falls back to the existing phrase/structure heuristics unchanged', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'blocker-type-4' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nThere is no open design question -- I ran out of turns mid-implementation.',
+        forcedSummary: true,
+        toolCallLog: [],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.doesNotMatch(out.blockedReason, /BLOCKER-TYPE/);
+  });
+});
+
 test('resolveAgenticDraft(needs-human-decision): "re-run me" text but an edit_file call landed -> stays the human/continuation path, not a turn-budget block', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial\n');
