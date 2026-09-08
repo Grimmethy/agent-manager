@@ -2516,15 +2516,28 @@ function writeTask(task) {
   // deletion/archiving -- the field on the record is a point-in-time snapshot for
   // debugging a specific task, not the source of truth itself.
   const jobTypeOccurrence = incrementJobTypeCounter(jobTypeCountersPath, resolveSourceName(task));
+  // 2026-09-08, Grimmethy: root-caused live a requeued adhoc task's real audit trail
+  // (needs-clarification cycles, staleness-flag notes, the requeue reasoning itself)
+  // silently vanishing the moment it got re-claimed. nextAdhocTask() (task-sources.js's
+  // own adhoc source) deliberately preserves an already-in-progress task's full history
+  // (see its own "preserves history and other fields" test/comment, written specifically
+  // because api_task_resolve_clarification depends on it) -- but this function, called
+  // for EVERY source's next task including adhoc's, unconditionally reset history to []
+  // and re-stamped `createdAt` to now, undoing that preservation one call later. A
+  // genuinely brand-new task (every source except adhoc, and a first-time adhoc task)
+  // has no history yet, so this only changes behavior for the case that matters: an
+  // already-in-progress adhoc task being picked back up keeps its real history and its
+  // real original createdAt instead of looking like it just sprang into existence.
+  const hasExistingHistory = Array.isArray(task.history) && task.history.length > 0;
   const record = {
     ...task,
     generatedForRepoRoot: repoRoot,
     status: 'pending',
-    createdAt: new Date().toISOString(),
+    createdAt: task.createdAt || new Date().toISOString(),
     jobTypeOccurrence,
-    history: [],
+    history: hasExistingHistory ? task.history : [],
   };
-  appendHistoryEvent(record, 'created', task.source);
+  if (!hasExistingHistory) appendHistoryEvent(record, 'created', task.source);
   fs.writeFileSync(file, JSON.stringify(record, null, 2));
   return file;
 }
