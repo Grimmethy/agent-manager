@@ -1196,7 +1196,7 @@ function renderSubTaskChecklist(task) {
 // backlink above or renderSubTaskChecklist below -- those cover the STRONG-semantic
 // relationships (decomposedFrom/subTasks), links[] covers the weak/general class only.
 function renderRelatedTasks(task) {
-  const outgoing = Array.isArray(task.links) ? task.links : [];
+  const outgoing = Array.isArray(task._outgoingLinks) ? task._outgoingLinks : [];
   const incoming = Array.isArray(task._incomingLinks) ? task._incomingLinks : [];
   if (!outgoing.length && !incoming.length) return '';
   const row = (id, type, label) =>
