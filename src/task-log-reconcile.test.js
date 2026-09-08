@@ -135,3 +135,48 @@ test('reconcile --reclassify: an inconclusive noop (no FP verdict) stays noop, n
   assert.equal(tail(f).stage, 'noop');
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.filter((e) => e.stage === 'noop').length, 1, 'no duplicate noop event');
 });
+
+// 2026-09-08: root-caused a false "abandoned -- branch gone, work lost" verdict on two
+// genuinely still-open branches, both traced to this routine tick never fetching from
+// origin before checking branch existence -- it only ever saw whatever local ref cache
+// happened to already be there. Fetch is now unconditional (not gated behind
+// --backfill/--fetch) so the routine path can't silently work from a stale view.
+test('reconcile fetches from origin by default when repoRoot is given', () => {
+  const dir = tmpPipeline();
+  writeRec(dir, '', 't6', [{ stage: 'applied', detail: 'no candidates' }]);
+  let calls = 0;
+  reconcile({ pipelineDir: dir, repoRoot: '/fake/repo', argv: [], fetchFn: () => { calls += 1; } });
+  assert.equal(calls, 1, 'fetch must run on a plain, no-flag invocation now');
+});
+
+test('reconcile --no-fetch skips the fetch (explicit opt-out for an offline/sandboxed run)', () => {
+  const dir = tmpPipeline();
+  writeRec(dir, '', 't7', [{ stage: 'applied', detail: 'no candidates' }]);
+  let calls = 0;
+  reconcile({ pipelineDir: dir, repoRoot: '/fake/repo', argv: ['--no-fetch'], fetchFn: () => { calls += 1; } });
+  assert.equal(calls, 0);
+});
+
+test('reconcile does not fetch at all when repoRoot is not given', () => {
+  const dir = tmpPipeline();
+  writeRec(dir, '', 't8', [{ stage: 'applied', detail: 'no candidates' }]);
+  let calls = 0;
+  reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [], fetchFn: () => { calls += 1; } });
+  assert.equal(calls, 0);
+});
+
+test('reconcile --reclassify: allowReopenFrom now includes abandoned (re-confirms it with no git context, since repoRoot is undefined in this test)', () => {
+  const dir = tmpPipeline();
+  const f = writeRec(dir, '', 't9', [{ stage: 'applied', detail: 'agent/t9' }, { stage: 'abandoned', detail: 'x' }], { terminalDisposition: 'abandoned' });
+  // A plain run leaves it alone (abandoned is not auto-reopened every tick).
+  const s0 = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
+  assert.equal(s0.resolved, 0);
+  // --reclassify re-resolves it; with no git context available it re-confirms the same
+  // verdict rather than flipping incorrectly. Same "tailUnchanged" shape as the
+  // inconclusive-noop-stays-noop case above -- re-confirming the same stage counts as
+  // nothing resolved, not a new abandoned event.
+  const s1 = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.equal(s1.resolved, 0, 're-confirming the same stage is not a new resolution');
+  assert.equal(tail(f).stage, 'abandoned');
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.filter((e) => e.stage === 'abandoned').length, 1, 'no duplicate abandoned event');
+});
