@@ -1162,8 +1162,14 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
   let html;
   try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
 
+  // isHtml (2026-09-08, Grimmethy: "Yes, please build it" -- see script-extract.js's own
+  // header for the review-task.js incident this closes): a plain .js/.mjs/.cjs source now
+  // ALSO gets this deterministic short-circuit, not just .html -- buildExtraction returns
+  // `newSource` (the whole rewritten file) instead of `newHtml` for that case, since there
+  // is no <script> tag/insertion-point rewriting to do.
+  const isHtml = /\.html?$/.test(ctx.sourceFile);
   const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(html, ctx.symbols);
+  const extraction = buildExtraction(html, ctx.symbols, { isHtml });
   if (!extraction.ok) {
     // Drifted since plan-validation time (e.g. an earlier stacked move on this same
     // branch already touched the file) -- fall through to the normal path rather than
@@ -1176,7 +1182,7 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
 
   const groupBChanges = [
     { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
-    { mode: 'edit', file: ctx.sourceFile, find: html, replace: extraction.newHtml },
+    { mode: 'edit', file: ctx.sourceFile, find: html, replace: isHtml ? extraction.newHtml : extraction.newSource },
   ];
 
   // adhoc-domain tasks apply via applyAdhocDiff (apply-task.js's writeArtifact ->

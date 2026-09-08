@@ -180,6 +180,14 @@ function moveTemplateFor(sourceFile) {
   if (ext === '.py') {
     return { kind: 'flask-blueprint', newFile: (slug) => `${dir}/routes/${slug}.py`, blueprint: (slug) => `${slug.replace(/-/g, '_')}_bp` };
   }
+  // 2026-09-08, Grimmethy: "Yes, please build it" -- a plain .js/.mjs/.cjs source now also
+  // gets kind:'script-extract' (was 'module-extract', the one category with no
+  // deterministic apply path at all -- see script-extract.js's own header for the
+  // review-task.js incident this fixes). Keeps the SAME lib/ path convention
+  // module-extract already used; only the deterministic-apply eligibility changes.
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+    return { kind: 'script-extract', newFile: (slug) => `${dir}/lib/${slug}${ext}` };
+  }
   return { kind: 'module-extract', newFile: (slug) => `${dir}/lib/${slug}${ext}` };
 }
 

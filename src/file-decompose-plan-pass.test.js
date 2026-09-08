@@ -61,6 +61,35 @@ test('planFromSections: emits balanced section modules, rejects a too-coarse spl
   assert.equal(planFromSections('x/app.py', coarse), null);
 });
 
+// 2026-09-08, Grimmethy: "Yes, please build it" -- a plain .js source now ALSO gets
+// kind:'script-extract' (was 'module-extract', the one category with no deterministic
+// apply path at all -- see script-extract.js's own header for the review-task.js
+// incident this fixes). Same lib/ path convention module-extract already used.
+test('planFromSections: a plain .js source gets kind:\'script-extract\' (deterministic-apply eligible), same lib/ path as module-extract used', () => {
+  const clean = [];
+  for (const sec of ['aaa', 'bbb', 'ccc', 'ddd']) {
+    for (let i = 0; i < 3; i += 1) clean.push({ name: `${sec}${i}`, line: clean.length + 1, kind: 'fn', section: sec });
+  }
+  const moves = planFromSections('src/review-task.js', clean);
+  assert.equal(moves.length, 4);
+  for (const m of moves) {
+    assert.equal(m.kind, 'script-extract');
+    assert.match(m.newFile, /^src\/lib\/.+\.js$/);
+  }
+});
+
+test('planFromSections: .mjs and .cjs sources also get kind:\'script-extract\'', () => {
+  const clean = [];
+  for (const sec of ['aaa', 'bbb', 'ccc', 'ddd']) {
+    for (let i = 0; i < 3; i += 1) clean.push({ name: `${sec}${i}`, line: clean.length + 1, kind: 'fn', section: sec });
+  }
+  for (const ext of ['.mjs', '.cjs']) {
+    const moves = planFromSections(`src/thing${ext}`, clean);
+    assert.equal(moves.length, 4);
+    for (const m of moves) assert.equal(m.kind, 'script-extract');
+  }
+});
+
 test('planFromSectionMerge: expands the model\'s section labels back to symbols', () => {
   const groups = new Map([
     ['Alpha', [{ name: 'a1' }, { name: 'a2' }]],
