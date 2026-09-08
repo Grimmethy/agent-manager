@@ -167,10 +167,15 @@ while :; do
     # origin/<main>, is still on an unmerged agent/<id> branch, or was applied to a branch
     # that has since vanished (lost work). This resolves the true state from git and appends
     # a terminal disposition event (merged / pending-merge / abandoned / filed / noop /
-    # applied-direct). Incremental via queue/task-log-reconcile-state.json -- one git harvest
-    # per run, then only new arrivals + the small pending-merge set are re-read, so it is
-    # cheap enough to run every tick like the sweeps above. `npm run task-log-reconcile --
-    # --report` (or -- --backfill) for the human-facing audit view.
+    # applied-direct). Incremental via queue/task-log-reconcile-state.json -- one
+    # fetch+git-harvest per run (2026-09-08: fetch is now unconditional here, not gated
+    # behind --backfill/--fetch -- root-caused a false "abandoned: work lost" verdict on
+    # two genuinely still-open branches caused by this routine tick trusting a stale
+    # local ref cache instead of asking origin), then only new arrivals + the small
+    # pending-merge set are re-read, so it is still cheap enough to run every tick like
+    # the sweeps above. `npm run task-log-reconcile -- --report` (or -- --backfill) for
+    # the human-facing audit view; -- --reclassify to re-check records already closed as
+    # noop or abandoned.
     task_log_result="$(node "${PACKAGE_SRC_DIR}/task-log-reconcile.js" 2>>"${HOME_LOGS}/task-log-reconcile.log")"
     printf '[watchdog] task-log-reconcile: %s\n' "$task_log_result" >&2
 
