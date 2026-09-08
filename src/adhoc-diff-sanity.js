@@ -60,8 +60,40 @@ const isDocPath = (p) => DOC_PATH_RE.test(p);
 
 // Does the task text ask for actual code, not just prose? A pure "write an ADR for X"
 // task has none of these; job-list ("renderJobListTab() in index.html") and second-brain
-// ("a new task source in src/task-sources.js") both do.
+// ("a new task source in src/task-sources.js") both do. Fallback only -- see
+// extractDeclaredFiles below for why the task's own "Files:" line is checked FIRST.
 const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b|\b(implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
+
+// 2026-09-08, Grimmethy: "fix the gate" -- root-caused live (a docs-only checklist-tick
+// task blocked as "the task asks for a code change" because its own PLAN cited a real
+// src/ file as justifying EVIDENCE for the tick, not as an edit target). CODE_SIGNAL_RE
+// above just regex-scans the whole combined rawText+planText blob for anything
+// code-shaped -- it can't tell "a src/ path is the edit target" from "a src/ path is
+// mentioned in passing." Second Brain [[dspy]] research applied: DSPy's own reward_fn
+// convention (dspy.Refine/BestOfN, replacing dspy.Assert/Suggest) validates a prediction's
+// explicit, typed OUTPUT FIELD (`pred.answer`, `pred.summary`) -- never scans the
+// surrounding free-form reasoning text for signals -- specifically because reasoning can
+// legitimately reference things the deliverable itself doesn't touch. This pipeline
+// already has the equivalent of a typed output field for "what files does this task
+// touch": prompts.js instructs every task-generating prompt (research/deep-dive,
+// pipeline-debrief, brain-dump-sort recommendations, ...) to emit a "Files: <comma,
+// separated, REAL paths>" line, "copied verbatim" and cited as the authoritative scope.
+// extractDeclaredFiles parses that structured line when present and uses IT (not the
+// free-text regex) to decide whether the task wants code -- CODE_SIGNAL_RE remains the
+// fallback for the (older/manual) task shapes that never had a Files: line to begin with.
+function extractDeclaredFiles(text) {
+  const m = /^Files:\s*(.+)$/im.exec(String(text || ''));
+  if (!m) return null;
+  const raw = m[1].trim();
+  if (!raw || /^none[.,:;]*$/i.test(raw)) return [];
+  return raw
+    .split(',')
+    // Strip a trailing "(lines ~464-467)"-style annotation, backticks, and trailing
+    // sentence punctuation -- the convention allows citing a path with a parenthetical
+    // note, but the PATH itself is still what's being declared.
+    .map((s) => s.replace(/\(.*?\)/g, '').replace(/`/g, '').replace(/[.,:;]+\s*$/, '').trim())
+    .filter(Boolean);
+}
 
 // Verbs that make a delete legitimate.
 const DELETE_INTENT_RE = /\b(delet\w+|remov\w+|drop\w*|deprecat\w+|rip out|tear out|get rid of|eliminat\w+|no longer needed|obsolete)\b/i;
@@ -192,14 +224,21 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
     };
   }
 
-  // 3. Docs-only diff for a task that clearly wants code.
+  // 3. Docs-only diff for a task that clearly wants code. The task's own "Files:" line
+  // (when present) is authoritative -- see extractDeclaredFiles's own header for why a
+  // free-text keyword scan can't distinguish an edit target from a cited-as-evidence
+  // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
   const nonDoc = files.filter((f) => !isDocPath(f.path));
-  if (nonDoc.length === 0 && CODE_SIGNAL_RE.test(combined)) {
-    return {
-      code: 'docs-only',
-      reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
-      retryFeedback: `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`,
-    };
+  if (nonDoc.length === 0) {
+    const declaredFiles = extractDeclaredFiles(rawText);
+    const wantsCode = declaredFiles ? declaredFiles.some((p) => !isDocPath(p)) : CODE_SIGNAL_RE.test(combined);
+    if (wantsCode) {
+      return {
+        code: 'docs-only',
+        reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
+        retryFeedback: `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`,
+      };
+    }
   }
 
   // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.

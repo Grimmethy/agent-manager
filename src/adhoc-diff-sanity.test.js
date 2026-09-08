@@ -51,6 +51,50 @@ test('docs-only: a diff that also touches real code is fine (ADR alongside imple
   assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/task-sources.js') + createDiff('docs/adr/0019-x.md')), null);
 });
 
+// 2026-09-08, Grimmethy: "fix the gate" -- real incident: a docs-only checklist-tick task
+// (adhoc-brain-dump-bd-...-close-the-open-verification-item-in-the-) was wrongly blocked
+// because its own PLAN cited src/auto-confirm-review.js as EVIDENCE justifying the tick,
+// not as an edit target -- CODE_SIGNAL_RE's blind scan couldn't tell the difference. The
+// task's own "Files:" line named only doc paths the whole time.
+test('docs-only: a Files: line naming only doc paths is NOT blocked even when the plan cites a real src/ file as evidence', () => {
+  const t = adhoc(
+    'Close the open verification item in the pipeline doc: tick `docs/arch-import-pipeline.md:197`.\n'
+    + 'Files: docs/arch-import-pipeline.md, docs/adr/0020-arch-import-pipeline.md.\n'
+    + 'Why: the doc already flags this as an unverified assumption.',
+    'The evidence in the repo already supports the check: src/auto-confirm-review.js '
+    + 'defaults AGENT_MANAGER_GREP_DIRS to \'src,python,scripts,docs\', which covers this.',
+  );
+  const p = adhocDiffSubstanceProblem(t, editDiff('docs/arch-import-pipeline.md'));
+  assert.equal(p, null, 'the Files: line, which names only doc paths, must override the free-text CODE_SIGNAL_RE hit from the cited evidence file');
+});
+
+test('docs-only: a Files: line naming a real code path DOES block a docs-only diff', () => {
+  const t = adhoc(
+    'Add a health check. Files: python/dashboard/app.py, docs/adr/0030-health-check.md.',
+  );
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0030-health-check.md'));
+  assert.equal(p.code, 'docs-only', 'the Files: line names a real code path the diff never touched -- this must still block');
+});
+
+test('docs-only: with no Files: line at all, the old CODE_SIGNAL_RE fallback still applies unchanged', () => {
+  const t = adhoc('Combine job types into expandable rows in python/dashboard/templates/index.html -- renderJobListTab().');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0021-job-list.md'));
+  assert.equal(p.code, 'docs-only');
+});
+
+test('docs-only: a "Files: none" declaration is treated as no code paths declared -- not blocked', () => {
+  const t = adhoc('Write a short design note.\nFiles: none.', 'Considered src/foo.js but decided against touching it.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0031-note.md'));
+  assert.equal(p, null);
+});
+
+test('extractDeclaredFiles: strips a "(lines ~N-N)" annotation and trailing punctuation, keeps commas working', () => {
+  const t = adhoc('Fix it. Files: src/review-task.js (lines ~464-467), src/blocked-drain.js.');
+  // Confirmed indirectly: a Files: line naming real src/ paths still blocks a docs-only diff.
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/note.md'));
+  assert.equal(p.code, 'docs-only');
+});
+
 test('unrequested-delete: deleting a file the task never mentioned removing is flagged', () => {
   const t = adhoc('Add a health-check endpoint to python/dashboard/app.py.');
   const p = adhocDiffSubstanceProblem(t, deleteDiff('src/apply-adhoc-diff.js'));
