@@ -2753,11 +2753,28 @@ def api_task_detail(state, task_id):
     return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
 
 
+def _archive_task_file(qdir, src):
+    """Moves a task file to queue/done/_archived_no_action/<id>.json -- not a new
+    convention, the exact folder already used for every manual archive done by hand
+    earlier in this project's history. Shared by api_task_archive (manual per-row button)
+    and api_git_discard_branch (discarding a branch's own task) so both go through the
+    exact same move logic rather than a second, possibly-inconsistent copy. Raises
+    FileExistsError if an archived copy already exists at the destination -- callers
+    decide how to surface that (api_task_archive 409s; api_git_discard_branch treats it
+    as already-archived and moves on)."""
+    dest_dir = qdir / "done" / "_archived_no_action"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.exists():
+        raise FileExistsError(f"an archived copy of '{src.stem}' already exists")
+    shutil.move(str(src), str(dest))
+    return dest
+
+
 @app.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
 def api_task_archive(state, task_id):
     """Manual archive (Job Status > Blocked/Done tabs, per-row button): moves the task file
-    to queue/done/_archived_no_action/ -- not a new convention, the exact folder already
-    used for every manual archive done by hand earlier in this project's history.
+    to queue/done/_archived_no_action/ via _archive_task_file (see its own header).
     Load-bearing detail: src/task-sources.js's taskIdExistsInQueue() only ever checks the
     direct queue/<state>/<id>.json path, never nested subfolders, so moving a file here
     silently frees up its underlying item (a brain-dump entry, an arch_import itemId, a
@@ -2776,13 +2793,10 @@ def api_task_archive(state, task_id):
     src = qdir / state / f"{task_id}.json"
     if not src.is_file():
         abort(404)
-
-    dest_dir = qdir / "done" / "_archived_no_action"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{task_id}.json"
-    if dest.exists():
-        abort(409, description=f"an archived copy of '{task_id}' already exists")
-    shutil.move(str(src), str(dest))
+    try:
+        _archive_task_file(qdir, src)
+    except FileExistsError as e:
+        abort(409, description=str(e))
     return jsonify({"id": task_id, "archived": True})
 
 
@@ -6896,6 +6910,95 @@ def api_git_merge_branch(branch):
                 break
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
+
+
+@app.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
+def api_git_discard_branch(branch):
+    """The Unmerged Branches tab's other action (2026-09-08, Grimmethy: "If we aren't
+    merging it we definitely need to archive it. It's still visible in my unmerged
+    branches tab... leaves us open to accidentally opening it back up in the future.") --
+    root-caused live via change-review-fix-ac-1: list_unmerged_branches is a pure git scan
+    (refs/remotes/origin/agent/* with ahead>0 vs. main), with zero awareness of task
+    disposition -- archiving a task record alone (api_task_archive) never removes its
+    branch from this list. This is the other half api_git_merge_branch's own delete-on-
+    success step never covers: a branch you've decided NOT to merge, which needs its
+    remote ref actually deleted plus its task archived, not just hidden.
+
+    Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
+    gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
+    main steps this doesn't need."""
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
+    # api_task_archive/api_task_requeue all already use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    lock_fd = _acquire_apply_lock()
+    if lock_fd is None:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    try:
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+        except RuntimeError as e:
+            # A delete failing because the ref is already gone (deleted by hand, or a
+            # duplicate click) means the actual goal -- this branch not existing on origin
+            # -- is already achieved; only a REAL git failure (auth, network, etc.) should
+            # surface as an error. Same "remote ref does not exist" shape git itself uses
+            # for this case.
+            if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
+                raise
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    # Archive the matching task record, same 2-location lookup api_git_merge_branch's own
+    # mergedAt-stamping step already does. Best-effort: no task record found (a branch
+    # pushed with nothing matching in done/) is not an error, just nothing to reconcile;
+    # already-archived (a human archived it by hand first, or a duplicate click) is a
+    # silent no-op, not a 409 -- the branch delete above is the part that mattered.
+    task_archived = False
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        done_path = qdir / "done" / f"{task_id}.json"
+        archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if done_path.is_file():
+            data = read_json_safe(done_path)
+            if data is not None:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                if data.get("terminalDisposition") != "dismissed":
+                    hist = data.get("history")
+                    if not isinstance(hist, list):
+                        hist = data["history"] = []
+                    hist.append({
+                        "stage": "dismissed",
+                        "at": now_iso,
+                        "detail": f"branch {branch} discarded via the dashboard Unmerged Branches tab -- not merging this",
+                    })
+                    data["terminalDisposition"] = "dismissed"
+                try:
+                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except OSError as exc:
+                    logger.error("Failed to persist dismissed-state for branch %r to %s: %s", branch, done_path, exc)
+                    raise
+            try:
+                _archive_task_file(qdir, done_path)
+                task_archived = True
+            except FileExistsError:
+                pass
+        elif archived_path.is_file():
+            task_archived = True  # already archived (e.g. by hand) -- nothing more to do
+
+    _invalidate_branch_cache()
+    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived})
 
 
 @app.route("/api/pipeline/status")
