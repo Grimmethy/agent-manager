@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues } = require('./fact-checker.js');
+const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkRevertsAPriorFix } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -668,4 +668,98 @@ test('checkDraft threads a ref through to still flag a genuinely fabricated fiel
   const fc = checkDraft(draftText, dir, sourceText, [], 'agent/stacked-family');
   assert.ok(fc.flags.some((f) => f.type === 'ungrounded-field' && f.detail === 'TOTALLY_MADE_UP_FIELD'),
     'a value that is fabricated everywhere, including on the stacked branch, must still be flagged');
+});
+
+// --- checkRevertsAPriorFix (2026-09-08) -------------------------------------------------
+// Root-caused live: change-review-fix-ac-1 auto-drafted (and got approved) a revert of a
+// `throw err` back to `continue`, unaware that `throw` was the deliberate resolution of an
+// earlier, different, already-confirmed finding (AC-164). This is the deterministic,
+// git-grounded gate that catches that class of edit before it ever reaches a review vote.
+
+function makeRevertFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-revert-test-'));
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+
+  const filePath = path.join(dir, 'sweep.js');
+  fs.writeFileSync(filePath, "  for (const dir of DIRS) {\n    try { names = fs.readdirSync(dir); } catch { continue; }\n  }\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'initial sweep loop'], { cwd: dir });
+
+  // The "prior confirmed fix" -- carries this pipeline's own AC-\d+ marker.
+  fs.writeFileSync(filePath, "  for (const dir of DIRS) {\n    try { names = fs.readdirSync(dir); } catch (err) { if (err.code === 'ENOENT') continue; console.error(err); throw err; }\n  }\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'AC-164 · Bare catch swallows non-ENOENT filesystem errors'], { cwd: dir });
+
+  return { dir, filePath };
+}
+
+test('checkRevertsAPriorFix flags an edit that reverts toward code removed by a prior AC-marked commit', () => {
+  const { dir } = makeRevertFixture();
+  const implementResponse = JSON.stringify([{
+    file: 'sweep.js',
+    mode: 'edit',
+    find: "console.error(err); throw err; }",
+    replace: "console.error(err); continue; }",
+  }]);
+  const flags = checkRevertsAPriorFix(implementResponse, dir);
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].type, 'reverts-a-prior-fix');
+  assert.match(flags[0].subject, /AC-164/);
+  assert.match(flags[0].detail, /sweep\.js/);
+});
+
+test('checkRevertsAPriorFix does not flag an edit to the same line that is NOT a revert (different transformation)', () => {
+  const { dir } = makeRevertFixture();
+  const implementResponse = JSON.stringify([{
+    file: 'sweep.js',
+    mode: 'edit',
+    find: "console.error(err); throw err; }",
+    replace: "logHardFailureAudit({ code: err.code }); throw err; }",
+  }]);
+  const flags = checkRevertsAPriorFix(implementResponse, dir);
+  assert.deepEqual(flags, []);
+});
+
+test('checkRevertsAPriorFix does not flag a revert of a commit with no AC-\\d+ marker (ordinary iteration, not undoing a confirmed fix)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-revert-noac-'));
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  const filePath = path.join(dir, 'sweep.js');
+  fs.writeFileSync(filePath, "const x = 1;\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: dir });
+  fs.writeFileSync(filePath, "const x = 2;\n");
+  execFileSync('git', ['add', 'sweep.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'just bump the constant, no AC marker here'], { cwd: dir });
+
+  const implementResponse = JSON.stringify([{ file: 'sweep.js', mode: 'edit', find: 'const x = 2;', replace: 'const x = 1;' }]);
+  const flags = checkRevertsAPriorFix(implementResponse, dir);
+  assert.deepEqual(flags, []);
+});
+
+test('checkRevertsAPriorFix is a no-op (never throws) with no git repo at all', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-revert-nogit-'));
+  fs.writeFileSync(path.join(dir, 'sweep.js'), 'const x = 1;\n');
+  const implementResponse = JSON.stringify([{ file: 'sweep.js', mode: 'edit', find: 'const x = 1;', replace: 'const x = 2;' }]);
+  assert.doesNotThrow(() => checkRevertsAPriorFix(implementResponse, dir));
+  assert.deepEqual(checkRevertsAPriorFix(implementResponse, dir), []);
+});
+
+test('checkRevertsAPriorFix returns [] for non-Group-B implementResponse (Group A markdown, not JSON)', () => {
+  const { dir } = makeRevertFixture();
+  assert.deepEqual(checkRevertsAPriorFix('Just a markdown writeup, not JSON.', dir), []);
+});
+
+test('checkDraft wires revertChecks into its own flags/return shape', () => {
+  const { dir } = makeRevertFixture();
+  const implementResponse = JSON.stringify([{
+    file: 'sweep.js', mode: 'edit',
+    find: "console.error(err); throw err; }", replace: "console.error(err); continue; }",
+  }]);
+  const fc = checkDraft(implementResponse, dir);
+  assert.ok(fc.flags.some((f) => f.type === 'reverts-a-prior-fix'));
+  assert.equal(fc.revertChecks.length, 1);
 });
