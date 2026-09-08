@@ -86,6 +86,33 @@ class TestIncomingTaskLinks(unittest.TestCase):
         self.assertEqual(links, [])
 
 
+class TestOutgoingTaskLinks(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "task-links.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_returns_every_link_originating_from_the_source_task(self):
+        make_task_links_db(self.db_path, [
+            ("task-b", "task-a", "relates-to", "same root cause", "2026-09-08T00:00:00Z"),
+            ("task-b", "task-c", "contributes-to-signature", None, "2026-09-08T01:00:00Z"),
+            ("task-x", "task-a", "relates-to", None, "2026-09-08T02:00:00Z"),  # different source, must not show up
+        ])
+        with mock.patch.object(app, "task_links_db_path", return_value=self.db_path):
+            links = app._outgoing_task_links("task-b")
+        self.assertEqual(len(links), 2)
+        target_ids = {l["targetId"] for l in links}
+        self.assertEqual(target_ids, {"task-a", "task-c"})
+
+    def test_returns_empty_list_not_none_when_db_does_not_exist_yet(self):
+        never_created = Path(self._tmp.name) / "never-created.db"
+        with mock.patch.object(app, "task_links_db_path", return_value=never_created):
+            links = app._outgoing_task_links("task-b")
+        self.assertEqual(links, [])
+
+
 class TestTaskDetailEndpointCarriesIncomingLinks(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -128,6 +155,18 @@ class TestTaskDetailEndpointCarriesIncomingLinks(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         body = res.get_json()
         self.assertEqual(body["_incomingLinks"], [])
+
+    def test_outgoingLinks_present_and_populated_when_a_real_link_exists(self):
+        self._write("task-b")
+        make_task_links_db(self.db_path, [
+            ("task-b", "task-c", "contributes-to-signature", None, "2026-09-08T00:00:00Z"),
+        ])
+        res = self.client.get("/api/task/blocked/task-b")
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertIn("_outgoingLinks", body)
+        self.assertEqual(len(body["_outgoingLinks"]), 1)
+        self.assertEqual(body["_outgoingLinks"][0]["targetId"], "task-c")
 
 
 if __name__ == "__main__":
