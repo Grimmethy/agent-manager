@@ -740,19 +740,32 @@ async function openJobLog(source) {
   });
 }
 
+// 2026-09-08, Grimmethy ("too many line breaks, just break between paragraphs headers and
+// bullets"): a hand-authored concept description hard-wraps one logical paragraph across
+// several source lines (~80-100 chars each) -- this used to treat every non-blank line as
+// its own <p>, so a single paragraph rendered as a stack of tiny ones instead of flowing
+// text. Standard markdown paragraph semantics instead: consecutive plain-text lines
+// accumulate into ONE paragraph (joined with a space, not a break), and a paragraph only
+// closes on a blank line, a header, or a list item. Machine-generated report content
+// (system-report.js's renderMarkdown) already pushes one fact/sentence per array entry
+// with no internal hard-wrapping, so this is a no-op there -- purely additive for the
+// concept-description case this was actually reported against.
 function renderReportMarkdown(md) {
   const lines = escapeHtml(md).split('\n');
   let html = '';
   let inList = false;
+  let para = null;
   const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+  const closePara = () => { if (para !== null) { html += `<p>${para}</p>`; para = null; } };
   const inline = (s) => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   for (const line of lines) {
-    if (line.startsWith('## ')) { closeList(); html += `<h3>${inline(line.slice(3))}</h3>`; }
-    else if (line.startsWith('# ')) { closeList(); html += `<h2>${inline(line.slice(2))}</h2>`; }
-    else if (line.startsWith('- ')) { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${inline(line.slice(2))}</li>`; }
-    else if (line.trim() === '') { closeList(); }
-    else { closeList(); html += `<p>${inline(line)}</p>`; }
+    if (line.startsWith('## ')) { closePara(); closeList(); html += `<h3>${inline(line.slice(3))}</h3>`; }
+    else if (line.startsWith('# ')) { closePara(); closeList(); html += `<h2>${inline(line.slice(2))}</h2>`; }
+    else if (line.startsWith('- ')) { closePara(); if (!inList) { html += '<ul>'; inList = true; } html += `<li>${inline(line.slice(2))}</li>`; }
+    else if (line.trim() === '') { closePara(); closeList(); }
+    else { closeList(); para = para === null ? inline(line) : `${para} ${inline(line)}`; }
   }
+  closePara();
   closeList();
   return html;
 }
