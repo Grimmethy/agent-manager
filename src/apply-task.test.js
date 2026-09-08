@@ -933,6 +933,42 @@ test('recordApplyOutcome routes a decompose parent to coordinating/, stamping th
   assert.equal(task.history.at(-1).stage, 'coordinating');
 });
 
+// parentHub (2026-09-08): when the task that just re-decomposed is ITSELF a hub's child
+// (promptContext.decomposedFrom set), the new hub it becomes should carry that link, so the
+// Hub Tasks tab can render the real family tree.
+test('recordApplyOutcome stamps parentHub from promptContext.decomposedFrom when a hub child itself decomposes', () => {
+  const task = { id: 'child-1', history: [], promptContext: { decomposedFrom: 'hub-original' } };
+  const result = {
+    coordinating: true,
+    reason: 'Decomposed into 2 sub-task(s), now coordinating: a; b',
+    subTasks: [
+      { id: 'adhoc-a-1', title: 'a', status: 'pending' },
+      { id: 'adhoc-b-2', title: 'b', status: 'pending' },
+    ],
+  };
+
+  recordApplyOutcome(task, result);
+
+  assert.equal(task.status, 'coordinating');
+  assert.equal(task.parentHub, 'hub-original');
+});
+
+test('recordApplyOutcome does not stamp parentHub when the task has no owning hub (a plain top-level decompose)', () => {
+  const task = { id: 'parent-2', history: [] };
+  const result = {
+    coordinating: true,
+    reason: 'Decomposed into 2 sub-task(s), now coordinating: a; b',
+    subTasks: [
+      { id: 'adhoc-a-1', title: 'a', status: 'pending' },
+      { id: 'adhoc-b-2', title: 'b', status: 'pending' },
+    ],
+  };
+
+  recordApplyOutcome(task, result);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(task, 'parentHub'), false);
+});
+
 // coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script
 // which implies that the program is inaccurately representing model used"): the
 // commit-message Co-Authored-By trailer must name the REAL model that drafted the

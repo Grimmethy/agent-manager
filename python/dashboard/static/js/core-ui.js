@@ -1242,9 +1242,14 @@ async function renderQueueTab(state) {
       return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">🔍 stale grounding — needs re-anchoring</span><br>`;
     })() : '';
     const trimKeepBtn = ctf ? `<button type="button" class="secondary task-context-trim-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays as-is and won't be re-anchored for a while">Keep grounding as-is</button>` : '';
+    // Hub Tasks family indent (2026-09-08): hubDepth comes pre-computed from api_queue_state's
+    // parentHub tree walk (coordinating state only, undefined/0 everywhere else -- no-op).
+    const hubIdCell = state === 'coordinating' && t.hubDepth
+      ? `<td style="padding-left:${t.hubDepth * 14 + 4}px">↳ ${t.id}</td>`
+      : `<td>${t.id}</td>`;
     return `
     <tr class="${rowClass}" data-id="${t.id}" data-state="${state}">
-      <td>${t.id}</td>
+      ${hubIdCell}
       <td>${t.title || ''}${isPrompt ? ' <span class="badge warn" title="This source is set to \'prompt\' -- it still needs your explicit Apply click, same as approve, but is actively badged so it does not sit unnoticed">needs review</span>' : ''}</td>
       <td>${t.domain || ''}/${t.source || ''}</td>
       <td>${staleChip}${trimChip}${detailCell}</td>

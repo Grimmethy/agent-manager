@@ -182,6 +182,11 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
             // files, same propagation apply-adhoc-diff.js's queueSubTasks already does
             // for a plain RESOLUTION: decompose split.
             ...(task.premiumPriority ? { premiumPriority: true } : {}),
+            // parentHub (2026-09-08): the stuck task's own owning hub, if it had one --
+            // propagated the same way premiumPriority is above, so the dashboard's Hub
+            // Tasks tab can render this new hub as a child of the one it was rescued from,
+            // instead of a disconnected root.
+            ...(task.promptContext && task.promptContext.decomposedFrom ? { parentHub: task.promptContext.decomposedFrom } : {}),
           }, null, 2)}\n`);
         }
 
@@ -216,6 +221,17 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           }],
         };
         const parentId = rewireCoordinatorParent(pipelineDir, task.id, hubId);
+        // Fallback parentHub stamp: covers a stuck task whose promptContext.decomposedFrom
+        // was missing/stale but rewireCoordinatorParent still found a real coordinating
+        // parent by scanning subTasks[] -- keeps the Hub Tasks family tree correct either way.
+        if (parentId) {
+          const hubFile = path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`);
+          const hubRecord = readJson(hubFile);
+          if (hubRecord && !hubRecord.parentHub) {
+            hubRecord.parentHub = parentId;
+            try { fs.writeFileSync(hubFile, `${JSON.stringify(hubRecord, null, 2)}\n`); } catch { /* best-effort */ }
+          }
+        }
         fs.mkdirSync(pendingDir, { recursive: true });
         fs.writeFileSync(path.join(pendingDir, `${task.id}.json`), `${JSON.stringify(rerouted, null, 2)}\n`);
         fs.unlinkSync(file);

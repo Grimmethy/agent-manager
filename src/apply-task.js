@@ -601,6 +601,12 @@ function recordApplyOutcome(task, result) {
   if (applyStage === 'coordinating') {
     task.subTasks = Array.isArray(result.subTasks) ? result.subTasks : [];
     task.progress = { done: 0, total: task.subTasks.length };
+    // parentHub (2026-09-08): this task IS a hub's own child re-decomposing into a new hub
+    // -- promptContext.decomposedFrom already points at the owning hub, zero new plumbing.
+    // Lets the dashboard's Hub Tasks tab render the real family tree instead of a root.
+    if (task.promptContext && task.promptContext.decomposedFrom) {
+      task.parentHub = task.promptContext.decomposedFrom;
+    }
   }
   // An apply-failed task lands in queue/blocked/ next (apply-task.sh's own move), the same
   // directory reject-retry-check.js scans for blockedStage==='review' to auto-requeue. A
