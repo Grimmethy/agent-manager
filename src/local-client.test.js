@@ -96,17 +96,20 @@ function withFixtureRepo(fn) {
   return fn(mod, dir);
 }
 
-function readAuditLog(dir) {
-  const p = path.join(dir, 'instances', 'degenerate-audit.log');
+// 2026-09-08: both audit functions now write into pipeline-history.js's unified
+// instances/pipeline-history.log, discriminated by `type` -- see that module's own
+// header for why the 4 separately-invented per-class log files were consolidated.
+function readAuditLog(dir, type) {
+  const p = path.join(dir, 'instances', 'pipeline-history.log');
   if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type === type);
 }
 
-test('logDegenerateAudit appends one well-formed NDJSON line per call, never throwing on a real pipelineDir', () => {
+test('logDegenerateAudit appends one well-formed NDJSON line per call, tagged type:degenerate, never throwing on a real pipelineDir', () => {
   withFixtureRepo((mod, dir) => {
     mod.logDegenerateAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 1, degenerate: 'truncated' });
     mod.logDegenerateAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 2, degenerate: 'truncated' });
-    const lines = readAuditLog(dir);
+    const lines = readAuditLog(dir, 'degenerate');
     assert.equal(lines.length, 2);
     assert.equal(lines[0].source, 'pipeline_debrief');
     assert.equal(lines[0].attempt, 1);
@@ -132,17 +135,11 @@ test('logDegenerateAudit is advisory: a broken pipelineDir never throws or break
 // out" symptom, each needing a fresh multi-hour live investigation -- one NDJSON line per
 // hard-failed attempt, tagged with ollama-http.js's own error `code`, closes that gap.
 
-function readHardFailureAuditLog(dir) {
-  const p = path.join(dir, 'instances', 'hard-failure-audit.log');
-  if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
-}
-
-test('logHardFailureAudit appends one well-formed NDJSON line per call, never throwing on a real pipelineDir', () => {
+test('logHardFailureAudit appends one well-formed NDJSON line per call, tagged type:hard-failure, never throwing on a real pipelineDir', () => {
   withFixtureRepo((mod, dir) => {
     mod.logHardFailureAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 1, code: 'OLLAMA_TIMEOUT', timeoutMs: 150000 });
     mod.logHardFailureAudit({ source: 'pipeline_debrief', taskId: 't1', stage: 'plan', attempt: 2, code: 'OLLAMA_TIMEOUT', timeoutMs: 150000 });
-    const lines = readHardFailureAuditLog(dir);
+    const lines = readAuditLog(dir, 'hard-failure');
     assert.equal(lines.length, 2);
     assert.equal(lines[0].code, 'OLLAMA_TIMEOUT');
     assert.equal(lines[0].timeoutMs, 150000);
