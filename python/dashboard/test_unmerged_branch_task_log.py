@@ -97,6 +97,38 @@ class TestBranchTaskLog(unittest.TestCase):
         m = app._TASK_TRAILER_RE.search(body)
         self.assertEqual(m.group(1), "adhoc-decompose-decompose-app-py-01-02-reports-py")
 
+    def test_shipped_count_excludes_noop(self):
+        # 2026-08-25: 24 of 25 "shipped" tasks produced zero code. A done-queue mix of
+        # 1 real merge + 1 no-op must tally as shipped==1, noop==1 -- not 2/2.
+        self._w("done", {
+            "id": "real-1", "title": "Real", "terminalDisposition": "merged",
+            "history": [
+                {"stage": "created", "at": "1"},
+                {"stage": "approved", "at": "2", "detail": "votes: 3/3 real"},
+                {"stage": "applied", "at": "3", "detail": "agent/real-1"},
+            ],
+        })
+        self._w("done", {
+            "id": "noop-1", "title": "Noop", "terminalDisposition": "noop",
+            "history": [
+                {"stage": "created", "at": "1"},
+                {"stage": "applied", "at": "3", "detail": "no candidates in implement response -- nothing to apply"},
+            ],
+        })
+        shipped = noop = 0
+        for tid in ("real-1", "noop-1"):
+            rec = json.loads((self.q / "done" / f"{tid}.json").read_text())
+            if app._is_real_ship(rec):
+                shipped += 1
+            else:
+                noop += 1
+        self.assertEqual(shipped, 1)
+        self.assertEqual(noop, 1)
+        # No applied stage at all -- or an applied stage with an empty detail -- is also
+        # a no-op, never a ship.
+        self.assertFalse(app._is_real_ship({"id": "x", "terminalDisposition": "merged", "history": [{"stage": "created"}]}))
+        self.assertFalse(app._is_real_ship({"id": "y", "terminalDisposition": "merged", "history": [{"stage": "applied", "detail": ""}]}))
+
 
 if __name__ == "__main__":
     unittest.main()
