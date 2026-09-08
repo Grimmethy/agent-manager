@@ -120,6 +120,63 @@ test('CLI end-to-end: an adhoc task referencing a real repo-tracked file gets it
   assert.match(stdout, /candidates = null/);
 });
 
+// 2026-09-08, Second Brain [[dspy-signatures]] research applied: root-caused live
+// (adhoc-extract-29-functions...) a draft whose agentic run genuinely executed `node
+// --check newfile.js && echo NEWFILE_OK`, got real stdout back, and correctly cited that
+// real result in its final summary -- but PARAPHRASED it ("printed `NEWFILE_OK` (exit
+// 0)") rather than repeating the literal echo syntax, so fact-checker.js's own
+// echo-marker carve-out (which only recognizes the literal `echo TOKEN` shell syntax
+// appearing in the draft's OWN text) couldn't generalize to this phrasing. The real fix:
+// ground against the task's own real, already-executed local-agentic-write transcript
+// (queue/worklogs/<id>.json -- a SEPARATE file from task.toolCallLog, which only covers a
+// different, plan-pass-only tool mechanism), so ANY citation of a real printed value is
+// recognized via plain substring match regardless of how the summary phrases it.
+test('CLI end-to-end: a local-agentic-write task\'s real worklog tool output (queue/worklogs/<id>.json) is included as grounding', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-worklog-test-'));
+  const worklogDir = path.join(repoRoot, 'queue', 'worklogs');
+  fs.mkdirSync(worklogDir, { recursive: true });
+  fs.writeFileSync(path.join(worklogDir, 'worklog-task-1.json'), JSON.stringify({
+    taskId: 'worklog-task-1',
+    tiers: [{
+      tier: 'local-agentic-write',
+      calls: [
+        { n: 1, tool: 'run_bash', args: { command: 'node --check newfile.js && echo NEWFILE_OK' }, resultPreview: '{"command":"node --check newfile.js && echo NEWFILE_OK","stdout":"NEWFILE_OK\\n","exitCode":0}' },
+      ],
+    }],
+  }));
+  const task = {
+    id: 'worklog-task-1', domain: 'adhoc', source: 'manual',
+    promptContext: { rawText: 'do the thing' },
+    implementResponse: 'Verified the new file parses -- printed `NEWFILE_OK` (exit 0).',
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+  });
+
+  assert.match(stdout, /NEWFILE_OK/, 'the real worklog stdout must be folded into grounding, not just left invisible');
+});
+
+test('CLI end-to-end: a task with no matching worklog file does not throw, grounding proceeds without it', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-no-worklog-test-'));
+  const task = {
+    id: 'no-worklog-task-1', domain: 'adhoc', source: 'manual',
+    promptContext: { rawText: 'do the thing' },
+    implementResponse: 'Some real content.',
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot },
+  });
+  assert.equal(typeof stdout, 'string');
+});
+
 // Regression, 2026-08-24: caught investigating a real blocked task whose draft correctly
 // cited `python/dashboard/templates/index.html:882-895` as proof a feature already
 // existed -- .html was never in the allowed extension list, so the ONE file that actually
