@@ -4124,6 +4124,14 @@ def api_concepts_create():
         "builtFromScratchCount": 0,
         "adaptedFromResourceCount": 0,
     }
+    # kind (2026-09-08, Grimmethy: "a blank template that can be viewed in the concepts
+    # tab" -- see src/concepts.js's own createConcept() comment): distinguishes a
+    # reference/template document from every existing concept's narrative finding, so
+    # the frontend can render it with real markdown instead of plain escaped text.
+    # Mirrors the Node side's own behavior: omitted entirely unless explicitly
+    # 'reference', so an ordinary create (and every existing concept) is unaffected.
+    if body.get("kind") == "reference":
+        concept["kind"] = "reference"
     concepts.append(concept)
     write_concepts(concepts)
     return jsonify(concept)

@@ -48,8 +48,13 @@ test('requeueBlockedTasksForSignature moves every task matching the signature to
   assert.equal(pending.title, 'X-1');
   assert.equal(pending.localRejectCount, undefined); // stripped -- a fresh do-over, not a continuation
   assert.equal(pending.blockedReason, undefined);
-  assert.match(pending.history[0].note, /auto-requeued/);
-  assert.match(pending.history[0].note, /arch_import::harness-search-zero-results/);
+  // 2026-09-08: history entries now use the canonical { stage, at, detail } shape
+  // (task-history.js's appendHistoryEvent), not a divergent { status, at, note }.
+  assert.equal(pending.history[0].stage, 'pending');
+  assert.match(pending.history[0].detail, /auto-requeued/);
+  assert.match(pending.history[0].detail, /arch_import::harness-search-zero-results/);
+  assert.equal(pending.history[0].status, undefined);
+  assert.equal(pending.history[0].note, undefined);
 });
 
 test('requeueBlockedTasksForSignature does not touch a task that already has a pending entry', () => {
@@ -109,7 +114,7 @@ test('with dirs: [blocked, needs-clarification] it drains a matching task out of
   assert.deepEqual(requeuedIds, ['adhoc-nc-1']);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 'adhoc-nc-1.json')), false);
   const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'adhoc-nc-1.json'), 'utf8'));
-  assert.match(pending.history[0].note, /auto-requeued from needs-clarification\//);
+  assert.match(pending.history[0].detail, /auto-requeued from needs-clarification\//);
   assert.deepEqual(pending.requeuedForSignatures, ['manual::empty-degenerate-draft']);
 });
 

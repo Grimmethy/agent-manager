@@ -73,6 +73,14 @@ test('sweep requeues a task once re-anchoring flips confidence from none to stro
   assert.match(fresh.promptContext.fetchedFiles[0].content, /realTarget/);
   assert.equal(fresh.promptContext.fetchedFiles[0].anchorConfidence, 'strong');
   assert.ok(!fresh.blockedReason, 'drafting/review artifacts must be dropped, not copied');
+  // 2026-09-08, Grimmethy: "establish a single, documented task log template" -- the
+  // fresh history entry must use the canonical { stage, at, detail } shape
+  // (task-history.js's appendHistoryEvent), not a divergent { status, at, note }.
+  assert.equal(fresh.history[0].stage, 'pending');
+  assert.ok(fresh.history[0].at);
+  assert.match(fresh.history[0].detail, /auto-requeued by context-trim-sweep/);
+  assert.equal(fresh.history[0].status, undefined);
+  assert.equal(fresh.history[0].note, undefined);
 });
 
 test('sweep does not requeue and does not flag when re-anchoring changes nothing measurable', async () => {

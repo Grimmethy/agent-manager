@@ -828,13 +828,22 @@ function renderConceptCard(concept) {
     ? `<button class="secondary" data-reopen-concept="${escapeAttr(concept.id)}">Reopen</button>`
     : `<button class="secondary" data-shelve-concept="${escapeAttr(concept.id)}">Shelve</button>
        <button class="secondary" data-ship-concept="${escapeAttr(concept.id)}">Ship</button>`;
+  // kind:'reference' (2026-09-08, Grimmethy: "a blank template that can be viewed in the
+  // concepts tab" -- see src/concepts.js's own createConcept() comment): a reference/
+  // template document, not a narrative finding -- rendered with real headers/lists via
+  // renderReportMarkdown() (analytics-and-discovery.js, already loaded on this page for
+  // the unrelated Reports tab) instead of the bare escaped one-line <span> every other
+  // concept still gets. Every concept without this kind is completely unaffected.
+  const descriptionHtml = concept.kind === 'reference'
+    ? `<div class="row meta" style="display:block">${renderReportMarkdown(concept.description || '')}</div>`
+    : `<div class="row meta"><span>${escapeHtml(concept.description || '')}</span></div>`;
   return `
     <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
       <div class="row">
         <span class="text"><strong>${escapeHtml(concept.name)}</strong>${researchChip}${buildChip}${linkedChip}</span>
         ${statusBadge}
       </div>
-      <div class="row meta"><span>${escapeHtml(concept.description || '')}</span></div>
+      ${descriptionHtml}
       ${shelveNote}
       <div class="row" style="margin-top:8px">
         <span></span>

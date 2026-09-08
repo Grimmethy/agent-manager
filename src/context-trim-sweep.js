@@ -237,11 +237,16 @@ async function sweep({ pipelineDir, repoRoot, dryRun = false, now = Date.now() }
         contextTrimAttempts: attempts + 1,
         status: 'pending',
         createdAt: nowIso,
-        history: [{
-          status: 'pending', at: nowIso,
-          note: `auto-requeued by context-trim-sweep: ${improvements.join('; ')} -- attempt ${attempts + 1}/${MAX_REQUEUES}`,
-        }],
+        history: [],
       };
+      // 2026-09-08, Grimmethy: "establish a single, documented task log template" --
+      // this used to hand-roll { status, at, note } directly, a different field
+      // vocabulary from every other stage-transition writer's { stage, at, detail }
+      // (task-history.js's own canonical shape, already imported and used elsewhere in
+      // this file at the 'advisory' call below). Real, live consequence: a downstream
+      // consumer expecting .stage/.detail silently missed or blanked these entries (see
+      // task-history.js's own header + the dashboard's own patched-around fallbacks).
+      appendHistoryEvent(fresh, 'pending', `auto-requeued by context-trim-sweep: ${improvements.join('; ')} -- attempt ${attempts + 1}/${MAX_REQUEUES}`);
 
       const destPath = path.join(pendingDir, path.basename(filePath));
       if (fs.existsSync(destPath)) { summary.skipped += 1; continue; }
