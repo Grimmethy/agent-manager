@@ -219,3 +219,171 @@ test('fetchBranch never throws for an unknown branch', () => {
   const runner = createRealGitRunner(repoDir);
   assert.doesNotThrow(() => runner.fetchBranch('agent/decompose-does-not-exist'));
 });
+
+// --- prepareStackedBranch (2026-09-08) --------------------------------------------------
+// Grimmethy: "harden it properly with tests" -- root-caused live: the OLD apply-task.js
+// logic trusted branchExists(name) (LOCAL-only) as proof a stacked branch was safe to
+// check out, with no check that the local copy was actually current. A stale local
+// branch -- same name, unrelated ancient content, origin's real copy long since merged
+// and deleted -- made every apply attempt check out that stale tree and then fail to
+// apply a diff computed against current main, identically, every retry. prepareStackedBranch
+// replaces the old branchExists/checkoutBranch/checkoutTracking/try-catch dance with the
+// same ahead/behind/diverged discipline resetToMain() already applies to mainBranch
+// itself, now applied to a per-hub scratch branch too.
+
+test('prepareStackedBranch: remote exists, no local ref -> syncs from origin', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  runner.checkoutMain();
+  git(['branch', '-D', 'agent/decompose-x'], repoDir);
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/decompose-x');
+  assert.equal(fs.readFileSync(path.join(repoDir, 'step1.txt'), 'utf8'), 'move 1\n');
+});
+
+test('prepareStackedBranch: remote exists, local is behind (⊆ origin) -> resets local to origin\'s tip', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  // A second host pushes step 2 to origin; THIS clone's local copy is now behind.
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  git(['fetch', 'origin', 'agent/decompose-x'], otherClone);
+  git(['checkout', 'agent/decompose-x'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'step2.txt'), 'move 2\n');
+  git(['add', 'step2.txt'], otherClone);
+  git(['commit', '-m', 'step 2'], otherClone);
+  git(['push', 'origin', 'agent/decompose-x'], otherClone);
+
+  runner.checkoutMain();
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  assert.equal(fs.existsSync(path.join(repoDir, 'step2.txt')), true, 'local must have synced forward to origin\'s tip');
+});
+
+test('prepareStackedBranch: remote exists, local is STRICTLY AHEAD (a prior push failed) -> trusts local, never discards the unpushed commit', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  // Step 2 commits locally, but its OWN push never happened (network blip, etc).
+  fs.writeFileSync(path.join(repoDir, 'step2.txt'), 'move 2 -- never pushed\n');
+  git(['add', 'step2.txt'], repoDir);
+  git(['commit', '-m', 'step 2, unpushed'], repoDir);
+  const localTip = git(['rev-parse', 'HEAD'], repoDir).trim();
+  runner.checkoutMain();
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  assert.equal(git(['rev-parse', 'agent/decompose-x'], repoDir).trim(), localTip, 'the unpushed commit must not be discarded');
+  assert.equal(fs.existsSync(path.join(repoDir, 'step2.txt')), true);
+});
+
+test('prepareStackedBranch: remote exists but has diverged from local -> throws, discards neither side', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  // Local commits its own step 2...
+  fs.writeFileSync(path.join(repoDir, 'step2-local.txt'), 'local version\n');
+  git(['add', 'step2-local.txt'], repoDir);
+  git(['commit', '-m', 'local step 2'], repoDir);
+  const localTip = git(['rev-parse', 'HEAD'], repoDir).trim();
+  // ...while a DIFFERENT step 2 landed on origin independently.
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  git(['fetch', 'origin', 'agent/decompose-x'], otherClone);
+  git(['checkout', 'agent/decompose-x'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'step2-other.txt'), 'other version\n');
+  git(['add', 'step2-other.txt'], otherClone);
+  git(['commit', '-m', 'a different step 2, pushed independently'], otherClone);
+  git(['push', 'origin', 'agent/decompose-x'], otherClone);
+  runner.checkoutMain();
+
+  assert.throws(() => runner.prepareStackedBranch('agent/decompose-x'), /diverged/);
+  assert.equal(git(['rev-parse', 'agent/decompose-x'], repoDir).trim(), localTip, 'local commit must still be right there, untouched');
+});
+
+// 2026-09-07 real incident + 2026-09-08 fix -- the two scenarios that matter when origin
+// no longer has the branch at all (already merged + cleaned up, e.g. GitHub's own
+// auto-delete-merged-branches).
+test('prepareStackedBranch: no remote copy, local descends from CURRENT main -> trusts local as real unpushed work', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  // Branch off current main, commit, but NEVER push it anywhere.
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1, never pushed\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1, never pushed'], repoDir);
+  const localTip = git(['rev-parse', 'HEAD'], repoDir).trim();
+  runner.checkoutMain();
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  assert.equal(git(['rev-parse', 'agent/decompose-x'], repoDir).trim(), localTip, 'real never-pushed work must not be discarded');
+});
+
+test('prepareStackedBranch: no remote copy AND local is stale (does not descend from current main) -> discards it and starts fresh off main', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+
+  // A stale local branch under the SAME name, from an ancient, unrelated point in
+  // history -- exactly the incident: a 5-day-old leftover local branch, unrelated
+  // content, origin's real copy long since merged and deleted.
+  git(['branch', 'agent/decompose-x'], repoDir); // branches off the current (soon-to-be-stale) tip
+  const staleTip = git(['rev-parse', 'agent/decompose-x'], repoDir).trim();
+
+  // Main moves forward with real new commits AFTER the stale branch was created.
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- main moved on\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'main moved on'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+  const newMainTip = git(['rev-parse', 'main'], repoDir).trim();
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  const finalTip = git(['rev-parse', 'agent/decompose-x'], repoDir).trim();
+  assert.notEqual(finalTip, staleTip, 'the stale local branch must be discarded, not trusted');
+  assert.equal(finalTip, newMainTip, 'a fresh branch must be created off CURRENT main');
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/decompose-x');
+});
+
+test('prepareStackedBranch: no remote copy and no local branch at all -> creates fresh off main, no delete attempted', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  const mainTip = git(['rev-parse', 'main'], repoDir).trim();
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-brand-new'));
+  assert.equal(git(['rev-parse', 'agent/decompose-brand-new'], repoDir).trim(), mainTip);
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/decompose-brand-new');
+});
+
+test('remoteBranchExists reflects the real remote-tracking ref, independent of a same-named local branch', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  assert.equal(runner.remoteBranchExists('agent/decompose-x'), false);
+
+  // A local-only branch exists, but origin never got it -- must still read false.
+  git(['branch', 'agent/decompose-x'], repoDir);
+  assert.equal(runner.remoteBranchExists('agent/decompose-x'), false);
+
+  git(['checkout', 'agent/decompose-x'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  assert.equal(runner.remoteBranchExists('agent/decompose-x'), true);
+});

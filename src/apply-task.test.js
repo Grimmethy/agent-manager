@@ -1048,47 +1048,28 @@ test('stacked seq 1: creates the shared decompose branch off main (reset first)'
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/decompose-x');
   assert.deepEqual(gitRunner.calls.map((c) => c.name),
-    ['fetchMain', 'fetchBranch', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+    ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 });
 
-test('stacked seq 2: rides on top of the existing shared branch -- never resets it away', () => {
-  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'] });
+// 2026-09-08: seq > 1 now delegates the whole fetch/exists/ancestry decision to
+// gitRunner.prepareStackedBranch (git-runner.js) -- one call from apply-task.js's own
+// perspective; the fake runner's own internal decision logic is exercised directly by
+// git-runner.test.js, so these tests just confirm apply-task.js calls it (not resetToMain/
+// deleteBranch/createBranch directly) and correctly wires its outcome into the rest of
+// the apply.
+test('stacked seq 2: rides on top of the existing shared branch via prepareStackedBranch -- never resets it away directly', () => {
+  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'], remoteBranches: ['agent/decompose-x'], isAncestorFn: () => true });
   const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }),
     { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
   assert.equal(result.succeeded, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'fetchBranch', 'branchExists', 'checkoutBranch', 'add', 'commit', 'push', 'checkoutMain']);
-  assert.ok(!names.includes('resetToMain'), 'must not reset -- prior steps live on this branch');
-  assert.ok(!names.includes('deleteBranch'), 'must not delete the shared branch');
-});
-
-test('stacked seq 2 with no local ref: takes origin/<branch> via checkoutTracking', () => {
-  const gitRunner = createFakeGitRunner({ existingBranches: [] });
-  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }),
-    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-  assert.equal(result.succeeded, true);
-  assert.deepEqual(gitRunner.calls.map((c) => c.name),
-    ['fetchMain', 'fetchBranch', 'branchExists', 'checkoutTracking', 'add', 'commit', 'push', 'checkoutMain']);
-});
-
-// 2026-09-07, real incident: step 1's branch had already merged and its remote ref was
-// cleaned up (e.g. GitHub's own auto-delete-merged-branches) by the time step 2 ran --
-// checkoutTracking() threw "origin/<branch> is not a commit" because neither a local nor
-// a remote copy existed anywhere. isDependencySatisfied() already guarantees the whole
-// prior chain reached a merged/done state before this task is ever claimed, so a missing
-// branch at this point can only mean main already has everything the old branch had.
-test('stacked seq 2 whose branch is gone from BOTH local and origin (already merged + cleaned up): falls back to seq===1 treatment instead of permanently failing', () => {
-  const gitRunner = createFakeGitRunner({ existingBranches: [], failOn: 'checkoutTracking', failMessage: "fatal: 'origin/agent/decompose-x' is not a commit and a branch 'agent/decompose-x' cannot be created from it" });
-  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }),
-    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
-  assert.equal(result.succeeded, true);
-  const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names,
-    ['fetchMain', 'fetchBranch', 'branchExists', 'checkoutTracking', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'prepareStackedBranch', 'checkoutTracking', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.ok(!names.includes('resetToMain'), 'must not reset directly -- prior steps live on this branch');
+  assert.ok(!names.includes('deleteBranch'), 'must not delete the shared branch directly');
 });
 
 test('stacked child: a write failure steps off the branch but does NOT delete it', () => {
-  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'] });
+  const gitRunner = createFakeGitRunner({ existingBranches: ['agent/decompose-x'], remoteBranches: ['agent/decompose-x'], isAncestorFn: () => true });
   const result = applyTask(
     baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 },
       implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'NOPE', replace: 'b' }) }),

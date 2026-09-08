@@ -54,6 +54,31 @@ function createRealGitRunner(repoRoot) {
   function run(args) {
     return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
   }
+  function isAncestor(a, b) {
+    try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  function doResetToMain() {
+    try {
+      run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+    } catch (e) {
+      throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+    }
+    run(['checkout', mainBranch]);
+    run(['fetch', 'origin', mainBranch]);
+    const remote = `origin/${mainBranch}`;
+    const originInLocal = isAncestor(remote, mainBranch);
+    const localInOrigin = isAncestor(mainBranch, remote);
+    if (originInLocal && !localInOrigin) {
+      try {
+        run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+      } catch (e) {
+        throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+      }
+    } else if (!originInLocal && !localInOrigin) {
+      throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
+    }
+    run(['reset', '--hard', remote]);
+  }
   return {
     mainBranch,
     fetchMain: () => run(['fetch', 'origin', mainBranch]),
@@ -76,59 +101,7 @@ function createRealGitRunner(repoRoot) {
     // 90 scanner false-positive suppressions were lost this way over 3 days before the
     // ledgers were ignored. src/pipeline-state-gitignored.test.js enforces the invariant
     // against every getConfig() path.
-    resetToMain: () => {
-      try {
-        run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
-      } catch (e) {
-        throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
-      }
-      run(['checkout', mainBranch]);
-      // Refresh origin/<mainBranch> so the ancestry checks below are against reality, not
-      // a stale remote-tracking ref -- callers normally fetchMain() first, but resetToMain
-      // must be correct on its own (a stale ref here misclassifies "local is simply
-      // behind" as "diverged" and wedges the apply loop -- confirmed live 2026-09-01 after
-      // an out-of-band push straight to master).
-      run(['fetch', 'origin', mainBranch]);
-      const remote = `origin/${mainBranch}`;
-      const isAncestor = (a, b) => {
-        try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
-      };
-      // 2026-08-27, Grimmethy: "This reset has consistently caused us to lose work and
-      // reintroduces bugs after we fix them." Root-caused live: the plain `git reset
-      // --hard origin/<mainBranch>` below discards ANY local commit on mainBranch that
-      // was never pushed, exactly as readily as it discards uncommitted debris -- the
-      // auto-stash above only ever protected the latter. Confirmed live losing 5 real
-      // commits this way in one incident, including a same-day critical fix
-      // (MIN_TIMEOUT_MS's cold-load timeout) that had been committed locally on master
-      // but not yet pushed when the next apply's resetToMain() ran: the fix was
-      // silently reverted out from under the pipeline, reintroducing the exact bug it
-      // had just fixed, recoverable only because git hadn't pruned the reflog yet. A
-      // local commit ahead of origin here is real, intentional work (this repo is
-      // sometimes committed to directly in the shared working tree) -- never something to
-      // discard by default. Classify the three cases explicitly:
-      const originInLocal = isAncestor(remote, mainBranch); // origin ⊆ local (local ahead or equal)
-      const localInOrigin = isAncestor(mainBranch, remote); // local ⊆ origin (local behind or equal)
-      if (originInLocal && !localInOrigin) {
-        // Local has real commit(s) origin lacks -- fast-forward origin FIRST so the hard
-        // reset below becomes a no-op instead of discarding them. A plain non-force push,
-        // safe by construction here (local is a strict superset of origin).
-        try {
-          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
-        } catch (e) {
-          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
-        }
-      } else if (!originInLocal && !localInOrigin) {
-        // Neither is an ancestor of the other -- genuinely diverged history (origin got a
-        // commit local doesn't have AND local has one origin doesn't). Not something to
-        // resolve by throwing either side away; surface it for a human. Caught by
-        // applyTask()'s top-level try/catch, which blocks just this one task.
-        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
-      }
-      // Remaining cases -- local behind origin (an out-of-band push straight to
-      // ${mainBranch}) or exactly equal -- have nothing local worth preserving: just
-      // fast-forward onto origin.
-      run(['reset', '--hard', remote]);
-    },
+    resetToMain: doResetToMain,
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
     // Checkout an EXISTING branch (stacked file-decompose: move N+1 rides on top of the
@@ -136,6 +109,14 @@ function createRealGitRunner(repoRoot) {
     checkoutBranch: (name) => run(['checkout', name]),
     branchExists: (name) => {
       try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; }
+      catch { return false; }
+    },
+    // 2026-09-08, added alongside prepareStackedBranch below -- checks the REMOTE copy
+    // specifically (refs/remotes/origin/<name>), distinct from branchExists' local-only
+    // check. A caller must never treat "a local ref with this name exists" as proof the
+    // branch is real/current -- see prepareStackedBranch's own header for the incident.
+    remoteBranchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${name}`]); return true; }
       catch { return false; }
     },
     // Best-effort fetch of one non-main branch (stacked decompose: pick up a prior step's
@@ -147,6 +128,67 @@ function createRealGitRunner(repoRoot) {
     // when the local ref is missing or stale but origin has the prior step's commit).
     checkoutTracking: (name) => run(['checkout', '-B', name, `origin/${name}`]),
     deleteBranch: (name) => run(['branch', '-D', name]),
+    // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: apply-
+    // task.js's stacked-decompose handling (seq > 1) used to trust branchExists(name)
+    // (a LOCAL-only check) as proof the branch was safe to check out, with no check that
+    // the local copy was actually current. A 5-day-old, unrelated local branch with the
+    // SAME name -- leftover cruft, origin's real copy long since merged and deleted --
+    // made every apply attempt check out that stale tree and then fail to apply a diff
+    // computed against current main, identically, every single retry (not a race; a
+    // permanently wrong decision that would never self-correct). This is the single,
+    // self-contained decision resetToMain() already models for the analogous "is my
+    // local copy of mainBranch safe to sync from origin" question -- same ahead/behind/
+    // diverged reasoning, applied here to a per-hub scratch branch instead:
+    //   - origin has it, local doesn't (or local ⊆ origin, i.e. stale/behind/identical):
+    //     sync local to origin's tip. Always safe -- local has nothing origin lacks.
+    //   - origin has it AND local is STRICTLY ahead (real unpushed commits, e.g. a prior
+    //     step's own push failed after a successful commit): trust local as-is, matching
+    //     the old default behavior -- never silently discard real unpushed work.
+    //   - origin has it and the two have diverged: surface loudly for a human, exactly
+    //     like resetToMain's own diverged case -- never guess which side to keep.
+    //   - origin doesn't have it, but local descends from CURRENT main: plausibly real,
+    //     unpushed work from a step whose push never even started -- trust it.
+    //   - origin doesn't have it, and local (if any) does NOT descend from current main:
+    //     this is the exact stale-branch case that caused the incident. Discard any such
+    //     local branch and fall back to resetToMain() + a fresh branch off it, the same
+    //     "the whole prior chain already merged" fallback the seq===1 path already uses
+    //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
+    //     by trusting whatever name happens to exist locally.
+    prepareStackedBranch: (name) => {
+      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      const remote = `origin/${name}`;
+      const remoteExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); return true; } catch { return false; }
+      })();
+      const localExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; } catch { return false; }
+      })();
+      if (remoteExists) {
+        if (localExists) {
+          const originInLocal = isAncestor(remote, name); // origin ⊆ local (local ahead or equal)
+          const localInOrigin = isAncestor(name, remote); // local ⊆ origin (local behind or equal)
+          if (originInLocal && !localInOrigin) {
+            run(['checkout', name]); // real unpushed commits -- trust local as-is.
+            return;
+          }
+          if (!originInLocal && !localInOrigin) {
+            throw new Error(`prepareStackedBranch: local ${name} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic sync`);
+          }
+        }
+        run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical)
+        return;
+      }
+      if (localExists && isAncestor(`origin/${mainBranch}`, name)) {
+        run(['checkout', name]); // no remote copy, but local is real work off current main
+        return;
+      }
+      // No remote copy, and no trustworthy local copy -- discard any stale local branch
+      // and start this step fresh off current main (2026-09-07 fallback reasoning: origin
+      // having nothing can only mean the whole prior chain already merged).
+      if (localExists) { try { run(['branch', '-D', name]); } catch { /* best-effort */ } }
+      doResetToMain();
+      run(['checkout', '-b', name]);
+    },
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
@@ -189,9 +231,49 @@ function createFakeGitRunner(opts = {}) {
       record('branchExists', name);
       return (opts.existingBranches || []).includes(name);
     },
+    remoteBranchExists: (name) => {
+      record('remoteBranchExists', name);
+      return (opts.remoteBranches || []).includes(name);
+    },
     fetchBranch: (name) => record('fetchBranch', name),
     checkoutTracking: (name) => record('checkoutTracking', name),
     deleteBranch: (name) => record('deleteBranch', name),
+    // Fake decision logic mirroring the real adapter's prepareStackedBranch (see its own
+    // header) -- driven by opts.remoteBranches / opts.existingBranches (already used for
+    // remoteBranchExists/branchExists above) plus opts.isAncestorFn(a, b), since a fake
+    // runner has no real git objects to compute ancestry against. Each resolved outcome
+    // records the SAME sub-operation name the real adapter's own git call would represent
+    // (checkoutBranch / checkoutTracking / resetToMain+createBranch), so an apply-task
+    // test can assert on the outcome exactly like it already does for every other path.
+    prepareStackedBranch: (name) => {
+      record('prepareStackedBranch', name);
+      const remoteExists = (opts.remoteBranches || []).includes(name);
+      const localExists = (opts.existingBranches || []).includes(name);
+      const isAncestor = opts.isAncestorFn || (() => false);
+      const remote = `origin/${name}`;
+      if (remoteExists) {
+        if (localExists) {
+          const originInLocal = isAncestor(remote, name);
+          const localInOrigin = isAncestor(name, remote);
+          if (originInLocal && !localInOrigin) {
+            record('checkoutBranch', name);
+            return;
+          }
+          if (!originInLocal && !localInOrigin) {
+            throw new Error(`prepareStackedBranch: local ${name} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic sync`);
+          }
+        }
+        record('checkoutTracking', name);
+        return;
+      }
+      if (localExists && isAncestor(`origin/${opts.mainBranch || 'main'}`, name)) {
+        record('checkoutBranch', name);
+        return;
+      }
+      if (localExists) record('deleteBranch', name);
+      record('resetToMain');
+      record('createBranch', name);
+    },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
     push: (branchName) => record('push', branchName),

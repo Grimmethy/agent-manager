@@ -378,30 +378,15 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     const stacked = task.stacked && task.stacked.branch && !commitsDirectlyToMain ? task.stacked : null;
     if (stacked) {
       const b = stacked.branch;
-      gitRunner.fetchBranch(b);
       if (stacked.seq > 1) {
-        if (gitRunner.branchExists(b)) {
-          gitRunner.checkoutBranch(b);
-        } else {
-          // 2026-09-07, real incident: a stacked hub's step 1 branch had already been
-          // merged AND cleaned up (its remote ref deleted, e.g. GitHub's own auto-
-          // delete-merged-branches) by the time step 2 ran -- checkoutTracking() threw
-          // "origin/<branch> is not a commit" because neither a local nor a remote copy
-          // existed anywhere any more. A missing branch at this point can ONLY mean the
-          // entire prior chain already merged into main (isDependencySatisfied() already
-          // required every earlier step to reach a merged/done state before this task
-          // was ever claimed) -- main already contains everything the old branch had, so
-          // this falls back to exactly the seq===1 treatment: reset to main and create a
-          // fresh branch under the same name, rather than leaving the whole hub
-          // permanently stuck on a branch that will never come back.
-          try {
-            gitRunner.checkoutTracking(b);
-          } catch (e) {
-            gitRunner.resetToMain();
-            try { gitRunner.deleteBranch(b); } catch (_) { /* no stale local branch */ }
-            gitRunner.createBranch(b);
-          }
-        }
+        // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: the
+        // old branchExists(b) check here was LOCAL-only, so a stale local branch with the
+        // same name (origin's real copy long since merged and deleted) made every apply
+        // attempt check out ancient history and fail to apply a diff computed against
+        // current main -- identically, every retry, never self-correcting. See
+        // git-runner.js's prepareStackedBranch for the full ahead/behind/diverged
+        // reasoning (same discipline resetToMain() already applies to mainBranch itself).
+        gitRunner.prepareStackedBranch(b);
       } else {
         gitRunner.resetToMain();
         try { gitRunner.deleteBranch(b); } catch (_) { /* no stale branch */ }
