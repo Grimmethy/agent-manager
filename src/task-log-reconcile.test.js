@@ -180,3 +180,92 @@ test('reconcile --reclassify: allowReopenFrom now includes abandoned (re-confirm
   assert.equal(tail(f).stage, 'abandoned');
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).history.filter((e) => e.stage === 'abandoned').length, 1, 'no duplicate abandoned event');
 });
+
+// --- Incident Amplification auto-trigger (2026-09-08) ----------------------------------
+
+const { deriveAmplificationRequestFromFix } = require('./task-log-reconcile.js');
+
+test('deriveAmplificationRequestFromFix picks the longest non-trivial line from an edit item\'s replace text, and lists every touched file as excludeFiles', () => {
+  const record = {
+    id: 't1',
+    title: 'Fix history-entry schema divergence',
+    implementResponse: JSON.stringify([
+      { file: 'src/context-trim-sweep.js', mode: 'edit', find: "status: 'x'", replace: "appendHistoryEvent(fresh, 'pending', 'auto-requeued by context-trim-sweep')" },
+      { file: 'src/blocked-drain.js', mode: 'edit', find: "status: 'y'", replace: '{\n}' },
+    ]),
+  };
+  const req = deriveAmplificationRequestFromFix(record);
+  assert.ok(req);
+  assert.match(req.query, /appendHistoryEvent/);
+  assert.deepEqual(req.excludeFiles, ['src/context-trim-sweep.js', 'src/blocked-drain.js']);
+  assert.equal(req.rootCauseSummary, 'Fix history-entry schema divergence');
+});
+
+test('deriveAmplificationRequestFromFix falls back to promptContext.signature when title is missing', () => {
+  const record = {
+    id: 't1',
+    promptContext: { signature: 'manual::history-entry-schema-divergence' },
+    implementResponse: JSON.stringify([{ file: 'src/a.js', mode: 'create', content: 'a genuinely distinctive line of real code here' }]),
+  };
+  const req = deriveAmplificationRequestFromFix(record);
+  assert.ok(req);
+  assert.equal(req.rootCauseSummary, 'manual::history-entry-schema-divergence');
+});
+
+test('deriveAmplificationRequestFromFix returns null for non-Group-B implementResponse (Group A markdown, not JSON)', () => {
+  const record = { id: 't1', title: 'x', implementResponse: 'Just a markdown writeup, not JSON.' };
+  assert.equal(deriveAmplificationRequestFromFix(record), null);
+});
+
+test('deriveAmplificationRequestFromFix returns null when every item only has trivial/short lines', () => {
+  const record = {
+    id: 't1', title: 'x',
+    implementResponse: JSON.stringify([{ file: 'src/a.js', mode: 'edit', find: 'x', replace: '{\n}\n;\n' }]),
+  };
+  assert.equal(deriveAmplificationRequestFromFix(record), null);
+});
+
+test('reconcile triggers a real amplification sweep when a pipeline_self_audit/pipeline_forensics_fix task resolves to merged, and never for other sources', () => {
+  const dir = tmpPipeline();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tlr-amp-root-'));
+  fs.writeFileSync(path.join(root, 'sibling.js'), "appendHistoryEvent(fresh, 'pending', 'auto-requeued elsewhere')\n");
+  const prevGrepDirs = process.env.AGENT_MANAGER_GREP_DIRS;
+  process.env.AGENT_MANAGER_GREP_DIRS = '.';
+
+  delete require.cache[require.resolve('./task-disposition.js')];
+  const disposition = require.cache[require.resolve('./task-disposition.js')] || { exports: {} };
+  const realDisposition = require('./task-disposition.js');
+  require.cache[require.resolve('./task-disposition.js')].exports = {
+    ...realDisposition,
+    resolveDisposition: (record) => ({ stage: 'merged', detail: 'forced for test' }),
+  };
+  delete require.cache[require.resolve('./task-log-reconcile.js')];
+  const mod = require('./task-log-reconcile.js');
+
+  try {
+    // The fix touched a DIFFERENT file than the real sibling.js fixture below -- otherwise
+    // excludeFiles would exclude the one real match and the sweep would file nothing.
+    writeRec(dir, '', 'audit-1', [{ stage: 'applied', detail: 'x' }], {
+      source: 'pipeline_self_audit',
+      implementResponse: JSON.stringify([{ file: 'already-fixed-site.js', mode: 'edit', find: 'x', replace: "appendHistoryEvent(fresh, 'pending', 'auto-requeued elsewhere')" }]),
+    });
+    // A non-systemic-fix source with the identical shape must NOT trigger a sweep.
+    writeRec(dir, '', 'other-1', [{ stage: 'applied', detail: 'x' }], {
+      source: 'brain_dump',
+      implementResponse: JSON.stringify([{ file: 'already-fixed-site.js', mode: 'edit', find: 'x', replace: "appendHistoryEvent(fresh, 'pending', 'auto-requeued elsewhere')" }]),
+    });
+
+    mod.reconcile({ pipelineDir: dir, repoRoot: root, argv: ['--no-fetch'] });
+
+    const inboxDir = path.join(dir, 'queue', 'side-findings-inbox');
+    const files = fs.readdirSync(inboxDir).map((f) => JSON.parse(fs.readFileSync(path.join(inboxDir, f), 'utf8')));
+    assert.equal(files.length, 1, 'exactly one sweep fired, from the pipeline_self_audit task only');
+    assert.equal(files[0].source, 'pipeline_self_audit');
+    assert.equal(files[0].taskId, 'audit-1');
+  } finally {
+    require.cache[require.resolve('./task-disposition.js')].exports = realDisposition;
+    delete require.cache[require.resolve('./task-log-reconcile.js')];
+    if (prevGrepDirs === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS;
+    else process.env.AGENT_MANAGER_GREP_DIRS = prevGrepDirs;
+  }
+});

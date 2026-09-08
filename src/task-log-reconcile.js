@@ -35,6 +35,62 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { resolveDisposition, buildShipContext, STABLE_TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+const { runAmplificationSweep } = require('./incident-amplification.js');
+
+// Incident Amplification's automatic trigger (2026-09-08, Grimmethy: "this system should
+// be aggressive... we lose a ton of machine time to these requeues. If we can reduce them
+// before they even happen we gain a huge efficiency boost.") -- a pipeline_self_audit /
+// pipeline_forensics_fix task landing as a real, confirmed code fix IS a confirmed
+// systemic root cause BY CONSTRUCTION (that is the whole point of those two sources: a
+// detector found a real cluster/pattern, forensics diagnosed it, this task fixed it) --
+// no human/Chat conversation needs to notice it. This is the automatic candidate the
+// concept's own "what done looks like" section named and the original implementation
+// plan explicitly deferred (needed a way to derive a search pattern without a fresh model
+// call, which risked GPU contention and was unproven).
+//
+// Deterministic derivation, no model call: both sources register no custom `apply()`
+// (confirmed via task-sources.js), so their implementResponse is always Group B JSON --
+// {file, mode: 'create'|'edit'|'delete', find, replace, content}[] (apply-group-b.js).
+// For an 'edit' item, `replace` IS the literal code the fix introduced -- exactly the
+// fix pattern a sibling site would also be missing. Picks the longest non-trivial line
+// from the first edit/create item that has one; every touched file is excluded from the
+// sweep's own results (they're already fixed, not a sibling).
+const TRIVIAL_LINE_RE = /^[{}();,[\]]*$/;
+function pickRepresentativeLine(text) {
+  const lines = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const candidates = lines.filter((l) => l.length >= 15 && !TRIVIAL_LINE_RE.test(l) && !l.startsWith('//') && !l.startsWith('#'));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0].slice(0, 200);
+}
+
+function deriveAmplificationRequestFromFix(record) {
+  let items;
+  try {
+    items = JSON.parse(record.implementResponse);
+  } catch {
+    return null; // not Group B JSON (or implementResponse was pruned) -- nothing to derive
+  }
+  if (!Array.isArray(items)) items = [items];
+
+  const excludeFiles = [];
+  let query = null;
+  for (const item of items) {
+    if (!item || !item.file) continue;
+    excludeFiles.push(item.file);
+    if (query) continue;
+    const text = item.mode === 'edit' ? item.replace : item.mode === 'create' ? item.content : null;
+    const line = pickRepresentativeLine(text);
+    if (line) query = line;
+  }
+  if (!query) return null;
+
+  return {
+    query,
+    excludeFiles,
+    rootCauseSummary: record.title || (record.promptContext && record.promptContext.signature) || 'confirmed systemic fix',
+  };
+}
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
@@ -170,6 +226,18 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
         record.mergedAt = new Date().toISOString();
         record.mergedAtSource = 'task-log-reconcile';
       }
+      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+        const req = deriveAmplificationRequestFromFix(record);
+        if (req) {
+          try {
+            runAmplificationSweep({
+              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+            });
+          } catch (e) { /* best-effort -- never break reconcile over an amplification sweep */ }
+        }
+      }
       try {
         fs.writeFileSync(file, JSON.stringify(record, null, 2));
       } catch (err) {
@@ -206,7 +274,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
   return summary;
 }
 
-module.exports = { reconcile, candidateRecords, loadState };
+module.exports = { reconcile, candidateRecords, loadState, deriveAmplificationRequestFromFix };
 
 if (require.main === module) {
   let cfg;
