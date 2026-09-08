@@ -119,6 +119,42 @@ test('no premiumPriority on the request -- no child or hub gets the field at all
   assert.equal(Object.prototype.hasOwnProperty.call(hub, 'premiumPriority'), false);
 });
 
+// parentHub (2026-09-08): propagates from the request onto the hub record only (not its
+// children -- a plain move/wiring child isn't itself a hub), same pattern as premiumPriority
+// above. Set by decompose-loop-autoroute.js when this hub rescues a stuck child of an
+// existing hub.
+test('parentHub on the request propagates to the hub itself, not its children', () => {
+  const dir = tmpRepo();
+  const reqPath = path.join(dir, 'queue', 'file-decompose-requests', 'p.json');
+  fs.writeFileSync(reqPath, JSON.stringify({ ...PLAN, parentHub: 'hub-original' }));
+
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'false' }, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.parentHub, 'hub-original', 'the hub itself should carry parentHub');
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  for (const name of adhoc) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', name), 'utf8'));
+    assert.equal(Object.prototype.hasOwnProperty.call(rec, 'parentHub'), false, `${name} (a plain child, not a hub) should have no parentHub key`);
+  }
+});
+
+test('no parentHub on the request -- the hub gets no field at all (not even false)', () => {
+  const dir = tmpRepo();
+  const reqPath = path.join(dir, 'queue', 'file-decompose-requests', 'p.json');
+  fs.writeFileSync(reqPath, JSON.stringify(PLAN));
+
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'false' }, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(Object.prototype.hasOwnProperty.call(hub, 'parentHub'), false);
+});
+
 // --- stacked model -------------------------------------------------------------------
 
 test('stacked mode + LLM wiring child (det-wiring off): one shared branch, sequential dependsOn chain, atomic children', () => {

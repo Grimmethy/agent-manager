@@ -155,6 +155,67 @@ test('sweep: no premiumPriority on the stuck task -- neither the request nor the
   assert.equal(Object.prototype.hasOwnProperty.call(moved, 'premiumPriority'), false);
 });
 
+// parentHub (2026-09-08): the Hub Tasks tab's real family-tree link, propagated the same
+// way premiumPriority already is above.
+test('sweep: promptContext.decomposedFrom on the stuck task carries onto the new hub as parentHub', async () => {
+  const dir = tmpPipeline();
+  const stuck = { ...STUCK(), promptContext: { ...STUCK().promptContext, decomposedFrom: 'hub-original' } };
+  w(dir, 'needs-clarification', stuck);
+
+  const call = async () => ({
+    response: JSON.stringify([
+      { newFile: 'python/dashboard/templates/static/js/job-list.js', kind: 'script-extract', symbols: ['renderJobListTab', 'renderJobRow'] },
+      { newFile: 'python/dashboard/templates/static/js/job-groups.js', kind: 'script-extract', symbols: ['renderGroupRow', 'toggleGroup'] },
+    ]),
+  });
+  fs.mkdirSync(path.join(dir, 'python/dashboard/templates'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
+    '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
+
+  await sweep({ pipelineDir: dir, repoRoot: dir, call });
+
+  const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
+  const req = r(path.join(dir, 'queue', 'file-decompose-requests', reqs[0]));
+  assert.equal(req.parentHub, 'hub-original', 'the auto-authored request should carry parentHub forward');
+
+  const hubFile = path.join(dir, 'queue', 'coordinating', `file-decompose-hub-${req.id}.json`);
+  const hub = r(hubFile);
+  assert.equal(hub.parentHub, 'hub-original', 'the newly materialised hub should carry parentHub');
+});
+
+// Fallback path: no decomposedFrom on the stuck task, but rewireCoordinatorParent() still
+// finds a real coordinating parent by scanning subTasks[] -- the new hub should still get
+// stamped, so the family tree is correct either way.
+test('sweep: with no decomposedFrom, a real coordinating parent found by scan still stamps parentHub (fallback)', async () => {
+  const dir = tmpPipeline();
+  const stuck = STUCK();
+  w(dir, 'needs-clarification', stuck);
+  w(dir, 'coordinating', {
+    id: 'hub-original',
+    subTasks: [{ id: stuck.id, title: stuck.title, status: 'needs-clarification' }],
+    history: [],
+  });
+
+  const call = async () => ({
+    response: JSON.stringify([
+      { newFile: 'python/dashboard/templates/static/js/job-list.js', kind: 'script-extract', symbols: ['renderJobListTab', 'renderJobRow'] },
+      { newFile: 'python/dashboard/templates/static/js/job-groups.js', kind: 'script-extract', symbols: ['renderGroupRow', 'toggleGroup'] },
+    ]),
+  });
+  fs.mkdirSync(path.join(dir, 'python/dashboard/templates'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
+    '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call });
+  assert.equal(summary.rewiredParents, 1);
+
+  const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
+  const req = r(path.join(dir, 'queue', 'file-decompose-requests', reqs[0]));
+  const hubFile = path.join(dir, 'queue', 'coordinating', `file-decompose-hub-${req.id}.json`);
+  const hub = r(hubFile);
+  assert.equal(hub.parentHub, 'hub-original', 'fallback should stamp parentHub from the scanned coordinating parent');
+});
+
 test('sweep: a decompose-loop task NOT about an oversized file is left alone (human keeps the flag)', async () => {
   const dir = tmpPipeline();
   w(dir, 'needs-clarification', STUCK(false));

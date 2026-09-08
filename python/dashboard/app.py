@@ -1125,6 +1125,10 @@ def task_summary(data: dict, filename: str) -> dict:
         # (a child stuck in needs-clarification/blocked, or a sibling waiting on one). The
         # Coordinating row shows ⛔ + the reason instead of the plain progress count.
         "coordinatorBlocked": data.get("coordinatorBlocked"),
+        # Owning hub, when this hub itself was spawned from an existing hub's child (see
+        # decompose-loop-autoroute.js / apply-task.js's recordApplyOutcome). api_queue_state
+        # uses this to build the Hub Tasks tab's real family-tree order + hubDepth.
+        "parentHub": data.get("parentHub"),
     }
 
 
@@ -2336,6 +2340,58 @@ def api_queue_state(state):
     limit = request.args.get("limit", type=int)
     offset = request.args.get("offset", default=0, type=int)
     source_filter = (request.args.get("source") or "").strip()
+
+    if state == "coordinating":
+        # Never paginated before ordering -- hub counts are small (same "in-flight, bounded"
+        # reasoning the drafting branch above already uses), and a family tree can only be
+        # built correctly with every hub in hand at once. Builds a parent->children map on
+        # `parentHub` (see decompose-loop-autoroute.js / apply-task.js's recordApplyOutcome)
+        # and walks it pre-order so a child always renders immediately beneath its parent,
+        # tagging `hubDepth` for the frontend's indent -- then pages the flattened result.
+        state_dir = qdir / "coordinating"
+        by_id = {}
+        if state_dir.is_dir():
+            for f in state_dir.glob("*.json"):
+                data = read_json_safe(f)
+                if data and (not source_filter or data.get("source") == source_filter):
+                    by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
+        children_of = {}
+        for tid, entry in by_id.items():
+            parent = entry.get("parentHub")
+            # A dangling/self/foreign parentHub (parent not among today's coordinating
+            # records -- already resolved and moved on, or a cycle) is treated as a root
+            # rather than dropped, so it never silently vanishes from the tab.
+            if parent and parent in by_id and parent != tid:
+                children_of.setdefault(parent, []).append(tid)
+            else:
+                children_of.setdefault(None, []).append(tid)
+        for kids in children_of.values():
+            kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
+
+        ordered = []
+        visited = set()
+
+        def walk(tid, depth):
+            if tid in visited:
+                return
+            visited.add(tid)
+            entry = dict(by_id[tid])
+            entry["hubDepth"] = depth
+            ordered.append(entry)
+            for child_id in children_of.get(tid, []):
+                walk(child_id, depth + 1)
+
+        for root_id in children_of.get(None, []):
+            walk(root_id, 0)
+        # Any hub left unvisited only happens via a parentHub cycle -- append as a root so
+        # it still shows up instead of disappearing.
+        for tid in by_id:
+            if tid not in visited:
+                walk(tid, 0)
+
+        total = len(ordered)
+        page = ordered[offset:offset + limit] if limit is not None else ordered[offset:]
+        return jsonify({"items": page, "total": total})
 
     entries = []
     total = 0

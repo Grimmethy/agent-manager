@@ -414,6 +414,10 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     progress: { done: 0, total: children.length },
     planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
     ...(request.premiumPriority ? { premiumPriority: true } : {}),
+    // parentHub (2026-09-08): propagated from the request the same way premiumPriority is,
+    // above -- set by decompose-loop-autoroute.js when this hub rescues a stuck child of an
+    // existing hub, so the dashboard's Hub Tasks tab can render the real family tree.
+    ...(request.parentHub ? { parentHub: request.parentHub } : {}),
     history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s)${useDetWiring ? ` + deterministic wiring for ${bpMoves.length} blueprint(s)` : ''}${fileWiringChild ? ` + 1 LLM wiring task${useDetWiring ? ` for ${otherMoves.length} non-blueprint move(s)` : ''}` : ''}${stacked ? ` (stacked on ${branch})` : ''}` }],
   };
   if (stacked) {
