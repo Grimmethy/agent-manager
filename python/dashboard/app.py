@@ -1541,17 +1541,49 @@ def api_tasks_completed():
     return jsonify({"tasks": rows, "nextCursor": next_cursor})
 
 
+def _recent_task_ids_for_instance(conn, instance_id, fetch_n):
+    """task_ids most recently associated with instance_id in model_calls, regardless of
+    that call's own outcome column. Deliberately drops the outcome='approved' filter the
+    original query used (2026-09-08, Grimmethy: "Worker-1 and Worker-reasoning have the
+    same problem. All task history information is stale.") -- root-caused live the same
+    way as the reviewer branch above, but through a different mechanism: outcome/
+    outcome_stage are ONLY populated on a call's row when review-task.js's
+    recordModelOutcome actually runs against it, which happens for a reviewed
+    approve/reject verdict -- a draft that resolves as a no-op/stale-task short-circuit,
+    a needs-clarification block, or any other non-reviewed terminal path leaves those
+    columns NULL forever on that call's row, even though the task itself did reach a
+    real terminal state. Confirmed directly against the db: worker-1's last
+    outcome='approved' row was from 00:50, but model_calls had real worker-reasoning
+    activity on that same task_id at 05:15-05:16 with outcome IS NULL (its actual
+    resolution was a stale-task no-op, not a review). instance_id itself IS reliable
+    unconditionally -- every real call stamps it via AGENT_MANAGER_INSTANCE_ID at call
+    time (model-stats-client.js:96) -- so it stays the attribution source of truth here;
+    only the outcome/title/completedAt need to come from the task's own real record
+    instead of this table's outcome columns (see the caller's lookup loop)."""
+    rows = conn.execute("""
+        SELECT task_id, MAX(started_at) AS at
+        FROM model_calls
+        WHERE instance_id = ?
+        GROUP BY task_id
+        ORDER BY at DESC
+        LIMIT ?
+    """, (instance_id, fetch_n)).fetchall()
+    return [t for t, _ in rows]
+
+
 @app.route("/api/instances/<instance_id>/recent-tasks")
 def api_instance_recent_tasks(instance_id):
     """Last 10 tasks a given instance actually completed (2026-08-23, Workers tab:
     "When I click on a worker to expand it's information I'd like to see a list of the
     last 10 tasks it completed."). model_calls is the only place that ties a task_id to
     the instance that drafted it (see model-stats-db.js's own instance_id migration) --
-    'completed' here means outcome='approved' on that instance's own call for the task
-    (review-task.js's recordModelOutcome stamps that onto the drafting instance's own
-    call_id via task.abCallId), same shipped-vs-not distinction the rest of this file's
-    cost tracking already relies on. GROUP BY task_id since a task can carry several calls
-    (retries/revisions) from the same instance; ordered by whichever timestamp is freshest.
+    GROUP BY task_id since a task can carry several calls (retries/revisions) from the
+    same instance. Only instance_id itself is trusted from that table (see
+    _recent_task_ids_for_instance's own header for why its outcome column isn't) -- the
+    real completedAt/outcome/model for each candidate come from the task's own current
+    record via _find_task_record_anywhere, and only task_ids that resolved to an actual
+    terminal state (done / archived / superseded, not still drafting/pending/blocked)
+    count as "completed" here.
 
     reviewer (2026-08-24, Grimmethy: "add reviewer's reviewed tasks too"; rewritten
     2026-09-08 -- "Under reviewer they're all showing approved and 5 hours ago. I don't
@@ -1572,24 +1604,37 @@ def api_instance_recent_tasks(instance_id):
     if instance_id == "reviewer":
         rows, _ = _scan_recently_completed_tasks(10, reviewed_only=True)
         return jsonify({"tasks": [{"taskId": r["taskId"], "completedAt": r["completedAt"], "model": r["model"], "outcome": r["outcome"]} for r in rows]})
+    qdir = queue_dir()
     db_path = model_stats_db_path()
-    if not db_path or not db_path.is_file():
+    if not qdir or not db_path or not db_path.is_file():
         return jsonify({"tasks": []})
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         if not _has_instance_id_column(conn):
             return jsonify({"tasks": []})
-        rows = conn.execute("""
-            SELECT task_id, MAX(COALESCE(outcome_at, started_at)) AS at, MAX(model) AS model
-            FROM model_calls
-            WHERE instance_id = ? AND outcome = 'approved'
-            GROUP BY task_id
-            ORDER BY at DESC
-            LIMIT 10
-        """, (instance_id,)).fetchall()
+        # Over-fetch: several of this instance's most recent calls can land on the same
+        # task_id (retries), or on a task_id that's still in-flight rather than terminal
+        # -- both get filtered out below, so 10 real candidates needs more than 10 raw
+        # rows to draw from.
+        candidate_ids = _recent_task_ids_for_instance(conn, instance_id, 60)
     finally:
         conn.close()
-    return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m} for t, at, m in rows]})
+    results = []
+    for tid in candidate_ids:
+        rec, state = _find_task_record_anywhere(qdir, tid)
+        if not rec or state not in ("done", "archived", "superseded"):
+            continue
+        history = rec.get("history") or []
+        last = history[-1] if history and isinstance(history[-1], dict) else {}
+        results.append({
+            "taskId": tid,
+            "completedAt": last.get("at"),
+            "model": rec.get("draftModel"),
+            "outcome": rec.get("terminalDisposition") or rec.get("status"),
+        })
+        if len(results) >= 10:
+            break
+    return jsonify({"tasks": results})
 
 
 @app.route("/api/instances/<instance_id>/assignable-tasks")
