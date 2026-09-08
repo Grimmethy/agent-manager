@@ -34,6 +34,25 @@ function runGit(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
 }
 
+// 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js, applied via
+// tryDeterministicScriptExtractEdit which reuses this exact capture path): `.trim()`
+// strips a valid `git diff --cached` output's ESSENTIAL trailing newline along with any
+// leading/trailing whitespace, silently corrupting the last hunk of a large multi-symbol
+// move -- confirmed directly: `git apply --check` on the stored rawDiff failed with
+// "corrupt patch at line N", and the raw text's very last byte was the last hunk's final
+// content line with no trailing `\n`, one line short of that hunk's own declared old-line
+// count. A unified diff must end with exactly one trailing newline (or `git` emits an
+// explicit "\ No newline at end of file" marker when the underlying file genuinely lacks
+// one, which `git diff` itself already handles correctly -- this bug was introduced only
+// by re-trimming its already-correct output afterward). Strips incidental leading/
+// trailing whitespace the same way `.trim()` did, but always restores exactly one
+// trailing newline on a non-empty diff; an empty/whitespace-only diff (no net change --
+// see this file's own docstring) still returns `''` unchanged.
+function normalizeDiffOutput(rawDiff) {
+  if (!rawDiff || !rawDiff.trim()) return '';
+  return `${rawDiff.replace(/^\s+/, '').replace(/\s+$/, '')}\n`;
+}
+
 /**
  * Applies a Group-B implementResponse against a throwaway worktree branched off
  * origin/<default branch>, captures the result as a real `git diff`, and always tears the
@@ -65,7 +84,7 @@ function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse,
     applyGroupB({ implementResponse, repoRoot: worktreeDir, pipelineDir });
     runGit(['add', '-A'], worktreeDir);
     const rawDiff = runGit(['diff', '--cached'], worktreeDir);
-    return rawDiff.trim();
+    return normalizeDiffOutput(rawDiff);
   } finally {
     // Best-effort cleanup regardless of outcome -- same reasoning adhoc-agentic-draft.js's
     // own finally block documents (a SIGKILL'd worker skips this, stranding a harmless
@@ -75,4 +94,4 @@ function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse,
   }
 }
 
-module.exports = { captureGroupBDiffInWorktree };
+module.exports = { captureGroupBDiffInWorktree, normalizeDiffOutput };
