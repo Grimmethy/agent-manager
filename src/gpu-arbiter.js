@@ -16,7 +16,7 @@
 //   3. ONE VIEW. status() reads every ticket -> who holds, who waits, per class. The
 //      dashboard reads this instead of stitching .model-locks + heartbeats + pidfiles.
 //
-// Tickets are files under <instancesDir>/.gpu-tickets<.model>/ -- same filesystem-durable
+// Tickets are files under <instancesDir>/.gpu-tickets<.key>/ -- same filesystem-durable
 // discipline as queue/ and instances/. A ticket is <seq-ms>.<pid>.<rand>.json holding
 // { pid, cls, taskId, phase, startedAt, holding, cancelRequested }, re-touched by its
 // owner every REFRESH_MS; one not refreshed within TICKET_STALE_MS (or whose pid is gone)
@@ -25,6 +25,24 @@
 // Retires: single-flight-lock.js's .discuss-waiting marker protocol + AGENT_MANAGER_
 // PRIORITY_HOLDER, the FIFO-ticket duplication in agent-manager-common.sh /
 // single_flight_lock.py, and the body of _preempt_pipeline_for_chat.
+//
+// lockKey vs model (2026-09-08, Grimmethy: "fix worker-1" -- root-caused live: worker-1's
+// qwen2.5:3b calls hit OLLAMA_TIMEOUT dozens of times in a row while worker-reasoning's
+// qwen3.8:27b-q4_K_M generated concurrently on the SAME physical GPU, 96% util). Every
+// ticket/lock function below defaults its serialization key to `model` -- deliberate,
+// 2026-08-25 (see single-flight-lock.js's own header): two DIFFERENT models were made to
+// stop serializing against each other at all, on the assumption that once both fit in
+// resident VRAM (OLLAMA_MAX_LOADED_MODELS=2) they don't meaningfully contend. Confirmed
+// FALSE under real sustained load: concurrent generation on one physical GPU is COMPUTE-
+// bound, not just VRAM-bound, and a light model can be starved into hard timeouts by a
+// heavy one regardless of which two models they are. `lockKey`, when a caller passes it,
+// overrides `model` as the actual serialization key while `model` is still stored/shown
+// as ticket metadata -- local-draft.js's two draft-class call sites now pass the resolved
+// Ollama ENDPOINT (OLLAMA_URL) as lockKey, so any two local models sharing that one
+// endpoint correctly serialize against each other again, while a call to a genuinely
+// separate endpoint (e.g. the P40 VM's AGENT_MANAGER_P40_OLLAMA_URL) still runs fully
+// independently, unaffected. Every caller that omits lockKey keeps today's per-model
+// behavior unchanged (interactive chat, holdPlace, the CLI's cancel-below/status).
 
 const fs = require('fs');
 const path = require('path');
@@ -81,14 +99,16 @@ function classRank(cls) {
 }
 
 // Same key-suffix scheme single-flight-lock.js uses, so the ticket dir and the lockfile
-// for a given model name stay side by side and consistently named.
-function keySuffix(model) {
-  if (!model) return '';
-  return '.' + String(model).replace(/[^A-Za-z0-9._-]+/g, '_');
+// for a given key stay side by side and consistently named. `key` is the resolved
+// serialization key (lockKey when a caller passes one, else the bare model name -- see
+// this file's own header for why those can now differ).
+function keySuffix(key) {
+  if (!key) return '';
+  return '.' + String(key).replace(/[^A-Za-z0-9._-]+/g, '_');
 }
 
-function ticketsDir(instancesDir, model) {
-  return path.join(instancesDir, TICKETS_DIRNAME + keySuffix(model));
+function ticketsDir(instancesDir, key) {
+  return path.join(instancesDir, TICKETS_DIRNAME + keySuffix(key));
 }
 
 function pidAlive(pid) {
@@ -115,11 +135,11 @@ function writeTicketAtomic(fp, data) {
   fs.renameSync(tmp, fp);
 }
 
-// Every live ticket for this model (fresh mtime + live pid), oldest seq first. Sweeps the
+// Every live ticket for this key (fresh mtime + live pid), oldest seq first. Sweeps the
 // abandoned ones it passes -- any reader keeps the dir clean, same as
 // single-flight-lock.js's sweepStaleTickets.
-function liveTickets(instancesDir, model) {
-  const dir = ticketsDir(instancesDir, model);
+function liveTickets(instancesDir, key) {
+  const dir = ticketsDir(instancesDir, key);
   let names;
   try { names = fs.readdirSync(dir); } catch { return []; }
   const now = Date.now();
@@ -172,8 +192,11 @@ function sleepSync(ms) {
 // The caller MUST call handle.release() (use withGpu() to make that automatic). While
 // holding, a background interval re-touches the ticket and, if cancelRequested lands,
 // invokes onCancel() exactly once -- the caller wires that to abort its model call.
-function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phase = null, onCancel = null } = {}) {
-  const dir = ticketsDir(instancesDir, model);
+function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = null, phase = null, onCancel = null } = {}) {
+  // lockKey overrides model as the actual serialization key when a caller passes one
+  // (see this file's own header) -- model is still carried on the ticket as metadata.
+  const key = lockKey || model;
+  const dir = ticketsDir(instancesDir, key);
   fs.mkdirSync(dir, { recursive: true });
 
   const myRank = classRank(cls);
@@ -183,16 +206,16 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phas
   const mySeqNum = Number(seq);
 
   writeTicketAtomic(fp, {
-    pid: process.pid, cls, taskId, phase,
+    pid: process.pid, cls, taskId, phase, model,
     startedAt: nowIso(), holding: false, cancelRequested: false,
   });
 
   // If this pid already holds a place ticket (holdPlace) of equal-or-higher priority for
-  // this model, FIFO position is already reserved -- an inner per-turn acquire must not
+  // this key, FIFO position is already reserved -- an inner per-turn acquire must not
   // re-queue behind peers that arrived AFTER the place (that would deadlock: the place
   // blocks those peers, and those peers would block this turn). Skip the wait loop; the
   // real flock still serialises the actual model call.
-  const holdsPlace = liveTickets(instancesDir, model).some(
+  const holdsPlace = liveTickets(instancesDir, key).some(
     (t) => t.pid === process.pid && t.place && classRank(t.cls) <= myRank,
   );
 
@@ -203,14 +226,14 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phas
       if (holdsPlace) break;
       if (Date.now() >= deadline) {
         safeUnlink(fp);
-        throw new Error(`gpu-arbiter: '${cls}' ticket for model '${model || '(default)'}' timed out waiting to reach the head of the queue`);
+        throw new Error(`gpu-arbiter: '${cls}' ticket for '${key || '(default)'}' timed out waiting to reach the head of the queue`);
       }
       touch(fp);
-      const tickets = liveTickets(instancesDir, model);
+      const tickets = liveTickets(instancesDir, key);
       const mine = tickets.find((t) => t._name === name);
       if (!mine) {
         // our ticket was swept (we were too slow to re-touch, or a clock jump) -- re-add.
-        writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, startedAt: nowIso(), holding: false, cancelRequested: false });
+        writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false });
         continue;
       }
       if (mine.cancelRequested) {
@@ -239,7 +262,7 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, taskId = null, phas
   const compat = interactiveCompatMarker(instancesDir, cls);
   let flockHandle;
   try {
-    flockHandle = sfl.acquire(instancesDir, model, { skipPriorityBackoff: true });
+    flockHandle = sfl.acquire(instancesDir, key, { skipPriorityBackoff: true });
   } catch (err) {
     compat.remove();
     safeUnlink(fp);
@@ -294,13 +317,14 @@ async function withGpu(instancesDir, opts, fn) {
 // (earlierPeer only counts a LOWER seq, and this outer ticket has a lower seq, so...) --
 // handled explicitly: an acquire() whose pid already owns an equal-or-higher-priority
 // ticket skips the earlier-peer check for that ticket.
-function holdPlace(instancesDir, { cls = 'interactive', model, taskId = null, phase = 'session' } = {}) {
-  const dir = ticketsDir(instancesDir, model);
+function holdPlace(instancesDir, { cls = 'interactive', model, lockKey, taskId = null, phase = 'session' } = {}) {
+  const key = lockKey || model;
+  const dir = ticketsDir(instancesDir, key);
   fs.mkdirSync(dir, { recursive: true });
   const seq = String(Date.now()).padStart(16, '0');
   const name = `${seq}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.hold.json`;
   const fp = path.join(dir, name);
-  writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, startedAt: nowIso(), holding: false, cancelRequested: false, place: true });
+  writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false, place: true });
   const compat = interactiveCompatMarker(instancesDir, cls);
   const iv = setInterval(() => { touch(fp); compat.refresh(); }, REFRESH_MS);
   if (typeof iv.unref === 'function') iv.unref();
@@ -344,9 +368,9 @@ function status(instancesDir, model) {
   const holder = tickets.find((t) => t.holding) || null;
   const waiting = tickets
     .filter((t) => !t.holding && !t.place)
-    .map((t) => ({ cls: t.cls, pid: t.pid, taskId: t.taskId, phase: t.phase, seq: t._seq }));
+    .map((t) => ({ cls: t.cls, pid: t.pid, taskId: t.taskId, phase: t.phase, model: t.model, seq: t._seq }));
   return {
-    holder: holder ? { cls: holder.cls, pid: holder.pid, taskId: holder.taskId, phase: holder.phase, startedAt: holder.startedAt } : null,
+    holder: holder ? { cls: holder.cls, pid: holder.pid, taskId: holder.taskId, phase: holder.phase, model: holder.model, startedAt: holder.startedAt } : null,
     waiting,
   };
 }
