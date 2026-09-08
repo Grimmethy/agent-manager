@@ -80,6 +80,45 @@ test('legacy mode: hub + one child per move + a wiring task gated on every move'
   assert.equal(wiring.promptContext.decomposedFrom, hub.id);
 });
 
+// 2026-09-08, Grimmethy: "any time a hub process that is set to premium priority
+// generates a new child, that child should be set to premium priority as well. I've had
+// to manually set premium on the last 2 children of decompose."
+test('premiumPriority on the request propagates to every move child, the wiring child, and the hub itself', () => {
+  const dir = tmpRepo();
+  const reqPath = path.join(dir, 'queue', 'file-decompose-requests', 'p.json');
+  fs.writeFileSync(reqPath, JSON.stringify({ ...PLAN, premiumPriority: true }));
+
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'false' }, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  for (const name of adhoc) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', name), 'utf8'));
+    assert.equal(rec.premiumPriority, true, `${name} should have inherited premiumPriority`);
+  }
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.premiumPriority, true, 'the hub itself should also carry premiumPriority');
+});
+
+test('no premiumPriority on the request -- no child or hub gets the field at all (not even false)', () => {
+  const dir = tmpRepo();
+  const reqPath = path.join(dir, 'queue', 'file-decompose-requests', 'p.json');
+  fs.writeFileSync(reqPath, JSON.stringify(PLAN));
+
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'false' }, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  for (const name of adhoc) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', name), 'utf8'));
+    assert.equal(Object.prototype.hasOwnProperty.call(rec, 'premiumPriority'), false, `${name} should have no premiumPriority key at all`);
+  }
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(Object.prototype.hasOwnProperty.call(hub, 'premiumPriority'), false);
+});
+
 // --- stacked model -------------------------------------------------------------------
 
 test('stacked mode + LLM wiring child (det-wiring off): one shared branch, sequential dependsOn chain, atomic children', () => {

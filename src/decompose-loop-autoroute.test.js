@@ -104,6 +104,57 @@ test('sweep: a decompose-loop task on an oversized file gets a file-decompose re
   assert.equal(moved.status, 'pending');
 });
 
+// 2026-09-08, Grimmethy: "any time a hub process that is set to premium priority
+// generates a new child, that child should be set to premium priority as well. I've had
+// to manually set premium on the last 2 children of decompose."
+test('sweep: premiumPriority on the stuck task carries onto the request AND the rerouted parent', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', { ...STUCK(), premiumPriority: true });
+
+  const call = async () => ({
+    response: JSON.stringify([
+      { newFile: 'python/dashboard/templates/static/js/job-list.js', kind: 'script-extract', symbols: ['renderJobListTab', 'renderJobRow'] },
+      { newFile: 'python/dashboard/templates/static/js/job-groups.js', kind: 'script-extract', symbols: ['renderGroupRow', 'toggleGroup'] },
+    ]),
+  });
+  fs.mkdirSync(path.join(dir, 'python/dashboard/templates'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
+    '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
+
+  await sweep({ pipelineDir: dir, repoRoot: dir, call });
+
+  const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
+  const req = r(path.join(dir, 'queue', 'file-decompose-requests', reqs[0]));
+  assert.equal(req.premiumPriority, true, 'the auto-authored request should carry premiumPriority forward');
+
+  const moved = r(path.join(dir, 'queue', 'pending', `${STUCK().id}.json`));
+  assert.equal(moved.premiumPriority, true, 'the rerouted parent task should keep its own premiumPriority too');
+});
+
+test('sweep: no premiumPriority on the stuck task -- neither the request nor the rerouted parent gets the field', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', STUCK());
+
+  const call = async () => ({
+    response: JSON.stringify([
+      { newFile: 'python/dashboard/templates/static/js/job-list.js', kind: 'script-extract', symbols: ['renderJobListTab', 'renderJobRow'] },
+      { newFile: 'python/dashboard/templates/static/js/job-groups.js', kind: 'script-extract', symbols: ['renderGroupRow', 'toggleGroup'] },
+    ]),
+  });
+  fs.mkdirSync(path.join(dir, 'python/dashboard/templates'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
+    '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
+
+  await sweep({ pipelineDir: dir, repoRoot: dir, call });
+
+  const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
+  const req = r(path.join(dir, 'queue', 'file-decompose-requests', reqs[0]));
+  assert.equal(Object.prototype.hasOwnProperty.call(req, 'premiumPriority'), false);
+
+  const moved = r(path.join(dir, 'queue', 'pending', `${STUCK().id}.json`));
+  assert.equal(Object.prototype.hasOwnProperty.call(moved, 'premiumPriority'), false);
+});
+
 test('sweep: a decompose-loop task NOT about an oversized file is left alone (human keeps the flag)', async () => {
   const dir = tmpPipeline();
   w(dir, 'needs-clarification', STUCK(false));
