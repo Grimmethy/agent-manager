@@ -828,15 +828,14 @@ function renderConceptCard(concept) {
     ? `<button class="secondary" data-reopen-concept="${escapeAttr(concept.id)}">Reopen</button>`
     : `<button class="secondary" data-shelve-concept="${escapeAttr(concept.id)}">Shelve</button>
        <button class="secondary" data-ship-concept="${escapeAttr(concept.id)}">Ship</button>`;
-  // kind:'reference' (2026-09-08, Grimmethy: "a blank template that can be viewed in the
-  // concepts tab" -- see src/concepts.js's own createConcept() comment): a reference/
-  // template document, not a narrative finding -- rendered with real headers/lists via
-  // renderReportMarkdown() (analytics-and-discovery.js, already loaded on this page for
-  // the unrelated Reports tab) instead of the bare escaped one-line <span> every other
-  // concept still gets. Every concept without this kind is completely unaffected.
-  const descriptionHtml = concept.kind === 'reference'
-    ? `<div class="row meta" style="display:block">${renderReportMarkdown(concept.description || '')}</div>`
-    : `<div class="row meta"><span>${escapeHtml(concept.description || '')}</span></div>`;
+  // 2026-09-08, Grimmethy: "the concept entry isn't very readable, we need proper
+  // paragraphs and line breaks in all concept entries" -- every concept's description now
+  // renders through renderReportMarkdown() (analytics-and-discovery.js, already loaded on
+  // this page for the unrelated Reports tab: #/## headers, - lists, **bold**, blank-line
+  // paragraphs), not just kind:'reference' docs. A plain narrative description with no
+  // markdown syntax at all just becomes normal wrapped <p> paragraphs -- strictly more
+  // readable than the old single-line escaped <span> every concept used to get, never less.
+  const descriptionHtml = `<div class="row meta" style="display:block">${renderReportMarkdown(concept.description || '')}</div>`;
   return `
     <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
       <div class="row">
