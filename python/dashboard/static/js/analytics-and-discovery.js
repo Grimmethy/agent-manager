@@ -755,14 +755,21 @@ function renderReportMarkdown(md) {
   let html = '';
   let inList = false;
   let para = null;
-  const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+  let li = null; // accumulates one list item's text, including hard-wrapped continuation lines
+  const closeLi = () => { if (li !== null) { html += `<li>${li}</li>`; li = null; } };
+  const closeList = () => { closeLi(); if (inList) { html += '</ul>'; inList = false; } };
   const closePara = () => { if (para !== null) { html += `<p>${para}</p>`; para = null; } };
   const inline = (s) => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   for (const line of lines) {
     if (line.startsWith('## ')) { closePara(); closeList(); html += `<h3>${inline(line.slice(3))}</h3>`; }
     else if (line.startsWith('# ')) { closePara(); closeList(); html += `<h2>${inline(line.slice(2))}</h2>`; }
-    else if (line.startsWith('- ')) { closePara(); if (!inList) { html += '<ul>'; inList = true; } html += `<li>${inline(line.slice(2))}</li>`; }
+    else if (line.startsWith('- ')) { closePara(); closeLi(); if (!inList) { html += '<ul>'; inList = true; } li = inline(line.slice(2)); }
     else if (line.trim() === '') { closePara(); closeList(); }
+    // A hard-wrapped continuation line of the CURRENT list item (e.g. a source line
+    // starting with leading spaces right after a `- ` line) stays part of that bullet,
+    // not a new paragraph -- same "only break between paragraphs, headers, and bullets"
+    // rule this whole function exists to enforce.
+    else if (inList && li !== null) { li = `${li} ${inline(line.trim())}`; }
     else { closeList(); para = para === null ? inline(line) : `${para} ${inline(line)}`; }
   }
   closePara();
