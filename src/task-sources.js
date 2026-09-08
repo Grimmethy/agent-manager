@@ -343,6 +343,17 @@ function nextAdhocTask() {
   // worker lanes were saturated with older, unrelated brain-dump tasks that happened to
   // have earlier mtimes.) Parsed once here and carried through to the loop below instead
   // of re-reading each file twice.
+  //
+  // `premiumPriority` checked FIRST, ahead of the decompose-child bump (2026-09-08,
+  // Grimmethy: "I just watched 2 tasks get picked instead of the target" -- root-caused
+  // live: this sort never looked at premiumPriority at all, only atomic/mtime, so the
+  // operator-set "keep this at the front of the WHOLE queue" flag
+  // (next-claimable-task.js's own header comment on the field, and its
+  // `if (task.premiumPriority) return -Infinity` in the OTHER selection path used by the
+  // dashboard/dropdown) was silently inert on the actual automatic claim path every
+  // worker tick calls. Confirmed live: `nextAdhocTask()` returned a plain, non-premium
+  // brain-dump task while a premiumPriority-stamped decompose child with zero unmet
+  // dependencies sat unclaimed in the same directory.
   const files = entries
     .filter((e) => e.isFile() && e.name.endsWith('.json'))
     .map((e) => {
@@ -350,11 +361,13 @@ function nextAdhocTask() {
       const mtime = fs.statSync(full).mtimeMs;
       let parsed = null;
       try { parsed = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { /* handled below via null parsed */ }
-      return { full, mtime, parsed, isDecomposeChild: !!(parsed && parsed.atomic) };
+      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isDecomposeChild: !!(parsed && parsed.atomic) };
     })
-    .sort((a, b) => (a.isDecomposeChild === b.isDecomposeChild
-      ? a.mtime - b.mtime
-      : (a.isDecomposeChild ? -1 : 1)));
+    .sort((a, b) => {
+      if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
+      if (a.isDecomposeChild !== b.isDecomposeChild) return a.isDecomposeChild ? -1 : 1;
+      return a.mtime - b.mtime;
+    });
 
   for (const f of files) {
     const parsed = f.parsed;
