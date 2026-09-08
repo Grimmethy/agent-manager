@@ -1,11 +1,14 @@
 'use strict';
 
 // Unit tests for fact-check-gate-audit.js -- the "close the loop" sweep for
-// review-task.js's fact-check-audit.log (2026-09-08, Second Brain [[dspy]] research
-// applied). See that file's own header for the full incident: this session found 4
-// confirmed false positives against fact-checker.js's own "high-precision, almost never
+// review-task.js's fact-check hard-block logging (2026-09-08, Second Brain [[dspy]]
+// research applied). See that file's own header for the full incident: this session found
+// 4 confirmed false positives against fact-checker.js's own "high-precision, almost never
 // a false positive" claim, discovered only by manually joining every historical
 // hard-block against its real eventual outcome by hand. This sweep automates that join.
+// Reads pipeline-history.js's unified instances/pipeline-history.log (type:'fact-check-
+// block') -- see that module's own header for why the 4 separately-invented per-class log
+// files were consolidated.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -25,12 +28,14 @@ function writeTask(pipelineDir, relDir, id, data = {}) {
   fs.writeFileSync(path.join(full, `${id}.json`), JSON.stringify({ id, ...data }));
 }
 
+// Defaults each entry to type:'fact-check-block' (production's logFactCheckAudit always
+// stamps this) unless a test explicitly wants to exercise a different/missing type.
 function writeAuditLog(pipelineDir, entries) {
   const dir = path.join(pipelineDir, 'instances');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
-    path.join(dir, 'fact-check-audit.log'),
-    entries.map((e) => JSON.stringify(e)).join('\n') + '\n',
+    path.join(dir, 'pipeline-history.log'),
+    entries.map((e) => JSON.stringify({ type: 'fact-check-block', ...e })).join('\n') + '\n',
   );
 }
 
@@ -44,7 +49,7 @@ test('readAuditLines skips a malformed line rather than failing the whole read',
   withPipelineDir((dir) => {
     const logDir = path.join(dir, 'instances');
     fs.mkdirSync(logDir, { recursive: true });
-    fs.writeFileSync(path.join(logDir, 'fact-check-audit.log'), '{"taskId":"t1"}\nnot json\n{"taskId":"t2"}\n');
+    fs.writeFileSync(path.join(logDir, 'pipeline-history.log'), '{"type":"fact-check-block","taskId":"t1"}\nnot json\n{"type":"fact-check-block","taskId":"t2"}\n');
     const lines = readAuditLines(dir);
     assert.equal(lines.length, 2);
     assert.equal(lines[0].taskId, 't1');

@@ -1,6 +1,6 @@
 'use strict';
 
-// Closes the loop review-task.js's fact-check-audit.log (2026-09-08) opened: a persistent
+// Closes the loop review-task.js's fact-check hard-block logging opened: a persistent
 // per-hard-block trail was step one, but a log nobody ever reads back against real
 // outcomes is only half of DSPy's own Evaluate pattern (Second Brain [[dspy]] research --
 // dspy.Evaluate returns a real, structured EvaluationResult of (example, prediction,
@@ -23,24 +23,14 @@
 //   (no flags) -- prints the JSON summary to stdout
 //   --report   -- prints a human-readable breakdown to stderr, JSON summary to stdout
 
-const fs = require('fs');
-const path = require('path');
 const { findTaskAnywhere } = require('./task-anywhere.js');
+// 2026-09-08: reads pipeline-history.js's unified log (type:'fact-check-block'), not a
+// dedicated fact-check-audit.log file -- see that module's own header for why the 4
+// separately-invented per-class audit logs were consolidated into one NDJSON stream.
+const { readPipelineHistory } = require('./pipeline-history.js');
 
 function readAuditLines(pipelineDir) {
-  const p = path.join(pipelineDir, 'instances', 'fact-check-audit.log');
-  let raw;
-  try {
-    raw = fs.readFileSync(p, 'utf8');
-  } catch {
-    return [];
-  }
-  const lines = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try { lines.push(JSON.parse(line)); } catch { /* skip a malformed line, don't fail the whole sweep */ }
-  }
-  return lines;
+  return readPipelineHistory(pipelineDir, { type: 'fact-check-block' });
 }
 
 // CLASSIFICATION (presumptive, not authoritative -- see header):
