@@ -1411,6 +1411,27 @@ test('parseCandidateSplit returns invalid:true when mode is "split" but fewer th
   assert.equal(parseCandidateSplit(noCandidatesArray).invalid, true);
 });
 
+// 2026-09-08, root-caused live via the real arch-import-review-ac-4 response: a genuine
+// split attempt whose JSON got truncated mid-response (numPredict exhausted) used to
+// silently return null here -- indistinguishable from "never attempted a split at all" --
+// and fall through as ordinary prose, which fact-checker.js's unrelated ALL-CAPS-field
+// heuristic then flagged as hallucination. See [[dspy-signatures]] Second Brain note.
+test('parseCandidateSplit returns invalid:true (not null) for a genuine split attempt truncated mid-JSON', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  // The real shape: valid JSON up through the first candidate, cut off mid-second-candidate.
+  const truncated = '{"mode":"split","candidates":[{"title":"Add ENDPOINT_MAP","files":"src/model-provider.js","problem":"p","solution":"s","benefits":"b"},{"title":"Add getEndpoint","files":"src/model-provider.js","problem":"p2","solution":"s2","benefits';
+  const result = parseCandidateSplit(truncated);
+  assert.equal(result.invalid, true, 'a recognizable split attempt with broken JSON must be a distinguishable failure, not null');
+  assert.match(result.reason, /truncated or malformed/);
+  assert.match(result.reason, /mode "split"/);
+});
+
+test('parseCandidateSplit still returns null for malformed JSON that is NOT a split attempt (no false positive from the truncation carve-out)', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  assert.equal(parseCandidateSplit('{"mode":"edit","file":"x.js","find":"a truncated'), null);
+  assert.equal(parseCandidateSplit('not json at all, and not truncated JSON either'), null);
+});
+
 test('parseCandidateSplit returns null for anything that is not a split attempt (normal edit/create/delete/empty responses pass through untouched)', () => {
   const { parseCandidateSplit } = require('./local-draft.js');
   assert.equal(parseCandidateSplit(''), null);
@@ -1928,6 +1949,39 @@ test('draftTask retries the implement call once when a candidate-fulfillment sou
   });
 });
 
+// Second Brain [[dspy-refine]] research, 2026-09-08: same diversify-on-retry principle as
+// the plan re-roll above, applied to the implement-retry call site (local-draft.js's own
+// explicitly-named retry path).
+test('draftTask samples the implement-retry call at RETRY_TEMPERATURE, not the first implement attempt\'s temperature', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { RETRY_TEMPERATURE } = require('./local-draft.js');
+    const task = {
+      id: 'obs-fix-test-temp', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-1', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    const temps = [];
+    let callCount = 0;
+    const localCall = async (opts) => {
+      callCount += 1;
+      temps.push(opts.temperature);
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'fabricated text not in file', replace: 'x' }), degenerate: null, attempts: 1 }; // implement, bad find
+      if (callCount === 3) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 }; // retry, good find
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(temps[1], 0.4, 'the first (bad) implement attempt stays at the normal temperature');
+    assert.equal(temps[2], RETRY_TEMPERATURE, 'the implement-retry (a genuine same-input retry) must diversify');
+  });
+});
+
 test('draftTask does not retry a candidate-fulfillment source whose find string verifies correctly the first time', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {
@@ -2421,6 +2475,26 @@ test('runPlanPass (adhoc): a thin first plan is re-rolled once, and a substantiv
     assert.equal(task.lastGoodPlan, PLAN_STUB);
     const planDone = (task.history || []).find((e) => e.stage === 'plan-done');
     assert.match(planDone.detail, /re-rolled once/);
+  });
+});
+
+// Second Brain [[dspy-refine]] research, 2026-09-08: dspy.Refine deliberately samples every
+// retry at temperature=1.0 to avoid attempts collapsing into near-identical repeats. The
+// plan re-roll above is a genuine same-prompt retry (identical planPrompt, second call) --
+// it must diversify, unlike the first attempt.
+test('runPlanPass (adhoc): the plan re-roll samples at RETRY_TEMPERATURE, not the first attempt\'s temperature', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { RETRY_TEMPERATURE } = require('./local-draft.js');
+    const task = { id: 'adhoc-reroll-temp', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    const temps = [];
+    const localCall = async (opts) => {
+      temps.push(opts.temperature);
+      return { response: temps.length === 1 ? '1. lone stub' : PLAN_STUB, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    // temps[0] = thin first plan, temps[1] = the re-roll, temps[2] = the preliminary decompose check.
+    assert.equal(temps[0], 0.4, 'the first attempt stays at the normal temperature');
+    assert.equal(temps[1], RETRY_TEMPERATURE, 'the re-roll (a genuine same-prompt retry) must diversify');
   });
 });
 
