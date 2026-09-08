@@ -1441,6 +1441,106 @@ def api_models_cost_summary():
     })
 
 
+def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
+    """Scans queue/done/'s own top level (mtime-sorted, most-recent-first; NOT the dated
+    queue/done/_archived/<YYYY-MM>/ or _archived_no_action/ buckets -- those hold work
+    already aged out of the "recent" window this is for) for completed tasks, reading
+    each one's own real history/terminalDisposition -- NOT model_calls.
+
+    2026-09-08, Grimmethy: "Under reviewer they're all showing approved and 5 hours ago.
+    I don't think it's updating properly." Root-caused live: model_calls is the ONLY
+    place api_instance_recent_tasks's 'reviewer' branch (below) ever looked, but a
+    deterministic review verdict (deterministic-script-extract-approve,
+    brain_dump_sort's deterministicReviewValidate, and every other deterministic gate
+    this session added/expanded) makes NO real model call at all -- there is nothing for
+    it to record. Confirmed directly against the real db: the single most recent
+    outcome_stage='review' row genuinely was ~4.5 hours old at the moment of the report,
+    because every review in that window happened to be a deterministic one, and the
+    dashboard was accurately reporting a query that has been silently blind to a growing
+    share of real review activity. Reading each task's own history file instead is
+    complete by construction -- it can't miss a review class that hasn't been invented
+    yet either, unlike a query hardcoded to one instrumentation table's own schema.
+
+    Returns (rows, nextCursor). `before_iso`, when given, only returns tasks whose done/
+    FILE mtime is strictly before that timestamp -- the cursor is always derived from the
+    same mtime the scan itself is ordered and filtered by, never from a task's own
+    history 'at' field (which is a free-form value a source can write anything into, and
+    is NOT guaranteed unique or even monotonic across tasks the way file mtime is -- an
+    earlier version of this returned the history-derived completedAt as the cursor while
+    filtering on mtime, two different clocks that could silently disagree and drop or
+    duplicate rows across a page boundary). Stable across concurrent completions between
+    page requests, unlike an offset that would skip/duplicate rows once new tasks land
+    above a previously-fetched page.
+    `reviewed_only` keeps only tasks whose own history actually shows an 'approved' or
+    'blocked' review-stage event (the reviewer card's own definition of "reviewed",
+    mirrored from the model_calls branch below)."""
+    qdir = queue_dir()
+    if not qdir:
+        return [], None
+    done_dir = qdir / "done"
+    if not done_dir.is_dir():
+        return [], None
+    # Rounded to microseconds at the source (not just when formatting the cursor below):
+    # datetime only carries microsecond precision, so a raw st_mtime float compared
+    # against a value that has round-tripped through isoformat()/fromisoformat() can
+    # disagree by sub-microsecond floating-point noise -- enough to make the boundary
+    # row of a page reappear (or vanish) depending on rounding direction. Rounding both
+    # sides to the same precision here makes the later `>=` comparison exact.
+    try:
+        entries = [(e.path, round(e.stat().st_mtime, 6)) for e in os.scandir(done_dir) if e.is_file() and e.name.endswith(".json")]
+    except OSError:
+        return [], None
+    entries.sort(key=lambda e: e[1], reverse=True)
+
+    before_ts = None
+    if before_iso:
+        try:
+            before_ts = round(datetime.fromisoformat(before_iso.replace("Z", "+00:00")).timestamp(), 6)
+        except ValueError:
+            before_ts = None
+
+    results = []
+    next_cursor = None
+    for path, mtime in entries:
+        if before_ts is not None and mtime >= before_ts:
+            continue
+        rec = read_json_safe(Path(path))
+        if not isinstance(rec, dict):
+            continue
+        history = rec.get("history") or []
+        if reviewed_only and not any(isinstance(h, dict) and h.get("stage") in ("approved", "blocked") for h in history):
+            continue
+        last = history[-1] if history and isinstance(history[-1], dict) else {}
+        mtime_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        results.append({
+            "taskId": rec.get("id") or Path(path).stem,
+            "title": rec.get("title"),
+            "source": rec.get("source"),
+            "model": rec.get("draftModel"),
+            "instanceId": rec.get("claimedBy"),
+            "completedAt": last.get("at") or mtime_iso,
+            "outcome": rec.get("terminalDisposition") or rec.get("status"),
+            "reviewProvider": rec.get("reviewProvider"),
+        })
+        if len(results) >= limit:
+            next_cursor = mtime_iso
+            break
+    return results, next_cursor
+
+
+@app.route("/api/tasks/completed")
+def api_tasks_completed():
+    """Global 'all tasks completed' log across every instance, for the Workers tab
+    (2026-09-08, Grimmethy: "an in-app representation of that all tasks completed log
+    under the workers... only loads the most recent 25 tasks until I scroll to the
+    bottom"). Cursor-paginated via _scan_recently_completed_tasks -- see that function's
+    own header for why this reads real task history rather than model_calls."""
+    limit = min(max(request.args.get("limit", 25, type=int) or 25, 1), 100)
+    before = request.args.get("before")
+    rows, next_cursor = _scan_recently_completed_tasks(limit, before_iso=before)
+    return jsonify({"tasks": rows, "nextCursor": next_cursor})
+
+
 @app.route("/api/instances/<instance_id>/recent-tasks")
 def api_instance_recent_tasks(instance_id):
     """Last 10 tasks a given instance actually completed (2026-08-23, Workers tab:
@@ -1453,17 +1553,25 @@ def api_instance_recent_tasks(instance_id):
     cost tracking already relies on. GROUP BY task_id since a task can carry several calls
     (retries/revisions) from the same instance; ordered by whichever timestamp is freshest.
 
-    reviewer (2026-08-24, Grimmethy: "add reviewer's reviewed tasks too") is a special
-    case, not just the branch below with a different verdict word: review-task.js never
-    calls recordCall for its own majorityVote() calls at all, only recordModelOutcome
-    against the DRAFTER's own call_id -- so instance_id='reviewer' never matches a single
-    row in this table, the drafting worker's instance_id does. This deployment only ever
-    runs ONE reviewer instance (dead-process-check.js's restartTargetFor() has no
-    "reviewer-N" concept, unlike worker-N), so outcome_stage='review' alone unambiguously
-    means "the reviewer decided this" regardless of which worker drafted it -- no need to
-    join against instance_id at all for this branch. Includes both verdicts (approved AND
-    rejected both count as "reviewed"), unlike the draft branch below which only counts
-    approved as "completed"."""
+    reviewer (2026-08-24, Grimmethy: "add reviewer's reviewed tasks too"; rewritten
+    2026-09-08 -- "Under reviewer they're all showing approved and 5 hours ago. I don't
+    think it's updating properly") is a special case, not just the branch below with a
+    different verdict word: review-task.js never calls recordCall for its own
+    majorityVote() calls at all, only recordModelOutcome against the DRAFTER's own
+    call_id -- so instance_id='reviewer' never matches a single row in this table at
+    all, model_calls-based or not. Worse, root-caused live: an increasing share of real
+    reviews are now DETERMINISTIC (deterministic-script-extract-approve,
+    brain_dump_sort's deterministicReviewValidate, ...) and make no model call
+    whatsoever -- confirmed directly against the real db, the single most recent
+    outcome_stage='review' row genuinely was ~4.5 hours stale, because every review in
+    that window happened to be one of these. _scan_recently_completed_tasks reads each
+    task's own real history instead, which can't miss a review class that hasn't even
+    been invented yet either. Includes both verdicts (approved AND blocked both count as
+    "reviewed"), unlike the draft branch below which only counts approved as
+    "completed"."""
+    if instance_id == "reviewer":
+        rows, _ = _scan_recently_completed_tasks(10, reviewed_only=True)
+        return jsonify({"tasks": [{"taskId": r["taskId"], "completedAt": r["completedAt"], "model": r["model"], "outcome": r["outcome"]} for r in rows]})
     db_path = model_stats_db_path()
     if not db_path or not db_path.is_file():
         return jsonify({"tasks": []})
@@ -1471,16 +1579,6 @@ def api_instance_recent_tasks(instance_id):
     try:
         if not _has_instance_id_column(conn):
             return jsonify({"tasks": []})
-        if instance_id == "reviewer":
-            rows = conn.execute("""
-                SELECT task_id, MAX(outcome_at) AS at, MAX(model) AS model, MAX(outcome) AS outcome
-                FROM model_calls
-                WHERE outcome_stage = 'review' AND outcome IS NOT NULL
-                GROUP BY task_id
-                ORDER BY at DESC
-                LIMIT 10
-            """).fetchall()
-            return jsonify({"tasks": [{"taskId": t, "completedAt": at, "model": m, "outcome": o} for t, at, m, o in rows]})
         rows = conn.execute("""
             SELECT task_id, MAX(COALESCE(outcome_at, started_at)) AS at, MAX(model) AS model
             FROM model_calls
