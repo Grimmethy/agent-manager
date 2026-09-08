@@ -58,6 +58,49 @@ test('resolveDisposition: applied to a now-gone branch, not on main -> abandoned
   assert.match(out.detail, /work lost/);
 });
 
+// 2026-09-08, Grimmethy: "[a stacked sub-task] says it's abandoned, no hub found... I do
+// see a hub task in unmerged branches" -- root-caused live: a stacked file-decompose
+// sub-task shares ONE real branch (record.stacked.branch, e.g.
+// "agent/decompose-<plan-slug>") across its WHOLE move sequence, never agent/<own id>.
+// Before this fix, step 3's lookup used the sub-task's own id as the branchAhead key
+// unconditionally, which could never match the real (differently-named) branch, so
+// EVERY stacked sub-task fell straight through to the abandoned verdict regardless of
+// whether the branch was actually still open.
+test('resolveDisposition: a stacked sub-task whose real branch is still open -> pending-merge, NOT abandoned', () => {
+  const r = {
+    id: 'adhoc-decompose-plan-01-review-utils-js',
+    stacked: { branch: 'agent/decompose-plan', seq: 1, total: 5 },
+    ...applied('agent/decompose-plan'),
+  };
+  // branchAhead is keyed by the REAL branch name (minus agent/), same as buildShipContext
+  // actually populates it -- NOT by the sub-task's own id.
+  const out = resolveDisposition(r, { ctx: ctx({ branches: { 'decompose-plan': 3 } }) });
+  assert.equal(out.stage, 'pending-merge');
+  assert.match(out.detail, /agent\/decompose-plan/);
+  assert.match(out.detail, /3 commit\(s\) ahead/);
+});
+
+test('resolveDisposition: a stacked sub-task whose real branch is fully merged (not ahead) -> merged', () => {
+  const r = {
+    id: 'adhoc-decompose-plan-02-tasks-js',
+    stacked: { branch: 'agent/decompose-plan', seq: 2, total: 5 },
+    ...applied('agent/decompose-plan'),
+  };
+  const out = resolveDisposition(r, { ctx: ctx({ branches: { 'decompose-plan': 0 } }) });
+  assert.equal(out.stage, 'merged');
+  assert.match(out.detail, /agent\/decompose-plan/);
+});
+
+test('resolveDisposition: a stacked sub-task whose real branch is genuinely gone -> still correctly abandoned', () => {
+  const r = {
+    id: 'adhoc-decompose-plan-03-gone-js',
+    stacked: { branch: 'agent/decompose-plan-gone', seq: 3, total: 5 },
+    ...applied('agent/decompose-plan-gone'),
+  };
+  const out = resolveDisposition(r, { ctx: ctx() }); // no branches in ctx at all -- genuinely gone
+  assert.equal(out.stage, 'abandoned');
+});
+
 test('resolveDisposition: directToMain triage-batch apply detail -> applied-direct', () => {
   const out = resolveDisposition({ id: 'obs-review-1', ...applied('committed to master in a 21-task triage batch') }, { ctx: ctx() });
   assert.equal(out.stage, 'applied-direct');
