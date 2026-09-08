@@ -49,7 +49,10 @@ function preliminaryPrompt(task) {
     'Answer with ONLY a JSON object, nothing else:',
     '{"one_pass": true}',
     'OR',
-    '{"one_pass": false, "subtasks": [{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece -- someone implementing only this must not need the original task"}, ...]}',
+    // 2026-09-08, same length-bound fix as local-agentic-write-draft.js's identical
+    // instruction -- see its own header for the real incident (a decompose response cut
+    // off mid-JSON writing an over-long rawText, blocking the task) this closes.
+    '{"one_pass": false, "subtasks": [{"title": "short imperative title", "rawText": "a 2-4 sentence description of just this piece -- someone implementing only this should not need the original task open, but keep it brief"}, ...]}',
     'Optionally add "after": N to a subtask (N = 0-based index of an EARLIER subtask it cannot start until that one is merged, e.g. it edits a file the earlier one creates).',
     'Give 2 to 6 subtasks when splitting.',
   ].join('\n');
@@ -71,8 +74,8 @@ function postExhaustionPrompt(task, priorInvestigation, priorAttempt, opener) {
     ONE_FILE_RULE,
     '',
     'Answer with ONLY a JSON array, nothing else:',
-    '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
-    'Optionally add "after": N (0-based index of an EARLIER piece it depends on). Give 2 to 6 pieces that together cover the whole task with nothing dropped.',
+    '[{"title": "short imperative title", "rawText": "a 2-4 sentence description of just this piece"}, ...]',
+    'Optionally add "after": N (0-based index of an EARLIER piece it depends on). Give 2 to 6 pieces that together cover the whole task with nothing dropped. Keep each rawText to 2-4 sentences -- with up to 6 pieces, a verbose description per piece risks the whole array getting cut off before it finishes.',
   ].filter(Boolean).join('\n');
 }
 

@@ -740,6 +740,33 @@ test('runPlanWithTools forces a wrap-up turn when the starting prompt alone is a
   });
 });
 
+// 2026-09-08, root-caused live (adhoc-brain-dump-bd-...-fail-empty-implement-passes-for-
+// deep-div-1788812338820): a real reason:'context' forced-summary turn answered
+// RESOLUTION: decompose and got cut off mid-string writing its second sub-task's rawText
+// -- exactly the moment remaining room is tightest is also the moment the old prompt
+// asked for the MOST verbose possible answer. The forced-summary prompt now adds an
+// explicit brevity instruction for reason:'context' specifically (not 'turns', where
+// context room isn't the constraint).
+test('runPlanWithTools forced wrap-up (context reason) tells the model to be concise about decompose sub-tasks', async () => {
+  const summaryTurn = { role: 'assistant', content: 'RESOLUTION: decompose\n[{"title": "a", "rawText": "b"}, {"title": "c", "rawText": "d"}]' };
+  const hugePrompt = 'x'.repeat(100000);
+  await withMockedChat([summaryTurn], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: hugePrompt, maxTurns: 50 });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.match(last.messages[last.messages.length - 1].content, /very little context room left.*CONCISE.*2-3 sentences/is);
+  });
+});
+
+test('runPlanWithTools forced wrap-up (turns reason, not context) does NOT add the context-specific brevity warning', async () => {
+  const summaryTurn = { role: 'assistant', content: 'RESOLUTION: implemented\nDone.' };
+  await withMockedChat([{ role: 'assistant', content: 'still going', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] }, summaryTurn], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'a short prompt', maxTurns: 1, forceSummaryOnCap: true });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /very little context room left/i);
+    assert.match(last.messages[last.messages.length - 1].content, /out of turns/i);
+  });
+});
+
 test('runPlanWithTools does NOT force a wrap-up turn for a normal-sized conversation well under the ceiling', async () => {
   await withMockedChat([{ role: 'assistant', content: 'RESOLUTION: implemented' }], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'a short normal prompt', maxTurns: 10 });

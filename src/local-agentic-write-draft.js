@@ -241,8 +241,17 @@ function buildWriteAgenticPrompt(task) {
     '',
     'If RESOLUTION: no-changes-needed -- follow with a short summary, then an "Already covered:" block: one line per concrete object the request names, as `<object> -- <path>:<symbol>`. If you cannot fill in a real file:symbol for every object, it is NOT no-changes-needed.',
     '',
-    'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, in exactly this shape (a full, self-contained description for each -- someone implementing just that one piece must not need the original task):',
-    '[{"title": "short imperative title", "rawText": "a full, self-contained description of just this piece"}, ...]',
+    // 2026-09-08, root-caused live: a real forced-summary decompose response got cut off
+    // mid-string writing the SECOND sub-task's rawText (no closing quote/brace/bracket),
+    // producing unparseable JSON that blocked the task -- this happens exactly when a
+    // decompose answer is most likely: after the agentic loop has already burned through
+    // most of its context budget, right where "a full, self-contained description ...
+    // must not need the original task" pushes the model toward maximum verbosity with the
+    // least room left to write it in. decomposedFrom already links every sub-task back to
+    // this parent task, so full self-containment was never actually required -- bounding
+    // length here removes the exact tension that caused the truncation.
+    'If RESOLUTION: decompose -- follow it immediately with a JSON array of the sub-tasks, in exactly this shape. Each rawText should tell someone implementing just that piece what to do WITHOUT needing the original task open, but keep it to 2-4 sentences (a short paragraph, not an essay) -- a shorter sub-task that finishes beats a longer one that gets cut off:',
+    '[{"title": "short imperative title", "rawText": "a 2-4 sentence description of just this piece"}, ...]',
     'You MAY add "after": N to a sub-task, where N is the 0-based index of an EARLIER sub-task in this same array, ONLY when the piece genuinely cannot start until that earlier one is merged -- e.g. it edits a file the earlier one creates. Omit "after" for pieces that can proceed independently (the common case).',
     'Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
