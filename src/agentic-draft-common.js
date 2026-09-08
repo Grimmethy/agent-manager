@@ -51,6 +51,22 @@ const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose|ne
 const MAX_AGENTIC_CONTINUATIONS = Number(process.env.AGENT_MANAGER_MAX_AGENTIC_CONTINUATIONS) || 2;
 const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:question|decision)\b|\b(?:ran |run )out of turns\b|\bexhausted (?:my|its|the|this) turn(?: budget)?\b|\bre-?run (?:this|the|it|me)\b|\bfresh pass (?:can|could|will) (?:complete|finish)\b|\bwhat (?:did |does )not(?: yet)? land\b/i;
 
+// 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js): the model's own
+// summary said plainly "not a design question -- a pass-budget overrun," but it neither
+// matched RERUN_NOT_A_QUESTION_RE's wording (worded "not a design question," not "no
+// design question") NOR the structural gate just below (result.forcedSummary was false --
+// the model voluntarily concluded with a clean RESOLUTION line rather than being cut off
+// mid-turn -- and captured zero edits, so the OTHER branch's "capturedDiff truthy"
+// requirement didn't hold either). Two independent misses on the SAME real, legitimate
+// case. Chasing more phrasings is a losing regex arms race (Second Brain
+// [[dspy-signatures]] research: DSPy constrains an output field's vocabulary with
+// Literal[...] rather than inferring meaning from free text after the fact) --
+// BLOCKER_TYPE_RE reads the explicit, fixed-vocabulary `BLOCKER-TYPE:` line
+// local-agentic-write-draft.js's own prompt contract now requires immediately after
+// `RESOLUTION: needs-human-decision`. When present, it is AUTHORITATIVE -- it wins over
+// both regex/structural heuristics below rather than needing to also satisfy them.
+const BLOCKER_TYPE_RE = /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+
 // Finds the FIRST top-level `[...]` array in text by depth-counting brackets (both `[`/`]`
 // and `{`/`}`, since the array's own elements are objects) while skipping over string
 // content -- unlike a plain `/\[[\s\S]*\]/` regex, this can't be dragged past the real
@@ -433,6 +449,41 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   if (resolution === 'needs-human-decision') {
     const capturedDiff = bestEffortDiff();
     const continuations = Number(task.agenticContinuationCount) || 0;
+    const blockerTypeMatch = BLOCKER_TYPE_RE.exec(summary);
+    const blockerType = blockerTypeMatch ? blockerTypeMatch[1].toLowerCase() : null;
+
+    // Authoritative: the model explicitly tagged this BLOCKER-TYPE: budget-exhausted --
+    // skip the phrase/structure heuristics below entirely (they exist only as a fallback
+    // for a response that, for whatever reason, doesn't carry the tag) and route it as a
+    // retryable block regardless of whether partial work landed, since neither of those
+    // heuristics' own structural gates (forcedSummary, capturedDiff) are reliable
+    // predictors of "did the model mean budget exhaustion" -- the tag itself already says.
+    if (blockerType === 'budget-exhausted') {
+      if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+        task.agenticContinuationCount = continuations + 1;
+        task.agenticContinuationNote = summary;
+        task.priorPartialDiff = capturedDiff;
+        task.retryableDraftBlock = true;
+        task.isAgenticContinuation = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+          ...meta,
+          capturedDiff,
+        };
+      }
+      task.turnBudgetExhausted = true;
+      task.retryableDraftBlock = true;
+      task.turnBudgetExhaustedBefore = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted -- explicit, not a real design question, requeued for a clean retry',
+        ...meta,
+        capturedDiff: undefined,
+      };
+    }
 
     // Zero edits, empty worktree, forced final turn, and the summary itself says "re-run
     // me / ran out of turns / no design question": this is turn-budget exhaustion on
@@ -613,4 +664,5 @@ module.exports = {
   agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree,
   runAgenticDraftInWorktree, resolveAgenticDraft,
   summariseInvestigation,
+  BLOCKER_TYPE_RE,
 };
