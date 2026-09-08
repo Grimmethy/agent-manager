@@ -174,6 +174,14 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           fs.writeFileSync(path.join(reqDir, `${requestId}.json`), `${JSON.stringify({
             ...plan,
             note: `Auto-authored by decompose-loop-autoroute for stuck task ${task.id}. ${plan.planPassNote || ''}`,
+            // premiumPriority propagation (2026-09-08, Grimmethy: "any time a hub process
+            // that is set to premium priority generates a new child, that child should be
+            // set to premium priority as well. I've had to manually set premium on the
+            // last 2 children of decompose") -- carried onto the request so fileHub()
+            // (file-decompose-to-hub.js) can stamp it onto every move/wiring child it
+            // files, same propagation apply-adhoc-diff.js's queueSubTasks already does
+            // for a plain RESOLUTION: decompose split.
+            ...(task.premiumPriority ? { premiumPriority: true } : {}),
           }, null, 2)}\n`);
         }
 
@@ -198,6 +206,9 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           dependsOn: [hubId],
           reroutedTo: { kind: 'file-decompose', requestId, hubId, targetFile, at: new Date(now).toISOString() },
           status: 'pending', createdAt: new Date(now).toISOString(),
+          // Same premiumPriority carry-through as the request write above -- this rebuild
+          // used to silently drop it, same bug, one level up (the rerouted PARENT itself).
+          ...(task.premiumPriority ? { premiumPriority: true } : {}),
           history: [...(task.history || []), {
             stage: 'pending',
             at: new Date(now).toISOString(),

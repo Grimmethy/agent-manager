@@ -354,6 +354,12 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
       record.stacked = { branch, seq: i + 1, total: moves.length + wiringChildCount };
       if (prevId) record.dependsOn = [prevId];
     }
+    // premiumPriority propagation (2026-09-08, Grimmethy: "any time a hub process that is
+    // set to premium priority generates a new child, that child should be set to premium
+    // priority as well. I've had to manually set premium on the last 2 children of
+    // decompose") -- same propagation apply-adhoc-diff.js's queueSubTasks already does for
+    // a plain RESOLUTION: decompose split; this hub-based path had no equivalent at all.
+    if (request.premiumPriority) record.premiumPriority = true;
     fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
     children.push({ id, title: record.title, status: 'pending' });
     prevId = id;
@@ -379,6 +385,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
       wiringRecord.noDecompose = true;
       wiringRecord.stacked = { branch, seq: moves.length + 1, total: moves.length + wiringChildCount };
     }
+    if (request.premiumPriority) wiringRecord.premiumPriority = true;
     fs.writeFileSync(path.join(adhocDir, `${wireId}.json`), `${JSON.stringify(wiringRecord, null, 2)}\n`);
     children.push({ id: wireId, title: `wire up ${wiringChildMoves.length} new file(s)`, status: 'pending' });
   }
@@ -396,6 +403,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     subTasks: children,
     progress: { done: 0, total: children.length },
     planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
+    ...(request.premiumPriority ? { premiumPriority: true } : {}),
     history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: filed ${moves.length} move task(s)${useDetWiring ? ` + deterministic wiring for ${bpMoves.length} blueprint(s)` : ''}${fileWiringChild ? ` + 1 LLM wiring task${useDetWiring ? ` for ${otherMoves.length} non-blueprint move(s)` : ''}` : ''}${stacked ? ` (stacked on ${branch})` : ''}` }],
   };
   if (stacked) {
