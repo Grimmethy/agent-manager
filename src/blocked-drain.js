@@ -25,6 +25,7 @@ const path = require('path');
 const { signatureForTask } = require('./pipeline-self-audit.js');
 const { signatureForClarificationTask } = require('./pipeline-forensics.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { classifyRequeue } = require('./requeue-attribution.js');
 
 // Re-derives each stuck task's signature fresh (not by matching on a stored field -- none
 // exists on the tasks that predate the fix that found them) using the SAME categorization
@@ -107,6 +108,12 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
 
       const destPath = path.join(pendingDir, name);
       if (fs.existsSync(destPath)) continue; // already has a pending entry -- don't clobber it
+
+      // Fire-and-forget: requeueBlockedTasksForSignature is synchronous end-to-end (its own
+      // caller, apply-task.js's applyTask, is sync too) -- classification is a best-effort
+      // side write that must never gate or slow down the real requeue.
+      classifyRequeue(data, { reasonHint: signature, requeueWriter: 'blocked-drain', repoRoot: pipelineDir })
+        .catch(() => { /* non-fatal, see requeue-attribution.js's own header */ });
 
       fs.mkdirSync(pendingDir, { recursive: true });
       fs.writeFileSync(destPath, JSON.stringify(fresh, null, 2));

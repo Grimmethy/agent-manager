@@ -1,0 +1,83 @@
+'use strict';
+
+// Unit tests for requeue-attribution-client.js -- mirrors task-links-client.test.js's own
+// exact fixture pattern (real throwaway sqlite db, env override, require.cache reset).
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
+
+function freshDbPath() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'requeue-attribution-client-test-'));
+  return path.join(dir, 'requeue-attribution.db');
+}
+
+function withFreshDb(dbPath, fn) {
+  process.env.AGENT_MANAGER_REQUEUE_ATTRIBUTION_DB_PATH = dbPath;
+  delete require.cache[require.resolve('./requeue-attribution-client.js')];
+  return fn(require('./requeue-attribution-client.js'));
+}
+
+test('recordRequeueCause persists a row with the right shape', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause }) => {
+    recordRequeueCause({ taskId: 't1', signature: 'sig-a', blockedStage: 'implement', requeueWriter: 'context-trim-sweep' });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare('SELECT * FROM requeue_causes WHERE task_id = ?').get('t1');
+    db.close();
+    assert.ok(row);
+    assert.equal(row.signature, 'sig-a');
+    assert.equal(row.blocked_stage, 'implement');
+    assert.equal(row.requeue_writer, 'context-trim-sweep');
+    assert.ok(row.at);
+  });
+});
+
+test('recordRequeueCause is a no-op (never throws) for a malformed payload missing a required field', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause }) => {
+    assert.doesNotThrow(() => recordRequeueCause({ taskId: null, signature: 'sig-a', requeueWriter: 'test' }));
+    assert.doesNotThrow(() => recordRequeueCause({ taskId: 't1', signature: null, requeueWriter: 'test' }));
+    assert.doesNotThrow(() => recordRequeueCause({ taskId: 't1', signature: 'sig-a', requeueWriter: null }));
+  });
+});
+
+test('getBurnRate returns { shortCount, longCount } scoped to the right rolling windows', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause, getBurnRate }) => {
+    recordRequeueCause({ taskId: 't1', signature: 'sig-a', requeueWriter: 'test' });
+    recordRequeueCause({ taskId: 't2', signature: 'sig-a', requeueWriter: 'test' });
+    recordRequeueCause({ taskId: 't3', signature: 'sig-b', requeueWriter: 'test' });
+
+    const now = Date.now();
+    const rateA = getBurnRate('sig-a', { shortWindowMs: 3600_000, longWindowMs: 259_200_000, now });
+    assert.equal(rateA.shortCount, 2);
+    assert.equal(rateA.longCount, 2);
+
+    const rateB = getBurnRate('sig-b', { shortWindowMs: 3600_000, longWindowMs: 259_200_000, now });
+    assert.equal(rateB.shortCount, 1);
+  });
+});
+
+test('getBurnRate returns zero counts (not throw) when the db does not exist yet', () => {
+  const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'requeue-attribution-client-test-')), 'never-created.db');
+  process.env.AGENT_MANAGER_REQUEUE_ATTRIBUTION_DB_PATH = dbPath;
+  delete require.cache[require.resolve('./requeue-attribution-client.js')];
+  const { getBurnRate } = require('./requeue-attribution-client.js');
+  assert.deepEqual(getBurnRate('sig-a', { shortWindowMs: 3600_000, longWindowMs: 259_200_000 }), { shortCount: 0, longCount: 0 });
+});
+
+test('getBurnRate excludes occurrences outside the requested window', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause, getBurnRate }) => {
+    recordRequeueCause({ taskId: 't1', signature: 'sig-old', requeueWriter: 'test' });
+    // A "now" far in the future puts the just-recorded row outside even the long window.
+    const farFuture = Date.now() + 30 * 24 * 60 * 60 * 1000;
+    const rate = getBurnRate('sig-old', { shortWindowMs: 3600_000, longWindowMs: 259_200_000, now: farFuture });
+    assert.equal(rate.shortCount, 0);
+    assert.equal(rate.longCount, 0);
+  });
+});

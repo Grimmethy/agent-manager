@@ -85,6 +85,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
+const { classifyRequeue } = require('./requeue-attribution.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
 // matches auto-confirm-review.js's discipline.
@@ -260,6 +261,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: decompose-loop flag but target is not an oversized file (autoroute declines) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
+              await classifyRequeue(task, { reasonHint: 'bucket-E: decompose-loop, non-oversized target', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
               fs.mkdirSync(adhocDir, { recursive: true });
               fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
               fs.unlinkSync(file);
@@ -300,6 +304,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             task.ncTriageAttempts = attempt;
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: false completion-claim signature (draft asserted something the diff/repo contradicts) -- now caught at draft time by adhoc-diff-sanity.js, clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-D: false completion-claim signature', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
             try {
               fs.mkdirSync(adhocDir, { recursive: true });
               fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
@@ -343,6 +350,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: drafter explicitly disclaimed any design uncertainty (ran out of turn/context budget mid-mechanical-step) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
+              await classifyRequeue(task, { reasonHint: 'bucket-F: turn/context budget exhausted, not a design question', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
               fs.mkdirSync(adhocDir, { recursive: true });
               fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
               fs.unlinkSync(file);
@@ -382,6 +392,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       task.ncTriageAttempts = attempt;
       appendHistoryEvent(task, 'requeued',
         `needs-clarification-triage: degenerate "no prior context" draft (rawText intact) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+      try {
+        await classifyRequeue(task, { reasonHint: 'bucket-A: degenerate draft, no prior context', requeueWriter: 'needs-clarification-triage', repoRoot });
+      } catch { /* classification must never block the real requeue */ }
       try {
         fs.mkdirSync(adhocDir, { recursive: true });
         fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));

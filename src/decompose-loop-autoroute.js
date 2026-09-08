@@ -30,6 +30,7 @@ const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
 const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js');
+const { classifyRequeue } = require('./requeue-attribution.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification'];
 const MIN_RETRY_MS = 6 * 60 * 60 * 1000; // don't re-attempt the plan pass more often than this
@@ -232,6 +233,14 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
             try { fs.writeFileSync(hubFile, `${JSON.stringify(hubRecord, null, 2)}\n`); } catch { /* best-effort */ }
           }
         }
+        try {
+          await classifyRequeue(task, {
+            reasonHint: rerouted.reroutedTo.kind,
+            requeueWriter: 'decompose-loop-autoroute',
+            repoRoot: resolvedRepoRoot,
+            now,
+          });
+        } catch { /* classification must never block the real requeue */ }
         fs.mkdirSync(pendingDir, { recursive: true });
         fs.writeFileSync(path.join(pendingDir, `${task.id}.json`), `${JSON.stringify(rerouted, null, 2)}\n`);
         fs.unlinkSync(file);
