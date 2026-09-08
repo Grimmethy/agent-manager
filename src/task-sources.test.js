@@ -912,6 +912,52 @@ test('nextAdhocTask preserves history and other fields already on the file (not 
   assert.deepEqual(task.promptContext.prefetchedPaths, ['src/foo.js']);
 });
 
+// 2026-09-08, Grimmethy: root-caused live -- a requeued adhoc task's real audit trail
+// (needs-clarification cycles, staleness-flag notes, the requeue reasoning itself) was
+// vanishing the moment it got re-claimed. nextAdhocTask() above correctly preserves
+// history (the test just above proves it) -- but writeTask(), called on EVERY source's
+// next task including adhoc's on the way into queue/pending/, unconditionally reset
+// history to [] and re-stamped createdAt to now, undoing that preservation one call
+// later. These tests exercise the REAL pipeline (nextAdhocTask() -> writeTask()), since
+// writeTask() alone had zero direct test coverage before this -- exactly how a fix one
+// layer down got silently defeated one layer up without anything catching it.
+test('writeTask preserves an already-in-progress adhoc task\'s real history and original createdAt, not just id/title', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'resolved-task.json', {
+    id: 'adhoc-resolved-task-2',
+    title: 'A task that was held for clarification and then resolved',
+    createdAt: '2026-08-19T00:00:00.000Z',
+    history: [
+      { stage: 'created', at: '2026-08-19T00:00:00.000Z', detail: 'manual' },
+      { stage: 'needs-clarification', at: '2026-08-19T00:01:00.000Z' },
+      { stage: 'requeued', at: '2026-08-19T00:02:00.000Z', detail: 'clean-state retry 1/1' },
+    ],
+  });
+
+  const { nextAdhocTask, writeTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  const file = writeTask(task);
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+
+  assert.equal(written.history.length, 3, 'the real history must survive into queue/pending/, not get reset to a single created event');
+  assert.deepEqual(written.history.map((h) => h.stage), ['created', 'needs-clarification', 'requeued']);
+  assert.equal(written.createdAt, '2026-08-19T00:00:00.000Z', 'the task\'s real original createdAt must survive, not get stamped to now');
+});
+
+test('writeTask still gives a genuinely brand-new task (no prior history) a fresh single created event', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'brand-new.json', { id: 'adhoc-brand-new-1', title: 'Never seen before' });
+
+  const { nextAdhocTask, writeTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  const file = writeTask(task);
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+
+  assert.equal(written.history.length, 1);
+  assert.equal(written.history[0].stage, 'created');
+  assert.ok(written.createdAt, 'a brand-new task still gets a real createdAt stamp');
+});
+
 test('nextAdhocTask still force-overrides domain/source/id regardless of what the file itself claims', () => {
   const dir = makeAdhocFixtureRepo();
   writeAdhocFile(dir, 'spoofed.json', {
