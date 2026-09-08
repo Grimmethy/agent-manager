@@ -62,8 +62,15 @@ function resolvePipelineDir() {
 // included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
 // dspy.settings.GLOBAL_HISTORY. Same call signature as before this change; no call site
 // anywhere in this file needed to change.
+// instanceId (2026-09-08, Grimmethy: "I want to see a log of every time an agent is run
+// and the outcome of that run" -- the per-instance Workers-tab run log this feeds needed
+// a way to attribute a FAILED run to the worker that made it, which neither this log nor
+// hard-failure-audit's own entries carried before now; model-stats-client.js's recordCall
+// already stamps the exact same env var onto every SUCCESSFUL call for the identical
+// reason (see its own instanceId comment) -- stamped here in the wrapper, not at each call
+// site, so no future caller of either logger can forget it.
 function logDegenerateAudit(entry) {
-  logPipelineEvent(resolvePipelineDir(), 'degenerate', entry);
+  logPipelineEvent(resolvePipelineDir(), 'degenerate', { ...entry, instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null });
 }
 
 // 2026-09-08, Second Brain [[dspy]] research applied (dspy/utils/exceptions.py's typed
@@ -84,7 +91,7 @@ function logDegenerateAudit(entry) {
 // are different failure classes with different fixes. 2026-09-08: now a thin wrapper over
 // pipeline-history.js's unified writer, same reasoning as logDegenerateAudit above.
 function logHardFailureAudit(entry) {
-  logPipelineEvent(resolvePipelineDir(), 'hard-failure', entry);
+  logPipelineEvent(resolvePipelineDir(), 'hard-failure', { ...entry, instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null });
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
