@@ -27,6 +27,7 @@ const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { isCandidateFulfillmentSource } = require('./local-draft.js');
+const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 
 const FLAG_TTL_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_FLAG_TTL_DAYS || 3) * 24 * 60 * 60 * 1000;
 const KEEP_COOLDOWN_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS || 21) * 24 * 60 * 60 * 1000;
@@ -105,12 +106,18 @@ function writeFlag(filePath, task, evidence, confidence, now) {
 
 // Re-reads one declared file off disk and re-windows it against the task's own candidate
 // body. Best-effort: a deleted/moved file is not an error here, just "no change possible."
-function reAnchorFile(repoRoot, fetched, body) {
+// 2026-09-08: `task`, when given and stacked, re-anchors against the shared stacked
+// branch's own tip instead of whatever's checked out at repoRoot -- otherwise a stacked
+// task's re-anchor pass judges its own already-fixed content against the wrong branch's
+// (stale, main's) version. null for any non-stacked task, so behavior there is unchanged.
+function reAnchorFile(repoRoot, fetched, body, task) {
   if (!fetched || !fetched.path) return null;
   try {
     const full = path.resolve(repoRoot, fetched.path);
     if (full !== path.resolve(repoRoot) && !full.startsWith(path.resolve(repoRoot) + path.sep)) return null;
-    const content = fs.readFileSync(full, 'utf8');
+    const groundingRef = task ? resolveGroundingRef(task, repoRoot) : null;
+    let content = groundingRef ? readFileAtRef(repoRoot, groundingRef, fetched.path) : null;
+    if (content === null) content = fs.readFileSync(full, 'utf8');
     const windowed = windowFetchedFileContent(content, body);
     return { fetched, windowed };
   } catch {
@@ -181,7 +188,7 @@ async function sweep({ pipelineDir, repoRoot, dryRun = false, now = Date.now() }
       const newFetchedByPath = new Map();
       let anyStrong = false;
       for (const entry of declared) {
-        const result = reAnchorFile(repoRoot, entry, body);
+        const result = reAnchorFile(repoRoot, entry, body, task);
         if (!result) continue;
         const { windowed } = result;
         if (windowed.confidence === 'strong') anyStrong = true;
@@ -264,7 +271,7 @@ async function sweep({ pipelineDir, repoRoot, dryRun = false, now = Date.now() }
   return summary;
 }
 
-module.exports = { sweep, FLAG_TTL_MS, KEEP_COOLDOWN_MS, MAX_REQUEUES };
+module.exports = { sweep, FLAG_TTL_MS, KEEP_COOLDOWN_MS, MAX_REQUEUES, reAnchorFile };
 
 // --- CLI --------------------------------------------------------------------------
 if (require.main === module) {

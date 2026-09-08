@@ -616,3 +616,56 @@ test('checkDraft: a genuinely absent file is still flagged missing-file', () => 
   const fc = checkDraft('See totally-made-up.py for the implementation.', repoRoot, undefined, ['server']);
   assert.ok(fc.flags.some((f) => f.type === 'missing-file' && f.detail === 'totally-made-up.py'));
 });
+
+// existsLiterallyInRepo / checkGroundedValues: stacked-branch ref (2026-09-08 incident) ---
+// A stacked task correctly citing a sibling's real, committed-but-unmerged value used to be
+// hard-blocked ("cites a value that appears nowhere in its real grounding source") because
+// existsLiterallyInRepo's git grep ran against the plain WORKING TREE (main), never the
+// shared stacked branch the value actually lives on. `ref` (new optional arg, threaded from
+// review-task.js's resolveGroundingRef) reads via the stacked ref's own tree instead.
+
+function makeGitRepoWithOrigin() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-stacked-origin-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-stacked-repo-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, dir]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'test');
+  execFileSync('git', ['add', 'README.md'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: dir });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: dir });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-family'], { cwd: dir });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'sibling.js'), 'const SIBLING_ONLY_FIELD = 1;\n');
+  execFileSync('git', ['add', 'src/sibling.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling commit'], { cwd: dir });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-family'], { cwd: dir });
+  execFileSync('git', ['checkout', 'main'], { cwd: dir });
+
+  return { dir };
+}
+
+test('checkGroundedValues does NOT flag a field that exists only on the given stacked ref', () => {
+  const { dir } = makeGitRepoWithOrigin();
+  const draftText = 'Wire this through SIBLING_ONLY_FIELD, already added by the sibling move task.';
+  const sourceText = 'unrelated grounding material that never mentions this field';
+
+  const flagsWithRef = checkGroundedValues(draftText, sourceText, dir, 'agent/stacked-family');
+  assert.deepEqual(flagsWithRef, [], 'a value real on the stacked branch must not be flagged ungrounded');
+
+  const flagsWithoutRef = checkGroundedValues(draftText, sourceText, dir);
+  assert.deepEqual(flagsWithoutRef, [{ type: 'ungrounded-field', detail: 'SIBLING_ONLY_FIELD' }],
+    'without a ref (a non-stacked task), the same value is still correctly flagged -- proves this is not a blanket loosening of the gate');
+});
+
+test('checkDraft threads a ref through to still flag a genuinely fabricated field even when a ref is given', () => {
+  const { dir } = makeGitRepoWithOrigin();
+  const draftText = 'This relies on TOTALLY_MADE_UP_FIELD being set.';
+  const sourceText = 'grounding material with no mention of this field';
+
+  const fc = checkDraft(draftText, dir, sourceText, [], 'agent/stacked-family');
+  assert.ok(fc.flags.some((f) => f.type === 'ungrounded-field' && f.detail === 'TOTALLY_MADE_UP_FIELD'),
+    'a value that is fabricated everywhere, including on the stacked branch, must still be flagged');
+});

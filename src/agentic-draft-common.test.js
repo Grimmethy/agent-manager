@@ -15,6 +15,7 @@ const { execFileSync } = require('child_process');
 const {
   parseSubTaskProposals, parseClarificationOptions, priorRejectionBlock,
   RESOLUTION_RE, resolveAgenticDraft, prepareAdhocWorktree, agenticWorktreePaths,
+  runAgenticDraftInWorktree,
 } = require('./agentic-draft-common.js');
 
 test('parseSubTaskProposals pulls a 2+ {title,rawText} array out of surrounding prose', () => {
@@ -683,6 +684,73 @@ test('prepareAdhocWorktree succeeds again for the same task id after its working
     const second = prepareAdhocWorktree(repoDir, 'main', worktreeDir, branchName);
     assert.equal(second.ok, true, `expected recovery, got: ${second.reason}`);
     assert.ok(fs.existsSync(worktreeDir), 'the recovered worktree directory should actually exist');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+// --- runAgenticDraftInWorktree: stacked-branch worktree base (2026-09-08 incident) ---
+
+// A sibling task's commit lives ONLY on the shared stacked branch, never merged to main --
+// the exact shape of the live incident (a wiring task's worktree used to be built from
+// origin/<mainBranch>, so it could never see it).
+function makeStackedRepoWithSiblingCommit() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-stacked-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-stacked-repo-'));
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+  g(['init', '--bare', '-b', 'main'], bareDir);
+  g(['clone', bareDir, repoDir]);
+  g(['config', 'user.email', 't@t'], repoDir);
+  g(['config', 'user.name', 't'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'a.txt'), 'v1\n');
+  g(['add', '-A'], repoDir);
+  g(['commit', '-qm', 'init'], repoDir);
+  g(['push', 'origin', 'main'], repoDir);
+
+  g(['checkout', '-b', 'agent/stacked-family'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'sibling-new-file.js'), 'module.exports = {};\n');
+  g(['add', '-A'], repoDir);
+  g(['commit', '-qm', 'sibling commit'], repoDir);
+  g(['push', 'origin', 'agent/stacked-family'], repoDir);
+  g(['checkout', 'main'], repoDir);
+
+  return { repoDir };
+}
+
+test('runAgenticDraftInWorktree bases a stacked task\'s worktree on task.stacked.branch, not main -- can see a sibling\'s already-committed file', async () => {
+  const { repoDir } = makeStackedRepoWithSiblingCommit();
+  try {
+    const task = { id: 'wiring-stacked-test', stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 } };
+    let sawSiblingFile = null;
+    const out = await runAgenticDraftInWorktree(task, {
+      repoRoot: repoDir,
+      modelLabel: 'test-model',
+      runInWorktree: async (worktreeDir) => {
+        sawSiblingFile = fs.existsSync(path.join(worktreeDir, 'sibling-new-file.js'));
+        return { response: 'RESOLUTION: implemented\nnothing to do', degenerate: false };
+      },
+    });
+    assert.equal(sawSiblingFile, true, 'the worktree should be based on the stacked branch and see the sibling file');
+    assert.equal(out.succeeded !== false, true, `unexpected worktree-setup failure: ${out.reason}`);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('runAgenticDraftInWorktree still bases a NON-stacked task\'s worktree on main (unchanged behavior)', async () => {
+  const { repoDir } = makeStackedRepoWithSiblingCommit();
+  try {
+    const task = { id: 'plain-task-test' };
+    let sawSiblingFile = null;
+    await runAgenticDraftInWorktree(task, {
+      repoRoot: repoDir,
+      modelLabel: 'test-model',
+      runInWorktree: async (worktreeDir) => {
+        sawSiblingFile = fs.existsSync(path.join(worktreeDir, 'sibling-new-file.js'));
+        return { response: 'RESOLUTION: implemented\nnothing to do', degenerate: false };
+      },
+    });
+    assert.equal(sawSiblingFile, false, 'a non-stacked task must not see a file that only exists on some other branch');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

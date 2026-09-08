@@ -40,6 +40,7 @@ const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { checkDraft } = require('./fact-checker.js');
+const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
@@ -479,7 +480,14 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const factCheckExtraRoots = (repoRootForCheck === workDir)
     ? (() => { try { return getConfig().grepAllowedDirs; } catch { return []; } })()
     : [];
-  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots);
+  // 2026-09-08, root-caused live: a stacked task correctly citing a sibling's real,
+  // committed-but-unmerged value was hard-blocked as "cites a value that appears nowhere
+  // in its real grounding source" -- the grep ran against repoRootForCheck's plain working
+  // tree, never the shared stacked branch. resolveGroundingRef is null for any non-stacked
+  // task (the overwhelming majority) or when the deep_dive external-clone repoRootForCheck
+  // swap already happened above, so this only diverges for the exact stacked case.
+  const groundingRef = (repoRootForCheck === workDir) ? resolveGroundingRef(task, repoRootForCheck) : null;
+  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots, groundingRef);
   // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
   // it must not by itself flip the verdict label to "flagged".
   const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';

@@ -6,7 +6,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { sweep } = require('./context-trim-sweep.js');
+const { execFileSync } = require('child_process');
+const { sweep, reAnchorFile } = require('./context-trim-sweep.js');
 const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
 // Use test-namespaced source names, not real ones (arch_review etc. are registered by the
@@ -180,4 +181,45 @@ test('sweep ignores a non-candidate-fulfillment source (e.g. manual) even if it 
 
   assert.equal(s.scanned, 0);
   assert.equal(exists(dir, 'blocked', 't7'), true);
+});
+
+// --- reAnchorFile: stacked-branch grounding (2026-09-08 incident) ----------------------
+// A stacked task's re-anchor pass used to always read repoRoot's plain working tree (main)
+// -- a file only real on the shared stacked branch (a sibling's already-committed content)
+// read as missing/stale there, so the sweep could judge the task against the wrong branch.
+
+function makeGitRepoWithStackedBranch() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-trim-stacked-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-trim-stacked-repo-'));
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, repoDir]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'README.md'), 'test');
+  execFileSync('git', ['add', 'README.md'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: repoDir });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-family'], { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'realTarget.js'), 'function realTarget() { return 42; }\n');
+  execFileSync('git', ['add', 'realTarget.js'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling commit'], { cwd: repoDir });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-family'], { cwd: repoDir });
+  execFileSync('git', ['checkout', 'main'], { cwd: repoDir });
+
+  return repoDir;
+}
+
+test('reAnchorFile reads a stacked task\'s file from its own stacked branch, not main', () => {
+  const repoRoot = makeGitRepoWithStackedBranch();
+  const task = { id: 't-stacked', stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 } };
+  const result = reAnchorFile(repoRoot, { path: 'realTarget.js', anchorConfidence: 'none' }, 'Problem:\nThe `realTarget` function has a bug.', task);
+  assert.ok(result, 'a file real on the stacked branch must be found, not silently dropped');
+  assert.match(result.windowed.text, /realTarget/);
+});
+
+test('reAnchorFile falls back to null (unreadable) for a NON-stacked task when the file only exists on some other branch', () => {
+  const repoRoot = makeGitRepoWithStackedBranch();
+  const result = reAnchorFile(repoRoot, { path: 'realTarget.js', anchorConfidence: 'none' }, 'Problem:\nThe `realTarget` function has a bug.', { id: 't-plain' });
+  assert.equal(result, null, 'a non-stacked task must not see a file that only exists on some other branch');
 });

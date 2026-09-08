@@ -18,6 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 // reviewTask spawns get-grounding-source.js as a real child process (execFileSync) --
 // that script requires AGENT_MANAGER_REPO_ROOT at load time same as every other CLI
@@ -655,6 +656,77 @@ test('reviewTask deterministically rejects a draft citing a URL not present anyw
   assert.match(result.blockedReason, /ungrounded-url/);
   assert.match(result.blockedReason, /totally-made-up-source/);
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known hallucinated URL');
+});
+
+// stacked-branch grounding (2026-09-08 incident) -----------------------------------------
+// A stacked task correctly citing a sibling's real, committed-but-unmerged value used to be
+// hard-blocked here -- the git-grep fallback inside checkGroundedValues ran against
+// repoRootForCheck's plain working tree (main), never task.stacked.branch, the branch the
+// value actually lives on.
+
+function makeGitFixtureWithStackedBranch() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-stacked-test-'));
+  const bareDir = path.join(dir, 'origin.git');
+  const repoRoot = path.join(dir, 'repo');
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, repoRoot]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoRoot });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoRoot });
+  fs.writeFileSync(path.join(repoRoot, 'README.md'), 'test');
+  execFileSync('git', ['add', 'README.md'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: repoRoot });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: repoRoot });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-family'], { cwd: repoRoot });
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'sibling.js'), 'const SIBLING_ONLY_FIELD = 1;\n');
+  execFileSync('git', ['add', 'src/sibling.js'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling commit'], { cwd: repoRoot });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-family'], { cwd: repoRoot });
+  execFileSync('git', ['checkout', 'main'], { cwd: repoRoot });
+
+  const domainsPath = path.join(dir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({
+    default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' },
+  }));
+  return { dir, repoRoot, secondBrainDir, domainsPath };
+}
+
+test('reviewTask does NOT hard-block a stacked task citing a real value that only exists on its own stacked branch', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeGitFixtureWithStackedBranch();
+  const task = {
+    id: 'stacked-grounding-test', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Wire this through SIBLING_ONLY_FIELD, already added by the sibling move task earlier in this same stacked branch, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material that never mentions this field' },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-ungrounded-value',
+    'a value real on the task\'s own stacked branch must not trip the ungrounded-value gate');
+  assert.equal(captured.length, 1, 'should reach the real review vote, not a false hard-block');
+});
+
+test('reviewTask STILL hard-blocks the same stacked task citing a genuinely fabricated field', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeGitFixtureWithStackedBranch();
+  const task = {
+    id: 'stacked-grounding-control-test', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'This relies on TOTALLY_MADE_UP_FIELD being set, with enough detail here to clear the length floor and reach the real fact-check gate.',
+    promptContext: { body: 'grounding material with no mention of this field' },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-ungrounded-value',
+    'a value fabricated everywhere, including on the stacked branch, must still be caught -- proves this is not a blanket loosening of the gate');
 });
 
 // 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: this
