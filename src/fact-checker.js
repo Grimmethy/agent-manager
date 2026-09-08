@@ -344,6 +344,28 @@ function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
 }
 
+// 2026-09-08, root-caused live via a real blocked adhoc task (the analytics-and-discovery.js
+// file-decompose child): the draft's own agentic run really did execute `node --check
+// newfile.js && echo "NEWFILE_SYNTAX_OK"` in a sandboxed run_bash call, got real, live
+// stdout back confirming the check passed, and cited that real result in its own report --
+// flagged ungrounded-field anyway, because the marker is GIS_FIELD_RE-shaped (ALL_CAPS with
+// underscores) and, being a private verification convention the model invented for its own
+// use, can never appear in any real repo source file by definition. This is the 4th
+// documented instance of the same false-positive shape (newly-declared constant, a real
+// field defined outside the diff's touched files, a field in an unchanged diff context
+// line) -- a token whose ONLY appearances are as the literal argument of the draft's own
+// `echo` command (and, following an `&&`, that same string echoed right back as real
+// captured output) is a self-referential shell artifact, not a claimed data value, no
+// matter how literal-substring-match-shaped it happens to be. Narrowly scoped to the
+// `echo "TOKEN"` / `echo TOKEN` idiom specifically -- a field that merely resembles this
+// shape without actually being quoted as an echo argument anywhere still gets flagged, same
+// as before.
+const ECHO_MARKER_RE = /\becho\s+"?([A-Z][A-Z0-9]*_[A-Z0-9_]+)"?/g;
+
+function extractEchoMarkers(text) {
+  return new Set([...text.matchAll(ECHO_MARKER_RE)].map((m) => m[1]));
+}
+
 // 2026-08-25, root-caused live via a real blocked adhoc task: a human design-decision note
 // in the task's own promptContext.rawText named a real third-party webhook service by name
 // ("Default to ntfy") without ever spelling out its literal URL -- the draft correctly cited
@@ -444,6 +466,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
   const flags = [];
   const scannableText = stripUnchangedDiffLines(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
+  const echoMarkers = extractEchoMarkers(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
   for (const raw of urls) {
@@ -459,6 +482,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot) {
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
+    if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });

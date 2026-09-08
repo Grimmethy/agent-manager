@@ -424,6 +424,46 @@ test('checkGroundedValues still flags a real comparison (NAME == value) rather t
   assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
 
+// checkGroundedValues: self-invented shell echo-marker exemption ------------------------
+// 2026-09-08, root-caused live via a real blocked adhoc task (analytics-and-discovery.js
+// file-decompose child): the draft's own agentic run really executed `node --check
+// newfile.js && echo "NEWFILE_SYNTAX_OK"` in a sandboxed run_bash call, got real, live
+// stdout back confirming the check passed, and cited that real result in its own report --
+// flagged ungrounded-field anyway, because the marker is GIS_FIELD_RE-shaped and, being a
+// private verification convention the model invented for itself, can never appear in any
+// real repo source file. The 4th documented instance of this false-positive shape.
+
+test('checkGroundedValues does not flag a self-invented echo success-marker the draft cites as real verification output', () => {
+  const draftText = [
+    'Ran the extraction script, then verified both files parse:',
+    '`python3 extract.py && node --check newfile.js && echo "NEWFILE_SYNTAX_OK"`',
+    'Real output: OK: 29 ranges removed; template 4921 -> 4076 lines; new file 873 lines',
+    'NEWFILE_SYNTAX_OK',
+  ].join('\n');
+  const sourceText = 'unrelated grounding material that never mentions that marker at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues still flags a field that merely LOOKS like an echo marker but was never actually echoed', () => {
+  // Same ALL_CAPS-with-underscores shape, but never appears as the argument of an echo
+  // command anywhere in the draft -- must still be flagged as a real fabrication risk.
+  const draftText = 'The upstream dataset exposes a NEWFILE_SYNTAX_OK status column.';
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'NEWFILE_SYNTAX_OK' }]);
+});
+
+test('checkGroundedValues exempts an echo marker whether or not it is quoted', () => {
+  const draftText = 'Verified with: some_check.sh && echo INLINE_SYNTAX_OK';
+  const sourceText = 'grounding material that never mentions that marker at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
 // checkGroundedValues: named-external-service URL exemption -----------------------------
 // 2026-08-25, root-caused live via a real blocked adhoc task: a human design-decision note
 // in the task's own promptContext.rawText named a real third-party webhook service by name
