@@ -64,6 +64,28 @@ function looksLikeUiRequest(text) {
   return words.some((w) => UI_VOCAB.has(w));
 }
 
+// Known keyword collision (live brain-dump bd-1788864613814, 2026-09-08): a task about
+// "task-pipeline throughput metrics" had src/local-throughput.js prefetched as its ONLY
+// anchor -- "throughput" substring-matching the filename by pure coincidence, even though
+// that file is an Ollama token-generation TPS calibrator (recordSample/getTokensPerSecond),
+// nothing to do with the task-pipeline's own metrics. When the task text itself carries
+// pipeline/approval context, that file is a false positive and is dropped from candidates
+// (both clean matches and the ambiguous list). Deliberately NOT a STOPWORDS entry: in a
+// genuinely Ollama/GPU calibration task "throughput" IS the real anchor for exactly that
+// file, and this project's own notes live in this repo -- both phrasings legitimately show up.
+const PIPELINE_CONTEXT_WORDS = new Set([
+  'pipeline', 'pipelines', 'approval', 'approvals', 'queue', 'queues',
+]);
+
+function isPipelineContext(text) {
+  const words = (text || '').toLowerCase().match(/[a-z]+/g) || [];
+  return words.some((w) => PIPELINE_CONTEXT_WORDS.has(w));
+}
+
+function isLocalThroughputFile(f) {
+  return path.basename(f) === 'local-throughput.js';
+}
+
 // Pulls candidate anchor keywords out of a task's title/text. Identifier-shaped tokens
 // (snake_case, kebab-case, camelCase, or a path/dotted segment) are ranked first --
 // they're far more likely to be real file/symbol names than ordinary prose -- but a
@@ -213,8 +235,14 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHu
   const matchedPaths = new Set();
   const ambiguous = {};
 
+  // Computed once: if the task is clearly about the pipeline itself (not Ollama's
+  // generation throughput), local-throughput.js is a false positive for every keyword --
+  // see PIPELINE_CONTEXT_WORDS's header for the live incident.
+  const dropLocalThroughput = isPipelineContext(combinedText);
+
   for (const keyword of keywords) {
-    const hits = matchKeyword(keyword, sourceFiles);
+    let hits = matchKeyword(keyword, sourceFiles);
+    if (dropLocalThroughput) hits = hits.filter((f) => !isLocalThroughputFile(f));
     if (hits.length === 0) continue;
     if (hits.length === 1) {
       matchedPaths.add(hits[0]);
@@ -257,4 +285,4 @@ function resolveAnchors({ repoRoot, title, rawText, graphPathOverride, uiVocabHu
   return uiVocabFallback() || { status: 'greenfield' };
 }
 
-module.exports = { extractKeywords, resolveAnchors, looksLikeUiRequest, MAX_PREFETCHED_PATHS };
+module.exports = { extractKeywords, resolveAnchors, looksLikeUiRequest, isPipelineContext, MAX_PREFETCHED_PATHS };
