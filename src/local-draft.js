@@ -1331,6 +1331,83 @@ function tryDeterministicOnePassDecompose(task, attempt) {
   return { succeeded: true, blocked: false };
 }
 
+// Deterministic ONE-PASS CommonJS decompose ([[hub-task-integration]], 2026-09-09). The
+// src/*.js analogue of tryDeterministicOnePassDecompose above: file-decompose-to-hub.js
+// files one task with promptContext.deterministicApply='node-module-decompose' when every
+// move is a self-contained cluster of top-level function declarations. decompose-node-
+// module.js produces every new module (require lines + moved fns verbatim + module.exports)
+// + the reduced source (moved fns gone, `const { ... } = require('./<mod>.js')` added,
+// module.exports untouched) as one Group-B change set, no model call. Falls through
+// (returns null) if a symbol no longer resolves or a move stopped being self-contained
+// against the current file, or if any produced file fails `node --check`.
+function tryDeterministicNodeModuleDecompose(task, attempt) {
+  const ctx = task.promptContext;
+  if (!(ctx && ctx.deterministicApply === 'node-module-decompose' && ctx.sourceFile
+        && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) {
+    return null;
+  }
+  let repoRoot; let pipelineDir;
+  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
+  if (!repoRoot) return null;
+
+  let sourceText;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
+
+  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+  const built = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+  if (!built.ok) {
+    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
+    return null;
+  }
+
+  // Parse-check every produced file before trusting the change set (the vm oracle inside
+  // buildExtraction already proved each moved fn is a complete unit; this catches a
+  // prelude/back-require splice that somehow did not).
+  try {
+    const vm = require('vm');
+    for (const ch of built.changes) {
+      const text = ch.mode === 'create' ? ch.content : ch.replace;
+      new vm.Script(text, { filename: ch.file }); // throws on a syntax error
+    }
+  } catch (e) {
+    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose produced a file that does not parse (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+    return null;
+  }
+
+  let rawDiff;
+  try {
+    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
+    });
+  } catch (e) {
+    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+    return null;
+  }
+  if (!rawDiff) {
+    appendHistoryEvent(task, 'advisory', 'deterministic node-module decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
+    return null;
+  }
+
+  const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+  task.planResponse = `Deterministic one-pass CommonJS decomposition: ${ctx.moves.length} module(s), ${symCount} function(s), every one a V8-parser-verified self-contained top-level declaration -- no model judgment needed.`;
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+  appendHistoryEvent(task, 'plan-done', 'deterministic node-module decompose, no model call');
+
+  task.implementResponse = JSON.stringify(built.changes);
+  task.rawDiff = rawDiff;
+  task.adhocResolution = 'implemented';
+  recordImplement(attempt, { text: task.implementResponse, note: `deterministic node-module decompose (${ctx.moves.length} module(s), ${symCount} function(s), V8-parser-verified)` });
+  appendHistoryEvent(task, 'implement-done', `deterministic node-module decompose: ${symCount} function(s) into ${ctx.moves.length} module(s) + require() wiring, no model call`);
+
+  task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
+  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
+
+  concludeDraft(task);
+  return { succeeded: true, blocked: false };
+}
+
 // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" -- caught
 // live via a Grill-skills adhoc task exhausting both retries because the model couldn't
 // reliably reproduce a 4362-char fixedLiterals block character-for-character in a JSON
@@ -2002,6 +2079,11 @@ async function runDraftPasses(task, attempt, {
     // single task, no stacked hub) -- see tryDeterministicOnePassDecompose()'s header.
     const onePassResult = tryDeterministicOnePassDecompose(task, attempt);
     if (onePassResult) return onePassResult;
+
+    // Same, for a plain CommonJS source (src/*.js) -- see
+    // tryDeterministicNodeModuleDecompose()'s header.
+    const nodeModuleResult = tryDeterministicNodeModuleDecompose(task, attempt);
+    if (nodeModuleResult) return nodeModuleResult;
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact
