@@ -157,6 +157,39 @@ test('sweep moves the parent to done/ once every child is terminal-good (done / 
   assert.deepEqual(done.progress, { done: 4, total: 4 });
 });
 
+test('non-stacked decompose hub: a `done`-not-merged child does NOT complete the hub; completes once every child is merged', () => {
+  const dir = makePipeline();
+  const prev = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false'; // skip the git commit-trailer reconcile -- test the pure gate
+  try {
+    write(dir, 'coordinating', {
+      id: 'dhub-1', status: 'coordinating', decomposeHub: true, history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [
+        { id: 'm-a', title: 'A', status: 'in-progress' },
+        { id: 'm-b', title: 'B', status: 'in-progress' },
+      ],
+    });
+    write(dir, 'done', { id: 'm-a', mergedAt: 'x' }); // merged
+    write(dir, 'done', { id: 'm-b' });                // done on its own agent/<id> branch, NOT merged
+
+    let summary = coordinatorSweep({ pipelineDir: dir });
+    assert.equal(summary.completed, 0, 'a bare `done` child does not count toward a decomposeHub');
+    let parent = readParent(dir, 'coordinating', 'dhub-1');
+    assert.deepEqual(parent.progress, { done: 1, total: 2 });
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'dhub-1.json')), false, 'hub stays in coordinating/');
+
+    write(dir, 'done', { id: 'm-b', mergedAt: 'y' }); // now actually landed on main
+    summary = coordinatorSweep({ pipelineDir: dir });
+    assert.equal(summary.completed, 1);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'dhub-1.json')), false);
+    parent = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'dhub-1.json'), 'utf8'));
+    assert.deepEqual(parent.progress, { done: 2, total: 2 });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+    else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prev;
+  }
+});
+
 test('completing a hub stamps mergedAt so a dependent sibling can clear isDependencySatisfied', () => {
   const dir = makePipeline();
   write(dir, 'coordinating', {

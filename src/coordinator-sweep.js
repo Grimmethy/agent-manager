@@ -19,6 +19,38 @@ const { findTaskRecordById } = require('./forensic-bundle.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
 const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
+const { taskCommitOnMain } = require('./task-disposition.js');
+
+// A non-stacked decompose hub ([[hub-task-integration]]) must not complete until every
+// move child is actually MERGED to main, not merely `done` on its own agent/<id> branch --
+// otherwise the hub's mergedAt stamp lies and the dependent feature task unblocks against a
+// main that doesn't have the split yet. Nothing else reconciles these children (they carry
+// no dependsOn), so the sweep greps origin/<main> for each child's `Task: <id>` commit
+// trailer and stamps mergedAt on its queue/done record. Memoised per process; env-gated.
+const _childMergeConfirmed = new Set();
+function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById) {
+  if (process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE === 'false') return;
+  let mainBranch;
+  try { ({ mainBranch } = require('./git-runner.js').createRealGitRunner(repoRoot)); } catch { return; }
+  const git = (root, args) => {
+    try { return require('child_process').execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 }).trim(); }
+    catch { return ''; }
+  };
+  for (const st of subTasks) {
+    if (!st || !st.id || st.status !== 'done') continue; // only `done`-not-`merged`
+    const rec = recById.get(st.id);
+    if (!rec || !rec.task || rec.task.mergedAt || rec.state !== 'done') continue;
+    if (!_childMergeConfirmed.has(st.id) && !taskCommitOnMain(git, repoRoot, mainBranch, st.id)) continue;
+    _childMergeConfirmed.add(st.id);
+    rec.task.mergedAt = new Date().toISOString();
+    rec.task.mergedAtSource = 'coordinator-sweep-decompose-child-trailer';
+    try {
+      const doneFile = path.join(pipelineDir, 'queue', 'done', `${st.id}.json`);
+      if (fs.existsSync(doneFile)) fs.writeFileSync(doneFile, JSON.stringify(rec.task, null, 2));
+    } catch { /* best-effort */ }
+    st.status = 'merged';
+  }
+}
 
 // findTaskRecordById state -> the status shown on the parent's checklist.
 function classifyChildStatus(rec) {
@@ -154,13 +186,28 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     }
 
     summary.checked += 1;
-    let doneCount = 0;
     const recById = new Map();
     for (const st of parent.subTasks) {
       const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
       recById.set(st && st.id, rec);
       st.status = classifyChildStatus(rec);
-      if (TERMINAL_GOOD.has(st.status)) doneCount += 1;
+    }
+
+    // A non-stacked decompose hub: its move children carry no dependsOn, so nothing else
+    // reconciles their merge. Confirm each `done` child against origin/<main>'s commit
+    // trailer and flip it to `merged` -- then the hub only completes on all-MERGED, so its
+    // mergedAt stamp is honest and dependents don't unblock against a pre-split main.
+    const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
+    if (strictMergeHub) {
+      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById);
+    }
+
+    let doneCount = 0;
+    for (const st of parent.subTasks) {
+      const terminal = strictMergeHub
+        ? (st.status === 'merged' || st.status === 'gone' || st.status === 'abandoned') // bare `done` is NOT enough here
+        : TERMINAL_GOOD.has(st.status);
+      if (terminal) doneCount += 1;
     }
     parent.progress = { done: doneCount, total: parent.subTasks.length };
     parent.lastReconciledAt = new Date().toISOString();

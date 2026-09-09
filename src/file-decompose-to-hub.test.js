@@ -160,7 +160,7 @@ test('no parentHub on the request -- the hub gets no field at all (not even fals
 test('stacked mode + LLM wiring child (det-wiring off): one shared branch, sequential dependsOn chain, atomic children', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
-  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => {
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'legacy', AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => {
     const s = sweep({ pipelineDir: dir });
     assert.equal(s.filedHubs, 1);
     assert.equal(s[PLAN.id].branch, 'agent/decompose-decompose-app-py');
@@ -282,7 +282,7 @@ test('preflight hard-stops a plan with a stray external reference to a moved sym
 test('sweep is idempotent -- a stamped request is skipped', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
-  withEnv(dir, {}, ({ sweep }) => {
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'legacy' }, ({ sweep }) => {
     sweep({ pipelineDir: dir });
     const s2 = sweep({ pipelineDir: dir });
     assert.equal(s2.checked, 0);
@@ -305,10 +305,10 @@ test('kill switch + a malformed request are both no-ops', () => {
 
 // --- deterministic blueprint wiring (default) -----------------------------------------
 
-test('det-wiring default: all-blueprint plan files NO wiring child, hub carries wiringPending + wiringMoves', () => {
+test('det-wiring default (legacy stacked): all-blueprint plan files NO wiring child, hub carries wiringPending + wiringMoves', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
-  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'legacy' }, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
 
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
   assert.equal(adhoc.length, 2, 'only the 2 move children, no -99-wiring');
@@ -327,7 +327,7 @@ test('det-wiring default: all-blueprint plan files NO wiring child, hub carries 
   assert.equal(hub.progress.total, 2);
 });
 
-test('det-wiring + a mixed plan: LLM wiring child is filed but scoped to the non-blueprint move only', () => {
+test('det-wiring + a mixed plan (legacy stacked): LLM wiring child is filed but scoped to the non-blueprint move only', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'm.json'), JSON.stringify({
     id: 'decompose-mixed',
@@ -337,7 +337,7 @@ test('det-wiring + a mixed plan: LLM wiring child is filed but scoped to the non
       { newFile: 'python/dashboard/routes/hw.py', kind: 'flask-blueprint', blueprint: 'hw_bp', symbols: ['api_hw'] },
     ],
   }));
-  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'legacy' }, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
 
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
   const wiring = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('wiring'))), 'utf8'));
@@ -588,5 +588,35 @@ test('one-pass: AGENT_MANAGER_DECOMPOSE_ONE_PASS=false keeps the stacked hub', (
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS; else process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = prev;
     delete require.cache[require.resolve('./decompose-one-pass.js')];
+  }
+});
+
+// --- non-stacked default: per-move-branch hub ([[hub-task-integration]] Tier 2) --------
+
+test('default (non-stacked) hub: no mode, decomposeHub + sourceFile stamped, children carry no stacked/atomic/inter-move dependsOn', () => {
+  const dir = tmpRepo();
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(PLAN));
+
+  // No STACKED env at all -- the new default. (One-pass does not apply: flask-blueprint moves.)
+  withEnv(dir, {}, ({ sweep }) => {
+    assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1);
+  });
+
+  const coord = fs.readdirSync(path.join(dir, 'queue', 'coordinating'));
+  assert.equal(coord.length, 1);
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', coord[0]), 'utf8'));
+  assert.equal(hub.mode, undefined, 'not stacked');
+  assert.equal(hub.decomposeHub, true, 'coordinator-sweep keys strict-merge behaviour off this');
+  assert.equal(hub.sourceFile, 'python/dashboard/app.py');
+
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
+  const moves = adhoc.filter((n) => !n.includes('wiring'));
+  assert.equal(moves.length, 2, 'one child per move');
+  for (const name of moves) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', name), 'utf8'));
+    assert.equal(rec.stacked, undefined, `${name}: no shared stacked branch`);
+    assert.equal(rec.atomic, undefined, `${name}: not atomic-on-one-branch`);
+    assert.equal(rec.dependsOn, undefined, `${name}: move children do not chain on each other`);
+    assert.equal(rec.branch, undefined, `${name}: each move gets its own agent/<id> branch at apply time`);
   }
 });
