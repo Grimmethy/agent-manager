@@ -175,7 +175,16 @@ function moveTemplateFor(sourceFile) {
   const ext = path.extname(sourceFile);
   const dir = path.dirname(sourceFile);
   if (ext === '.html' || ext === '.htm') {
-    return { kind: 'script-extract', newFile: (slug) => `${dir}/static/js/${slug}.js` };
+    // Flask convention: static/ is a SIBLING of templates/, never nested inside it. Strip
+    // a trailing templates/ path segment before appending static/js/ -- root-caused live
+    // (file-decompose-hub-autodecomp-adhoc-add-job-stage-groups-...): the un-stripped
+    // dir/static/js/ path put the new file INSIDE templates/, which doesn't match where a
+    // real Flask app actually resolves static assets, and doesn't match where this exact
+    // decomposition's files actually landed once applied. A no-op for an HTML source NOT
+    // under a templates/ directory (appRoot === dir), so this only changes behavior for
+    // the one shape it was wrong for.
+    const appRoot = dir.replace(/\/templates$/, '');
+    return { kind: 'script-extract', newFile: (slug) => `${appRoot}/static/js/${slug}.js` };
   }
   if (ext === '.py') {
     return { kind: 'flask-blueprint', newFile: (slug) => `${dir}/routes/${slug}.py`, blueprint: (slug) => `${slug.replace(/-/g, '_')}_bp` };
