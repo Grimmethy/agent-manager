@@ -34,7 +34,13 @@
 //   * before the branch is offered for merge, decompose-integration-gate.js actually
 //     imports the app and diffs its url_map against main -- a py_compile-in-isolation pass
 //     never caught the circular import `from app import second_brain_dir` introduces
-// Set AGENT_MANAGER_DECOMPOSE_STACKED=false to fall back to the old per-move-branch model.
+// 2026-09-09 ([[hub-task-integration]], concept-hub-task-integration-549f09): the stacked
+// model is now OPT-IN legacy (AGENT_MANAGER_DECOMPOSE_STACKED=legacy). Default is the
+// per-move-branch model -- each move applies to its own agent/<id> branch off CURRENT main
+// and merges independently, so a slow decompose can't rot one shared branch against a
+// moving main (that lost a finished split twice: app.py 2026-09-06, index.html 2026-09-09).
+// A fully-mechanical HTML plan is short-circuited earlier still into ONE deterministic
+// one-pass task (decompose-one-pass.js / Tier 1).
 //
 // Preflight: the plan author only ASSERTS "nothing else calls these" / "self-contained".
 // validatePlan() checks it (scripts/decompose-plan-check.py, Python AST) -- a missing
@@ -56,7 +62,7 @@ function slugify(s) {
 }
 
 function stackedEnabled() {
-  return process.env.AGENT_MANAGER_DECOMPOSE_STACKED !== 'false';
+  return process.env.AGENT_MANAGER_DECOMPOSE_STACKED === 'legacy';
 }
 
 function readRequests(requestsDir) {
@@ -345,7 +351,11 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now }) {
 }
 
 function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
-  const validation = stackedEnabled() ? validatePlan(repoRoot, request) : { ok: true, hardProblems: [], moveMeta: request.moves.map(() => ({})) };
+  // Always validate now (was stacked-only) -- Tier 1's planIsFullyMechanicalHtml needs
+  // every move's `deterministicApplyOk`, and a non-resolvable symbol should block a
+  // per-move-branch hub just as it blocks a stacked one. validatePlan is non-destructive:
+  // an unavailable Python checker returns null -> no false hard-problem.
+  const validation = validatePlan(repoRoot, request);
   if (!validation.ok) {
     return fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems: validation.hardProblems });
   }
@@ -463,6 +473,12 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     subTasks: children,
     progress: { done: 0, total: children.length },
     planValidation: { ok: true, sharedDeps: validation.moveMeta.map((m) => m.sharedDeps || []), checkedAt: nowIso },
+    // decomposeHub: coordinator-sweep.js treats a non-stacked one specially -- it does NOT
+    // complete until every move child is actually MERGED to main (not merely `done` on its
+    // own agent/<id> branch), reconciling each via the commit trailer. sourceFile is kept
+    // here (not just for stacked) so a later per-move integration gate has the target.
+    decomposeHub: true,
+    sourceFile: request.sourceFile,
     ...(request.premiumPriority ? { premiumPriority: true } : {}),
     // parentHub (2026-09-08): propagated from the request the same way premiumPriority is,
     // above -- set by decompose-loop-autoroute.js when this hub rescues a stuck child of an

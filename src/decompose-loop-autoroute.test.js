@@ -26,10 +26,15 @@ const r = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 // Tier-1 one-pass short-circuits a fully-mechanical HTML plan into a single task (no hub).
 // These hub-materialisation / parentHub tests deliberately exercise the HUB path.
 async function sweepHubPath(args) {
-  const prev = process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS;
+  const p1 = process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS;
+  const p2 = process.env.AGENT_MANAGER_DECOMPOSE_STACKED;
   process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = 'false';
+  process.env.AGENT_MANAGER_DECOMPOSE_STACKED = 'legacy';
   try { return await sweep(args); }
-  finally { if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS; else process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = prev; }
+  finally {
+    if (p1 === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS; else process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = p1;
+    if (p2 === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_STACKED; else process.env.AGENT_MANAGER_DECOMPOSE_STACKED = p2;
+  }
 }
 
 test('targetOversizedFile: matches the flagged path named in the task text', () => {
