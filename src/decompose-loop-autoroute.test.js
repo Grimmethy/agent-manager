@@ -259,3 +259,69 @@ test('rewireCoordinatorParent: swaps the child for the hub and rewrites sibling 
   const sib = r(path.join(dir, 'queue', 'needs-clarification', 'child-1.json'));
   assert.deepEqual(sib.dependsOn, ['file-decompose-hub-x']);
 });
+
+// --- hot-file exclusion ([[hub-task-integration]], 2026-09-09) -------------------------
+
+const { execFileSync } = require('child_process');
+
+function gitInitWithFile(dir, relPath, content) {
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@t'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: dir });
+  fs.mkdirSync(path.dirname(path.join(dir, relPath)), { recursive: true });
+  fs.writeFileSync(path.join(dir, relPath), content);
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+}
+
+test('sweep: a decompose-loop task on an oversized file that was committed to recently is NOT auto-decomposed', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', STUCK());
+  // real git repo, index.html committed just now -> "hot"
+  gitInitWithFile(dir, 'python/dashboard/templates/index.html', '<script>\n' + ['a','b','c','d','e','f','g','h'].map((n) => `function ${n}(){ return 1; }`).join('\n') + '\n</script>\n');
+  const call = async () => { throw new Error('plan pass should not run for a hot file'); };
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call });
+
+  assert.equal(summary.routed, 0);
+  assert.equal(summary.planFailed, 0);
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 0, 'no request authored');
+  const t = r(path.join(dir, 'queue', 'needs-clarification', `${STUCK().id}.json`));
+  assert.ok(t, 'stuck task left in place for a human');
+  assert.equal(t.autorouteAttempts.count, 1, 'attempt bumped so it is not re-checked every tick');
+  assert.match(t.autorouteAttempts.lastNote, /last 7 days/);
+  assert.ok(t.history.some((h) => /actively developed/.test(h.detail || '')));
+});
+
+test('sweep: AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS=0 disables the hot-file gate (plan pass runs)', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', STUCK());
+  gitInitWithFile(dir, 'python/dashboard/templates/index.html', '<script>\n' + ['a','b','c','d','e','f','g','h'].map((n) => `function ${n}(){ return 1; }`).join('\n') + '\n</script>\n');
+  let planPassRan = false;
+  const call = async () => { planPassRan = true; return { response: '[]' }; }; // proceeds past the hot-file skip
+
+  process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS = '0';
+  try {
+    delete require.cache[require.resolve('./decompose-loop-autoroute.js')];
+    const { sweep: freshSweep } = require('./decompose-loop-autoroute.js');
+    await freshSweep({ pipelineDir: dir, repoRoot: dir, call });
+    assert.equal(planPassRan, true, 'gate disabled -> sweep got past the hot-file skip and ran the plan pass');
+  } finally {
+    delete process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS;
+    delete require.cache[require.resolve('./decompose-loop-autoroute.js')];
+  }
+});
+
+test('sweep: a hot file whose hub is ALREADY filed is not abandoned', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', STUCK());
+  gitInitWithFile(dir, 'python/dashboard/templates/index.html', '<script>\nfunction renderJobListTab(){}\n</script>\n');
+  // pre-existing request (routed on an earlier, non-hot tick)
+  const requestId = `autodecomp-add-job-stage-groups-table-1788382532092-0`.slice(0, 60);
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', `${requestId}.json`),
+    JSON.stringify({ id: requestId, sourceFile: 'python/dashboard/templates/index.html', moves: [] }));
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: async () => ({ response: '[]' }) });
+  // not skipped-as-hot; it takes the normal already-filed path (re-points the task)
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'file-decompose-requests', `${requestId}.json`)), true, 'existing request untouched');
+});
