@@ -196,3 +196,54 @@ test('classifyRequeue writes a real requeue_causes row and a task-links contribu
     assert.equal(link.type, 'contributes-to-signature');
   });
 });
+
+// --- actor dimension + the manual-requeue CLI (2026-09-09, Ghost-in-the-Machine telemetry) ---
+
+test('classifyRequeue threads actor through to the requeue_causes row (default pipeline-mechanism)', async () => {
+  await withFreshEnv(async (ra, dir) => {
+    await ra.classifyRequeue({ id: 'mech-1', blockedReason: 'x' }, { requeueWriter: 'blocked-drain', repoRoot: dir });
+    await ra.classifyRequeue({ id: 'hand-1', blockedReason: 'x' }, { requeueWriter: 'operator-manual', actor: 'operator-manual', repoRoot: dir });
+    const db = new DatabaseSync(path.join(dir, 'requeue-attribution.db'), { readOnly: true });
+    assert.equal(db.prepare('SELECT actor FROM requeue_causes WHERE task_id = ?').get('mech-1').actor, 'pipeline-mechanism');
+    assert.equal(db.prepare('SELECT actor FROM requeue_causes WHERE task_id = ?').get('hand-1').actor, 'operator-manual');
+    db.close();
+  });
+});
+
+test('classifyRequeue with skipFallbackModel never calls the model even for an unstructured reason', async () => {
+  await withFreshEnv(async (ra, dir) => {
+    let called = false;
+    const callModel = async () => { called = true; return { response: 'CAUSE: genuine-bug' }; };
+    const { category } = await ra.classifyRequeue(
+      { id: 'skip-1', blockedReason: 'some freeform reason with no structured signal' },
+      { requeueWriter: 'operator-manual', actor: 'operator-manual', skipFallbackModel: true, callModel, repoRoot: dir },
+    );
+    assert.equal(called, false);
+    assert.equal(category, 'unclassified');
+  });
+});
+
+test('the `classify` CLI records an operator-manual row and prints {signature,category}', async () => {
+  await withFreshEnv(async (ra, dir) => {
+    const { execFileSync } = require('child_process');
+    const payloadPath = path.join(dir, 'payload.json');
+    fs.writeFileSync(payloadPath, JSON.stringify({
+      task: { id: 'cli-task-1', blockedReason: 'BLOCKER-TYPE: infra-error a command failed' },
+      reasonHint: 'manually requeued from blocked/',
+      requeueWriter: 'operator-manual',
+      actor: 'operator-manual',
+    }));
+    const out = execFileSync('node', [path.join(__dirname, 'requeue-attribution.js'), 'classify', payloadPath], {
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: dir },
+    });
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.category, 'infra-error');
+    assert.ok(parsed.signature);
+    const db = new DatabaseSync(path.join(dir, 'requeue-attribution.db'), { readOnly: true });
+    const row = db.prepare('SELECT * FROM requeue_causes WHERE task_id = ?').get('cli-task-1');
+    db.close();
+    assert.equal(row.actor, 'operator-manual');
+    assert.equal(row.requeue_writer, 'operator-manual');
+  });
+});

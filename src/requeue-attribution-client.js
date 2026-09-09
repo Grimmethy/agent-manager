@@ -28,11 +28,11 @@ function resolveDbPath() {
     path.join(process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT, 'requeue-attribution.db');
 }
 
-function recordRequeueCause({ taskId, signature, blockedStage = null, requeueWriter }) {
+function recordRequeueCause({ taskId, signature, blockedStage = null, requeueWriter, actor = 'pipeline-mechanism' }) {
   if (!taskId || !signature || !requeueWriter) return;
   const tmpPath = path.join(os.tmpdir(), `requeue-attribution-record-cause-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify({ taskId, signature, blockedStage, requeueWriter }));
+    fs.writeFileSync(tmpPath, JSON.stringify({ taskId, signature, blockedStage, requeueWriter, actor }));
     execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'record-cause', tmpPath], { stdio: 'pipe' });
   } catch (e) {
     // Non-fatal -- see header.
@@ -65,4 +65,52 @@ function getBurnRate(signature, { shortWindowMs, longWindowMs, now = Date.now() 
   }
 }
 
-module.exports = { recordRequeueCause, getBurnRate };
+// Actor rollup for the Ghost-in-the-Machine concept card (2026-09-09): raw counts per
+// `actor` over a window, plus an optional coarse time series so the dashboard can draw a
+// "hand-fixes vs mechanism-recoveries" trend. Plain read-only in-process query, same
+// convention as getBurnRate -- policy (what counts as "hand-fix" = operator-manual +
+// agent-session) lives in the caller, not here.
+function getActorRollup({ sinceMs, bucketMs = 24 * 3600 * 1000, now = Date.now() } = {}) {
+  const empty = { totals: {}, series: [] };
+  const dbPath = resolveDbPath();
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch (e) { return empty; }
+  if (!fs.existsSync(dbPath)) return empty;
+  let db;
+  try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch (e) { return empty; }
+  try {
+    const since = new Date(Number.isFinite(sinceMs) ? now - sinceMs : 0).toISOString();
+    const totalsRows = db.prepare(
+      `SELECT actor, COUNT(*) AS c FROM requeue_causes WHERE at >= ? GROUP BY actor`,
+    ).all(since);
+    const totals = {};
+    for (const r of totalsRows) totals[r.actor || 'pipeline-mechanism'] = r.c;
+
+    const series = [];
+    if (Number.isFinite(sinceMs) && bucketMs > 0) {
+      const rows = db.prepare(
+        `SELECT actor, at FROM requeue_causes WHERE at >= ? ORDER BY at ASC`,
+      ).all(since);
+      const buckets = new Map();
+      for (const r of rows) {
+        const t = Date.parse(r.at);
+        if (!Number.isFinite(t)) continue;
+        const key = Math.floor(t / bucketMs) * bucketMs;
+        if (!buckets.has(key)) buckets.set(key, {});
+        const b = buckets.get(key);
+        const a = r.actor || 'pipeline-mechanism';
+        b[a] = (b[a] || 0) + 1;
+      }
+      for (const [key, counts] of [...buckets.entries()].sort((x, y) => x[0] - y[0])) {
+        series.push({ at: new Date(key).toISOString(), ...counts });
+      }
+    }
+    return { totals, series };
+  } catch (e) {
+    return empty;
+  } finally {
+    try { db.close(); } catch (e) { /* best-effort */ }
+  }
+}
+
+module.exports = { recordRequeueCause, getBurnRate, getActorRollup };
