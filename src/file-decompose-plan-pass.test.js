@@ -53,12 +53,32 @@ test('planFromSections: emits balanced section modules, rejects a too-coarse spl
   const moves = planFromSections('x/index.html', clean);
   assert.equal(moves.length, 4);
   assert.ok(moves[0].newFile.endsWith('.js'));
+  // No templates/ segment in 'x/index.html' -- appRoot === dir, unchanged from before.
+  assert.ok(moves[0].newFile.startsWith('x/static/js/'));
 
   // too coarse: one section holds 40 of 45
   const coarse = [];
   for (let i = 0; i < 40; i += 1) coarse.push({ name: `big${i}`, line: i + 1, kind: 'fn', section: 'huge' });
   for (const s of ['x', 'y', 'z', 'w', 'v']) coarse.push({ name: s, line: coarse.length + 1, kind: 'fn', section: s });
   assert.equal(planFromSections('x/app.py', coarse), null);
+});
+
+// 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+// groups-...): an HTML source under a templates/ directory computed its target as
+// dir/static/js/<slug>.js -- nested INSIDE templates/, which doesn't match Flask's real
+// convention (static/ is a SIBLING of templates/) and didn't match where this exact
+// decomposition's files actually landed once applied.
+test('planFromSections: an HTML source under templates/ puts its target in the SIBLING static/js/, not nested inside templates/', () => {
+  const clean = [];
+  for (const sec of ['aaa', 'bbb', 'ccc', 'ddd']) {
+    for (let i = 0; i < 3; i += 1) clean.push({ name: `${sec}${i}`, line: clean.length + 1, kind: 'fn', section: sec });
+  }
+  const moves = planFromSections('python/dashboard/templates/index.html', clean);
+  assert.equal(moves.length, 4);
+  for (const m of moves) {
+    assert.ok(m.newFile.startsWith('python/dashboard/static/js/'), `expected python/dashboard/static/js/... got ${m.newFile}`);
+    assert.doesNotMatch(m.newFile, /templates\/static/, 'must never nest static/ inside templates/');
+  }
 });
 
 // 2026-09-08, Grimmethy: "Yes, please build it" -- a plain .js source now ALSO gets
