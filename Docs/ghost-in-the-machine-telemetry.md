@@ -1,7 +1,19 @@
 # Spec: Ghost-in-the-Machine telemetry & debt register
 
-Status: proposed · Concept: `concept-ghost-in-the-machine-0dbeea` · Own PR (separate from the
-infra-error / forbidden-path fixes)
+Status: **implemented** (this PR) · Concept: `concept-ghost-in-the-machine-0dbeea`
+
+Deviations from the proposal, all confirmed during implementation:
+- `api_discuss_end` is **not** a requeue site — it edits the held task in place; the move to
+  `adhoc/` happens later via `/resolve` or `/answer`. Those two (plus `api_task_requeue`)
+  are the manual-requeue sites that call `_record_manual_requeue`.
+- The ghost-telemetry route reads `requeue-attribution.db` directly with stdlib `sqlite3`
+  (dedicated route `/api/concepts/<id>/ghost-telemetry`, gated to the ghost concept id) —
+  no Node bridge needed for a read.
+- Ghost debt from `needs-clarification-triage.js` fires only on the **retry-exhausted**
+  bucket-C path, not on a genuine design question (a real human call is not a missing
+  mechanism).
+- `classifyRequeue` gained a `skipFallbackModel` flag; the manual-requeue CLI forces it on
+  so a hand requeue never makes a model call.
 
 ## Why
 

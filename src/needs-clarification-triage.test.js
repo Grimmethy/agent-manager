@@ -587,3 +587,38 @@ test('bucket G skipped: an exhausted history event -> not requeued', async () =>
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'tg2.json')));
 });
+
+// --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
+
+const sfInbox = (dir) => {
+  try {
+    return fs.readdirSync(at(dir, 'side-findings-inbox'))
+      .map((f) => JSON.parse(fs.readFileSync(at(dir, 'side-findings-inbox', f), 'utf8')));
+  } catch { return []; }
+};
+
+test('bucket C retry-exhausted files a ghost-debt side-finding tagged to the concept', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('gd-exh', {
+    needsClarification: { reason: 'design-decision', openQuestions: 'The automated handler could not get this past review after 3 attempts: never produced a real diff.' },
+    blockedReason: 'never produced a real diff',
+    history: [{ stage: 'exhausted', at: '2026-09-01T00:00:00Z' }, { stage: 'needs-clarification', at: '2026-09-01T00:01:00Z' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.leftForHuman, 1);
+  assert.equal(read(at(dir, 'needs-clarification', 'gd-exh.json')).ncTriageDecision, 'leave-for-human');
+  const debt = sfInbox(dir).find((r) => r.stage === 'ghost-debt' && r.taskId === 'gd-exh');
+  assert.ok(debt, 'ghost-debt side-finding filed for the retry-exhausted leave-for-human');
+  assert.equal(debt.conceptId, 'concept-ghost-in-the-machine-0dbeea');
+});
+
+test('bucket C genuine design question does NOT file ghost debt (legitimate human call, not a missing mechanism)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('gd-genuine', {
+    needsClarification: { reason: 'design-decision', openQuestions: 'Should the export be CSV or Parquet? This is a real product decision.' },
+    history: [{ stage: 'implement-done', at: '2026-09-01T00:00:00Z' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.leftForHuman, 1);
+  assert.equal(sfInbox(dir).filter((r) => r.stage === 'ghost-debt').length, 0);
+});
