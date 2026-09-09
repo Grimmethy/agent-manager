@@ -1266,6 +1266,71 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
   return { succeeded: true, blocked: false };
 }
 
+// Deterministic ONE-PASS decompose ([[hub-task-integration]], spec Docs/hub-task-independent-
+// merge.md Tier 1, 2026-09-09). Same idea as tryDeterministicScriptExtractEdit above but for
+// a WHOLE fully-mechanical HTML file-decompose: file-decompose-to-hub.js files one task with
+// promptContext.deterministicApply='one-pass-decompose' + moves:[{newFile,symbols}] instead
+// of a stacked hub of N move children + a wiring child. This produces every new module file
+// + the reduced source + the <script> wiring as one Group-B change set, no model call, and
+// captures the real diff against fresh origin/<main> -- so the split lands as ONE verified
+// commit that can't go days-stale. Falls through (returns null) if any symbol no longer
+// resolves cleanly against the current file.
+function tryDeterministicOnePassDecompose(task, attempt) {
+  const ctx = task.promptContext;
+  if (!(ctx && ctx.deterministicApply === 'one-pass-decompose' && ctx.sourceFile
+        && Array.isArray(ctx.moves) && ctx.moves.length >= 2)) {
+    return null;
+  }
+  let repoRoot; let pipelineDir;
+  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
+  if (!repoRoot) return null;
+
+  // Never stacked -- read the plain working tree (the worktree diff capture below
+  // re-verifies against real origin/<main>).
+  let sourceText;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
+
+  const { buildOnePassGroupBChanges } = require('./decompose-one-pass.js');
+  const built = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
+  if (!built.ok) {
+    appendHistoryEvent(task, 'advisory', `deterministic one-pass decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
+    return null;
+  }
+
+  let rawDiff;
+  try {
+    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
+    });
+  } catch (e) {
+    appendHistoryEvent(task, 'advisory', `deterministic one-pass decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+    return null;
+  }
+  if (!rawDiff) {
+    appendHistoryEvent(task, 'advisory', 'deterministic one-pass decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
+    return null;
+  }
+
+  const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+  task.planResponse = `Deterministic one-pass decomposition: ${ctx.moves.length} module(s), ${symCount} symbol(s), every one a V8-parser-verified top-level declaration -- no model judgment needed.`;
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+  appendHistoryEvent(task, 'plan-done', 'deterministic one-pass decompose, no model call');
+
+  task.implementResponse = JSON.stringify(built.changes);
+  task.rawDiff = rawDiff;
+  task.adhocResolution = 'implemented';
+  recordImplement(attempt, { text: task.implementResponse, note: `deterministic one-pass decompose (${ctx.moves.length} module(s), ${symCount} symbol(s), V8-parser-verified)` });
+  appendHistoryEvent(task, 'implement-done', `deterministic one-pass decompose: ${symCount} symbol(s) into ${ctx.moves.length} module(s) + <script> wiring, no model call`);
+
+  task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
+  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
+
+  concludeDraft(task);
+  return { succeeded: true, blocked: false };
+}
+
 // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" -- caught
 // live via a Grill-skills adhoc task exhausting both retries because the model couldn't
 // reliably reproduce a 4362-char fixedLiterals block character-for-character in a JSON
@@ -1932,6 +1997,11 @@ async function runDraftPasses(task, attempt, {
     // tryDeterministicScriptExtractEdit()'s own header for the full incident.
     const scriptExtractResult = tryDeterministicScriptExtractEdit(task, attempt);
     if (scriptExtractResult) return scriptExtractResult;
+
+    // Deterministic ONE-PASS decompose (a whole fully-mechanical HTML file-decompose in a
+    // single task, no stacked hub) -- see tryDeterministicOnePassDecompose()'s header.
+    const onePassResult = tryDeterministicOnePassDecompose(task, attempt);
+    if (onePassResult) return onePassResult;
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact

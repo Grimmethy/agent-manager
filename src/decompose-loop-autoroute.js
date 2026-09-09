@@ -245,14 +245,21 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           }
         }
 
-        // Re-point the stuck task at the decompose hub and send it back to pending so it
-        // re-drafts once the file is split. isDependencySatisfied() gates it until the hub
-        // is stamped merged.
+        // Tier 1 ([[hub-task-integration]]): a fully-mechanical HTML plan materialises as a
+        // SINGLE one-pass task, not a hub. Point the stuck task at whichever id was filed.
+        const filedReq = readJson(path.join(reqDir, `${requestId}.json`)) || {};
+        const isOnePass = !!filedReq.onePassTaskId;
+        const depTarget = isOnePass ? filedReq.onePassTaskId : hubId;
+        const reroutedKind = isOnePass ? 'file-decompose-onepass' : 'file-decompose';
+
+        // Re-point the stuck task at the decompose hub (or one-pass task) and send it back
+        // to pending so it re-drafts once the file is split. isDependencySatisfied() gates
+        // it until that dependency is merged.
         const rerouted = {
           id: task.id, domain: task.domain, source: task.source, title: task.title,
           promptContext: task.promptContext,
-          dependsOn: [hubId],
-          reroutedTo: { kind: 'file-decompose', requestId, hubId, targetFile, at: new Date(now).toISOString() },
+          dependsOn: [depTarget],
+          reroutedTo: { kind: reroutedKind, requestId, hubId: isOnePass ? undefined : hubId, onePassTaskId: isOnePass ? depTarget : undefined, targetFile, at: new Date(now).toISOString() },
           status: 'pending', createdAt: new Date(now).toISOString(),
           // Same premiumPriority carry-through as the request write above -- this rebuild
           // used to silently drop it, same bug, one level up (the rerouted PARENT itself).
@@ -260,14 +267,15 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
           history: [...(task.history || []), {
             stage: 'pending',
             at: new Date(now).toISOString(),
-            detail: `decompose-loop autoroute: ${targetFile} is being split (${hubId}); this task waits for that, then re-drafts against the smaller file`,
+            detail: `decompose-loop autoroute: ${targetFile} is being split (${depTarget}); this task waits for that, then re-drafts against the smaller file`,
           }],
         };
-        const parentId = rewireCoordinatorParent(pipelineDir, task.id, hubId);
+        const parentId = rewireCoordinatorParent(pipelineDir, task.id, depTarget);
         // Fallback parentHub stamp: covers a stuck task whose promptContext.decomposedFrom
         // was missing/stale but rewireCoordinatorParent still found a real coordinating
         // parent by scanning subTasks[] -- keeps the Hub Tasks family tree correct either way.
-        if (parentId) {
+        // (Only for the hub case -- a one-pass task carries no hub record to stamp.)
+        if (parentId && !isOnePass) {
           const hubFile = path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`);
           const hubRecord = readJson(hubFile);
           if (hubRecord && !hubRecord.parentHub) {
