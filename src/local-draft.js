@@ -56,6 +56,7 @@ const { getConfig, ensureRegistered } = require('./config.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
+const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
@@ -1158,9 +1159,24 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
   try { ({ repoRoot } = getConfig()); } catch { return null; }
   if (!repoRoot) return null;
 
-  const absSource = path.join(repoRoot, ctx.sourceFile);
+  // 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+  // groups-...): this used to always read the plain repoRoot working tree, which for a
+  // stacked file-decompose sub-task is main's content, not the shared stacked branch's --
+  // already missing earlier sibling moves already extracted from it. The `find`/`replace`
+  // pair below got built from the wrong base, so it verified fine in isolation (against
+  // itself) but failed a real `git apply` once actually applied to the real stacked
+  // branch. Same missing concept already fixed at 5 other call sites via
+  // stacked-grounding.js's resolveGroundingRef -- groundingRef is null for any non-stacked
+  // task, so every non-stacked caller reads exactly as before.
+  const groundingRef = resolveGroundingRef(task, repoRoot);
   let html;
-  try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
+  if (groundingRef) {
+    html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
+    if (html === null) return null;
+  } else {
+    const absSource = path.join(repoRoot, ctx.sourceFile);
+    try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
+  }
 
   // isHtml (2026-09-08, Grimmethy: "Yes, please build it" -- see script-extract.js's own
   // header for the review-task.js incident this closes): a plain .js/.mjs/.cjs source now
@@ -1198,12 +1214,15 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
   // path produces it. It also re-confirms the Group-B change still applies cleanly
   // against real origin/<main> content (not just the repoRoot snapshot read above),
   // throwing (caught below, falls through to the normal path) if that has ALSO drifted.
+  // `task` passed through (2026-09-09) so a stacked sub-task's diff is captured against
+  // its own shared branch, not main -- see captureGroupBDiffInWorktree's own header for
+  // the real incident this closes.
   const { pipelineDir } = getConfig();
   let rawDiff;
   try {
     const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
     rawDiff = captureGroupBDiffInWorktree({
-      repoRoot, pipelineDir, implementResponse: JSON.stringify(groupBChanges), worktreeSuffix: task.id,
+      repoRoot, pipelineDir, implementResponse: JSON.stringify(groupBChanges), worktreeSuffix: task.id, task,
     });
   } catch (e) {
     appendHistoryEvent(task, 'advisory', `deterministic script-extract diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);

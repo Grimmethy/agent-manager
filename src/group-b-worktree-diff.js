@@ -26,6 +26,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { applyGroupB } = require('./apply-group-b.js');
+const { resolveGroundingRef } = require('./stacked-grounding.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -69,16 +70,27 @@ function normalizeDiffOutput(rawDiff) {
  * @param {string} opts.implementResponse - Group-B JSON (single object or array).
  * @param {string} opts.worktreeSuffix - Unique per-call suffix (e.g. task.id) so concurrent
  *   callers never collide on the same worktree directory/branch name.
+ * @param {object} [opts.task] - The task this diff is being captured for. 2026-09-09,
+ *   root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-groups-...): this
+ *   always branched off origin/<mainBranch> unconditionally, so a stacked file-decompose
+ *   sub-task's deterministic script-extract diff got captured against MASTER's version of
+ *   the source file, not the shared stacked branch's -- which already has earlier sibling
+ *   moves extracted from it, at different line offsets. The diff verified/applied cleanly
+ *   in isolation but failed `git apply` for real once actually applied to the real stacked
+ *   branch ("patch does not apply"). Same missing concept already fixed at 5 other call
+ *   sites by stacked-grounding.js's resolveGroundingRef -- this is call site #6. Null for
+ *   any non-stacked task, so every existing (non-stacked) caller is unaffected.
  * @returns {string} The captured unified diff, trimmed (may be empty if Group-B produced
  *   no net change against origin, e.g. an edit whose replace equals its find).
  */
-function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse, worktreeSuffix }) {
+function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse, worktreeSuffix, task }) {
   const mainBranch = detectDefaultBranch(repoRoot);
+  const groundingBranch = (task && resolveGroundingRef(task, repoRoot)) || mainBranch;
   const worktreeDir = path.join(os.tmpdir(), `agent-manager-groupb-worktree-${worktreeSuffix}`);
   const branchName = `throwaway/groupb-${worktreeSuffix}`;
 
-  runGit(['fetch', 'origin', mainBranch], repoRoot);
-  runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${mainBranch}`], repoRoot);
+  runGit(['fetch', 'origin', groundingBranch], repoRoot);
+  runGit(['worktree', 'add', worktreeDir, '-b', branchName, `origin/${groundingBranch}`], repoRoot);
 
   try {
     applyGroupB({ implementResponse, repoRoot: worktreeDir, pipelineDir });
