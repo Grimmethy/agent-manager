@@ -137,6 +137,60 @@ function pathHitsForbidden(changedPath, forbidden) {
   });
 }
 
+// Paths the task ITSELF declares as an edit target: the structured `Files:` line, a
+// path token in a non-restriction fragment of the title (a decompose / "wire up" task
+// names the file it must edit right in its title), or an explicit `edit_file` /
+// `EDIT ... <path>` mention in the plan body. Mirror image of the 2026-09-08 "fix the
+// gate" change on check 3 (a path cited as EVIDENCE misread as an edit target): a
+// scope-discipline clause in the task's OWN plan -- "No other lines in `index.html`
+// were modified", "Do not touch CSS, HTML structure" -- is guidance on how to edit the
+// target carefully, not a prohibition on touching it at all. extractForbiddenPaths'
+// output is filtered against this set so the forbidden-path gate only ever fires for a
+// path that is NOT one of the task's declared targets.
+function extractDeclaredTargets(task, planText = '') {
+  const out = new Set();
+  const add = (raw) => {
+    const s = String(raw || '').trim().replace(/^[`'"(]+|[`'".,;)]+$/g, '').replace(/^\.\//, '');
+    if (s) out.add(s);
+  };
+  const rawText = task && ((task.promptContext && task.promptContext.rawText) || task.title);
+  // 1. The authoritative structured `Files:` line, when the task has one.
+  for (const p of (extractDeclaredFiles(rawText) || [])) add(p);
+  // 2. Path tokens in the TITLE -- but only from fragments that are NOT themselves a
+  //    restriction clause, so "Refactor src/a.js, do not touch src/b.js" keeps b.js
+  //    forbidden. Same two token regexes extractForbiddenPaths uses.
+  for (const frag of String((task && task.title) || '').split(/(?<=[.!?:;])\s+|\s+[—-]\s+/)) {
+    if (RESTRICTION_SENTENCE_RE.test(frag)) continue;
+    for (const m of frag.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(m[0]);
+    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(m[0]);
+  }
+  // 3. Explicit edit-target mentions in the plan body.
+  const plan = String(planText || '');
+  for (const m of plan.matchAll(/\b(?:edit_file|write_file)\b[^\n]*?`([\w./@-]+\.\w+)`/gi)) add(m[1]);
+  for (const m of plan.matchAll(/\b(?:EDIT\b|Wire up\b[^\n]*?\binto)\b[^\n]*?`([\w./@-]+\.\w+)`/gi)) add(m[1]);
+  return [...out];
+}
+
+// Loose path equality shared by the forbidden-vs-target reconciliation. Mirrors
+// pathHitsForbidden's own matching latitude but symmetric: a bare filename or an
+// extensionless dir-prefix restriction still lines up with the concrete target path.
+function pathsRefEqual(a, b) {
+  const na = String(a || '').replace(/^\.\//, '');
+  const nb = String(b || '').replace(/^\.\//, '');
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const hasExt = (s) => /\.\w+$/.test(s);
+  if (na.includes('/') && !hasExt(na) && (nb === na || nb.startsWith(`${na}.`))) return true;
+  if (nb.includes('/') && !hasExt(nb) && (na === nb || na.startsWith(`${nb}.`))) return true;
+  // Same basename when BOTH sides are concrete files with a known extension -- covers the
+  // common shape where the restriction clause writes a bare "index.html" and the target
+  // (and the diff) carry the full "python/dashboard/templates/index.html".
+  if (hasExt(na) && hasExt(nb) && !na.endsWith('/') && !nb.endsWith('/')) {
+    return na.split('/').pop() === nb.split('/').pop();
+  }
+  return false;
+}
+
 // --- the gate -------------------------------------------------------------
 
 function isAdhoc(task) {
@@ -199,8 +253,13 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const files = parseChangedFiles(rawDiff);
   if (files.length === 0) return null; // can't parse -- don't block on this check
 
-  // 1. Explicit "do NOT touch X" violation -- most specific, checked first.
-  const forbidden = extractForbiddenPaths(combined);
+  // 1. Explicit "do NOT touch X" violation -- most specific, checked first. A path the
+  //    task itself declares as an edit target is never "forbidden": its own plan's
+  //    scope-discipline language ("no other lines in index.html were modified") must not
+  //    lock the drafter out of the file it was told to change. See extractDeclaredTargets.
+  const targets = extractDeclaredTargets(task, planText);
+  const forbidden = extractForbiddenPaths(combined)
+    .filter((f) => !targets.some((t) => pathsRefEqual(f, t)));
   if (forbidden.length) {
     const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit);
     if (violations.length) {
@@ -328,4 +387,5 @@ function adhocNoChangesClaimProblem(task, summary) {
 
 module.exports = {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
+  extractDeclaredTargets, pathsRefEqual,
 };

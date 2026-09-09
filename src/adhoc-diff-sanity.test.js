@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
+  extractDeclaredTargets,
 } = require('./adhoc-diff-sanity.js');
 
 // Stubs arch-import-fetch.js's fetchForQueries for the duration of fn(), via require-cache
@@ -126,6 +127,55 @@ test('forbidden-path: a diff touching an explicitly off-limits dir is flagged', 
 test('forbidden-path: no false positive when the "do not" clause names no path', () => {
   const t = adhoc('Add a retry counter to src/reject-retry-check.js. Do not change the public API of rejectRetryCheck.');
   assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/reject-retry-check.js')), null);
+});
+
+test('forbidden-path: a decompose/wire-up task is NOT locked out of the file named in its own title', () => {
+  // The live regression: the plan's own acceptance criterion "No other lines in
+  // `index.html` were modified" was scanned as a "do not modify index.html" restriction,
+  // blocking the wiring task whose entire job is editing that file.
+  const t = {
+    source: 'manual',
+    title: 'Decompose python/dashboard/templates/index.html — wire up the 4 new file(s)',
+    lastGoodPlan: [
+      '# PLAN: Wire up 4 new JS files into `python/dashboard/templates/index.html`',
+      '2. EDIT — insert the four `<script>` tags using `edit_file` on `python/dashboard/templates/index.html`.',
+      '## CRITERIA:',
+      '- No other lines in `index.html` were modified (diff shows only the 4 added `<script>` lines).',
+      '- Do not touch CSS, HTML structure, or any inline JS that is still in use.',
+    ].join('\n'),
+  };
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('python/dashboard/templates/index.html')), null);
+});
+
+test('forbidden-path: a genuine "do not touch X" for a NON-target file is still enforced', () => {
+  const t = adhoc(
+    'Implement the guard in src/a.js.\nFiles: src/a.js\nDo NOT touch src/b.js — it is out of scope.',
+    '# PLAN\nEdit `src/a.js` only.',
+  );
+  const p = adhocDiffSubstanceProblem(t, editDiff('src/b.js'));
+  assert.equal(p.code, 'forbidden-path');
+  assert.match(p.retryFeedback, /EXPLICITLY forbids/);
+});
+
+test('forbidden-path: a restriction clause in the TITLE is not mistaken for a target', () => {
+  const t = { source: 'manual', title: 'Refactor src/a.js. Do not touch src/b.js.' };
+  const p = adhocDiffSubstanceProblem(t, editDiff('src/b.js'));
+  assert.equal(p.code, 'forbidden-path');
+});
+
+test('extractDeclaredTargets: pulls the title path, the Files: line, and edit_file plan mentions; skips restriction fragments', () => {
+  const t = {
+    title: 'Decompose python/dashboard/templates/index.html — wire it up',
+    promptContext: { rawText: 'Do the thing.\nFiles: src/wiring.js' },
+  };
+  const targets = extractDeclaredTargets(t, 'use `edit_file` on `src/other.js` to register it');
+  assert.ok(targets.includes('python/dashboard/templates/index.html'));
+  assert.ok(targets.includes('src/wiring.js'));
+  assert.ok(targets.includes('src/other.js'));
+
+  const t2 = { title: 'Refactor src/a.js without regressing; do not touch src/b.js' };
+  assert.ok(extractDeclaredTargets(t2).includes('src/a.js'));
+  assert.ok(!extractDeclaredTargets(t2).includes('src/b.js'));
 });
 
 test('non-adhoc tasks and empty diffs are never gated', () => {
