@@ -30,8 +30,49 @@ const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
+const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
+
+// Fields wiped when a task is re-admitted with a CLEAN SLATE (not a blind redraft, which
+// keeps priorRejectionFeedback + increments localRejectCount). Kept deliberately in sync
+// with needs-clarification-triage.js's REQUEUE_STRIP_FIELDS -- same intent: a fresh start
+// for a task whose accumulated failure state was an artifact of a bug, not a real signal.
+const READMIT_CLEAN_SLATE_FIELDS = [
+  'needsClarification', 'localRejectCount', 'ncTriageAttempts', 'ncTriageDecision', 'ncTriageReviewedAt',
+  'retryableDraftBlock', 'turnBudgetExhausted', 'turnBudgetExhaustedBefore',
+  'infraErrorRetry', 'infraErrorNote', 'adhocResolution', 'subTaskProposals',
+  'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage', 'claimedAt',
+  'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
+  'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback',
+];
+
+// A prior forbidden-path block whose named path is actually one of the task's OWN declared
+// edit targets -- adhoc-diff-sanity.js's forbidden-path gate false-positived on the task's
+// own scope-discipline language ("No other lines in `index.html` were modified"), since
+// fixed there via extractDeclaredTargets. A blind retry could never clear it: the gate
+// reproduced the identical false positive on every pass until the retry budget burned out,
+// so `localRejectCount` here is noise, not a real rejection signal. Returns true => the
+// system re-admits the task with a clean slate (once), instead of an operator hand-fixing it.
+function forbiddenPathBlockNamesOwnTarget(task) {
+  const text = [
+    String(task.blockedReason || ''),
+    ...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback.map(String) : []),
+  ].join('\n');
+  if (!/matches forbidden "|EXPLICITLY forbids \(/i.test(text)) return false;
+  const named = new Set();
+  for (const m of text.matchAll(/matches forbidden "([^"]+)"/gi)) named.add(m[1]);
+  for (const m of text.matchAll(/EXPLICITLY forbids \(([^)]+)\)/gi)) {
+    for (const p of m[1].split(',')) {
+      const s = p.replace(/^[\s"'`]+|[\s"'`]+$/g, '');
+      if (s) named.add(s);
+    }
+  }
+  if (!named.size) return false;
+  let targets = [];
+  try { targets = extractDeclaredTargets(task, task.planResponse || task.lastGoodPlan || ''); } catch { return false; }
+  return [...named].some((n) => targets.some((t) => pathsRefEqual(n, t)));
+}
 
 function isReviewRejection(task) {
   return task.blockedStage === 'review';
@@ -184,6 +225,28 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // (2026-09-06): once ANY prior mechanism flags a needed human decision, nothing
       // here should ever re-decide it, regardless of which reason string it used.
       if (task.needsClarification) continue;
+
+      // Re-admit a task the (now-fixed) forbidden-path gate bug wrongly ran to exhaustion:
+      // its block named one of its OWN declared edit targets, so no blind retry could ever
+      // have differed. The pipeline itself brings it back -- clean slate, retry budget
+      // reset -- exactly once (the forbiddenPathReadmitted stamp bounds it, so a task that
+      // somehow still fails this way after the fix is not re-admitted forever). This is the
+      // deterministic counterpart to an operator manually requeueing it.
+      if (!task.forbiddenPathReadmitted && forbiddenPathBlockNamesOwnTarget(task)) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.forbiddenPathReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+        if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+        summary.requeued++;
+        continue;
+      }
 
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
       // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
