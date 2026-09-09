@@ -59,6 +59,9 @@ function findTaskAnywhere(pipelineDir, taskId) {
   const adhocData = readJsonSafe(path.join(qdir, 'adhoc', `${taskId}.json`));
   if (adhocData) return { data: adhocData, foundState: 'adhoc' };
 
+  const derivedData = readJsonSafe(path.join(qdir, 'derived', `${taskId}.json`));
+  if (derivedData) return { data: derivedData, foundState: 'derived' };
+
   const noActionData = readJsonSafe(path.join(qdir, 'done', '_archived_no_action', `${taskId}.json`));
   if (noActionData) return { data: noActionData, foundState: 'archived' };
 

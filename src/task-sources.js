@@ -323,9 +323,21 @@ function pendingTierCounts() {
 // domain/source are always forced to 'adhoc'/'manual' regardless of what the file itself
 // says, since a hand-edited file could claim anything -- this is the pipeline's fixed
 // contract for this source.
-function nextAdhocTask() {
+//
+// nextDerivedTask (2026-09-09, Grimmethy: "adhoc is bloated with automatically generated
+// brain dump entries... a different task name and priority for tasks that are generated
+// via debrief or the passive scanning/adjacent tell mechanism") reuses this exact claim
+// logic against queue/derived/ -- pipeline-DERIVED follow-up work (a pipeline_debrief
+// Now-What item, a side-finding). Same adhoc SHAPE (domain:'adhoc' so every draft/apply/
+// grounding path is identical -- resolveSourceName() sends it down the adhoc branch), but
+// source:'derived_task' so it has its own Job List row, its own priority (48, the
+// self-maintenance band -- see registerTaskSource below), its own on/off toggle, and it
+// is NOT `alwaysAllowed` in getNextTask() and does NOT preempt every deterministic
+// source the way genuine adhoc does. next-claimable-task.js ranks it at 48, not adhoc's
+// 10 + the bot penalty.
+function nextAdhocLikeTask({ dir, sourceOverride }) {
   const { pipelineDir } = getConfig();
-  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const adhocDir = path.join(pipelineDir, 'queue', dir);
   let entries;
   try {
     entries = fs.readdirSync(adhocDir, { withFileTypes: true });
@@ -412,12 +424,20 @@ function nextAdhocTask() {
       ...parsed,
       id,
       domain: 'adhoc',
-      source: 'manual',
+      source: sourceOverride,
       title: parsed.title ?? `Adhoc task: ${id}`,
     };
   }
 
   return null;
+}
+
+function nextAdhocTask() {
+  return nextAdhocLikeTask({ dir: 'adhoc', sourceOverride: 'manual' });
+}
+
+function nextDerivedTask() {
+  return nextAdhocLikeTask({ dir: 'derived', sourceOverride: 'derived_task' });
 }
 
 // --- Source: research_task (Brain Dump #1 follow-up, 2026-08-17) -- notes brain_dump_sort
@@ -1408,6 +1428,17 @@ function adhocReviewCompletenessQuestion(task) {
 // in an isolated worktree -- see local-draft.js's draftAdhocBranch). 2026-09-01: no
 // longer a Claude route.
 registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'benefit' });
+// derived_task -- pipeline-DERIVED follow-up work routed here by brain_dump_sort when the
+// source brain-dump entry carries a `raisedBy` (a pipeline_debrief Now-What item, a
+// side-finding). Adhoc-shaped (domain:'adhoc', so drafts/applies via the exact adhoc
+// agentic-write path -- resolveSourceName() resolves these to 'adhoc'), but its own row
+// here so the operator can reprioritise / throttle / disable this whole class without
+// touching genuine adhoc. Priority 48 = the self-maintenance band (brain_dump_sort 42,
+// pipeline_forensics 44, path_prefetch_resolve 45), behind genuine adhoc(10) and NOT
+// preempting deterministic sources. next-claimable-task.js honours this 48 rather than
+// adhoc's 10 + BOT_ADHOC_PRIORITY_PENALTY. apply/reviewGuidance mirror adhoc's for the
+// rare code path that looks this source up by its literal name.
+registerTaskSource('derived_task', { priority: taskPriority('derived_task', 48), next: nextDerivedTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'housekeeping' });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
 // task" priority tier as adhoc. reasoningTier: 'high' keeps it on the worker-reasoning
 // lane, but research is the ONE draft path with no local implementation -- WebSearch/
@@ -2544,7 +2575,7 @@ function writeTask(task) {
 
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue,
-  nextTroubleLogTask, nextAdhocTask, nextSecondBrainTask,
+  nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
   nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
