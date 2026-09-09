@@ -26,6 +26,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
@@ -87,6 +88,36 @@ function attemptGate(task, now) {
   if ((a.count || 0) >= MAX_ATTEMPTS) return false;
   const last = Date.parse(a.lastAt || '');
   return !Number.isFinite(last) || now - last >= MIN_RETRY_MS;
+}
+
+// Hot-file exclusion ([[hub-task-integration]], concept-hub-task-integration-549f09): a
+// file with commits in the last N days is not a safe UNATTENDED auto-decompose target.
+// A file-decompose is a whole-file rewrite -- maximal conflict surface -- and the hub
+// takes days; concurrent edits to that file in the window are the norm, and the stacked
+// branch rots (lost a finished split twice: app.py 2026-09-06, index.html 2026-09-09).
+// The file-length-flags advisory entry stays -- a HUMAN can still decompose it
+// deliberately, and Tier-1 fast one-pass decomposes (see the spec) are exempt; this only
+// gates the reactive auto-authoring here. AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS=0 disables.
+const HOT_FILE_DAYS = (() => {
+  const v = process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS;
+  return v === undefined ? 7 : Number(v);
+})();
+
+function fileHasRecentCommits(repoRoot, filePath, days = HOT_FILE_DAYS) {
+  if (!repoRoot || !days || days <= 0) return false;
+  try {
+    const out = execFileSync(
+      'git',
+      ['log', `--since=${days} days ago`, '--oneline', '-1', '--', filePath],
+      { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 },
+    );
+    return out.trim().length > 0;
+  } catch {
+    // A git failure must not silently DISABLE the gate (that would re-open the exact hole
+    // this closes) nor block a legit request forever -- treat "can't tell" as "not hot"
+    // for THIS tick; the request is idempotent so a later tick with a working git re-checks.
+    return false;
+  }
 }
 
 function bumpAttempt(task, now, note) {
@@ -160,6 +191,17 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
       // Already routed on a prior tick (request or hub exists) -- just wire this task to it.
       const alreadyFiled = fs.existsSync(path.join(reqDir, `${requestId}.json`))
         || fs.existsSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`));
+
+      // Hot-file exclusion -- only when nothing is filed yet (never abandon a hub already
+      // in flight). The stuck task keeps its decompose-loop flag for a human; bump the
+      // attempt counter so it isn't re-checked every tick forever.
+      if (!alreadyFiled && fileHasRecentCommits(resolvedRepoRoot, targetFile)) {
+        bumpAttempt(task, now, `${targetFile} has commits in the last ${HOT_FILE_DAYS} days -- not a safe unattended auto-decompose target`);
+        appendHistoryEvent(task, 'advisory', `decompose-loop autoroute: ${targetFile} is actively developed (commit in the last ${HOT_FILE_DAYS}d) -- not auto-decomposing; a human can split it deliberately (concept-hub-task-integration-549f09)`);
+        try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+        summary.skipped += 1;
+        continue;
+      }
 
       try {
         if (!alreadyFiled) {
