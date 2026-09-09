@@ -33,6 +33,11 @@
 // Same division of labor as local-draft.js/apply-task.js: this script mutates and
 // rewrites the task JSON IN PLACE at the given path; the caller (review-runner.sh) owns
 // moving the file to queue/approved/ or queue/blocked/.
+// Scope note (2026-09-09, "Different Scope"): "agent-manager-apply-target" appearing in related
+// task titles (e.g. performance-...-src-review-task-js-74) is this deployment's consumer-checkout
+// NAME (see python/build_graph.py:378, python/dashboard/app.py:6207, scripts/provision-plugin-
+// repo.sh:57) -- NOT a file or module in this repo. Those tasks target THIS file
+// (src/review-task.js, the REVIEW step); the APPLY step is a separate file, src/apply-task.js.
 
 const fs = require('fs');
 const path = require('path');
