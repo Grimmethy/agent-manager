@@ -101,42 +101,113 @@ function topLevelBindingNames(src) {
   return names;
 }
 
-// Names *locally* bound inside a slice of code: any `const/let/var NAME`, `function NAME`,
-// and parameter lists. Used to keep the self-containment check from flagging a moved
-// function's own locals that happen to share a name with a source module-scope binding.
+// Split `s` on top-level commas only (brace/bracket/paren aware). For a binding pattern
+// or a param list.
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out.filter((p) => p.trim());
+}
+
+// The NAMES a binding pattern introduces -- NOT the identifiers in its default-value
+// expressions or its object-literal keys. `{ a, b: c, d = e() }` -> a, c, d.
+// `[x, , ...y]` -> x, y. `a = someHelper()` -> a. Handles one level of nesting.
+function bindingNamesFromPattern(pat) {
+  const names = new Set();
+  let p = pat.trim();
+  if (!p) return names;
+  // strip a top-level default: everything from the first top-level `=` that is not `==`/`=>`
+  {
+    let depth = 0;
+    for (let i = 0; i < p.length; i++) {
+      const c = p[i];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth--;
+      else if (c === '=' && depth === 0 && p[i + 1] !== '=' && p[i + 1] !== '>' && p[i - 1] !== '=' && p[i - 1] !== '!' && p[i - 1] !== '<' && p[i - 1] !== '>') {
+        p = p.slice(0, i);
+        break;
+      }
+    }
+    p = p.trim();
+  }
+  p = p.replace(/^\.\.\.\s*/, '');
+  if (p.startsWith('{')) {
+    const inner = p.slice(1, p.lastIndexOf('}'));
+    for (const part of splitTopLevel(inner)) {
+      const t = part.trim().replace(/^\.\.\.\s*/, '');
+      const colon = (() => { // first top-level colon
+        let d = 0;
+        for (let i = 0; i < t.length; i++) {
+          const c = t[i];
+          if (c === '(' || c === '[' || c === '{') d++;
+          else if (c === ')' || c === ']' || c === '}') d--;
+          else if (c === ':' && d === 0) return i;
+        }
+        return -1;
+      })();
+      if (colon !== -1) {
+        for (const n of bindingNamesFromPattern(t.slice(colon + 1))) names.add(n);
+      } else {
+        const nm = t.replace(/\s*=[\s\S]*$/, '').trim();
+        if (/^[A-Za-z_$][\w$]*$/.test(nm)) names.add(nm);
+      }
+    }
+  } else if (p.startsWith('[')) {
+    const inner = p.slice(1, p.lastIndexOf(']'));
+    for (const part of splitTopLevel(inner)) for (const n of bindingNamesFromPattern(part)) names.add(n);
+  } else {
+    const nm = p.split(/[\s:]/)[0].trim();
+    if (/^[A-Za-z_$][\w$]*$/.test(nm)) names.add(nm);
+  }
+  return names;
+}
+
+// Names *locally* bound inside a slice of code: `const/let/var` declarations (incl.
+// destructuring), `function NAME`, parameter lists, and for/catch bindings. Used to keep
+// the self-containment check from flagging a moved function's own locals that happen to
+// share a name with a source module-scope binding. CRUCIAL that it does NOT pick up
+// identifiers from a parameter's DEFAULT VALUE expression -- `function f(a, ms = helper())`
+// binds `a` and `ms`, not `helper` (2026-09-09 incident: a moved fn's real module-scope
+// dependency lived in a default param, got treated as a local, slipped the check, and the
+// merged split threw ReferenceError at call time).
 function locallyBoundNames(code) {
   const clean = stripStringsAndComments(code);
   const names = new Set();
   let m;
-  const declRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g;
+
+  // const/let/var -- simple `= ` (name before the first `=`) and destructuring patterns
+  // (one level of nesting handled explicitly, since regex can't balance braces).
+  const declRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?==|;|\bin\b|\bof\b|$)/g;
   while ((m = declRe.exec(clean))) names.add(m[1]);
-  const destructRe = /\b(?:const|let|var)\s*[{[]([^}\]]+)[}\]]/g;
-  while ((m = destructRe.exec(clean))) {
-    for (const part of m[1].split(',')) {
-      const nm = part.split(':').pop().trim().replace(/\s*=[\s\S]*$/, '').replace(/\.\.\./, '');
-      if (/^[A-Za-z_$][\w$]*$/.test(nm)) names.add(nm);
-    }
-  }
-  // Parameter lists: `function name(...)` and `(...) =>`. Pull EVERY identifier out of the
-  // param group (including destructured `{ a, b: c }` / `[d]` and defaults) -- being
-  // generous here only ever suppresses a false external-ref flag for a genuine local.
+  const declPatRe = /\b(?:const|let|var)\s*(\{(?:[^{}]|\{[^{}]*\})*\}|\[(?:[^[\]]|\[[^[\]]*\])*\])\s*=/g;
+  while ((m = declPatRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
+
+  // function name(<params>) and (<params>) =>
   const paramGroups = [];
-  const fnRe = /\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(([\s\S]*?)\)/g;
+  const fnRe = /\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(([\s\S]*?)\)\s*\{/g;
   while ((m = fnRe.exec(clean))) { if (m[1]) names.add(m[1]); paramGroups.push(m[2]); }
   const arrowRe = /\(([\s\S]*?)\)\s*=>/g;
   while ((m = arrowRe.exec(clean))) paramGroups.push(m[1]);
-  for (const g of paramGroups) {
-    let pm;
-    const idRe = /[A-Za-z_$][\w$]*/g;
-    while ((pm = idRe.exec(g))) names.add(pm[0]);
-  }
+  for (const g of paramGroups) for (const part of splitTopLevel(g)) for (const n of bindingNamesFromPattern(part)) names.add(n);
+
+  // single-identifier arrow: `x => ...`
   const singleArrowRe = /(?:^|[^\w$)."'`])\s*([A-Za-z_$][\w$]*)\s*=>/g;
   while ((m = singleArrowRe.exec(clean))) names.add(m[1]);
-  // for/catch bindings
-  const forRe = /\bfor\s*\(\s*(?:const|let|var)?\s*([A-Za-z_$][\w$]*)/g;
-  while ((m = forRe.exec(clean))) names.add(m[1]);
+
+  // for (const X of ...) / for (X = ...) / catch (e)
+  const forRe = /\bfor\s*\(\s*(?:const|let|var)?\s*([{[][\s\S]*?[}\]]|[A-Za-z_$][\w$]*)/g;
+  while ((m = forRe.exec(clean))) for (const n of bindingNamesFromPattern(m[1])) names.add(n);
   const catchRe = /\bcatch\s*\(\s*([A-Za-z_$][\w$]*)/g;
   while ((m = catchRe.exec(clean))) names.add(m[1]);
+
   return names;
 }
 
@@ -304,7 +375,7 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
  * @param {Array<{newFile:string, symbols:string[]}>} moves
  * @returns {{ok:true, changes:Array} | {ok:false, reason:string, externalRefs?:string[], problems?:Array}}
  */
-function buildNodeModuleOnePassChanges(sourceText, sourceFile, moves) {
+function buildNodeModuleOnePassChanges(sourceText, sourceFile, moves, repoRoot = null) {
   if (!/\.(js|mjs|cjs)$/.test(sourceFile || '')) return { ok: false, reason: 'source is not a .js/.mjs/.cjs file' };
   if (!Array.isArray(moves) || moves.length < 1) return { ok: false, reason: 'need at least one move' };
   const creates = [];
@@ -328,6 +399,18 @@ function buildNodeModuleOnePassChanges(sourceText, sourceFile, moves) {
   // never be returned as ok. Cheap: N+1 short-lived `node --check` spawns.
   const parseErr = firstNodeCheckError(changes);
   if (parseErr) return { ok: false, reason: `produced file does not pass \`node --check\` -- ${parseErr}` };
+
+  // EXECUTION guard (2026-09-09 incident): a split can be syntactically perfect yet drop a
+  // real dependency -- a module-scope const referenced only inside the moved code, or (the
+  // one that actually shipped broken) a helper called from a parameter's DEFAULT value.
+  // `node --check` is parse-only. This applies the whole change set to a throwaway copy of
+  // the source's directory, `require()`s the reduced module, and calls every plain
+  // (non-side-effecting-looking) exported function -- a ReferenceError from either the load
+  // or a call is a dropped dependency. Skipped only when repoRoot is unavailable.
+  if (repoRoot) {
+    const rte = firstRuntimeError(changes, sourceFile, repoRoot);
+    if (rte) return { ok: false, reason: `produced split fails at runtime -- ${rte}` };
+  }
 
   return { ok: true, changes };
 }
@@ -353,6 +436,60 @@ function firstNodeCheckError(changes) {
       }
     }
     return null;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Apply the change set to a throwaway copy of the source file's directory, require() the
+// reduced module, and call every plain exported function; return the first ReferenceError
+// (a dropped module-scope dependency), a load failure, or null. Side-effect-looking
+// exports (write/apply/save/generate/run/queue/commit/push/delete/sync/...) are NOT
+// invoked -- only their presence in module.exports is proven by the successful require().
+function firstRuntimeError(changes, sourceFile, repoRoot) {
+  const os = require('os');
+  const fs = require('fs');
+  const { execFileSync } = require('child_process');
+  const srcDir = path.join(repoRoot, path.dirname(sourceFile));
+  const base = path.basename(sourceFile);
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-runtime-'));
+    fs.cpSync(srcDir, dir, { recursive: true });
+  } catch (e) {
+    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    return null; // can't stage a runnable copy -- fall back to the static + parse guards
+  }
+  try {
+    for (const ch of changes) {
+      const body = ch.mode === 'create' ? ch.content : ch.replace;
+      if (typeof body !== 'string') continue;
+      fs.writeFileSync(path.join(dir, path.basename(ch.file)), body);
+    }
+    const probe = [
+      'const path=require("path");',
+      `const m=require(${JSON.stringify(path.join(dir, base))});`,
+      'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build)/i;',
+      'for(const [k,v] of Object.entries(m||{})){',
+      '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
+      '  try{ v(); }catch(e){',
+      '    if(e && e.name==="ReferenceError"){ process.stderr.write("RTE "+k+": "+e.message); process.exit(3); }',
+      '  }',
+      '}',
+    ].join('\n');
+    try {
+      execFileSync('node', ['-e', probe], {
+        cwd: dir, timeout: 20_000, stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot },
+      });
+      return null;
+    } catch (e) {
+      const err = String((e && e.stderr) || (e && e.message) || e);
+      if (e && e.status === 3) return err.replace(/^RTE\s*/, '').split('\n')[0].slice(0, 200);
+      // any other non-zero exit == the reduced module could not even be require()d
+      const line = err.split('\n').find((l) => /Error:|ReferenceError|is not defined/.test(l)) || 'module failed to load';
+      return `${sourceFile}: ${line.trim().slice(0, 200)}`;
+    }
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
@@ -385,9 +522,12 @@ module.exports = {
   planIsFullyMechanicalNodeModule,
   topLevelBindingNames,
   locallyBoundNames,
+  bindingNamesFromPattern,
+  splitTopLevel,
   referencedIdentifiers,
   splitRequirePrelude,
   firstNodeCheckError,
+  firstRuntimeError,
   allTopLevelRequireStatements,
   JS_GLOBALS,
 };

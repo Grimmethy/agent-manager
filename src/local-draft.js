@@ -1354,7 +1354,7 @@ function tryDeterministicNodeModuleDecompose(task, attempt) {
   try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
 
   const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-  const built = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+  const built = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves, repoRoot);
   if (!built.ok) {
     appendHistoryEvent(task, 'advisory', `deterministic node-module decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
     return null;

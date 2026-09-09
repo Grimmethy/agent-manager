@@ -3,12 +3,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const vm = require('vm');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const {
   buildNodeModuleExtraction,
   buildNodeModuleOnePassChanges,
   planIsFullyMechanicalNodeModule,
   topLevelBindingNames,
   locallyBoundNames,
+  bindingNamesFromPattern,
+  firstRuntimeError,
   splitRequirePrelude,
 } = require('./decompose-node-module.js');
 
@@ -276,4 +281,64 @@ test('buildNodeModuleOnePassChanges: new file drops the source prose header, kee
 test('locallyBoundNames: params, destructures, nested fns', () => {
   const names = locallyBoundNames('function f(a, b = 2, { c, d: e }) { const g = 1; let [h] = x; return a; }');
   for (const n of ['f', 'a', 'b', 'c', 'e', 'g', 'h']) assert.ok(names.has(n), `expected ${n}`);
+});
+
+test('locallyBoundNames: a param DEFAULT-VALUE expression is NOT treated as a local binding (2026-09-09 regression)', () => {
+  const names = locallyBoundNames('function isStale(task, now, thresholdMs = stalenessThresholdMs()) { return lastActivityTs(task) < now - thresholdMs; }');
+  assert.ok(names.has('task') && names.has('now') && names.has('thresholdMs') && names.has('isStale'));
+  assert.ok(!names.has('stalenessThresholdMs'), 'the helper in the default value is a DEPENDENCY, not a local');
+  assert.ok(!names.has('lastActivityTs'), 'a call in the body is a dependency');
+});
+
+test('locallyBoundNames: object-literal keys in a destructure are not bindings; nested defaults are excluded', () => {
+  const names = locallyBoundNames('const { alpha, beta: b2, gamma = helper(), delta: { deep } = fallback() } = x;');
+  for (const n of ['alpha', 'b2', 'gamma', 'deep']) assert.ok(names.has(n), `expected ${n}`);
+  assert.ok(!names.has('beta'), 'beta is a key, b2 is the binding');
+  assert.ok(!names.has('helper') && !names.has('fallback'), 'default-value calls are not bindings');
+});
+
+test('bindingNamesFromPattern: strips defaults + keys, keeps rest', () => {
+  assert.deepEqual([...bindingNamesFromPattern('a = f()')], ['a']);
+  assert.deepEqual([...bindingNamesFromPattern('...rest')], ['rest']);
+  assert.deepEqual([...bindingNamesFromPattern('{ x, y: z }')].sort(), ['x', 'z']);
+});
+
+test('buildNodeModuleExtraction: BLOCKS a move whose fn needs a helper only via a default param', () => {
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'function THRESH() { return 5; }',
+    '',
+    'function alpha(x, n = THRESH()) { return x + n; }',
+    '',
+    'function beta(x) { return alpha(x) * 2; }',
+    '',
+    'module.exports = { THRESH, alpha, beta };',
+    '',
+  ].join('\n');
+  const r = buildNodeModuleExtraction(src, 'src/m.js', 'src/m-ab.js', ['alpha', 'beta']);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /not a self-contained move.*THRESH/);
+});
+
+test('firstRuntimeError: null for a self-contained split that require()s + calls cleanly; catches a ReferenceError', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'rte-test-'));
+  const srcDir = path.join(repo, 'src');
+  fs.mkdirSync(srcDir);
+  fs.writeFileSync(path.join(srcDir, 'sib.js'), "module.exports = { two: () => 2 };\n");
+
+  const goodChanges = [
+    { mode: 'create', file: 'src/m-pure.js', content: "'use strict';\nfunction pure(x) { return x + 1; }\nmodule.exports = { pure };\n" },
+    { mode: 'edit', file: 'src/m.js', find: 'x', replace: "'use strict';\nconst { two } = require('./sib.js');\nconst { pure } = require('./m-pure.js');\nfunction other() { return pure(two()); }\nmodule.exports = { pure, other };\n" },
+  ];
+  assert.equal(firstRuntimeError(goodChanges, 'src/m.js', repo), null);
+
+  // broken: a moved fn references a name that no longer exists once relocated
+  const badChanges = [
+    { mode: 'create', file: 'src/m-pure.js', content: "'use strict';\nfunction pure(x) { return x + GONE; }\nmodule.exports = { pure };\n" },
+    { mode: 'edit', file: 'src/m.js', find: 'x', replace: "'use strict';\nconst { pure } = require('./m-pure.js');\nmodule.exports = { pure };\n" },
+  ];
+  const err = firstRuntimeError(badChanges, 'src/m.js', repo);
+  assert.ok(err && /GONE|not defined|ReferenceError/.test(err), String(err));
 });
