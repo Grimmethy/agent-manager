@@ -6653,6 +6653,7 @@ _SOURCE_TO_DOMAIN_KEY = {
     "unused_export": "default",
     "project_search": "project_search", "deep_dive": "deep_dive",
     "brain_dump_sort": "brain_dump_sort", "secondbrain": "secondbrain", "adhoc": "adhoc",
+    "derived_task": "adhoc",
     "path_prefetch_resolve": "path_prefetch_resolve", "pipeline_self_audit": "adhoc",
     "pipeline_forensics": "default", "pipeline_forensics_fix": "default",
     "change_review": "default", "change_review_fix": "default",
@@ -6689,6 +6690,7 @@ SOURCE_DOMAIN_LABELS = {"default": "(project default)"}
 # renders a blank description cell.
 SOURCE_DESCRIPTIONS = {
     "adhoc": "Manually submitted one-off task, queued via queue-adhoc-task.js. Drop-everything priority lane.",
+    "derived_task": "Pipeline-DERIVED follow-up work (a pipeline_debrief Now-What item, a passive side-finding) that brain_dump_sort routed to queue/derived/. Adhoc-shaped, but its own throttleable lane at priority 48 -- it does NOT preempt deterministic sources the way genuine adhoc does.",
     "research_task": "A captured Brain Dump entry brain_dump_sort classified as requiresResearch (queue/research/*.json), drafted by research-agentic-draft.js's WebSearch/WebFetch-backed agentic call. Always high-reasoning-tier. Same \"drop everything\" priority as adhoc.",
     "trouble_log": "Entries in the project's trouble-log doc flagged ready-for-agent (\U0001f916 marker).",
     "secondbrain": "Oldest unprocessed note in a SecondBrain-style Inbox/ folder.",

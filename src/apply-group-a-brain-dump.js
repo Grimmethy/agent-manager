@@ -217,12 +217,23 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
 
     if (validDomains.includes('adhoc')) {
       const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+      // A brain-dump entry with a `raisedBy` was machine-filed (side-finding-sweep.js:
+      // a pipeline_debrief Now-What item, or any pass's writeSideFindingInbox side
+      // finding) -- NOT a human handing the pipeline a task. Route it to queue/derived/
+      // (source: derived_task, priority 48) instead of queue/adhoc/ (priority 10, preempts
+      // every deterministic source), so this whole class is its own throttleable Job List
+      // lane. A human-typed entry has no raisedBy and stays genuine adhoc. If it still
+      // needs clarification (below), it goes to needs-clarification either way -- a human
+      // resolving it there re-files it as real adhoc, which is correct (they vouched for it).
+      const isDerived = !!(entry && entry.raisedBy);
       const adhocTask = {
         id: queuedId,
         domain: 'adhoc',
-        source: 'brain_dump',
+        source: isDerived ? 'derived_task' : 'brain_dump',
         title: rawText.slice(0, 120),
-        promptContext: { rawText, brainDumpEntryId },
+        promptContext: isDerived
+          ? { rawText, brainDumpEntryId, derivedFrom: entry.raisedBy }
+          : { rawText, brainDumpEntryId },
       };
 
       // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
@@ -252,7 +263,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         // simply never triggers the fallback, same behavior as before this existed.
         uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
       });
-      let adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      let adhocDir = path.join(matchedProject.pipelineDir, 'queue', isDerived ? 'derived' : 'adhoc');
       if (anchorResult.status === 'matched') {
         adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
       } else if (anchorResult.status === 'no-match') {

@@ -101,6 +101,18 @@ test('effectivePriority: premiumPriority always wins, -Infinity, regardless of s
   assert.equal(effectivePriority({ source: 'trouble_log', premiumPriority: true }, 20, resolveSourceName), -Infinity);
 });
 
+test('pickClaimableTasks: a derived_task ranks at its own registered priority (48), not adhoc 10 + the bot penalty', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'human-adhoc', { source: 'adhoc', domain: 'adhoc', humanQueued: true });     // 10
+  writeTask(pendingDir, 'bot-adhoc', { source: 'adhoc', domain: 'adhoc' });                           // 10 + 30 = 40
+  writeTask(pendingDir, 'derived', { source: 'derived_task', domain: 'adhoc',                         // 48 -- its OWN row
+    promptContext: { rawText: 'x', derivedFrom: { source: 'pipeline_debrief' } } });
+
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true });
+
+  assert.deepEqual(items, ['human-adhoc.json', 'bot-adhoc.json', 'derived.json']);
+});
+
 test('pickClaimableTasks: a human-queued adhoc task is claimed before a bot-originated one of the same source, oldest-bot-first tie-break still applies within each tier', () => {
   const pendingDir = setupPending();
   writeTask(pendingDir, 'bot-adhoc-a', { source: 'adhoc' });                          // no humanQueued -> demoted
