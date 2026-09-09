@@ -155,22 +155,72 @@ function referencedIdentifiers(code) {
   return out;
 }
 
-// The leading module prelude: 'use strict' + the head comment block + every top-level
-// `require(...)` line (through the LAST one), so the new module starts life with the same
-// imports available. Returns { prelude, body } where body is everything after.
+// One top-level statement starting at line index `i` (column 0). Accumulates continuation
+// lines until the statement terminates with `;` at end-of-line (capped), so a multi-line
+// `const {\n a,\n b\n} = require('x');` is one unit. Returns { text, endExclusive }.
+function readTopLevelStatement(lines, i) {
+  let j = i;
+  let buf = lines[i];
+  while (!/;\s*$/.test(buf.trimEnd()) && j < lines.length - 1 && j - i < 40) {
+    // A new column-0 statement keyword on the next line means the current one had no
+    // trailing `;` -- stop here rather than swallowing it.
+    if (/^(?:const|let|var|function|class|async\s|module\.exports|if\b|for\b|while\b|return\b)/.test(lines[j + 1] || '')) break;
+    j += 1;
+    buf += `\n${lines[j]}`;
+  }
+  return { text: buf, endExclusive: j + 1 };
+}
+
+// The module prelude: the CONTIGUOUS run of `'use strict'`, comments, and top-level
+// `require(...)` / `import` statements at the very top of the file -- STOPPING at the first
+// real code (a `function`, a `class`, a non-require `const/let/var`, or executable code).
+// A `require()` that appears LATER in the file (a lazy/local-ish import after real code) is
+// deliberately NOT part of the prelude -- putting the back-require after it would splice it
+// into the middle of the module (the 2026-09-09 staleness-audit.js / apply-group-a.js
+// corruption). Returns { prelude, body }.
 function splitRequirePrelude(src) {
   const lines = src.split('\n');
-  let lastRequire = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^(?:const|let|var|import)\b/.test(lines[i]) && /\brequire\s*\(|^\s*import\b/.test(lines[i])) lastRequire = i;
-    else if (/^\s*require\s*\(/.test(lines[i])) lastRequire = i;
+  let i = 0;
+  let preludeEnd = 0; // exclusive
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    if (/^\s*['"]use strict['"];?\s*$/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^\s*\/\//.test(line)) { i++; continue; }
+    if (/^\s*\/\*/.test(line)) {
+      while (i < lines.length && !/\*\//.test(lines[i])) i++;
+      i += 1;
+      continue;
+    }
+    if (/^import\b/.test(line)) { preludeEnd = i + 1; i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stmt.text)) { preludeEnd = stmt.endExclusive; i = stmt.endExclusive; continue; }
+      break; // a non-require declaration == real code
+    }
+    break; // function / class / executable == real code
   }
-  if (lastRequire === -1) {
-    let i = 0;
-    while (i < lines.length && (/^\s*$/.test(lines[i]) || /^\s*\/\//.test(lines[i]) || /^\s*\/\*/.test(lines[i]) || /\*\/\s*$/.test(lines[i]) || /^\s*['"]use strict['"];?\s*$/.test(lines[i]))) i++;
-    return { prelude: lines.slice(0, i).join('\n'), body: lines.slice(i).join('\n') };
+  return { prelude: lines.slice(0, preludeEnd).join('\n'), body: lines.slice(preludeEnd).join('\n') };
+}
+
+// EVERY top-level `require(...)` / `import` statement in the whole file, not just the
+// prelude ones -- a module-scope `const { x } = require('./y')` that sits AFTER real code
+// still binds `x` module-wide, so the self-containment check and the new module both need
+// to know about it.
+function allTopLevelRequireStatements(src) {
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^import\b/.test(line)) { out.push(line); i++; continue; }
+    if (/^(?:const|let|var|require)\b/.test(line) && /\brequire\s*\(/.test(line.split('//')[0])) {
+      const stmt = readTopLevelStatement(lines, i);
+      if (/\brequire\s*\(/.test(stmt.text)) { out.push(stmt.text); i = stmt.endExclusive; continue; }
+    }
+    i++;
   }
-  return { prelude: lines.slice(0, lastRequire + 1).join('\n'), body: lines.slice(lastRequire + 1).join('\n') };
+  return out;
 }
 
 /**
@@ -197,8 +247,8 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
 
   const moved = new Set(symbols);
   const sourceBindings = topLevelBindingNames(sourceText);
-  const { prelude } = splitRequirePrelude(sourceText);
-  const requireBound = topLevelBindingNames(prelude);
+  const allRequires = allTopLevelRequireStatements(sourceText);
+  const requireBound = topLevelBindingNames(allRequires.join('\n'));
   const locals = locallyBoundNames(ex.newFileContent);
   const refs = referencedIdentifiers(ex.newFileContent);
 
@@ -214,9 +264,16 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
 
   const newBase = path.basename(newFile).replace(/\.(js|mjs|cjs)$/, '');
   const hadUseStrict = /^\s*(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*['"]use strict['"]/.test(sourceText);
-  // Only the `require(...)` lines carry over -- NOT the source's prose head comment (that
-  // describes the source, not this new slice). An over-copied require is harmless.
-  const requireLines = prelude.split('\n').filter((l) => /^(?:const|let|var|import)\b.*\brequire\s*\(|^\s*require\s*\(|^\s*import\b/.test(l));
+  // Carry over only the `require(...)` statements whose bound name(s) the moved code
+  // actually references (plus any bare side-effect `require('./x')`). NOT the source's
+  // prose head comment (it describes the source, not this slice). A require whose binding
+  // is never referenced would be dead in the new module, so it is dropped.
+  const requireLines = allRequires.filter((rl) => {
+    const bound = topLevelBindingNames(rl);
+    if (bound.size === 0) return true; // bare `require('./side-effect')`
+    for (const n of bound) if (refs.has(n)) return true;
+    return false;
+  });
   const parts = [];
   if (hadUseStrict) parts.push("'use strict';\n");
   parts.push(`// ${path.basename(newFile)} -- extracted from ${sourceFile} ([[hub-task-integration]] node-module decompose).\n`);
@@ -263,7 +320,42 @@ function buildNodeModuleOnePassChanges(sourceText, sourceFile, moves) {
     creates.push({ mode: 'create', file: move.newFile, content: one.newContent });
     cur = one.reduced; // next move extracts from here; its back-require is already in the prelude
   }
-  return { ok: true, changes: [...creates, { mode: 'edit', file: sourceFile, find: sourceText, replace: cur }] };
+  const changes = [...creates, { mode: 'edit', file: sourceFile, find: sourceText, replace: cur }];
+
+  // Independent final guard (2026-09-09 incident): write every produced file and run the
+  // REAL `node --check` on it -- not the vm oracle, not this module's own splice logic. A
+  // corrupt splice that still happened to vm-parse (or that only broke once applied) can
+  // never be returned as ok. Cheap: N+1 short-lived `node --check` spawns.
+  const parseErr = firstNodeCheckError(changes);
+  if (parseErr) return { ok: false, reason: `produced file does not pass \`node --check\` -- ${parseErr}` };
+
+  return { ok: true, changes };
+}
+
+// Returns the first `node --check` failure across a change set (`<file>: <first stderr line>`),
+// or null if every produced file parses.
+function firstNodeCheckError(changes) {
+  const os = require('os');
+  const fs = require('fs');
+  const { execFileSync } = require('child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-nodecheck-'));
+  try {
+    for (const ch of changes) {
+      const body = ch.mode === 'create' ? ch.content : ch.replace;
+      if (typeof body !== 'string') continue;
+      const fp = path.join(dir, `${path.basename(ch.file)}.__check__.js`);
+      fs.writeFileSync(fp, body);
+      try {
+        execFileSync('node', ['--check', fp], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 15_000 });
+      } catch (e) {
+        const line = String((e && e.stderr) || (e && e.message) || e).split('\n').find((l) => /SyntaxError|Error:/.test(l)) || 'parse failed';
+        return `${ch.file}: ${line.trim().slice(0, 200)}`;
+      }
+    }
+    return null;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
 }
 
 // Put the back-require on its own line immediately after the reduced source's require
@@ -295,5 +387,7 @@ module.exports = {
   locallyBoundNames,
   referencedIdentifiers,
   splitRequirePrelude,
+  firstNodeCheckError,
+  allTopLevelRequireStatements,
   JS_GLOBALS,
 };
