@@ -77,26 +77,26 @@ function stripStringsAndComments(code) {
 // destructured `const { a, b: c } = ...`). Column-0 only == genuinely module scope.
 function topLevelBindingNames(src) {
   const names = new Set();
-  for (const raw of src.split('\n')) {
+  const lines = src.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
     if (!/^(?:async\s+function|function|const|let|var|class)\b/.test(raw)) continue;
     let m;
     if ((m = raw.match(/^(?:async\s+function|function)\s*\*?\s*([A-Za-z_$][\w$]*)/))) { names.add(m[1]); continue; }
     if ((m = raw.match(/^class\s+([A-Za-z_$][\w$]*)/))) { names.add(m[1]); continue; }
-    if ((m = raw.match(/^(?:const|let|var)\s*\{([^}]+)\}/))) {
-      for (const part of m[1].split(',')) {
-        const nm = part.split(':').pop().trim().replace(/\s*=[\s\S]*$/, '').replace(/\.\.\./, '');
-        if (/^[A-Za-z_$][\w$]*$/.test(nm)) names.add(nm);
-      }
-      continue;
+    // const/let/var: read the WHOLE logical statement -- a destructure can span many
+    // physical lines (`const {\n  a,\n  b,\n} = require('./x')`). A line-only match missed
+    // every member of a multi-line destructured require, so its bound names looked like
+    // free globals to the self-containment check (2026-09-09: parseBrainDumpSortResult).
+    const stmt = readTopLevelStatement(lines, i);
+    const decl = stripStringsAndComments(stmt.text).replace(/^(?:const|let|var)\s+/, '');
+    const dm = decl.match(/^(\{[\s\S]*\}|\[[\s\S]*\])\s*=/);
+    if (dm) {
+      for (const n of bindingNamesFromPattern(dm[1])) names.add(n);
+    } else if ((m = decl.match(/^([A-Za-z_$][\w$]*)/))) {
+      names.add(m[1]);
     }
-    if ((m = raw.match(/^(?:const|let|var)\s*\[([^\]]+)\]/))) {
-      for (const part of m[1].split(',')) {
-        const nm = part.trim().replace(/\s*=[\s\S]*$/, '').replace(/\.\.\./, '');
-        if (/^[A-Za-z_$][\w$]*$/.test(nm)) names.add(nm);
-      }
-      continue;
-    }
-    if ((m = raw.match(/^(?:const|let|var)\s+([A-Za-z_$][\w$]*)/))) names.add(m[1]);
+    i = stmt.endExclusive - 1;
   }
   return names;
 }
@@ -211,16 +211,20 @@ function locallyBoundNames(code) {
   return names;
 }
 
-// Identifiers *read* in a slice of code -- word tokens not preceded by `.` and not an
-// object-literal key. Over-reports (locals, params) -- callers filter those out.
+// Identifiers *read* in a slice of code -- word tokens not preceded by a single `.`
+// (member access) and not an object-literal key. A `...` prefix is spread/rest, NOT
+// member access, so `...listArchivedMonthDirs(x)` DOES read `listArchivedMonthDirs`
+// (2026-09-09: a require-bound name reached only via spread was dropped from the carried
+// requires -> ReferenceError at call time, past both the parse and no-arg runtime guard).
+// Over-reports (locals, params) -- callers filter those out.
 function referencedIdentifiers(code) {
   const clean = stripStringsAndComments(code);
   const out = new Set();
-  const re = /(\.)?\b([A-Za-z_$][\w$]*)\b(\s*:(?![:=]))?/g;
+  const re = /(\.\.\.|\.)?\b([A-Za-z_$][\w$]*)\b(\s*:(?![:=]))?/g;
   let m;
   while ((m = re.exec(clean))) {
-    if (m[1] === '.') continue;
-    if (m[3]) continue;
+    if (m[1] === '.') continue; // member access -- not a free read
+    if (m[3]) continue;         // object-literal key
     out.add(m[2]);
   }
   return out;
@@ -285,9 +289,14 @@ function allTopLevelRequireStatements(src) {
   while (i < lines.length) {
     const line = lines[i];
     if (/^import\b/.test(line)) { out.push(line); i++; continue; }
-    if (/^(?:const|let|var|require)\b/.test(line) && /\brequire\s*\(/.test(line.split('//')[0])) {
+    if (/^(?:const|let|var|require)\b/.test(line)) {
+      // Don't require `require(` on the FIRST line -- a multi-line destructured require
+      // (`const {\n  a,\n  b,\n} = require('./x')`) has the call several lines down. Read
+      // the whole logical statement, then test that for `require(`.
       const stmt = readTopLevelStatement(lines, i);
-      if (/\brequire\s*\(/.test(stmt.text)) { out.push(stmt.text); i = stmt.endExclusive; continue; }
+      if (/\brequire\s*\(/.test(stripStringsAndComments(stmt.text))) {
+        out.push(stmt.text); i = stmt.endExclusive; continue;
+      }
     }
     i++;
   }
