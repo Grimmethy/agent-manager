@@ -39,6 +39,7 @@ const fs = require('fs');
 const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
+const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
@@ -1029,10 +1030,16 @@ async function runPlanPass(task, {
     }
   }
 
+  // Hub status grounding (2026-09-09) -- see hub-status-grounding.js's own header for the
+  // real incident this closes. Cheap/deterministic like buildPlanGrounding above; null for
+  // any non-decomposed task, so this is a no-op for the overwhelming majority of tasks.
+  try { task._hubStatusGrounding = buildHubStatusGrounding(task); } catch { task._hubStatusGrounding = null; }
+
   if (seedPlan) task._seedPlan = seedPlan;
   const planPrompt = buildPlanPrompt(task);
   delete task._seedPlan; // transient -- the seed is baked into planPrompt now; never persist it
   delete task._planGrounding; // transient -- baked into planPrompt; planWasGrounded persists
+  delete task._hubStatusGrounding; // transient -- baked into planPrompt
 
   const planNumPredict = computePlanNumPredict(task);
   const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');

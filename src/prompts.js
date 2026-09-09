@@ -343,6 +343,14 @@ function planGroundingBlock(task) {
   ];
 }
 
+// Hub status grounding (2026-09-09, see hub-status-grounding.js's own header for the real
+// incident this closes) -- [] for any non-decomposed task (the overwhelming majority).
+function hubStatusGroundingBlock(task) {
+  const g = task && typeof task._hubStatusGrounding === 'string' ? task._hubStatusGrounding.trim() : '';
+  if (!g) return [];
+  return ['', g];
+}
+
 function statedAcceptanceBlock(task) {
   const ctx = (task && task.promptContext) || {};
   const raw = ctx.acceptanceCriteria;
@@ -418,6 +426,7 @@ function adhocPlanPrompt(task) {
     ...seedPlanBlock(task),
     ...planCritiqueFeedbackBlock(task),
     ...planGroundingBlock(task),
+    ...hubStatusGroundingBlock(task),
   ].join('\n');
 }
 
@@ -1898,7 +1907,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents,
-  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, planCritiqueFeedbackBlock,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
   driftFixPlanPrompt, driftFixImplementPrompt,
