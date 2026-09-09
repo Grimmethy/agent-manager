@@ -3095,7 +3095,28 @@ def api_task_requeue(state, task_id):
         fresh["noDecompose"] = data["noDecompose"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
     return jsonify({"id": task_id, "requeued": True})
+
+
+def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual"):
+    """Best-effort: record an operator-initiated requeue into requeue-attribution.db with
+    actor='operator-manual', so the Ghost-in-the-Machine concept card can trend hand-fixes
+    against pipeline-mechanism recoveries. Never raises -- a telemetry write must not turn
+    a working requeue into a 500. See requeue_attribution_client.py."""
+    try:
+        import requeue_attribution_client
+        d = get_pipeline_dir()
+        requeue_attribution_client.classify_requeue(
+            task,
+            reason_hint=reason_hint,
+            requeue_writer=requeue_writer,
+            actor=actor,
+            blocked_stage=(task or {}).get("blockedStage"),
+            pipeline_dir=str(d) if d else None,
+        )
+    except Exception:
+        pass
 
 
 @app.route("/api/task/needs-clarification/<task_id>/resolve", methods=["POST"])
@@ -3129,6 +3150,7 @@ def api_task_resolve_clarification(task_id):
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
+    _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual")
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
@@ -3178,6 +3200,7 @@ def api_task_answer_clarification(task_id):
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
+    _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual")
     return jsonify({"id": task_id, "answered": True})
 
 
@@ -4224,6 +4247,86 @@ def read_concepts() -> list:
     data = read_json_safe(path)
     concepts = data.get("concepts") if isinstance(data, dict) else None
     return concepts if isinstance(concepts, list) else []
+
+
+GHOST_CONCEPT_ID = "concept-ghost-in-the-machine-0dbeea"
+_GHOST_HAND_FIX_ACTORS = ("operator-manual", "agent-session")
+
+
+def _requeue_attribution_db_path() -> Path | None:
+    v = os.environ.get("AGENT_MANAGER_REQUEUE_ATTRIBUTION_DB_PATH")
+    if v:
+        return Path(v)
+    d = get_pipeline_dir()
+    return (d / "requeue-attribution.db") if d else None
+
+
+def _ghost_telemetry(days: int = 30) -> dict:
+    """Read requeue-attribution.db's `actor` dimension straight (stdlib sqlite3, read-only)
+    -- the Node getActorRollup's Python twin. 'hand-fixes' = operator-manual + agent-session
+    (a person or an assistant tool clicked Requeue); 'mechanism recoveries' =
+    pipeline-mechanism (a watchdog sweep, no one in the loop). Plus openDebt = the count of
+    distinct still-open ghost-debt signatures (Part B's queue/ghost-debt-state.json).
+    Everything degrades to zero on a missing db / table / column."""
+    out = {
+        "window": f"{days}d",
+        "handFixes": 0,
+        "mechanismRecoveries": 0,
+        "byActor": {},
+        "series": [],
+        "openDebt": 0,
+    }
+    db_path = _requeue_attribution_db_path()
+    if db_path and db_path.is_file():
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT actor, at FROM requeue_causes WHERE at >= ?", (since,)
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+        by_actor: dict = {}
+        by_day: dict = {}
+        for actor, at in rows:
+            actor = actor or "pipeline-mechanism"
+            by_actor[actor] = by_actor.get(actor, 0) + 1
+            day = (at or "")[:10]
+            bucket = by_day.setdefault(day, {"handFixes": 0, "mechanismRecoveries": 0})
+            if actor in _GHOST_HAND_FIX_ACTORS:
+                bucket["handFixes"] += 1
+            else:
+                bucket["mechanismRecoveries"] += 1
+        out["byActor"] = by_actor
+        out["handFixes"] = sum(by_actor.get(a, 0) for a in _GHOST_HAND_FIX_ACTORS)
+        out["mechanismRecoveries"] = by_actor.get("pipeline-mechanism", 0)
+        out["series"] = [
+            {"at": day, **counts} for day, counts in sorted(by_day.items()) if day
+        ]
+
+    d = get_pipeline_dir()
+    if d:
+        state = read_json_safe(d / "queue" / "ghost-debt-state.json")
+        if isinstance(state, dict):
+            out["openDebt"] = len(state)
+    return out
+
+
+@app.route("/api/concepts/<concept_id>/ghost-telemetry")
+def api_concept_ghost_telemetry(concept_id):
+    """Audit surface for concept-ghost-in-the-machine-0dbeea: how often the pipeline
+    recovered a task itself vs. how often a human/agent hand-fixed it (a requeue click).
+    404 for any other concept -- this data isn't per-concept, the route is just that
+    concept's dashboard hook."""
+    if concept_id != GHOST_CONCEPT_ID:
+        abort(404)
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+    except (TypeError, ValueError):
+        days = 30
+    return jsonify({"conceptId": concept_id, **_ghost_telemetry(days)})
 
 
 def write_concepts(concepts: list):

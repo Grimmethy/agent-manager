@@ -143,6 +143,14 @@ an underlying deterministic step or a missing recovery mechanism — if it is, t
 `writeSideFindingInbox()` entry tagged `conceptId: 'concept-ghost-in-the-machine-0dbeea'`,
 not a closed loop.
 
+**This concept audits itself.** `requeue-attribution.db`'s `actor` column records whether
+each requeue was a pipeline mechanism or an operator/agent hand-fix, and
+`reject-retry-check.js` / `needs-clarification-triage.js` file a `ghost-debt` side-finding
+(deduped by failure signature, tagged to the concept) whenever a task reaches a human-only
+escalation with no re-admission mechanism matching. The concept card's telemetry line and
+its timeline are the live scoreboard — a debt entry stops recurring once you build the
+missing deterministic recovery.
+
 ## Concept research: give a named topic the same treatment, tag it as it flows through
 
 Twice this session (2026-09-06), a narrow topic (chat-context-trimming, then

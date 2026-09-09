@@ -86,6 +86,7 @@ const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { fileGhostDebt } = require('./ghost-debt.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
 // matches auto-confirm-review.js's discipline.
@@ -536,6 +537,13 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     log(`${id}: bucket C (${hasExhausted ? 'retry-exhausted' : 'genuine question'}) -> leave for human`);
     summary.leftForHuman += 1;
     if (DRY_RUN) continue;
+    // Ghost debt -- only the retry-exhausted shape: a mechanical failure that no bucket
+    // (A/B/D/E/F/G) caught and only a conditional blocked-drain fix-signature match can
+    // ever rescue. A genuine design question is a legitimate human call, not a missing
+    // mechanism, so it is deliberately NOT recorded as debt.
+    if (hasExhausted) {
+      fileGhostDebt({ task, reasonText: oq || task.blockedReason, site: 'needs-clarification-triage:bucket-C-retry-exhausted', pipelineDir });
+    }
     task.ncTriageReviewedAt = now;
     task.ncTriageDecision = 'leave-for-human';
     appendHistoryEvent(task, 'advisory', hasExhausted

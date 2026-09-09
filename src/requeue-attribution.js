@@ -206,8 +206,10 @@ async function classifyRequeue(task, {
   reasonHint,
   blockedStage = null,
   requeueWriter,
+  actor = 'pipeline-mechanism',
   repoRoot,
   callModel = null,
+  skipFallbackModel = false,
   now = Date.now(),
 } = {}) {
   const reasonText = normalizeReasonText(reasonHint) || (task && task.blockedReason) || '';
@@ -220,7 +222,10 @@ async function classifyRequeue(task, {
     }
   }
 
-  if (!category && reasonText && fallbackRateLimitOk(now)) {
+  // skipFallbackModel: the manual-requeue CLI path (invoked as a subprocess from Flask)
+  // must not make a model call -- it would compete for the same constrained GPU a worker
+  // may be using, for a classification the actor dimension already makes secondary.
+  if (!category && !skipFallbackModel && reasonText && fallbackRateLimitOk(now)) {
     category = await classifyViaFallbackModel(reasonText, callModel);
   }
 
@@ -228,7 +233,7 @@ async function classifyRequeue(task, {
 
   const signature = buildSignature(category, reasonText);
 
-  recordRequeueCause({ taskId: task && task.id, signature, blockedStage, requeueWriter });
+  recordRequeueCause({ taskId: task && task.id, signature, blockedStage, requeueWriter, actor });
   if (task && task.id) {
     recordLink({ sourceId: task.id, targetId: signature, type: 'contributes-to-signature' });
     checkAndEscalate(signature, task.id, { repoRoot, now });
@@ -247,3 +252,38 @@ module.exports = {
   CAUSE_CATEGORIES,
   _resetFallbackRateLimitForTests,
 };
+
+// CLI: `node src/requeue-attribution.js classify <payloadPath>` -- so the Flask dashboard
+// (python/dashboard/requeue_attribution_client.py) can record a MANUAL requeue, which
+// otherwise never reaches this classifier at all (api_task_requeue is pure Python).
+// payload: { task?, taskFile?, reasonHint, requeueWriter, actor, blockedStage? }.
+// Prints the { signature, category } result as JSON. Best-effort: any failure exits 0
+// with an empty object so a telemetry problem never breaks a requeue on the caller side.
+if (require.main === module) {
+  (async () => {
+    try {
+      const [event, payloadPath] = process.argv.slice(2);
+      if (event !== 'classify' || !payloadPath) {
+        process.stderr.write('Usage: node requeue-attribution.js classify <payloadPath>\n');
+        process.exit(1);
+      }
+      const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
+      let task = payload.task;
+      if (!task && payload.taskFile && fs.existsSync(payload.taskFile)) {
+        task = JSON.parse(fs.readFileSync(payload.taskFile, 'utf8'));
+      }
+      const repoRoot = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
+      const result = await classifyRequeue(task || {}, {
+        reasonHint: payload.reasonHint,
+        blockedStage: payload.blockedStage || null,
+        requeueWriter: payload.requeueWriter || 'operator-manual',
+        actor: payload.actor || 'operator-manual',
+        skipFallbackModel: true,
+        repoRoot,
+      });
+      process.stdout.write(JSON.stringify(result || {}));
+    } catch (e) {
+      process.stdout.write('{}');
+    }
+  })();
+}

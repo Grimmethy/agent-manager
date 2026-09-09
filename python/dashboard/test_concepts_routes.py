@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -230,6 +231,55 @@ class ConceptsRoutesTest(unittest.TestCase):
             app.CONCEPT_TASK_SCAN_BUDGET_SECONDS = orig_budget
         data = resp.get_json()
         self.assertEqual(data["truncated"], True)
+
+    # --- ghost-telemetry route (2026-09-09, concept-ghost-in-the-machine-0dbeea) --------
+
+    def _write_requeue_attribution_db(self, rows):
+        import sqlite3
+        db = sqlite3.connect(self.pipeline_dir / "requeue-attribution.db")
+        db.execute(
+            "CREATE TABLE requeue_causes (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+            "signature TEXT NOT NULL, blocked_stage TEXT, requeue_writer TEXT NOT NULL, "
+            "actor TEXT NOT NULL DEFAULT 'pipeline-mechanism', at TEXT NOT NULL)"
+        )
+        db.executemany(
+            "INSERT INTO requeue_causes (task_id, signature, requeue_writer, actor, at) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        db.commit()
+        db.close()
+
+    def test_ghost_telemetry_404s_for_a_non_ghost_concept(self):
+        resp = self.client.get("/api/concepts/concept-something-else/ghost-telemetry")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_ghost_telemetry_splits_hand_fixes_from_mechanism_recoveries(self):
+        now = datetime.now(timezone.utc).isoformat()
+        self._write_requeue_attribution_db([
+            ("a", "s", "needs-clarification-triage", "pipeline-mechanism", now),
+            ("b", "s", "context-trim-sweep", "pipeline-mechanism", now),
+            ("c", "s", "operator-manual", "operator-manual", now),
+        ])
+        (self.pipeline_dir / "queue").mkdir(parents=True, exist_ok=True)
+        (self.pipeline_dir / "queue" / "ghost-debt-state.json").write_text(
+            json.dumps({"sig1": now, "sig2": now}), encoding="utf-8")
+
+        resp = self.client.get("/api/concepts/concept-ghost-in-the-machine-0dbeea/ghost-telemetry")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["handFixes"], 1)
+        self.assertEqual(data["mechanismRecoveries"], 2)
+        self.assertEqual(data["openDebt"], 2)
+        self.assertEqual(data["byActor"]["operator-manual"], 1)
+        self.assertTrue(data["series"])
+
+    def test_ghost_telemetry_all_zeros_when_no_db_yet(self):
+        resp = self.client.get("/api/concepts/concept-ghost-in-the-machine-0dbeea/ghost-telemetry")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["handFixes"], 0)
+        self.assertEqual(data["mechanismRecoveries"], 0)
+        self.assertEqual(data["openDebt"], 0)
 
 
 if __name__ == "__main__":
