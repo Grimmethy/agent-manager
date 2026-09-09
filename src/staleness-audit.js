@@ -29,6 +29,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
 const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
+const { isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE } = require('./staleness-audit-signals.js');
+const { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask } = require('./staleness-audit-dedup.js');
 
 // Lowered from 14 (2026-08-23, Grimmethy: "Yes, lower the default" -- after confirming
 // live that the first real candidate, adhoc-brain-dump-bd-1786742554232, had been
@@ -36,26 +38,11 @@ const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 // (lastActivityTs's own exhausted-spam fix, same commit range) was only ~9 days --
 // still under the old 14-day threshold. 7 days catches that case with margin while
 // staying well clear of a task still in normal active back-and-forth.
-const DEFAULT_STALENESS_THRESHOLD_DAYS = 7;
 const DEFAULT_COOLDOWN_DAYS = 21; // re-eligible after this long even if already reported once -- a
 // human who leaves a flagged task blocked (rather than archiving it) hasn't resolved it,
 // so this should surface again eventually rather than being suppressed forever, unlike
 // pipeline_self_audit's own coverage (a systemic-bug report that's either fixed or not,
 // with no "still relevant, just not actioned yet" middle state a single stale task has).
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-const FABRICATION_KEYWORDS = REASON_CATEGORIES.find((c) => c.key === 'fabricated-ungrounded-claim').keywords;
-
-function envDays(name, fallback) {
-  const raw = process.env[name];
-  const parsed = raw ? parseInt(raw, 10) : NaN;
-  return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback;
-}
-
-function stalenessThresholdMs() {
-  return envDays('AGENT_MANAGER_STALENESS_THRESHOLD_DAYS', DEFAULT_STALENESS_THRESHOLD_DAYS) * MS_PER_DAY;
-}
-
 function cooldownMs() {
   return envDays('AGENT_MANAGER_STALENESS_COOLDOWN_DAYS', DEFAULT_COOLDOWN_DAYS) * MS_PER_DAY;
 }
@@ -74,8 +61,6 @@ function cooldownMs() {
 // storm should make a task look MORE stuck, never fresher; 'exhausted' is explicitly a
 // "no further attempts will happen" marker, the opposite of progress, so it can never be
 // the most recent signal used to judge how stale something is.
-const NON_PROGRESS_STAGES = new Set(['exhausted']);
-
 // The last real forward-progress timestamp for a task -- history[]'s own last entry NOT
 // in NON_PROGRESS_STAGES above (whatever real stage it's in: blocked, needs-clarification,
 // a retry's plan-done, etc.), NOT createdAt, so a task that's old but still actively
@@ -83,35 +68,9 @@ const NON_PROGRESS_STAGES = new Set(['exhausted']);
 // empty, or every entry is a non-progress marker (a task that NEVER did anything but
 // exhaust retries) -- logged nowhere specifically, but both cases are unusual enough that
 // treating it as "last touched at creation" is the safe, conservative read.
-function lastActivityTs(task) {
-  const hist = Array.isArray(task.history) ? task.history : [];
-  const timestamps = hist
-    .filter((h) => !NON_PROGRESS_STAGES.has(h.stage))
-    .map((h) => Date.parse(h.at))
-    .filter((t) => Number.isFinite(t));
-  if (timestamps.length > 0) return Math.max(...timestamps);
-  const created = Date.parse(task.createdAt);
-  return Number.isFinite(created) ? created : null;
-}
-
-function isStaleByAge(task, now, thresholdMs = stalenessThresholdMs()) {
-  const last = lastActivityTs(task);
-  if (last == null) return false; // no timestamp at all -- can't confidently call this stale, not a guess this module makes
-  return now - last > thresholdMs;
-}
-
 // priorRejectionFeedback may be a string or an array of strings (see prompts.js's own
 // priorRejectionBlock() handling of the same field) -- normalized to one lowercase blob
 // alongside blockedReason so a single keyword scan covers both.
-function isFabricationRepeat(task) {
-  if (!((task.localRejectCount || 0) >= 2)) return false;
-  const feedback = Array.isArray(task.priorRejectionFeedback)
-    ? task.priorRejectionFeedback.join(' ')
-    : (task.priorRejectionFeedback || '');
-  const text = `${task.blockedReason || ''} ${feedback}`.toLowerCase();
-  return FABRICATION_KEYWORDS.some((kw) => text.includes(kw));
-}
-
 // Third criterion, added 2026-08-23 (Grimmethy: "we very likely have other adhoc tasks
 // that are just stuck" -- confirmed live: 167 of 213 real blocked tasks, 78%, already
 // carry this marker) -- reject-retry-check.js stamps 'exhausted' on a task once it's
@@ -122,13 +81,6 @@ function isFabricationRepeat(task) {
 // pipeline's own explicit "I have given up on this automatically" signal the instant it
 // fires, closing the exact backlog gap a fresh 7-day-old task with genuinely no future
 // would otherwise sit in, uncaught, for up to a week.
-function hasExhaustedRetries(task) {
-  const hist = Array.isArray(task.history) ? task.history : [];
-  return hist.some((h) => h.stage === 'exhausted');
-}
-
-const GIT_LOG_TIMEOUT_MS = 15_000;
-
 // Real file paths a task's own text mentions -- reuses fact-checker.js's own extraction
 // (same PATH_EXT_RE regex checkFilePaths already runs at review time) rather than a
 // second, possibly-inconsistent implementation. Pulls from every place a task's own
@@ -136,17 +88,6 @@ const GIT_LOG_TIMEOUT_MS = 15_000;
 // blocked, and any accumulated rejection feedback.
 // Generated / append-only docs that virtually every task "names" and that the triage
 // batch commits touch constantly -- a commit to one is not evidence anything was resolved.
-const GENERATED_DOC_RE = /(_CANDIDATES\.md$|PRODUCT_SPEC(_OUTLINE)?\.md$|TROUBLE_LOG\.md$|BACKLOG_CANDIDATES\.md$)/;
-
-function candidateFilePaths(task) {
-  const ctx = task.promptContext || {};
-  const feedback = Array.isArray(task.priorRejectionFeedback)
-    ? task.priorRejectionFeedback.join(' ')
-    : (task.priorRejectionFeedback || '');
-  const text = [ctx.rawText, task.title, task.blockedReason, feedback].filter(Boolean).join('\n');
-  return extractFilePaths(text).filter((p) => !GENERATED_DOC_RE.test(p));
-}
-
 // Fourth criterion, added 2026-08-23 (Grimmethy: "What really makes a task stale is if
 // it's already been completed or redundant in some way. How do we check for that?") --
 // the other three criteria are all proxies for "the pipeline gave up trying," not the
@@ -214,49 +155,12 @@ function findFilesTouchedSince(repoRoot, task, { graceDays = 0, strictlyBefore =
 // "there is nothing left to do." Extract identifiers the task's own text pairs with a
 // create/add verb (`create \`X.js\``, "add a function `fooBar`", "new module `y`"), then
 // see whether that file already exists or that symbol is already defined in the repo.
-const CREATE_VERB_RE = /\b(create|add|introduce|implement|build|write|new)\b[^.\n]{0,60}?`([A-Za-z0-9_./-]{3,})`/gi;
 const BACKTICK_IDENT_RE = /`([A-Za-z_][A-Za-z0-9_]{2,})`/g;
-
-function extractCreatedSymbols(text) {
-  const out = new Set();
-  const s = String(text || '');
-  let m;
-  CREATE_VERB_RE.lastIndex = 0;
-  while ((m = CREATE_VERB_RE.exec(s))) {
-    const tok = m[2];
-    if (/[./]/.test(tok)) out.add(tok);           // a path
-    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) out.add(tok); // an identifier
-  }
-  return [...out];
-}
-
-function symbolDefinedInRepo(repoRoot, symbol) {
-  if (!repoRoot || !symbol) return null;
-  // A DEFINITION, not any mention -- function/const/let/class/def, JS or Python.
-  const pattern = `(function|class|const|let|var|def)\\s+${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`;
-  try {
-    const out = execFileSync(
-      'git', ['grep', '-l', '-E', pattern, '--', 'src', 'python', 'scripts'],
-      { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    const first = out.split('\n').map((x) => x.trim()).filter(Boolean)[0];
-    return first || null;
-  } catch (e) {
-    return null; // git grep exits 1 on no match -> not defined
-  }
-}
 
 // Distinctive 2-3 word phrases from the task's title/first line -- what the task is
 // actually ABOUT, e.g. "FIFO ticket lock", "per-attempt record". Drops the
 // `<project> > <area> :` prefix; the n-gram extraction itself is shared with
 // side-finding-sweep.js's dedup via text-similarity.js's own distinctivePhrases().
-const TITLE_PREFIX_RE = /^[^:>]*[>:]\s*/;
-function distinctivePhrases(task) {
-  const line = String((task.promptContext && task.promptContext.rawText) || task.title || '')
-    .split('\n')[0].replace(TITLE_PREFIX_RE, '');
-  return sharedDistinctivePhrases(line);
-}
-
 // Returns { strong, strongEvidence[], phraseHits[] }.
 //   strong: the task asks to CREATE a file/symbol that ALREADY EXISTS -- near-certain
 //           "nothing to do", zero-false-positive by construction. -> high confidence.
@@ -264,44 +168,6 @@ function distinctivePhrases(task) {
 //           file the task itself names. NOT a standalone flag reason (too noisy -- a
 //           comment can just quote the task); only ever attached as extra context for the
 //           medium-confidence vote to weigh, alongside another real candidate signal.
-function alreadyImplementedSignal(repoRoot, task) {
-  if (!repoRoot) return { strong: false, strongEvidence: [], phraseHits: [] };
-  const strongEvidence = [];
-  const ctx = task.promptContext || {};
-  const text = [ctx.rawText, task.title].filter(Boolean).join('\n');
-
-  for (const sym of extractCreatedSymbols(text)) {
-    if (/[./]/.test(sym)) {
-      const resolved = resolveAgainstRepo(repoRoot, sym);
-      if (resolved) strongEvidence.push(`asks to create \`${sym}\` -- but ${path.relative(repoRoot, resolved)} already exists`);
-    } else {
-      const where = symbolDefinedInRepo(repoRoot, sym);
-      if (where) strongEvidence.push(`asks to add \`${sym}\` -- but it is already defined in ${where}`);
-    }
-  }
-
-  const phraseHits = [];
-  const namedFiles = candidateFilePaths(task)
-    .map((p) => resolveAgainstRepo(repoRoot, p)).filter(Boolean)
-    .map((abs) => path.relative(repoRoot, abs));
-  if (namedFiles.length > 0 && namedFiles.length <= 12) {
-    for (const phrase of distinctivePhrases(task)) {
-      try {
-        const line = execFileSync(
-          'git', ['grep', '-n', '-F', '-i', '--', phrase, ...namedFiles],
-          { cwd: repoRoot, encoding: 'utf8', timeout: GIT_LOG_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
-        ).split('\n').map((x) => x.trim()).filter(Boolean)[0];
-        // Skip a line that is itself just quoting the brain-dump / this task.
-        if (line && !/brain[- ]?dump|see task|the task's|rawText/i.test(line)) {
-          phraseHits.push(`grep for the task's phrase "${phrase}" -> ${line.slice(0, 160)}`);
-        }
-      } catch (e) { /* git grep exit 1 = no match */ }
-    }
-  }
-
-  return { strong: strongEvidence.length > 0, strongEvidence, phraseHits };
-}
-
 // The inverse: the task is concrete about file paths and NONE of them resolve to a real
 // file. "The premise contradicts the codebase." Only fires when there is at least one
 // named path and every one is absent -- otherwise silent (a task naming zero paths, or a
@@ -325,72 +191,19 @@ function alreadyImplementedSignal(repoRoot, task) {
 // creation target" (promptContext.newFile) -- excluding it here, the same way an
 // already-known create target is excluded elsewhere, closes the false positive without
 // weakening the check for every task that doesn't set it.
-function invalidPremiseSignal(repoRoot, task) {
-  if (!repoRoot) return { hit: false, evidence: [] };
-  const ownCreateTarget = task.promptContext && task.promptContext.newFile;
-  const named = candidateFilePaths(task).filter((p) => p !== ownCreateTarget);
-  if (named.length === 0) return { hit: false, evidence: [] };
-  const missing = named.filter((p) => !resolveAgainstRepo(repoRoot, p));
-  if (missing.length !== named.length) return { hit: false, evidence: [] };
-  return { hit: true, evidence: [`every file this task names is absent from the repo: ${missing.join(', ')}`] };
-}
-
 // --- duplicate detection -----------------------------------------------------------
 // normalizeTokens/jaccardSimilarity extracted to text-similarity.js (2026-09-05) so
 // side-finding-sweep.js's own duplicate-finding check can reuse the identical primitives
 // instead of a third near-duplicate copy.
 const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS, distinctivePhrases: sharedDistinctivePhrases } = require('./text-similarity.js');
 
-function normalizeTaskTokens(task) {
-  const ctx = task.promptContext || {};
-  return normalizeTokens(`${task.title || ''} ${(ctx.rawText || '').slice(0, 600)}`);
-}
-
-function dupSimilarityThreshold() {
-  const raw = Number(process.env.AGENT_MANAGER_STALENESS_DUP_SIMILARITY);
-  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.6;
-}
-
-function bdLineage(id) {
-  const m = String(id || '').match(/bd-(\d{10,})/);
-  return m ? m[1] : null;
-}
-
 // corpus: [{ id, state, ... }] -- every OTHER task (queue + recent done). Returns the
 // best match above threshold, or null. Excludes the brain-dump-sort task that SPAWNED
 // this one (same bd-<id> lineage) and any *_sort / *_outline task -- those legitimately
 // share almost all their text with the task they produced; that is not duplication.
-function findDuplicateTask(task, corpus) {
-  const mine = normalizeTaskTokens(task);
-  if (mine.size < 4) return null;
-  const myLineage = bdLineage(task.id);
-  const threshold = dupSimilarityThreshold();
-  let best = null;
-  for (const other of corpus || []) {
-    if (!other || !other.id || other.id === task.id) continue;
-    if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;
-    if (myLineage && bdLineage(other.id) === myLineage) continue; // same lineage, not a dup
-    const sim = jaccard(mine, normalizeTaskTokens(other));
-    if (sim >= threshold && (!best || sim > best.sim)) {
-      best = { id: other.id, state: other.state || other.status || null, sim: Number(sim.toFixed(2)) };
-    }
-  }
-  return best;
-}
-
 // Every draft attempt chose to decompose and the task is exhausted -- the pipeline didn't
 // fail to BUILD it, it failed to BREAK IT DOWN. A distinct disposition from retries-
 // exhausted (a re-scope, not an archive candidate).
-function isDecomposeLoop(task) {
-  const attempts = Array.isArray(task.draftAttempts) ? task.draftAttempts : [];
-  if (attempts.length < 2) return false;
-  const allDecompose = attempts.every((a) => {
-    const r = `${a.adhocResolution || ''} ${a.resolution || ''} ${(a.outcome && a.outcome.resolution) || ''}`.toLowerCase();
-    return r.includes('decompose');
-  });
-  return allDecompose && hasExhaustedRetries(task);
-}
-
 // One entry per task that survives ANY condition -- reasons records which one(s) fired
 // (a task can be old AND a repeat fabricator AND possibly-resolved) so the filed task's
 // own text can be specific about why it was flagged, rather than a generic "this looked
