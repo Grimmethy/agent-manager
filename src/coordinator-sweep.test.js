@@ -190,6 +190,95 @@ test('non-stacked decompose hub: a `done`-not-merged child does NOT complete the
   }
 });
 
+test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: a done mechanical child is auto-merged and the hub completes', () => {
+  const dir = makePipeline();
+  const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = 'true';
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false'; // isolate the auto-merge path from the trailer grep
+  try {
+    write(dir, 'coordinating', {
+      id: 'dhub-am', status: 'coordinating', decomposeHub: true, history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'am-x', title: 'X', status: 'in-progress' }],
+    });
+    write(dir, 'done', { id: 'am-x', promptContext: { deterministicApply: 'script-extract', sourceFile: 'python/dashboard/templates/index.html' } });
+
+    const seen = [];
+    const runAutoMerge = (a) => { seen.push(a.childId); return { merged: true, mergeCommit: 'abc123def456' }; };
+    const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
+
+    assert.deepEqual(seen, ['am-x'], 'auto-merge was attempted for the mechanical child');
+    assert.equal(summary.completed, 1);
+    const child = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'am-x.json'), 'utf8'));
+    assert.ok(child.mergedAt);
+    assert.equal(child.mergedAtSource, 'coordinator-auto-merge-verified-move');
+    assert.equal(child.autoMergeCommit, 'abc123def456');
+    const parent = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'dhub-am.json'), 'utf8'));
+    assert.deepEqual(parent.progress, { done: 1, total: 1 });
+  } finally {
+    if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
+test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: an unmergeable mechanical child blocks the hub, persists autoMergeBlocked, is not re-attempted', () => {
+  const dir = makePipeline();
+  const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = 'true';
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
+  try {
+    write(dir, 'coordinating', {
+      id: 'dhub-cf', status: 'coordinating', decomposeHub: true, history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'cf-x', title: 'X', status: 'in-progress' }],
+    });
+    write(dir, 'done', { id: 'cf-x', promptContext: { deterministicApply: 'script-extract', sourceFile: 'python/dashboard/templates/index.html' } });
+
+    let n = 0;
+    const runAutoMerge = () => { n += 1; return { merged: false, reason: 'conflict', conflictFiles: ['python/dashboard/templates/index.html'] }; };
+
+    let summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
+    assert.equal(n, 1);
+    assert.equal(summary.completed, 0);
+    let parent = readParent(dir, 'coordinating', 'dhub-cf');
+    assert.ok(parent.coordinatorBlocked, 'hub is flagged blocked');
+    assert.match(parent.blockedReason, /auto-merge blocked \(conflict: python\/dashboard\/templates\/index\.html\)/);
+    const child = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'cf-x.json'), 'utf8'));
+    assert.equal(child.autoMergeBlocked.reason, 'conflict');
+    assert.deepEqual(child.autoMergeBlocked.conflictFiles, ['python/dashboard/templates/index.html']);
+    assert.ok(!child.mergedAt);
+
+    // Next tick: the persisted marker (and the per-process give-up set) stop a re-attempt.
+    summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
+    assert.equal(n, 1, 'the expensive auto-merge + gate is not re-run while blocked');
+    assert.equal(summary.completed, 0);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'dhub-cf.json')), true, 'hub stays in coordinating/');
+  } finally {
+    if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
+test('AUTO_MERGE_MOVES unset: a done mechanical child is never auto-merged (opt-in)', () => {
+  const dir = makePipeline();
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
+  try {
+    write(dir, 'coordinating', {
+      id: 'dhub-off', status: 'coordinating', decomposeHub: true, history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'off-x', title: 'X', status: 'in-progress' }],
+    });
+    write(dir, 'done', { id: 'off-x', promptContext: { deterministicApply: 'script-extract', sourceFile: 'a/index.html' } });
+    let called = false;
+    const runAutoMerge = () => { called = true; return { merged: true }; };
+    const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
+    assert.equal(called, false, 'auto-merge is opt-in -- not called without AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=true');
+    assert.equal(summary.completed, 0);
+  } finally {
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
 test('completing a hub stamps mergedAt so a dependent sibling can clear isDependencySatisfied', () => {
   const dir = makePipeline();
   write(dir, 'coordinating', {
