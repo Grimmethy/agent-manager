@@ -193,7 +193,7 @@ test('write tier: buildWriteAgenticPrompt includes real hub-status grounding for
     });
     assert.match(p, /HUB STATUS/);
     assert.match(p, /hub status: merged/);
-    assert.match(p, /TRUST THE VERIFIED LINE/);
+    assert.match(p, /do NOT immediately trust either one/);
   });
 });
 
