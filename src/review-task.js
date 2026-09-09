@@ -284,7 +284,7 @@ function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
     fresh = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
   } else if (kind === 'node-module-decompose') {
     const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-    fresh = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+    fresh = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves, repoRoot);
   } else {
     const { buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
     fresh = buildBlueprintOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
