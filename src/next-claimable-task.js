@@ -142,8 +142,17 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
     let priority = Infinity;
     if (task) {
       try {
-        const source = getRegisteredSource(resolveSourceName(task));
-        if (source && typeof source.priority === 'number') priority = effectivePriority(task, source.priority, resolveSourceName);
+        // A derived_task carries domain:'adhoc' (so every draft/apply path treats it
+        // exactly like adhoc -- resolveSourceName() sends it there), but it must RANK at
+        // its own registered priority (48, self-maintenance band), never adhoc's base 10
+        // + BOT_ADHOC_PRIORITY_PENALTY. Look it up by its literal source name.
+        if (task.source === 'derived_task') {
+          const dt = getRegisteredSource('derived_task');
+          priority = (dt && typeof dt.priority === 'number') ? dt.priority : Infinity;
+        } else {
+          const source = getRegisteredSource(resolveSourceName(task));
+          if (source && typeof source.priority === 'number') priority = effectivePriority(task, source.priority, resolveSourceName);
+        }
       } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
     }
     if (!resolvesToTier(task, isReasoningLane)) continue;

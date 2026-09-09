@@ -912,6 +912,36 @@ test('nextAdhocTask preserves history and other fields already on the file (not 
   assert.deepEqual(task.promptContext.prefetchedPaths, ['src/foo.js']);
 });
 
+test('nextDerivedTask reads queue/derived/ and stamps source:derived_task (not manual), domain:adhoc', () => {
+  const dir = makeAdhocFixtureRepo();
+  const derivedDir = path.join(dir, 'queue', 'derived');
+  fs.mkdirSync(derivedDir, { recursive: true });
+  fs.writeFileSync(path.join(derivedDir, 'd1.json'), JSON.stringify({
+    id: 'adhoc-brain-dump-bd-x-1', title: 'a debrief Now-What follow-up',
+    source: 'derived_task', domain: 'adhoc',
+    promptContext: { rawText: 'do the follow-up', derivedFrom: { source: 'pipeline_debrief', stage: 'now-what' } },
+  }));
+  const { nextDerivedTask, nextAdhocTask } = freshTaskSources(dir);
+  const task = nextDerivedTask();
+  assert.ok(task);
+  assert.equal(task.source, 'derived_task');
+  assert.equal(task.domain, 'adhoc');
+  assert.deepEqual(task.promptContext.derivedFrom, { source: 'pipeline_debrief', stage: 'now-what' });
+  // nextAdhocTask only scans queue/adhoc/ -- it must NOT also pick up a derived task
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('derived_task is registered at priority 48 and is NOT one of getNextTask()\'s always-allowed sources', () => {
+  const dir = makeAdhocFixtureRepo();
+  freshTaskSources(dir);
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  const dt = getRegisteredSource('derived_task');
+  assert.ok(dt);
+  assert.equal(dt.priority, 48);
+  assert.equal(dt.reasoningTier, 'high');
+  assert.equal(dt.reportClass, 'housekeeping');
+});
+
 // 2026-09-08, Grimmethy: root-caused live -- a requeued adhoc task's real audit trail
 // (needs-clarification cycles, staleness-flag notes, the requeue reasoning itself) was
 // vanishing the moment it got re-claimed. nextAdhocTask() above correctly preserves

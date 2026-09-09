@@ -667,6 +667,46 @@ test('applyBrainDumpSort queues to adhoc/ (NOT needs-clarification) when nothing
   assert.equal(written.promptContext.prefetchedPaths, undefined);
 });
 
+test('applyBrainDumpSort routes a machine-filed entry (raisedBy present) to queue/derived/ with source:derived_task + derivedFrom', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-derived-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/widget.ts' }]);
+
+  const raisedBy = { source: 'pipeline_debrief', taskId: 'pipeline-debrief-x', stage: 'now-what', conceptId: null };
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Xyzzy plugh frobnicate quux', raisedBy })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Xyzzy plugh frobnicate quux' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false, 'a machine finding does NOT land in the genuine adhoc lane');
+  const queued = fs.readdirSync(path.join(pipelineDir, 'queue', 'derived'));
+  assert.equal(queued.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'derived', queued[0]), 'utf8'));
+  assert.equal(written.source, 'derived_task');
+  assert.equal(written.domain, 'adhoc');
+  assert.deepEqual(written.promptContext.derivedFrom, raisedBy);
+});
+
+test('applyBrainDumpSort routes a HUMAN entry (no raisedBy) to queue/adhoc/ as before, source brain_dump, no derivedFrom', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-human-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/widget.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Xyzzy plugh frobnicate quux' })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Xyzzy plugh frobnicate quux' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'derived')), false);
+  const queued = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  assert.equal(queued.length, 1);
+  const written = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'adhoc', queued[0]), 'utf8'));
+  assert.equal(written.source, 'brain_dump');
+  assert.equal(written.promptContext.derivedFrom, undefined);
+});
+
 test('applyBrainDumpSort routes to queue/needs-clarification/ with candidates when a keyword matches multiple files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-adhoc-test-'));
   const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);

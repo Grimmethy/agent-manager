@@ -157,7 +157,7 @@ function buildExhaustedAdhocQuestion(task) {
   ].join('\n');
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
   // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
   // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
@@ -179,14 +179,19 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
   // live 2026-09-02: adhoc-...-plugins-install-...-1, blockedStage 'review',
   // localRejectCount 2/2, stranded in queue/adhoc/. Pick those up here too -- everything
   // downstream already keys off isAdhocTask(task) and the per-entry source dir.
-  try {
-    for (const n of fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'))) {
-      try {
-        const t = JSON.parse(fs.readFileSync(path.join(adhocDir, n), 'utf8'));
-        if (t && t.status === 'blocked') entries.push({ dir: adhocDir, name: n });
-      } catch { /* unparseable -- not this sweep's problem */ }
-    }
-  } catch { /* no adhoc/ dir -- fine */ }
+  // queue/derived/ (source: derived_task) is adhoc-SHAPED, so a draft-stage block writes
+  // back in place there the same way -- sweep it too.
+  for (const inPlaceDir of [adhocDir, derivedDir]) {
+    if (!inPlaceDir) continue;
+    try {
+      for (const n of fs.readdirSync(inPlaceDir).filter((f) => f.endsWith('.json'))) {
+        try {
+          const t = JSON.parse(fs.readFileSync(path.join(inPlaceDir, n), 'utf8'));
+          if (t && t.status === 'blocked') entries.push({ dir: inPlaceDir, name: n });
+        } catch { /* unparseable -- not this sweep's problem */ }
+      }
+    } catch { /* dir absent -- fine */ }
+  }
 
   if (entries.length === 0) return summary;
 
@@ -245,7 +250,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         appendHistoryEvent(task, 'requeued',
           "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
         recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
-        const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
         fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
@@ -405,7 +410,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // nextAdhocTask() only scans queue/adhoc/ -- an adhoc task requeued to pending/ is
       // only picked up by a general worker, never re-drafted through draftAdhocBranch's
       // tiers. Match python/dashboard/app.py's own adhoc-requeue destination.
-      const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+      const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
       const newPath = path.join(destDir, name);
       fs.mkdirSync(destDir, { recursive: true });
       fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
@@ -429,9 +434,10 @@ function main() {
   const blockedDir = path.join(queueDir, 'blocked');
   const pendingDir = path.join(queueDir, 'pending');
   const adhocDir = path.join(queueDir, 'adhoc');
+  const derivedDir = path.join(queueDir, 'derived');
   const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir });
   process.stdout.write(JSON.stringify(summary));
 }
 
