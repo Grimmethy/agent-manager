@@ -83,7 +83,15 @@ function applyOneChange(parsed, repoRoot, pipelineDir) {
     if (matchCount > 1) {
       throw new Error(`find string matches ${matchCount} times in ${relFile}, ambiguous -- refusing to guess which occurrence`);
     }
-    const updated = text.replace(find, parsed.replace || '');
+    // Function replacer, NOT a string: `String.prototype.replace` interprets `$$`, `$&`,
+    // `` $` ``, `$'`, `$<n>` in a string replacement, so a `replace` payload containing a
+    // `$` right before a backtick / quote / `&` (common in extracted code -- e.g. a regex
+    // built as `new RegExp(`...(.+)$`)`) would be silently mangled. The function form
+    // substitutes the text verbatim. (2026-09-09: corrupted the apply-group-a.js
+    // deterministic decompose -- `` $` `` in two template-literal regexes was dropped,
+    // producing an unterminated-string SyntaxError in the merged file.)
+    const replacement = parsed.replace || '';
+    const updated = text.replace(find, () => replacement);
     fs.writeFileSync(fullPath, updated);
     // Inverse restores the exact prior bytes captured just above, NOT a find/replace swap
     // (replace: find, find: replace) -- swapping back can't be trusted to still be unique,

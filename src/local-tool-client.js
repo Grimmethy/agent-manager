@@ -470,7 +470,11 @@ function editFileTool(a, b) {
   if (occurrences > 1) {
     return { error: `"find" text matches ${occurrences} places in ${relPath} -- make it unique (include more surrounding context) before editing.` };
   }
-  const updated = content.replace(find, replace || '');
+  // Function replacer: a string replacement would interpret `$$`/`$&`/`` $` ``/`$'`/`$<n>`
+  // in `replace` (e.g. a regex literal ending `(.+)$` inside a template string). Substitute
+  // verbatim. Uniqueness already enforced just above.
+  const replacement = replace || '';
+  const updated = content.replace(find, () => replacement);
   try {
     fs.writeFileSync(full, updated);
   } catch (e) {

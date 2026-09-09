@@ -44,6 +44,21 @@ test('applyGroupB edits a file via a unique find/replace', () => {
   assert.equal(fs.readFileSync(path.join(repoRoot, 'a.js'), 'utf8'), 'const x = 2;\n');
 });
 
+test('applyGroupB edit: a replace payload with `$` substitution patterns is written VERBATIM', () => {
+  const repoRoot = tmpRepo();
+  fs.writeFileSync(path.join(repoRoot, 'r.js'), 'const OLD = 1;\n');
+  // `` $` ``, `$'`, `$&`, `$$`, `$1` are all special in a STRING replacement -- they must
+  // survive untouched here (regression: a template-literal regex `(.+)$` in extracted
+  // decompose code was silently mangled, breaking the merged file).
+  const replace = "const re = new RegExp(`^${name}:(.+)$`, 'mi'); // $& $$ $1 $' done";
+  applyGroupB({
+    implementResponse: JSON.stringify({ mode: 'edit', file: 'r.js', find: 'const OLD = 1;', replace }),
+    repoRoot,
+    pipelineDir: repoRoot,
+  });
+  assert.equal(fs.readFileSync(path.join(repoRoot, 'r.js'), 'utf8'), `${replace}\n`);
+});
+
 test('applyGroupB rolls back an earlier successful create when a later item in the same batch fails', () => {
   const repoRoot = tmpRepo();
   const batch = [
