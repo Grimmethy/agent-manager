@@ -99,6 +99,32 @@ function buildInvalidPremiseQuestion(task) {
   ].join('\n');
 }
 
+// concept-candidate-grounding-gate-3e9bec: the candidate-generator grounding checks
+// (arch_import / arch_discovery / deep_dive) emit this exact "fabricated file path(s)"
+// prefix via the shared deterministic Check 0 (candidate-path-grounding.js) when the
+// write-up's `Files:` line names a path that resolves NOWHERE in the target repo -- not
+// even by basename walk. MODEL-side, but NOT retryable: the plan pass proposes fresh
+// search terms each attempt yet the model keeps fabricating the Files: line, so every
+// blind redraft reproduces the identical block until the retry budget burns out (measured
+// live: 3 qwen passes all re-inventing `src/agent-manager/task-queue.js`). Escalate after
+// ONE rejection instead. blockedReason shape: "Ungrounded draft: fabricated file path(s): ...".
+function hasFabricatedFilePath(task) {
+  return /^ungrounded draft:\s*fabricated file path/i.test(String(task.blockedReason || '').trim());
+}
+
+function buildFabricatedFilePathQuestion(task) {
+  const detail = String(task.blockedReason || '').replace(/^ungrounded draft:\s*/i, '').trim();
+  return [
+    `This candidate's implement pass cited destination file path(s) that do not exist in the `
+      + `target repo: ${detail}`,
+    '',
+    'A blind redraft cannot fix this -- the plan proposes different search terms each attempt '
+      + 'but the model keeps inventing the Files: line. Either the underlying finding maps to a '
+      + 'real file the search simply missed (re-file the candidate with the accurate path), or '
+      + 'there is genuinely no applicable site in the target repo (Archive this task).',
+  ].join('\n');
+}
+
 // Keyword categories over blockedReason text, same ones used by hand triaging this
 // session's blocked queue, same priority order. faultSide:'model' -- a keyword match on
 // the draft's own text/behavior -- and retryable:true for all five: no real evidence yet
@@ -162,6 +188,20 @@ const CLASSIFIERS = [
     buildQuestion: buildInvalidPremiseQuestion,
   },
   {
+    // Ordered BEFORE harness-search-zero-results and the REASON_CATEGORIES keyword spread:
+    // the "fabricated file path" reason also contains "ungrounded"/"fabricat", which the
+    // retryable `fabricated-ungrounded-claim` keyword classifier would otherwise shadow it
+    // with. See hasFabricatedFilePath's comment.
+    name: 'fabricated-file-path',
+    classify(task) {
+      if (hasFabricatedFilePath(task)) {
+        return { category: 'fabricated-file-path', faultSide: 'model', retryable: false };
+      }
+      return null;
+    },
+    buildQuestion: buildFabricatedFilePathQuestion,
+  },
+  {
     name: 'harness-search-zero-results',
     classify(task) {
       if (hasZeroHitHarnessSearch(task)) {
@@ -223,6 +263,7 @@ module.exports = {
   hasZeroHitHarnessSearch,
   hasUnreliableGrounding,
   hasInvalidPremise,
+  hasFabricatedFilePath,
   signatureForTask,
   findClassifier,
 };

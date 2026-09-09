@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyBlockedTask, categorizeBlockedReason, hasZeroHitHarnessSearch, hasUnreliableGrounding,
-  hasInvalidPremise, signatureForTask, findClassifier, REASON_CATEGORIES,
+  hasInvalidPremise, hasFabricatedFilePath, signatureForTask, findClassifier, REASON_CATEGORIES,
 } = require('./blocked-task-classifiers.js');
 
 test('classifyBlockedTask recognizes a pre-stamped external-dependency task as environment-side, non-retryable', () => {
@@ -43,6 +43,37 @@ test('findClassifier("invalid-premise") has a buildQuestion that quotes the bloc
   assert.ok(c);
   const question = c.buildQuestion({ blockedReason: 'Invalid premise: the AC-13a gate was never built' });
   assert.match(question, /the AC-13a gate was never built/);
+});
+
+test('classifyBlockedTask recognizes a "fabricated file path(s)" grounding block as model-side, NON-retryable', () => {
+  const task = { blockedReason: 'Ungrounded draft: fabricated file path(s): src/agent-manager/task-queue.js -- not present anywhere in the target repo. A redraft cannot make an invented path real; re-file with an accurate citation, or archive if nothing applies.' };
+  const result = classifyBlockedTask(task);
+  assert.deepEqual(result, { category: 'fabricated-file-path', faultSide: 'model', retryable: false, classifierName: 'fabricated-file-path' });
+});
+
+test('fabricated-file-path wins over the retryable "fabricated-ungrounded-claim" keyword classifier (ordering)', () => {
+  // The reason string contains BOTH "ungrounded" and "fabricat" -- the keyword classifier
+  // would otherwise shadow it with retryable:true.
+  const result = classifyBlockedTask({ blockedReason: 'Ungrounded draft: fabricated file path(s): src/nope.js -- not present anywhere in the target repo.' });
+  assert.equal(result.classifierName, 'fabricated-file-path');
+  assert.equal(result.retryable, false);
+});
+
+test('hasFabricatedFilePath matches the exact grounding-check prefix, case-insensitively, and nothing else', () => {
+  assert.equal(hasFabricatedFilePath({ blockedReason: 'Ungrounded draft: fabricated file path(s): src/x.js -- ...' }), true);
+  assert.equal(hasFabricatedFilePath({ blockedReason: 'UNGROUNDED DRAFT: FABRICATED FILE PATH(S): a.js' }), true);
+  assert.equal(hasFabricatedFilePath({ blockedReason: 'Ungrounded draft: the class `Foo` is not in any fetched file' }), false); // a Check-1 fabricated-symbol block stays retryable
+  assert.equal(hasFabricatedFilePath({ blockedReason: 'Invalid premise: x' }), false);
+  assert.equal(hasFabricatedFilePath({}), false);
+});
+
+test('findClassifier("fabricated-file-path").buildQuestion names the paths and says a redraft cannot fix it', () => {
+  const c = findClassifier('fabricated-file-path');
+  assert.ok(c);
+  const q = c.buildQuestion({ blockedReason: 'Ungrounded draft: fabricated file path(s): src/agent-manager/task-queue.js -- not present anywhere in the target repo.' });
+  assert.match(q, /src\/agent-manager\/task-queue\.js/);
+  assert.match(q, /blind redraft cannot fix this/i);
+  assert.match(q, /Archive/);
 });
 
 test('classifyBlockedTask maps each existing keyword category to faultSide:model, retryable:true', () => {
