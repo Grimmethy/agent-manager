@@ -97,7 +97,7 @@ test('buildHubStatusGrounding reports a sibling whose title-parsed path is wrong
   assert.match(grounding, /NOT FOUND at static\/js\/wrong-path\.js/);
 });
 
-test('buildHubStatusGrounding tells the model to trust the VERIFIED line over its own exploration', () => {
+test('buildHubStatusGrounding tells the model to investigate rather than blindly trust either signal on disagreement', () => {
   const { repoRoot, pipelineDir } = makeFixture();
   writeHub(pipelineDir, 'file-decompose-hub-fixture', [
     { id: 'move-1', title: 'Decompose index.html → static/js/core-ui.js', status: 'merged' },
@@ -109,7 +109,7 @@ test('buildHubStatusGrounding tells the model to trust the VERIFIED line over it
     promptContext: { decomposedFrom: 'file-decompose-hub-fixture' },
   };
   const grounding = buildHubStatusGrounding(task, { repoRoot, pipelineDir });
-  assert.match(grounding, /TRUST THE VERIFIED LINE/);
+  assert.match(grounding, /do NOT immediately trust either one/);
 });
 
 test('buildHubStatusGrounding returns null when the hub has no subTasks', () => {
