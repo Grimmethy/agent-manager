@@ -370,6 +370,82 @@ test('an exhausted infra-error task escalates with reason:infra-error, not desig
   assert.equal(out.needsClarification.reason, 'infra-error');
 });
 
+// --- forbidden-path gate-bug re-admission (2026-09-09): a block that named one of the
+// task's OWN declared targets is a now-fixed adhoc-diff-sanity false positive; the system
+// re-admits it clean-slate rather than dead-ending / needing an operator requeue. --------
+
+const FORBIDDEN_TARGET_BLOCK_REASON =
+  'Agentic implement pass produced a diff that is not a real implementation -- diff touches '
+  + 'python/dashboard/templates/index.html (matches forbidden "python/dashboard/templates/index.html") '
+  + '-- the task explicitly says not to';
+
+function forbiddenPathReadmitTask(extra = {}) {
+  return {
+    id: 'adhoc-fp', domain: 'adhoc', source: 'manual', status: 'blocked',
+    title: 'Decompose python/dashboard/templates/index.html — wire up the 4 new file(s)',
+    lastGoodPlan: '# PLAN\nUsing `edit_file` on `python/dashboard/templates/index.html`, insert the four `<script>` tags.\n## CRITERIA:\n- No other lines in `index.html` were modified.',
+    retryableDraftBlock: true, adhocResolution: 'needs-human-decision',
+    blockedReason: FORBIDDEN_TARGET_BLOCK_REASON,
+    priorRejectionFeedback: [
+      'A prior attempt spent its whole turn budget exploring and made ZERO edits.',
+      'Your diff modified python/dashboard/templates/index.html, which the task EXPLICITLY forbids ("index.html"). Discard those changes entirely.',
+    ],
+    localRejectCount: 2, turnBudgetExhaustedBefore: true,
+    history: [{ stage: 'needs-clarification', at: '2026-09-08T10:02:11Z' }],
+    ...extra,
+  };
+}
+
+test('a forbidden-path block that named one of the task\'s own declared targets is re-admitted clean-slate, not exhausted', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-fp.json'), JSON.stringify(forbiddenPathReadmitTask()));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-fp.json')), 'back in queue/adhoc/');
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'adhoc-fp.json')));
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-fp.json'), 'utf8'));
+  assert.equal(out.localRejectCount, undefined, 'retry budget reset');
+  assert.equal(out.priorRejectionFeedback, undefined, 'poisoned "index.html is forbidden" feedback dropped');
+  assert.equal(out.blockedReason, undefined);
+  assert.equal(out.turnBudgetExhaustedBefore, undefined);
+  assert.equal(out.forbiddenPathReadmitted, true, 're-admission is stamped so it happens at most once');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /own declared edit targets/.test(h.detail)));
+});
+
+test('the forbidden-path re-admission fires at most once (forbiddenPathReadmitted stamp)', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-fp.json'),
+    JSON.stringify(forbiddenPathReadmitTask({ forbiddenPathReadmitted: true })));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0, 'not re-admitted a second time');
+  // localRejectCount 2 + already-escalated history -> normal exhaustion path, left in place
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'adhoc-fp.json')));
+});
+
+test('a forbidden-path block naming a genuine NON-target file is NOT re-admitted', () => {
+  const d = setupAdhocDirs();
+  const task = forbiddenPathReadmitTask({
+    id: 'adhoc-fp-real',
+    blockedReason: 'Agentic implement pass produced a diff that is not a real implementation -- diff touches src/git-runner.js (matches forbidden "src/git-runner.js") -- the task explicitly says not to',
+    priorRejectionFeedback: ['Your diff modified src/git-runner.js, which the task EXPLICITLY forbids ("src/git-runner.js").'],
+    history: [],
+  });
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-fp-real.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  // localRejectCount 2, no prior needs-clarification event -> real exhaustion escalation
+  assert.equal(summary.requeued, 0);
+  const out = JSON.parse(fs.readFileSync(path.join(d.needsClarificationDir, 'adhoc-fp-real.json'), 'utf8'));
+  assert.equal(out.needsClarification.reason, 'design-decision');
+});
+
 test('an adhoc retryable draft block at the retry cap escalates to needs-clarification (honest, after real retries)', () => {
   const d = setupAdhocDirs();
   const task = {
