@@ -43,6 +43,14 @@ const MAX_SIDE_FINDINGS_PER_RESPONSE = Number(process.env.AGENT_MANAGER_MAX_SIDE
 const SIDE_FINDING_SPLIT_RE = /(?=^SIDE-FINDING:\s*)/m;
 const SIDE_FINDING_TITLE_RE = /^SIDE-FINDING:\s*(.+)$/m;
 
+// A model that echoes the instruction's own example tokens ("<one-line title>",
+// "<1-3 sentences of detail>") emitted a template, not a finding. Seen live -- brain-dump
+// serials 659/661 ("Inconsistent Read-Only Tier Performance", "Inconsistent Read/Write
+// Tiers") carried "<1-3 sentences of detail>" verbatim and one was still promoted to a
+// task. Deterministic drop, same "malformed -> skip, never throw" contract as the
+// empty-title/body check.
+const SIDE_FINDING_PLACEHOLDER_RE = /<one-line title>|<\d(?:\s*-\s*\d)?\s+sentences?[^>]*>/i;
+
 // Appends the instruction blurb once. Idempotent (checks it isn't already present) --
 // matters because call() can retry the identical prompt several times (CHAT_FLAKE-style
 // retries elsewhere, local-client.js's own maxRetries) and must not accumulate copies.
@@ -89,6 +97,7 @@ function extractSideFindings(text) {
     cleanParts.push(remainder); // whatever comes after this finding's own paragraph stays
 
     if (!title || !body) continue; // malformed -- drop, don't fail the whole extraction
+    if (SIDE_FINDING_PLACEHOLDER_RE.test(title) || SIDE_FINDING_PLACEHOLDER_RE.test(body)) continue; // instruction template echoed back verbatim
     const key = title.toLowerCase();
     if (seenTitles.has(key)) continue; // same finding repeated in one response
     if (findings.length >= MAX_SIDE_FINDINGS_PER_RESPONSE) continue;

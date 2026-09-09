@@ -68,6 +68,18 @@ test('extractSideFindings drops a block with no body rather than throwing', () =
   assert.equal(result.findings.length, 0);
 });
 
+test('extractSideFindings drops a block that echoes the instruction template verbatim (placeholder title/body)', () => {
+  // Seen live: brain-dump serials 659/661 carried "<1-3 sentences of detail>" verbatim
+  // from the SIDE_FINDING_INSTRUCTION example, and one was still promoted to a task.
+  const placeholderBody = extractSideFindings('Answer.\n\nSIDE-FINDING: Inconsistent tiers\n<1-3 sentences of detail>\n');
+  assert.equal(placeholderBody.findings.length, 0);
+  const placeholderTitle = extractSideFindings('Answer.\n\nSIDE-FINDING: <one-line title>\nA plausible-looking body.\n');
+  assert.equal(placeholderTitle.findings.length, 0);
+  // a real finding with normal prose is unaffected
+  const real = extractSideFindings('Answer.\n\nSIDE-FINDING: A real thing\nThe worker log rotates but the index is never truncated.\n');
+  assert.equal(real.findings.length, 1);
+});
+
 test('extractSideFindings de-duplicates an identical title repeated in one response', () => {
   const text = [
     'SIDE-FINDING: Same thing',
