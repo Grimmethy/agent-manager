@@ -134,6 +134,65 @@ test('topLevelBindingNames: functions, consts, and destructured requires; column
   assert.ok(!names.has('total'), 'a local inside a function body is not top-level');
 });
 
+test('topLevelBindingNames: members of a MULTI-LINE destructured require are top-level bindings', () => {
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    'const {',
+    '  parseThing,',
+    '  ROUTE_TABLE,',
+    '  deriveName,',
+    "} = require('./helpers.js');",
+    '',
+    'function use() { return parseThing(ROUTE_TABLE); }',
+    '',
+    'module.exports = { use };',
+    '',
+  ].join('\n');
+  const names = topLevelBindingNames(src);
+  for (const n of ['fs', 'parseThing', 'ROUTE_TABLE', 'deriveName', 'use']) {
+    assert.ok(names.has(n), `expected ${n}`);
+  }
+});
+
+test('allTopLevelRequireStatements + carry: a MULTI-LINE destructured require reached only via spread is carried', () => {
+  const { allTopLevelRequireStatements } = require('./decompose-node-module.js');
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    'const {',
+    '  listMonths,',
+    "} = require('./archive.js');",
+    '',
+    'function scan(dir) {',
+    '  return [',
+    '    ...listMonths(dir).map((d) => ({ d })),',
+    '  ];',
+    '}',
+    '',
+    'function other() { return fs.readdirSync("."); }',
+    '',
+    'module.exports = { scan, other };',
+    '',
+  ].join('\n');
+  const all = allTopLevelRequireStatements(src);
+  assert.ok(all.some((l) => /archive\.js/.test(l) && /listMonths/.test(l)), 'multi-line require captured');
+
+  // and the extraction carries it into the new module (spread read must count)
+  const r = buildNodeModuleExtraction(src, 'src/m.js', 'src/m-scan.js', ['scan']);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.match(r.changes[0].content, /require\('\.\/archive\.js'\)/);
+  assert.match(r.changes[0].content, /listMonths/);
+});
+
+test('referencedIdentifiers via spread: `...name(x)` reads `name` (not treated as member access)', () => {
+  const { referencedIdentifiers } = require('./decompose-node-module.js');
+  const refs = referencedIdentifiers('const y = [ ...expand(a), b.c ]; f(...rest);');
+  assert.ok(refs.has('expand'), 'spread callee is a read');
+  assert.ok(refs.has('rest'), 'spread of a plain identifier is a read');
+  assert.ok(!refs.has('c'), 'a genuine member access is still not a read');
+});
+
 test('buildNodeModuleExtraction: a self-contained cluster (computeA+computeB) extracts cleanly', () => {
   const r = buildNodeModuleExtraction(SRC, 'src/thing.js', 'src/thing-compute.js', ['computeA', 'computeB']);
   assert.equal(r.ok, true, r.ok ? '' : r.reason);
