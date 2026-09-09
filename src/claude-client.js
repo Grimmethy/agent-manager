@@ -300,9 +300,11 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   for (let i = 0; i < n; i++) {
     let result;
     try {
-      // taskId/stage threaded through so a vote model's SIDE-FINDING: markers are
-      // attributed to the task -- parity with local-client.js's majorityVote (see its note).
-      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs, taskId, stage }, 1);
+      // allowSideFindings:false -- a vote is a binary classifier, not an exploratory pass;
+      // the SIDE-FINDING channel is pure noise here. Parity with local-client.js's
+      // majorityVote (see its note for the needs_clarification_triage incident). taskId/
+      // stage still threaded for call()'s hard-failure-audit log.
+      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs, taskId, stage, allowSideFindings: false }, 1);
     } catch (e) {
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under

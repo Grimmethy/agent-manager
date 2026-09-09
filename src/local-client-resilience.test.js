@@ -498,12 +498,14 @@ test('call() logs a tagged hard-failure entry to the unified pipeline-history.lo
   );
 });
 
-// 2026-09-09: a vote model's SIDE-FINDING: markers must be attributed to the task the
-// vote was about. majorityVote() previously destructured a fixed param list and rebuilt
-// the object it handed to call(), silently dropping any taskId/stage a caller passed --
-// so every such side-finding landed in the inbox with taskId:null (brain-dump serial 644
-// "Different Scope", dedup-counted to 406, was one). This proves the threading.
-test('majorityVote() threads taskId/stage into call() so a vote SIDE-FINDING is written with the task id', async () => {
+// 2026-09-09: a majorityVote() is a binary classifier (CONFIRM/DENY, APPROVE/REJECT),
+// never an exploratory pass -- the SIDE-FINDING: channel is pure noise there. The
+// needs_clarification_triage brain-dump family proved it live: serial 644 "Different
+// Scope" dedup-counted to 406, all taskId:null, several promoted to dud tasks against
+// already-resolved work. allowSideFindings:false suppresses it entirely (prompt injection
+// AND response extraction); the verdict still classifies fine. taskId/stage stay threaded
+// for call()'s hard-failure-audit log.
+test('majorityVote() does NOT file a SIDE-FINDING even when a vote response carries the marker', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-vote-sf-'));
   fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
   await withServer(
@@ -524,18 +526,15 @@ test('majorityVote() threads taskId/stage into call() so a vote SIDE-FINDING is 
       const { majorityVote } = require('./local-client.js');
 
       const classify = (t) => (t.includes('DENY') ? 'deny' : null);
-      await majorityVote({
+      const result = await majorityVote({
         prompt: 'x', classify, n: 1, minAgreeing: 1,
         source: 'needs_clarification_triage', taskId: 'nc-task-42', stage: 'nc-triage-premise-vote',
       });
+      assert.equal(result.verdict, 'deny', 'the binary classification still works');
 
       const inbox = path.join(dir, 'queue', 'side-findings-inbox');
-      const files = fs.readdirSync(inbox);
-      assert.equal(files.length, 1, 'the vote SIDE-FINDING was filed');
-      const rec = JSON.parse(fs.readFileSync(path.join(inbox, files[0]), 'utf8'));
-      assert.equal(rec.taskId, 'nc-task-42', 'attributed to the task, not null');
-      assert.equal(rec.stage, 'nc-triage-premise-vote');
-      assert.equal(rec.source, 'needs_clarification_triage');
+      assert.ok(!fs.existsSync(inbox) || fs.readdirSync(inbox).length === 0,
+        'a vote must not file a SIDE-FINDING (allowSideFindings:false)');
     }
   );
 });
