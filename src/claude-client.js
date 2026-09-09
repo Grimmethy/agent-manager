@@ -294,13 +294,15 @@ async function call(opts, maxRetries = 2) {
 // background pipeline stage, not human-blocking, so wall-clock is the cheap axis. The
 // real gap AC-4 sat next to -- this copy having drifted out of parity (no try/catch, no
 // voteErrors despite review-task.js reading it, no early-exit) -- is closed instead.
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs }) {
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs, taskId, stage }) {
   const votes = [];
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
     try {
-      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs }, 1);
+      // taskId/stage threaded through so a vote model's SIDE-FINDING: markers are
+      // attributed to the task -- parity with local-client.js's majorityVote (see its note).
+      result = await call({ prompt, think: false, temperature, model, effort, timeoutMs, taskId, stage }, 1);
     } catch (e) {
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under

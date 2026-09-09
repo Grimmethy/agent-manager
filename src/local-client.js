@@ -444,13 +444,18 @@ async function call(opts, maxRetries = 2) {
 // function's own internal call() already accepts; omitted entirely (undefined) preserves
 // today's exact behavior (call()'s own defaults / this module's MODEL const) for every
 // existing caller that doesn't pass them.
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict }) {
+// taskId/stage: threaded straight through to call() -> callOnce()'s side-finding /
+// hard-failure-audit hooks, which key off opts.taskId. Without this, EVERY side-finding a
+// vote model emits (SIDE-FINDING: markers are injected into vote prompts too) lands in the
+// inbox with taskId:null -- orphaned from the task the vote was actually about. Confirmed
+// live via brain-dump serial 644 ("Different Scope"), raisedBy.taskId:null, count 406.
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
   const votes = [];
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
     try {
-      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict }, 1);
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage }, 1);
     } catch (e) {
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under

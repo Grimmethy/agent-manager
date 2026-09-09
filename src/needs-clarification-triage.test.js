@@ -169,6 +169,23 @@ test('bucket B: invalid premise, no signal, confident DENY vote -> flagged, left
   assert.equal(t.stalenessFlag.confidence, 'medium');
 });
 
+test('bucket B: the premise vote is called with the task id + stage (so a vote-model SIDE-FINDING is attributed, not orphaned as taskId:null)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('t-attrib', {
+    needsClarification: { reason: 'design-decision', openQuestions: 'has no mapping to anything in this repository' },
+  }));
+  let seen = null;
+  const recordingVote = async (opts) => {
+    seen = opts;
+    return { verdict: 'DENY', confident: true, votes: [{ verdict: 'DENY', response: 'DENY: x' }], realVoteCount: 2, requestedVotes: 3 };
+  };
+  await needsClarificationTriage(args(dir, recordingVote));
+  assert.ok(seen, 'the vote was actually invoked');
+  assert.equal(seen.taskId, 't-attrib');
+  assert.equal(seen.stage, 'nc-triage-premise-vote');
+  assert.equal(seen.source, 'needs_clarification_triage');
+});
+
 test('bucket B: vote throws -> not stamped, errors++, retried next tick', async () => {
   const dir = makePipeline();
   held(dir, baseTask('t9', {
