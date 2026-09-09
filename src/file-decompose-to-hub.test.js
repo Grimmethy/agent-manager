@@ -511,3 +511,82 @@ test('validatePlan: a script-extract move whose source file does not exist yet s
   const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', moveFile), 'utf8'));
   assert.equal(move.promptContext.deterministicApply, undefined);
 });
+
+// --- Tier 1: fully-mechanical HTML plan -> one deterministic one-pass task, no hub -------
+// ([[hub-task-integration]] / concept-hub-task-integration-549f09, spec
+// Docs/hub-task-independent-merge.md)
+
+test('one-pass: a fully-mechanical HTML plan files ONE deterministic task, no hub, no stacked branch', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html',
+    'function alpha(){return 1;}\nfunction beta(){return 2;}\nfunction gamma(){return 3;}\nfunction keep(){return 9;}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify({
+    id: 'decompose-index-html',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [
+      { newFile: 'python/dashboard/static/js/ab.js', kind: 'script-extract', symbols: ['alpha', 'beta'] },
+      { newFile: 'python/dashboard/static/js/g.js', kind: 'script-extract', symbols: ['gamma'] },
+    ],
+  }));
+
+  withEnv(dir, {}, ({ sweep }) => {
+    const s = sweep({ pipelineDir: dir });
+    assert.equal(s['decompose-index-html'].onePass, true);
+    assert.equal(s.filedHubs, 1); // counted as a "filed" outcome (not blocked)
+  });
+
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating')) && fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length || 0, 0, 'no hub filed');
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(adhoc.length, 1);
+  assert.match(adhoc[0], /-onepass\.json$/);
+  const task = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc[0]), 'utf8'));
+  assert.equal(task.promptContext.deterministicApply, 'one-pass-decompose');
+  assert.equal(task.promptContext.sourceFile, 'python/dashboard/templates/index.html');
+  assert.equal(task.promptContext.moves.length, 2);
+  assert.deepEqual(task.promptContext.moves[0].symbols, ['alpha', 'beta']);
+  assert.equal(task.stacked, undefined);
+  assert.equal(task.atomic, true);
+  const req = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), 'utf8'));
+  assert.equal(req.onePassTaskId, task.id);
+});
+
+test('one-pass: a mixed plan (a non-script-extract move) still files a hub', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html',
+    'function alpha(){return 1;}\nfunction beta(){return 2;}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify({
+    id: 'decompose-mixed',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [
+      { newFile: 'python/dashboard/static/js/a.js', kind: 'script-extract', symbols: ['alpha'] },
+      { newFile: 'python/dashboard/static/js/b.js', kind: 'module-extract', symbols: ['beta'] },
+    ],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { sweep({ pipelineDir: dir }); });
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length, 1, 'hub filed for a mixed plan');
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'adhoc')).some((n) => n.includes('-onepass')), false);
+});
+
+test('one-pass: AGENT_MANAGER_DECOMPOSE_ONE_PASS=false keeps the stacked hub', () => {
+  const dir = tmpRepo();
+  writeHtmlWithScript(dir, 'python/dashboard/templates/index.html',
+    'function alpha(){return 1;}\nfunction beta(){return 2;}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify({
+    id: 'decompose-x',
+    sourceFile: 'python/dashboard/templates/index.html',
+    moves: [
+      { newFile: 'python/dashboard/static/js/a.js', kind: 'script-extract', symbols: ['alpha'] },
+      { newFile: 'python/dashboard/static/js/b.js', kind: 'script-extract', symbols: ['beta'] },
+    ],
+  }));
+  const prev = process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS;
+  process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = 'false';
+  try {
+    delete require.cache[require.resolve('./decompose-one-pass.js')];
+    withEnv(dir, {}, ({ sweep }) => { sweep({ pipelineDir: dir }); });
+    assert.equal(fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length, 1, 'hub filed, one-pass disabled');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS; else process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = prev;
+    delete require.cache[require.resolve('./decompose-one-pass.js')];
+  }
+});

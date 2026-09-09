@@ -23,6 +23,15 @@ function tmpPipeline() {
 const w = (dir, state, t) => fs.writeFileSync(path.join(dir, 'queue', state, `${t.id}.json`), JSON.stringify(t, null, 2));
 const r = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 
+// Tier-1 one-pass short-circuits a fully-mechanical HTML plan into a single task (no hub).
+// These hub-materialisation / parentHub tests deliberately exercise the HUB path.
+async function sweepHubPath(args) {
+  const prev = process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS;
+  process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = 'false';
+  try { return await sweep(args); }
+  finally { if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS; else process.env.AGENT_MANAGER_DECOMPOSE_ONE_PASS = prev; }
+}
+
 test('targetOversizedFile: matches the flagged path named in the task text', () => {
   const oversized = new Set(['python/dashboard/templates/index.html', 'src/x.js']);
   const t = { title: 'Combine job types', promptContext: { rawText: 'edit python/dashboard/templates/index.html renderJobListTab()' } };
@@ -78,7 +87,7 @@ test('sweep: a decompose-loop task on an oversized file gets a file-decompose re
   fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
     '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
 
-  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call });
+  const summary = await sweepHubPath({ pipelineDir: dir, repoRoot: dir, call });
   assert.equal(summary.routed, 1);
 
   const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
@@ -172,7 +181,7 @@ test('sweep: promptContext.decomposedFrom on the stuck task carries onto the new
   fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
     '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
 
-  await sweep({ pipelineDir: dir, repoRoot: dir, call });
+  await sweepHubPath({ pipelineDir: dir, repoRoot: dir, call });
 
   const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
   const req = r(path.join(dir, 'queue', 'file-decompose-requests', reqs[0]));
@@ -206,7 +215,7 @@ test('sweep: with no decomposedFrom, a real coordinating parent found by scan st
   fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
     '<script>\nfunction renderJobListTab(){}\nfunction renderJobRow(){}\nfunction renderGroupRow(){}\nfunction toggleGroup(){}\nfunction extra1(){}\nfunction extra2(){}\n</script>\n');
 
-  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call });
+  const summary = await sweepHubPath({ pipelineDir: dir, repoRoot: dir, call });
   assert.equal(summary.rewiredParents, 1);
 
   const reqs = fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests'));
@@ -324,4 +333,37 @@ test('sweep: a hot file whose hub is ALREADY filed is not abandoned', async () =
   const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: async () => ({ response: '[]' }) });
   // not skipped-as-hot; it takes the normal already-filed path (re-points the task)
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'file-decompose-requests', `${requestId}.json`)), true, 'existing request untouched');
+});
+
+// --- Tier 1: autoroute of a fully-mechanical HTML plan -> single one-pass task, no hub ---
+
+test('sweep: a fully-mechanical HTML decompose-loop task is routed to a one-pass task, not a hub', async () => {
+  const dir = tmpPipeline();
+  w(dir, 'needs-clarification', STUCK());
+  fs.mkdirSync(path.join(dir, 'python/dashboard/templates'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python/dashboard/templates/index.html'),
+    '<html><body>\n<script>\n' + ['renderJobListTab','renderJobRow','renderGroupRow','toggleGroup','extra1','extra2']
+      .map((n) => `function ${n}(){ return 1; }`).join('\n') + '\n</script>\n</body></html>\n');
+  const call = async () => ({ response: JSON.stringify([
+    { newFile: 'python/dashboard/static/js/job-list.js', kind: 'script-extract', symbols: ['renderJobListTab', 'renderJobRow'] },
+    { newFile: 'python/dashboard/static/js/job-groups.js', kind: 'script-extract', symbols: ['renderGroupRow', 'toggleGroup'] },
+  ]) });
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call });
+  assert.equal(summary.routed, 1);
+
+  // no hub
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length, 0);
+  // one -onepass adhoc task
+  const onePass = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).filter((n) => n.includes('-onepass'));
+  assert.equal(onePass.length, 1);
+  const opTask = r(path.join(dir, 'queue', 'adhoc', onePass[0]));
+  assert.equal(opTask.promptContext.deterministicApply, 'one-pass-decompose');
+
+  // stuck task depends on the one-pass task id, not a non-existent hub
+  const moved = r(path.join(dir, 'queue', 'pending', `${STUCK().id}.json`));
+  assert.deepEqual(moved.dependsOn, [opTask.id]);
+  assert.equal(moved.reroutedTo.kind, 'file-decompose-onepass');
+  assert.equal(moved.reroutedTo.onePassTaskId, opTask.id);
+  assert.equal(moved.reroutedTo.hubId, undefined);
 });
