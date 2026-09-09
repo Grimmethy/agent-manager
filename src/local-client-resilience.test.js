@@ -497,3 +497,45 @@ test('call() logs a tagged hard-failure entry to the unified pipeline-history.lo
     }
   );
 });
+
+// 2026-09-09: a vote model's SIDE-FINDING: markers must be attributed to the task the
+// vote was about. majorityVote() previously destructured a fixed param list and rebuilt
+// the object it handed to call(), silently dropping any taskId/stage a caller passed --
+// so every such side-finding landed in the inbox with taskId:null (brain-dump serial 644
+// "Different Scope", dedup-counted to 406, was one). This proves the threading.
+test('majorityVote() threads taskId/stage into call() so a vote SIDE-FINDING is written with the task id', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-vote-sf-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('DENY\n\nSIDE-FINDING: something unrelated the model noticed\nA one line body for it.'));
+      });
+    },
+    async (base) => {
+      process.env.OLLAMA_URL = base;
+      process.env.LOCAL_MODEL = 'test-model';
+      process.env.ORNITH_TIMEOUT_MS = '5000';
+      process.env.AGENT_MANAGER_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+      delete require.cache[require.resolve('./local-client.js')];
+      const { majorityVote } = require('./local-client.js');
+
+      const classify = (t) => (t.includes('DENY') ? 'deny' : null);
+      await majorityVote({
+        prompt: 'x', classify, n: 1, minAgreeing: 1,
+        source: 'needs_clarification_triage', taskId: 'nc-task-42', stage: 'nc-triage-premise-vote',
+      });
+
+      const inbox = path.join(dir, 'queue', 'side-findings-inbox');
+      const files = fs.readdirSync(inbox);
+      assert.equal(files.length, 1, 'the vote SIDE-FINDING was filed');
+      const rec = JSON.parse(fs.readFileSync(path.join(inbox, files[0]), 'utf8'));
+      assert.equal(rec.taskId, 'nc-task-42', 'attributed to the task, not null');
+      assert.equal(rec.stage, 'nc-triage-premise-vote');
+      assert.equal(rec.source, 'needs_clarification_triage');
+    }
+  );
+});
