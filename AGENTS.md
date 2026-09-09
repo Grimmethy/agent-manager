@@ -151,6 +151,28 @@ escalation with no re-admission mechanism matching. The concept card's telemetry
 its timeline are the live scoreboard — a debt entry stops recurring once you build the
 missing deterministic recovery.
 
+## Hub tasks: every sub-task must merge to `main` independently
+
+Tracked as its own concept row (`concepts.json`, `concept-hub-task-integration-549f09` —
+[[hub-task-integration]]). A **coordinator hub** (`file-decompose-to-hub.js`,
+`decompose-loop-autoroute.js`, product_spec section hubs; the dashboard's Hub Tasks tab)
+must **not** batch its sub-tasks onto one deferred stacked branch that merges to `main`
+only at the end. That model has lost a finished decomposition **twice** — 2026-09-06
+(`app.py`, branch vanished, split never landed) and 2026-09-09 (`index.html`, branch went
+~6 days stale against 9 intervening commits, produced 8 unmergeable modify/delete conflict
+hunks, hub superseded and completed work discarded). A file-decompose is a whole-file
+rewrite (maximal conflict surface); the pipeline is slow (multi-day per hub); concurrent
+edits to the target on a live project are the norm; nothing rebases the stale branch. The
+hub's `mergedAt` bookkeeping stamp is a [[ghost-in-the-machine]] stale flag — it reads
+"merged" while the branch is in fact unmergeable.
+
+**When building or touching any hub flow:** each sub-task branches from *current* `main`,
+carries its own wiring so `main` is never half-decomposed between pieces, and merges on its
+own — conflict window per piece is minutes, not days for the whole file. Where the move is
+mechanical (`script-extract.js`'s verbatim symbol relocation), do the whole split in one
+fast deterministic pass. Exclude files with recent commits from auto-decompose entirely —
+the oversized-file flag is advisory.
+
 ## Concept research: give a named topic the same treatment, tag it as it flows through
 
 Twice this session (2026-09-06), a narrow topic (chat-context-trimming, then
