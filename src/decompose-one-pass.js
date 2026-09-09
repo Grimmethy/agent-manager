@@ -81,6 +81,15 @@ function buildOnePassGroupBChanges(sourceText, sourceFile, moves) {
   }
   const finalHtml = spliceScriptTags(cur, moves);
   changes.push({ mode: 'edit', file: sourceFile, find: sourceText, replace: finalHtml });
+
+  // Independent guard (2026-09-09 incident, parity with decompose-node-module.js): run the
+  // REAL `node --check` on every extracted .js module -- a `buildExtraction` slice that
+  // desynced on a template literal / regex would still return here, and neither the vm
+  // oracle nor a byte-match review gate re-parses the final module as Node would.
+  const { firstNodeCheckError } = require('./decompose-node-module.js');
+  const parseErr = firstNodeCheckError(changes.filter((c) => c.mode === 'create' && /\.m?js$/.test(c.file)));
+  if (parseErr) return { ok: false, reason: `extracted module does not pass \`node --check\` -- ${parseErr}` };
+
   return { ok: true, changes };
 }
 
