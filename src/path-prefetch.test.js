@@ -302,3 +302,26 @@ test('resolveAnchors\' UI fallback never overrides a genuinely ambiguous real ma
   });
   assert.equal(result.status, 'ambiguous');
 });
+
+test('resolveAnchors excludes src/local-throughput.js when the task is about pipeline throughput, not Ollama (bd-1788864613814)', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/local-throughput.js');
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/local-throughput.js' }]);
+  // "throughput" substring-matches local-throughput.js, but the pipeline context must
+  // drop it -- the Ollama TPS calibrator is not the task-pipeline's own metrics code.
+  const result = resolveAnchors({ repoRoot, title: 'task-pipeline throughput metrics', rawText: '' });
+  assert.equal(result.status, 'greenfield');
+  assert.ok(
+    !((result.paths || []).includes('src/local-throughput.js')) &&
+    !Object.values(result.candidates || {}).some((hits) => hits.includes('src/local-throughput.js')),
+    'local-throughput.js must not be a candidate in pipeline context'
+  );
+});
+
+test('resolveAnchors still matches src/local-throughput.js for a genuine Ollama token-generation throughput task (no over-exclusion)', () => {
+  const repoRoot = makeRepo();
+  writeSourceFile(repoRoot, 'src/local-throughput.js');
+  writeGraph(repoRoot, [{ id: 0, community: 0, source_file: 'src/local-throughput.js' }]);
+  const result = resolveAnchors({ repoRoot, title: 'Ollama token-generation throughput calibration', rawText: '' });
+  assert.deepEqual(result, { status: 'matched', paths: ['src/local-throughput.js'] });
+});
