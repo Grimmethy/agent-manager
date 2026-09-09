@@ -24,6 +24,13 @@
 //
 // All git/python calls go through an injectable `exec` so the sweep's own test can drive
 // this with canned output instead of a real repo + interpreter.
+//
+// 2026-09-09: since AGENT_MANAGER_APPLY_REPO_ROOT (2026-09-07) apply runs in a SEPARATE
+// clone, so the `agent/<hub>` branch is pushed to origin and NEVER exists as a local ref
+// in this checkout (getConfig().repoRoot, where coordinator-sweep.js runs the gate).
+// `git worktree add --detach <wt> <branch>` and `git diff <main>...<branch>` with the bare
+// branch name then die with "fatal: invalid reference". Setup now fetches branch + main
+// into throwaway `refs/decompose-gate/*` refs and every git op uses those.
 
 const os = require('os');
 const path = require('path');
@@ -106,6 +113,11 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
   const wtBase = fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-gate-'));
   const branchWt = path.join(wtBase, 'branch');
   const mainWt = path.join(wtBase, 'main');
+  // The hub branch + main only exist on origin (apply runs in a separate clone since
+  // 2026-09-07 -- see this file's header). Fetch both into throwaway local refs and point
+  // every git op at those instead of the bare names, which no longer resolve here.
+  const branchRef = 'refs/decompose-gate/branch';
+  const mainRef = 'refs/decompose-gate/main';
   const cleanup = [];
 
   const record = (name, status, detail) => checks.push({ name, status, detail: String(detail || '').slice(0, 2000) });
@@ -113,13 +125,24 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
     for (const wt of cleanup) {
       try { exec('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot }); } catch { /* best-effort */ }
     }
+    for (const ref of [branchRef, mainRef]) {
+      try { exec('git', ['update-ref', '-d', ref], { cwd: repoRoot }); } catch { /* best-effort */ }
+    }
     try { fs.rmSync(wtBase, { recursive: true, force: true }); } catch { /* best-effort */ }
     const failed = checks.filter((c) => c.status === 'fail');
     return { ok: failed.length === 0, checks, branch };
   };
 
   try {
-    exec('git', ['worktree', 'add', '--detach', branchWt, branch], { cwd: repoRoot });
+    exec('git', ['fetch', '--no-tags', '--force', 'origin',
+      `${branch}:${branchRef}`, `${mainBranch}:${mainRef}`], { cwd: repoRoot });
+  } catch (e) {
+    record('setup', 'fail', `could not fetch ${branch} / ${mainBranch} from origin: ${e.message}`);
+    return { ...done(), errored: true };
+  }
+
+  try {
+    exec('git', ['worktree', 'add', '--detach', branchWt, branchRef], { cwd: repoRoot });
     cleanup.push(branchWt);
   } catch (e) {
     record('setup', 'fail', `could not create worktree for ${branch}: ${e.message}`);
@@ -134,7 +157,7 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
   // 1. py_compile every changed / new .py file on the branch.
   let changed = [];
   try {
-    const out = exec('git', ['diff', '--name-only', `${mainBranch}...${branch}`], { cwd: repoRoot });
+    const out = exec('git', ['diff', '--name-only', `${mainRef}...${branchRef}`], { cwd: repoRoot });
     changed = out.split('\n').map((s) => s.trim()).filter((s) => s.endsWith('.py'));
   } catch (e) {
     record('py_compile', 'skip', `could not list changed files: ${e.message}`);
@@ -201,7 +224,7 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFil
 
   // 3. url_map invariant: identical route table on main and on the branch.
   try {
-    exec('git', ['worktree', 'add', '--detach', mainWt, mainBranch], { cwd: repoRoot });
+    exec('git', ['worktree', 'add', '--detach', mainWt, mainRef], { cwd: repoRoot });
     cleanup.push(mainWt);
   } catch (e) {
     record('url_map', 'skip', `could not create ${mainBranch} worktree: ${e.message}`);
