@@ -45,6 +45,12 @@ const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 // than to an open-ended agent run. Configurable for slower/loaded accounts.
 const REQUEST_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 300_000;
 const MAX_BUDGET_USD = process.env.CLAUDE_MAX_BUDGET_USD || '';
+// Hard ceiling on --max-turns for the claude -p draft call.
+// Brain-dump bd-1788707820332: a 61-turn / $2.68 runaway draft showed the draft
+// path needs a bounded default. Override via env if a specific workflow
+// genuinely needs more (the cap is a ceiling, not a target -- smaller caller
+// values are always preserved).
+const DRAFT_MAX_TURNS = Number(process.env.DRAFT_MAX_TURNS) || 20;
 // Bounds what a read-only tool under --permission-mode dontAsk's "read-only command
 // set" carve-out could see, regardless of --allowedTools -- an empty scratch dir has
 // nothing sensitive in it even if some read-only capability slips through. Defense in
@@ -108,11 +114,14 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   if (allowAmplification) effectivePrompt = injectAmplificationInstruction(effectivePrompt);
   if (conceptId) effectivePrompt = injectConceptBuildInstruction(effectivePrompt);
   const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
+  // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
+  // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1.
+  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
   const args = [
     '-p', datedPrompt,
     '--output-format', 'json',
     '--model', model || MODEL,
-    '--max-turns', String(maxTurns),
+    '--max-turns', String(effectiveMaxTurns),
     '--permission-mode', permissionMode,
   ];
   // low/medium/high/xhigh/max -- see CLI --effort. Falls back to the CLI's own default
@@ -198,6 +207,17 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     });
   } catch (e) {
     const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    // Non-zero exit whose output mentions the turn limit (the CLI's own
+    // "Reached maximum number of turns (N)" failure, confirmed live 2026-08-16)
+    // -- surface it as the same structured error as the JSON-parsed path below
+    // so a caller can detect exhaustion uniformly instead of pattern-matching
+    // free text.
+    if (/(?:max(?:imum)?[ -]?turns?|turn budget)/i.test(detail)) {
+      const turnLimitErr = new Error(`Draft turn limit exceeded (claude -p non-zero exit): ${detail}`);
+      turnLimitErr.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+      turnLimitErr.maxTurns = effectiveMaxTurns;
+      throw turnLimitErr;
+    }
     throw new Error(`claude -p failed: ${detail}`);
   }
 
@@ -206,6 +226,26 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     parsed = JSON.parse(stdout);
   } catch (e) {
     throw new Error(`claude -p returned non-JSON output with --output-format json: ${stdout.slice(0, 500)}`);
+  }
+
+  // Turn-limit exhaustion detected in the CLI's own JSON (confirmed live shape:
+  // stop_reason "tool_use" with num_turns at the requested ceiling, e.g. 31/31 in
+  // the 2026-08-23 adhoc-draft failure) -- throw the structured error here,
+  // before the caller can mistake an exhausted run for a completed one. This is
+  // the code the retry-exclusion consumer (call()'s loop / adhoc-agentic-draft.js)
+  // keys on rather than pattern-matching stop_reason/num_turns itself.
+  if (
+    parsed.stop_reason === 'tool_use' &&
+    parsed.num_turns != null &&
+    parsed.num_turns >= effectiveMaxTurns
+  ) {
+    const turnLimitErr = new Error(
+      `Draft turn limit exceeded: ${parsed.num_turns} turns reached the ceiling of ${effectiveMaxTurns}.`
+    );
+    turnLimitErr.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+    turnLimitErr.maxTurns = effectiveMaxTurns;
+    turnLimitErr.numTurns = parsed.num_turns;
+    throw turnLimitErr;
   }
 
   return {
