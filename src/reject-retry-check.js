@@ -30,8 +30,49 @@ const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
+const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
+
+// Fields wiped when a task is re-admitted with a CLEAN SLATE (not a blind redraft, which
+// keeps priorRejectionFeedback + increments localRejectCount). Kept deliberately in sync
+// with needs-clarification-triage.js's REQUEUE_STRIP_FIELDS -- same intent: a fresh start
+// for a task whose accumulated failure state was an artifact of a bug, not a real signal.
+const READMIT_CLEAN_SLATE_FIELDS = [
+  'needsClarification', 'localRejectCount', 'ncTriageAttempts', 'ncTriageDecision', 'ncTriageReviewedAt',
+  'retryableDraftBlock', 'turnBudgetExhausted', 'turnBudgetExhaustedBefore',
+  'infraErrorRetry', 'infraErrorNote', 'adhocResolution', 'subTaskProposals',
+  'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage', 'claimedAt',
+  'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
+  'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback',
+];
+
+// A prior forbidden-path block whose named path is actually one of the task's OWN declared
+// edit targets -- adhoc-diff-sanity.js's forbidden-path gate false-positived on the task's
+// own scope-discipline language ("No other lines in `index.html` were modified"), since
+// fixed there via extractDeclaredTargets. A blind retry could never clear it: the gate
+// reproduced the identical false positive on every pass until the retry budget burned out,
+// so `localRejectCount` here is noise, not a real rejection signal. Returns true => the
+// system re-admits the task with a clean slate (once), instead of an operator hand-fixing it.
+function forbiddenPathBlockNamesOwnTarget(task) {
+  const text = [
+    String(task.blockedReason || ''),
+    ...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback.map(String) : []),
+  ].join('\n');
+  if (!/matches forbidden "|EXPLICITLY forbids \(/i.test(text)) return false;
+  const named = new Set();
+  for (const m of text.matchAll(/matches forbidden "([^"]+)"/gi)) named.add(m[1]);
+  for (const m of text.matchAll(/EXPLICITLY forbids \(([^)]+)\)/gi)) {
+    for (const p of m[1].split(',')) {
+      const s = p.replace(/^[\s"'`]+|[\s"'`]+$/g, '');
+      if (s) named.add(s);
+    }
+  }
+  if (!named.size) return false;
+  let targets = [];
+  try { targets = extractDeclaredTargets(task, task.planResponse || task.lastGoodPlan || ''); } catch { return false; }
+  return [...named].some((n) => targets.some((t) => pathsRefEqual(n, t)));
+}
 
 function isReviewRejection(task) {
   return task.blockedStage === 'review';
@@ -185,6 +226,28 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
       // here should ever re-decide it, regardless of which reason string it used.
       if (task.needsClarification) continue;
 
+      // Re-admit a task the (now-fixed) forbidden-path gate bug wrongly ran to exhaustion:
+      // its block named one of its OWN declared edit targets, so no blind retry could ever
+      // have differed. The pipeline itself brings it back -- clean slate, retry budget
+      // reset -- exactly once (the forbiddenPathReadmitted stamp bounds it, so a task that
+      // somehow still fails this way after the fix is not re-admitted forever). This is the
+      // deterministic counterpart to an operator manually requeueing it.
+      if (!task.forbiddenPathReadmitted && forbiddenPathBlockNamesOwnTarget(task)) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.forbiddenPathReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+        if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+        summary.requeued++;
+        continue;
+      }
+
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
       // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
       // unreliable-grounding gate). Runs BEFORE the retry-cap check below and regardless
@@ -221,7 +284,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         if (isAdhocTask(task) && needsClarificationDir) {
           const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
           if (alreadyEscalated) { summary.exhausted++; continue; }
-          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedAdhocQuestion(task) };
+          // A task that exhausted its retries on a tagged tool/environment failure lands
+          // with an honest reason:'infra-error' -- not design-decision -- so forensics and
+          // the triage sweep see it for what it is. (nc.reason already carries non-
+          // design-decision values elsewhere: external-dependency, unreliable-grounding.)
+          task.needsClarification = {
+            reason: task.infraErrorBefore ? 'infra-error' : 'design-decision',
+            openQuestions: buildExhaustedAdhocQuestion(task),
+          };
           appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
           appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
           fs.mkdirSync(needsClarificationDir, { recursive: true });
@@ -288,12 +358,26 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         // feedback names the exact gap. See adhoc-diff-sanity.js.
         priorFeedback.push(task.adhocNoChangesClaimFeedback);
         delete task.adhocNoChangesClaimFeedback;
+      } else if (retryableDraftBlock && typeof task.infraErrorNote === 'string' && task.infraErrorNote.trim()) {
+        // resolveAgenticDraft (agentic-draft-common.js): the model tagged BLOCKER-TYPE:
+        // infra-error -- a tool/command/file-op that should have worked failed, unrelated
+        // to any design decision. A transient fault usually clears on a fresh pass; tell
+        // it what broke and how to escalate if it genuinely reproduces.
+        priorFeedback.push([
+          'A prior attempt hit a tool/environment failure (not a design question):',
+          '',
+          String(task.infraErrorNote).slice(0, 3000),
+          '',
+          'Retry the operation from a clean pass. If a command genuinely fails identically again, end with RESOLUTION: needs-human-decision and BLOCKER-TYPE: infra-error, quoting the exact command and its full error output.',
+        ].join('\n'));
+        delete task.infraErrorNote;
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
       delete task.turnBudgetExhausted;
+      delete task.infraErrorRetry;
       delete task.retryableDraftBlock;
       // Clear the terminal block state -- otherwise a task requeued into queue/adhoc/ still
       // reads status:'blocked' and this sweep's adhoc/ scan re-requeues it every tick until

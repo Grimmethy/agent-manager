@@ -50,20 +50,35 @@ than making arbitrary [numbers]"*. Treat this as a standing preference, not a on
   evidence itself as something worth closing (usually via the logging point above), not
   just something to route around this one time.
 
-## Third principle: "ghost in the machine" — a model call is a last resort, not a default
+## Third principle: "[[ghost-in-the-machine]]" — a model call, or an agent hand-editing state, is a last resort
 
 Named and tracked as its own concept row (`concepts.json`, `concept-ghost-in-the-machine-0dbeea`
 — read it with `require('./src/concepts.js').getConceptTimeline(pipelineDir, 'concept-ghost-in-the-machine-0dbeea', ...)`
-before extending this pattern, it has the fuller incident history). The distinction that
-matters:
+before extending this pattern; it has the fuller incident history). The
+[[ghost-in-the-machine]] is the AI agent — or a human operator — doing by hand what a
+deterministic mechanism should do every time. It has two forms, and both are the ghost:
 
-- A **ghost-in-the-machine fix** makes the model more likely to behave correctly (a better
-  instruction, a pointer to a tool, a stronger warning) without removing it from the step.
-  It still trusts a stochastic process to reliably do, every time, something that could
-  instead be done with 100% certainty by code.
-- A **systematic fix** removes the model from the step entirely wherever the step is
-  actually deterministic, leaving it only the genuinely judgment-requiring residue (if
-  any).
+- **A model call standing in for a mechanical step.** Asking the model to "move these named
+  symbols verbatim," "apply this exact rename," "run this fixed validation command" — or
+  nudging its prompt so it is *more likely* to get such a step right — trusts a stochastic
+  process to reliably do, every time, something code could do with 100% certainty.
+- **An agent or operator editing pipeline state by hand.** Requeuing a stuck task, clearing
+  a flag, hand-committing a one-off fix, re-filing a plan yourself (see the First
+  principle). Requeuing is the canonical example — it "works" once and the pipeline learns
+  nothing.
+
+The distinction that matters:
+
+- A **[[ghost-in-the-machine]] fix** makes the failure less likely without removing the
+  model or agent from the step (a better instruction, a pointer to a tool, a stronger
+  warning; a manual requeue of the one stuck task). It still trusts a stochastic or manual
+  process to reliably do, every time, something that could instead be done with 100%
+  certainty by code.
+- A **systematic fix** removes the model or agent from the step entirely wherever the step
+  is actually deterministic — leaving only the genuinely judgment-requiring residue (if
+  any) — and makes the **pipeline itself own the outcome, including failure and re-entry**.
+  An automatic system has to handle a task *failing* and *getting back into the flow*, not
+  just the happy path.
 
 **When authoring a task shape, a prompt, or a plan/implement pass, ask first: is the thing
 I'm about to ask the model to do actually mechanical?** A "move these named symbols
@@ -92,6 +107,17 @@ wrong half of the problem. Concrete precedent for both the win and the trap:
   it for a task that already exists** — a sibling task landing, a file edited by hand, or a
   tool getting fixed can all flip eligibility after creation, and a check that only ever
   runs once silently stops protecting anything the moment the world changes.
+- **Failure recovery is a mechanism, not a requeue.** When a *gate bug* (not the model)
+  blocks a task, blind retries reproduce it every pass until the retry budget burns out and
+  the task dead-ends in `blocked/` or `needs-clarification/` → `leave-for-human` —
+  "recoverable" only by an operator clicking requeue, which teaches the pipeline nothing.
+  Build the deterministic re-admission instead: `needs-clarification-triage.js`'s D/E/F/G
+  buckets ("a fix shipped → re-admit exactly what the old bug stranded") and
+  `reject-retry-check.js`'s forbidden-path re-admission (2026-09-09: a block that named one
+  of the task's own declared edit targets → clean-slate re-admit, bounded by a one-shot
+  `forbiddenPathReadmitted` stamp). Every new gate or behavior fix that could have wrongly
+  exhausted tasks carries its paired re-admission signature, or those tasks stay dependent
+  on a human to bring them back.
 - For the residue that genuinely isn't deterministic-eligible (yet, or ever — a
   flask-blueprint/.py move, an ambiguous symbol), don't leave the model's prompt asking it
   to re-derive work the request already fully specifies. `prompts.js`'s
@@ -99,7 +125,7 @@ wrong half of the problem. Concrete precedent for both the win and the trap:
   pattern: tell the model explicitly "the request already IS the plan, don't re-list a
   step per item" rather than silently hoping a generic "write a numbered PLAN" instruction
   doesn't provoke a runaway, unbounded re-enumeration. This is itself still only a
-  ghost-in-the-machine mitigation, not a systematic fix — reach for it only for the
+  [[ghost-in-the-machine]] mitigation, not a systematic fix — reach for it only for the
   residue a real deterministic check has already ruled out, never as a substitute for
   building that check.
 - Other real deterministic short-circuits already in this codebase, worth checking before
@@ -111,10 +137,11 @@ wrong half of the problem. Concrete precedent for both the win and the trap:
   scanner rules re-run through).
 
 **Retroactive audit is part of this too, not just new code.** When you land a
-ghost-in-the-machine mitigation (a prompt nudge, a closed list, a stronger warning) for a
-recurring model failure, name in the writeup whether it's actually masking an underlying
-deterministic step — if it is, that's a `writeSideFindingInbox()` entry tagged
-`conceptId: 'concept-ghost-in-the-machine-0dbeea'`, not a closed loop.
+[[ghost-in-the-machine]] mitigation (a prompt nudge, a closed list, a stronger warning, a
+one-off requeue) for a recurring failure, name in the writeup whether it's actually masking
+an underlying deterministic step or a missing recovery mechanism — if it is, that's a
+`writeSideFindingInbox()` entry tagged `conceptId: 'concept-ghost-in-the-machine-0dbeea'`,
+not a closed loop.
 
 ## Concept research: give a named topic the same treatment, tag it as it flows through
 
