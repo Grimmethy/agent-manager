@@ -244,6 +244,8 @@ async function renderJobListTab() {
   const workerTypeByName = {};
   const timesPerformedByName = {};
   const availableByName = {};
+  const familyByName = {};
+  const familyLabelByName = {};
   (jobTypes || []).forEach((j) => {
     activeByName[j.name] = j.active;
     alwaysActiveByName[j.name] = j.alwaysActive;
@@ -252,6 +254,8 @@ async function renderJobListTab() {
     workerTypeByName[j.name] = j.workerType;
     timesPerformedByName[j.name] = j.timesPerformed;
     availableByName[j.name] = j.available;
+    familyByName[j.name] = j.family || null;
+    familyLabelByName[j.name] = j.familyLabel || null;
   });
   const descByName = {};
   const domainByName = {};
@@ -287,10 +291,7 @@ async function renderJobListTab() {
   // Sort by the EFFECTIVE priority (server override if any, else the registry/JOB_TYPES
   // static default) -- not the bare static default -- so an edit actually reorders the
   // table.
-  const rows = sourceList.slice()
-    .map((j) => ({ ...j, priority: priorityByName[j.name] ?? j.priority }))
-    .sort((a, b) => a.priority - b.priority)
-    .map(j => {
+  const buildRow = (j, opts = {}) => {
     const alwaysActive = !!alwaysActiveByName[j.name];
     const isActive = jobTypes ? (activeByName[j.name] ?? true) : true;
     const checkbox = jobTypes
@@ -360,13 +361,15 @@ async function renderJobListTab() {
     const turnsCell = j.turnsStats
       ? `${j.turnsStats.minTurns} / ${Math.round(j.turnsStats.avgTurns * 10) / 10} / ${j.turnsStats.maxTurns}<span class="meta"> (n=${j.turnsStats.calls})</span>`
       : '<span class="meta">—</span>';
+    const nameCellStyle = opts.inFamily ? ' style="padding-left:24px"' : '';
+    const trAttrs = opts.inFamily ? ` class="fam-member" data-fam-row="${escapeAttr(opts.inFamily)}"${opts.hidden ? ' style="display:none"' : ''}` : '';
     return `
-    <tr>
+    <tr${trAttrs}>
       <td>${checkbox}</td>
       <td>${priorityCell}</td>
       <td>${approvalModeCell}</td>
       <td>${workerTypeCell}</td>
-      <td><a href="#" class="job-log-link" data-job-log="${escapeAttr(j.name)}" title="Recent runs of this job type">${escapeHtml(j.name)}</a></td>
+      <td${nameCellStyle}><a href="#" class="job-log-link" data-job-log="${escapeAttr(j.name)}" title="Recent runs of this job type">${escapeHtml(j.name)}</a></td>
       <td>${domainByName[j.name] ?? '—'}</td>
       <td>${behaviorCell}</td>
       <td>${liveCell}</td>
@@ -376,6 +379,67 @@ async function renderJobListTab() {
       <td>${escapeHtml(descByName[j.name] ?? '')}</td>
     </tr>
   `;
+  };
+
+  // Group family members (arch_discovery/arch_import/arch_review/arch_import_review, ...)
+  // out of the flat priority sort: a family renders as one collapsible block positioned
+  // at its lowest-priority member, with a group-level Priority input that shifts every
+  // member together (POST /api/job-types/priority-family). Members are NOT guaranteed
+  // contiguous in a global priority sort, so pulling them into a block means a family's
+  // higher-priority members can appear ahead of a singleton that outranks them -- an
+  // accepted trade for the grouping. Per-source overrides still work: expand and edit a
+  // member row. Collapse state persists per family in localStorage.
+  let collapsedFamilies;
+  try {
+    collapsedFamilies = new Set(JSON.parse(localStorage.getItem('joblist-collapsed-families') || '[]'));
+  } catch (e) {
+    collapsedFamilies = new Set();
+  }
+
+  const sorted = sourceList.slice()
+    .map((j) => ({ ...j, priority: priorityByName[j.name] ?? j.priority }))
+    .sort((a, b) => a.priority - b.priority);
+
+  const familyMembers = {};
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (fam) (familyMembers[fam] = familyMembers[fam] || []).push(j);
+  }
+
+  const renderItems = [];
+  const seenFamilies = new Set();
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (!fam) { renderItems.push({ sortKey: j.priority, kind: 'single', row: j }); continue; }
+    if (seenFamilies.has(fam)) continue;
+    seenFamilies.add(fam);
+    const members = familyMembers[fam];
+    const lo = Math.min(...members.map((m) => m.priority));
+    const hi = Math.max(...members.map((m) => m.priority));
+    renderItems.push({ sortKey: lo, kind: 'family', key: fam, label: familyLabelByName[members[0].name] || fam, members, lo, hi });
+  }
+  renderItems.sort((a, b) => a.sortKey - b.sortKey);
+
+  const rows = renderItems.map((item) => {
+    if (item.kind === 'single') return buildRow(item.row);
+    const collapsed = collapsedFamilies.has(item.key);
+    const spread = item.lo === item.hi ? `priority ${item.lo}` : `priority ${item.lo}–${item.hi}`;
+    const headerPriorityCell = jobTypes
+      ? `<input type="number" class="fam-priority-input" data-family="${escapeAttr(item.key)}" value="${item.lo}" title="Set this family's position — shifts every member by the same amount, keeping their internal order. Expand to override one row.">`
+      : `<span class="meta">${item.lo}</span>`;
+    const header = `
+    <tr class="fam-header" style="background:var(--panel)">
+      <td></td>
+      <td>${headerPriorityCell}</td>
+      <td colspan="10">
+        <button type="button" class="fam-toggle" data-family="${escapeAttr(item.key)}"
+          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 6px 0 0">${collapsed ? '▶' : '▼'}</button>
+        <b>${escapeHtml(item.label)}</b>
+        <span class="meta"> — ${item.members.length} sources · ${spread}</span>
+      </td>
+    </tr>`;
+    const memberRows = item.members.map((m) => buildRow(m, { inFamily: item.key, hidden: collapsed })).join('');
+    return header + memberRows;
   }).join('');
 
   const unregistered = mapAvailable ? (pipelineMap.unregistered || []) : [];
@@ -476,6 +540,48 @@ async function renderJobListTab() {
       const original = priorityByName[input.dataset.source];
       if (Number.isNaN(parsed) || parsed === original) { input.value = original; return; }
       submitPriority(input.dataset.source, parsed, original);
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+  });
+
+  // Family collapse toggle: show/hide the member rows in place (no refetch) and remember
+  // the choice per family.
+  main.querySelectorAll('.fam-toggle').forEach((btn) => {
+    btn.onclick = () => {
+      const fam = btn.dataset.family;
+      const collapse = !collapsedFamilies.has(fam);
+      if (collapse) collapsedFamilies.add(fam); else collapsedFamilies.delete(fam);
+      try { localStorage.setItem('joblist-collapsed-families', JSON.stringify([...collapsedFamilies])); } catch (e) { /* private mode */ }
+      btn.textContent = collapse ? '▶' : '▼';
+      main.querySelectorAll(`tr[data-fam-row="${CSS.escape(fam)}"]`).forEach((tr) => {
+        tr.style.display = collapse ? 'none' : '';
+      });
+    };
+  });
+
+  // Family-level Priority: one number shifts every member of the family together (server
+  // keeps the internal 70/71/80/81-style offsets). Re-renders on success so the table
+  // re-sorts; reverts the field on failure.
+  main.querySelectorAll('.fam-priority-input').forEach((input) => {
+    const original = Number(input.value);
+    const commit = async () => {
+      const parsed = parseInt(input.value, 10);
+      if (Number.isNaN(parsed) || parsed === original) { input.value = original; return; }
+      input.disabled = true;
+      try {
+        const res = await fetch('/api/job-types/priority-family', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ family: input.dataset.family, base: parsed }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        await renderJobListTab();
+      } catch (e) {
+        alert('Could not update family priority: ' + e.message);
+        input.value = original;
+        input.disabled = false;
+      }
     };
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
