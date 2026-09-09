@@ -103,6 +103,40 @@ test('worktree creation failure -> errored (caller retries), not a hard fail ver
   assert.equal(res.errored, true);
 });
 
+// 2026-09-09: the hub branch is pushed from a separate apply clone, so it never exists as
+// a local ref here -- the gate must FETCH it (into a throwaway ref) before any worktree op.
+test('the gate fetches branch + main into refs/decompose-gate/* BEFORE touching a worktree', () => {
+  const f = fakeExec([
+    ['worktree add', ''],
+    ['git diff --name-only', ''],
+    ['python3 -c import app', ''],
+  ]);
+  runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-x', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  const fetchIdx = f.calls.findIndex((c) => c.startsWith('git fetch') && c.includes('agent/decompose-x:refs/decompose-gate/branch') && c.includes('master:refs/decompose-gate/main'));
+  const firstWtIdx = f.calls.findIndex((c) => c.includes('worktree add'));
+  assert.ok(fetchIdx >= 0, 'a git fetch of branch+main into refs/decompose-gate/* happened');
+  assert.ok(firstWtIdx > fetchIdx, 'the fetch runs before the first worktree add');
+  assert.ok(f.calls.some((c) => c.includes('worktree add --detach') && c.includes('refs/decompose-gate/branch')), 'the branch worktree is created from the fetched ref, not the bare name');
+  assert.ok(f.calls.some((c) => c.includes('git diff --name-only refs/decompose-gate/main...refs/decompose-gate/branch')), 'the changed-file diff uses the fetched refs');
+  // throwaway refs are cleaned up
+  assert.ok(f.calls.some((c) => c.includes('update-ref -d refs/decompose-gate/branch')));
+});
+
+test('a fetch failure -> errored setup (caller retries), not a hard fail verdict', () => {
+  const err = new Error('fatal: could not read from remote repository');
+  const f = fakeExec([['git fetch', err]]);
+  const res = runIntegrationGate({
+    repoRoot: '/repo', branch: 'agent/decompose-x', mainBranch: 'master',
+    sourceFile: 'python/dashboard/app.py', exec: f.exec,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.errored, true);
+  assert.equal(res.checks.find((c) => c.name === 'setup').status, 'fail');
+});
+
 test('entrypoint smoke: a circular import that only bites the __main__ path fails the gate', () => {
   const err = new Error('cmd failed');
   err.stderr = [
