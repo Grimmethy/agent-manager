@@ -138,6 +138,14 @@ const COMPLETABLE_NOT_DESIGN_RE = /no further code changes? or decisions? (?:are
 // the phrase-matching pair).
 const BLOCKER_TYPE_BUDGET_EXHAUSTED_RE = /BLOCKER-TYPE:\s*budget-exhausted\b/i;
 
+// Bucket G signature: the drafter tagged an explicit tool/environment failure. Normally
+// resolveAgenticDraft (agentic-draft-common.js) intercepts this as a retryable block
+// before it ever reaches needs-clarification/ -- this is the backstop for a task that
+// gets here another way (an older draft, a non-agentic path, a regression) still carrying
+// the tag in its openQuestions. A transient infra fault clears on a fresh pass; bounded
+// by MAX_REQUEUES like every other bucket.
+const BLOCKER_TYPE_INFRA_ERROR_RE = /BLOCKER-TYPE:\s*infra-error\b/i;
+
 // Bucket D signature: a draft's own text (or review's account of it) asserted a checkable
 // completion claim that is contradicted by the diff/repo -- the exact shape
 // adhoc-diff-sanity.js's adhocNoChangesClaimProblem and the false-test-count/
@@ -367,6 +375,49 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
     }
 
+    // --- Bucket G: drafter tagged BLOCKER-TYPE: infra-error -> clean-state requeue ----
+    // Same shape and reasoning as F: a tool/environment failure is not a design question,
+    // and a transient one usually clears on a fresh pass. resolveAgenticDraft normally
+    // catches this upstream; this is the backstop for a task that reached here another way.
+    {
+      const oqG = nc.openQuestions || '';
+      const historyG = Array.isArray(task.history) ? task.history : [];
+      const hasExhaustedG = historyG.some((h) => h && h.stage === 'exhausted');
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (BLOCKER_TYPE_INFRA_ERROR_RE.test(oqG) && !hasExhaustedG && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket G but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket G (BLOCKER-TYPE: infra-error, a tool/environment failure, not a design question) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: drafter tagged BLOCKER-TYPE: infra-error (tool/environment failure, not a design question) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-G: infra-error, not a design question', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
     if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
 
     summary.checked += 1;
@@ -505,6 +556,7 @@ module.exports = {
   BUDGET_EXHAUSTED_RE,
   COMPLETABLE_NOT_DESIGN_RE,
   BLOCKER_TYPE_BUDGET_EXHAUSTED_RE,
+  BLOCKER_TYPE_INFRA_ERROR_RE,
 };
 
 if (require.main === module) {

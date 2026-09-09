@@ -820,6 +820,11 @@ async function draftAdhocBranch(task, {
   // check and Discuss button pick it up; `reason: 'design-decision'` is what
   // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
   // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
+  // NB by the time execution reaches here, `BLOCKER-TYPE: budget-exhausted` and
+  // `BLOCKER-TYPE: infra-error` have already been intercepted as retryable blocks in
+  // resolveAgenticDraft (agentic-draft-common.js) -- the only thing that still arrives as
+  // needsClarification is a genuine `BLOCKER-TYPE: design-question` (or an untagged real
+  // open question), so the hardcoded reason:'design-decision' is now accurate.
   if (agenticResult.needsClarification) {
     // 2026-08-24 (Grimmethy: multiple-choice shortcut) -- options is undefined
     // (never a key at all, not even null) when the model didn't offer a clean

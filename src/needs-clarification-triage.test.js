@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE, BLOCKER_TYPE_BUDGET_EXHAUSTED_RE } = require('./needs-clarification-triage.js');
+const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE, BLOCKER_TYPE_BUDGET_EXHAUSTED_RE, BLOCKER_TYPE_INFRA_ERROR_RE } = require('./needs-clarification-triage.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-test-'));
@@ -550,4 +550,40 @@ test('bucket F: BLOCKER-TYPE: design-question is NOT treated as budget-exhausted
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'tf8.json')));
   assert.equal(read(at(dir, 'needs-clarification', 'tf8.json')).ncTriageDecision, 'leave-for-human');
+});
+
+// --- Bucket G: BLOCKER-TYPE: infra-error (backstop; resolveAgenticDraft normally
+// catches this upstream) ---------------------------------------------------------------
+const INFRA_ERROR_OQ = 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\n'
+  + 'Every `node --check` invocation exits with ETIMEDOUT and edit_file reports "unable to create .git/index.lock". '
+  + 'This is a tool/environment failure, not a design question -- a fresh pass should be able to proceed.';
+
+test('regex: BLOCKER_TYPE_INFRA_ERROR_RE matches the explicit tag and not a design question', () => {
+  assert.ok(BLOCKER_TYPE_INFRA_ERROR_RE.test(INFRA_ERROR_OQ));
+  assert.ok(!BLOCKER_TYPE_INFRA_ERROR_RE.test('RESOLUTION: needs-human-decision\nBLOCKER-TYPE: design-question\nWhich store?'));
+});
+
+test('bucket G: BLOCKER-TYPE: infra-error -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tg1', {
+    needsClarification: { reason: 'design-decision', openQuestions: INFRA_ERROR_OQ },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tg1.json')));
+  const moved = read(at(dir, 'adhoc', 'tg1.json'));
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /BLOCKER-TYPE: infra-error/.test(h.detail)));
+});
+
+test('bucket G skipped: an exhausted history event -> not requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tg2', {
+    needsClarification: { reason: 'design-decision', openQuestions: INFRA_ERROR_OQ },
+    history: [{ stage: 'exhausted', at: '2026-09-03T00:00:00Z', detail: '2/2 retries used' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tg2.json')));
 });

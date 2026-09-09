@@ -328,6 +328,48 @@ test('an adhoc decompose-into-one re-scope block is requeued with promptContext.
   assert.match(out.priorRejectionFeedback[0], /Do not decompose again/);
 });
 
+test('an adhoc infra-error block is requeued to queue/adhoc/ with the retry-the-operation feedback line', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-infra', domain: 'adhoc', source: 'manual', retryableDraftBlock: true,
+    infraErrorRetry: true, infraErrorBefore: true,
+    infraErrorNote: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nrun_bash returned ETIMEDOUT on every `node --check` call.',
+    blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- a tool/environment failure, not a design question, requeued for a clean retry',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-infra.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-infra.json')), 'lands in queue/adhoc/');
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-infra.json'), 'utf8'));
+  assert.equal(out.localRejectCount, 1);
+  assert.equal(out.infraErrorRetry, undefined, 'transient flag cleared on requeue');
+  assert.equal(out.infraErrorNote, undefined, 'consumed on requeue');
+  assert.equal(out.infraErrorBefore, true, 'sticky flag retained for the exhaustion-reason check');
+  assert.equal(out.retryableDraftBlock, undefined);
+  assert.equal(out.priorRejectionFeedback.length, 1);
+  assert.match(out.priorRejectionFeedback[0], /tool\/environment failure/);
+  assert.match(out.priorRejectionFeedback[0], /ETIMEDOUT/);
+});
+
+test('an exhausted infra-error task escalates with reason:infra-error, not design-decision', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-infra-cap', domain: 'adhoc', source: 'manual', retryableDraftBlock: true, infraErrorBefore: true,
+    blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error',
+    localRejectCount: 2, priorRejectionFeedback: ['x', 'y'], history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-infra-cap.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(d.needsClarificationDir, 'adhoc-infra-cap.json'), 'utf8'));
+  assert.equal(out.needsClarification.reason, 'infra-error');
+});
+
 test('an adhoc retryable draft block at the retry cap escalates to needs-clarification (honest, after real retries)', () => {
   const d = setupAdhocDirs();
   const task = {
