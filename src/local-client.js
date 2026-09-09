@@ -444,18 +444,24 @@ async function call(opts, maxRetries = 2) {
 // function's own internal call() already accepts; omitted entirely (undefined) preserves
 // today's exact behavior (call()'s own defaults / this module's MODEL const) for every
 // existing caller that doesn't pass them.
-// taskId/stage: threaded straight through to call() -> callOnce()'s side-finding /
-// hard-failure-audit hooks, which key off opts.taskId. Without this, EVERY side-finding a
-// vote model emits (SIDE-FINDING: markers are injected into vote prompts too) lands in the
-// inbox with taskId:null -- orphaned from the task the vote was actually about. Confirmed
-// live via brain-dump serial 644 ("Different Scope"), raisedBy.taskId:null, count 406.
+// allowSideFindings:false -- a majorityVote() is always a BINARY CLASSIFIER (CONFIRM/DENY,
+// APPROVE/REJECT), never an exploratory pass, so the SIDE-FINDING: channel is pure noise
+// here: the vote model free-associates commentary about its own prompt instead of voting.
+// Confirmed live -- the entire needs_clarification_triage brain-dump family (serials
+// 644-669, all taskId:null, serial 644 "Different Scope" dedup-counted to 406, several
+// promoted to dud tasks against already-resolved work; two even echoed the instruction's
+// own "<1-3 sentences of detail>" placeholder verbatim). false suppresses BOTH the prompt
+// injection and the response extraction. Real problems with what's being voted on go
+// through the verdict itself (a REJECT reason), not a side-finding.
+// taskId/stage are still threaded through for call()'s hard-failure-audit log
+// (logHardFailureAudit keys off opts.taskId).
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
   const votes = [];
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
     try {
-      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage }, 1);
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
     } catch (e) {
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under
