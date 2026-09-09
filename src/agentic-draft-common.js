@@ -17,6 +17,7 @@ const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
+const { writeSideFindingInbox } = require('./side-finding.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -40,6 +41,59 @@ function priorRejectionBlock(task) {
 // `no-changes-needed` produce a reviewable outcome; `decompose` yields a sub-task list;
 // `needs-human-decision` routes straight to queue/needs-clarification/.
 const RESOLUTION_RE = /RESOLUTION:\s*(implemented|no-changes-needed|decompose|needs-human-decision)\b/i;
+
+// Self-declared-partial-scope gate (2026-09-09) -- root-caused live: adhoc-brain-dump-
+// bd-1788769575997-orphaned-claim-recovery-cost-... closed RESOLUTION: implemented (and
+// its originating brain-dump entry got marked fully resolved) while its own plan text
+// said, in plain language, "The pipeline-side check is a follow-up that requires the
+// pipeline source (not in the files provided here)... Do not attempt it here. File it as
+// a follow-up task referencing this one." The actual fix (the whole point of the finding)
+// was never built, and the promised follow-up was never filed -- confirmed live, nothing
+// in the queue references this task. Grimmethy: "Fast path fix is a ghost fix. It doesn't
+// solve the problem of these bugs reproducing... I'd like to see it auto-file a follow
+// up." Per the Ghost in the Machine concept: this is a deterministic, phrase-based
+// detector on the model's OWN admission text, not an LLM judgment call re-asking "did you
+// really finish?" -- each phrase below is drawn from that real incident's own language.
+// Deliberately narrow (not a bare "follow-up" match, which appears harmlessly all the
+// time, e.g. "as a follow-up step, I also verified X") -- precision-first, same
+// discipline as reverts-a-prior-fix's AC-\d+ marker gate (fact-checker.js).
+const SELF_DECLARED_PARTIAL_SCOPE_RE = /\b(?:file(?:d)? (?:it |this )?as a follow-?up task|is a follow-?up (?:that|task)|out of scope for this (?:plan|pass|task)|do not attempt (?:it |this )?here|not (?:present |included )?in the files provided)\b/i;
+const PARTIAL_SCOPE_EXCERPT_WINDOW = 200; // chars of context on each side of the match
+
+// Does NOT change the task's own outcome -- the partial work (e.g. a real flag/test) is
+// often genuinely worth landing; the gap this closes is the promised follow-up silently
+// never getting filed, not the partial work itself being wrong. Reuses side-finding.js's
+// already-built, already-tested filing+dedup pipeline end-to-end (the same infra Incident
+// Amplification already reuses) -- zero new filing/dedup logic needed: a repeated
+// admission of the same deferred work consolidates via that pipeline's own Jaccard/
+// shared-phrase dedup instead of spamming duplicate entries.
+function fileSelfDeclaredPartialScopeFollowUp(task, summary) {
+  // Checked against BOTH the plan and implement text -- root-caused live: the real
+  // incident's own admission ("The pipeline-side check is a follow-up that requires the
+  // pipeline source... Do not attempt it here") was in task.planResponse (the PLAN pass's
+  // own output, already set on `task` by local-draft.js before implement runs), not the
+  // implement summary this function otherwise only ever sees. A different incident could
+  // just as easily have the admission surface mid-implementation instead, so both are
+  // checked, plan first (matches the one real case seen so far).
+  const haystacks = [task && task.planResponse, summary].filter((s) => typeof s === 'string' && s);
+  let text = null;
+  let match = null;
+  for (const h of haystacks) {
+    const m = SELF_DECLARED_PARTIAL_SCOPE_RE.exec(h);
+    if (m) { text = h; match = m; break; }
+  }
+  if (!match) return;
+  const start = Math.max(0, match.index - PARTIAL_SCOPE_EXCERPT_WINDOW);
+  const end = Math.min(text.length, match.index + match[0].length + PARTIAL_SCOPE_EXCERPT_WINDOW);
+  const excerpt = text.slice(start, end).trim();
+  try {
+    const { pipelineDir } = getConfig();
+    writeSideFindingInbox(
+      { title: `Follow-up: ${task.title || task.id}`, body: excerpt },
+      { source: 'self-declared-partial-scope', taskId: task.id, stage: 'implement', pipelineDir },
+    );
+  } catch (e) { /* best-effort, never break the real draft outcome over a filing failure */ }
+}
 
 // A multi-step adhoc task can exceed one agentic pass's turn budget even when the model
 // knows exactly what to do. When it ends `RESOLUTION: needs-human-decision` but its own
@@ -604,6 +658,9 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       task.acceptanceResults = require('./acceptance-criteria.js').parseAcceptanceBlock(summary);
     } catch { /* non-fatal */ }
   }
+  if (resolution === 'implemented') {
+    fileSelfDeclaredPartialScopeFollowUp(task, summary);
+  }
   return { succeeded: true, blocked: false, ...meta };
 }
 
@@ -673,4 +730,5 @@ module.exports = {
   runAgenticDraftInWorktree, resolveAgenticDraft,
   summariseInvestigation,
   BLOCKER_TYPE_RE,
+  SELF_DECLARED_PARTIAL_SCOPE_RE, fileSelfDeclaredPartialScopeFollowUp,
 };

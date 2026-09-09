@@ -15,7 +15,7 @@ const { execFileSync } = require('child_process');
 const {
   parseSubTaskProposals, parseClarificationOptions, priorRejectionBlock,
   RESOLUTION_RE, resolveAgenticDraft, prepareAdhocWorktree, agenticWorktreePaths,
-  runAgenticDraftInWorktree,
+  runAgenticDraftInWorktree, SELF_DECLARED_PARTIAL_SCOPE_RE,
 } = require('./agentic-draft-common.js');
 
 test('parseSubTaskProposals pulls a 2+ {title,rawText} array out of surrounding prose', () => {
@@ -171,6 +171,149 @@ test('resolveAgenticDraft(implemented): a real code diff for an adhoc task is un
     assert.equal(task.adhocResolution, 'implemented');
     assert.match(task.rawDiff, /a\.txt/);
   });
+});
+
+// --- self-declared-partial-scope gate (2026-09-09) ---------------------------------
+// Root-caused live: adhoc-brain-dump-bd-1788769575997-orphaned-claim-recovery-cost-...
+// closed RESOLUTION: implemented while its own plan text admitted the real fix was out
+// of scope and promised (but never filed) a follow-up task.
+
+function withPipelineEnv(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-partial-scope-'));
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  try { return fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+function readInboxFindings(pipelineDir) {
+  const inboxDir = path.join(pipelineDir, 'queue', 'side-findings-inbox');
+  let names;
+  try { names = fs.readdirSync(inboxDir).filter((f) => f.endsWith('.json')); } catch { return []; }
+  return names.map((n) => JSON.parse(fs.readFileSync(path.join(inboxDir, n), 'utf8')));
+}
+
+test('resolveAgenticDraft(implemented): a self-declared-partial-scope admission auto-files a follow-up, task outcome unchanged', () => {
+  withPipelineEnv((pipelineDir) => {
+    withRealRepo((wt) => {
+      fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+      const task = { id: 'partial-scope-test-1', title: 'Orphaned-claim recovery cost', source: 'manual', domain: 'adhoc' };
+      const response = 'Stamped the flag.\n\n'
+        + 'The pipeline-side check is a follow-up that requires the pipeline source '
+        + '(not in the files provided here); this plan scopes only the flag + test. '
+        + 'Do not attempt it here. File it as a follow-up task referencing this one.\n\n'
+        + 'RESOLUTION: implemented';
+      const out = resolveAgenticDraft(task, { result: { response }, worktreeDir: wt });
+
+      assert.equal(out.blocked, false, 'the gate must not change the task\'s own outcome');
+      assert.equal(task.adhocResolution, 'implemented');
+
+      const findings = readInboxFindings(pipelineDir);
+      assert.equal(findings.length, 1);
+      assert.match(findings[0].title, /Follow-up: Orphaned-claim recovery cost/);
+      assert.equal(findings[0].taskId, 'partial-scope-test-1');
+      assert.equal(findings[0].source, 'self-declared-partial-scope');
+      assert.match(findings[0].body, /follow-up that requires the pipeline source/);
+    });
+  });
+});
+
+test('resolveAgenticDraft(implemented): an ordinary response with no admission never files a follow-up', () => {
+  withPipelineEnv((pipelineDir) => {
+    withRealRepo((wt) => {
+      fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+      const task = { id: 'partial-scope-test-2', title: 'test', source: 'manual', domain: 'adhoc' };
+      const out = resolveAgenticDraft(task, {
+        result: { response: 'Implemented the whole thing cleanly.\n\nRESOLUTION: implemented' }, worktreeDir: wt,
+      });
+      assert.equal(out.blocked, false);
+      assert.equal(readInboxFindings(pipelineDir).length, 0);
+    });
+  });
+});
+
+test('resolveAgenticDraft(implemented): a harmless, non-admission use of "follow-up" does not false-positive', () => {
+  withPipelineEnv((pipelineDir) => {
+    withRealRepo((wt) => {
+      fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+      const task = { id: 'partial-scope-test-3', title: 'test', source: 'manual', domain: 'adhoc' };
+      const out = resolveAgenticDraft(task, {
+        result: { response: 'As a follow-up step, I also verified the existing tests still pass.\n\nRESOLUTION: implemented' },
+        worktreeDir: wt,
+      });
+      assert.equal(out.blocked, false);
+      assert.equal(readInboxFindings(pipelineDir).length, 0);
+    });
+  });
+});
+
+test('resolveAgenticDraft(no-changes-needed): a self-declared-partial-scope phrase does NOT auto-file (scoped to implemented only)', () => {
+  withPipelineEnv((pipelineDir) => {
+    withRealRepo((wt) => {
+      const task = { id: 'partial-scope-test-4', title: 'test', source: 'manual', domain: 'adhoc' };
+      resolveAgenticDraft(task, {
+        result: {
+          response: 'Already covered:\n- x -- src/y.js:1\n\n'
+            + 'A deeper refactor is out of scope for this plan.\n\nRESOLUTION: no-changes-needed',
+        },
+        worktreeDir: wt,
+      });
+      assert.equal(readInboxFindings(pipelineDir).length, 0);
+    });
+  });
+});
+
+test('SELF_DECLARED_PARTIAL_SCOPE_RE matches every real phrase from the incident that motivated this gate', () => {
+  assert.match('not in the files provided', SELF_DECLARED_PARTIAL_SCOPE_RE);
+  assert.match('Do not attempt it here.', SELF_DECLARED_PARTIAL_SCOPE_RE);
+  assert.match('File it as a follow-up task referencing this one.', SELF_DECLARED_PARTIAL_SCOPE_RE);
+  assert.match('is a follow-up that requires the pipeline source', SELF_DECLARED_PARTIAL_SCOPE_RE);
+  assert.match('out of scope for this plan', SELF_DECLARED_PARTIAL_SCOPE_RE);
+  assert.doesNotMatch('as a follow-up step, I also verified the tests pass', SELF_DECLARED_PARTIAL_SCOPE_RE);
+});
+
+// Root-caused live: on the ACTUAL orphaned-claim-recovery-cost incident, the admission
+// language was in task.planResponse (the plan pass's own output), not the implement
+// summary -- a first version of this gate only ever checked the implement summary and
+// silently missed the real case it was built for.
+test('resolveAgenticDraft(implemented): an admission in task.planResponse (the real incident\'s own shape) is detected even when the implement summary is clean', () => {
+  withPipelineEnv((pipelineDir) => {
+    withRealRepo((wt) => {
+      fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+      const task = {
+        id: 'partial-scope-test-6', title: 'test', source: 'manual', domain: 'adhoc',
+        planResponse: 'The pipeline-side check is a follow-up that requires the pipeline source '
+          + '(not in the files provided here); this plan scopes only the flag + test.',
+      };
+      const out = resolveAgenticDraft(task, {
+        result: { response: 'All changes are implemented and verified.\n\nRESOLUTION: implemented' }, worktreeDir: wt,
+      });
+      assert.equal(out.blocked, false);
+      const findings = readInboxFindings(pipelineDir);
+      assert.equal(findings.length, 1);
+      assert.match(findings[0].body, /follow-up that requires the pipeline source/);
+    });
+  });
+});
+
+test('resolveAgenticDraft(implemented): auto-file failure (e.g. no pipelineDir resolvable) never breaks the real draft outcome', () => {
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  const prevPipeline = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  delete process.env.AGENT_MANAGER_REPO_ROOT;
+  delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+  try {
+    withRealRepo((wt) => {
+      fs.writeFileSync(path.join(wt, 'a.txt'), 'real change\n');
+      const task = { id: 'partial-scope-test-5', title: 'test', source: 'manual', domain: 'adhoc' };
+      const out = resolveAgenticDraft(task, {
+        result: { response: 'Do not attempt it here.\n\nRESOLUTION: implemented' }, worktreeDir: wt,
+      });
+      assert.equal(out.blocked, false);
+      assert.equal(task.adhocResolution, 'implemented');
+    });
+  } finally {
+    if (prevRoot !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    if (prevPipeline !== undefined) process.env.AGENT_MANAGER_PIPELINE_DIR = prevPipeline;
+  }
 });
 
 test('resolveAgenticDraft(implemented): stages + captures the worktree diff into task.rawDiff', () => {
