@@ -175,7 +175,7 @@ function logFactCheckAudit(pipelineDir, entry) {
 // match is a strictly STRONGER guarantee than an LLM skim of a diff it can't even fit in
 // context -- same "don't ask a model to verify what code can verify with certainty"
 // principle as this pipeline's other deterministic gates just above/below this one.
-function verifyDeterministicScriptExtractDraft(task, repoRoot) {
+function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
   const ctx = task.promptContext;
   if (!(ctx && ctx.deterministicApply === 'script-extract')) return null;
   // 2026-09-07, Grimmethy ("review blocked the decompose task again, forensic analysis
@@ -212,9 +212,22 @@ function verifyDeterministicScriptExtractDraft(task, repoRoot) {
   if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) {
     return null;
   }
+  // 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+  // groups-...): reading the plain repoRoot working tree here silently APPROVED a stacked
+  // sub-task's diff against the wrong base (main, missing earlier sibling moves) --
+  // "byte-match a fresh re-derivation" passed because it re-derived against the SAME wrong
+  // base the draft itself used, so the mismatch only surfaced later as a real `git apply`
+  // failure. groundingRef (from resolveGroundingRef, null for any non-stacked task) reads
+  // the real stacked branch tip via git's object database instead.
   let html;
-  try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
-    return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+  if (groundingRef) {
+    const { readFileAtRef } = require('./stacked-grounding.js');
+    html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
+    if (html === null) return { ok: false, reason: `could not re-read ${ctx.sourceFile} at ${groundingRef}` };
+  } else {
+    try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
+      return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+    }
   }
   const { buildExtraction } = require('./script-extract.js');
   const fresh = buildExtraction(html, ctx.symbols);
@@ -574,7 +587,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
-  const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck);
+  const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck, groundingRef);
   if (scriptExtractVerdict) {
     if (scriptExtractVerdict.ok) {
       task.reviewedAt = new Date().toISOString();

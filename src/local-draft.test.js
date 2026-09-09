@@ -1264,6 +1264,53 @@ test('a script-extract move task falls through to the normal path when the file 
   });
 });
 
+// 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+// groups-...): tryDeterministicScriptExtractEdit used to always read the plain repoRoot
+// working tree (main's content), so a stacked sub-task's create/edit pair got built from
+// the WRONG base -- missing an earlier sibling move already committed only to the shared
+// (not-yet-merged) stacked branch. Verified clean against itself, then failed a real
+// `git apply` once actually applied to the real branch.
+test('a stacked script-extract move reads the shared stacked branch, not main, for its source content', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() { return 1; }\n');
+    makeGitOriginFor(dir);
+    const { execFileSync } = require('child_process');
+    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
+    // The stacked branch has a sibling move already applied -- a real, different function
+    // that only exists there, not on main.
+    git(['checkout', '-b', 'agent/decompose-stacked-test'], dir);
+    writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() { return 1; }\nfunction siblingAlreadyMoved() { return 2; }\n');
+    git(['add', '-A'], dir);
+    git(['commit', '-m', 'sibling move already landed here'], dir);
+    git(['push', 'origin', 'agent/decompose-stacked-test'], dir);
+    git(['checkout', 'master'], dir);
+
+    const task = {
+      id: 'script-extract-stacked-test-1', domain: 'adhoc', source: 'manual', title: 'test',
+      stacked: { branch: 'agent/decompose-stacked-test', seq: 2, total: 3 },
+      promptContext: {
+        deterministicApply: 'script-extract',
+        sourceFile: 'python/dashboard/templates/index.html',
+        newFile: 'python/dashboard/static/js/hardware.js',
+        symbols: ['renderHardwareTab'],
+      },
+    };
+    let callCount = 0;
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(result.succeeded, true);
+    assert.equal(callCount, 0);
+    const parsed = JSON.parse(task.implementResponse);
+    // The edit's `replace` (what stays behind in index.html) must still carry the
+    // sibling's already-landed function -- proof the extraction read the STACKED branch's
+    // content, not main's (which never had siblingAlreadyMoved at all).
+    assert.match(parsed[1].replace, /function siblingAlreadyMoved/, 'must read the stacked branch, not main');
+    assert.ok(task.rawDiff);
+  });
+});
+
 test('a task without the deterministicApply marker never triggers the script-extract short-circuit', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     writeHtmlWithFunctions(dir, 'python/dashboard/templates/index.html', 'function renderHardwareTab() {}\n');

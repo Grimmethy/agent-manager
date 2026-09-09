@@ -1082,3 +1082,81 @@ test('reviewTask deterministically rejects a script-extract move whose diff no l
   assert.equal(task.reviewProvider, 'deterministic-script-extract-reject');
   assert.equal(captured.length, 0);
 });
+
+// 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+// groups-...): verifyDeterministicScriptExtractDraft used to always re-read the plain
+// repoRoot working tree (main's content) to check a draft's byte-match -- for a stacked
+// sub-task that meant re-deriving against the WRONG base (missing an earlier sibling
+// move only committed to the shared, not-yet-merged stacked branch), so a draft built
+// from that same wrong base "byte-matched" and got approved, then failed a real
+// `git apply` once actually applied to the real branch.
+function makeGitFixtureWithStackedSourceFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-stacked-script-extract-'));
+  const bareDir = path.join(dir, 'origin.git');
+  const repoRoot = path.join(dir, 'repo');
+  execFileSync('git', ['init', '--bare', '-b', 'main', bareDir]);
+  execFileSync('git', ['clone', bareDir, repoRoot]);
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoRoot });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoRoot });
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
+  execFileSync('git', ['add', 'index.html'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: repoRoot });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: repoRoot });
+
+  execFileSync('git', ['checkout', '-b', 'agent/stacked-script-extract'], { cwd: repoRoot });
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction siblingAlreadyMoved() { return 2; }\n');
+  execFileSync('git', ['add', 'index.html'], { cwd: repoRoot });
+  execFileSync('git', ['commit', '-q', '-m', 'sibling move already landed here'], { cwd: repoRoot });
+  execFileSync('git', ['push', 'origin', 'agent/stacked-script-extract'], { cwd: repoRoot });
+  execFileSync('git', ['checkout', 'main'], { cwd: repoRoot });
+
+  const domainsPath = path.join(dir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
+  return { repoRoot, domainsPath };
+}
+
+test('reviewTask auto-approves a stacked script-extract move derived from the shared stacked branch, not main', async () => {
+  const { repoRoot, domainsPath } = makeGitFixtureWithStackedSourceFile();
+  const { execFileSync: exec2 } = require('child_process');
+  const stackedHtml = exec2('git', ['show', 'origin/agent/stacked-script-extract:index.html'], { cwd: repoRoot, encoding: 'utf8' });
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(stackedHtml, ['a']);
+  const task = {
+    id: 'script-extract-stacked-review-1', domain: 'default', source: 'manual', title: 'test',
+    stacked: { branch: 'agent/stacked-script-extract', seq: 2, total: 3 },
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'index.html', find: stackedHtml, replace: extraction.newHtml },
+    ]),
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-script-extract-approve');
+  assert.equal(captured.length, 0);
+});
+
+test('reviewTask rejects a stacked script-extract move derived from MAIN instead of the shared stacked branch (the exact bug this closes)', async () => {
+  const { repoRoot, domainsPath } = makeGitFixtureWithStackedSourceFile();
+  const mainHtml = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8'); // main's content -- missing the sibling move
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(mainHtml, ['a']);
+  const task = {
+    id: 'script-extract-stacked-review-2', domain: 'default', source: 'manual', title: 'test',
+    stacked: { branch: 'agent/stacked-script-extract', seq: 2, total: 3 },
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'index.html', find: mainHtml, replace: extraction.newHtml },
+    ]),
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-script-extract-reject');
+});

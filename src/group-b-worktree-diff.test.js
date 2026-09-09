@@ -155,3 +155,65 @@ test('captureGroupBDiffInWorktree: the real captured diff ends with exactly one 
     fs.rmSync(patchPath, { force: true });
   }
 });
+
+// --- stacked-branch awareness (2026-09-09) ----------------------------------------------
+// Root-caused live: file-decompose-hub-autodecomp-adhoc-add-job-stage-groups-... -- a
+// stacked sub-task's diff got captured against origin/main, not the shared stacked branch
+// (already carrying earlier sibling moves at different content) -- verified clean in
+// isolation, then failed a real `git apply` once actually applied to the real branch.
+
+function makeRepoWithStackedBranch() {
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'groupb-worktree-stacked-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'groupb-worktree-stacked-repo-'));
+  git(['init', '--bare', '-b', 'main', bareDir]);
+  git(['clone', bareDir, repoDir]);
+  git(['config', 'user.email', 'test@example.com'], repoDir);
+  git(['config', 'user.name', 'Test'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'shared.txt'), 'original\n');
+  git(['add', 'shared.txt'], repoDir);
+  git(['commit', '-m', 'init'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+
+  // The stacked branch diverges from main -- a sibling move already landed there.
+  git(['checkout', '-b', 'agent/stacked-family'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'shared.txt'), 'sibling-already-changed-this\n');
+  git(['add', 'shared.txt'], repoDir);
+  git(['commit', '-m', 'sibling move already landed here'], repoDir);
+  git(['push', 'origin', 'agent/stacked-family'], repoDir);
+  git(['checkout', 'main'], repoDir);
+
+  return { repoDir };
+}
+
+test('captureGroupBDiffInWorktree captures against the stacked branch, not main, when task.stacked.branch is given', () => {
+  const { repoDir } = makeRepoWithStackedBranch();
+  const task = { id: 't1', stacked: { branch: 'agent/stacked-family' } };
+  const implementResponse = JSON.stringify({
+    mode: 'edit', file: 'shared.txt', find: 'sibling-already-changed-this', replace: 'and-now-this-too',
+  });
+  const diff = captureGroupBDiffInWorktree({
+    repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-stacked', task,
+  });
+  assert.match(diff, /-sibling-already-changed-this/);
+  assert.match(diff, /\+and-now-this-too/);
+});
+
+test('captureGroupBDiffInWorktree still captures against main when task is not stacked (unchanged behavior)', () => {
+  const { repoDir } = makeRepoWithStackedBranch();
+  const implementResponse = JSON.stringify({ mode: 'edit', file: 'shared.txt', find: 'original', replace: 'changed-on-main' });
+  const diff = captureGroupBDiffInWorktree({
+    repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-nonstacked',
+  });
+  assert.match(diff, /-original/);
+  assert.match(diff, /\+changed-on-main/);
+});
+
+test('captureGroupBDiffInWorktree throws (not silently applies against the wrong branch) when the edit find only matches the stacked branch and no task is given', () => {
+  const { repoDir } = makeRepoWithStackedBranch();
+  const implementResponse = JSON.stringify({
+    mode: 'edit', file: 'shared.txt', find: 'sibling-already-changed-this', replace: 'x',
+  });
+  assert.throws(() => captureGroupBDiffInWorktree({
+    repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-wrong-base',
+  }), /find string not found/);
+});
