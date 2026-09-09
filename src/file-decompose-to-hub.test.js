@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 
 function withEnv(repoRoot, extraEnv, fn) {
-  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'AGENT_MANAGER_DECOMPOSE_STACKED', 'AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB', 'AGENT_MANAGER_DECOMPOSE_DET_WIRING'];
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'AGENT_MANAGER_DECOMPOSE_STACKED', 'AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB', 'AGENT_MANAGER_DECOMPOSE_DET_WIRING', 'AGENT_MANAGER_DECOMPOSE_BLUEPRINT', 'AGENT_MANAGER_DECOMPOSE_ONE_PASS', 'AGENT_MANAGER_DECOMPOSE_NODE_MODULE'];
   const prev = {};
   for (const k of keys) prev[k] = process.env[k];
   process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
@@ -218,7 +218,10 @@ test('stacked wiring prompt: bottom-of-file placement when a new module imports 
     moves: [{ newFile: 'python/dashboard/routes/reports.py', kind: 'flask-blueprint', blueprint: 'reports_bp',
       symbols: ['_reports_root', 'api_reports'] }],
   }));
-  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
+  // legacy path (AGENT_MANAGER_DECOMPOSE_BLUEPRINT=false) -- an all-blueprint plan now
+  // defaults to the deterministic one-pass (no hub, no LLM wiring child); this test still
+  // covers the legacy hub+wiring-prompt shape.
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_BLUEPRINT: 'false', AGENT_MANAGER_DECOMPOSE_DET_WIRING: 'false' }, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
 
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).sort();
   const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc.find((n) => n.includes('-01-'))), 'utf8'));
@@ -253,7 +256,55 @@ test('preflight hard-stops a plan whose symbol is not defined -- hub filed block
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')) && fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length || 0, 0);
   const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
   assert.equal(hub.planValidation.ok, false);
-  assert.match(hub.blockedReason, /not defined at module scope/);
+  assert.match(hub.blockedReason, /not a module-level function|not defined at module scope/);
+});
+
+test('all-flask-blueprint plan: files ONE deterministic one-pass task (no hub, no wiring child)', () => {
+  const dir = tmpRepo();
+  const srcDir = path.join(dir, 'python', 'dashboard');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'app.py'), [
+    'from flask import Flask, jsonify, request, abort',
+    'app = Flask(__name__)',
+    'STATE = {}',
+    'def _norm(x):',
+    '    return str(x).strip()',
+    '@app.route("/api/widget")',
+    'def api_widget_list():',
+    '    """List."""',
+    '    return jsonify(sorted(STATE))',
+    '@app.route("/api/widget/<wid>", methods=["POST"])',
+    'def api_widget_put(wid):',
+    '    STATE[_norm(wid)] = 1',
+    '    return jsonify({"ok": True})',
+    '@app.route("/api/keep")',
+    'def api_keep():',
+    '    return jsonify({})',
+    '',
+    'if __name__ == "__main__":',
+    '    app.run()',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'w.json'), JSON.stringify({
+    id: 'decompose-widget',
+    sourceFile: 'python/dashboard/app.py',
+    moves: [{ newFile: 'python/dashboard/routes/widget.py', kind: 'flask-blueprint', blueprint: 'widget_bp',
+      symbols: ['_norm', 'api_widget_list', 'api_widget_put'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { sweep({ pipelineDir: dir }); });
+
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating')) && fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length || 0, 0, 'no hub');
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(adhoc.length, 1);
+  assert.match(adhoc[0], /-onepass\.json$/);
+  const task = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc[0]), 'utf8'));
+  assert.equal(task.promptContext.deterministicApply, 'blueprint-decompose');
+  assert.equal(task.promptContext.sourceFile, 'python/dashboard/app.py');
+  assert.equal(task.promptContext.moves[0].blueprint, 'widget_bp');
+  assert.deepEqual(task.promptContext.moves[0].symbols, ['_norm', 'api_widget_list', 'api_widget_put']);
+  assert.equal(task.atomic, true);
+  const req = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'w.json'), 'utf8'));
+  assert.equal(req.onePassTaskId, task.id);
 });
 
 test('preflight hard-stops a plan with a stray external reference to a moved symbol', () => {
