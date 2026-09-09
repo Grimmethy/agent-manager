@@ -24,15 +24,28 @@ function scriptTagFor(newFile) {
   return `<script src="/static/js/${path.basename(newFile)}"></script>`;
 }
 
-// Splice the N tags in as a block immediately before the final </body>, preserving its
-// indentation. If there is no </body> (unexpected for a Jinja page), append at the end.
+// Where the new <script src> block goes, in priority order:
+//   1. immediately BEFORE the first inline <script> (one with no src=). An index.html-style
+//      template runs load-time wiring inside that inline block (`setInterval(fn, ...)`,
+//      `el.onclick = fn`, a DOMContentLoaded handler) that can reference a just-extracted
+//      function -- so the modules that now DEFINE those functions must load first. This
+//      matches how the hand-run core-ui.js extraction (commit dd43d362) wired its includes:
+//      the module <script src> tags sit right above the remaining inline <script>.
+//   2. otherwise, just before the final </body>, preserving its indentation.
+//   3. otherwise (no </body> -- unexpected for a Jinja page), append at the end.
 function spliceScriptTags(html, moves) {
   const block = moves.map((m) => scriptTagFor(m.newFile)).join('\n');
-  const m = html.match(/[ \t]*<\/body>(?![\s\S]*<\/body>)/i);
-  if (!m) return `${html.replace(/\s*$/, '')}\n${block}\n`;
-  // m[0] is the indent + `</body>`; put the block on its own line just above it, keeping
+  const inline = html.match(/^([ \t]*)<script(?![^>]*\bsrc=)[^>]*>/im);
+  if (inline) {
+    const indent = inline[1] || '';
+    const indented = block.split('\n').map((l) => indent + l).join('\n');
+    return html.slice(0, inline.index) + `${indented}\n` + html.slice(inline.index);
+  }
+  const b = html.match(/[ \t]*<\/body>(?![\s\S]*<\/body>)/i);
+  if (!b) return `${html.replace(/\s*$/, '')}\n${block}\n`;
+  // b[0] is the indent + `</body>`; put the block on its own line just above it, keeping
   // that same indentation on the closing tag.
-  return html.slice(0, m.index) + `${block}\n` + m[0] + html.slice(m.index + m[0].length);
+  return html.slice(0, b.index) + `${block}\n` + b[0] + html.slice(b.index + b[0].length);
 }
 
 /**

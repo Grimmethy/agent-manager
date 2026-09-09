@@ -67,6 +67,29 @@ test('spliceScriptTags: inserts a block before the final </body>, preserving ind
   assert.match(noBody, /just text\n<script src="\/static\/js\/one\.js"><\/script>\n/);
 });
 
+test('spliceScriptTags: when an inline <script> exists, the module block goes BEFORE it (not before </body>), with its indentation', () => {
+  const html = [
+    '<body>',
+    '  <div>page</div>',
+    '  <script src="/static/js/core-ui.js"></script>',
+    '  <script>',
+    '  setInterval(renderMain, 1000);', // load-time wiring that needs renderMain already defined
+    '  </script>',
+    '  </body>',
+    '',
+  ].join('\n');
+  const out = spliceScriptTags(html, [{ newFile: 'a/b/tasks.js' }, { newFile: 'concepts.js' }]);
+  const tasksIdx = out.indexOf('js/tasks.js');
+  const inlineIdx = out.indexOf('<script>\n'); // the inline (srcless) open tag
+  const bodyIdx = out.indexOf('</body>');
+  assert.ok(tasksIdx > 0 && tasksIdx < inlineIdx, 'module tag precedes the inline <script>');
+  assert.ok(inlineIdx < bodyIdx);
+  // existing src include is untouched and still first
+  assert.ok(out.indexOf('core-ui.js') < tasksIdx);
+  // indentation of the inserted block matches the inline <script> (two spaces)
+  assert.match(out, /\n {2}<script src="\/static\/js\/tasks\.js"><\/script>\n {2}<script src="\/static\/js\/concepts\.js"><\/script>\n {2}<script>/);
+});
+
 test('scriptTagFor: basename only, /static/js/ path', () => {
   assert.equal(scriptTagFor('python/dashboard/static/js/core-ui.js'), '<script src="/static/js/core-ui.js"></script>');
 });
