@@ -49,6 +49,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
+const { planIsFullyMechanicalHtml } = require('./decompose-one-pass.js');
 
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'x';
@@ -304,10 +305,59 @@ function fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems }
   return { hubId, childCount: 0, blocked: true, problems: hardProblems };
 }
 
+// Tier 1: one deterministic task, no hub, no stacked branch. It rides the normal
+// adhoc pipeline (draft -> review -> apply -> pending-merge) but its "draft" is
+// tryDeterministicOnePassDecompose (zero model calls), so the whole split is a single
+// verified commit on `agent/<id>` built against fresh main -- it can't go days-stale.
+function fileOnePassTask({ pipelineDir, requestFile, request, now }) {
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  const nowIso = new Date(now).toISOString();
+  const planSlug = slugify(request.id);
+  const id = `adhoc-decompose-${planSlug}-onepass`.slice(0, 120);
+  const moves = request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols }));
+  const record = {
+    id,
+    domain: 'adhoc',
+    source: 'manual',
+    title: `Decompose ${request.sourceFile} into ${moves.length} module(s) (deterministic one-pass)`,
+    createdAt: nowIso,
+    atomic: true,
+    noDecompose: true,
+    promptContext: {
+      rawText: `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`,
+      decomposedFrom: `file-decompose-${planSlug}`,
+      deterministicApply: 'one-pass-decompose',
+      sourceFile: request.sourceFile,
+      moves,
+    },
+    ...(request.premiumPriority ? { premiumPriority: true } : {}),
+    ...(request.parentHub ? { parentHub: request.parentHub } : {}),
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical HTML plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
+  };
+  fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
+
+  request.hubFiledAt = nowIso;
+  request.onePassTaskId = id;
+  request.hubChildIds = [id];
+  fs.writeFileSync(requestFile, `${JSON.stringify(request, null, 2)}\n`);
+  return { onePass: true, taskId: id, childCount: 1 };
+}
+
 function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   const validation = stackedEnabled() ? validatePlan(repoRoot, request) : { ok: true, hardProblems: [], moveMeta: request.moves.map(() => ({})) };
   if (!validation.ok) {
     return fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems: validation.hardProblems });
+  }
+
+  // Tier 1 ([[hub-task-integration]] / spec Docs/hub-task-independent-merge.md): a fully-
+  // mechanical HTML plan (every move a script-extract, every symbol deterministicApplyOk)
+  // has no judgement left. File ONE deterministic task instead of a stacked hub of N move
+  // children + a wiring child + a multi-day merge window -- local-draft.js's
+  // tryDeterministicOnePassDecompose runs the whole split with no model call, against
+  // CURRENT main, in one tick. Fall through to the hub if it doesn't qualify.
+  if (planIsFullyMechanicalHtml(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now });
   }
 
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
