@@ -1408,6 +1408,72 @@ function tryDeterministicNodeModuleDecompose(task, attempt) {
   return { succeeded: true, blocked: false };
 }
 
+// Deterministic ONE-PASS Flask-Blueprint decompose ([[hub-task-integration]], 2026-09-09).
+// The .py analogue of the two functions above: file-decompose-to-hub.js files one task
+// with promptContext.deterministicApply='blueprint-decompose' when every move is a
+// flask-blueprint route group. decompose-flask-blueprint.js (AST via scripts/decompose-
+// blueprint-extract.py) produces every new routes/<x>.py + the reduced app.py (spans
+// removed AND register_blueprint wired) as one Group-B change set, py_compile-verified,
+// zero model calls. This is what the local 27B kept failing at -- it burns its whole turn
+// budget orienting on a large app.py and runs out before the edits (the 2026-09-09
+// blueprint hub: ~4 attempts per child, brain-dump failed all 6). Falls through (returns
+// null) on any drift / compile failure / empty diff.
+function tryDeterministicBlueprintDecompose(task, attempt) {
+  const ctx = task.promptContext;
+  if (!(ctx && ctx.deterministicApply === 'blueprint-decompose' && ctx.sourceFile
+        && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) {
+    return null;
+  }
+  let repoRoot; let pipelineDir;
+  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
+  if (!repoRoot) return null;
+
+  let sourceText;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
+
+  const { buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
+  const built = buildBlueprintOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+  if (!built.ok) {
+    appendHistoryEvent(task, 'advisory', `deterministic blueprint decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
+    return null;
+  }
+  // buildBlueprintOnePassChanges already runs `python3 -m py_compile` on every produced
+  // file before returning ok -- no separate parse check needed here.
+
+  let rawDiff;
+  try {
+    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+    rawDiff = captureGroupBDiffInWorktree({
+      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
+    });
+  } catch (e) {
+    appendHistoryEvent(task, 'advisory', `deterministic blueprint decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+    return null;
+  }
+  if (!rawDiff) {
+    appendHistoryEvent(task, 'advisory', 'deterministic blueprint decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
+    return null;
+  }
+
+  const routeCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
+  task.planResponse = `Deterministic one-pass Flask-Blueprint decomposition: ${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST-extracted + py_compile-verified -- no model judgment needed.`;
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+  appendHistoryEvent(task, 'plan-done', 'deterministic blueprint decompose, no model call');
+
+  task.implementResponse = JSON.stringify(built.changes);
+  task.rawDiff = rawDiff;
+  task.adhocResolution = 'implemented';
+  recordImplement(attempt, { text: task.implementResponse, note: `deterministic blueprint decompose (${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST + py_compile)` });
+  appendHistoryEvent(task, 'implement-done', `deterministic blueprint decompose: ${routeCount} route(s) into ${ctx.moves.length} blueprint(s) + register_blueprint wiring, no model call`);
+
+  task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
+  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
+
+  concludeDraft(task);
+  return { succeeded: true, blocked: false };
+}
+
 // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" -- caught
 // live via a Grill-skills adhoc task exhausting both retries because the model couldn't
 // reliably reproduce a 4362-char fixedLiterals block character-for-character in a JSON
@@ -2084,6 +2150,11 @@ async function runDraftPasses(task, attempt, {
     // tryDeterministicNodeModuleDecompose()'s header.
     const nodeModuleResult = tryDeterministicNodeModuleDecompose(task, attempt);
     if (nodeModuleResult) return nodeModuleResult;
+
+    // Same, for an all-flask-blueprint .py decompose -- see
+    // tryDeterministicBlueprintDecompose()'s header.
+    const blueprintResult = tryDeterministicBlueprintDecompose(task, attempt);
+    if (blueprintResult) return blueprintResult;
 
     // Pre-drafted task escape hatch: an explicit task.preDrafted===true flag (set by a
     // human, or an orchestrating agent acting as architect) that already knows the exact

@@ -262,7 +262,7 @@ function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
 function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
   const ctx = task.promptContext;
   const kind = ctx && ctx.deterministicApply;
-  if (kind !== 'one-pass-decompose' && kind !== 'node-module-decompose') return null;
+  if (kind !== 'one-pass-decompose' && kind !== 'node-module-decompose' && kind !== 'blueprint-decompose') return null;
   if (!(ctx.sourceFile && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) return null;
 
   let parsed;
@@ -282,9 +282,12 @@ function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
   if (kind === 'one-pass-decompose') {
     const { buildOnePassGroupBChanges } = require('./decompose-one-pass.js');
     fresh = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
-  } else {
+  } else if (kind === 'node-module-decompose') {
     const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
     fresh = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+  } else {
+    const { buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
+    fresh = buildBlueprintOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
   }
   if (!fresh || !fresh.ok) {
     return { ok: false, reason: `plan no longer re-derives cleanly against current repo state: ${(fresh && fresh.reason) || 'unknown'}` };

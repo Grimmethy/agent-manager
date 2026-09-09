@@ -57,6 +57,7 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { planIsFullyMechanicalHtml } = require('./decompose-one-pass.js');
 const { planIsFullyMechanicalNodeModule, buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+const { planIsFullyMechanicalBlueprint, buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
 
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'x';
@@ -162,6 +163,32 @@ function validatePlan(repoRoot, request) {
       const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })));
       if (built.ok) {
         for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
+  // decompose-flask-blueprint.js once (AST extract + py_compile). ok -> every move gets
+  // blueprintApplyOk and fileHub short-circuits to a single deterministic one-pass task
+  // (no hub, no per-move 27B agentic pass -- which on a large app.py runs out of turn
+  // budget before finishing: the 2026-09-09 blueprint hub). not-ok -> one hard problem.
+  // A MIXED .py plan (some blueprint, some not) still falls through to the per-move path.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildBlueprintOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
       } else {
         hardProblems.push(`${request.sourceFile}: ${built.reason}`);
         for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
@@ -346,12 +373,17 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now, kind = 'html'
   const nowIso = new Date(now).toISOString();
   const planSlug = slugify(request.id);
   const id = `adhoc-decompose-${planSlug}-onepass`.slice(0, 120);
-  const moves = request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols }));
   const isNode = kind === 'node-module';
-  const deterministicApply = isNode ? 'node-module-decompose' : 'one-pass-decompose';
-  const rawText = isNode
-    ? `Deterministic one-pass CommonJS decomposition of ${request.sourceFile}: move each listed function set verbatim into its new module (with the require() lines it needs + a module.exports), delete from the source, and add \`const { ... } = require('./<module>.js')\` after the require prelude. module.exports stays as-is. No judgement -- validatePlan already confirmed every move is self-contained. If a symbol no longer resolves or a move stopped being self-contained (the file drifted), this falls through to the normal drafting path.`
-    : `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`;
+  const isBlueprint = kind === 'flask-blueprint';
+  const moves = request.moves.map((m) => (isBlueprint
+    ? { newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols }
+    : { newFile: m.newFile, symbols: m.symbols }));
+  const deterministicApply = isBlueprint ? 'blueprint-decompose' : isNode ? 'node-module-decompose' : 'one-pass-decompose';
+  const rawText = isBlueprint
+    ? `Deterministic one-pass Flask-Blueprint decomposition of ${request.sourceFile}: move each listed @app.route view verbatim into routes/<x>.py, rewrite only its decorator to @<bp>.route, give it a lazy \`from app import ...\` first line, delete from the source, and splice the \`register_blueprint\` lines. No judgement -- validatePlan already ran the AST extraction + py_compile. If a route no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`
+    : isNode
+      ? `Deterministic one-pass CommonJS decomposition of ${request.sourceFile}: move each listed function set verbatim into its new module (with the require() lines it needs + a module.exports), delete from the source, and add \`const { ... } = require('./<module>.js')\` after the require prelude. module.exports stays as-is. No judgement -- validatePlan already confirmed every move is self-contained. If a symbol no longer resolves or a move stopped being self-contained (the file drifted), this falls through to the normal drafting path.`
+      : `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`;
   const record = {
     id,
     domain: 'adhoc',
@@ -369,7 +401,7 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now, kind = 'html'
     },
     ...(request.premiumPriority ? { premiumPriority: true } : {}),
     ...(request.parentHub ? { parentHub: request.parentHub } : {}),
-    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical ${isNode ? 'CommonJS' : 'HTML'} plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical ${isBlueprint ? 'Flask-Blueprint' : isNode ? 'CommonJS' : 'HTML'} plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
   };
   fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
 
@@ -406,6 +438,12 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   // only shapes with a deterministic path were HTML <script> and flask-blueprint.
   if (planIsFullyMechanicalNodeModule(request, validation)) {
     return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'node-module' });
+  }
+
+  // Same, for an all-flask-blueprint .py plan: one deterministic task (AST extract +
+  // register_blueprint splice + py_compile), no hub, no per-move 27B agentic pass.
+  if (planIsFullyMechanicalBlueprint(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'flask-blueprint' });
   }
 
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
