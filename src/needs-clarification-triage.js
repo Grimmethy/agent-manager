@@ -502,6 +502,10 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             classify: classifyVote(['CONFIRM', 'DENY'], 15),
             n: 3, minAgreeing: 2, temperature: 0.2,
             source: 'needs_clarification_triage', model: VOTE_MODEL,
+            // Attribute any SIDE-FINDING: the vote model emits to the task actually being
+            // voted on -- without this it lands in the inbox with taskId:null (brain-dump
+            // serial 644 "Different Scope" was one such orphan, dedup-counted to 406).
+            taskId: task.id, stage: 'nc-triage-premise-vote',
           });
         } catch (e) {
           appendHistoryEvent(task, 'advisory',
