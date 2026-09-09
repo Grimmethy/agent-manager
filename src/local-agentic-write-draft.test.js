@@ -173,6 +173,38 @@ test('write tier: blindPlanBlock softens its "could NOT read any files" language
   });
 });
 
+// 2026-09-09, root-caused live (see hub-status-grounding.js's own header): a stacked
+// wiring child's own prompt must include a real, verified per-sibling status check --
+// this is the actual pass that produced the wrong "files don't exist" conclusion.
+test('write tier: buildWriteAgenticPrompt includes real hub-status grounding for a decomposed hub child', async () => {
+  await withRepo(async (dir) => {
+    fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'file-decompose-hub-fixture.json'), JSON.stringify({
+      id: 'file-decompose-hub-fixture',
+      subTasks: [
+        { id: 'move-1', title: 'Decompose index.html → static/js/core-ui.js', status: 'merged' },
+        { id: 'wiring-1', title: 'wire up 1 new file(s)', status: 'needs-clarification' },
+      ],
+    }));
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({
+      id: 'wiring-1', title: 'T',
+      promptContext: { rawText: 'wire it up', decomposedFrom: 'file-decompose-hub-fixture' },
+    });
+    assert.match(p, /HUB STATUS/);
+    assert.match(p, /hub status: merged/);
+    assert.match(p, /TRUST THE VERIFIED LINE/);
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt adds no hub-status content for an ordinary (non-decomposed) task', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'the ask' } });
+    assert.doesNotMatch(p, /HUB STATUS/);
+  });
+});
+
 test('write tier: a confirmed-atomic leaf (decomposedFrom) is told NOT to decompose and loses the "split into 2-6" clause', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();

@@ -473,6 +473,15 @@ test('adhocPlanPrompt: _planGrounding is embedded as a trailing block with the "
   assert.ok(prompt.indexOf('Write a numbered, actionable PLAN') < prompt.indexOf('REAL REPOSITORY CONTENT'), 'grounding block trails the stable instructions');
 });
 
+test('adhocPlanPrompt: _hubStatusGrounding is embedded verbatim when set (2026-09-09, see hub-status-grounding.js)', () => {
+  const { hubStatusGroundingBlock } = require('./prompts.js');
+  assert.deepEqual(hubStatusGroundingBlock({ promptContext: {} }), []);
+  const g = 'HUB STATUS -- ...\n- some sibling [hub status: merged] -- VERIFIED ON DISK: CONFIRMED exists at x.js';
+  const task = { domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'wire it up' }, _hubStatusGrounding: g };
+  const prompt = buildPlanPrompt(task);
+  assert.ok(prompt.includes(g), 'hub status grounding text verbatim');
+});
+
 test('adhocPlanPrompt asks for a trailing CRITERIA: block; echoes stated criteria verbatim', () => {
   const bare = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do a thing' } });
   assert.match(bare, /End your PLAN with a line "CRITERIA:"/);

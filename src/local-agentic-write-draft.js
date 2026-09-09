@@ -30,6 +30,7 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
+const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -156,6 +157,21 @@ function priorInvestigationBlock(task) {
   ].join('\n');
 }
 
+// See hub-status-grounding.js's own header for the real incident this closes. Computed
+// fresh on every call (never cached on the task), unlike the plan pass's own transient
+// _planGrounding field, since this is the pass that actually produced the wrong
+// conclusion in the real incident and must not depend on another pass's own lifecycle.
+function hubStatusGroundingBlock(task) {
+  let grounding;
+  try {
+    grounding = buildHubStatusGrounding(task);
+  } catch (e) {
+    return ''; // best-effort -- never let a grounding failure block the real draft
+  }
+  if (!grounding) return '';
+  return `${grounding}\n`;
+}
+
 // A task carrying promptContext.decomposedFrom was itself split off a larger feature by a
 // prior decompose pass; one carrying rescopedFromDecompose was re-scoped down to a single
 // sub-task the model proposed. Either way it is a confirmed-atomic leaf -- offering it the
@@ -229,6 +245,7 @@ function buildWriteAgenticPrompt(task) {
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
     anchorFilesPromptBlock(task),
+    hubStatusGroundingBlock(task),
     priorRejectionBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
