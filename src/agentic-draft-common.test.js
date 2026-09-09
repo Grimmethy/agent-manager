@@ -595,6 +595,45 @@ test('resolveAgenticDraft(needs-human-decision): no BLOCKER-TYPE tag at all fall
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error, zero edits -> retryable block, NOT a human hold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'blocker-type-infra-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe worktree git index is locked -- every edit_file call fails with "unable to create .git/index.lock". Not a design question.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.infraErrorBefore, true);
+    assert.equal(task.infraErrorRetry, true);
+    assert.notEqual(task.turnBudgetExhausted, true, 'infra-error must not borrow turn-budget semantics');
+    assert.match(task.infraErrorNote, /index\.lock/);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: infra-error/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error WITH partial work landed -> continuation', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'blocker-type-infra-2' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nGot the first two files done, then run_bash started returning ETIMEDOUT on every call.' },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: infra-error with partial work landed/);
+    assert.equal(task.isAgenticContinuation, true);
+    assert.equal(task.agenticContinuationCount, 1);
+    assert.match(task.priorPartialDiff, /a\.txt/);
+  });
+});
+
 test('resolveAgenticDraft(needs-human-decision): "re-run me" text but an edit_file call landed -> stays the human/continuation path, not a turn-budget block', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial\n');

@@ -547,6 +547,44 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       };
     }
 
+    // Authoritative, exactly like budget-exhausted above: the model explicitly tagged a
+    // tool/environment failure (a command that should have worked did not, a file op
+    // failed) unrelated to any decision. A transient infra fault is worth a bounded retry,
+    // NOT a human hold -- without this it fell through to the needsClarification return
+    // below and local-draft.js stamped reason:'design-decision' on it, dead-ending it in
+    // queue/needs-clarification/ where nothing retries it (the same pre-fix dead-end
+    // budget-exhausted had). Deliberately does NOT set turnBudgetExhausted -- that flag
+    // carries "over-explored, edit sooner" grounding + unlocks decompose for a leaf, wrong
+    // for an infra fault. reject-retry-check.js bounds it by MAX_LOCAL_REJECT_RETRIES and,
+    // on exhaustion, escalates with reason:'infra-error' (not design-decision).
+    if (blockerType === 'infra-error') {
+      if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+        task.agenticContinuationCount = continuations + 1;
+        task.agenticContinuationNote = summary;
+        task.priorPartialDiff = capturedDiff;
+        task.retryableDraftBlock = true;
+        task.isAgenticContinuation = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: infra-error with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+          ...meta,
+          capturedDiff,
+        };
+      }
+      task.infraErrorRetry = true;
+      task.infraErrorBefore = true;
+      task.infraErrorNote = summary;
+      task.retryableDraftBlock = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- a tool/environment failure, not a design question, requeued for a clean retry',
+        ...meta,
+        capturedDiff: undefined,
+      };
+    }
+
     // Zero edits, empty worktree, forced final turn, and the summary itself says "re-run
     // me / ran out of turns / no design question": this is turn-budget exhaustion on
     // orientation dressed up as a clarification, NOT a real open question. The `!resolution`

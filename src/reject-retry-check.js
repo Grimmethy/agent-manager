@@ -221,7 +221,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         if (isAdhocTask(task) && needsClarificationDir) {
           const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
           if (alreadyEscalated) { summary.exhausted++; continue; }
-          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedAdhocQuestion(task) };
+          // A task that exhausted its retries on a tagged tool/environment failure lands
+          // with an honest reason:'infra-error' -- not design-decision -- so forensics and
+          // the triage sweep see it for what it is. (nc.reason already carries non-
+          // design-decision values elsewhere: external-dependency, unreliable-grounding.)
+          task.needsClarification = {
+            reason: task.infraErrorBefore ? 'infra-error' : 'design-decision',
+            openQuestions: buildExhaustedAdhocQuestion(task),
+          };
           appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
           appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
           fs.mkdirSync(needsClarificationDir, { recursive: true });
@@ -288,12 +295,26 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
         // feedback names the exact gap. See adhoc-diff-sanity.js.
         priorFeedback.push(task.adhocNoChangesClaimFeedback);
         delete task.adhocNoChangesClaimFeedback;
+      } else if (retryableDraftBlock && typeof task.infraErrorNote === 'string' && task.infraErrorNote.trim()) {
+        // resolveAgenticDraft (agentic-draft-common.js): the model tagged BLOCKER-TYPE:
+        // infra-error -- a tool/command/file-op that should have worked failed, unrelated
+        // to any design decision. A transient fault usually clears on a fresh pass; tell
+        // it what broke and how to escalate if it genuinely reproduces.
+        priorFeedback.push([
+          'A prior attempt hit a tool/environment failure (not a design question):',
+          '',
+          String(task.infraErrorNote).slice(0, 3000),
+          '',
+          'Retry the operation from a clean pass. If a command genuinely fails identically again, end with RESOLUTION: needs-human-decision and BLOCKER-TYPE: infra-error, quoting the exact command and its full error output.',
+        ].join('\n'));
+        delete task.infraErrorNote;
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
       delete task.turnBudgetExhausted;
+      delete task.infraErrorRetry;
       delete task.retryableDraftBlock;
       // Clear the terminal block state -- otherwise a task requeued into queue/adhoc/ still
       // reads status:'blocked' and this sweep's adhoc/ scan re-requeues it every tick until
