@@ -248,6 +248,53 @@ function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
   return { ok: true };
 }
 
+// Same principle as verifyDeterministicScriptExtractDraft above, for a WHOLE fully-
+// mechanical file-decompose filed as one deterministic task ([[hub-task-integration]]):
+//   deterministicApply='one-pass-decompose'  -> HTML, decompose-one-pass.js
+//   deterministicApply='node-module-decompose' -> src/*.js, decompose-node-module.js
+// Both produce N `create` changes + one `edit`, re-derivable byte-for-byte from current
+// repo state by the same V8-parser oracle the draft used, and both produce a diff far too
+// large for the review model's context window (index.html: ~370K chars) -- so an LLM
+// "does this look right" skim is strictly weaker than re-deriving and requiring an exact
+// match. 2026-09-09: caught live -- the index.html one-pass draft (74 fns -> 5 modules)
+// was blocked TWICE by a reviewer that misread the legitimately-reduced template as "a
+// truncated fragment ending mid-script".
+function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
+  const ctx = task.promptContext;
+  const kind = ctx && ctx.deterministicApply;
+  if (kind !== 'one-pass-decompose' && kind !== 'node-module-decompose') return null;
+  if (!(ctx.sourceFile && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) return null;
+
+  let parsed;
+  try { parsed = JSON.parse(task.implementResponse); } catch { return null; }
+  if (!Array.isArray(parsed) || parsed.length < 2) return null;
+  const creates = parsed.slice(0, -1);
+  const edit = parsed[parsed.length - 1];
+  if (!creates.every((c) => c && c.mode === 'create' && typeof c.content === 'string')) return null;
+  if (!(edit && edit.mode === 'edit' && edit.file === ctx.sourceFile && typeof edit.find === 'string' && typeof edit.replace === 'string')) return null;
+
+  let sourceText;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
+    return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+  }
+
+  let fresh;
+  if (kind === 'one-pass-decompose') {
+    const { buildOnePassGroupBChanges } = require('./decompose-one-pass.js');
+    fresh = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
+  } else {
+    const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+    fresh = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
+  }
+  if (!fresh || !fresh.ok) {
+    return { ok: false, reason: `plan no longer re-derives cleanly against current repo state: ${(fresh && fresh.reason) || 'unknown'}` };
+  }
+  if (JSON.stringify(fresh.changes) !== JSON.stringify(parsed)) {
+    return { ok: false, reason: `the ${creates.length}-module split no longer byte-matches a fresh re-derivation (${ctx.sourceFile} drifted between draft and review)` };
+  }
+  return { ok: true, moduleCount: creates.length };
+}
+
 const NON_IMPL_PATTERNS = [
   /"mode"\s*:\s*"read"/,
   /^(let me|i need to|i will|i'll|i am going to|i'm going to)\s+(read|check|look at|search|verify|examine|understand)\b/i,
@@ -592,6 +639,23 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  const onePassVerdict = verifyDeterministicOnePassDecomposeDraft(task, repoRootForCheck);
+  if (onePassVerdict) {
+    if (onePassVerdict.ok) {
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-one-pass-decompose-approve';
+      task.localVerdict = `Auto-approved: a whole ${onePassVerdict.moduleCount}-module file-decompose that byte-matches a fresh re-derivation (V8-parser oracle) from current repo state -- no local-model review call spent (the diff is also far larger than the review model's context window).`;
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', 'deterministic-one-pass-decompose-approve');
+      return { succeeded: true, verdict: 'approved', factCheckVerdict };
+    }
+    const reason = `Deterministic gate: this one-pass decompose's diff no longer matches a fresh re-derivation from current repo state -- ${onePassVerdict.reason}. No local-model review call spent. Requeue re-runs the deterministic draft against the then-current file.`;
+    task.reviewProvider = 'deterministic-one-pass-decompose-reject';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck, groundingRef);
   if (scriptExtractVerdict) {
     if (scriptExtractVerdict.ok) {
@@ -820,7 +884,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft };
+module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft };
 
 if (require.main === module) {
   main();

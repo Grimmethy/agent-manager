@@ -1040,6 +1040,74 @@ test('verifyDeterministicScriptExtractDraft: correctly-shaped Group-B JSON that 
   assert.equal(result.ok, false);
 });
 
+// --- Deterministic ONE-PASS / node-module decompose review gate (2026-09-09) ------------
+// A whole fully-mechanical file-decompose filed as ONE task ([[hub-task-integration]]):
+// N `create` changes + one `edit`, re-derivable byte-for-byte, and a diff (index.html:
+// ~370K chars) far larger than the review model's context. Caught live: the index.html
+// one-pass draft was blocked twice by a reviewer misreading the reduced template as "a
+// truncated fragment".
+
+test('verifyDeterministicOnePassDecomposeDraft (node-module): a byte-exact re-derivation -> ok:true', () => {
+  const { repoRoot } = makeFixture();
+  const rel = 'src/mod.js';
+  const abs = path.join(repoRoot, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'function alpha(x) { return x + 1; }',
+    'function beta(x) { return alpha(x) * 2; }',
+    'function keep() { return fs.existsSync("x"); }',
+    '',
+    'module.exports = { alpha, beta, keep };',
+    '',
+  ].join('\n'));
+  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+  const moves = [{ newFile: 'src/mod-math.js', symbols: ['alpha', 'beta'] }];
+  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
+  assert.equal(built.ok, true, built.ok ? '' : built.reason);
+
+  const task = {
+    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
+    implementResponse: JSON.stringify(built.changes),
+  };
+  const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
+  assert.deepEqual(verifyDeterministicOnePassDecomposeDraft(task, repoRoot), { ok: true, moduleCount: 1 });
+});
+
+test('verifyDeterministicOnePassDecomposeDraft: tampered create content -> ok:false (drift)', () => {
+  const { repoRoot } = makeFixture();
+  const rel = 'src/mod.js';
+  const abs = path.join(repoRoot, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, "'use strict';\n\nfunction alpha(x) { return x + 1; }\nfunction beta(x) { return x; }\n\nmodule.exports = { alpha, beta };\n");
+  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+  const moves = [{ newFile: 'src/mod-a.js', symbols: ['alpha'] }];
+  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
+  const changes = JSON.parse(JSON.stringify(built.changes));
+  changes[0].content = changes[0].content.replace('x + 1', 'x + 999'); // tamper
+
+  const task = {
+    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
+    implementResponse: JSON.stringify(changes),
+  };
+  const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
+  const r = verifyDeterministicOnePassDecomposeDraft(task, repoRoot);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no longer byte-matches/);
+});
+
+test('verifyDeterministicOnePassDecomposeDraft: not a decompose task -> null (falls through to normal review)', () => {
+  const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
+  assert.equal(verifyDeterministicOnePassDecomposeDraft({ promptContext: { deterministicApply: 'script-extract' } }, '/tmp'), null);
+  assert.equal(verifyDeterministicOnePassDecomposeDraft({ promptContext: {} }, '/tmp'), null);
+  assert.equal(verifyDeterministicOnePassDecomposeDraft(
+    { promptContext: { deterministicApply: 'one-pass-decompose', sourceFile: 'x.html', moves: [{ newFile: 'a.js', symbols: ['a'] }] }, implementResponse: 'Let me read the file first...' },
+    '/tmp',
+  ), null, 'a non-JSON agentic retry on the same task falls through, not a hard reject');
+});
+
 test('reviewTask auto-approves a script-extract move deterministically -- zero model calls, even though the diff is huge', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
