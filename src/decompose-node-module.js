@@ -302,12 +302,67 @@ function allTopLevelRequireStatements(src) {
  *   | {ok:false, reason:string, externalRefs?:string[], problems?:Array}}
  *   changes: [{mode:'create', file:newFile, content}, {mode:'edit', file:sourceFile, find, replace}]
  */
+// Pull the named column-0 `const|let|var NAME = <expr>;` declarations out of `src`,
+// verbatim, in their original order. Returns { ok, blocks:[{name,text}], reducedSource }
+// or { ok:false, missing:[...] } when a name is not a simple top-level declaration.
+function extractTopLevelConsts(src, names) {
+  if (!names.length) return { ok: true, blocks: [], reducedSource: src };
+  const lines = src.split('\n');
+  const want = new Set(names);
+  const found = new Map(); // name -> { startLine, endLine }
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/);
+    if (!m || !want.has(m[1]) || found.has(m[1])) continue;
+    // scan to statement end: first line index where brace/paren/bracket depth is 0 and
+    // the line ends with `;` (or the accumulated text is balanced and ends with `;`).
+    let depth = 0;
+    let j = i;
+    for (; j < lines.length; j++) {
+      for (const ch of stripStringsAndComments(lines[j])) {
+        if (ch === '(' || ch === '[' || ch === '{') depth++;
+        else if (ch === ')' || ch === ']' || ch === '}') depth--;
+      }
+      if (depth <= 0 && /;\s*(?:\/\/.*)?$/.test(lines[j])) break;
+      if (j - i > 60) break; // runaway guard
+    }
+    found.set(m[1], { startLine: i, endLine: Math.min(j, lines.length - 1) });
+  }
+  const missing = names.filter((n) => !found.has(n));
+  if (missing.length) return { ok: false, missing };
+
+  const blocks = names
+    .map((n) => ({ n, ...found.get(n) }))
+    .sort((a, b) => a.startLine - b.startLine)
+    .map((b) => ({ name: b.n, text: lines.slice(b.startLine, b.endLine + 1).join('\n') }));
+
+  const cut = [...found.values()].sort((a, b) => b.startLine - a.startLine);
+  const red = lines.slice();
+  for (const { startLine, endLine } of cut) {
+    let end = endLine + 1;
+    while (end < red.length && red[end].trim() === '') end++;
+    red.splice(startLine, end - startLine);
+  }
+  let reducedSource = red.join('\n');
+  while (reducedSource.includes('\n\n\n\n')) reducedSource = reducedSource.replace('\n\n\n\n', '\n\n\n');
+  return { ok: true, blocks, reducedSource };
+}
+
 function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
   if (!/\.(js|mjs|cjs)$/.test(sourceFile || '')) return { ok: false, reason: 'source is not a .js/.mjs/.cjs file' };
   if (!/\.(js|mjs|cjs)$/.test(newFile || '')) return { ok: false, reason: 'target is not a .js/.mjs/.cjs file' };
   if (!Array.isArray(symbols) || symbols.length === 0) return { ok: false, reason: 'no symbols to move' };
 
-  const ex = buildExtraction(sourceText, symbols, { isHtml: false });
+  // Split the requested symbols into top-level function declarations (relocated by the V8
+  // oracle) and top-level const/let/var declarations (relocated verbatim). A cluster whose
+  // functions read a module-scope constant can now carry that constant with them instead of
+  // being rejected as not-self-contained.
+  const located = require('./script-extract.js').locateFunctions(sourceText, symbols, { isHtml: false });
+  const fnSyms = symbols.filter((s) => (located.results || []).some((r) => r.name === s && r.status === 'OK'));
+  const constSyms = symbols.filter((s) => !fnSyms.includes(s));
+
+  const ex = fnSyms.length
+    ? buildExtraction(sourceText, fnSyms, { isHtml: false })
+    : { ok: true, newFileContent: '', newSource: sourceText };
   if (!ex.ok) {
     return {
       ok: false,
@@ -316,12 +371,21 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
     };
   }
 
+  const constResult = extractTopLevelConsts(ex.newSource, constSyms);
+  if (!constResult.ok) {
+    return { ok: false, reason: `not a top-level function or simple const declaration: ${constResult.missing.join(', ')}`, problems: constResult.missing.map((n) => ({ name: n, status: 'NOT_TOP_LEVEL' })) };
+  }
+  const constText = constResult.blocks.map((b) => b.text).join('\n\n');
+  // Everything the moved code (fn bodies + const RHS) reads, for the self-containment check
+  // and the require carry-over.
+  const movedCode = `${constText}\n${ex.newFileContent}`;
+
   const moved = new Set(symbols);
   const sourceBindings = topLevelBindingNames(sourceText);
   const allRequires = allTopLevelRequireStatements(sourceText);
   const requireBound = topLevelBindingNames(allRequires.join('\n'));
-  const locals = locallyBoundNames(ex.newFileContent);
-  const refs = referencedIdentifiers(ex.newFileContent);
+  const locals = locallyBoundNames(movedCode);
+  const refs = referencedIdentifiers(movedCode);
 
   const external = [...refs].filter((n) =>
     sourceBindings.has(n) && !moved.has(n) && !requireBound.has(n) && !locals.has(n) && !JS_GLOBALS.has(n));
@@ -349,12 +413,13 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
   if (hadUseStrict) parts.push("'use strict';\n");
   parts.push(`// ${path.basename(newFile)} -- extracted from ${sourceFile} ([[hub-task-integration]] node-module decompose).\n`);
   if (requireLines.length) parts.push(requireLines.join('\n') + '\n');
-  parts.push(ex.newFileContent.replace(/\s+$/, '') + '\n');
+  if (constText.trim()) parts.push(constText.replace(/\s+$/, '') + '\n');
+  if (ex.newFileContent.trim()) parts.push(ex.newFileContent.replace(/\s+$/, '') + '\n');
   parts.push(`module.exports = { ${symbols.join(', ')} };\n`);
   const newContent = parts.join('\n');
 
   const backRequire = `const { ${symbols.join(', ')} } = require('./${newBase}.js');`;
-  const reduced = insertBackRequire(ex.newSource, backRequire);
+  const reduced = insertBackRequire(constResult.reducedSource, backRequire);
 
   return {
     ok: true,

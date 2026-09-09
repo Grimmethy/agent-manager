@@ -181,10 +181,69 @@ test('buildNodeModuleExtraction: a move that DROPS the dependency in with it is 
   assert.match(r.changes[1].replace, /const \{ summarize, computeA, computeB, readThing \} = require\('\.\/thing-sum\.js'\);/);
 });
 
-test('buildNodeModuleExtraction: bails when a symbol is not a top-level function declaration', () => {
-  const r = buildNodeModuleExtraction(SRC, 'src/thing.js', 'src/x.js', ['computeA', 'ROOT']); // ROOT is a const, not a fn
+test('buildNodeModuleExtraction: relocates a plain top-level const requested alongside a function', () => {
+  // ROOT is `const ROOT = process.cwd();` -- a simple, self-contained declaration
+  // (process is a JS global). It rides with computeA verbatim.
+  const r = buildNodeModuleExtraction(SRC, 'src/thing.js', 'src/x.js', ['computeA', 'ROOT']);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.match(r.changes[0].content, /const ROOT = process\.cwd\(\);/);
+  assert.match(r.changes[0].content, /module\.exports = \{ computeA, ROOT \};/);
+  // removed from the source; back-require covers it
+  assert.doesNotMatch(r.changes[1].replace, /^const ROOT = process\.cwd\(\)/m);
+  assert.match(r.changes[1].replace, /const \{ computeA, ROOT \} = require\('\.\/x\.js'\);/);
+});
+
+test('buildNodeModuleExtraction: a fn cluster carries the module const it reads (self-containment passes)', () => {
+  const src = [
+    "'use strict';",
+    "const path = require('path');",
+    '',
+    'const LIMIT_MS = 5000;',
+    'const TABLE = { a: 1, b: 2 };',
+    '',
+    'function isSlow(ms) { return ms > LIMIT_MS; }',
+    '',
+    'function lookup(k) { return TABLE[k] || 0; }',
+    '',
+    'function untouched() { return path.sep; }',
+    '',
+    'module.exports = { isSlow, lookup, untouched, LIMIT_MS, TABLE };',
+    '',
+  ].join('\n');
+  const r = buildNodeModuleExtraction(src, 'src/m.js', 'src/m-timing.js', ['isSlow', 'lookup', 'LIMIT_MS', 'TABLE']);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.match(r.changes[0].content, /const LIMIT_MS = 5000;/);
+  assert.match(r.changes[0].content, /const TABLE = \{ a: 1, b: 2 \};/);
+  assert.match(r.changes[0].content, /module\.exports = \{ isSlow, lookup, LIMIT_MS, TABLE \};/);
+  // source keeps `untouched`, loses the consts + moved fns, gains one back-require
+  assert.match(r.changes[1].replace, /function untouched\(\)/);
+  assert.doesNotMatch(r.changes[1].replace, /^const LIMIT_MS = 5000;/m);
+  assert.match(r.changes[1].replace, /const \{ isSlow, lookup, LIMIT_MS, TABLE \} = require\('\.\/m-timing\.js'\);/);
+});
+
+test('buildNodeModuleExtraction: bails when a symbol is neither a top-level function nor a simple const', () => {
+  const r = buildNodeModuleExtraction(SRC, 'src/thing.js', 'src/x.js', ['computeA', 'nonexistentThing']);
   assert.equal(r.ok, false);
-  assert.match(r.reason, /resolve|ROOT/i);
+  assert.match(r.reason, /nonexistentThing|top-level function or simple const/i);
+});
+
+test('buildNodeModuleExtraction: a relocated const whose RHS reads a non-moved module fn is rejected', () => {
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'function helperConst() { return 7; }',
+    '',
+    'const DERIVED = helperConst();', // RHS calls a module fn NOT in the moved set
+    '',
+    'function useDerived() { return DERIVED + 1; }',
+    '',
+    'module.exports = { helperConst, useDerived, DERIVED };',
+    '',
+  ].join('\n');
+  const r = buildNodeModuleExtraction(src, 'src/m.js', 'src/m-x.js', ['useDerived', 'DERIVED']);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /helperConst|self-contained/i);
 });
 
 test('buildNodeModuleExtraction: rejects a non-.js source or target', () => {
