@@ -36,8 +36,6 @@ const { readSamplesInWindow } = require('./uptime-log.js');
 const { signatureForTask } = require('./pipeline-self-audit.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { fmtLocal, fmtDuration, fmtUsd } = require('./system-report-format.js');
-const { classifyTask, scanTaskActivity, computeDowntime, computeTimeAccounting, oldestFileAgeSec, computeQueueHealth, computeSelfAuditActivity, computeBlockedPatterns } = require('./system-report-compute.js');
 
 // classifyTask() reads each source's own reportClass off the registry (see its comment).
 // Populate it with this repo's built-ins + any AGENT_MANAGER_REGISTER_PATH plugin sources,
@@ -79,16 +77,140 @@ function terminalTimestamp(task) {
 //   'unclear'     -- didn't match any of the above; reported as its own bucket rather
 //                    than guessed into one, same "don't silently misclassify" reasoning
 //                    as everywhere else in this pipeline.
+function classifyTask(task, queueState) {
+  if (queueState === 'blocked' || queueState === 'archived') return 'junk';
+
+  // Each task source declares how its completed tasks count toward this accounting via
+  // reportClass on its registration -- a plain bucket string ('benefit' / 'filtering' /
+  // 'housekeeping'), or a (task) => bucket function for a source that decides from the
+  // draft text (observability/performance review split filtering vs. benefit on what the
+  // verdict actually said). A source with no reportClass -> 'unclear', reported as its own
+  // bucket rather than guessed into one. ADR-0022 Stage G removed the hardcoded per-source
+  // fallback chain this used to carry -- every source that had a branch now sets the field.
+  const registered = getRegisteredSource(resolveSourceName(task));
+  const declared = typeof registered?.reportClass === 'function'
+    ? registered.reportClass(task)
+    : registered?.reportClass;
+  return declared || 'unclear';
+}
+
 // Scans queue/done/ (including done/_archived_no_action/, which is where the minified-
 // file-bug cleanup archived 182 confirmed-junk tasks 2026-08-19 -- those are exactly the
 // kind of thing this report exists to surface, not hide) and queue/blocked/ for anything
 // whose terminal history timestamp falls in [startIso, endIso). Best-effort per file: an
 // unreadable/malformed task is skipped, never fatal to the whole scan.
+function scanTaskActivity(pipelineDir, startIso, endIso) {
+  const queueDir = path.join(pipelineDir, 'queue');
+  const start = new Date(startIso).getTime();
+  const end = new Date(endIso).getTime();
+
+  const dirs = [
+    { dir: path.join(queueDir, 'done'), state: 'done' },
+    { dir: path.join(queueDir, 'done', '_archived_no_action'), state: 'archived' },
+    { dir: path.join(queueDir, 'blocked'), state: 'blocked' },
+    // done-archive.js's own dated month buckets (2026-08-24) -- a report window reaching
+    // back past the retention cutoff (default 30 days) would otherwise silently miss any
+    // task that pass already relocated out of done/'s top level. Expanded dynamically
+    // (not a static list) since new month buckets appear over time with no code change.
+    ...listArchivedMonthDirs(pipelineDir).map((dir) => ({ dir, state: 'archived' })),
+  ];
+
+  const tasks = [];
+  const skipped = [];
+  for (const { dir, state } of dirs) {
+    let names;
+    try {
+      names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    } catch (err) {
+      skipped.push({ dir, reason: err.code ?? err.message });
+      continue;
+    }
+    for (const name of names) {
+      let task;
+      try {
+        task = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      } catch (err) {
+        console.warn(`[system-report] skipping ${name}: ${err.message}`);
+        continue;
+      }
+      const at = terminalTimestamp(task);
+      if (!at) continue;
+      const t = new Date(at).getTime();
+      if (Number.isNaN(t) || t < start || t >= end) continue;
+      tasks.push({
+        id: task.id, source: task.source, domain: task.domain, at, queueState: state,
+        classification: classifyTask(task, state),
+        // title carried through for buildPlainEnglishSummary() below -- naming a real
+        // accomplishment ("...including a fix for silent-catch-block in
+        // budget-monitor.js") is what makes a period's summary specific instead of
+        // generic restated numbers.
+        title: task.title,
+        // Carried through for computeBlockedPatterns() below -- signatureForTask() needs
+        // the raw blockedReason/history, not just the coarse classification.
+        blockedReason: task.blockedReason, history: task.history,
+      });
+    }
+  }
+  tasks.skipped = skipped;
+  return tasks;
+}
+
 // Downtime from uptime-log.js's samples: a gap between consecutive samples wider than
 // DOWN_GAP_THRESHOLD_SEC is "pipeline down" for that whole gap (watchdog itself wasn't
 // ticking -- see uptime-log.js's header for why this is the best available signal).
 // Within samples that DO exist, a specific instance marked `stale` contributes to that
 // instance's own downtime separately, even while the rest of the pipeline was fine.
+function computeDowntime(instancesDir, startIso, endIso) {
+  const samples = readSamplesInWindow(instancesDir, startIso, endIso);
+  const windowStart = new Date(startIso).getTime();
+  const windowEnd = new Date(endIso).getTime();
+
+  let pipelineDownMs = 0;
+  const pipelineDownIntervals = [];
+  const perInstanceDownMs = {};
+
+  // Clamp every interval endpoint to the report window -- the "sample before the window"
+  // readSamplesInWindow includes can start before windowStart, and there's no sample
+  // guaranteed to exist exactly at windowEnd either.
+  const clamp = (ms) => Math.max(windowStart, Math.min(windowEnd, ms));
+
+  for (let i = 0; i < samples.length; i++) {
+    const cur = samples[i];
+    const curMs = new Date(cur.at).getTime();
+    const next = samples[i + 1];
+    const nextMs = next ? new Date(next.at).getTime() : windowEnd;
+    const segStart = clamp(curMs);
+    const segEnd = clamp(nextMs);
+    const gapSec = (nextMs - curMs) / 1000;
+
+    if (gapSec > DOWN_GAP_THRESHOLD_SEC && segEnd > segStart) {
+      pipelineDownMs += segEnd - segStart;
+      pipelineDownIntervals.push({ from: new Date(segStart).toISOString(), to: new Date(segEnd).toISOString() });
+    } else if (segEnd > segStart) {
+      // Pipeline itself was observed (gap is normal tick cadence) -- attribute any
+      // individual stale instance's share of this segment to its own downtime.
+      for (const [instanceId, info] of Object.entries(cur.instances || {})) {
+        if (info.stale) perInstanceDownMs[instanceId] = (perInstanceDownMs[instanceId] || 0) + (segEnd - segStart);
+      }
+    }
+  }
+
+  // No samples at all in the window (and none before it either) means the whole window
+  // is unobserved -- report it as fully down rather than silently showing zero downtime,
+  // which would read as "everything was fine" when really "nothing was watching."
+  if (samples.length === 0) {
+    pipelineDownMs = windowEnd - windowStart;
+    pipelineDownIntervals.push({ from: startIso, to: endIso });
+  }
+
+  return {
+    pipelineDownSec: Math.round(pipelineDownMs / 1000),
+    pipelineDownIntervals,
+    perInstanceDownSec: Object.fromEntries(Object.entries(perInstanceDownMs).map(([k, v]) => [k, Math.round(v / 1000)])),
+    sampleCount: samples.length,
+  };
+}
+
 // Real per-call wall-clock time AND estimated Anthropic API cost (model-stats.db's
 // model_calls.latency_ms / cost_usd), summed per classification bucket AND per task
 // source, by joining each call's task_id to the same tasks scanTaskActivity already
@@ -103,7 +225,118 @@ function terminalTimestamp(task) {
 // TABLE migration only runs from the Node side's next real recordCall()), so this checks
 // pragma_table_info the same way app.py's own _has_cost_usd_column already does, rather
 // than letting a missing-column query throw and take down the whole report.
+function computeTimeAccounting(dbPath, tasks, startIso, endIso) {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return null;
+  }
+  if (!fs.existsSync(dbPath)) return null;
+
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return null;
+  }
+
+  const byTaskId = new Map(tasks.map((t) => [t.id, t.classification]));
+  const sourceByTaskId = new Map(tasks.map((t) => [t.id, t.source || 'unknown']));
+  const bucketMs = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const bucketCalls = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const bucketCostUsd = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  // Hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // bucketCostUsd above (real spend, only real Claude calls contribute), this sums
+  // hypothetical_cost_usd, which model-stats-client.js's recordCall() always populates
+  // for EVERY call (the real cost when it was a real Claude call, a token-based estimate
+  // via anthropic-pricing.js otherwise) -- so this bucket set answers "what would THIS
+  // period have cost if every call, including the local ones, had gone through the API."
+  const bucketHypotheticalCostUsd = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0, 'in-progress': 0 };
+  const costBySource = new Map(); // source -> { costUsd, calls }
+  const hypotheticalCostBySource = new Map(); // source -> { costUsd, calls }
+  let totalCostUsd = 0;
+  let callsWithCost = 0;
+  let totalHypotheticalCostUsd = 0;
+  let callsWithHypotheticalCost = 0;
+
+  try {
+    const hasCostColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'`).get().c > 0;
+    const hasHypotheticalColumn = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('model_calls') WHERE name = 'hypothetical_cost_usd'`).get().c > 0;
+    const costSelect = (hasCostColumn ? ', cost_usd' : '') + (hasHypotheticalColumn ? ', hypothetical_cost_usd' : '');
+    const rows = db.prepare(`SELECT task_id, latency_ms${costSelect} FROM model_calls WHERE started_at >= ? AND started_at < ?`).all(startIso, endIso);
+    for (const row of rows) {
+      const ms = row.latency_ms || 0;
+      const bucket = byTaskId.has(row.task_id) ? byTaskId.get(row.task_id) : 'in-progress';
+      const source = sourceByTaskId.has(row.task_id) ? sourceByTaskId.get(row.task_id) : 'in-progress';
+      bucketMs[bucket] = (bucketMs[bucket] || 0) + ms;
+      bucketCalls[bucket] = (bucketCalls[bucket] || 0) + 1;
+      if (hasCostColumn && row.cost_usd != null) {
+        bucketCostUsd[bucket] = (bucketCostUsd[bucket] || 0) + row.cost_usd;
+        totalCostUsd += row.cost_usd;
+        callsWithCost += 1;
+        const entry = costBySource.get(source) || { costUsd: 0, calls: 0 };
+        entry.costUsd += row.cost_usd;
+        entry.calls += 1;
+        costBySource.set(source, entry);
+      }
+      if (hasHypotheticalColumn && row.hypothetical_cost_usd != null) {
+        bucketHypotheticalCostUsd[bucket] = (bucketHypotheticalCostUsd[bucket] || 0) + row.hypothetical_cost_usd;
+        totalHypotheticalCostUsd += row.hypothetical_cost_usd;
+        callsWithHypotheticalCost += 1;
+        const hEntry = hypotheticalCostBySource.get(source) || { costUsd: 0, calls: 0 };
+        hEntry.costUsd += row.hypothetical_cost_usd;
+        hEntry.calls += 1;
+        hypotheticalCostBySource.set(source, hEntry);
+      }
+    }
+  } finally {
+    db.close();
+  }
+
+  const bySource = [...costBySource.entries()]
+    .map(([source, v]) => ({ source, costUsd: v.costUsd, calls: v.calls }))
+    .sort((a, b) => b.costUsd - a.costUsd);
+  const hypotheticalBySource = [...hypotheticalCostBySource.entries()]
+    .map(([source, v]) => ({ source, costUsd: v.costUsd, calls: v.calls }))
+    .sort((a, b) => b.costUsd - a.costUsd);
+
+  return {
+    bucketSec: Object.fromEntries(Object.entries(bucketMs).map(([k, v]) => [k, Math.round(v / 1000)])),
+    bucketCalls,
+    bucketCostUsd,
+    totalCostUsd,
+    callsWithCost,
+    costBySource: bySource,
+    bucketHypotheticalCostUsd,
+    totalHypotheticalCostUsd,
+    callsWithHypotheticalCost,
+    hypotheticalCostBySource: hypotheticalBySource,
+  };
+}
+
 const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 'needs-clarification', 'blocked', 'coordinating'];
+
+function oldestFileAgeSec(dir, now) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return null;
+  }
+  if (entries.length === 0) return null;
+  let oldestMtime = null;
+  for (const name of entries) {
+    try {
+      const mtime = fs.statSync(path.join(dir, name)).mtimeMs;
+      if (oldestMtime === null || mtime < oldestMtime) oldestMtime = mtime;
+    } catch {
+      // skip an unreadable file rather than let it abort the whole scan
+    }
+  }
+  return oldestMtime === null ? null : Math.round((now.getTime() - oldestMtime) / 1000);
+}
 
 // Live snapshot of queue depth/age at report-generation time -- deliberately NOT windowed
 // like scanTaskActivity above ("what happened in the period" vs. "how healthy is the
@@ -116,11 +349,66 @@ const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 
 // moving. oldestReviewAgeSec/oldestPendingAgeSec are the two states most likely to
 // silently stall (a claimed-but-abandoned task, a starved reviewer) without an obvious
 // symptom anywhere else.
+function computeQueueHealth(pipelineDir, now = new Date()) {
+  const queueDir = path.join(pipelineDir, 'queue');
+  const counts = {};
+  for (const state of LIVE_QUEUE_STATES) {
+    try {
+      counts[state] = fs.readdirSync(path.join(queueDir, state)).filter((f) => f.endsWith('.json')).length;
+    } catch {
+      counts[state] = 0;
+    }
+  }
+
+  // drafting/ is one level deeper (per-instance subfolders) -- same walk task-sources.js's
+  // own hasDraftingWork uses.
+  let draftingCount = 0;
+  try {
+    const draftingDir = path.join(queueDir, 'drafting');
+    for (const entry of fs.readdirSync(draftingDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      try {
+        draftingCount += fs.readdirSync(path.join(draftingDir, entry.name)).filter((f) => f.endsWith('.json')).length;
+      } catch {
+        // skip an unreadable instance subfolder
+      }
+    }
+  } catch {
+    // no drafting dir at all -- 0 is correct
+  }
+  counts.drafting = draftingCount;
+
+  return {
+    counts,
+    oldestReviewAgeSec: oldestFileAgeSec(path.join(queueDir, 'review'), now),
+    oldestPendingAgeSec: oldestFileAgeSec(path.join(queueDir, 'pending'), now),
+  };
+}
+
 // Surfaces what pipeline_self_audit (see pipeline-self-audit.js) actually found and
 // reported during this window -- closes the loop between the two systems built the same
 // day: the self-improvement detector's findings now show up in the same report a human
 // already reads regularly, instead of only being visible by hand-inspecting
 // self-audit-coverage.json.
+function computeSelfAuditActivity(selfAuditCoveragePath, startIso, endIso) {
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(selfAuditCoveragePath, 'utf8'));
+  } catch {
+    return [];
+  }
+  const start = new Date(startIso).getTime();
+  const end = new Date(endIso).getTime();
+  const activity = [];
+  for (const [signature, entry] of Object.entries(coverage || {})) {
+    const at = entry && entry.reportedAt ? new Date(entry.reportedAt).getTime() : NaN;
+    if (Number.isNaN(at) || at < start || at >= end) continue;
+    activity.push({ signature, taskId: entry.taskId, reportedAt: entry.reportedAt });
+  }
+  activity.sort((a, b) => new Date(a.reportedAt) - new Date(b.reportedAt));
+  return activity;
+}
+
 // Breaks the window's blocked/archived ("junk") tasks down by the SAME failure signature
 // pipeline-self-audit.js clusters on, reused directly rather than re-implemented --
 // surfaces which failure pattern actually dominates a period's junk count (e.g. "18 of
@@ -130,6 +418,24 @@ const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 
 // pattern has crossed pipeline_self_audit's own CLUSTER_THRESHOLD -- this reports on
 // EVERY pattern seen, however small, since a report reader benefits from seeing a pattern
 // start forming even before it's large enough for the automated detector to act on it.
+function computeBlockedPatterns(tasks) {
+  const junkTasks = tasks.filter((t) => t.classification === 'junk');
+  const counts = new Map();
+  let uncategorized = 0;
+  for (const task of junkTasks) {
+    const signature = signatureForTask(task);
+    if (!signature) {
+      uncategorized += 1;
+      continue;
+    }
+    counts.set(signature, (counts.get(signature) || 0) + 1);
+  }
+  const patterns = [...counts.entries()]
+    .map(([signature, count]) => ({ signature, count }))
+    .sort((a, b) => b.count - a.count);
+  return { patterns, uncategorized, totalJunk: junkTasks.length };
+}
+
 // Renders an ISO timestamp in the SYSTEM's own local timezone (Grimmethy, 2026-08-20:
 // "We should change the time readout on time reports to match the systems time zone") --
 // every timestamp this module computes WITH (window boundaries, downtime gaps, schedule
@@ -140,6 +446,28 @@ const LIVE_QUEUE_STATES = ['pending', 'review', 'approved', 'awaiting-confirm', 
 // hardcoded zone name and no extra config -- correct automatically if this pipeline ever
 // runs somewhere else. Falls back to the raw ISO string for a genuinely unparseable
 // input rather than throwing.
+function fmtLocal(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZoneName: 'short',
+  });
+}
+
+function fmtDuration(sec) {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function fmtUsd(usd) {
+  return `$${usd.toFixed(4)}`;
+}
+
 // A short (2-5 sentence) plain-English narrative of what THIS PERIOD specifically
 // accomplished -- added 2026-08-20 (Grimmethy: "Every time tracking entry should contain
 // a plain english description of the specific benefit and results of that period. This
