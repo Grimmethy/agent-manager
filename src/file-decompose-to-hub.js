@@ -56,6 +56,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { planIsFullyMechanicalHtml } = require('./decompose-one-pass.js');
+const { planIsFullyMechanicalNodeModule, buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
 
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'x';
@@ -146,6 +147,30 @@ function validatePlan(repoRoot, request) {
   const moveMeta = [];
   const allMovedSymbols = new Set();
   for (const m of request.moves) for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  // A plain CommonJS source (src/*.js) -- neither an HTML <script> nor a .py. Run the
+  // whole plan through decompose-node-module.js once: it chains the N moves and only
+  // succeeds if EVERY move is a self-contained set of top-level function declarations
+  // (references only each other + require()d names + JS globals). ok -> every move gets
+  // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
+  // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
+  // irrelevant here -- .js wiring is require()/module.exports either way.
+  if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
 
   for (const move of request.moves) {
     const symbols = move.symbols || [];
@@ -315,13 +340,18 @@ function fileBlockedHub({ pipelineDir, requestFile, request, now, hardProblems }
 // adhoc pipeline (draft -> review -> apply -> pending-merge) but its "draft" is
 // tryDeterministicOnePassDecompose (zero model calls), so the whole split is a single
 // verified commit on `agent/<id>` built against fresh main -- it can't go days-stale.
-function fileOnePassTask({ pipelineDir, requestFile, request, now }) {
+function fileOnePassTask({ pipelineDir, requestFile, request, now, kind = 'html' }) {
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
   const nowIso = new Date(now).toISOString();
   const planSlug = slugify(request.id);
   const id = `adhoc-decompose-${planSlug}-onepass`.slice(0, 120);
   const moves = request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols }));
+  const isNode = kind === 'node-module';
+  const deterministicApply = isNode ? 'node-module-decompose' : 'one-pass-decompose';
+  const rawText = isNode
+    ? `Deterministic one-pass CommonJS decomposition of ${request.sourceFile}: move each listed function set verbatim into its new module (with the require() lines it needs + a module.exports), delete from the source, and add \`const { ... } = require('./<module>.js')\` after the require prelude. module.exports stays as-is. No judgement -- validatePlan already confirmed every move is self-contained. If a symbol no longer resolves or a move stopped being self-contained (the file drifted), this falls through to the normal drafting path.`
+    : `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`;
   const record = {
     id,
     domain: 'adhoc',
@@ -331,15 +361,15 @@ function fileOnePassTask({ pipelineDir, requestFile, request, now }) {
     atomic: true,
     noDecompose: true,
     promptContext: {
-      rawText: `Deterministic one-pass decomposition of ${request.sourceFile}: move each listed symbol set verbatim into its new module, delete from the source, and add the <script> tags. No judgement -- validatePlan already confirmed every symbol resolves. If a symbol no longer resolves cleanly (the file drifted), this falls through to the normal drafting path.`,
+      rawText,
       decomposedFrom: `file-decompose-${planSlug}`,
-      deterministicApply: 'one-pass-decompose',
+      deterministicApply,
       sourceFile: request.sourceFile,
       moves,
     },
     ...(request.premiumPriority ? { premiumPriority: true } : {}),
     ...(request.parentHub ? { parentHub: request.parentHub } : {}),
-    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical HTML plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
+    history: [{ stage: 'created', at: nowIso, detail: `file-decompose-to-hub: fully-mechanical ${isNode ? 'CommonJS' : 'HTML'} plan -> single deterministic one-pass task (no hub, no stacked branch)` }],
   };
   fs.writeFileSync(path.join(adhocDir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
 
@@ -367,7 +397,15 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
   // tryDeterministicOnePassDecompose runs the whole split with no model call, against
   // CURRENT main, in one tick. Fall through to the hub if it doesn't qualify.
   if (planIsFullyMechanicalHtml(request, validation)) {
-    return fileOnePassTask({ pipelineDir, requestFile, request, now });
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'html' });
+  }
+
+  // Same, for a plain CommonJS source (src/*.js): every move a self-contained function
+  // cluster (decompose-node-module.js) -> ONE deterministic task, no hub. This is what
+  // finally lets a src/*.js file be decomposed by the pipeline at all -- until now the
+  // only shapes with a deterministic path were HTML <script> and flask-blueprint.
+  if (planIsFullyMechanicalNodeModule(request, validation)) {
+    return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'node-module' });
   }
 
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');

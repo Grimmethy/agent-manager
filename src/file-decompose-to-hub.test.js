@@ -463,22 +463,56 @@ test('validatePlan + fileHub: a script-extract move with every symbol resolvable
   assert.deepEqual(move.promptContext.symbols, ['renderHardwareTab']);
 });
 
-test('validatePlan + fileHub: a plain .js source script-extract move ALSO gets deterministicApply stamped, no LLM instructions in rawText', () => {
+test('validatePlan + fileHub: a plain .js (CommonJS) source files ONE deterministic node-module one-pass task -- no hub, no browser script-extract mishandling', () => {
   const dir = tmpRepo();
-  writeJs(dir, 'src/review-task.js', "'use strict';\n\nfunction isEmptyApprovalSource() {\n  return true;\n}\n");
+  writeJs(dir, 'src/review-task.js',
+    "'use strict';\n\nconst fs = require('fs');\n\n"
+    + 'function isEmptyApprovalSource(x) {\n  return !x;\n}\n\n'
+    + 'function normalizeSource(x) {\n  return String(x || "").trim();\n}\n\n'
+    + 'function readIt(p) {\n  return fs.readFileSync(p, "utf8");\n}\n\n'
+    + 'module.exports = { isEmptyApprovalSource, normalizeSource, readIt };\n');
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'se3.json'), JSON.stringify({
     id: 'decompose-se3',
     sourceFile: 'src/review-task.js',
-    moves: [{ newFile: 'src/lib/review-validation.js', kind: 'script-extract', symbols: ['isEmptyApprovalSource'] }],
+    moves: [
+      { newFile: 'src/review-validation.js', kind: 'module-extract', symbols: ['isEmptyApprovalSource', 'normalizeSource'] },
+      { newFile: 'src/review-io.js', kind: 'module-extract', symbols: ['readIt'] },
+    ],
   }));
   withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).filedHubs, 1); });
 
+  // no hub, exactly one adhoc task
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating')) && fs.readdirSync(path.join(dir, 'queue', 'coordinating')).length || 0, 0, 'no hub');
   const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
-  const moveFile = adhoc.find((n) => n.includes('review-validation-js') && !n.includes('wiring'));
-  const move = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', moveFile), 'utf8'));
-  assert.equal(move.promptContext.deterministicApply, 'script-extract');
-  assert.equal(move.promptContext.sourceFile, 'src/review-task.js');
-  assert.deepEqual(move.promptContext.symbols, ['isEmptyApprovalSource']);
+  assert.equal(adhoc.length, 1);
+  assert.match(adhoc[0], /-onepass\.json$/);
+  const task = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc[0]), 'utf8'));
+  assert.equal(task.promptContext.deterministicApply, 'node-module-decompose');
+  assert.equal(task.promptContext.sourceFile, 'src/review-task.js');
+  assert.equal(task.promptContext.moves.length, 2);
+  assert.deepEqual(task.promptContext.moves[0].symbols, ['isEmptyApprovalSource', 'normalizeSource']);
+  assert.equal(task.atomic, true);
+  assert.match(task.promptContext.rawText, /CommonJS|require\(/);
+  const req = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'se3.json'), 'utf8'));
+  assert.equal(req.onePassTaskId, task.id);
+});
+
+test('validatePlan + fileHub: a .js plan whose move is NOT self-contained is filed BLOCKED with the exact external name', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'src/m.js',
+    "'use strict';\n\nconst SHARED = 42;\n\n"
+    + 'function usesShared() {\n  return SHARED + 1;\n}\n\n'
+    + 'function other() {\n  return usesShared();\n}\n\n'
+    + 'module.exports = { usesShared, other };\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'nsc.json'), JSON.stringify({
+    id: 'decompose-nsc',
+    sourceFile: 'src/m.js',
+    moves: [{ newFile: 'src/m-uses.js', kind: 'module-extract', symbols: ['usesShared'] }],
+  }));
+  withEnv(dir, {}, ({ sweep }) => { assert.equal(sweep({ pipelineDir: dir }).blockedHubs, 1); });
+  const hub = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'coordinating', fs.readdirSync(path.join(dir, 'queue', 'coordinating'))[0]), 'utf8'));
+  assert.equal(hub.planValidation.ok, false);
+  assert.match(hub.planValidation.problems.join(' '), /SHARED/);
 });
 
 test('validatePlan + fileHub: an unresolvable symbol in a script-extract move blocks the whole hub (hardProblems), same as the .py path', () => {
