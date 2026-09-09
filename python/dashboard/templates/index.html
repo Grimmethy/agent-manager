@@ -843,6 +843,13 @@ function renderConceptCard(concept) {
   // markdown syntax at all just becomes normal wrapped <p> paragraphs -- strictly more
   // readable than the old single-line escaped <span> every concept used to get, never less.
   const descriptionHtml = `<div class="row meta" style="display:block">${renderReportMarkdown(concept.description || '')}</div>`;
+  // Ghost-in-the-Machine's own audit surface (2026-09-09): hand-fixes (a person/agent
+  // clicked Requeue) vs. mechanism recoveries (a watchdog sweep, no one in the loop),
+  // plus the count of failure classes that currently have NO deterministic recovery
+  // (Part B's ghost-debt register). Lazily hydrated in renderConceptsTab.
+  const ghostPanel = concept.id === 'concept-ghost-in-the-machine-0dbeea'
+    ? `<div class="ghost-telemetry meta" data-ghost-telemetry-for="${escapeAttr(concept.id)}" style="margin-top:6px">Loading requeue telemetry…</div>`
+    : '';
   return `
     <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
       <div class="row">
@@ -850,6 +857,7 @@ function renderConceptCard(concept) {
         ${statusBadge}
       </div>
       ${descriptionHtml}
+      ${ghostPanel}
       ${shelveNote}
       <div class="row" style="margin-top:8px">
         <span></span>
@@ -862,6 +870,33 @@ function renderConceptCard(concept) {
       <div class="concept-timeline" data-timeline-for="${escapeAttr(concept.id)}" hidden></div>
     </div>
   `;
+}
+
+// Tiny dual-series sparkline (hand-fixes vs mechanism recoveries per day). Inline SVG,
+// theme-aware via CSS vars, no library. Empty string when there's nothing to plot.
+function renderGhostSparkline(series) {
+  const pts = (series || []).filter((d) => d && d.at);
+  if (pts.length < 2) return '';
+  const W = 160, H = 32, max = Math.max(1, ...pts.flatMap((d) => [d.handFixes || 0, d.mechanismRecoveries || 0]));
+  const x = (i) => (i / (pts.length - 1)) * W;
+  const y = (v) => H - (v / max) * H;
+  const line = (key) => pts.map((d, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(d[key] || 0).toFixed(1)}`).join(' ');
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="vertical-align:middle;margin-left:8px" aria-hidden="true">
+    <path d="${line('mechanismRecoveries')}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+    <path d="${line('handFixes')}" fill="none" stroke="var(--warn)" stroke-width="1.5"/>
+  </svg>`;
+}
+
+function renderGhostTelemetry(t) {
+  if (!t) return '<span style="color:var(--warn)">requeue telemetry unavailable</span>';
+  const hand = t.handFixes || 0, mech = t.mechanismRecoveries || 0;
+  const debt = t.openDebt || 0;
+  const debtBit = debt > 0
+    ? ` · <span style="color:var(--warn)" title="Failure classes with no deterministic recovery -- see the timeline below (ghost-debt findings)">🕳 ${debt} open ghost-debt</span>`
+    : '';
+  return `<span title="operator-manual + agent-session requeues"><span style="color:var(--warn)">🫥 ${hand}</span> hand-fix${hand === 1 ? '' : 'es'}</span>`
+    + ` · <span title="watchdog-sweep requeues, no human in the loop"><span style="color:var(--accent)">⚙ ${mech}</span> mechanism recover${mech === 1 ? 'y' : 'ies'}</span>`
+    + ` <span class="meta">(${escapeHtml(t.window || '30d')})</span>${debtBit}${renderGhostSparkline(t.series)}`;
 }
 
 function renderConceptTimelineRows({ rows, truncated }) {
@@ -907,6 +942,15 @@ async function renderConceptsTab() {
     });
     renderConceptsTab();
   };
+
+  main.querySelectorAll('[data-ghost-telemetry-for]').forEach(async (el) => {
+    try {
+      const t = await fetchJson(`/api/concepts/${encodeURIComponent(el.dataset.ghostTelemetryFor)}/ghost-telemetry`);
+      el.innerHTML = renderGhostTelemetry(t);
+    } catch (e) {
+      el.innerHTML = '<span style="color:var(--warn)">requeue telemetry unavailable</span>';
+    }
+  });
 
   main.querySelectorAll('[data-view-timeline]').forEach((btn) => {
     btn.onclick = async () => {

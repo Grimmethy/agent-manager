@@ -81,3 +81,54 @@ test('getBurnRate excludes occurrences outside the requested window', () => {
     assert.equal(rate.longCount, 0);
   });
 });
+
+// --- actor dimension + getActorRollup (2026-09-09, Ghost-in-the-Machine telemetry) -----
+
+test('recordRequeueCause persists actor; default is pipeline-mechanism', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause }) => {
+    recordRequeueCause({ taskId: 'def', signature: 's', requeueWriter: 'blocked-drain' });
+    recordRequeueCause({ taskId: 'man', signature: 's', requeueWriter: 'operator-manual', actor: 'operator-manual' });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    assert.equal(db.prepare('SELECT actor FROM requeue_causes WHERE task_id = ?').get('def').actor, 'pipeline-mechanism');
+    assert.equal(db.prepare('SELECT actor FROM requeue_causes WHERE task_id = ?').get('man').actor, 'operator-manual');
+    db.close();
+  });
+});
+
+test('a db created before the actor column is migrated in place, old rows default to pipeline-mechanism', () => {
+  const dbPath = freshDbPath();
+  const old = new DatabaseSync(dbPath);
+  old.exec('CREATE TABLE requeue_causes (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, signature TEXT NOT NULL, blocked_stage TEXT, requeue_writer TEXT NOT NULL, at TEXT NOT NULL);');
+  old.prepare('INSERT INTO requeue_causes (task_id,signature,requeue_writer,at) VALUES (?,?,?,?)').run('legacy', 'ls', 'blocked-drain', new Date().toISOString());
+  old.close();
+  withFreshDb(dbPath, ({ recordRequeueCause, getActorRollup }) => {
+    recordRequeueCause({ taskId: 'fresh', signature: 'fs', requeueWriter: 'operator-manual', actor: 'operator-manual' });
+    const r = getActorRollup({ sinceMs: 7 * 24 * 3600_000 });
+    assert.equal(r.totals['pipeline-mechanism'], 1, 'legacy row backfilled by the column default');
+    assert.equal(r.totals['operator-manual'], 1);
+  });
+});
+
+test('getActorRollup buckets totals per actor and returns a time series', () => {
+  const dbPath = freshDbPath();
+  withFreshDb(dbPath, ({ recordRequeueCause, getActorRollup }) => {
+    recordRequeueCause({ taskId: 'a', signature: 's', requeueWriter: 'needs-clarification-triage' });
+    recordRequeueCause({ taskId: 'b', signature: 's', requeueWriter: 'context-trim-sweep' });
+    recordRequeueCause({ taskId: 'c', signature: 's', requeueWriter: 'operator-manual', actor: 'operator-manual' });
+    const r = getActorRollup({ sinceMs: 7 * 24 * 3600_000, bucketMs: 24 * 3600_000 });
+    assert.equal(r.totals['pipeline-mechanism'], 2);
+    assert.equal(r.totals['operator-manual'], 1);
+    assert.equal(r.series.length, 1);
+    assert.equal(r.series[0]['pipeline-mechanism'], 2);
+    assert.equal(r.series[0]['operator-manual'], 1);
+  });
+});
+
+test('getActorRollup returns empty (not throw) when the db does not exist', () => {
+  const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'requeue-attribution-client-test-')), 'nope.db');
+  process.env.AGENT_MANAGER_REQUEUE_ATTRIBUTION_DB_PATH = dbPath;
+  delete require.cache[require.resolve('./requeue-attribution-client.js')];
+  const { getActorRollup } = require('./requeue-attribution-client.js');
+  assert.deepEqual(getActorRollup({ sinceMs: 3600_000 }), { totals: {}, series: [] });
+});

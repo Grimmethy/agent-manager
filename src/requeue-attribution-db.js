@@ -31,11 +31,24 @@ try {
       signature TEXT NOT NULL,
       blocked_stage TEXT,
       requeue_writer TEXT NOT NULL,
+      actor TEXT NOT NULL DEFAULT 'pipeline-mechanism',
       at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_requeue_causes_signature ON requeue_causes(signature);
     CREATE INDEX IF NOT EXISTS idx_requeue_causes_task_id ON requeue_causes(task_id);
   `)
+
+  // Migration for a db created before `actor` existed (2026-09-09, Ghost-in-the-Machine
+  // telemetry): who initiated this requeue -- 'pipeline-mechanism' (a watchdog sweep, no
+  // human in the loop -- every writer that existed before this column), 'operator-manual'
+  // (a human clicked Requeue / answered a picker), or 'agent-session' (a Chat-panel tool).
+  // ADD COLUMN ... DEFAULT backfills every historical row correctly: manual requeues were
+  // never recorded here at all, so 100% of pre-existing rows genuinely are mechanism.
+  const cols = db.prepare('PRAGMA table_info(requeue_causes)').all()
+  if (!cols.some((c) => c.name === 'actor')) {
+    db.exec("ALTER TABLE requeue_causes ADD COLUMN actor TEXT NOT NULL DEFAULT 'pipeline-mechanism'")
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_requeue_causes_actor ON requeue_causes(actor)')
 
   const [event, payloadPath] = process.argv.slice(2)
 
@@ -53,13 +66,14 @@ try {
       process.exit(0)
     }
     db.prepare(`
-      INSERT INTO requeue_causes (task_id, signature, blocked_stage, requeue_writer, at)
-      VALUES (@taskId, @signature, @blockedStage, @requeueWriter, @at)
+      INSERT INTO requeue_causes (task_id, signature, blocked_stage, requeue_writer, actor, at)
+      VALUES (@taskId, @signature, @blockedStage, @requeueWriter, @actor, @at)
     `).run({
       taskId: payload.taskId,
       signature: payload.signature,
       blockedStage: payload.blockedStage != null ? payload.blockedStage : null,
       requeueWriter: payload.requeueWriter,
+      actor: payload.actor || 'pipeline-mechanism',
       at: new Date().toISOString(),
     })
   } else {

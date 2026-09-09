@@ -462,6 +462,14 @@ test('an adhoc retryable draft block at the retry cap escalates to needs-clarifi
   assert.ok(fs.existsSync(p), 'escalated to needs-clarification/');
   const out = JSON.parse(fs.readFileSync(p, 'utf8'));
   assert.match(out.needsClarification.openQuestions, /could not get this past review after 3 attempts/);
+
+  // Ghost-in-the-Machine (2026-09-09): a retry-cap escalation with no re-admission
+  // signature is ghost debt -- one side-finding tagged to the concept.
+  const inbox = path.join(d.root, 'queue', 'side-findings-inbox');
+  const sf = fs.readdirSync(inbox).map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+  const debt = sf.find((r) => r.stage === 'ghost-debt' && r.taskId === 'adhoc-tb2');
+  assert.ok(debt, 'a ghost-debt side-finding was filed');
+  assert.equal(debt.conceptId, 'concept-ghost-in-the-machine-0dbeea');
 });
 
 test('a NON-adhoc task carrying retryableDraftBlock is NOT requeued (guarded on isAdhocTask)', () => {

@@ -31,6 +31,7 @@ const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-clie
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
+const { fileGhostDebt } = require('./ghost-debt.js');
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
 
@@ -156,8 +157,13 @@ function buildExhaustedAdhocQuestion(task) {
   ].join('\n');
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
+  // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
+  // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
+  // caller (older tests) didn't pass it explicitly.
+  const ghostRoot = pipelineDir
+    || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
   const entries = [];
   try {
     for (const n of fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'))) {
@@ -265,6 +271,9 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
               : `Classified as ${classification.category} (${classification.faultSide}-side), which a blind retry cannot fix -- needs a human decision.`;
             task.needsClarification = { reason: classification.category, openQuestions };
             appendHistoryEvent(task, 'needs-clarification', `escalated immediately -- ${classification.category} (${classification.faultSide}-side), a blind retry cannot differ`);
+            // No automated recovery exists for this class -- a blind retry is structurally
+            // futile and no re-admission signature matched. Record the debt.
+            if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason || openQuestions, site: 'reject-retry-check:non-retryable-classification', pipelineDir: ghostRoot });
             fs.mkdirSync(needsClarificationDir, { recursive: true });
             fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
             fs.unlinkSync(filePath);
@@ -294,6 +303,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarification
           };
           appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
           appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
+          // Blind redrafts were spent and nothing re-admitted this class -- ghost debt.
+          if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:retry-cap-exhausted', pipelineDir: ghostRoot });
           fs.mkdirSync(needsClarificationDir, { recursive: true });
           fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
           fs.unlinkSync(filePath);
@@ -420,7 +431,7 @@ function main() {
   const adhocDir = path.join(queueDir, 'adhoc');
   const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, adhocDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir });
   process.stdout.write(JSON.stringify(summary));
 }
 
