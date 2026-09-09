@@ -20,8 +20,8 @@
 //
 // Every git call goes through an injectable `exec` (realExec signature: (file, args,
 // {cwd, timeout})) so coordinator-sweep's test drives this with canned output instead of a
-// real repo. Opt-in: coordinator-sweep gates the call on
-// AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=true.
+// real repo. On by default in coordinator-sweep; kill switch
+// AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false.
 
 const os = require('os');
 const path = require('path');

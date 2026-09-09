@@ -22,13 +22,13 @@ const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 const { taskCommitOnMain } = require('./task-disposition.js');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 
-// Opt-in (AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=true): the sweep merges a verified
-// mechanical move child's branch to main itself, instead of a human clicking merge once
-// per move. Off by default for its first release -- an autonomous `git push origin <main>`
-// gets a shakeout week like every other risky pipeline autonomy (auto-confirm vote, det
-// wiring) before the default flips.
+// On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
+// verified mechanical move child's branch to main itself, instead of a human clicking
+// merge once per move. Only ever a `script-extract` / `one-pass-decompose` child that
+// still merges clean AND passes the integration gate -- see decompose-auto-merge.js.
+// Kill switch: AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false.
 function autoMergeEnabled() {
-  return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES === 'true';
+  return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES !== 'false';
 }
 
 const writeChildDone = (pipelineDir, task) => {
@@ -43,7 +43,7 @@ const writeChildDone = (pipelineDir, task) => {
 // otherwise the hub's mergedAt stamp lies and the dependent feature task unblocks against a
 // main that doesn't have the split yet. Nothing else reconciles these children (they carry
 // no dependsOn). Two mechanisms here, tried in order per `done`-not-`merged` child:
-//   1. auto-merge (opt-in): if the child is a verified mechanical move and its branch still
+//   1. auto-merge (on by default): if the child is a verified mechanical move and its branch still
 //      merges clean + the integration gate passes, merge it to origin/<main> now. A
 //      conflict or gate failure is terminal for the machine -- stamp coordinatorBlocked
 //      and leave it for a human (and remember, so the expensive gate is not re-run every

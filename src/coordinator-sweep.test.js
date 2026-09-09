@@ -259,9 +259,34 @@ test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: an unmergeable mechanic
   }
 });
 
-test('AUTO_MERGE_MOVES unset: a done mechanical child is never auto-merged (opt-in)', () => {
+test('auto-merge is on by default: a done mechanical child IS attempted with no env set', () => {
   const dir = makePipeline();
+  const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
   const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
+  try {
+    write(dir, 'coordinating', {
+      id: 'dhub-def', status: 'coordinating', decomposeHub: true, history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'def-x', title: 'X', status: 'in-progress' }],
+    });
+    write(dir, 'done', { id: 'def-x', promptContext: { deterministicApply: 'script-extract', sourceFile: 'a/index.html' } });
+    let called = false;
+    const runAutoMerge = () => { called = true; return { merged: true, mergeCommit: 'aaa111bbb222' }; };
+    const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
+    assert.equal(called, true, 'auto-merge runs by default');
+    assert.equal(summary.completed, 1);
+  } finally {
+    if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
+test('AUTO_MERGE_MOVES=false is the kill switch: a done mechanical child is never auto-merged', () => {
+  const dir = makePipeline();
+  const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = 'false';
   process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
   try {
     write(dir, 'coordinating', {
@@ -272,9 +297,10 @@ test('AUTO_MERGE_MOVES unset: a done mechanical child is never auto-merged (opt-
     let called = false;
     const runAutoMerge = () => { called = true; return { merged: true }; };
     const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
-    assert.equal(called, false, 'auto-merge is opt-in -- not called without AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=true');
+    assert.equal(called, false, 'AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false disables it');
     assert.equal(summary.completed, 0);
   } finally {
+    if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
     if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
   }
 });
