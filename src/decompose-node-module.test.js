@@ -52,11 +52,73 @@ const SRC = [
   '',
 ].join('\n');
 
-test('splitRequirePrelude: prelude ends at the last top-level require', () => {
+test('splitRequirePrelude: prelude is the top require cluster; body starts at the first real code', () => {
   const { prelude, body } = splitRequirePrelude(SRC);
   assert.match(prelude, /require\('util'\)/);
   assert.doesNotMatch(prelude, /function fmt/);
+  assert.doesNotMatch(prelude, /const ROOT/); // a non-require const == real code, ends the prelude
   assert.match(body, /^\s*const ROOT = process\.cwd\(\)/);
+});
+
+test('splitRequirePrelude: a require() that sits AFTER real code is NOT swallowed into the prelude', () => {
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'const CONST_A = 1;',
+    '',
+    'function early() { return CONST_A; }',
+    '',
+    '// lazy import, deliberately mid-file',
+    "const { helper } = require('./util-helper.js');",
+    '',
+    'function late() { return helper(); }',
+    '',
+    'module.exports = { early, late };',
+    '',
+  ].join('\n');
+  const { prelude, body } = splitRequirePrelude(src);
+  assert.match(prelude, /require\('fs'\)/);
+  assert.doesNotMatch(prelude, /util-helper/); // the mid-file require stays in the body
+  assert.doesNotMatch(prelude, /const CONST_A/);
+  assert.match(body, /^\s*const CONST_A = 1;/);
+});
+
+test('buildNodeModuleExtraction: a moved fn that uses a MID-FILE require binding still resolves (whole-source require scan)', () => {
+  const src = [
+    "'use strict';",
+    "const fs = require('fs');",
+    '',
+    'function unrelated() { return fs.existsSync("x"); }',
+    '',
+    "const { transform } = require('./transform.js');", // mid-file, after real code
+    '',
+    'function usesTransform(x) { return transform(x) + 1; }',
+    '',
+    'module.exports = { unrelated, usesTransform };',
+    '',
+  ].join('\n');
+  const r = buildNodeModuleExtraction(src, 'src/m.js', 'src/m-transform.js', ['usesTransform']);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason); // `transform` is require-bound, not an external module-scope ref
+  assert.match(r.changes[0].content, /require\('\.\/transform\.js'\)/); // and the new module gets that require
+});
+
+test('firstNodeCheckError: null for a parseable change set, a `<file>: <error>` string for a broken one', () => {
+  const { firstNodeCheckError } = require('./decompose-node-module.js');
+  assert.equal(firstNodeCheckError([
+    { mode: 'create', file: 'src/ok.js', content: "'use strict';\nfunction a() { return 1; }\nmodule.exports = { a };\n" },
+    { mode: 'edit', file: 'src/src.js', find: 'x', replace: "'use strict';\nconst { a } = require('./ok.js');\nmodule.exports = { a };\n" },
+  ]), null);
+  const err = firstNodeCheckError([
+    { mode: 'create', file: 'src/bad.js', content: "'use strict';\nfunction a( { return 1; }\n" }, // syntax error
+  ]);
+  assert.ok(err && err.startsWith('src/bad.js: '), err);
+  assert.match(err, /SyntaxError|Error/);
+});
+
+test('buildNodeModuleOnePassChanges: the node --check guard runs on a real plan (stays ok)', () => {
+  const good = buildNodeModuleOnePassChanges(SRC, 'src/thing.js', [{ newFile: 'src/thing-c.js', symbols: ['computeA', 'computeB'] }]);
+  assert.equal(good.ok, true, good.ok ? '' : good.reason);
 });
 
 test('topLevelBindingNames: functions, consts, and destructured requires; column-0 only', () => {
