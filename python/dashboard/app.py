@@ -3544,13 +3544,24 @@ def _load_topology_fallback() -> list[dict]:
 def load_topology() -> list[dict]:
     """List of per-source dicts from `--dump-topology` (name, slug, priority, reasoningTier,
     workerType, candidateFulfillment, candidatesPath, candidateDocTitle, ...). Falls back to
-    the committed snapshot on any error."""
+    the committed snapshot on any error.
+
+    Deliberately run with AGENT_MANAGER_TASK_PRIORITIES / AGENT_MANAGER_TASK_TIERS stripped
+    from the child env: `registerTaskSource(...)` bakes `taskPriority(name, default)` /
+    `taskTierFor(...)` at registration time, so inheriting those would make `priority` /
+    `workerType` here the EFFECTIVE (already-overridden) values, not the registry defaults.
+    task_source_default_priorities() / _worker_types() and every "collapse a row back to
+    its default clears the override" check (api_job_types_priority, ...priority_family)
+    depend on these being the true defaults; read_task_priorities() / read_worker_types()
+    layer the live overrides back on top."""
     now = time.monotonic()
     if _topology_cache["value"] is not None and now - _topology_cache["at"] < _TOPOLOGY_TTL_SECONDS:
         return _topology_cache["value"]
     value = None
     try:
         child_env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+        child_env.pop("AGENT_MANAGER_TASK_PRIORITIES", None)
+        child_env.pop("AGENT_MANAGER_TASK_TIERS", None)
         result = subprocess.run(
             ["node", str(SRC_DIR / "task-sources.js"), "--dump-topology"],
             capture_output=True, text=True, timeout=15, cwd=str(SRC_DIR), env=child_env,
@@ -3585,6 +3596,72 @@ def task_source_default_priorities() -> dict:
 
 def task_source_default_worker_types() -> dict:
     return {s["name"]: s.get("workerType", "ornith") for s in load_topology()}
+
+
+# --- Job List source families (UI grouping only) ---------------------------------------
+# Several registered sources are really one pipeline the operator wants to steer with a
+# single priority knob -- arch_discovery / arch_import / arch_review / arch_import_review
+# are the "Architecture review" family, and observability / product_spec / performance /
+# function_length / change_review / backlog / pipeline_forensics have the same
+# generator + consumer (+ variant) shape. This grouping is PURELY a dashboard convenience
+# derived from the source name: the registry, the priority ladder, and the running
+# pipeline are untouched, and every member keeps its own independent
+# AGENT_MANAGER_TASK_PRIORITIES override underneath (expand the group to edit one row).
+# A trailing "_<suffix>" is stripped recursively, so arch_import_review -> arch_import ->
+# arch. The suffix list is deliberately conservative -- "audit" is absent because
+# pipeline_self_audit / pipeline_health_audit / staleness_audit / ui_visibility_audit are
+# unrelated singletons, not a family; a suffix only belongs here once it names a real
+# generator/consumer/variant split in the live catalog.
+_FAMILY_MEMBER_SUFFIXES = (
+    "review", "fix", "digest", "discovery", "import",
+    "outline", "section", "decomposition", "fulfillment",
+)
+_FAMILY_LABELS = {
+    "arch": "Architecture review",
+    "observability": "Observability review",
+    "performance": "Performance review",
+    "function_length": "Function-length review",
+    "change": "Change review",
+    "product_spec": "Product spec",
+    "pipeline_forensics": "Pipeline forensics",
+    "backlog": "Backlog decomposition",
+}
+
+
+def task_source_family_key(name: str) -> str:
+    """The family a source belongs to (recursive `_<suffix>` strip), or its own name when
+    it stands alone. Not every returned key is a real family -- see task_source_families()."""
+    key = name
+    while True:
+        for suf in _FAMILY_MEMBER_SUFFIXES:
+            if key.endswith("_" + suf) and len(key) > len(suf) + 1:
+                key = key[: -(len(suf) + 1)]
+                break
+        else:
+            return key
+
+
+def task_source_families() -> dict:
+    """{familyKey: [member source names]} for every family with >= 2 members in the live
+    catalog. A key with a single member is NOT a family (it renders as an ordinary flat
+    row under its own name). Member order follows the catalog's own registry order."""
+    groups: dict = {}
+    for name in task_source_catalog():
+        groups.setdefault(task_source_family_key(name), []).append(name)
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def task_source_family_of() -> dict:
+    """{sourceName: familyKey}, only for sources that belong to a real (>=2 member) family."""
+    out = {}
+    for key, members in task_source_families().items():
+        for m in members:
+            out[m] = key
+    return out
+
+
+def task_source_family_label(key: str) -> str:
+    return _FAMILY_LABELS.get(key) or key.replace("_", " ").capitalize()
 
 
 def arch_candidates_path() -> Path | None:
@@ -6823,16 +6900,23 @@ def api_job_types():
     reads; this is just a UI over that one persisted value."""
     active = read_active_job_types()
     priorities = read_task_priorities()
+    default_priorities = task_source_default_priorities()
     approval_modes = read_approval_modes()
     worker_types = read_worker_types()
     counters = read_job_type_counters()
     available_counts = available_candidate_counts()
+    family_of = task_source_family_of()
     return jsonify([
         {
             "name": name,
             "active": name in active,
             "alwaysActive": name in ALWAYS_ACTIVE_SOURCES,
             "priority": priorities.get(name),
+            "defaultPriority": default_priorities.get(name),
+            # Job List family grouping (UI only) -- null for a source that isn't in a
+            # >=2-member family. See task_source_families().
+            "family": family_of.get(name),
+            "familyLabel": task_source_family_label(family_of[name]) if name in family_of else None,
             "approvalMode": approval_modes.get(name),
             "workerType": worker_types.get(name),
             "timesPerformed": counters.get(name, 0),
@@ -7005,6 +7089,46 @@ def api_job_types_priority():
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_PRIORITIES", new_value)
 
     return jsonify({"name": name, "priority": priority})
+
+
+@app.route("/api/job-types/priority-family", methods=["POST"])
+def api_job_types_priority_family():
+    """Job List tab's family-level Priority control. Shifts EVERY member of a source
+    family (arch_discovery / arch_import / arch_review / arch_import_review, ...) by the
+    same delta so `base` becomes the new lowest effective priority across the family,
+    leaving the internal offsets -- which encode the deliberate consumer-outranks-generator
+    ordering (70/71 vs 80/81 for arch) -- exactly as they were, manual per-row tweaks
+    included. Writes all N member overrides to AGENT_MANAGER_TASK_PRIORITIES in one shot;
+    a member that lands back on its registry default is dropped from the override string
+    (same tidy round-trip as api_job_types_priority). Purely a convenience over that
+    per-source endpoint -- nothing here the operator couldn't do by editing each row by
+    hand. No pipeline restart: src/config.js's taskPriorityOverrides re-reads the env file
+    on the next `node task-sources.js` tick."""
+    body = request.get_json(silent=True) or {}
+    family = (body.get("family") or "").strip()
+    members = task_source_families().get(family)
+    if not members:
+        abort(400, description=f"unknown source family '{family}'")
+    try:
+        base = int(body.get("base"))
+    except (TypeError, ValueError):
+        abort(400, description="base must be an integer")
+
+    priorities = read_task_priorities()  # every catalog source -> effective priority
+    delta = base - min(priorities[m] for m in members)
+    for m in members:
+        priorities[m] = priorities[m] + delta
+
+    defaults = task_source_default_priorities()
+    non_default = {n: p for n, p in priorities.items() if p != defaults.get(n)}
+    new_value = ",".join(f"{n}:{p}" for n, p in sorted(non_default.items()))
+    write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_TASK_PRIORITIES", new_value)
+
+    return jsonify({
+        "family": family,
+        "base": base,
+        "members": {m: priorities[m] for m in members},
+    })
 
 
 @app.route("/api/job-types/approval-mode", methods=["POST"])
