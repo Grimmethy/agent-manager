@@ -85,7 +85,11 @@ test('parseClarificationOptions needs an OPTIONS: header + 2 well-formed lines',
 
 test('priorRejectionBlock renders feedback, empty string for none', () => {
   assert.equal(priorRejectionBlock({}), '');
-  assert.match(priorRejectionBlock({ priorRejectionFeedback: ['too vague', 'wrong file'] }), /attempted 2 time\(s\)[\s\S]*1\. too vague[\s\S]*2\. wrong file/);
+  const block = priorRejectionBlock({ priorRejectionFeedback: ['too vague', 'wrong file'] });
+  assert.match(block, /HARD CONSTRAINT/);
+  assert.match(block, /MUST NOT repeat/);
+  assert.match(block, /attempted 2 time\(s\)/);
+  assert.match(block, /1\. too vague[\s\S]*2\. wrong file/);
 });
 
 test('RESOLUTION_RE recognises all four verbs, case-insensitively', () => {
