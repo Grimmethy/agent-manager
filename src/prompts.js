@@ -1842,14 +1842,33 @@ function buildPlanPrompt(task) {
   return prior ? prior + base : base;
 }
 
-function buildImplementPrompt(task, planText) {
+function strictCiteConstraintBlock(task) {
+  const files = Array.isArray(task.verifiedFiles) ? task.verifiedFiles : [];
+  const lines = [
+    '',
+    'STRICT-CITE CONSTRAINT:',
+    files.length === 0
+      ? 'The verified-files list is empty. cite only the files explicitly provided in the plan text above -- cite no files beyond what is shown there.'
+      : 'cite only the files listed in the verified-files list below. Do NOT cite, reference, or assume the contents of any file not in this list, even if you think you know what it contains.',
+    '',
+  ];
+  if (files.length > 0) {
+    lines.push('VERIFIED-FILES LIST:');
+    files.forEach(f => lines.push(`  - ${f}`));
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+function buildImplementPrompt(task, planText, options) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
   const prior = priorRejectionBlock(task);
   const base = source && typeof source.buildImplementPrompt === 'function'
     ? source.buildImplementPrompt(task, planText)
     : genericFallbackImplementPrompt(task, planText);
-  return prior ? prior + base : base;
+  const strict = (options && options.strictCite) ? strictCiteConstraintBlock(task) : '';
+  return (prior ? prior + base : base) + strict;
 }
 
 // Independent second-opinion pass: a fresh model call reviews the drafter's own Implement
@@ -1938,7 +1957,10 @@ if (require.main === module) {
     process.stdout.write(buildPlanPrompt(task));
   } else if (pass === 'implement') {
     const planText = fs.readFileSync(planTextPath, 'utf8');
-    process.stdout.write(buildImplementPrompt(task, planText));
+    // Optional strict-cite variant for manual testing: STRICT_CITE=1 appends the
+    // "cite only verified-files" constraint block on top of the base prompt.
+    const opts = process.env.STRICT_CITE === '1' ? { strictCite: true } : undefined;
+    process.stdout.write(buildImplementPrompt(task, planText, opts));
   } else if (pass === 'critique') {
     const planText = fs.readFileSync(planTextPath, 'utf8');
     const implementText = fs.readFileSync(implementTextPath, 'utf8');
