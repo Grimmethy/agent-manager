@@ -15,19 +15,23 @@ test('already-implemented-strong -> retire / high', () => {
   assert.equal(strong.reason, 'already-implemented');
   assert.equal(strong.disposition, 'retire');
   assert.equal(strong.confidence, 'high');
+  assert.equal(strong.confidenceSource, 'deterministic-rule');
 });
 
 test('invalid-premise -> retire / high', () => {
   const f = classifyStaleTask({ task: { id: 't' }, reasons: ['invalid-premise'], evidence: ['every file this task names is absent'] });
   assert.equal(f.confidence, 'high');
+  assert.equal(f.confidenceSource, 'deterministic-rule');
   assert.equal(f.disposition, 'retire');
 });
 
 test('duplicate of an already-done task -> retire / high; of a live task -> medium', () => {
   const done = classifyStaleTask({ task: { id: 't' }, reasons: ['duplicate-of'], evidence: [], duplicateOf: { id: 'other', state: 'merged', sim: 0.8 } });
   assert.equal(done.confidence, 'high');
+  assert.equal(done.confidenceSource, 'deterministic-rule');
   const live = classifyStaleTask({ task: { id: 't' }, reasons: ['duplicate-of'], evidence: [], duplicateOf: { id: 'other', state: 'blocked', sim: 0.7 } });
   assert.equal(live.confidence, 'medium');
+  assert.equal(live.confidenceSource, 'heuristic-default');
 });
 
 test('decompose-loop -> re-scope / medium', () => {
@@ -35,12 +39,14 @@ test('decompose-loop -> re-scope / medium', () => {
   assert.equal(f.reason, 'decompose-loop');
   assert.equal(f.disposition, 're-scope');
   assert.equal(f.confidence, 'medium');
+  assert.equal(f.confidenceSource, 'heuristic-default');
 });
 
 test('retries-exhausted only -> capability-ceiling / medium', () => {
   const f = classifyStaleTask({ task: { id: 't' }, reasons: ['retries-exhausted'], evidence: [] });
   assert.equal(f.disposition, 'capability-ceiling');
   assert.equal(f.confidence, 'medium');
+  assert.equal(f.confidenceSource, 'heuristic-default');
 });
 
 test('stale-age only, or possibly-resolved only -> null (staleness_audit source owns these)', () => {
@@ -108,6 +114,7 @@ test('vote is OFF by default -- a medium candidate is stamped directly, no major
   const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: boom, now: Date.now() });
   assert.equal(s.voted, 0);
   assert.equal(readTask(dir, 'blocked', 'nov-1').stalenessFlag.confidence, 'medium');
+  assert.equal(readTask(dir, 'blocked', 'nov-1').stalenessFlag.confidenceSource, 'heuristic-default');
 });
 
 test('with the vote enabled: DENY drops the flag + Keep cooldown; CONFIRM promotes to high', async () => {
@@ -129,6 +136,7 @@ test('with the vote enabled: DENY drops the flag + Keep cooldown; CONFIRM promot
     writeTask(dir2, 'blocked', exhaustedTask('conf-1'));
     await voteSweep({ pipelineDir: dir2, repoRoot: null, majorityVote: async () => ({ confident: true, verdict: 'CONFIRM', realVoteCount: 3, requestedVotes: 3 }), now: Date.now() });
     assert.equal(readTask(dir2, 'blocked', 'conf-1').stalenessFlag.confidence, 'high');
+    assert.equal(readTask(dir2, 'blocked', 'conf-1').stalenessFlag.confidenceSource, 'model-vote');
   } finally {
     delete process.env.AGENT_MANAGER_ADHOC_STALENESS_VOTE;
     delete require.cache[require.resolve('./adhoc-staleness-flag.js')];
