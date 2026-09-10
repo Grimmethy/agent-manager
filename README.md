@@ -61,6 +61,7 @@ convention the underlying model client already used. Set these before launching 
 | `ORNITH_AB_MODELS` | no (default unset -- A/B off) | Comma-separated candidate model tags for a same-stage A/B test of the worker's implement pass. A task deterministically hashes to one candidate (stable across redraft), so the same task always compares the same model. Only safe on a single worker instance -- Ollama keeps one model tier resident, so distinct candidate lists across concurrent instances would thrash the model cache the same way mixing `ORNITH_MODEL` tiers across instances would. |
 | `AGENT_MANAGER_MODEL_STATS_DB_PATH` | no (default `<pipelineDir>/model-stats.db`) | SQLite DB tracking per-model-call outcome/performance/stability stats (see the dashboard's Models tab). The one deliberate exception to this package's no-database-required design -- per-model comparisons need to survive past individual tasks leaving the queue. |
 | `REVIEW_PROVIDER` | no (default `ornith`) | Set to `claude` to use `claude -p` for a combined review+apply call instead. |
+| `DRAFT_MAX_TURNS` | no (default `20`) | hard ceiling on agentic turns for a single `claude -p` draft call. Prevents runaway cost (brain-dump bd-1788707820332). |
 
 ## Domains
 
