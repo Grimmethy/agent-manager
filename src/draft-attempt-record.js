@@ -131,8 +131,10 @@ function recordPlan(attempt, info = {}) {
 }
 
 // The standard (non-adhoc) implement pass. `info` carries any of { text, attempts,
-// degenerate, note } -- `note` (a deterministic short-circuit / a split summary) and
-// `text` may coexist.
+// degenerate, note, promptVariant } -- `note` (a deterministic short-circuit / a split
+// summary) and `text` may coexist. `promptVariant` records WHICH implement prompt was
+// used for this call: 'default' (the standard prompt) or 'strict-cite' (the verbatim-
+// citation retry). Defaults to 'default' when the caller does not supply it.
 function recordImplement(attempt, info = {}) {
   if (!attempt) return;
   const impl = { chars: 0 };
@@ -143,6 +145,7 @@ function recordImplement(attempt, info = {}) {
     impl.text = cap(info.text, RESPONSE_TEXT_CAP);
   }
   if (info.attempts != null) impl.attempts = info.attempts;
+  impl.promptVariant = info.promptVariant ?? 'default';
   attempt.implement = impl;
 }
 
