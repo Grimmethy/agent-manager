@@ -349,3 +349,55 @@ Add a new function _call_claude(session, prompt, transcript) placed directly abo
 
 Benefits:
 Completes the split of per-provider logic out of _generate, leaving _generate as a short, easy-to-follow dispatcher with a single unified stats-recording path, while both adapters remain plain functions in the same file with no behavioral change and no new module/class introduced.
+
+### AC-27 · `readPluginsManifest()` has no injectable path, forcing a cache-bust ritual in every test
+Strength: Worth exploring
+Files: src/plugins-manifest.js, src/accessible-roots.js, src/plugins-manifest.test.js, src/accessible-roots.test.js
+
+Problem:
+`PLUGINS_MANIFEST_PATH` is a module-level `const` resolved from `process.env.AGENT_MANAGER_PLUGINS_MANIFEST` at require-time, and `readPluginsManifest()` accepts no arguments. The only way to point the function at a different manifest file is to set the environment variable *before* the module is first loaded. Both test files work around this by setting the env var, deleting the entry from `require.cache`, and re-requiring. `accessible-roots.test.js` makes it worse: it must bust the cache for **two** modules (`plugins-manifest.js` *and* `accessible-roots.js`) because `accessible-roots.js` captured `readPluginsManifest` and `enabledRegisterPaths` as free variables at its own load time. Any future module that requires `plugins-manifest.js` early (e.g., `config.js`'s `ensureRegistered()`) locks in the path for the life of the process, and any new test that wants a different manifest must replicate the same cache-bust dance. The interface is "shallow" in the sense that the function that most needs a parameter (the path) has none, while the one constant that *is* exported (`PLUGINS_MANIFEST_PATH`) is read-only and not wired into the function's signature.
+
+Solution:
+Let `readPluginsManifest(manifestPath?)` accept an optional path argument that defaults to the existing `PLUGINS_MANIFEST_PATH` constant, and let `resolveAccessibleRoots({ repoRoot, manifestPath? })` pass it through. Tests then inject a temp path as a plain argument and drop the cache-bust entirely. No behavioural change for existing callers that omit the argument.
+
+Benefits:
+Tests become deterministic and independent of module-load order; the two-line `delete require.cache[…]; require(…)` ritual disappears from both test files. Any future module that needs a non-default manifest can pass a path directly without mutating global state or fighting the require cache. The public API becomes self-documenting: the parameter that controls behaviour is visible in the function signature rather than hidden in an env-var side-effect at load time.
+
+### AC-28 · `accessible-roots.js` recovers the plugin repo root with `path.dirname(registerPath)`, an implicit "register.js lives at repo root" contract
+Strength: Worth exploring
+Files: src/accessible-roots.js, src/plugins-manifest.js
+
+Problem:
+The manifest format stores a *file* path (`registerPath: "/abs/…/agent-manager-hygiene/register.js"`). `accessible-roots.js` recovers the *directory* it needs with `path.dirname(rp)`. This silently assumes `register.js` is always one level deep (i.e., at the repo root). If a plugin ever ships its entry point in a subdirectory (`…/plugin/src/register.js`), `dirname` yields `…/plugin/src/` and the grounding search is scoped to the wrong tree—no error, just a narrower (wrong) search root. The assumption is visible in the doc-comment example but is not encoded in the manifest schema, not validated by `enabledRegisterPaths()`, and not checked by `resolveAccessibleRoots()`. The `dirname` step is a one-line coupling that is easy to miss when adding a new plugin whose layout differs.
+
+Solution:
+Add a `repoRoot` (or `rootDir`) field to each manifest entry so the directory the grounding search should be scoped to is explicit data rather than a derived guess. `accessible-roots.js` reads `entry.repoRoot` directly and falls back to `path.dirname(entry.registerPath)` only for legacy manifests that lack the field, emitting a deprecation warning. `enabledRegisterPaths()` can validate that `repoRoot` is an absolute directory path when present.
+
+Benefits:
+The contract between the manifest producer and `accessible-roots.js` becomes explicit and self-documenting in the schema rather than implicit in a `dirname` call. Plugins with non-trivial layouts (monorepos, nested entry points) work correctly without a code change. The fallback path preserves backward compatibility with existing manifests, so the migration is additive and low-risk.
+
+### AC-29 · `metrics` is an undeclared implicit global in `budget-monitor.js`
+Strength: Strong
+Files: budget-monitor.js
+
+Problem:
+`readEntries()` references a bare identifier `metrics` in its `catch` block (guarded by a `typeof` check) but never imports it, receives it as a parameter, or reads it from any configuration surface. The module silently depends on a caller having assigned `globalThis.metrics` before the parse-failure path executes. Because no `require`, parameter, or env-var reference mentions `metrics`, the dependency is invisible in the module's apparent interface: a reader scanning signatures and imports sees a two-parameter function with no way to know it conditionally emits a counter. In practice this means (a) a test asserting "parse failures are counted" must set and later delete a global, introducing order-dependence and cross-test contamination; (b) a test asserting the opposite must ensure the global is absent, which is fragile in a shared runner; and (c) in the file's own documented invocation pattern (`node -e` one-liner), the global is absent by default, so the metric is silently dropped with no log, no warning, and no return-value signal to the caller.
+
+Solution:
+Add an optional `metrics` (or `onParseFailure`) parameter to `readEntries(filePath, sinceMs, metrics?)` and thread it from `computeBudgetHealthy(options?)`, which itself accepts an optional reporter. Default to a no-op function so existing callers (the shell-script one-liner, current tests) need no changes. The caller that has a metrics library passes it in; the dependency becomes visible in the signature, testable by passing a stub, and the silent no-op becomes an explicit, documented default rather than an accidental side-effect of global state.
+
+Benefits:
+The module's true dependency graph matches its visible interface—no hidden global. Tests can assert counter emission or its absence by passing (or omitting) a stub, with zero global mutation and no cache-bust ritual. Future callers in CI sandboxes or secondary agent processes can inject their own metrics sink without polluting `globalThis`. The "silent drop" failure mode is eliminated: the no-op is now a deliberate, documented default rather than an accident of the runtime environment.
+
+### AC-30 · `PROJECTS_DIR` / `CACHE_PATH` frozen at require-time; only override is env-var + cache-bust
+Strength: Worth exploring
+Files: budget-monitor.js
+
+Problem:
+`PROJECTS_DIR` and `CACHE_PATH` are resolved from `process.env` once at module load into module-level `const`s. `computeBudgetHealthy()` and `isBudgetHealthy()` take no arguments, so the only way to point the scanner at a non-default directory (a CI sandbox, a secondary agent's transcript store, a per-test `mkdtemp` dir) is to set the env var, delete the module from `require.cache`, and re-`require`—the same ritual the file's own comments describe for tests and that AC-30 documents for `PLUGINS_MANIFEST_PATH`. This makes the scan target an invisible, load-time side-effect rather than a parameter, coupling every test or alternate caller to the global `require.cache` lifecycle.
+
+Solution:
+Add an optional `projectsDir?` parameter to `computeBudgetHealthy(projectsDir?)` (and propagate to `isBudgetHealthy`), defaulting to the existing `PROJECTS_DIR` const. Derive `CACHE_PATH` from the resolved directory rather than freezing it at load. Existing callers that pass nothing see identical behaviour; tests and future callers inject a target directory directly without mutating env vars or busting the cache.
+
+Benefits:
+Tests no longer need the set-env → delete-from-cache → re-require dance, eliminating a class of flaky, order-dependent test failures. CI sandboxes and multi-agent deployments can scan arbitrary transcript stores in the same process without global mutation. The module's interface honestly reflects its one degree of freedom (the scan target), making the code easier to reason about and compose.
