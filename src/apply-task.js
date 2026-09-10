@@ -19,6 +19,7 @@ const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings,
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { isNoopApplyDetail } = require('./task-disposition.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -629,7 +630,26 @@ function recordApplyOutcome(task, result) {
   // same reason review-task.js's main() now does: the dashboard list view reads task.status
   // straight through, and nothing downstream of local-draft.js was updating it.
   task.status = { applied: 'done', 'apply-failed': 'blocked', 'awaiting-confirm': 'awaiting-confirm', coordinating: 'coordinating' }[applyStage];
-  appendHistoryEvent(task, applyStage, result.doneMarker || result.branch || result.reason);
+  const marker = result.doneMarker || result.branch || result.reason;
+  appendHistoryEvent(task, applyStage, marker);
+
+  // Apply-time no-op stamp (2026-09-10): a `skipped` apply -- empty/degenerate implement,
+  // "no candidates in implement response -- nothing to apply" -- still returns
+  // succeeded:true, so `applied` was every such task's last event and it read as SHIPPED
+  // until task-log-reconcile.js's periodic sweep eventually re-classified it. That window
+  // is exactly why pipeline_debrief's "N completed" headline kept over-counting ~24x.
+  // Close a plain no-op here instead of waiting for the sweep (which respects an existing
+  // terminal event, so this is not a conflict). Review sources are deliberately skipped:
+  // their "false positive" outcome is a `dismissed`, a distinction only the sweep's
+  // reviewDisposition/verdict-text checks can draw -- stamping `noop` here would lock that
+  // out (STABLE_TERMINAL_STAGES is never re-opened).
+  if (applyStage === 'applied' && isNoopApplyDetail(marker)) {
+    const isReviewSource = /_review(_digest)?$/.test(String(resolveSourceName(task) || ''));
+    if (!isReviewSource) {
+      task.terminalDisposition = 'noop';
+      appendHistoryEvent(task, 'noop', `no-op apply: ${String(marker || '').slice(0, 200)}`);
+    }
+  }
   return applyStage;
 }
 

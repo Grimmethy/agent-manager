@@ -31,6 +31,32 @@ const {
   gatherEvidenceForTask, readModelCallsForTasks, readStateDir, terminalTs,
 } = require('./forensic-bundle.js');
 const { readWorkLog } = require('./work-log.js');
+const { isNoopApplyDetail, lastAppliedEvent } = require('./task-disposition.js');
+
+// Did this done/ task actually ship real terminal work, or was it a no-op (empty/
+// degenerate implement, "no candidates -- nothing to apply", a false-positive dismissal)?
+// String/disposition heuristic, no git -- mirrors python/dashboard/app.py's _is_real_ship()
+// on purpose. A `noop`/`dismissed`/`abandoned` terminalDisposition is decisive; otherwise
+// (disposition not stamped yet -- the reconcile sweep is periodic) fall back to the
+// `applied` event's own detail string. `merged`/`filed`/`applied-direct` and a clean
+// applied-detail both count as shipped.
+function taskDidShip(task) {
+  const disp = task && task.terminalDisposition;
+  if (disp === 'noop' || disp === 'dismissed' || disp === 'abandoned') return false;
+  if (disp === 'merged' || disp === 'filed' || disp === 'applied-direct') return true;
+  const applied = lastAppliedEvent(task && task.history);
+  if (!applied) return false; // never applied -- not this window's subject
+  return !isNoopApplyDetail(applied.detail);
+}
+
+// Split a time-ordered done window into the tasks that shipped (the debrief's real
+// subject) and the no-ops (counted in the framing, never analyzed as a success).
+function splitWindowByShipped(windowTasks) {
+  const shipped = [];
+  const noop = [];
+  for (const t of windowTasks) (taskDidShip(t) ? shipped : noop).push(t);
+  return { shipped, noop };
+}
 
 const DEFAULT_BUDGET_CHARS = 28000;
 // A debrief over 3-4 done tasks is just re-litigating one task's own history -- not a
@@ -77,12 +103,23 @@ function collectContrastTasks(pipelineDir, windowTasks, maxContrast = MAX_CONTRA
   return matched.slice(0, maxContrast);
 }
 
-function renderFraming(windowTasks, contrastRecords, windowStart, windowEnd) {
+function renderFraming(shippedTasks, noopCount, contrastRecords, windowStart, windowEnd) {
   const sourceCounts = new Map();
-  for (const t of windowTasks) sourceCounts.set(t.source || 'unknown', (sourceCounts.get(t.source || 'unknown') || 0) + 1);
-  const sourceLine = [...sourceCounts.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}=${n}`).join(', ');
+  for (const t of shippedTasks) sourceCounts.set(t.source || 'unknown', (sourceCounts.get(t.source || 'unknown') || 0) + 1);
+  const sourceLine = [...sourceCounts.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}=${n}`).join(', ') || '(none)';
+  const total = shippedTasks.length + noopCount;
+  // Honest headline (2026-09-10): the old count was raw done/ tasks, so a window that was
+  // ~90% no-op (empty/degenerate implement, no candidates) still read "25 completed" and
+  // the whole "why did this window SUCCEED" analysis ran over nothing -- the recurring
+  // "24 of 25 shipped zero code" finding. Count shipped vs no-op separately; only the
+  // shipped tasks are analyzed below.
+  const noopDominant = noopCount >= shippedTasks.length && noopCount > 0;
   return [
-    `PIPELINE DEBRIEF — window ${windowStart} .. ${windowEnd} (${windowTasks.length} completed task(s): ${sourceLine})`,
+    `PIPELINE DEBRIEF — window ${windowStart} .. ${windowEnd} (${total} done in window: ${shippedTasks.length} shipped, analyzed below; ${noopCount} no-op, not analyzed. shipped by source: ${sourceLine})`,
+    ...(noopDominant ? [
+      '',
+      `NOTE: this window shipped only ${shippedTasks.length} of ${total} tasks -- the dominant outcome was a NO-OP (empty/degenerate implement, "no candidates -- nothing to apply"). If you cannot find a real success pattern in the ${shippedTasks.length} shipped task(s) below, do NOT invent one: the correct SO WHAT is that this window mostly produced nothing, and the NOW WHAT should target WHY (which source, which stage) rather than crediting a win that barely happened.`,
+    ] : []),
     '',
     'Method -- What / So What / Now What, applied to work that actually SHIPPED:',
     '  WHAT:     a factual account of this batch -- what got built, which sources it came',
@@ -116,16 +153,24 @@ function buildDebriefBundle({
 } = {}) {
   const windowTasks = collectDoneWindow(pipelineDir, sinceIso, maxWindow);
   if (windowTasks.length < MIN_WINDOW_TASKS) {
-    return { evidenceText: null, taskIds: [], contrastIds: [], windowStart: null, windowEnd: null, stats: { windowCount: windowTasks.length } };
+    return { evidenceText: null, taskIds: [], contrastIds: [], windowStart: null, windowEnd: null, stats: { windowCount: windowTasks.length, shippedCount: 0, noopCount: 0 } };
   }
 
-  const contrastRecords = collectContrastTasks(pipelineDir, windowTasks, maxContrast);
+  // The window as a whole clears MIN_WINDOW_TASKS, but only the SHIPPED subset is the
+  // debrief's subject -- the no-ops are counted in the framing, never analyzed as a
+  // success (see renderFraming). A window that is mostly no-op still produces a bundle,
+  // deliberately: "why did this whole window produce nothing" is a real, high-value
+  // debrief, just not a "what worked" one.
+  const { shipped: shippedTasks, noop: noopTasks } = splitWindowByShipped(windowTasks);
+
+  const contrastRecords = collectContrastTasks(pipelineDir, shippedTasks.length ? shippedTasks : windowTasks, maxContrast);
   const windowStart = terminalTs(windowTasks[0]);
   const windowEnd = terminalTs(windowTasks[windowTasks.length - 1]);
 
-  const taskIds = windowTasks.map((t) => t.id);
+  const subjectIds = shippedTasks.map((t) => t.id);
+  const taskIds = windowTasks.map((t) => t.id); // archive-on-confirm blast radius: the whole window
   const contrastIds = contrastRecords.map((r) => r.task.id);
-  const allIds = [...taskIds, ...contrastIds];
+  const allIds = [...subjectIds, ...contrastIds];
   const callsById = readModelCallsForTasks(dbPath, allIds);
   const worklogById = new Map();
   for (const id of allIds) {
@@ -134,9 +179,9 @@ function buildDebriefBundle({
   }
 
   const sections = [
-    { text: renderFraming(windowTasks, contrastRecords, windowStart, windowEnd) },
+    { text: renderFraming(shippedTasks, noopTasks.length, contrastRecords, windowStart, windowEnd) },
   ];
-  windowTasks.forEach((task, i) => {
+  shippedTasks.forEach((task, i) => {
     sections.push({
       text: gatherEvidenceForTask({ task, state: 'done' }, worklogById.get(task.id), callsById.get(task.id), { label: `COMPLETED ${i + 1}` }),
       dropTag: i < 2 ? 'keep' : 'oldCompleted',
@@ -155,11 +200,15 @@ function buildDebriefBundle({
   return {
     evidenceText: text,
     taskIds,
+    subjectIds,
+    noopIds: noopTasks.map((t) => t.id),
     contrastIds,
     windowStart,
     windowEnd,
     stats: {
       windowCount: windowTasks.length,
+      shippedCount: shippedTasks.length,
+      noopCount: noopTasks.length,
       contrastCount: contrastRecords.length,
       callRows: [...callsById.values()].reduce((n, rows) => n + rows.length, 0),
       worklogs: worklogById.size,
@@ -177,6 +226,8 @@ module.exports = {
   collectDoneWindow,
   collectContrastTasks,
   buildDebriefBundle,
+  taskDidShip,
+  splitWindowByShipped,
 };
 
 // CLI (read-only): node src/debrief-bundle.js [--since <ISO>]

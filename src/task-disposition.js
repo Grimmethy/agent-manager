@@ -142,6 +142,16 @@ const FILED_RE = /filed under|->\s*\/|→\s*\/|appended|candidate\(s\)|wrote .*\
 const DEBRIEF_ARCHIVED_RE = /^debriefed \d+ task/i;
 const DISMISSED_RE = /\bfalse[\s-]?positive\b/i;
 const NOOP_RE = /no candidates|no code change|degenerate|false positive|empty implement|no-op|suggested 0|nothing to (apply|do)|skipped/i;
+
+// True when an `applied`-event detail string describes a no-op apply (empty/degenerate
+// implement, no candidates, "nothing to apply", a false-positive dismissal) rather than
+// real shipped work. The single source of truth for that check -- used by
+// resolveDisposition() below, apply-task.js's apply-time noop stamp, and
+// debrief-bundle.js's shipped/no-op window split. python/dashboard/app.py's
+// _is_real_ship() mirrors the same markers on purpose (see the item-5 JS/PS-drift note).
+function isNoopApplyDetail(detail) {
+  return NOOP_RE.test(String(detail || ''));
+}
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;
 const BRANCH_DETAIL_RE = /^agent\//;
 
@@ -269,4 +279,4 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   return { stage: 'noop', detail: `apply outcome not classifiable, treated as no-op: ${detail || '(no detail)'}`.slice(0, 200) };
 }
 
-module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain };
+module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail };
