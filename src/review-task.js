@@ -815,6 +815,20 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real${voteErrorSuffix}`;
 
   if (!voteResult.confident || !voteResult.verdict) {
+    // brain-dump bd-1788725054994: Tasks 13/18/20/24 were requeued solely on 3/3
+    // inconclusive votes, costing tokens without changing task complexity. An adhoc
+    // task passes through with a caveat instead of blocking.
+    const _sourceName = resolveSourceName(task);
+    const _inconclusiveDecision = decideInconclusiveOutcome(_sourceName, voteResult);
+    if (_inconclusiveDecision.passThrough) {
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'local';
+      task.localVotes = voteResult.votes;
+      task.voteErrors = voteResult.voteErrors;
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: `pass-with-caveat: inconclusive votes on adhoc source (${_sourceName})` });
+      appendHistoryEvent(task, 'approved', `pass-with-caveat: inconclusive votes (${voteSummary}), adhoc pass-through`);
+      return { succeeded: true, verdict: 'approved', factCheckVerdict };
+    }
     const reason = `Local-model review inconclusive, no confident majority (${voteSummary})`;
     task.reviewProvider = 'local';
     task.localVotes = voteResult.votes;
@@ -905,7 +919,18 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft };
+// Pure decision helper for runReview's inconclusive-vote branch: adhoc tasks with no
+// confident vote pass through with a caveat instead of blocking, since requeueing them
+// has only ever burned tokens without changing task complexity. Exported so it is
+// testable in isolation.
+function decideInconclusiveOutcome(sourceName, voteResult) {
+  if (sourceName === 'adhoc' && !voteResult.verdict) {
+    return { passThrough: true, outcome: 'pass-with-caveat' };
+  }
+  return { passThrough: false };
+}
+
+module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome };
 
 if (require.main === module) {
   main();
