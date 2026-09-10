@@ -55,15 +55,15 @@ function classifyStaleTask(candidate) {
   const dup = candidate.duplicateOf || null;
   const ev = Array.isArray(candidate.evidence) ? candidate.evidence.slice() : [];
 
-  const mk = (reason, disposition, confidence, extra = []) => ({
-    reason, disposition, confidence, evidence: [...ev, ...extra],
+  const mk = (reason, disposition, confidence, extra = [], confidenceSource = 'heuristic-default') => ({
+    reason, disposition, confidence, evidence: [...ev, ...extra], confidenceSource,
   });
 
   // High-confidence deterministic -- nothing left to build.
-  if (r.has('already-implemented-strong')) return mk('already-implemented', 'retire', 'high');
-  if (r.has('invalid-premise')) return mk('invalid-premise', 'retire', 'high');
+  if (r.has('already-implemented-strong')) return mk('already-implemented', 'retire', 'high', [], 'deterministic-rule');
+  if (r.has('invalid-premise')) return mk('invalid-premise', 'retire', 'high', [], 'deterministic-rule');
   if (dup && DONE_STATES.has(String(dup.state))) {
-    return mk('duplicate-of', 'retire', 'high', [`the matched task ${dup.id} is already ${dup.state}`]);
+    return mk('duplicate-of', 'retire', 'high', [`the matched task ${dup.id} is already ${dup.state}`], 'deterministic-rule');
   }
 
   // Medium -- a human (or a vote) should confirm.
@@ -275,7 +275,7 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
       }
       const votedAt = new Date(now).toISOString();
       if (vote.confident && vote.verdict === 'CONFIRM') {
-        writeFlag(filePath, task, { ...flag, confidence: 'high', votedAt, voteResult: `CONFIRM ${vote.realVoteCount}/${vote.requestedVotes}` }, now);
+        writeFlag(filePath, task, { ...flag, confidence: 'high', confidenceSource: 'model-vote', votedAt, voteResult: `CONFIRM ${vote.realVoteCount}/${vote.requestedVotes}` }, now);
         summary.flagged += 1; summary.confirmed += 1;
       } else if (vote.confident && vote.verdict === 'DENY') {
         writeKeep(filePath, task, `vote DENY ${vote.realVoteCount}/${vote.requestedVotes}`, now);
