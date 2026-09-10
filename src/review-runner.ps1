@@ -456,55 +456,20 @@ function Invoke-ReviewPass {
         # Ornith sometimes writes the literal two-character JSON-style empty-string
         # representation instead of a truly empty response). Keeping this one definition
         # of "empty" consistent across the pipeline instead of drifting per call site.
-        # Deterministic empty-approve guard (runs BEFORE the source-specific
-        # auto-approve below): an effectively-empty implement response with zero
-        # harness-search hits has nothing to review and nothing worth re-searching,
-        # so requeue deterministically instead of spending a model review vote or
-        # falling through to the auto-approve path. Empty check mirrors the
-        # $isEffectivelyEmpty logic below (same three-way ''/"\"\""/"''" comparison);
-        # hit count comes from promptContext.harnessHits (set by local-draft.js /
-        # local-worker.ps1), falling back to promptContext.searchResults, defaulting
-        # to 0 when neither property is present (a source that ran no harness search
-        # at all has zero hits by construction).
-        $guardTrimmedResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
-        $guardIsEmptyResponse = ($guardTrimmedResponse -eq '') -or ($guardTrimmedResponse -eq '""') -or ($guardTrimmedResponse -eq "''")
-        $guardHitCount = 0
-        if ($task.promptContext -and $task.promptContext.PSObject.Properties['harnessHits']) {
-            $guardHitCount = @($task.promptContext.harnessHits).Count
-        } elseif ($task.promptContext -and $task.promptContext.PSObject.Properties['searchResults']) {
-            $guardHitCount = @($task.promptContext.searchResults).Count
-        }
-        if ($guardIsEmptyResponse -and $guardHitCount -eq 0) {
-            $task | Add-Member -NotePropertyName 'emptyApproval' -NotePropertyValue $true -Force
-            Write-Host ('WARNING [deterministic-empty-approve]: {0} -- implementResponse is effectively empty and harness-search hit count is 0; requeuing without spending a model review vote' -f $task.id) -ForegroundColor Yellow
-            return 'requeued'
-        }
         $emptyApprovalSources = @('arch_discovery', 'project_search', 'deep_dive', 'arch_import')
         $trimmedImplResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
         $isEffectivelyEmpty = ($trimmedImplResponse -eq '') -or ($trimmedImplResponse -eq '""') -or ($trimmedImplResponse -eq "''")
-        if (($task.source -in $emptyApprovalSources) -and $isEffectivelyEmpty) {
-            if ($env:AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL -eq 'false') {
-                # Explicit opt-out (AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL=false) --
-                # preserves the previous unconditional auto-approve path verbatim.
-                $detail = 'Auto-approved: implementResponse is genuinely empty, a documented valid outcome for {0} (no local-model vote spent -- this is deterministic, not a judgment call)' -f $task.source
-                $task | Add-Member -NotePropertyName 'reviewedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
-                $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-approve' -Force
-                $task | Add-Member -NotePropertyName 'localVerdict' -NotePropertyValue $detail -Force
-                $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $next.Name
-                Write-TaskJson $approvedPath $task
-                Remove-Item $next.FullName -Force
-                $reviewSw.Stop()
-                Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'deterministic-empty-approve' } | ConvertTo-Json -Compress)
-                Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'approved'; outcomeStage = 'review'; outcomeReason = $null }
-                Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'APPROVED' -Detail $detail
-                Write-Host ('Auto-approved (empty, deterministic): {0} -- queued for apply-runner' -f $task.id) -ForegroundColor Cyan
-                return 'approved'
-            }
-            # Default (mirrors review-task.js's empty-fail flip): a genuinely empty
-            # implement response now blocks instead of auto-approving -- "empty" can
-            # also be a silently-failed run, not just a documented valid outcome. Still
-            # deterministic, not a judgment call: no local-model review call spent.
-            $reason = 'Deterministic gate: implementResponse is effectively empty -- blocking instead of auto-approving (set AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL=false to restore the old approve path). No local-model review call spent (mechanically detectable, not a judgment call).'
+
+        # Empty-implement outcome -- ONE shared definition (src/empty-approval-decision.js),
+        # also require()d by review-task.js, so the JS and PowerShell review paths can never
+        # drift here again. Replaces the former hand-copied empty-approve guard + the
+        # AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL kill switch. 'approve' = effectively
+        # empty AND the harness search found real hits (documented "nothing actionable"
+        # no-op); 'block' = empty AND zero hits (nothing to review; a blind requeue only
+        # re-derives the same empty grounding); 'none' = fall through to normal review.
+        $emptyOutcome = (& node (Join-Path $PackageSrcDir 'empty-approval-decision.js') $next.FullName 2>$null | Out-String).Trim()
+        if ($emptyOutcome -eq 'block') {
+            $reason = 'Deterministic gate: implementResponse is empty AND the harness search that fed this task found zero hits -- nothing to review, and a blind requeue only re-derives the same empty grounding. No local-model review call spent.'
             Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-fail' -Force
             $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $next.Name
@@ -514,8 +479,23 @@ function Invoke-ReviewPass {
             Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reason } | ConvertTo-Json -Compress)
             Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'rejected'; outcomeStage = 'review'; outcomeReason = [string]$reason }
             Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'REJECTED' -Detail $reason
-            Write-Host ('Auto-blocked (empty, deterministic): {0}' -f $task.id) -ForegroundColor Yellow
+            Write-Host ('Auto-blocked (empty, zero-hit, deterministic): {0}' -f $task.id) -ForegroundColor Yellow
             return 'blocked'
+        }
+        if ($emptyOutcome -eq 'approve') {
+            $detail = 'Auto-approved: implementResponse is genuinely empty and the harness search that fed this task found real hits -- a documented valid "nothing actionable" outcome for {0} (no local-model vote spent -- deterministic, not a judgment call)' -f $task.source
+            $task | Add-Member -NotePropertyName 'reviewedAt' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+            $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-empty-approve' -Force
+            $task | Add-Member -NotePropertyName 'localVerdict' -NotePropertyValue $detail -Force
+            $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $next.Name
+            Write-TaskJson $approvedPath $task
+            Remove-Item $next.FullName -Force
+            $reviewSw.Stop()
+            Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; factCheckResult = $factCheckVerdict; reviewProvider = 'deterministic-empty-approve' } | ConvertTo-Json -Compress)
+            Invoke-ModelStatsDb 'record-outcome' @{ callId = $task.abCallId; outcome = 'approved'; outcomeStage = 'review'; outcomeReason = $null }
+            Add-ReviewLogEntry -TaskId $task.id -Title $task.title -Provider 'deterministic' -Result 'APPROVED' -Detail $detail
+            Write-Host ('Auto-approved (empty, grounded, deterministic): {0} -- queued for apply-runner' -f $task.id) -ForegroundColor Cyan
+            return 'approved'
         }
 
         # Deterministic gate, added 2026-08-03: auto-reject drafts that are mechanically NOT
