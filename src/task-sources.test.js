@@ -1447,7 +1447,7 @@ test('nextPipelineDebriefTask returns null below MIN_WINDOW_TASKS and a real tas
   assert.ok(task);
   assert.equal(task.source, 'pipeline_debrief');
   assert.equal(task.promptContext.taskIds.length, MIN_WINDOW_TASKS);
-  assert.ok(task.promptContext.evidenceText.includes('PIPELINE DEBRIEF'));
+  assert.ok(task.promptContext.evidenceText.includes('PIPELINE DETERMINISM AUDIT'));
 });
 
 test('markPipelineDebriefReported advances the cursor so the next call never re-selects this window\'s tasks', () => {

@@ -88,7 +88,8 @@ function collectDoneWindow(pipelineDir, sinceIso, maxWindow = MAX_WINDOW_TASKS) 
 }
 
 // Contrast set: tasks from the SAME sources as the window that are still stuck (blocked /
-// needs-clarification) as of `now` -- the survivorship-bias check. Newest first (the most
+// needs-clarification) as of `now` -- the shared-inefficiency check (is a wasteful stage
+// ALSO where the stuck siblings burn out?). Newest first (the most
 // recently-stuck sibling is the sharpest "did this pattern actually help, or just this
 // batch" contrast).
 function collectContrastTasks(pipelineDir, windowTasks, maxContrast = MAX_CONTRAST_TASKS) {
@@ -115,35 +116,48 @@ function renderFraming(shippedTasks, noopCount, contrastRecords, windowStart, wi
   // shipped tasks are analyzed below.
   const noopDominant = noopCount >= shippedTasks.length && noopCount > 0;
   return [
-    `PIPELINE DEBRIEF — window ${windowStart} .. ${windowEnd} (${total} done in window: ${shippedTasks.length} shipped, analyzed below; ${noopCount} no-op, not analyzed. shipped by source: ${sourceLine})`,
+    `PIPELINE DETERMINISM AUDIT — window ${windowStart} .. ${windowEnd} (${total} done in window: ${shippedTasks.length} shipped, audited below; ${noopCount} no-op. shipped by source: ${sourceLine})`,
+    '',
+    'This is a DETERMINISM AUDIT, not a "what worked" retrospective. The tasks below already',
+    'SHIPPED. The goal is to find model calls that were spent DECIDING something a',
+    'deterministic check, transform, lookup, or an EXISTING gate could have decided -- and',
+    'name the specific cheaper replacement.',
     ...(noopDominant ? [
       '',
-      `NOTE: this window shipped only ${shippedTasks.length} of ${total} tasks -- the dominant outcome was a NO-OP (empty/degenerate implement, "no candidates -- nothing to apply"). If you cannot find a real success pattern in the ${shippedTasks.length} shipped task(s) below, do NOT invent one: the correct SO WHAT is that this window mostly produced nothing, and the NOW WHAT should target WHY (which source, which stage) rather than crediting a win that barely happened.`,
+      `NOTE: this window shipped only ${shippedTasks.length} of ${total} -- the rest were NO-OPs (empty/degenerate implement, "no candidates -- nothing to apply"). A no-op that still consumed a full plan + implement + critique + review budget IS an inefficiency: SO WHAT should ask why that source/stage spent model calls to produce nothing, and NOW WHAT should target a cheaper deterministic early-exit before the implement pass -- not a success pattern.`,
     ] : []),
     '',
-    'Method -- What / So What / Now What, applied to work that actually SHIPPED:',
-    '  WHAT:     a factual account of this batch -- what got built, which sources it came',
-    '            from, roughly how it went (fast/clean vs. costly/many attempts).',
-    '  SO WHAT:  WHY it went that way -- a real pattern in the evidence below (a plan/',
-    '            implement shape that correlated with a fast first-pass ACCEPT, a source',
-    '            that is consistently cheap or consistently expensive, a step that kept',
-    '            costing turns/tokens without changing the outcome).',
-    '  NOW WHAT: what should change going forward -- concrete, and BOUNDED. Prior research',
-    '            on retrospectives found that 70-80% of action items from a typical review',
-    '            never get implemented, and that FEWER, more specific, time-bound items',
-    '            complete at a much higher rate than an exhaustive list. Recommend at most',
-    '            2-3 concrete changes, each naming a real src/ file or config this pipeline',
-    '            already has -- not a wish list.',
+    'Method -- WHAT / SO WHAT / NOW WHAT:',
+    '  WHAT:     per shipped task (or cluster of near-identical ones): its source, and its',
+    '            model-call profile from the evidence -- which stages ran (plan / implement /',
+    '            critique / review-vote), how many calls each, cheap-local vs. slow-27B, how',
+    '            many attempts. Facts from the model_calls rows + history only.',
+    '  SO WHAT:  the audit. For every stage that spent model calls, ask: was that decision',
+    '            mechanically determinable from inputs the task ALREADY had? Flag a call',
+    '            that (a) re-derived work the task already specified (e.g. a plan pass for a',
+    '            task whose acceptanceCriteria already spell out the change), (b) reformatted',
+    '            output the model got wrong the SAME way across retries (a systematic bias a',
+    '            one-time transform fixes), (c) reviewed/critiqued a change whose correctness',
+    '            is a `node --check` + test run or an acceptance-criteria checklist, or',
+    '            (d) classified/routed by a signal already extractable (a path, an',
+    '            identifier, a registered label). Cite task id + history stage + model_calls',
+    '            row for each flag.',
+    '  NOW WHAT: at most 2-3 concrete, BOUNDED changes. Each must name (a) the stage to make',
+    '            deterministic or skip, (b) the exact mechanism -- a grep/substring check, an',
+    '            AST/`node --check` gate, a lookup table, a normalizer, running the',
+    '            acceptance criteria, or dropping the stage -- and (c) roughly how many model',
+    '            calls per task it saves. Fewer, specific items land far more often than a',
+    '            wish list.',
     '',
-    'SURVIVORSHIP-BIAS CHECK (mandatory, do not skip): a pattern found ONLY by reading',
-    'successes risks being a coincidence, not a cause. The CONTRAST TASKS below are still-',
-    'stuck tasks from the SAME sources as this window. For each pattern you propose in SO',
-    'WHAT, check it against the contrast tasks: did the stuck ones lack the very thing you',
-    'are crediting for the win? If a contrast task ALSO has the pattern you are crediting,',
-    'say so plainly -- the pattern is not the real cause, and the report should say what IS',
-    'more likely, or that no confident cause was found. "No confident pattern found here" is',
-    'a valid, correct outcome, exactly like pipeline_forensics\' "NO CLEAR ROOT CAUSE".',
-    contrastRecords.length ? '' : '(No contrast tasks were found from these sources -- treat any SO WHAT claim with extra caution; there is nothing here to rule out coincidence.)',
+    'ALREADY-DETERMINISTIC CHECK (mandatory, do not skip): the pipeline has already made',
+    'several stages deterministic (normalizeSecondBrainPathCase, brain_dump_sort\'s',
+    'parse+validate review, the script-extract auto-approve in review-task.js, the',
+    'fact-checker pre-checks). Before recommending a deterministic replacement, check the',
+    'AVAILABLE FILES content: does a gate / normalizer / check for this ALREADY exist? If it',
+    'does and just is not wired into this path, say WHERE it should be wired. If it does and',
+    'the window simply predates it, say so -- the finding is STALE, do NOT re-propose it. A',
+    'recommendation that duplicates code already in the current src/ is worse than none.',
+    contrastRecords.length ? 'The CONTRAST tasks are still-stuck siblings from the same sources -- use them to check whether a stage that looks wasteful on the shipped tasks is ALSO where the stuck ones burn out (a shared inefficiency), or whether the stuck ones failed for an unrelated reason.' : '(No contrast tasks were found from these sources.)',
   ].filter((l) => l !== undefined).join('\n');
 }
 
