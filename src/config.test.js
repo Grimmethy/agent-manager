@@ -99,3 +99,17 @@ test('getConfig().applyRepoRoot uses AGENT_MANAGER_APPLY_REPO_ROOT when set, ind
     assert.equal(cfg.repoRoot, repoRoot, 'repoRoot itself must stay pointed at the shared checkout for every other consumer');
   });
 });
+
+test('directToMain candidate-doc paths are rooted at applyRepoRoot, not repoRoot, when the two differ', () => {
+  const repoRoot = makeRepo();
+  const applyRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_APPLY_REPO_ROOT: applyRoot }, () => {
+    const cfg = getConfig();
+    for (const key of ['archReviewCandidatesPath', 'archImportCandidatesPath', 'pipelineFixCandidatesPath',
+      'observabilityFixCandidatesPath', 'performanceFixCandidatesPath', 'changeReviewCandidatesPath',
+      'backlogCandidatesPath', 'troubleLogPath']) {
+      assert.ok(cfg[key].startsWith(applyRoot + '/Docs/'), `${key} must live under applyRepoRoot/Docs (got ${cfg[key]})`);
+      assert.ok(!cfg[key].startsWith(repoRoot + '/Docs/'), `${key} must NOT be rooted at repoRoot/Docs`);
+    }
+  });
+});
