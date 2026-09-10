@@ -1773,7 +1773,20 @@ function computeImplementBudget(task, implPrompt) {
   // including one whose PLAN pass had already succeeded -- the implement pass alone still
   // burned its entire budget on a redundant think trace.
   const implNoThink = hasFixedLiterals || task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
-  return { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement };
+  return {
+    hasFixedLiterals,
+    implNoThink,
+    implNumPredict,
+    implNumCtx,
+    allowEmptyImplement,
+    // evalTokCap / latencyMsCap (2026-09-08): hard ceilings on the implement pass's
+    // token generation and wall-clock latency, exposed alongside the token/context
+    // budgets above. Inert for the local-call path (callImplementModel destructures only
+    // the five fields it consumes), but present on the budget object so downstream
+    // consumers (retry routing, attempt recording) can read a single cap source.
+    evalTokCap: 1000,
+    latencyMsCap: 20000,
+  };
 }
 
 // Post-processing for the five candidate-fulfillment sources only, which are the only

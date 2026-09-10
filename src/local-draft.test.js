@@ -569,6 +569,14 @@ test('computeImplementBudget floors implNumCtx at PINNED_NUM_CTX for a normal-si
   assert.equal(b.implNumCtx, PINNED_NUM_CTX, 'a normal prompt gets exactly the pinned value, not the old 8192 floor');
 });
 
+test('computeImplementBudget exposes evalTokCap and latencyMsCap caps', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const task = { source: 'manual', planResponse: 'x'.repeat(1500) };
+  const b = computeImplementBudget(task, 'a normal implement prompt '.repeat(120));
+  assert.equal(b.evalTokCap, 1000, 'evalTokCap is 1000');
+  assert.equal(b.latencyMsCap, 20000, 'latencyMsCap is 20000');
+});
+
 test('computeImplementBudget still grows implNumCtx past the floor for a whole-document source, capped at EXTENDED_NUM_CTX', () => {
   const { computeImplementBudget } = require('./local-draft.js');
   const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
