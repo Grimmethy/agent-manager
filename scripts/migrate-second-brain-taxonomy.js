@@ -34,9 +34,11 @@ const RULES = [
   [/^AdProjects\//, 'Projects/AdProjects/'],
   [/^property-forager\//, 'Projects/property-forager/'],
   [/^OrnithDebug\//, 'References/ornith-debug/'],
+  [/^lessons\//, 'Lessons/'],
+  [/^Lessons\//, 'Lessons/'],
 ];
 
-const LEAVE_ALONE_TOP = new Set(['Agent Manager Reports', 'Model Benchmarks', 'ModelBenchmarks', 'AgentManagerReports']);
+const LEAVE_ALONE_TOP = new Set(['Agent Manager Reports', 'Model Benchmarks', 'ModelBenchmarks', 'AgentManagerReports', 'Lessons']);
 
 function listNotes(root) {
   const out = [];
