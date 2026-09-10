@@ -136,10 +136,38 @@ const {
 // truncated for the doneMarker/log -- no JSON parsing, so a malformed or refusal-shaped
 // response can't produce the "Invalid JSON in Group B implementResponse" apply-stage
 // failure this fix exists to close.
+// Hedging-phrase output-contract gate: a verdict that hedges ("I cannot confirm",
+// "not sure", "uncertain", "I don't know") is NOT a shippable verdict -- it is the
+// model declining the judgment it was asked to make. Silently filing that as a
+// {skipped:true} done-task hides the failure behind a plausible-sounding doneMarker,
+// so instead apply throws with a message that names the exact contract violation.
+// A genuinely empty response is a different (already-handled) outcome: nothing to
+// hedge about, so it keeps the historical {skipped:true, placeholder} shape.
+const HEDGING_PHRASES = [
+  /\bi cannot confirm\b/i,
+  /\bi can'?t confirm\b/i,
+  /\bnot sure\b/i,
+  /\buncertain\b/i,
+  /\bI don'?t know\b/i,
+];
+
+function containsHedging(text) {
+  return HEDGING_PHRASES.some((re) => re.test(text));
+}
+
 function applyVerdictOnly({ implementResponse }) {
   const text = (implementResponse || '').trim();
-  const reason = text.length > 0 ? text.slice(0, 500) : '(no verdict text returned)';
-  return { skipped: true, reason };
+  if (text.length === 0) {
+    return { skipped: true, reason: '(no verdict text returned)' };
+  }
+  if (containsHedging(text)) {
+    const phrase = HEDGING_PHRASES.map((re) => re.exec(text)).find(Boolean)[0][0];
+    throw new Error(
+      `output-contract violation: verdict hedges instead of deciding (matched "${phrase}") -- ` +
+      `a judgment-verdict task must return a real verdict, not a hedged one.`
+    );
+  }
+  return { skipped: true, reason: text.slice(0, 500) };
 }
 
 // pipeline_forensics (2026-09-01): the implement pass wrote a RANKED root-cause report
@@ -353,6 +381,8 @@ module.exports = {
   isEffectivelyEmptyResponse,
   applyBrainDumpSort,
   applyVerdictOnly,
+  HEDGING_PHRASES,
+  containsHedging,
   applyForensicsReport,
   applyDebriefReport,
   parseDebriefNowWhatItems,
