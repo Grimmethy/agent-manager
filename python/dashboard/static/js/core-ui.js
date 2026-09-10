@@ -1130,14 +1130,67 @@ function wireQueueSourceFilter(state) {
   };
 }
 
+// Hub Tasks tab sort control. Choice persists in localStorage so it survives a reload and
+// the 5s auto-refresh; changing it resets pagination to page 1 the same way the task-type
+// filter does.
+function wireHubSort(state) {
+  const select = document.getElementById('hub-sort-select');
+  if (!select) return;
+  select.onchange = () => {
+    localStorage.setItem('agentManagerHubSort', select.value);
+    queueLoadedCount[state] = QUEUE_PAGE_SIZE;
+    renderQueueTab(state);
+  };
+}
+
+// Prompt for a hub's priority and POST it. Lower = worked first; blank clears the ranking.
+// The backend route (/api/task-anywhere/<id>/hub-priority) only accepts a coordinating
+// hub, and src/hub-priority.js reads the field on both this tab's sort and the worker
+// claim order for the hub's children.
+async function setHubPriority(id, current) {
+  const raw = window.prompt(
+    `Priority for hub "${id}"\n\nLower number = worked first. Leave blank to clear the ranking (unranked hubs run oldest-first).`,
+    current === null || current === undefined ? '' : String(current));
+  if (raw === null) return; // cancelled
+  const trimmed = raw.trim();
+  let payload;
+  if (trimmed === '') {
+    payload = { priority: null };
+  } else if (/^-?\d+$/.test(trimmed)) {
+    payload = { priority: parseInt(trimmed, 10) };
+  } else {
+    showToast('Hub priority must be a whole number.', 'error');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/task-anywhere/${encodeURIComponent(id)}/hub-priority`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast(payload.priority === null ? 'Hub priority cleared.' : `Hub priority set to ${payload.priority}.`, 'info');
+    renderQueueTab('coordinating');
+  } catch (e) {
+    showToast('Could not set hub priority: ' + e.message, 'error');
+  }
+}
+
 async function renderQueueTab(state) {
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
   const sourceFilter = queueSourceFilter[state] || '';
   const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '';
+  // Hub Tasks tab sort (2026-09-09, Grimmethy: "I'd like the hubs to be sortable either
+  // alphabetically by name or by priority"). Only the coordinating state honours it;
+  // 'priority' (the default) = explicit hubPriority asc, then unranked hubs oldest-first.
+  const hubSort = state === 'coordinating'
+    ? (localStorage.getItem('agentManagerHubSort') || 'priority')
+    : '';
+  const sortQS = hubSort ? `&sort=${encodeURIComponent(hubSort)}` : '';
   let tasks, total;
   try {
-    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0${filterQS}`);
+    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0${filterQS}${sortQS}`);
     tasks = resp.items;
     total = resp.total;
   } finally {
@@ -1150,11 +1203,18 @@ async function renderQueueTab(state) {
   const filterOptionsHtml = ['<option value="">All task types</option>']
     .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
     .join('');
-  const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label></div>`;
+  const hubSortHtml = state === 'coordinating'
+    ? `<label class="meta" style="margin-left:14px">Sort hubs: <select id="hub-sort-select">
+         <option value="priority" ${hubSort === 'priority' ? 'selected' : ''}>Priority (then oldest first)</option>
+         <option value="name" ${hubSort === 'name' ? 'selected' : ''}>Name (A–Z)</option>
+       </select></label>`
+    : '';
+  const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
 
   if (tasks.length === 0) {
     main.innerHTML = filterHtml + `<div class="empty">${sourceFilter ? `No "${escapeHtml(sourceFilter)}" tasks here.` : 'Nothing here.'}</div>`;
     wireQueueSourceFilter(state);
+    wireHubSort(state);
     return;
   }
   const showArchiveRequeue = state === 'blocked' || state === 'done';
@@ -1255,8 +1315,20 @@ async function renderQueueTab(state) {
     const trimKeepBtn = ctf ? `<button type="button" class="secondary task-context-trim-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays as-is and won't be re-anchored for a while">Keep grounding as-is</button>` : '';
     // Hub Tasks family indent (2026-09-08): hubDepth comes pre-computed from api_queue_state's
     // parentHub tree walk (coordinating state only, undefined/0 everywhere else -- no-op).
-    const hubIdCell = state === 'coordinating' && t.hubDepth
-      ? `<td style="padding-left:${t.hubDepth * 14 + 4}px">↳ ${t.id}</td>`
+    // Hub priority chip + Set-priority button (2026-09-09): `hubPriority` (lower = worked
+    // first) drives both this tab's default sort and the worker claim order for the hub's
+    // children. Shown on every coordinating row; the button prompts and POSTs to
+    // /api/task-anywhere/<id>/hub-priority.
+    const hubPriorityControl = state === 'coordinating'
+      ? `<div style="margin-top:3px">`
+        + (t.hubPriority !== null && t.hubPriority !== undefined
+          ? `<span title="Hub priority — lower is worked first" style="display:inline-block;padding:1px 5px;border:1px solid var(--link);border-radius:3px;color:var(--link);font-size:11px">P${escapeHtml(String(t.hubPriority))}</span> `
+          : `<span class="meta" style="font-size:11px">unranked</span> `)
+        + `<button type="button" class="secondary hub-priority-btn" data-id="${escapeAttr(t.id)}" data-priority="${t.hubPriority === null || t.hubPriority === undefined ? '' : escapeAttr(String(t.hubPriority))}" style="padding:0 6px;font-size:11px" title="Set or clear this hub's priority">Set priority</button>`
+        + `</div>`
+      : '';
+    const hubIdCell = state === 'coordinating'
+      ? `<td${t.hubDepth ? ` style="padding-left:${t.hubDepth * 14 + 4}px"` : ''}>${t.hubDepth ? '↳ ' : ''}${t.id}${hubPriorityControl}</td>`
       : `<td>${t.id}</td>`;
     let familyHeaderRow = '';
     if (state === 'coordinating' && t.hubFamily && t.hubFamily !== lastHubFamily) {
@@ -1294,8 +1366,16 @@ async function renderQueueTab(state) {
     + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path, answer an open design question, or Discuss -- then send it back to drafting.</div>' : '');
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   wireQueueSourceFilter(state);
+  wireHubSort(state);
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
+  });
+  main.querySelectorAll('.hub-priority-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const cur = btn.dataset.priority === '' ? null : parseInt(btn.dataset.priority, 10);
+      setHubPriority(btn.dataset.id, cur);
+    };
   });
   main.querySelectorAll('.task-archive-btn').forEach((btn) => {
     const msg = state === 'needs-clarification'

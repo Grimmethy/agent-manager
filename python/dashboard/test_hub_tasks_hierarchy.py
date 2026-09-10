@@ -43,7 +43,7 @@ class HubTasksHierarchyTestBase(unittest.TestCase):
             p.stop()
         self._tmp.cleanup()
 
-    def _write_hub(self, hub_id, created_at, parent_hub=None, source="manual", sub_tasks=None, title=None):
+    def _write_hub(self, hub_id, created_at, parent_hub=None, source="manual", sub_tasks=None, title=None, hub_priority=None):
         hub = {
             "id": hub_id, "domain": "adhoc", "source": source, "status": "coordinating",
             "title": title or hub_id, "createdAt": created_at,
@@ -52,6 +52,8 @@ class HubTasksHierarchyTestBase(unittest.TestCase):
         }
         if parent_hub:
             hub["parentHub"] = parent_hub
+        if hub_priority is not None:
+            hub["hubPriority"] = hub_priority
         (self.queue / "coordinating" / f"{hub_id}.json").write_text(json.dumps(hub, indent=2), encoding="utf-8")
 
     def _ids(self, items):
@@ -111,11 +113,13 @@ class TestHubFamilyOrder(HubTasksHierarchyTestBase):
         self._write_hub("hub-child", "2026-09-08T01:00:00Z", parent_hub="hub-root")
         self._write_hub("hub-other", "2026-09-08T02:00:00Z")
 
+        # Default sort is 'priority': neither root is ranked, so they fall back to
+        # oldest-first by createdAt -> [hub-root, hub-child, hub-other].
         page1 = self.client.get("/api/queue/coordinating?limit=1&offset=0").get_json()
         page2 = self.client.get("/api/queue/coordinating?limit=1&offset=1").get_json()
         self.assertEqual(page1["total"], 3)
-        self.assertEqual(self._ids(page1["items"]), ["hub-other"])
-        self.assertEqual(self._ids(page2["items"]), ["hub-root"])
+        self.assertEqual(self._ids(page1["items"]), ["hub-root"])
+        self.assertEqual(self._ids(page2["items"]), ["hub-child"])
 
     def test_source_filter_still_applies_before_hierarchy_ordering(self):
         self._write_hub("hub-root", "2026-09-08T00:00:00Z", source="manual")
@@ -199,6 +203,56 @@ class TestHubFamilyLabel(HubTasksHierarchyTestBase):
         page2 = self.client.get("/api/queue/coordinating?limit=1&offset=1").get_json()
         self.assertEqual(self._ids(page2["items"]), ["hub-child"])
         self.assertEqual(page2["items"][0]["hubFamily"], "The Family")
+
+
+class TestHubSort(HubTasksHierarchyTestBase):
+    """GET /api/queue/coordinating?sort= (2026-09-09, Grimmethy: "I'd like the hubs to be
+    sortable either alphabetically by name or by priority ... The highest priority hub
+    should always be worked on next"). Only ROOT order changes; each family's subtree
+    stays contiguous. The claim-path side (src/hub-priority.js) is covered by
+    src/hub-priority.test.js / src/task-sources.test.js, not here."""
+
+    def test_default_sort_is_priority_ranked_hubs_first_then_unranked_oldest_first(self):
+        self._write_hub("hub-unranked-new", "2026-09-09T00:00:00Z")
+        self._write_hub("hub-unranked-old", "2026-09-01T00:00:00Z")
+        self._write_hub("hub-p5", "2026-09-08T00:00:00Z", hub_priority=5)
+        self._write_hub("hub-p1", "2026-09-08T00:00:00Z", hub_priority=1)
+
+        ids = self._ids(self.client.get("/api/queue/coordinating").get_json()["items"])
+        self.assertEqual(ids, ["hub-p1", "hub-p5", "hub-unranked-old", "hub-unranked-new"])
+
+    def test_negative_priority_is_more_urgent(self):
+        self._write_hub("hub-zero", "2026-09-08T00:00:00Z", hub_priority=0)
+        self._write_hub("hub-neg", "2026-09-08T00:00:00Z", hub_priority=-10)
+        self._write_hub("hub-pos", "2026-09-08T00:00:00Z", hub_priority=10)
+
+        ids = self._ids(self.client.get("/api/queue/coordinating").get_json()["items"])
+        self.assertEqual(ids, ["hub-neg", "hub-zero", "hub-pos"])
+
+    def test_sort_name_orders_roots_case_insensitively_by_title(self):
+        self._write_hub("h1", "2026-09-01T00:00:00Z", title="banana split", hub_priority=1)
+        self._write_hub("h2", "2026-09-02T00:00:00Z", title="Apple pie")
+        self._write_hub("h3", "2026-09-03T00:00:00Z", title="cherry cake")
+
+        ids = self._ids(self.client.get("/api/queue/coordinating?sort=name").get_json()["items"])
+        self.assertEqual(ids, ["h2", "h1", "h3"])  # Apple, banana, cherry -- hubPriority ignored under name sort
+
+    def test_families_stay_contiguous_under_priority_sort(self):
+        self._write_hub("hub-b", "2026-09-08T00:00:00Z", hub_priority=1)
+        self._write_hub("hub-b-child", "2026-09-08T05:00:00Z", parent_hub="hub-b")
+        self._write_hub("hub-a", "2026-09-08T00:00:00Z", hub_priority=9)
+        self._write_hub("hub-a-child", "2026-09-08T05:00:00Z", parent_hub="hub-a")
+
+        ids = self._ids(self.client.get("/api/queue/coordinating").get_json()["items"])
+        self.assertEqual(ids, ["hub-b", "hub-b-child", "hub-a", "hub-a-child"])
+
+    def test_hubPriority_is_echoed_onto_each_returned_hub(self):
+        self._write_hub("hub-ranked", "2026-09-08T00:00:00Z", hub_priority=3)
+        self._write_hub("hub-plain", "2026-09-08T01:00:00Z")
+
+        by_id = {i["id"]: i for i in self.client.get("/api/queue/coordinating").get_json()["items"]}
+        self.assertEqual(by_id["hub-ranked"]["hubPriority"], 3)
+        self.assertIsNone(by_id["hub-plain"]["hubPriority"])
 
 
 if __name__ == "__main__":
