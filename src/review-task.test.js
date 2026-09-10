@@ -1228,3 +1228,69 @@ test('reviewTask rejects a stacked script-extract move derived from MAIN instead
   assert.equal(result.verdict, 'blocked');
   assert.equal(task.reviewProvider, 'deterministic-script-extract-reject');
 });
+
+// Inconclusive-vote outcomes (review-task.js decideInconclusiveOutcome, line ~926): an
+// adhoc-resolving source (source:'manual') PASSES THROUGH with a caveat -- verdict
+// 'approved', reviewProvider 'local', localVotes recorded -- while every other source
+// BLOCKS with "Local-model review inconclusive, no confident majority (...)". Note there
+// is NO literal 'inconclusive' verdict in review-task.js; 'approved' (pass-with-caveat)
+// is adhoc's real outcome.
+//
+// arch_import lives in the out-of-tree agent-manager-hygiene plugin (like
+// observability_review/performance_review above), so ./task-sources.js doesn't register
+// it here. Stub it (only if unregistered) so the inconclusive-block test below resolves
+// the source the same way production (plugin loaded) does.
+{
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('arch_import')) {
+    registerTaskSource('arch_import', { priority: 80, next: () => null, apply: () => ({ skipped: true }) });
+  }
+}
+
+const inconclusiveVote = () => async () => ({
+  confident: false,
+  verdict: null,
+  votes: [
+    { verdict: 'UNSURE', response: 'unsure' },
+    { verdict: 'UNSURE', response: 'unsure' },
+    { verdict: 'UNSURE', response: 'unsure' },
+  ],
+  realVoteCount: 3,
+  requestedVotes: 3,
+});
+
+// Plain prose >80 chars, no NON_IMPL_PATTERNS hits, no backticks -- clears the
+// deterministic non-implementation gate so the (faked) majority vote is actually reached.
+const inconclusiveProse = 'This change refactors the review pipeline to separate the voting logic from the verdict assembly, making each stage independently testable and easier to reason about in isolation.';
+
+test('reviewTask passes an inconclusive local vote through for an adhoc (manual) task -- approved with a caveat, not blocked', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = baseTask({
+    source: 'manual',
+    implementResponse: inconclusiveProse,
+  });
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: inconclusiveVote(),
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'local');
+  assert.ok(Array.isArray(task.localVotes));
+});
+
+test('reviewTask BLOCKS an inconclusive local vote for a non-adhoc source (arch_import) with a specific reason', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = baseTask({
+    source: 'arch_import',
+    implementResponse: inconclusiveProse,
+  });
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: inconclusiveVote(),
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /Local-model review inconclusive, no confident majority/);
+});
