@@ -31,7 +31,7 @@ function priorRejectionBlock(task) {
   const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
   if (feedback.length === 0) return '';
   return [
-    `PRIOR REVIEW REJECTIONS -- this task has been attempted ${feedback.length} time(s) and rejected each time. Address each one; do NOT just restate the same conclusion:`,
+    `HARD CONSTRAINT -- this task has been attempted ${feedback.length} time(s) and rejected each time. You MUST NOT repeat the same approach. Address each rejection below:`,
     ...feedback.map((r, i) => `  ${i + 1}. ${r}`),
     '',
   ].join('\n');

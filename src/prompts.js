@@ -1824,7 +1824,7 @@ function priorRejectionBlock(task) {
   if (feedback.length === 0) return '';
   const lines = [
     '',
-    `This task has been attempted ${feedback.length} time(s) before and rejected each time. Do NOT repeat any of these specific mistakes -- read each one and make sure your new attempt genuinely avoids it, not just avoids restating it:`,
+    `HARD CONSTRAINT: This task has been attempted ${feedback.length} time(s) before and rejected each time. You MUST NOT repeat any of the specific mistakes listed below. If a rejection reason states that a particular line, field, or piece of content already exists, you MUST NOT re-derive or restate that line -- do not produce it again. Read each entry below and ensure your new attempt genuinely avoids the stated mistake:`,
     '',
   ];
   feedback.forEach((reason, i) => lines.push(`${i + 1}. ${reason}`));
@@ -1868,7 +1868,7 @@ function buildImplementPrompt(task, planText, options) {
     ? source.buildImplementPrompt(task, planText)
     : genericFallbackImplementPrompt(task, planText);
   const strict = (options && options.strictCite) ? strictCiteConstraintBlock(task) : '';
-  return (prior ? prior + base : base) + strict;
+  return (prior ? prior + base : base) + '\n\nDo not cite file:line references (e.g. src/foo.js:42) unless the file was confirmed in the pre-check; unconfirmed citations are stripped before review.' + strict;
 }
 
 // Independent second-opinion pass: a fresh model call reviews the drafter's own Implement
@@ -1906,6 +1906,8 @@ function buildCritiquePrompt(task, planText, implementText) {
     'Output contract: if the draft has NO real problems against the given inputs, output exactly and ONLY the literal string `NO ISSUES FOUND`. If it DOES have problems, list each as a separate numbered point. Each point must state (a) what is wrong and (b) which specific fact/input/requirement it contradicts or fails to meet — vague stylistic nitpicks do not count.',
     '',
     'Do NOT invent a problem just to have something to say. If the draft genuinely looks fine against the given inputs, output must be `NO ISSUES FOUND` and nothing else.',
+    '',
+    'Do not cite file:line references (e.g. src/foo.js:42) unless the file was confirmed in the pre-check; unconfirmed citations are stripped before review.',
   ].join('\n');
 }
 
