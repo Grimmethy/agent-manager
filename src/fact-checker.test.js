@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkRevertsAPriorFix } = require('./fact-checker.js');
+const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -762,4 +762,31 @@ test('checkDraft wires revertChecks into its own flags/return shape', () => {
   const fc = checkDraft(implementResponse, dir);
   assert.ok(fc.flags.some((f) => f.type === 'reverts-a-prior-fix'));
   assert.equal(fc.revertChecks.length, 1);
+});
+
+test('checkFileLineCitations strips a line citing scripts/local-worker.sh:414 when sourceText lacks it', () => {
+  const draftText = 'The INFRA_FAILURE_PATTERN regex lives at scripts/local-worker.sh:414.';
+  const sourceText = 'unrelated grounding material';
+  assert.deepEqual(
+    checkFileLineCitations(draftText, sourceText).unconfirmedCitations,
+    [draftText],
+  );
+});
+
+test('checkFileLineCitations leaves a line citing src/agentic-draft-common.js:310 intact when sourceText contains it', () => {
+  const draftText = 'The worktree helper is at src/agentic-draft-common.js:310.';
+  const sourceText = 'See src/agentic-draft-common.js:310 for the helper.';
+  assert.deepEqual(
+    checkFileLineCitations(draftText, sourceText).unconfirmedCitations,
+    [],
+  );
+});
+
+test('checkFileLineCitations is a no-op for a bare path with no :NNN suffix', () => {
+  const draftText = 'The worker script lives in scripts/local-worker.sh.';
+  const sourceText = 'whatever';
+  assert.deepEqual(
+    checkFileLineCitations(draftText, sourceText).unconfirmedCitations,
+    [],
+  );
 });
