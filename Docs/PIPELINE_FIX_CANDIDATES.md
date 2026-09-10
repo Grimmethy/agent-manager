@@ -237,3 +237,64 @@ Solution: Modify `src/reject-retry-check.js` to ensure that when a task is reque
 Benefits: This fix will prevent tasks from failing due to empty or degenerate plans on retries, ensuring that the model has a fresh opportunity to generate a valid plan for each attempt. This will improve the success rate of tasks that are rejected due to false-positive claims or other plan-related issues.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-observability-fix-ac-128-1788946167782
+
+### AC-129 · AC-27a: Export RESEARCH_KEYWORDS constant from src/prompts.js
+Strength: Strong
+Split-Depth: 1
+Files: src/prompts.js
+
+Problem:
+AC-27 needs a single, testable, exported list of the three research-routing keywords ("Research:", "investigate", "compare") that src/local-draft.js will import to decide whether an adhoc task should be routed to the agentic-research tier instead of the local plan/implement path. The keyword list is a prompt-domain constant (it defines which task titles trigger the research prompt tier), and src/prompts.js is the established home for prompt-related constants and builder lookups (it already exports buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt, and holds shared constants like groupBJsonInstructions). Without a named export here, src/local-draft.js would either inline the list (making it untestable in isolation and duplicating it if a second call-site ever needs it) or define it locally (scattering a prompt-domain constant away from the prompt module).
+
+Solution:
+Add a single exported const near the top of src/prompts.js (after the existing require block and before the first function definition, consistent with how groupBJsonInstructions is placed after formatFileContents):
+
+const RESEARCH_KEYWORDS = ['Research:', 'investigate', 'compare'];
+
+Export it by adding it to the module's existing export surface. The file currently uses named function exports (buildPlanPrompt, buildImplementPrompt, etc.) consumed via destructuring in src/local-draft.js's require line: const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js'); -- so the new constant will be picked up the same way once src/local-draft.js adds RESEARCH_KEYWORDS to that destructuring list (done in the dependent sub-candidate). The list is a plain array of lowercase-mixed-case strings; the matching predicate in src/local-draft.js will do case-insensitive substring search, so the entries themselves are stored in their canonical mixed-case form for readability.
+
+Benefits:
+Single source of truth for the keyword list, co-located with the prompt-domain constants it governs. Trivially importable and unit-testable without loading the full local-draft.js module. Easy to extend (add a keyword) without touching routing logic. Keeps src/local-draft.js free of prompt-content constants, preserving its role as orchestration/routing.
+
+### AC-130 · AC-27b: Route research-keyword adhoc tasks to draftResearchImplement in src/local-draft.js
+Strength: Strong
+Split-Depth: 1
+Files: src/local-draft.js
+Depends-On: AC-129
+
+Problem:
+Adhoc tasks whose title or ask field contains a research keyword ("Research:", "investigate", "compare") currently fall through to the local plan/implement path, which has no WebSearch/WebFetch capability and produces the "Plan pass degenerate: truncated" failure (forensic task adhoc-brain-dump-bd-1788662025833-research-open-webui-opt-in-context-compa-178866741). The agentic-research tier (draftResearchImplement in src/research-agentic-draft.js) already exists, is already imported in this file (const { draftResearchImplement } = require('./research-agentic-draft.js');), and accepts the same task object shape (task.title, task.promptContext, task.planResponse) that the adhoc path receives. What is missing is a guard clause that detects the keyword match BEFORE the plan pass is invoked and delegates to draftResearchImplement instead, returning early so the plan/implement/critique sequence is never entered for these tasks.
+
+Solution:
+Three edits, all in src/local-draft.js:
+
+1) Extend the existing prompts.js import to pull in the new constant. Change the line:
+const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
+to:
+const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt, RESEARCH_KEYWORDS } = require('./prompts.js');
+
+2) Add a small pure helper (place it near the other small utility functions, e.g. after writeTaskJson or before the main draft function):
+
+function isResearchTask(task) {
+  const text = ((task && task.title) || '') + ' ' + ((task && task.ask) || '');
+  const lower = text.toLowerCase();
+  return RESEARCH_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()));
+}
+
+This is a case-insensitive substring match on the concatenation of title and ask, catching "Research: Open WebUI…", "investigate the trade-offs", and "compare two parsers" alike.
+
+3) Insert a guard clause at the top of the adhoc task handler (the code path that currently calls buildPlanPrompt / the plan pass for adhoc-domain tasks), immediately before the plan-pass invocation:
+
+if (isResearchTask(task)) {
+  const result = await draftResearchImplement(task);
+  // Propagate result the same way the adhoc path propagates its own result
+  // (write back task JSON, emit the single-line JSON status to stdout).
+  return result;
+}
+
+The draftResearchImplement import is already present in the file's require block, so no new require line is needed. The function signature (per src/research-agentic-draft.js) accepts the task object directly and returns a result/throws on failure -- the same contract the adhoc path's caller expects, so no adapter is required. The guard clause is a pure early-return; no existing logic below it is reordered or refactored.
+
+Also add a focused unit test (in the existing test file for src/local-draft.js, or a new test/local-draft-research-routing.test.js alongside it) covering: (a) a task with title "Research: Open WebUI opt-in Context Compaction" triggers draftResearchImplement (mocked) and does NOT call the plan-pass function; (b) a task with title "Add retry logic to fetcher" takes the plan-pass path and never calls draftResearchImplement; (c) a task with title "Refactor: compare two parsers" routes to research (substring match on "compare").
+
+Benefits:
+Eliminates the "Plan pass degenerate: truncated" failure for research-keyword tasks by routing them to the tier that actually has WebSearch/WebFetch. Zero changes to src/research-agentic-draft.js (non-goal preserved). The guard clause is a single early-return -- no existing adhoc logic is touched, so non-research tasks are unaffected. The keyword list is imported from src/prompts.js (sub-candidate 0), keeping prompt-domain constants in the prompt module. Testable in isolation via the pure isResearchTask helper.
