@@ -1586,6 +1586,38 @@ async function runCritiqueAndRevision(task, {
     recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: critiqueResult, source: task.source, stage: 'critique' });
   }
 
+  // Gate critique-done on a grounding check: for sources whose drafts cite REAL code
+  // (deep_dive, or any registered source with its own postImplementCheck), an ungrounded
+  // draft must not reach the review queue -- block it right here, before any revise call
+  // or degenerate/no-issues assignment. Advisory: a throwing check never blocks a real
+  // draft (same contract as the postImplementCheck disposition in runImplementPass).
+  {
+    const src = resolveSourceName(task);
+    const regEntry = getRegisteredSource(src);
+    const realFiles = (task.promptContext && Array.isArray(task.promptContext.files))
+      ? task.promptContext.files.filter((f) => f && typeof f.content === 'string')
+      : [];
+    if (realFiles.length > 0 && (src === 'deep_dive' || (regEntry && typeof regEntry.postImplementCheck === 'function'))) {
+      let groundingVerdict = null;
+      try {
+        groundingVerdict = await require('./deep-dive-grounding-check.js').runGroundingCheck(task, task.implementResponse, { call: resolvedLocalCall });
+      } catch (e) {
+        console.warn('[local-draft] grounding check failed (advisory):', (e && e.message) || e);
+      }
+      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
+        const blockedReason = `Ungrounded draft: ${String(groundingVerdict.reason || '(no detail)')}`.slice(0, 500);
+        task.critiqueOutcome = 'grounding-failed';
+        task.blockedStage = 'review';
+        task.blockedReason = blockedReason;
+        task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+        task.priorRejectionFeedback.push(blockedReason);
+        recordCritique(attempt, { outcome: 'grounding-failed' });
+        appendHistoryEvent(task, 'critique-done', blockedReason);
+        return;
+      }
+    }
+  }
+
   if (critiqueResult.degenerate) {
     task.critiqueOutcome = 'critique-degenerate';
   } else if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
@@ -2311,6 +2343,13 @@ async function runDraftPasses(task, attempt, {
     await runCritiqueAndRevision(task, {
       maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
     });
+
+    // Grounding gate fired inside critique (see runCritiqueAndRevision): the draft is
+    // already stamped blockedStage/blockedReason -- dispose it exactly like the
+    // postImplementCheck disposition in runImplementPass, before concludeDraft.
+    if (task.blockedStage) {
+      return { succeeded: true, blocked: true, blockedReason: task.blockedReason };
+    }
 
     concludeDraft(task);
 
