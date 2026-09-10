@@ -223,6 +223,24 @@ function priorAttemptAnalysisBlock(task) {
   ].join('\n');
 }
 
+// Pre-filter flags (task.preFilterFlags, threaded onto the task by the sibling
+// "wire pre-filter flags" pass in local-draft.js): deterministic checks
+// run BEFORE this pass, with any flags they raised. Unlike the other blocks above this
+// one is UNCONDITIONAL -- the header must always appear (an empty list is itself
+// meaningful: it means every deterministic check passed), so it never returns ''.
+function preFilterFlagsBlock(task) {
+  const flags = (task && Array.isArray(task.preFilterFlags)) ? task.preFilterFlags : [];
+  const lines = ['Here are the pre-filter flags (deterministic checks run before this pass):'];
+  if (flags.length === 0) {
+    lines.push('(none -- all deterministic checks passed)');
+  } else {
+    for (const f of flags) {
+      lines.push('- ' + f.type + ' ' + f.detail);
+    }
+  }
+  return lines.join('\n');
+}
+
 function buildWriteAgenticPrompt(task) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
@@ -251,6 +269,7 @@ function buildWriteAgenticPrompt(task) {
     priorInvestigationBlock(task),
     acceptanceCriteriaBlock(task),
     priorAttemptAnalysisBlock(task),
+    preFilterFlagsBlock(task),
     'First, investigate whether this specific request is ALREADY satisfied by the CURRENT code -- read the real files. A commit or feature that MENTIONS the same topic is NOT proof this request is done. Two things especially: (a) if the request asks to EXTEND something ("X should ALSO ...", "WHEN Y, ALSO do Z", a reference to an existing UI element/endpoint), the base feature already existing is NOT enough -- the SPECIFIC delta being asked for must be present. (b) a feature with the same NAME may act on a DIFFERENT object than the one this request names. Before RESOLUTION: no-changes-needed you MUST enumerate every concrete object the request names and, for EACH, point at the specific CURRENT file:symbol that already implements it. If any one is not covered, this is NOT no-changes-needed -- implement the missing part (or ask, per below).',
     '',
     'If it is NOT already resolved and is a concrete, scoped change you can make confidently: implement it with edit_file / write_file. Read whatever real files you need first -- do not guess at code you have not looked at. Run a targeted check (py_compile / one test module) for what you changed before finishing, and fix any failure your own change introduced.',
