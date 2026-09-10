@@ -57,6 +57,18 @@ test('recordImplement: note and text can coexist; degenerate is recorded separat
   assert.equal(b.implement.chars, 0);
 });
 
+test('recordImplement: promptVariant defaults to "default" when not supplied', () => {
+  const a = beginDraftAttempt({});
+  recordImplement(a, { text: 'hello' });
+  assert.equal(a.implement.promptVariant, 'default');
+});
+
+test('recordImplement: records promptVariant "strict-cite" when supplied', () => {
+  const a = beginDraftAttempt({});
+  recordImplement(a, { text: 'hello', promptVariant: 'strict-cite' });
+  assert.equal(a.implement.promptVariant, 'strict-cite');
+});
+
 test('recordCritique records the outcome enum and whether a revision was applied', () => {
   const a = beginDraftAttempt({});
   recordCritique(a, { outcome: 'issues-flagged', revised: true });

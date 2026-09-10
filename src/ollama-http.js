@@ -211,4 +211,4 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
   });
 }
 
-module.exports = { postJson, postJsonStream, OLLAMA_ERROR_CODES };
+module.exports = { postJson, postJsonStream, OLLAMA_ERROR_CODES, taggedError };
