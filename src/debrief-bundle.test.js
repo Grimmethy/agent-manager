@@ -126,3 +126,73 @@ test('buildDebriefBundle caps the window at the given maxWindow even with a much
   const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db'), maxWindow: 15 });
   assert.equal(bundle.taskIds.length, 15);
 });
+
+// --- shipped / no-op window split (2026-09-10) -----------------------------------------
+const { taskDidShip, splitWindowByShipped } = require('./debrief-bundle.js');
+
+function doneTaskWithApplyDetail(id, atIso, detail, source = 'adhoc') {
+  const t = doneTask(id, atIso, source);
+  t.history[t.history.length - 1].detail = detail;
+  return t;
+}
+
+test('taskDidShip: terminalDisposition is decisive', () => {
+  assert.equal(taskDidShip({ terminalDisposition: 'noop', history: [{ stage: 'applied' }] }), false);
+  assert.equal(taskDidShip({ terminalDisposition: 'dismissed', history: [{ stage: 'applied' }] }), false);
+  assert.equal(taskDidShip({ terminalDisposition: 'abandoned', history: [{ stage: 'applied' }] }), false);
+  assert.equal(taskDidShip({ terminalDisposition: 'merged', history: [{ stage: 'applied', detail: 'no candidates' }] }), true);
+  assert.equal(taskDidShip({ terminalDisposition: 'filed', history: [{ stage: 'applied' }] }), true);
+});
+
+test('taskDidShip: falls back to the applied-event detail when disposition is not stamped yet', () => {
+  assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'agent/adhoc-x is 1 commit(s) ahead of master' }] }), true);
+  assert.equal(taskDidShip({ history: [{ stage: 'applied' }] }), true, 'no detail = shipped (conservative toward analysis)');
+  assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' }] }), false);
+  assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'no code change needed (empty implement response)' }] }), false);
+  assert.equal(taskDidShip({ history: [{ stage: 'created' }] }), false, 'never applied');
+});
+
+test('splitWindowByShipped separates the two', () => {
+  const shipped = { history: [{ stage: 'applied', detail: 'agent/adhoc-a is 2 commit(s) ahead' }] };
+  const noop = { history: [{ stage: 'applied', detail: 'no candidates -- nothing to apply' }] };
+  const { shipped: s, noop: n } = splitWindowByShipped([shipped, noop, shipped]);
+  assert.equal(s.length, 2);
+  assert.equal(n.length, 1);
+});
+
+test('buildDebriefBundle: framing counts shipped vs no-op, and only shipped tasks get COMPLETED evidence blocks', () => {
+  const dir = makePipeline();
+  // 8 real ships + 6 no-ops, all in-window
+  for (let i = 0; i < 8; i++) {
+    writeTask(dir, 'done', doneTaskWithApplyDetail(`ship-${i}`, `2026-09-0${1 + (i % 8)}T01:00:00Z`, `agent/adhoc-ship-${i} is 1 commit(s) ahead of master`));
+  }
+  for (let i = 0; i < 6; i++) {
+    writeTask(dir, 'done', doneTaskWithApplyDetail(`noop-${i}`, `2026-09-0${1 + (i % 8)}T02:00:00Z`, 'no candidates in implement response -- nothing to apply'));
+  }
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
+  assert.equal(bundle.stats.windowCount, 14);
+  assert.equal(bundle.stats.shippedCount, 8);
+  assert.equal(bundle.stats.noopCount, 6);
+  assert.equal(bundle.subjectIds.length, 8);
+  assert.equal(bundle.noopIds.length, 6);
+  assert.equal(bundle.taskIds.length, 14, 'archive blast radius is still the whole window');
+  assert.match(bundle.evidenceText, /8 shipped, analyzed below; 6 no-op, not analyzed/);
+  assert.ok(bundle.evidenceText.includes('COMPLETED 8'));
+  assert.ok(!bundle.evidenceText.includes('COMPLETED 9'), 'no evidence block for a no-op task');
+});
+
+test('buildDebriefBundle: a no-op-dominant window still produces a bundle, framed around the no-op problem', () => {
+  const dir = makePipeline();
+  for (let i = 0; i < 2; i++) {
+    writeTask(dir, 'done', doneTaskWithApplyDetail(`ship-${i}`, `2026-09-0${1 + i}T01:00:00Z`, `agent/adhoc-ship-${i} is 1 commit(s) ahead of master`));
+  }
+  for (let i = 0; i < 12; i++) {
+    writeTask(dir, 'done', doneTaskWithApplyDetail(`noop-${i}`, `2026-09-0${1 + (i % 8)}T03:00:00Z`, 'degenerate implement -- no code change'));
+  }
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
+  assert.ok(bundle.evidenceText, 'bundle is still produced');
+  assert.equal(bundle.stats.shippedCount, 2);
+  assert.equal(bundle.stats.noopCount, 12);
+  assert.match(bundle.evidenceText, /this window shipped only 2 of 14/);
+  assert.match(bundle.evidenceText, /do NOT invent one/);
+});
