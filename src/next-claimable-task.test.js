@@ -79,6 +79,44 @@ test('a reasoning lane claims only high-tier tasks; a non-reasoning lane skips t
   assert.deepEqual(ordinaryItems, ['ordinary-task.json']);
 });
 
+// Hub priority (2026-09-09): within one source-priority band, a live hub's children are
+// ordered by their owning hub's key (explicit hubPriority asc, then hub createdAt asc),
+// so this path can't disagree with nextAdhocTask() about which hub is worked next.
+test('within a source-priority band, the higher-priority hub\'s child sorts first (then hub createdAt)', () => {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-low.json'),
+    JSON.stringify({ id: 'hub-low', status: 'coordinating', hubPriority: 1, createdAt: '2026-09-09T00:00:00Z' }));
+  fs.writeFileSync(path.join(coordDir, 'hub-high.json'),
+    JSON.stringify({ id: 'hub-high', status: 'coordinating', hubPriority: 50, createdAt: '2026-09-01T00:00:00Z' }));
+  fs.writeFileSync(path.join(coordDir, 'hub-unranked-older.json'),
+    JSON.stringify({ id: 'hub-unranked-older', status: 'coordinating', createdAt: '2026-08-01T00:00:00Z' }));
+
+  // All 'adhoc' (priority 10, reasoningTier high). Written oldest-first by mtime; the
+  // hub-key ordering must override that.
+  writeTask(pendingDir, 'child-of-hub-high', { source: 'adhoc', parentHub: 'hub-high' });
+  writeTask(pendingDir, 'child-of-unranked', { source: 'adhoc', parentHub: 'hub-unranked-older' });
+  writeTask(pendingDir, 'child-of-hub-low', { source: 'adhoc', parentHub: 'hub-low' });
+
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true });
+  assert.deepEqual(items, ['child-of-hub-low.json', 'child-of-hub-high.json', 'child-of-unranked.json']);
+});
+
+test('a hub child sorts ahead of an unrelated task at the same source priority; a non-hub task keeps its place otherwise', () => {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-x.json'),
+    JSON.stringify({ id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' }));
+
+  writeTask(pendingDir, 'plain-adhoc', { source: 'adhoc' });               // no hub
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true });
+  assert.deepEqual(items, ['hub-child.json', 'plain-adhoc.json']);
+});
+
 // --- effectivePriority (bot-vs-human adhoc split + premiumPriority pin, 2026-09-07) ---
 
 test('effectivePriority: an adhoc task with no humanQueued marker is demoted by BOT_ADHOC_PRIORITY_PENALTY', () => {

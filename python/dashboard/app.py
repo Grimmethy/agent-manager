@@ -1186,6 +1186,10 @@ def task_summary(data: dict, filename: str) -> dict:
         # shows the "N of M" from `progress` without a per-row round-trip.
         "subTasks": data.get("subTasks"),
         "progress": data.get("progress"),
+        # Operator-set integer on a coordinating hub (LOWER = more urgent), stamped by
+        # POST /api/task-anywhere/<id>/hub-priority. Drives the Hub Tasks tab's default
+        # sort AND the worker claim order for that hub's children (src/hub-priority.js).
+        "hubPriority": data.get("hubPriority"),
         # coordinator-sweep.js stamps this on a hub whose remaining sub-tasks can't proceed
         # (a child stuck in needs-clarification/blocked, or a sibling waiting on one). The
         # Coordinating row shows ⛔ + the reason instead of the plain progress count.
@@ -2446,6 +2450,27 @@ def api_queue_state(state):
         for kids in children_of.values():
             kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
 
+        # Root-hub ordering (2026-09-09, Grimmethy: "I'd like the hubs to be sortable
+        # either alphabetically by name or by priority ... The highest priority hub should
+        # always be worked on next"). Only the ROOT list is reordered -- each family's
+        # subtree keeps its newest-first child order from the loop above, so families stay
+        # contiguous. `sort=priority` (default): explicit `hubPriority` ascending (LOWER =
+        # more urgent), then unranked hubs oldest-first by createdAt (FIFO -- the direct
+        # answer to "new hubs being worked before old hubs are finished"). `sort=name`:
+        # case-insensitive by title. The same rule the worker claim path uses for this
+        # hub's children (src/hub-priority.js), so the tab shows the real work order.
+        sort_mode = (request.args.get("sort") or "priority").strip().lower()
+        roots = children_of.get(None, [])
+        if sort_mode == "name":
+            roots.sort(key=lambda tid: (by_id[tid].get("title") or tid).casefold())
+        else:
+            def _root_key(tid):
+                hp = by_id[tid].get("hubPriority")
+                rank = hp if isinstance(hp, (int, float)) and not isinstance(hp, bool) else float("inf")
+                return (rank, by_id[tid].get("createdAt") or "￿")
+            roots.sort(key=_root_key)
+        children_of[None] = roots
+
         ordered = []
         visited = set()
 
@@ -3405,6 +3430,56 @@ def api_task_set_premium_priority(task_id):
     })
     target.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "premiumPriority": enabled})
+
+
+@app.route("/api/task-anywhere/<task_id>/hub-priority", methods=["POST"])
+def api_task_set_hub_priority(task_id):
+    """Operator-set priority for a coordinating HUB (2026-09-09, Grimmethy: "I'd like the
+    hubs to be sortable ... by priority. Priority tagging for hubs doesn't exist yet ...
+    The highest priority hub should always be worked on next until it is either ready to
+    merge or gets blocked").
+
+    Body: {"priority": <int>} to rank it (LOWER = more urgent), or {"priority": null} to
+    clear the ranking. Writes `hubPriority` onto the hub's own JSON. It is never
+    auto-cleared -- it survives every coordinator-sweep reconcile, same discipline as
+    `premiumPriority`. src/hub-priority.js reads this field on BOTH the Hub Tasks tab's
+    default sort and the worker claim order for the hub's children, so ranking a hub here
+    actually changes what gets worked next, not just how the list looks.
+
+    Only meaningful on a coordinating task; a non-hub target is rejected so a stray call
+    can't stamp the field somewhere it will never be read."""
+    body = request.get_json(silent=True) or {}
+    raw = body.get("priority", None)
+    if raw is None or raw == "":
+        priority = None
+    else:
+        try:
+            priority = int(raw)
+        except (TypeError, ValueError):
+            abort(400, description="priority must be an integer or null")
+
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    target = qdir / "coordinating" / f"{task_id}.json"
+    if not target.is_file():
+        abort(404, description=f"'{task_id}' is not a coordinating hub -- hub priority only applies there")
+
+    data = read_json_safe(target)
+    if not data:
+        abort(500, description="could not read the hub file")
+
+    if priority is None:
+        data.pop("hubPriority", None)
+    else:
+        data["hubPriority"] = priority
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
+        "detail": (f"hub priority set to {priority} by operator override"
+                   if priority is not None else "hub priority cleared by operator override"),
+    })
+    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "hubPriority": priority})
 
 
 def _adhoc_task_excerpt(data):
