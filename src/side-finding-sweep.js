@@ -79,7 +79,12 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
   const threshold = similarityThreshold();
   const nowIso = new Date(now).toISOString();
   const data = loadBrainDump(path.join(pipelineDir, 'brain-dump.json'));
-  const machineEntries = data.entries.filter((e) => e && e.raisedBy);
+  // `suppressed` entries (a human decided the finding is obsolete/invalid -- e.g. a
+  // stale model-routing recommendation against a config that no longer exists) are
+  // excluded from dedup matching: new similar findings no longer merge into them (and
+  // no longer bump their count/lastSeenAt), so a genuinely-recurring issue surfaces as
+  // a fresh entry instead of silently inflating a dead one.
+  const machineEntries = data.entries.filter((e) => e && e.raisedBy && !e.suppressed);
 
   for (const { record, filePath } of items) {
     try {

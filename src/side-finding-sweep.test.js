@@ -66,6 +66,32 @@ test('a near-duplicate finding increments the existing machine-raised entry inst
   assert.deepEqual(entry.seenIn, ['task-1', 'task-2']);
 });
 
+test('a finding similar to a SUPPRESSED entry does not merge into it -- it files fresh', async () => {
+  const dir = tmpPipeline();
+  writeSideFindingInbox(
+    { title: 'queue-watcher silently swallows a bwrap timeout', body: 'The bwrap sandbox timeout error is caught and dropped without logging.' },
+    { source: 'observability_fix', taskId: 'task-1', pipelineDir: dir },
+  );
+  await sweep({ pipelineDir: dir });
+
+  // A human retires the entry.
+  const data0 = readBrainDump(dir);
+  data0.entries[0].suppressed = true;
+  fs.writeFileSync(path.join(dir, 'brain-dump.json'), JSON.stringify(data0, null, 2));
+
+  writeSideFindingInbox(
+    { title: 'queue-watcher script swallows the bwrap sandbox timeout silently', body: 'It catches the bwrap sandbox timeout error and drops it with no logging.' },
+    { source: 'performance_fix', taskId: 'task-2', pipelineDir: dir },
+  );
+  const s = await sweep({ pipelineDir: dir });
+
+  assert.equal(s.merged, 0, 'must not merge into a suppressed entry');
+  assert.equal(s.created, 1);
+  const data = readBrainDump(dir);
+  assert.equal(data.entries.length, 2);
+  assert.equal(data.entries[0].count || 1, 1, 'suppressed entry count/lastSeenAt untouched');
+});
+
 test('two genuinely unrelated findings both get filed as separate entries', async () => {
   const dir = tmpPipeline();
   writeSideFindingInbox({ title: 'Chat panel truncates long responses', body: 'done_reason length is never checked.' }, { source: 'chat', pipelineDir: dir });
