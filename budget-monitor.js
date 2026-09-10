@@ -52,11 +52,16 @@ function readCache() {
 }
 
 function writeCache(result) {
+  const tmpPath = CACHE_PATH + '.tmp';
   try {
     fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
-    fs.writeFileSync(CACHE_PATH, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
+    fs.writeFileSync(tmpPath, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
+    fs.renameSync(tmpPath, CACHE_PATH);
   } catch (err) {
-    // best-effort -- a failed cache write must not fail the health check itself
+    // best-effort -- a failed cache write must not fail the health check itself.
+    // Atomic write (tmp + rename) guarantees concurrent readers see either the
+    // previous complete cache file or the new one, never a partial write.
+    try { fs.unlinkSync(tmpPath); } catch { /* temp may not exist if failure preceded the write */ }
     console.warn(`[budget-monitor] cache write to ${CACHE_PATH} failed (non-fatal): ${err && err.message ? err.message : String(err)}`);
   }
 }
@@ -82,7 +87,7 @@ function listJsonlFiles(dir) {
   return out;
 }
 
-function readEntries(filePath, sinceMs) {
+function readEntries(filePath, sinceMs, metricsReporter = null) {
   let text;
   try {
     text = fs.readFileSync(filePath, 'utf8');
@@ -103,8 +108,8 @@ function readEntries(filePath, sinceMs) {
       if (parseFailures % 1000 === 1) {
         console.warn(`budget-monitor: JSON parse failure #${parseFailures}; sample: ${line.substring(0, 120)}`);
       }
-      if (typeof metrics !== 'undefined' && metrics && typeof metrics.increment === 'function') {
-        metrics.increment('budget_monitor.parse_failures');
+      if (metricsReporter && typeof metricsReporter.increment === 'function') {
+        metricsReporter.increment('budget_monitor.parse_failures');
       }
       continue;
     }
