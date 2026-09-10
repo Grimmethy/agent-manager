@@ -196,3 +196,44 @@ Solution: In the `ungrounded-field` branch of src/fact-checker.js, before pushin
 Benefits: The class of "create-new-module + verify-by-compile" adhoc tasks (blueprint extraction, new-file scaffolding) stops failing on a self-generated verification token, while genuine fabrication (identifiers with no source anywhere in the draft or worklog) is still caught.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-fabricated-ungrounded-claim-1788486413899
+
+### AC-22 · 3 needs-clarification tasks, same signature (brain_dump::fabricated-ungrounded-claim)
+Strength: Strong
+Files: src/blocked-drain.js
+
+Model confidence: Worth exploring
+Problem: The `isDesignDecision` check at line 76 treats all `needsClarification.reason === 'design-decision'` tasks as genuine human questions unless they have an 'exhausted' history event, but the triage step is over-classifying actionable pipeline fixes as design questions, causing them to be permanently held in the needs-clarification state instead of being requeued for autonomous execution.
+Solution: Modify the `isDesignDecision` check in src/blocked-drain.js to also inspect the `openQuestions` field for the specific pattern "flagged as a possible duplicate of an already-queued task" and treat tasks with this pattern as auto-escalations (eligible for requeue) rather than genuine design questions, since the duplicate flag is a heuristic artifact rather than a true human decision point. Acceptance check: after the fix, requeue a test task with `needsClarification.reason: 'design-decision'` and `openQuestions` containing the duplicate-flag pattern, and verify it is requeued to pending rather than skipped.
+Benefits: Brain-dump notes that are actionable pipeline fixes but incorrectly flagged as duplicates or design questions will no longer be permanently held in the needs-clarification state, reducing the backlog of tasks that require manual human intervention to unblock.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-brain-dump-fabricated-ungrounded-clai-1788900477911
+
+### AC-23 · on-demand task "adhoc-brain-dump-bd-1788662025833-research-open-webui-opt-in-context-compa-178866741
+Strength: Strong
+Files: src/local-draft.js, src/prompts.js
+
+Problem: The subject task is a research investigation ("Research: Open WebUI opt-in Context Compaction") that was routed through the adhoc plan/implement path, which requires a concrete code change plan. The plan pass degenerates because it cannot produce a valid implementation plan for a research task. The pipeline should detect research tasks and route them to the agentic-research tier (src/research-agentic-draft.js) with WebSearch/WebFetch capabilities.
+Solution: In src/local-draft.js, add a check before the plan pass that inspects the task title/ask for research keywords (e.g., "Research:", "investigate", "compare") and routes to draftResearchImplement instead of the adhoc plan/implement path. Acceptance check: a research task with "Research:" in the title should complete via the agentic-research tier without hitting "Plan pass degenerate: truncated".
+Benefits: Research tasks stop failing on the adhoc plan pass and are handled by the appropriate research-specific pipeline.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788662025833-research-open-webui-opt-in-cont-1788923971501
+
+### AC-24 · on-demand task "adhoc-brain-dump-bd-1788668489656-design-option-c-extract-the-inline-scrip-178868326
+Strength: Strong
+Files: src/local-agentic-write-draft.js
+
+Problem: The `detectExternalDependency` heuristic in `src/local-agentic-write-draft.js` is incorrectly triggering on local file-extraction tasks, blocking them as "external-state operations" that require human provisioning. This prevents purely local, mechanical tasks from completing, even when the sandbox has all necessary tools and permissions.
+Solution: Tighten the `detectExternalDependency` heuristic in `src/local-agentic-write-draft.js` to only trigger on genuine external-state operations (e.g., `git push`, `npm publish`, `curl` to external APIs, `ssh` to remote hosts) and explicitly exclude local file operations (`edit_file`, `write_file`, `run_bash` with local commands). Acceptance check: Re-run the failing task `adhoc-brain-dump-bd-1788668489656-design-option-c-extract-the-inline-scrip-1788683267606`; it should complete in tier-3 with `resolution=implemented` and `blocked=false`, producing the expected static `.js` files and updated `index.html`.
+Benefits: All local file-extraction, refactoring, and mechanical code-splitting tasks will stop failing due to spurious external-dependency blocks, allowing the pipeline to complete tasks that are entirely within the sandbox's capabilities.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788668489656-design-option-c-extract-the-inl-1788931826152
+
+### AC-25 · on-demand task "observability-fix-ac-128"
+Strength: Strong
+Files: src/local-draft.js, src/reject-retry-check.js
+
+Problem: The pipeline's retry/requeue mechanism is not re-invoking the `plan` stage when a draft is rejected, causing the model to generate an empty or degenerate plan on subsequent attempts. The failing task (AC-128) shows `blocked: Plan pass degenerate: empty` on retries without a preceding `plan-done` event, while all winning tasks show `plan-done` on their retries.
+Solution: Modify `src/reject-retry-check.js` to ensure that when a task is requeued, the `plan` stage is re-invoked before the `implement` stage. Add a check in the requeue logic to verify that a `plan-done` event has occurred in the current cycle, and if not, force a re-plan. Acceptance check: Run the failing task (AC-128) through the pipeline and verify that a `plan-done` event occurs on each retry cycle, and that the task eventually reaches `approved` or `merged` state.
+Benefits: This fix will prevent tasks from failing due to empty or degenerate plans on retries, ensuring that the model has a fresh opportunity to generate a valid plan for each attempt. This will improve the success rate of tasks that are rejected due to false-positive claims or other plan-related issues.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-observability-fix-ac-128-1788946167782
