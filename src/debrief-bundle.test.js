@@ -100,13 +100,14 @@ test('collectContrastTasks matches only tasks sharing a window source, from bloc
   assert.deepEqual(ids, ['b1', 'nc1']);
 });
 
-test('buildDebriefBundle: real evidence blob names WHAT/SO WHAT/NOW WHAT framing and the survivorship-bias instruction', () => {
+test('buildDebriefBundle: evidence blob names the determinism-audit framing and sections', () => {
   const dir = makePipeline();
   fillWindow(dir, MIN_WINDOW_TASKS, () => 'observability_review');
   writeTask(dir, 'blocked', stuckTask('stuck-1', '2026-09-05T00:00:00Z', 'blocked', 'observability_review'));
   const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
-  assert.ok(bundle.evidenceText.includes('PIPELINE DEBRIEF'));
-  assert.ok(bundle.evidenceText.includes('SURVIVORSHIP-BIAS CHECK'));
+  assert.ok(bundle.evidenceText.includes('PIPELINE DETERMINISM AUDIT'));
+  assert.ok(bundle.evidenceText.includes('DETERMINISM AUDIT, not a "what worked" retrospective'));
+  assert.ok(bundle.evidenceText.includes('ALREADY-DETERMINISTIC CHECK'));
   assert.ok(bundle.evidenceText.includes('COMPLETED 1'));
   assert.ok(bundle.evidenceText.includes('CONTRAST 1'));
   assert.equal(bundle.contrastIds.length, 1);
@@ -176,7 +177,7 @@ test('buildDebriefBundle: framing counts shipped vs no-op, and only shipped task
   assert.equal(bundle.subjectIds.length, 8);
   assert.equal(bundle.noopIds.length, 6);
   assert.equal(bundle.taskIds.length, 14, 'archive blast radius is still the whole window');
-  assert.match(bundle.evidenceText, /8 shipped, analyzed below; 6 no-op, not analyzed/);
+  assert.match(bundle.evidenceText, /8 shipped, audited below; 6 no-op/);
   assert.ok(bundle.evidenceText.includes('COMPLETED 8'));
   assert.ok(!bundle.evidenceText.includes('COMPLETED 9'), 'no evidence block for a no-op task');
 });
@@ -194,5 +195,5 @@ test('buildDebriefBundle: a no-op-dominant window still produces a bundle, frame
   assert.equal(bundle.stats.shippedCount, 2);
   assert.equal(bundle.stats.noopCount, 12);
   assert.match(bundle.evidenceText, /this window shipped only 2 of 14/);
-  assert.match(bundle.evidenceText, /do NOT invent one/);
+  assert.match(bundle.evidenceText, /a cheaper deterministic early-exit/);
 });

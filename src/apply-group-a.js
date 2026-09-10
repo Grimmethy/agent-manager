@@ -185,7 +185,7 @@ function applyVerdictOnly({ implementResponse }) {
 // {title, body} per item, for writeSideFindingInbox() below. Lenient by construction (same
 // "drop malformed, never fail everything" discipline as candidate-docs.js's
 // parseArchDiscoveryCandidates and side-finding.js's own extractSideFindings): a report
-// missing the section (including the whole-response "NO CONFIDENT PATTERN" escape hatch,
+// missing the section (including the whole-response "NO CONFIDENT INEFFICIENCY" escape hatch,
 // which never contains a "NOW WHAT" heading at all) simply yields no items, and an item not
 // shaped like "<change> -- Files: ... Why: ..." still files fine, just with its whole text
 // as both title and body rather than being dropped.

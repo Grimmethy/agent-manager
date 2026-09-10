@@ -1019,7 +1019,7 @@ function pipelineForensicsPlanPrompt(task) {
 // pipelineDebriefImplementPrompt only got this after 2 real reports fabricated file paths
 // despite real harness hits; the "Files:" line here had the exact same soft "cite real
 // files" instruction and the exact same shape of risk, just never caught live yet. (2) an
-// explicit honesty requirement mirroring debrief's own SURVIVORSHIP-BIAS CHECK section --
+// explicit honesty requirement mirroring debrief's own ALREADY-DETERMINISTIC CHECK section --
 // "CONTRAST WITH SUCCESSFUL SIBLINGS" asked for a divergence paragraph unconditionally,
 // with no permission to say the winner evidence doesn't actually support one.
 function pipelineForensicsImplementPrompt(task, planText) {
@@ -1172,16 +1172,16 @@ function driftFixImplementPrompt(task, planText) {
 // implicated by the window's own evidence (a Now-What that names real code needs to see the
 // CURRENT code, not remembered names), the harness runs them against this repo's own src/,
 // and the implement pass writes the report. debrief-bundle.js's evidence (a bounded window
-// of queue/done/ tasks that SHIPPED, plus a survivorship-bias contrast set of still-stuck
+// of queue/done/ tasks that SHIPPED with their per-stage model-call profile, plus a contrast set of still-stuck
 // siblings) is already in ctx.evidenceText.
 function pipelineDebriefPlanPrompt(task) {
   const ctx = task.promptContext || {};
   return [
-    'A deterministic scan assembled the debrief evidence below: a window of pipeline tasks that SHIPPED, plus a contrast set of still-stuck siblings. Your eventual job is a What / So What / Now What report -- but first, locate the real pipeline code your Now What recommendations would need to name.',
+    'A deterministic scan assembled the DETERMINISM-AUDIT evidence below: a window of pipeline tasks that SHIPPED, with their per-stage model-call profile, plus a contrast set of still-stuck siblings. Your eventual job is a WHAT / SO WHAT / NOW WHAT audit of where those model calls were spent on mechanically-decidable work -- but first, locate the real pipeline code any NOW WHAT recommendation would need to name.',
     '',
     ctx.evidenceText || '(no evidence text)',
     '',
-    'Propose 1 to 3 SHORT search terms (a function name, a file name, a config key, or a few-word phrase) that would let you read the CURRENT code of the pipeline paths implicated above -- use the TIER -> SOURCE FILE map in the evidence to pick real targets (e.g. the tier most of the window\'s tasks passed through, or a mechanism a contrast task\'s history shows it never reached).',
+    'Propose 1 to 3 SHORT search terms (a function name, a file name, a config key, or a few-word phrase) that would let you read the CURRENT code for: (a) the prompt-builder or dispatch for a stage the window\'s tasks spent model calls on (e.g. the plan / critique / review path for the dominant source), AND (b) any EXISTING deterministic gate, validator, or normalizer near that stage -- so the audit can tell whether a cheaper path is already there. Use the TIER -> SOURCE FILE map in the evidence to pick real targets.',
     '',
     'Output EXACTLY this format, one query per line, nothing else:',
     'QUERY: <search terms>',
@@ -1212,31 +1212,31 @@ function pipelineDebriefImplementPrompt(task, planText) {
     : '(none -- no real file content was fetched for this window; NOW WHAT must not include a Files: line for any item)';
 
   const stable = [
-    'You are running a pipeline DEBRIEF: a structured retrospective over work that already SHIPPED, so the pipeline can get more efficient. This is analysis, not a code change -- output prose, never a diff.',
+    'You are running a pipeline DETERMINISM AUDIT: a structured pass over work that already SHIPPED, to find model calls that were spent DECIDING something a deterministic check, transform, lookup, or an EXISTING gate could have decided. This is analysis, not a code change -- output prose, never a diff.',
     '',
-    'METHOD -- What / So What / Now What, exactly as named:',
-    '1. WHAT: state plainly what this batch of completed work was -- which sources, roughly how many tasks, what shape (fast/clean vs. many attempts/expensive), grounded ONLY in the evidence below.',
-    '2. SO WHAT: name the real pattern behind it. A plan/implement shape that correlated with a fast accept? A source that is consistently cheap or consistently costly? A step that burned turns/tokens without changing the outcome? Cite the specific evidence (task id, history stage, model_calls row) for every claim.',
-    '3. SURVIVORSHIP-BIAS CHECK: for every SO WHAT pattern, check it against the CONTRAST tasks (same sources, still stuck). If a contrast task ALSO shows the pattern you are crediting, say so -- it is not the real cause. If there are no contrast tasks, say plainly that the pattern is unconfirmed.',
-    '4. NOW WHAT: at most 2-3 concrete, BOUNDED recommendations. If an item names a file, its Files: line MUST be copied EXACTLY (character-for-character) from the AVAILABLE FILES list below -- that is the ONLY closed set of files you may cite. Never invent, guess, paraphrase, or reconstruct-from-memory a path, even a plausible-sounding one -- you are not expected to go digging through the codebase yourself. If AVAILABLE FILES is empty, or none of them genuinely fit a real recommendation, omit the Files: line for that item entirely and recommend in prose only. A recommendation naming no file is far better than one naming a wrong one.',
+    'METHOD -- WHAT / SO WHAT / NOW WHAT, exactly as named:',
+    '1. WHAT: per shipped task (or cluster of near-identical ones): its source, and its model-call profile from the evidence -- which stages ran (plan / implement / critique / review-vote), how many calls each, cheap-local vs. slow-27B, how many attempts. Facts from the model_calls rows + history ONLY.',
+    '2. SO WHAT: the audit. For every stage that spent model calls, ask: was that decision mechanically determinable from inputs the task ALREADY had? Flag a call that (a) re-derived work the task already specified (e.g. a plan pass for a task whose acceptanceCriteria already spell out the change), (b) reformatted output the model got wrong the SAME way across retries (a systematic bias a one-time transform fixes), (c) reviewed/critiqued a change whose correctness is a `node --check` + test run or an acceptance-criteria checklist, or (d) classified/routed by a signal already extractable (a path, an identifier, a registered label). Cite task id + history stage + model_calls row for each flag. If none of the window\'s stages show this, say so plainly.',
+    '3. ALREADY-DETERMINISTIC CHECK: before recommending any deterministic replacement, check AVAILABLE FILES -- does a gate / normalizer / check for it already exist? If it does and is just not wired into this path, name WHERE it should be wired. If the window predates it, say the finding is STALE. NEVER re-propose code already present in the current src/.',
+    '4. NOW WHAT: at most 2-3 concrete, BOUNDED changes. Each must name (a) the stage to make deterministic or skip, (b) the exact mechanism (a grep/substring check, an AST/`node --check` gate, a lookup table, a normalizer, running the acceptance criteria, or dropping the stage), and (c) roughly how many model calls per task it saves. If an item names a file, its Files: line MUST be copied EXACTLY (character-for-character) from the AVAILABLE FILES list below -- the ONLY closed set of files you may cite. Never invent, guess, paraphrase, or reconstruct a path. If AVAILABLE FILES is empty or none fit, omit the Files: line and recommend in prose. A recommendation naming no file is far better than one naming a wrong one.',
     '',
-    'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CONFIDENT PATTERN" if the evidence genuinely does not support one:',
+    'End your report with EXACTLY these sections (prose, no JSON, no code fence), or the single line "NO CONFIDENT INEFFICIENCY" if the evidence genuinely shows none:',
     '',
     'WHAT',
-    '<factual account of this batch, grounded in the evidence>',
+    '<per-task/cluster source + model-call profile, grounded in the evidence>',
     '',
     'SO WHAT',
-    '<the real pattern, with cited evidence per claim>',
+    '<flagged model calls: stage, count, why the decision was mechanically decidable, cited evidence per flag>',
     '',
-    'SURVIVORSHIP-BIAS CHECK',
-    '<did the contrast tasks share this pattern? if so, say the pattern is not confirmed; if there were no contrast tasks, say so>',
+    'ALREADY-DETERMINISTIC CHECK',
+    '<for each proposed replacement: does it already exist in AVAILABLE FILES? -- not-wired-into-this-path (say where) / stale (window predates it) / genuinely absent>',
     '',
     'NOW WHAT',
-    '1. <concrete, bounded change> -- Files: <copied verbatim from AVAILABLE FILES, or omit this entirely>. Why: <one sentence tying it back to SO WHAT>.',
+    '1. <stage to make deterministic or skip + exact mechanism + ~model-calls-saved per task> -- Files: <copied verbatim from AVAILABLE FILES, or omit this entirely>. Why: <one sentence tying it back to SO WHAT>.',
     '2. <...>',
     '',
-    'If instead the evidence does not support a confident pattern, output ONLY:',
-    'NO CONFIDENT PATTERN -- <the one additional signal that would be needed>',
+    'If instead the evidence shows no real inefficiency, output ONLY:',
+    'NO CONFIDENT INEFFICIENCY -- <the one additional signal that would be needed>',
   ];
   const volatile = [
     'Earlier you proposed search terms to locate the implicated pipeline code:',
