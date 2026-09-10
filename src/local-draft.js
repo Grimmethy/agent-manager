@@ -59,6 +59,7 @@ const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 const { runDecomposePass } = require('./decompose-pass.js');
+const { checkDraft } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
@@ -790,6 +791,37 @@ async function draftAdhocBranch(task, {
       const g = buildPlanGrounding(task);
       if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
     } catch { /* non-fatal */ }
+  }
+  // PRE-FILTER FACT-CHECK: run the same deterministic fact-checker review-task.js uses
+  // (checkDraft) against the text this pass is about to act on -- task.title +
+  // promptContext.rawText + the blind plan (exactly the "ask" text
+  // buildWriteAgenticPrompt assembles -- see local-agentic-write-draft.js) -- and stash
+  // the resulting flags on task.preFilterFlags as an array of { type, detail } entries,
+  // so the write-agentic prompt can warn the drafter up front about, e.g., files the
+  // task claims that do not exist (missing-file / fabricated-commit-reference) instead
+  // of only discovering it mid-loop. Best-effort: any failure (no repoRoot, fact-checker
+  // throwing on an odd shape) leaves task.preFilterFlags untouched and this pass proceeds
+  // exactly as before -- same non-fatal posture as the plan-grounding rebuild above.
+  try {
+    const fcText = [task && task.title,
+      (task && task.promptContext && task.promptContext.rawText) || '',
+      (task && (task.planResponse || task.lastGoodPlan))]
+      .filter((s) => typeof s === 'string' && s.trim()).join('\n\n');
+    if (fcText.trim()) {
+      let fcRepoRoot;
+      let fcExtraRoots = [];
+      try {
+        const cfg = getConfig();
+        fcRepoRoot = cfg.repoRoot;
+        fcExtraRoots = Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [];
+      } catch { /* fall through with whatever we have -- checkDraft tolerates it */ }
+      const factCheck = checkDraft(fcText, fcRepoRoot, undefined, fcExtraRoots);
+      // checkDraft returns { flags: [{ type, detail }, ...], ... } -- attach exactly the
+      // flags array (guaranteed to be an array even when empty) per the pre-filter contract.
+      task.preFilterFlags = Array.isArray(factCheck && factCheck.flags) ? factCheck.flags : [];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-filter fact-check failed (non-fatal):', err?.message ?? err);
   }
   const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
   delete task._priorInvestigation;
