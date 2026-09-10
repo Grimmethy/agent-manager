@@ -1294,3 +1294,51 @@ test('reviewTask BLOCKS an inconclusive local vote for a non-adhoc source (arch_
   assert.equal(result.blockedStage, 'review');
   assert.match(result.blockedReason, /Local-model review inconclusive, no confident majority/);
 });
+
+// --- empty-implement outcome via the shared decideEmptyApprovalOutcome (2026-09-10) ------
+// Replaces the old AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL kill-switch flip; the same
+// module is called by review-runner.ps1's CLI so the two runtimes cannot drift.
+
+test('empty deep_dive draft + ZERO harness hits -> deterministic block, no reviewer vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'empty-zero-hit', domain: 'default', source: 'deep_dive',
+    title: 'Deep dive: test', planResponse: 'QUERY: x',
+    implementResponse: '',
+    promptContext: { harnessHits: [] },
+  };
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured) });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.equal(task.reviewProvider, 'deterministic-empty-fail');
+  assert.match(result.blockedReason, /zero hits/i);
+  assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable empty+zero-hit outcome');
+});
+
+test('empty deep_dive draft + real harness hits -> deterministic approve, no reviewer vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'empty-with-hits', domain: 'default', source: 'deep_dive',
+    title: 'Deep dive: test', planResponse: 'QUERY: x',
+    implementResponse: '',
+    promptContext: { harnessHits: [{ file: 'a.py' }, { file: 'b.py' }] },
+  };
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured) });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-empty-approve');
+  assert.equal(captured.length, 0);
+});
+
+test('empty draft for a NON-emptyApproval source is unaffected (falls through, not auto-decided here)', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'empty-adhoc', domain: 'default', source: 'trouble_log',
+    title: 'x', planResponse: 'p', implementResponse: '',
+    promptContext: { harnessHits: [] },
+  };
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]) });
+  assert.notEqual(task.reviewProvider, 'deterministic-empty-fail');
+  assert.notEqual(task.reviewProvider, 'deterministic-empty-approve');
+});
