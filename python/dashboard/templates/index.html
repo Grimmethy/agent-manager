@@ -340,7 +340,7 @@ const TABS = [
     { key: 'blocked', label: 'Blocked', description: 'Jobs that cannot proceed until something outside the pipeline is resolved.' },
     { key: 'needs-clarification', label: '⚠ Needs Clarification', description: 'Jobs paused because the agent needs a human decision or missing information before it can continue.' },
     { key: 'awaiting-confirm', label: '🗑 Awaiting Confirm', description: 'Delete batches and forensics reports pending a confirm/deny call. Auto-reviewed each watchdog tick; only cases the automated review could not decide wait for you here.' },
-    { key: 'coordinating', label: 'Hub Tasks', description: 'Decomposed parent tasks that stay alive as a hub, tracking their sub-tasks on a checklist until all are done. A hub spawned from another hub\'s stuck child renders indented beneath its parent.' },
+    { key: 'coordinating', label: 'Hub Tasks', description: 'Decomposed parent tasks that stay alive as a hub, tracking their sub-tasks on a checklist until all are done. A hub spawned from another hub\'s stuck child renders indented beneath its parent. Sort by priority (set a hub\'s priority with its Set priority button — lower is worked first; unranked hubs run oldest-first) or by name; the sort also drives which hub\'s sub-tasks workers claim next.' },
     { key: 'done', label: 'Done', description: 'Jobs that have completed the full pipeline.' },
   ] },
 ];

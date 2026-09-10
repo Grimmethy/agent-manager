@@ -1084,6 +1084,73 @@ test('nextAdhocTask still applies oldest-first FIFO within each tier (two ordina
   assert.equal(task.id, 'adhoc-older-ordinary-1', 'FIFO must still hold within the ordinary tier');
 });
 
+// Hub priority (2026-09-09, Grimmethy: "The highest priority hub should always be worked
+// on next until it is either ready to merge or gets blocked"). Within the decompose-child
+// band, a child of the higher-priority hub (lower hubPriority number) is claimed first,
+// even with a newer mtime, so workers drain one hub before starting another.
+function writeHubFile(dir, hub) {
+  const coordDir = path.join(dir, 'queue', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, `${hub.id}.json`), JSON.stringify(hub));
+}
+
+test('nextAdhocTask claims the higher-priority hub\'s child first (lower hubPriority wins over a newer mtime)', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, { id: 'hub-low', title: 'urgent hub', status: 'coordinating', hubPriority: 1, createdAt: '2026-09-09T00:00:00Z' });
+  writeHubFile(dir, { id: 'hub-high', title: 'later hub', status: 'coordinating', hubPriority: 50, createdAt: '2026-09-08T00:00:00Z' });
+  // Written FIRST (older mtime) -- belongs to the LOWER-priority hub.
+  writeAdhocFile(dir, 'a-child-of-hub-high.json', {
+    id: 'adhoc-child-of-hub-high', title: 'child of the later hub', atomic: true,
+    promptContext: { decomposedFrom: 'hub-high' },
+  });
+  // Written SECOND (newer mtime) -- belongs to the higher-priority hub, must still win.
+  writeAdhocFile(dir, 'b-child-of-hub-low.json', {
+    id: 'adhoc-child-of-hub-low', title: 'child of the urgent hub', atomic: true,
+    promptContext: { decomposedFrom: 'hub-low' },
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-child-of-hub-low', 'the urgent hub\'s child must be claimed first despite its newer mtime');
+});
+
+test('nextAdhocTask treats a non-atomic child of a live hub as hub work (ahead of an older ordinary task) and orders unranked hubs oldest-first', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, { id: 'hub-older', title: 'older unranked hub', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' });
+  writeHubFile(dir, { id: 'hub-newer', title: 'newer unranked hub', status: 'coordinating', createdAt: '2026-09-05T00:00:00Z' });
+  writeAdhocFile(dir, 'a-ordinary.json', { id: 'adhoc-ordinary-old', title: 'an ordinary older brain-dump task' });
+  writeAdhocFile(dir, 'b-child-newer-hub.json', {
+    id: 'adhoc-child-newer-hub', title: 'generic decompose child, newer hub',
+    promptContext: { decomposedFrom: 'hub-newer' },
+  });
+  writeAdhocFile(dir, 'c-child-older-hub.json', {
+    id: 'adhoc-child-older-hub', title: 'generic decompose child, older hub',
+    promptContext: { decomposedFrom: 'hub-older' },
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-child-older-hub',
+    'a live hub\'s child outranks an ordinary task, and the older unranked hub goes first');
+});
+
+test('nextAdhocTask falls back to ordinary ordering once a child\'s hub is no longer in coordinating/', () => {
+  const dir = makeAdhocFixtureRepo();
+  // No hub file written -- the hub already completed and left coordinating/.
+  writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });
+  writeAdhocFile(dir, 'b-orphaned-hub-child.json', {
+    id: 'adhoc-orphaned-child', title: 'child whose hub already shipped',
+    promptContext: { decomposedFrom: 'hub-long-gone' },
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-older-ordinary-1', 'with no live hub, the orphaned child competes on plain mtime');
+});
+
 // dependsOn (2026-08-22, Grimmethy: "We need some systematic way to prioritize what
 // order adhoc tasks get completed in. Those with dependencies on new adhoc tasks are
 // absolutely going to need to be done after the dependency is completed") -- satisfied

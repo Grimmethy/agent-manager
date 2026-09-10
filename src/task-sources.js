@@ -26,6 +26,7 @@ const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-a
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
 const debriefBundle = require('./debrief-bundle.js');
@@ -366,6 +367,17 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
   // worker tick calls. Confirmed live: `nextAdhocTask()` returned a plain, non-premium
   // brain-dump task while a premiumPriority-stamped decompose child with zero unmet
   // dependencies sat unclaimed in the same directory.
+  // Hub ordering (2026-09-09, Grimmethy: "The highest priority hub should always be worked
+  // on next until it is either ready to merge or gets blocked"). A child of a LIVE
+  // coordinating hub is grouped into the same priority band the `atomic` decompose-child
+  // bump already occupies, and WITHIN that band children are ordered by their owning hub's
+  // key (explicit hubPriority asc, then hub createdAt asc -- see hub-priority.js), not raw
+  // mtime. Net effect: workers drain the highest-priority hub's runnable children before
+  // touching any other hub; when that hub has nothing runnable left (all done, or the rest
+  // blocked / dependsOn-unmet -- the loop below already skips those) work falls through to
+  // the next hub on its own. `hubKeyCache` shares one read of each coordinating file
+  // across the whole scan.
+  const hubKeyCache = new Map();
   const files = entries
     .filter((e) => e.isFile() && e.name.endsWith('.json'))
     .map((e) => {
@@ -373,11 +385,23 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const mtime = fs.statSync(full).mtimeMs;
       let parsed = null;
       try { parsed = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { /* handled below via null parsed */ }
-      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isDecomposeChild: !!(parsed && parsed.atomic) };
+      const hubKey = parsed ? hubOrderKeyForTask(pipelineDir, parsed, hubKeyCache) : { isHubChild: false };
+      return {
+        full, mtime, parsed,
+        isPremium: !!(parsed && parsed.premiumPriority),
+        // `atomic` file-decompose children keep the bump even if their hub record can't be
+        // read this tick; a generic decompose child only counts while its hub is live.
+        isHubWork: !!(parsed && parsed.atomic) || hubKey.isHubChild,
+        hubKey,
+      };
     })
     .sort((a, b) => {
       if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
-      if (a.isDecomposeChild !== b.isDecomposeChild) return a.isDecomposeChild ? -1 : 1;
+      if (a.isHubWork !== b.isHubWork) return a.isHubWork ? -1 : 1;
+      if (a.isHubWork && b.isHubWork) {
+        const byHub = compareHubKeys(a.hubKey, b.hubKey);
+        if (byHub !== 0) return byHub;
+      }
       return a.mtime - b.mtime;
     });
 

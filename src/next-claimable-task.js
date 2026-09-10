@@ -127,6 +127,12 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
   // alone reported every source as 'low' every time).
   require('./task-sources.js');
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+  const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
+
+  // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
+  const pipelineDir = path.join(pendingDir, '..', '..');
+  const hubKeyCache = new Map();
+  const noHubKey = { rank: Infinity, createdAt: null };
 
   const pinned = [];
   const rankable = [];
@@ -156,11 +162,18 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
       } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
     }
     if (!resolvesToTier(task, isReasoningLane)) continue;
-    rankable.push({ name, priority, mtimeMs });
+    // Within one source-priority band, order a live hub's children by their owning hub's
+    // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
+    // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
+    // file's own header already documents for the tier split. Non-hub tasks get noHubKey
+    // (rank Infinity), so hub children sort ahead of unrelated work at the same priority.
+    const hk = task ? hubOrderKeyForTask(pipelineDir, task, hubKeyCache) : { isHubChild: false };
+    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
+    rankable.push({ name, priority, mtimeMs, hubKey });
   }
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  rankable.sort((a, b) => (a.priority - b.priority) || (a.mtimeMs - b.mtimeMs));
+  rankable.sort((a, b) => (a.priority - b.priority) || compareHubKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
   return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
 }
 
