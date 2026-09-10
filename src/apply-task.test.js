@@ -900,6 +900,33 @@ test('recordApplyOutcome does not touch blockedStage/blockedReason on a successf
   assert.equal(task.status, 'done', 'status tracks the queue/done/ dir apply-task.sh moves it to');
 });
 
+test('recordApplyOutcome stamps a terminal noop event + terminalDisposition for a no-op apply', () => {
+  const task = { id: 'noop-task', source: 'adhoc', history: [] };
+  const result = { succeeded: true, doneMarker: 'no candidates in implement response -- nothing to apply' };
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'applied');
+  assert.equal(task.terminalDisposition, 'noop');
+  const stages = task.history.map((h) => h.stage);
+  assert.deepEqual(stages, ['applied', 'noop']);
+  assert.match(task.history[1].detail, /no-op apply: no candidates/);
+});
+
+test('recordApplyOutcome does NOT stamp noop for a real branch apply', () => {
+  const task = { id: 'ship-task', source: 'adhoc', history: [] };
+  recordApplyOutcome(task, { succeeded: true, branch: 'agent/ship-task', pushed: true });
+  assert.equal(task.terminalDisposition, undefined);
+  assert.deepEqual(task.history.map((h) => h.stage), ['applied']);
+});
+
+test('recordApplyOutcome does NOT stamp noop for a *_review source (its no-op is a dismissed, only the reconcile sweep can tell)', () => {
+  const task = { id: 'rev-task', source: 'observability_review', history: [] };
+  recordApplyOutcome(task, { succeeded: true, doneMarker: 'no candidates -- false positive' });
+  assert.equal(task.terminalDisposition, undefined, 'left for the reconcile sweep to classify as dismissed vs noop');
+  assert.deepEqual(task.history.map((h) => h.stage), ['applied']);
+});
+
 test('recordApplyOutcome reports awaiting-confirm (not apply-failed) for a needsConfirmation hold, and does not stamp blockedStage', () => {
   const task = { id: 'hold-task', history: [] };
   const result = { succeeded: false, needsConfirmation: true, reason: 'real agentic code diff ready to apply -- held for human confirmation' };
