@@ -52,11 +52,16 @@ function readCache() {
 }
 
 function writeCache(result) {
+  const tmpPath = CACHE_PATH + '.tmp';
   try {
     fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
-    fs.writeFileSync(CACHE_PATH, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
+    fs.writeFileSync(tmpPath, JSON.stringify({ _cachedAt: Date.now(), _result: result }));
+    fs.renameSync(tmpPath, CACHE_PATH);
   } catch (err) {
-    // best-effort -- a failed cache write must not fail the health check itself
+    // best-effort -- a failed cache write must not fail the health check itself.
+    // Atomic write (tmp + rename) guarantees concurrent readers see either the
+    // previous complete cache file or the new one, never a partial write.
+    try { fs.unlinkSync(tmpPath); } catch { /* temp may not exist if failure preceded the write */ }
     console.warn(`[budget-monitor] cache write to ${CACHE_PATH} failed (non-fatal): ${err && err.message ? err.message : String(err)}`);
   }
 }
