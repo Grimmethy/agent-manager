@@ -110,6 +110,7 @@ function writeFlag(taskFilePath, task, flag, now) {
     reason: flag.reason,
     disposition: flag.disposition,
     confidence: flag.confidence,
+    confidenceSource: flag.confidenceSource || 'heuristic-default',
     evidence: flag.evidence,
     flaggedAt: new Date(now).toISOString(),
     votedAt: flag.votedAt || null,
