@@ -845,6 +845,33 @@ test('applyVerdictOnly returns a placeholder reason for a truly empty implement 
   assert.match(result.reason, /no verdict text/);
 });
 
+// --- hedging-phrase output-contract gate --------------------------------------------
+// A verdict that hedges ("I cannot confirm...") is the model declining the judgment it
+// was asked to make -- silently filing that as {skipped:true} hides the failure behind
+// a plausible-sounding doneMarker, so the gate makes apply throw a contract violation
+// instead. The other two cases pin the paths that must KEEP working (a genuine verdict
+// and the empty-response placeholder) so the gate doesn't over-broaden.
+
+test('applyVerdictOnly throws an output-contract violation on a hedging response', () => {
+  assert.throws(
+    () => applyVerdictOnly({ implementResponse: 'I cannot confirm this is a real issue.' }),
+    (err) => {
+      assert.match(err.message, /output-contract violation/);
+      return true;
+    }
+  );
+});
+
+test('applyVerdictOnly still returns {skipped:true, reason} for a genuine-regression response', () => {
+  const result = applyVerdictOnly({ implementResponse: 'This is a genuine regression.' });
+  assert.deepEqual(result, { skipped: true, reason: 'This is a genuine regression.' });
+});
+
+test('applyVerdictOnly still returns the no-verdict placeholder for an empty string', () => {
+  const result = applyVerdictOnly({ implementResponse: '' });
+  assert.deepEqual(result, { skipped: true, reason: '(no verdict text returned)' });
+});
+
 // --- parsePathPrefetchResolveResult / applyPathPrefetchResolve (hybrid path-prefetch
 // fallback, 2026-08-16) -------------------------------------------------------------------
 
