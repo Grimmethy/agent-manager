@@ -163,6 +163,31 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+test('write tier: buildWriteAgenticPrompt lists non-empty pre-filter flags verbatim', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({
+      title: 'T', promptContext: { rawText: 'the ask' },
+      preFilterFlags: [{ type: 'missing-file', detail: 'src/foo.js' }],
+    });
+    assert.match(p, /Here are the pre-filter flags/);
+    assert.match(p, /missing-file/);
+    assert.match(p, /src\/foo\.js/);
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt still shows the pre-filter flags header for an empty list, with the (none ...) sentinel', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({
+      title: 'T', promptContext: { rawText: 'the ask' },
+      preFilterFlags: [],
+    });
+    assert.match(p, /Here are the pre-filter flags/);
+    assert.match(p, /\(none/);
+  });
+});
+
 test('write tier: blindPlanBlock softens its "could NOT read any files" language when task.planWasGrounded', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
