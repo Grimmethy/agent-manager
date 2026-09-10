@@ -679,7 +679,25 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const trimmedImplResponse = (task.implementResponse || '').trim();
   const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
 
-  if (isEmptyApprovalSource(task.source) && effectivelyEmpty) {
+  // 2026-09-10, root-caused live (adhoc-brain-dump-bd-1788725105579-fail-empty-implement-
+  // passes-for-deep-div-1788812338820): an empty implementResponse was being treated as a
+  // documented valid no-op for every emptyApproval source -- but for the deep-dive brain-
+  // dump case an empty response is the implement pass producing NOTHING at all, a failure
+  // the prior approve was silently papering over. Flip the default to a hard block; the
+  // original approve behavior survives behind the AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL
+  // kill switch (env === 'false' restores it) so a bad flip can be rolled back per-
+  // deployment without a code change.
+  if (process.env.AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL !== 'false'
+      && isEmptyApprovalSource(task.source)
+      && effectivelyEmpty) {
+    const reason = 'Deterministic gate: implementResponse is empty -- the implement pass produced no content at all, which for this source is a failure, not a valid no-op (no local-model review call spent)';
+    task.reviewProvider = 'deterministic-empty-fail';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  } else if (isEmptyApprovalSource(task.source) && effectivelyEmpty) {
+    // Kill switch OFF (AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL === 'false'): preserve
+    // the legacy empty-approve behavior exactly as it was before the 2026-09-10 flip.
     task.reviewedAt = new Date().toISOString();
     task.reviewProvider = 'deterministic-empty-approve';
     task.localVerdict = `Auto-approved: implementResponse is genuinely empty, a documented valid outcome for ${task.source} (no local-model review call spent -- this is deterministic, not a judgment call)`;
