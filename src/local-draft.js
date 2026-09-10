@@ -69,6 +69,7 @@ const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
 const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
+const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
@@ -2132,6 +2133,17 @@ async function runDraftPasses(task, attempt, {
 
   try {
     appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
+
+    // Fail-fast Ollama pre-flight (src/ollama-health.js): if this draft is about to
+    // hit a REAL local Ollama endpoint (no injected localCall -- unit tests pass fakes,
+    // so localCall===null means the default model-provider.js pick) and it resolves to
+    // a local call, probe the endpoint now. A rejection throws and falls into this
+    // function's existing catch below ({ succeeded: false, reason }) -- a one-line
+    // diagnostic in ~5s instead of stalling on the first generate call's 4-minute
+    // socket timeout with the identical, less actionable symptom.
+    if (localCall === null && resolvedCallIsLocal) {
+      await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');
+    }
 
     // Re-ground a candidate-fulfillment task against CURRENT file content before any
     // prompt is built (see refreshCandidateFetchedFiles) -- a sibling AC on the same file
