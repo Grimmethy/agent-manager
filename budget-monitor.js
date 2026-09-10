@@ -82,7 +82,7 @@ function listJsonlFiles(dir) {
   return out;
 }
 
-function readEntries(filePath, sinceMs) {
+function readEntries(filePath, sinceMs, metricsReporter = null) {
   let text;
   try {
     text = fs.readFileSync(filePath, 'utf8');
@@ -103,8 +103,8 @@ function readEntries(filePath, sinceMs) {
       if (parseFailures % 1000 === 1) {
         console.warn(`budget-monitor: JSON parse failure #${parseFailures}; sample: ${line.substring(0, 120)}`);
       }
-      if (typeof metrics !== 'undefined' && metrics && typeof metrics.increment === 'function') {
-        metrics.increment('budget_monitor.parse_failures');
+      if (metricsReporter && typeof metricsReporter.increment === 'function') {
+        metricsReporter.increment('budget_monitor.parse_failures');
       }
       continue;
     }
