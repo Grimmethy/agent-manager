@@ -161,7 +161,7 @@ function applyVerdictOnly({ implementResponse }) {
     return { skipped: true, reason: '(no verdict text returned)' };
   }
   if (containsHedging(text)) {
-    const phrase = HEDGING_PHRASES.map((re) => re.exec(text)).find(Boolean)[0][0];
+    const phrase = HEDGING_PHRASES.map((re) => re.exec(text)).find(Boolean)[0];
     throw new Error(
       `output-contract violation: verdict hedges instead of deciding (matched "${phrase}") -- ` +
       `a judgment-verdict task must return a real verdict, not a hedged one.`
