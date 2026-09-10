@@ -589,3 +589,70 @@ test('call() extracts a CONCEPT-BUILD report and records the tally on concepts.j
     assert.equal(updated.builtFromScratchCount, 1);
   });
 });
+
+// Turn-limit path: when the CLI exhausts its turn budget it comes back with a
+// stop_reason that is NOT the caller's fault and retrying cannot help -- call()
+// must surface a distinct, catchable error (code 'DRAFT_TURN_LIMIT_EXCEEDED') and
+// must NOT burn its retry budget on it.
+//
+// test.skip, not test: the DRAFT_MAX_TURNS ceiling / DRAFT_TURN_LIMIT_EXCEEDED
+// error was being added to claude-client.js by a sibling task in the same
+// decomposition ("Add DRAFT_MAX_TURNS ceiling + turn-limit error to
+// claude-client.js") and is NOT yet on this worktree (grep src/ for
+// DRAFT_TURN_LIMIT_EXCEEDED -> 0 hits at the time this was written). The test is
+// written against the agreed error-code contract so it flips to active by
+// deleting the skip option once that sibling lands -- then verify the stub's
+// stop_reason/numTurns values actually trigger the real code path and adjust if
+// the sibling's sentinel differs.
+// TODO: un-skip once "Add DRAFT_MAX_TURNS ceiling + turn-limit error to claude-client.js" merges.
+test('call() throws DRAFT_TURN_LIMIT_EXCEEDED (code) and does not retry a turn-limit stop_reason', { skip: true }, async () => {
+  let calls = 0;
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    await withMockedClient(
+      () => {
+        calls++;
+        return JSON.stringify({
+          result: 'Reached maximum number of turns (5) for this conversation.',
+          stop_reason: 'end_turn',
+          numTurns: 5,
+          session_id: 's1',
+        });
+      },
+      async ({ call }) => {
+        await assert.rejects(
+          () => call({ prompt: 'hi' }, 2),
+          (err) => {
+            assert.equal(err.code, 'DRAFT_TURN_LIMIT_EXCEEDED');
+            return true;
+          },
+        );
+      },
+    );
+    assert.equal(calls, 1, 'a turn-limit response must not be retried -- exactly one execFileSync call');
+  });
+});
+
+// The normal path must be untouched by the turn-limit handling: a healthy
+// end_turn response resolves through call()'s success path exactly as before,
+// with no retries spent.
+test('call() returns a normal stop_reason end_turn response through the success path, no retries', async () => {
+  let calls = 0;
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    const result = await withMockedClient(
+      () => {
+        calls++;
+        return JSON.stringify({
+          result: 'a normal, complete response here',
+          stop_reason: 'end_turn',
+          numTurns: 1,
+          session_id: 's1',
+        });
+      },
+      ({ call }) => call({ prompt: 'hi' }, 2),
+    );
+    assert.equal(calls, 1, 'a clean end_turn response must not be retried');
+    assert.equal(result.degenerate, null);
+    assert.equal(result.response, 'a normal, complete response here');
+    assert.equal(result.sessionId, 's1');
+  });
+});
