@@ -1874,7 +1874,7 @@ async function finalizeCandidateFulfillment(task, {
       task.implementResponse = retryResult.response;
     }
     const note = `retried once (${unverified.problem})`;
-    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note });
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note, promptVariant: 'strict-cite' });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (${note})`);
   } else {
     recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
