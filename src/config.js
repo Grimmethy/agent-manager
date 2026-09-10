@@ -110,9 +110,22 @@ function getConfig() {
   // Sensible-default, overridable paths for the built-in task sources that read/write a
   // project doc file. Defaults match this pipeline's own original layout; a consumer with
   // a different docs-folder convention overrides via env var.
-  const troubleLogPath = process.env.AGENT_MANAGER_TROUBLE_LOG_PATH || path.join(repoRoot, 'Docs', 'TROUBLE_LOG.md');
-  const archReviewCandidatesPath = process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_REVIEW_CANDIDATES.md');
-  const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(repoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
+  //
+  // These `Docs/*.md` files are all APPEND-then-`git add`-then-commit-straight-to-main
+  // targets of a `directToMain` source's apply (arch_discovery, pipeline_forensics,
+  // observability_review, change_review, product_spec, ...). apply-task.js runs that write
+  // + `git add` inside `applyRepoRoot`, so the path MUST be rooted there too -- rooting it
+  // at `repoRoot` (the interactive checkout) when the two diverge makes `git add` fail
+  // with "<abs path> is outside repository at '<applyRepoRoot>'" and the task exhausts its
+  // apply retries (regression from the 2026-09-07 AGENT_MANAGER_APPLY_REPO_ROOT split;
+  // ~7 tasks stuck this way as of 2026-09-10). `applyRepoRoot` defaults to `repoRoot`, so
+  // this is a no-op for any deployment without a dedicated apply worktree. Grounding reads
+  // of these docs (nextCandidateFulfillmentTask) now come from `applyRepoRoot` too, which
+  // resetToMain() keeps origin-fresh -- fresher than the interactive checkout, which only
+  // updates on a manual pull.
+  const troubleLogPath = process.env.AGENT_MANAGER_TROUBLE_LOG_PATH || path.join(applyRepoRoot, 'Docs', 'TROUBLE_LOG.md');
+  const archReviewCandidatesPath = process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH || path.join(applyRepoRoot, 'Docs', 'ARCH_REVIEW_CANDIDATES.md');
+  const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(applyRepoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
@@ -146,7 +159,7 @@ function getConfig() {
   // to promise ("a genuine issue becomes a separate follow-up task later") but never
   // actually built.
   const observabilityFixCandidatesPath = process.env.AGENT_MANAGER_OBSERVABILITY_FIX_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'OBSERVABILITY_FIX_CANDIDATES.md');
+    || path.join(applyRepoRoot, 'Docs', 'OBSERVABILITY_FIX_CANDIDATES.md');
   // performance_review (Brain Dump #94, 2026-08-18) -- REDIRECTED 2026-08-20, same
   // reasoning/shape as observability_review's own redirect just above ("Do the same for
   // performance_review"): 355 done tasks, 297 (84%) false positive, 56 (16%) genuine,
@@ -158,7 +171,7 @@ function getConfig() {
   // Where a "genuine issue" verdict lands as a real, fixable candidate -- same mechanism
   // as observabilityFixCandidatesPath just above.
   const performanceFixCandidatesPath = process.env.AGENT_MANAGER_PERFORMANCE_FIX_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'PERFORMANCE_FIX_CANDIDATES.md');
+    || path.join(applyRepoRoot, 'Docs', 'PERFORMANCE_FIX_CANDIDATES.md');
   const importCoveragePath = process.env.AGENT_MANAGER_IMPORT_COVERAGE_PATH
     || path.join(pipelineDir, 'import-coverage.json');
   // pipeline_self_audit (2026-08-19: "how can we turn this into a self improving
@@ -190,7 +203,7 @@ function getConfig() {
   // shape as observabilityFixCandidatesPath / archReviewCandidatesPath, but the Files:
   // line points at this pipeline's OWN src/.
   const pipelineFixCandidatesPath = process.env.AGENT_MANAGER_PIPELINE_FIX_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'PIPELINE_FIX_CANDIDATES.md');
+    || path.join(applyRepoRoot, 'Docs', 'PIPELINE_FIX_CANDIDATES.md');
   // pipeline_debrief (2026-09-06, "The Debrief" concept, Grimmethy: "a whole phase where we
   // go through actually completed work to analyze for patterns... What / So What / Now
   // What") -- see debrief-bundle.js. The cursor advanced past is a timestamp
@@ -215,7 +228,7 @@ function getConfig() {
   // into real diffs. repoRoot/Docs so the candidate doc travels with the reviewed repo's
   // own history, like archReviewCandidatesPath.
   const changeReviewCandidatesPath = process.env.AGENT_MANAGER_CHANGE_REVIEW_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md');
+    || path.join(applyRepoRoot, 'Docs', 'CHANGE_REVIEW_CANDIDATES.md');
   // The SHA cursor for change_review's commit walk -- { lastReviewedSha, updatedAt }. Only
   // ever advanced over commits whose review task is already queued/done (taskIdExistsInQueue),
   // so it is a pure optimization, not the idempotency key (the sha is in the task id). Lives
@@ -238,21 +251,21 @@ function getConfig() {
   // the target project's own git history, same reasoning as troubleLogPath/
   // archReviewCandidatesPath above.
   const productSpecPath = process.env.AGENT_MANAGER_PRODUCT_SPEC_PATH
-    || path.join(repoRoot, 'Docs', 'PRODUCT_SPEC.md');
+    || path.join(applyRepoRoot, 'Docs', 'PRODUCT_SPEC.md');
   // backlog_decomposition (2026-08-20, the other half of "is agent-manager ready to build
   // a whole plugin": product_spec answers "what does this product need," this answers
   // "what order do we build it in") -- same AC-NNN candidate-doc format
   // ARCH_REVIEW_CANDIDATES.md already uses, so nextCandidateFulfillmentTask (fully
   // generic, task-sources.js) can consume it for free with zero new consumption code.
   const backlogCandidatesPath = process.env.AGENT_MANAGER_BACKLOG_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'BACKLOG_CANDIDATES.md');
+    || path.join(applyRepoRoot, 'Docs', 'BACKLOG_CANDIDATES.md');
   // product_spec BROWNFIELD outline doc (2026-08-30): a brownfield spec request is
   // decomposed into ordered `### AC-NNN` section candidates here (product_spec_outline),
   // then drafted one section at a time on the LOCAL model (product_spec_section, a
   // candidate-fulfillment consumer of this exact doc). Same AC-NNN format and repoRoot/Docs
   // home as backlogCandidatesPath, for the same "reuse the generic writer/consumer" reason.
   const productSpecOutlineCandidatesPath = process.env.AGENT_MANAGER_PRODUCT_SPEC_OUTLINE_CANDIDATES_PATH
-    || path.join(repoRoot, 'Docs', 'PRODUCT_SPEC_OUTLINE.md');
+    || path.join(applyRepoRoot, 'Docs', 'PRODUCT_SPEC_OUTLINE.md');
 
   // brain_dump_sort's queue -- same file the dashboard's Brain Dump tab reads/writes
   // (python/dashboard/app.py's brain_dump_path()). Env var name kept byte-identical across
