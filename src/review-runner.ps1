@@ -456,6 +456,29 @@ function Invoke-ReviewPass {
         # Ornith sometimes writes the literal two-character JSON-style empty-string
         # representation instead of a truly empty response). Keeping this one definition
         # of "empty" consistent across the pipeline instead of drifting per call site.
+        # Deterministic empty-approve guard (runs BEFORE the source-specific
+        # auto-approve below): an effectively-empty implement response with zero
+        # harness-search hits has nothing to review and nothing worth re-searching,
+        # so requeue deterministically instead of spending a model review vote or
+        # falling through to the auto-approve path. Empty check mirrors the
+        # $isEffectivelyEmpty logic below (same three-way ''/"\"\""/"''" comparison);
+        # hit count comes from promptContext.harnessHits (set by local-draft.js /
+        # local-worker.ps1), falling back to promptContext.searchResults, defaulting
+        # to 0 when neither property is present (a source that ran no harness search
+        # at all has zero hits by construction).
+        $guardTrimmedResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
+        $guardIsEmptyResponse = ($guardTrimmedResponse -eq '') -or ($guardTrimmedResponse -eq '""') -or ($guardTrimmedResponse -eq "''")
+        $guardHitCount = 0
+        if ($task.promptContext -and $task.promptContext.PSObject.Properties['harnessHits']) {
+            $guardHitCount = @($task.promptContext.harnessHits).Count
+        } elseif ($task.promptContext -and $task.promptContext.PSObject.Properties['searchResults']) {
+            $guardHitCount = @($task.promptContext.searchResults).Count
+        }
+        if ($guardIsEmptyResponse -and $guardHitCount -eq 0) {
+            $task | Add-Member -NotePropertyName 'emptyApproval' -NotePropertyValue $true -Force
+            Write-Host ('WARNING [deterministic-empty-approve]: {0} -- implementResponse is effectively empty and harness-search hit count is 0; requeuing without spending a model review vote' -f $task.id) -ForegroundColor Yellow
+            return 'requeued'
+        }
         $emptyApprovalSources = @('arch_discovery', 'project_search', 'deep_dive', 'arch_import')
         $trimmedImplResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
         $isEffectivelyEmpty = ($trimmedImplResponse -eq '') -or ($trimmedImplResponse -eq '""') -or ($trimmedImplResponse -eq "''")
