@@ -89,6 +89,41 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertNotIn("sort", entry)
         self.assertIn("T", entry["editedAt"])
 
+    def test_suppress_sets_flag_and_hides_from_default_view_but_not_status_all(self):
+        self._seed([
+            {"id": "bd-keep", "serial": 1, "rawText": "live finding", "status": "sorted",
+             "raisedBy": {"source": "pipeline_debrief"}},
+            {"id": "bd-stale", "serial": 2, "rawText": "stale routing finding", "status": "sorted",
+             "raisedBy": {"source": "pipeline_debrief"}},
+        ])
+        resp = self.client.post("/api/brain-dump/bd-stale/suppress", json={"reason": "config removed"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entry = resp.get_json()
+        self.assertTrue(entry["suppressed"])
+        self.assertEqual(entry["suppressedReason"], "config removed")
+        self.assertIn("T", entry["suppressedAt"])
+
+        default_ids = [e["id"] for e in self.client.get("/api/brain-dump").get_json()]
+        self.assertIn("bd-keep", default_ids)
+        self.assertNotIn("bd-stale", default_ids)
+
+        all_ids = [e["id"] for e in self.client.get("/api/brain-dump?status=all").get_json()]
+        self.assertIn("bd-stale", all_ids)
+
+    def test_suppress_is_reversible(self):
+        self._seed([{"id": "bd-x", "serial": 1, "rawText": "x", "status": "sorted",
+                     "suppressed": True, "suppressedReason": "was stale"}])
+        resp = self.client.post("/api/brain-dump/bd-x/suppress", json={"suppressed": False})
+        self.assertEqual(resp.status_code, 200)
+        entry = resp.get_json()
+        self.assertNotIn("suppressed", entry)
+        self.assertNotIn("suppressedReason", entry)
+        self.assertIn("bd-x", [e["id"] for e in self.client.get("/api/brain-dump").get_json()])
+
+    def test_suppress_unknown_entry_404s(self):
+        self._seed([])
+        self.assertEqual(self.client.post("/api/brain-dump/nope/suppress").status_code, 404)
+
     def test_prioritize_queues_an_adhoc_task_and_actions_the_entry(self):
         self._seed([{"id": "bd-p", "serial": 1, "rawText": "do this now", "status": "captured"}])
         resp = self.client.post("/api/brain-dump/bd-p/prioritize")

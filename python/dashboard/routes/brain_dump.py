@@ -39,6 +39,12 @@ def api_brain_dump():
     from app import BRAIN_DUMP_NEEDS_ATTENTION_STATES, _brain_dump_entries_with_task_status
     entries = _brain_dump_entries_with_task_status()
 
+    # `suppressed` entries (a human marked the finding obsolete/invalid) are hidden from
+    # every view except ?status=all, so a stale recurring machine finding can be retired
+    # without deleting its record.
+    if request.args.get("status", "").strip() != "all":
+        entries = [e for e in entries if not e.get("suppressed")]
+
     status_filter = request.args.get("status", "").strip()
     if status_filter == "actioned":
         entries = [
@@ -113,6 +119,34 @@ def api_brain_dump_edit(entry_id):
         entry.pop("sort", None)
     entry["rawText"] = text
     entry["editedAt"] = datetime.now(timezone.utc).isoformat()
+
+    write_brain_dump_entries(entries)
+    return jsonify(entry)
+
+
+@brain_dump_bp.route("/api/brain-dump/<entry_id>/suppress", methods=["POST"])
+def api_brain_dump_suppress(entry_id):
+    """Retire a machine-generated finding without deleting it: sets `suppressed` (+
+    `suppressedReason`/`suppressedAt`) so side-finding-sweep.js stops merging new similar
+    findings into it (no more count/lastSeenAt inflation) and every dashboard view except
+    ?status=all hides it. Reversible: `{"suppressed": false}` clears the flag. Use for a
+    stale recurring observation whose premise no longer holds -- e.g. a model-routing
+    recommendation against a config that has since been removed."""
+    from app import read_brain_dump_entries, write_brain_dump_entries
+    body = request.get_json(silent=True) or {}
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+
+    if body.get("suppressed") is False:
+        entry.pop("suppressed", None)
+        entry.pop("suppressedReason", None)
+        entry.pop("suppressedAt", None)
+    else:
+        entry["suppressed"] = True
+        entry["suppressedReason"] = (body.get("reason") or "").strip() or "retired by a human"
+        entry["suppressedAt"] = datetime.now(timezone.utc).isoformat()
 
     write_brain_dump_entries(entries)
     return jsonify(entry)
