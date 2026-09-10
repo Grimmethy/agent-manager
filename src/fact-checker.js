@@ -637,6 +637,23 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   return flags;
 }
 
+// A file:line citation is a "path.ext:NN" token (e.g. src/foo.js:42). Confirmed iff its
+// exact string appears in the grounding sourceText (mirrors the literal-substring-match
+// convention checkGroundedValues uses above). Lines carrying at least one unconfirmed
+// citation are the "offending lines" the hard guard strips.
+const FILE_LINE_CITATION_RE = /[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,10}:[0-9]+/g;
+
+function checkFileLineCitations(draftText, sourceText) {
+  if (!sourceText) return { unconfirmedCitations: [] }; // no grounding material -> nothing to strip
+  const unconfirmedCitations = [];
+  for (const line of draftText.split('\n')) {
+    const tokens = (line.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')); // skip URL host:port
+    if (tokens.length === 0) continue;
+    if (tokens.some((t) => !sourceText.includes(t))) unconfirmedCitations.push(line);
+  }
+  return { unconfirmedCitations };
+}
+
 // Returns a flat list of flags Claude's review pass should look at first. An empty
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
@@ -646,6 +663,17 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
+  const { unconfirmedCitations } = checkFileLineCitations(draftText, sourceText);
+  let cleanedText = draftText;
+  let strippedFileLineCitations = [];
+  if (unconfirmedCitations.length > 0) {
+    const removedSet = new Set(unconfirmedCitations.map((l) => l.trim()));
+    cleanedText = draftText
+      .split('\n')
+      .filter((line) => !removedSet.has(line.trim()))
+      .join('\n');
+    strippedFileLineCitations = unconfirmedCitations;
+  }
   const createModeTargets = extractCreateModeTargets(draftText);
   const commitChecks = checkCommitClaims(draftText, repoRoot);
   const revertChecks = checkRevertsAPriorFix(draftText, repoRoot);
@@ -698,7 +726,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   flags.push(...groundedFlags);
   flags.push(...revertChecks);
 
-  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks };
+  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations };
 }
 
 module.exports = {
@@ -707,6 +735,7 @@ module.exports = {
   checkRelationships,
   checkBlastRadiusBias,
   checkGroundedValues,
+  checkFileLineCitations,
   checkCommitClaims,
   checkRevertsAPriorFix,
   extractFilePaths,
