@@ -639,3 +639,146 @@ test('bucket C genuine design question does NOT file ghost debt (legitimate huma
   assert.equal(s.leftForHuman, 1);
   assert.equal(sfInbox(dir).filter((r) => r.stage === 'ghost-debt').length, 0);
 });
+
+// --- Bucket H: deterministically-classified invalid-premise (2026-09-11) -----------
+
+function invalidPremiseTask(id, over = {}) {
+  return baseTask(id, {
+    needsClarification: {
+      reason: 'invalid-premise',
+      openQuestions: 'Classified as invalid-premise (environment-side), which a blind retry cannot fix -- needs a human decision.',
+    },
+    blockedReason: 'Invalid premise: the real content in `src/foo.js` does not contain a `plan-done` event.',
+    history: [{ stage: 'needs-clarification', at: '2026-09-09T00:00:00Z' }],
+    ...over,
+  });
+}
+
+test('bucket H: reason=invalid-premise used to be silently skipped by the design-decision gate -- now it is checked', async () => {
+  const dir = makePipeline();
+  held(dir, invalidPremiseTask('h1'));
+  const s = await needsClarificationTriage(args(dir, voteOf('DENY', 'still real work here')));
+  assert.equal(s.checked, 1, 'no longer skipped as "not ours"');
+});
+
+test('bucket H: a confident CONFIRM vote archives it', async () => {
+  const dir = makePipeline();
+  held(dir, invalidPremiseTask('h2'));
+  const s = await needsClarificationTriage(args(dir, voteOf('CONFIRM', 'premise genuinely false, nothing to build')));
+  assert.equal(s.archived, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'h2.json')));
+  const archived = read(at(dir, 'done', '_archived_no_action', 'h2.json'));
+  assert.equal(archived.status, 'done');
+  assert.ok(archived.history.some((h) => h.stage === 'archived' && /invalid-premise/.test(h.detail)));
+});
+
+test('bucket H: a possibly-resolved signal archives without needing a vote', async () => {
+  const dir = makePipeline();
+  held(dir, invalidPremiseTask('h3', {
+    promptContext: { rawText: bigRawText, reasons: ['possibly-resolved'] },
+  }));
+  const s = await needsClarificationTriage(args(dir)); // no majorityVote wired -- must not be needed
+  assert.equal(s.archived, 1);
+});
+
+test('bucket H: no resolution signal + DENY/inconclusive vote -> flagged and left, not silently dropped', async () => {
+  const dir = makePipeline();
+  held(dir, invalidPremiseTask('h4'));
+  const s = await needsClarificationTriage(args(dir, voteOf('DENY', 'the premise still holds, real work remains')));
+  assert.equal(s.flagged, 1);
+  const t = read(at(dir, 'needs-clarification', 'h4.json'));
+  assert.equal(t.ncTriageDecision, 'leave-for-human');
+  assert.equal(t.stalenessFlag.reason, 'nc-triage-invalid-premise');
+});
+
+test('bucket H: idempotent -- a second sweep does not re-check an already-flagged task', async () => {
+  const dir = makePipeline();
+  held(dir, invalidPremiseTask('h5'));
+  const vote = countingVote('DENY', 'still real work');
+  await needsClarificationTriage(args(dir, vote));
+  await needsClarificationTriage(args(dir, vote));
+  assert.equal(vote.box.calls, 1, 'second sweep skips the already-reviewed task entirely');
+});
+
+test('bucket H: DRY_RUN=1 reports but does not move or write anything', async () => {
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try {
+    const dir = makePipeline();
+    held(dir, invalidPremiseTask('h6'));
+    const before = read(at(dir, 'needs-clarification', 'h6.json'));
+    const s = await needsClarificationTriage(args(dir, voteOf('CONFIRM', 'yep')));
+    assert.equal(s.archived, 1);
+    assert.deepEqual(read(at(dir, 'needs-clarification', 'h6.json')), before, 'file untouched');
+  } finally {
+    delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  }
+});
+
+// --- Bucket I: deterministically-classified unreliable-grounding (2026-09-11) ------
+
+function unreliableGroundingTask(id, over = {}) {
+  return baseTask(id, {
+    needsClarification: {
+      reason: 'unreliable-grounding',
+      openQuestions: 'The grounding for src/bar.js could not be reliably anchored (confidence: none) -- a blind retry re-derives the same search against the same file.',
+    },
+    blockedReason: 'unreliable grounding: src/bar.js anchor confidence none',
+    history: [{ stage: 'needs-clarification', at: '2026-09-09T00:00:00Z' }],
+    ...over,
+  });
+}
+
+test('bucket I: reason=unreliable-grounding used to be silently skipped -- now files ghost debt and leaves it visible', async () => {
+  const dir = makePipeline();
+  held(dir, unreliableGroundingTask('i1'));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 1);
+  assert.equal(s.leftForHuman, 1);
+  const t = read(at(dir, 'needs-clarification', 'i1.json'));
+  assert.equal(t.ncTriageDecision, 'leave-for-human');
+  const debt = sfInbox(dir).find((r) => r.stage === 'ghost-debt' && r.taskId === 'i1');
+  assert.ok(debt, 'ghost-debt filed -- no automated recovery for a harness-side anchor failure');
+});
+
+test('bucket I: never requeued -- a blind retry would reproduce the identical anchor failure', async () => {
+  const dir = makePipeline();
+  held(dir, unreliableGroundingTask('i2'));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'i2.json')), 'stays in needs-clarification/, not moved to adhoc/');
+});
+
+test('bucket I: idempotent -- a second sweep does not re-file ghost debt or re-append history', async () => {
+  const dir = makePipeline();
+  held(dir, unreliableGroundingTask('i3'));
+  await needsClarificationTriage(args(dir));
+  const afterFirst = read(at(dir, 'needs-clarification', 'i3.json'));
+  const s2 = await needsClarificationTriage(args(dir));
+  assert.equal(s2.checked, 0, 'already-reviewed task skipped on the next tick');
+  assert.deepEqual(read(at(dir, 'needs-clarification', 'i3.json')), afterFirst);
+});
+
+test('bucket I: DRY_RUN=1 reports but does not write or file ghost debt', async () => {
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try {
+    const dir = makePipeline();
+    held(dir, unreliableGroundingTask('i4'));
+    const before = read(at(dir, 'needs-clarification', 'i4.json'));
+    const s = await needsClarificationTriage(args(dir));
+    assert.equal(s.leftForHuman, 1);
+    assert.deepEqual(read(at(dir, 'needs-clarification', 'i4.json')), before);
+    assert.equal(sfInbox(dir).length, 0);
+  } finally {
+    delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  }
+});
+
+test('ambiguous reason is still skipped (out of scope for this fix)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('amb1', {
+    needsClarification: { reason: 'ambiguous', openQuestions: 'Which of these 3 candidates did you mean?' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.archived, s.leftForHuman], [0, 0, 0]);
+  assert.ok(exists(at(dir, 'needs-clarification', 'amb1.json')), 'left completely untouched, same as before');
+});
