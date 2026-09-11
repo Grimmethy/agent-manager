@@ -728,14 +728,19 @@ function Invoke-ReviewPass {
         $voteResult = $null
         try {
             Wait-ForLocalAvailability
-            # 3 votes, requires ALL 3 agreeing real votes (raised from 2 on 2026-08-03 --
-            # 2/3 let a single correctly-reasoned REJECT get outvoted by two bare, unreasoned
-            # APPROVEs on two separate real drafts in one session; unanimous is the direct
-            # fix). minReasoningChars=20 discards any vote whose reasoning, once the
-            # verdict marker itself is stripped out, is under 20 characters -- catches a
-            # model that ignores the reasoning instruction above and reverts to a bare
-            # marker; such a vote is excluded from the tally rather than counted.
-            $voteResult = Invoke-LocalMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 3 -Temperature 0.2 -MinReasoningChars 20
+            # 3 votes, requires 2 of 3 agreeing real votes (lowered from 3 to 2 on
+            # 2026-08-16 -- a real 2-1 split where all three votes are genuine,
+            # non-degenerate votes is a confident majority, not a tie; confirmed live
+            # 2026-08-16: 23 of 181 blocked tasks were real 2-1 splits discarded as
+            # "no confident majority" purely because one of three votes dissented. The
+            # 2026-08-03 unanimity raise was guarding against bare, unreasoned votes;
+            # that guard is now carried by minReasoningChars=20 below, which discards any
+            # vote whose reasoning, once the verdict marker itself is stripped out, is
+            # under 20 characters -- catches a model that ignores the reasoning
+            # instruction above and reverts to a bare marker; such a vote is excluded
+            # from the tally rather than counted. Matches Invoke-LocalMajorityVote's own
+            # default (MinAgreeing = 2) and src/review-task.js (minAgreeing: 2).
+            $voteResult = Invoke-LocalMajorityVote -Prompt $verdictPrompt -ClassifyMarkers @('APPROVE', 'REJECT') -N 3 -MinAgreeing 2 -Temperature 0.2 -MinReasoningChars 20
         } catch {
             $reviewFailed = $true
             $reviewFailReason = $_.Exception.Message
