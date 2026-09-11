@@ -237,6 +237,16 @@ function closeOriginatingBrainDumpEntry(task, brainDumpPath, note) {
   }
 }
 
+// Guards both staging sites below against the "git add [undefined]"
+// pathspec failure: artifact.files absent AND artifact.file undefined yields
+// [undefined] from `artifact.files || [artifact.file]`. Fails fast with the task
+// id in the message instead of a cryptic git pathspec error.
+function assertStageableFiles(task, files) {
+  if (!Array.isArray(files) || files.length === 0 || !files.every((f) => typeof f === 'string' && f.length > 0)) {
+    throw new Error(`task ${task.id}: no target file path`);
+  }
+}
+
 function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
   try {
     if (task.domain === 'secondbrain') {
@@ -480,6 +490,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // { files: [...] } (one or more). Normalize to an array so both shapes stage
     // correctly regardless of which path produced the artifact.
     const filesToAdd = artifact.files || [artifact.file];
+    assertStageableFiles(task, filesToAdd);
     gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
@@ -694,6 +705,7 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
         continue;
       }
       const files = artifact.files || [artifact.file];
+      assertStageableFiles(task, files);
       gitRunner.add(files);
       staged.push({ task, files });
     } catch (e) {

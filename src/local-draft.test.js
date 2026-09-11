@@ -2322,7 +2322,8 @@ test('draftTask skips the critique+revision pass entirely for an advisoryProse s
 
     assert.equal(result.succeeded, true);
     assert.equal(callCount, 2, 'only plan + implement -- no third (critique) call for an advisoryProse source');
-    assert.equal(task.critiqueOutcome, 'skipped-advisory-prose');
+    assert.equal(task.critiqueOutcome, undefined, 'advisory-prose source: no critique bookkeeping at all, outcome stays unset');
+    assert.ok(!(task.history || []).some((h) => h.stage === 'critique-done'), 'no critique-done history entry recorded for an advisory-prose source');
     assert.equal(task.revisionApplied, undefined, 'no revision pass ran, so this must stay unset, not falsely imply one ran and found nothing');
   });
 });
