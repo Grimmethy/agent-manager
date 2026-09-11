@@ -116,6 +116,29 @@ test('detectExternalDependency still matches a real auth/API token reference', (
   assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }), 'credentials/API keys/tokens/secrets');
 });
 
+// 2026-09-11, root-caused live from two real blocked hub-children: the bare "network"/
+// "internet" alternative matched a task's own NEGATION of the dependency ("does not
+// depend on network access") and a parenthetical listing pre-existing error categories
+// ("errors (network, timeout, ...)"), neither of which describes something THIS task
+// needs. Same discipline as the token fix above: require a qualifier after network/
+// internet, plus a shared negation guard for every marker.
+test('detectExternalDependency does NOT false-positive on a negated or merely-mentioned "network"', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({
+    planResponse: 'The test does not depend on network access, external services, or mutable global state; it is fully deterministic.',
+  }), null);
+  assert.equal(detectExternalDependency({
+    planResponse: 'The existing retry path for other errors (network, timeout, `detectDegenerate`) must remain untouched.',
+  }), null);
+});
+
+test('detectExternalDependency still matches a real network/third-party dependency', () => {
+  const { detectExternalDependency } = freshModule();
+  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ title: 'Requires network access to fetch the remote schema' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ planResponse: 'make a network call to the upstream pricing API' }), 'a network/third-party service call');
+});
+
 test('write tier: a task requiring an external resource is blocked with needsClarification BEFORE any model call', async () => {
   await withRepo(async () => {
     const { draftAdhocViaLocalAgenticWrite } = freshModule();
