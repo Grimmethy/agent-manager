@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { wrapWithSandbox, buildBwrapArgs, clearBwrapPathCache } = require('./sandbox.js');
+const { wrapWithSandbox, buildBwrapArgs, clearBwrapPathCache, linkedWorktreeBinds } = require('./sandbox.js');
 
 function withPath(pathValue, fn) {
   const prior = process.env.PATH;
@@ -65,6 +65,59 @@ test('buildBwrapArgs omits an env entry whose value is null/undefined', () => {
   assert.equal(args.includes('FOO'), false);
   assert.equal(args.includes('BAR'), false);
   assert.ok(args.includes('BAZ'));
+});
+
+test('linkedWorktreeBinds parses a linked-worktree .git file into the ro main .git + rw worktree gitdir split', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-worktree-test-'));
+  const mainGit = path.join(root, 'main', '.git');
+  const worktreeGitDir = path.join(mainGit, 'worktrees', 'feat-x');
+  fs.mkdirSync(worktreeGitDir, { recursive: true });
+  const workDir = path.join(root, 'wt');
+  fs.mkdirSync(workDir);
+  fs.writeFileSync(path.join(workDir, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+  const binds = linkedWorktreeBinds(workDir);
+  assert.deepEqual(binds, { readOnlyBinds: [mainGit], writableBinds: [worktreeGitDir] });
+});
+
+test('linkedWorktreeBinds returns empty binds when .git is a directory or absent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-normals-'));
+  const normal = path.join(root, 'normal-repo');
+  fs.mkdirSync(path.join(normal, '.git'), { recursive: true });
+  assert.deepEqual(linkedWorktreeBinds(normal), { readOnlyBinds: [], writableBinds: [] });
+  assert.deepEqual(linkedWorktreeBinds(path.join(root, 'no-dotgit-here')), { readOnlyBinds: [], writableBinds: [] });
+  const malformed = path.join(root, 'malformed');
+  fs.mkdirSync(malformed);
+  fs.writeFileSync(path.join(malformed, '.git'), 'not-a-gitdir-line\n');
+  assert.deepEqual(linkedWorktreeBinds(malformed), { readOnlyBinds: [], writableBinds: [] });
+});
+
+test('buildBwrapArgs emits --ro-bind <main .git> before --bind <worktree gitdir> for a linked-worktree workDir, skipping any that are missing on the host', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-wt-args-'));
+  const mainGit = path.join(root, 'main', '.git');
+  const worktreeGitDir = path.join(mainGit, 'worktrees', 'feat-y');
+  fs.mkdirSync(worktreeGitDir, { recursive: true });
+  const workDir = path.join(root, 'wt');
+  fs.mkdirSync(workDir);
+  fs.writeFileSync(path.join(workDir, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+  const args = buildBwrapArgs({ workDir });
+  const roIndex = args.indexOf('--ro-bind', 0);
+  const rwIndex = args.indexOf('--bind');
+  assert.ok(roIndex !== -1 && rwIndex !== -1, 'both bind flags must be present');
+  assert.ok(roIndex < rwIndex, 'read-only main .git bind must be applied before the writable worktree gitdir bind');
+  assert.deepEqual(args.slice(roIndex, roIndex + 3), ['--ro-bind', mainGit, mainGit]);
+  assert.deepEqual(args.slice(rwIndex, rwIndex + 3), ['--bind', worktreeGitDir, worktreeGitDir]);
+
+  // A .git file pointing at a worktree gitdir that does not exist on the host must be
+  // skipped entirely (same "missing optional path" treatment as every other bind).
+  const missingDir = path.join(root, 'definitely-missing');
+  const workDir2 = path.join(root, 'wt-missing');
+  fs.mkdirSync(workDir2);
+  fs.writeFileSync(path.join(workDir2, '.git'), `gitdir: ${missingDir}/worktrees/ghost\n`);
+  const args2 = buildBwrapArgs({ workDir: workDir2 });
+  assert.equal(args2.includes('--ro-bind'), false);
+  assert.equal(args2.includes('--bind'), false);
 });
 
 test('wrapWithSandbox reports available:false when bwrap is not on PATH', () => {
