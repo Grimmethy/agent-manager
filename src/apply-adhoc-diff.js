@@ -29,6 +29,47 @@ function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
 }
 
+// 2026-09-11 (brain-dump #886): a deterministic backstop for a missed `after` link. The
+// decompose prompt already tells the model to set "after": N "when the piece genuinely
+// cannot start until that earlier one is merged -- e.g. it edits a file the earlier one
+// creates" (local-agentic-write-draft.js) -- but two real incidents (draft-file-guard,
+// apply-outcome-classifiers) show the model skipping it even when a LATER proposal's own
+// rawText literally `require()`s the exact file path an EARLIER proposal's own title/
+// rawText says it creates. Each sub-task then drafted independently against its own
+// guess of the other's shape, producing two incompatible siblings -- caught only by luck,
+// via a `git cherry-pick` add/add conflict during manual landing.
+//
+// Narrow and conservative on purpose: only fires on an earlier proposal matching
+// "create/add/write/scaffold ... <path>.<ext>" (a real created-file claim, not a passing
+// mention), and only links when a LATER proposal's rawText contains that exact path
+// substring -- the same "it edits a file the earlier one creates" case the prompt already
+// names, just enforced mechanically when the model forgets it. Never overrides an
+// `after` the model DID set.
+const CREATED_FILE_RE = /\b(?:create|add|write|scaffold)\b(?:[^.\n]{0,60}?)\b([\w./-]+\.(?:js|ts|py|ps1|sh))\b/i;
+
+function inferMissingAfterLinks(subTasks) {
+  // Keyed on the file's BASENAME, not its full path -- a wiring sub-task typically
+  // `require()`s/`import`s the module by a relative path ("./draft-file-guard.js"), while
+  // the creating sub-task names it repo-rooted ("src/draft-file-guard.js"); matching on
+  // the shared basename catches both real incidents without needing exact path agreement.
+  const createdBy = new Map(); // basename -> earliest sub-task index that creates it
+  subTasks.forEach((sub, i) => {
+    const m = CREATED_FILE_RE.exec(`${sub.title || ''} ${sub.rawText || ''}`);
+    if (!m) return;
+    const basename = m[1].split('/').pop();
+    if (!createdBy.has(basename)) createdBy.set(basename, i);
+  });
+  return subTasks.map((sub, i) => {
+    if (Number.isInteger(sub.after)) return sub; // the model already made this call -- leave it
+    for (const [basename, j] of createdBy) {
+      if (j < i && typeof sub.rawText === 'string' && sub.rawText.includes(basename)) {
+        return { ...sub, after: j };
+      }
+    }
+    return sub;
+  });
+}
+
 // 2026-08-24: applies a RESOLUTION: decompose draft (adhoc-agentic-draft.js) by writing
 // each proposed sub-task into queue/adhoc/, the exact schema/location queue-adhoc-task.js
 // already uses -- nextAdhocTask() (task-sources.js) force-overrides domain/source to
@@ -48,7 +89,8 @@ function slugify(str) {
 // doing the work. Required a manual re-stamp on both children to keep the original
 // intent. A parent that was flagged premium clearly wants ITS descendants prioritized
 // too -- decomposition is supposed to be transparent to that intent, not reset it.
-function queueSubTasks(subTasks, pipelineDir, parentTaskId, parentTask) {
+function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
+  const subTasks = inferMissingAfterLinks(rawSubTasks);
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
   const ids = subTasks.map((sub, i) => `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`);
@@ -208,4 +250,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks };
