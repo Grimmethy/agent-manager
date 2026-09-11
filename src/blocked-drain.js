@@ -84,6 +84,18 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
       const already = Array.isArray(data.requeuedForSignatures) ? data.requeuedForSignatures : [];
       if (already.includes(signature)) continue;
 
+      // Carry the rejection context a fresh drafting pass would otherwise lose: blockedReason
+      // and priorRejectionFeedback are deliberately dropped from the stripped `fresh` shape
+      // below (see the test asserting pending.blockedReason === undefined), so stamp them
+      // onto data.retryPromptContext and surface them on the requeued task instead.
+      data.retryPromptContext = {
+        blockedReason: data.blockedReason || null,
+        mostRecentRejection: (Array.isArray(data.priorRejectionFeedback) && data.priorRejectionFeedback.length) ? data.priorRejectionFeedback[data.priorRejectionFeedback.length - 1] : null,
+        allPriorRejections: Array.isArray(data.priorRejectionFeedback) ? data.priorRejectionFeedback : [],
+        stampedAt: nowIso,
+        stampedBy: 'blocked-drain',
+      };
+
       // Same "strip to a fresh pending shape" reset the dashboard's own manual requeue
       // endpoint uses (python/dashboard/app.py's api_task_requeue) -- every drafting/review
       // artifact dropped, localRejectCount implicitly reset to 0 (field simply absent), a
@@ -95,6 +107,7 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
         source: data.source,
         title: data.title,
         promptContext: data.promptContext,
+        retryPromptContext: data.retryPromptContext,
         requeuedForSignatures: [...already, signature],
         status: 'pending',
         createdAt: nowIso,
@@ -105,6 +118,7 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
       // different, undocumented { status, at, note } vocabulary here vs every other
       // stage-transition writer's canonical { stage, at, detail }, task-history.js).
       appendHistoryEvent(fresh, 'pending', `auto-requeued from ${dir}/: the fix for "${signature}" was confirmed and applied`);
+      appendHistoryEvent(fresh, 'retry-context-stamped', data.retryPromptContext.mostRecentRejection || 'no prior rejections');
 
       const destPath = path.join(pendingDir, name);
       if (fs.existsSync(destPath)) continue; // already has a pending entry -- don't clobber it
