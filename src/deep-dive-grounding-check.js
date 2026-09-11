@@ -31,6 +31,7 @@
 
 const { call: localCall } = require('./local-client.js');
 
+// 2026 'Cheap Verifiers, Large Blind Spots' caveat: Check 2 (this cheap model) is a better-than-nothing second layer, NOT a substitute for Check 1's deterministic match -- its blind spot is largest in this cheap/cheap config. See src/deterministic-recheck-registry.js header.
 const GROUNDING_CHECK_MODEL = process.env.AGENT_MANAGER_DEEP_DIVE_GROUNDING_MODEL || 'qwen2.5:3b';
 const GROUNDING_CHECK_NUM_CTX = 8192;
 
