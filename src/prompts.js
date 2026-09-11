@@ -1903,6 +1903,12 @@ function buildCritiquePrompt(task, planText, implementText) {
     '=== IMPLEMENT DRAFT (the one you are reviewing) ===',
     implementText,
     '',
+    ...(Array.isArray(task.preFilterFlags) && task.preFilterFlags.length ? [
+      'DETERMINISTIC PRE-CHECKS (run before you, on the plan and/or this draft) flagged the following -- treat each as a LEAD to verify against the inputs, not a verdict:',
+      ...task.preFilterFlags.map((f) => `- ${f.type}: ${f.detail}`),
+      'For a `missing-file` lead specifically: it is only a real problem if the draft CLAIMS that path already exists (edits/reads it as existing code). It is NOT a problem if the draft is CREATING that file, or the path lives in another repo the checker cannot see.',
+      '',
+    ] : []),
     'Output contract: if the draft has NO real problems against the given inputs, output exactly and ONLY the literal string `NO ISSUES FOUND`. If it DOES have problems, list each as a separate numbered point. Each point must state (a) what is wrong and (b) which specific fact/input/requirement it contradicts or fails to meet — vague stylistic nitpicks do not count.',
     '',
     'Do NOT invent a problem just to have something to say. If the draft genuinely looks fine against the given inputs, output must be `NO ISSUES FOUND` and nothing else.',
