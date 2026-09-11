@@ -55,6 +55,23 @@ test('buildCritiquePrompt still truncates a promptContext larger than the new ca
   assert.ok(prompt.includes('...[truncated]'), 'a genuinely oversized promptContext should still be capped, not passed through unbounded');
 });
 
+test('buildCritiquePrompt renders task.preFilterFlags as advisory LEADS, framed as verify-not-verdict', () => {
+  const task = {
+    title: 't', domain: 'adhoc', source: 'adhoc', promptContext: {},
+    preFilterFlags: [{ type: 'missing-file', detail: 'src/phantom.js' }],
+  };
+  const prompt = buildCritiquePrompt(task, 'plan', 'impl');
+  assert.match(prompt, /DETERMINISTIC PRE-CHECKS/);
+  assert.match(prompt, /- missing-file: src\/phantom\.js/);
+  assert.match(prompt, /LEAD to verify/i);
+  assert.match(prompt, /NOT a problem if the draft is CREATING that file/);
+});
+
+test('buildCritiquePrompt has no pre-checks section when there are no preFilterFlags', () => {
+  const prompt = buildCritiquePrompt({ title: 't', domain: 'adhoc', source: 'adhoc', promptContext: {} }, 'plan', 'impl');
+  assert.ok(!prompt.includes('DETERMINISTIC PRE-CHECKS'));
+});
+
 // brain_dump_sort's selfProjectLabel carve-out (2026-08-16): confirmed live a real
 // self-referential note ("brain dump entries should track an interaction count") was
 // classified actionable:false, belongsToProject:null despite being a genuine feature

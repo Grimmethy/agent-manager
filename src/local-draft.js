@@ -1574,6 +1574,34 @@ async function runCritiqueAndRevision(task, {
     appendHistoryEvent(task, 'critique-done', task.critiqueOutcome);
     return;
   }
+
+  // Advisory pre-critique fact-check on the IMPLEMENT RESPONSE (brain-dump
+  // bd-1788725054994): missingFileCheck (src/draft-file-guard.js -- a pure checkDraft
+  // wrapper) flags file paths the draft names that do not exist in the repo and are not
+  // its own create targets. Merged into task.preFilterFlags so buildCritiquePrompt
+  // surfaces them to the critic as leads. Deliberately NOT a hard block: checkFilePaths
+  // over-matches prose/example paths, which is exactly why review-task.js has always
+  // treated missing-file as a reviewer hint, never an auto-reject. Best-effort -- any
+  // failure leaves task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const cfg = getConfig();
+    const { missing } = require('./draft-file-guard.js').missingFileCheck(
+      task.implementResponse || '',
+      cfg.repoRoot,
+      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [],
+    );
+    if (Array.isArray(missing) && missing.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = missing
+        .map((p) => ({ type: 'missing-file', detail: p }))
+        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique missing-file check failed (advisory):', (err && err.message) || err);
+  }
+
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
   let startedAt = new Date().toISOString();
   let startMs = Date.now();
