@@ -760,6 +760,26 @@ test('computePlanNumPredict gives a large evidence-bundle task (e.g. pipeline_de
   assert.equal(computePlanNumPredict({ source: 'manual' }), 1400);
 });
 
+// 2026-09-11, root-caused live from the biggest blocked-task cluster (21 of ~99 blocked
+// tasks): change_review/observability_fix/performance_fix/arch_discovery hit the exact
+// same "truncated, 0 visible chars, doneReason length" failure as the evidenceText case
+// above, but via other large promptContext fields (change_review's own diff/file-content
+// blob), so the evidenceText-only check above never gave them the higher budget. Sized
+// off promptContext.length in aggregate rather than a specific field name.
+test('computePlanNumPredict gives ANY large promptContext the higher plan budget, not just evidenceText', () => {
+  const { computePlanNumPredict } = require('./local-draft.js');
+  const bigDiff = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(9000), files: ['a.js'] } };
+  assert.equal(computePlanNumPredict(bigDiff), 2800);
+
+  const smallDiff = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(500), files: ['a.js'] } };
+  assert.equal(computePlanNumPredict(smallDiff), 1400);
+
+  // Real observed sizes from the live blocked cluster (observability_fix, performance_fix,
+  // arch_discovery) all clear the threshold too, regardless of field name.
+  const observabilityFix = { source: 'observability_fix', promptContext: { candidateText: 'y'.repeat(7200) } };
+  assert.equal(computePlanNumPredict(observabilityFix), 2800);
+});
+
 test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
   const { computeImplementBudget } = require('./local-draft.js');
   const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
