@@ -78,8 +78,40 @@ const EXTERNAL_DEP_MARKERS = [
   { label: 'hosting/deploying/publishing', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
   { label: 'a git remote operation', re: /\bgit\s+(remote|push|clone)\b/i },
   { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
-  { label: 'a network/third-party service call', re: /\b(network|internet|external\s+api|third[\s_-]?party\s+service)\b/i },
+  // 2026-09-11 (screaminggoatclubmt, from two real blocked hub-children -- adhoc-add-
+  // node-test-coverage-for-scopecomplexitygate-1789097760618-2 and adhoc-exclude-turn-
+  // limit-exhaustion-from-the-retry-loop-1788877276899-1): the bare `\bnetwork\b`/
+  // `\binternet\b` alternative matched the word on its own, with no requirement that it
+  // actually describe a dependency THIS task has. Root-caused live: one task's own
+  // acceptance criteria said "does not depend on network access" (a NEGATION -- the task
+  // explicitly disclaims the dependency the marker then credited it with), the other
+  // named "network" only inside a parenthetical listing pre-existing retryable error
+  // categories ("errors (network, timeout, ...)"), describing code that already exists,
+  // not a new call this task must make. Same shape as the "tokens" false-positive fixed
+  // 2026-09-08 above: a bare vocabulary word that also has an innocuous, common
+  // in-repo/in-plan usage. Fixed two ways, same as that precedent: (1) require an actual
+  // dependency-shaped qualifier after network/internet (access/call/request/connectivity/
+  // outage) rather than the bare word alone -- "errors (network, timeout, ...)" no longer
+  // matches; (2) a shared negation guard (isNegatedMatch, below) skips any marker whose
+  // match is preceded nearby by a negation cue -- "does not depend on network access"
+  // no longer matches. The negation guard is applied to every marker, not just this one,
+  // since a task text saying "this does NOT need git push" or "no credentials required"
+  // would be the identical false-positive shape for any of them.
+  { label: 'a network/third-party service call', re: /\b(network|internet)\s+(access|call|request|connectivity|connection|outage|dependency)\b|\bexternal\s+api\b|\bthird[\s_-]?party\s+service\b/i },
 ];
+
+// Negation cues that, appearing shortly before a marker match, mean the surrounding text
+// is disclaiming the dependency rather than requiring it ("does not depend on network
+// access", "no credentials needed", "without a third-party service"). A short fixed
+// window (not a full-sentence parse) is deliberate: cheap, and every real false positive
+// found so far had the cue within a few words of the match.
+const NEGATION_LOOKBACK_CHARS = 40;
+const NEGATION_RE = /\b(not|n't|no|without|never|cannot|can't|doesn't|does not|didn't|won't|isn't|aren't)\b/i;
+
+function isNegatedMatch(text, matchIndex) {
+  const windowStart = Math.max(0, matchIndex - NEGATION_LOOKBACK_CHARS);
+  return NEGATION_RE.test(text.slice(windowStart, matchIndex));
+}
 
 // Real field names, verified against this repo's actual task shape -- NOT task.ask/
 // task.plan (no such fields exist anywhere in this codebase): task.title +
@@ -91,7 +123,8 @@ function detectExternalDependency(task) {
   const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
     .filter(Boolean).join(' ');
   for (const marker of EXTERNAL_DEP_MARKERS) {
-    if (marker.re.test(text)) return marker.label;
+    const match = marker.re.exec(text);
+    if (match && !isNegatedMatch(text, match.index)) return marker.label;
   }
   return null;
 }
