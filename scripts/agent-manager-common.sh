@@ -201,7 +201,23 @@ should_yield_for_model_swap() {
     return 0
   fi
 
-  local state_path="${INSTANCES_DIR}/.active-local-model.json"
+  # Keyed per Ollama endpoint (2026-09-11, screaminggoatclubmt: worker-p40 never picked
+  # up a task after the P40 lane was re-enabled) -- this state file used to be one
+  # pipeline-wide path shared by every local-worker/reviewer instance regardless of which
+  # Ollama endpoint they talk to. That was fine when there was exactly one shared GPU:
+  # "resident model" and "target tier's pending count" both meant the one machine. Once
+  # worker-p40/worker-reasoning-p40 started pointing OLLAMA_URL at the P40 VM's own,
+  # physically separate Ollama instance, the shared file made them yield to the LOCAL
+  # RTX 3090 lanes' residency and pending-tier counts -- a swap on the local GPU can't
+  # possibly evict anything on the P40, so that yield was pure starvation: confirmed live,
+  # worker-p40 yielded every tick because reviewer kept re-writing the shared file with
+  # its own (different) resident model while the global "low" tier queue, which local
+  # lanes constantly cycle, never emptied. Keying the path by ollama_url isolates each
+  # physically independent GPU's residency tracking from every other one; the local
+  # lanes' own single-GPU behavior is unchanged since they all still share one key.
+  local ollama_key
+  ollama_key="$(printf '%s' "$ollama_url" | tr -c 'A-Za-z0-9' '_')"
+  local state_path="${INSTANCES_DIR}/.active-local-model.${ollama_key}.json"
   [[ -f "$state_path" ]] || { echo proceed; return 0; }
   local resident_model resident_tier
   resident_model="$(node -e 'try{const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(d.model||"")}catch(e){}' "$state_path")"
@@ -409,7 +425,10 @@ release_single_flight_lock() {
 # residency for a model this process gave up pursuing ticks ago.
 record_active_model() {
   local instance_id="$1" model="$2" tier="$3"
-  local state_path="${INSTANCES_DIR}/.active-local-model.json"
+  local ollama_url="${OLLAMA_URL:-http://localhost:11434}"
+  local ollama_key
+  ollama_key="$(printf '%s' "$ollama_url" | tr -c 'A-Za-z0-9' '_')"
+  local state_path="${INSTANCES_DIR}/.active-local-model.${ollama_key}.json"
   node -e '
     const fs = require("fs");
     const [statePath, instanceId, model, tier] = process.argv.slice(1);
