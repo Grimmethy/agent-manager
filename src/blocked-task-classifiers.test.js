@@ -158,3 +158,51 @@ test('REASON_CATEGORIES is exported unchanged in shape for staleness-audit.js\'s
   assert.ok(entry);
   assert.deepEqual(entry.keywords, ['fabricat', 'hallucinat', 'unverified claim', 'ungrounded']);
 });
+
+test('categorizeBlockedReason recognizes the AC-45/AC-59 JSON-parse-failure shape (mixed case, real apply-group-b.js wording)', () => {
+  assert.equal(
+    categorizeBlockedReason('Invalid JSON in Group B implementResponse: Unexpected end of JSON input'),
+    'json-parse-failure',
+  );
+  assert.equal(
+    categorizeBlockedReason('invalid json: Unexpected token < in JSON at position 0'),
+    'json-parse-failure',
+  );
+});
+
+test('categorizeBlockedReason recognizes a false-positive-worded blockedReason (case-insensitive)', () => {
+  assert.equal(categorizeBlockedReason('False positive: task was not actually blocked'), 'json-parse-failure');
+  assert.equal(categorizeBlockedReason('FALSE POSITIVE after re-check'), 'json-parse-failure');
+});
+
+test('classifyBlockedTask returns json-parse-failure / model / retryable for a JSON-parse blockedReason, not uncategorized', () => {
+  const result = classifyBlockedTask({ blockedReason: 'Invalid JSON in Group B implementResponse: Unexpected end of JSON input' });
+  assert.deepEqual(result, { category: 'json-parse-failure', faultSide: 'model', retryable: true, classifierName: 'json-parse-failure' });
+});
+
+test('negative: the five pre-existing keyword categories still resolve to their own buckets', () => {
+  const cases = [
+    ['fabricated-ungrounded-claim', 'the draft contains a fabricated citation'],
+    ['refusal-no-changes-needed', 'refusal: no-changes-needed'],
+    ['empty-degenerate-draft', 'empty response from model'],
+    ['truncated-draft', 'response was truncated'],
+    ['inconclusive-review', 'review vote was inconclusive'],
+  ];
+  for (const [category, reason] of cases) {
+    assert.equal(categorizeBlockedReason(reason), category, `for "${reason}"`);
+  }
+});
+
+test('negative: an unknown reason still categorizes to null and still falls back to uncategorized', () => {
+  assert.equal(categorizeBlockedReason('a genuinely novel failure nobody has a keyword for'), null);
+  const result = classifyBlockedTask({ blockedReason: 'a genuinely novel failure nobody has a keyword for' });
+  assert.equal(result.category, 'uncategorized');
+  assert.equal(result.classifierName, null);
+});
+
+test('signatureForTask: json-parse-failure gets a distinct non-null signature; uncategorized stays null', () => {
+  const classified = signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'Invalid JSON in Group B implementResponse: Unexpected end of JSON input' });
+  assert.equal(classified, 'pipeline_forensics_fix::json-parse-failure');
+  assert.equal(signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'a genuinely novel failure nobody has a keyword for' }), null);
+  assert.notEqual(classified, null);
+});
