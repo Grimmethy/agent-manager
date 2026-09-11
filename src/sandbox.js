@@ -25,6 +25,7 @@
 // under bwrap."
 
 const fs = require('fs');
+const path = require('path');
 const { execFileSync } = require('child_process');
 
 let cachedBwrapPath;
@@ -46,6 +47,34 @@ function clearBwrapPathCache() {
   cachedBwrapPath = undefined;
 }
 
+// If workDir is a linked git worktree (its .git is a FILE containing a "gitdir:" line,
+// not a directory), returns the two binds git needs to actually work inside a sandbox:
+// the main <repoRoot>/.git as read-only (objects/refs are shared with the main checkout
+// and must not be mutated by a worktree-local status/diff), and the worktree's own
+// .git/worktrees/<name> gitdir as writable (HEAD, index, and other worktree-local state
+// live there and git status/diff must be able to refresh them). Returns empty bind lists
+// for a normal repo (.git directory), a workDir with no .git at all, or a .git file that
+// somehow lacks a "gitdir:" line (malformed -- nothing safe to derive from). buildBwrapArgs
+// then skips any of these paths that does not exist on the host, as with all other binds.
+function linkedWorktreeBinds(workDir) {
+  const gitFile = path.join(workDir, '.git');
+  let stat;
+  try {
+    stat = fs.statSync(gitFile);
+  } catch (e) {
+    return { readOnlyBinds: [], writableBinds: [] };
+  }
+  if (!stat.isFile()) return { readOnlyBinds: [], writableBinds: [] };
+  const gitdirLine = fs.readFileSync(gitFile, 'utf8')
+    .split('\n')
+    .find((l) => l.startsWith('gitdir:'));
+  if (!gitdirLine) return { readOnlyBinds: [], writableBinds: [] };
+  const worktreeGitDir = gitdirLine.slice('gitdir:'.length).trim();
+  // e.g. /repo/.git/worktrees/feat-x -> /repo/.git (the two path segments above the name)
+  const mainGitDir = path.dirname(path.dirname(worktreeGitDir));
+  return { readOnlyBinds: [mainGitDir], writableBinds: [worktreeGitDir] };
+}
+
 // Builds a bwrap argv from a bind list. Read-only binds are applied first, writable binds
 // second -- bwrap applies binds in argv order, so a writable bind whose path is NESTED
 // inside an already-bound read-only tree correctly overrides just that subpath (this is
@@ -53,8 +82,15 @@ function clearBwrapPathCache() {
 // <repoRoot>/.git stays read-only -- see adhoc-agentic-draft.js's own comment on why that
 // specific split is needed). Silently skips any bind path that doesn't exist on disk
 // (e.g. /lib64 isn't present on every distro) rather than erroring -- a missing optional
-// path is not a reason to fail the whole sandbox.
+// path is not a reason to fail the whole sandbox. Also auto-adds the linked-worktree .git
+// split (see linkedWorktreeBinds) when workDir is a worktree, so git status/diff have
+// read access to the shared main .git and write access to the worktree-local gitdir --
+// without that, git inside the sandbox errors "not a git repository" or fails to refresh
+// the worktree's index/HEAD (adhoc-brain-dump-bd-1788863683714 acceptance criterion 4).
 function buildBwrapArgs({ workDir, readOnlyBinds = [], writableBinds = [], env = {} }) {
+  const wt = linkedWorktreeBinds(workDir);
+  readOnlyBinds = [...readOnlyBinds, ...wt.readOnlyBinds];
+  writableBinds = [...writableBinds, ...wt.writableBinds];
   const args = [];
   for (const p of readOnlyBinds) {
     if (fs.existsSync(p)) args.push('--ro-bind', p, p);
@@ -97,4 +133,4 @@ function wrapWithSandbox(bin, binArgs, opts) {
   return { available: true, command: bwrap, args: [...sandboxArgs, '--', bin, ...binArgs] };
 }
 
-module.exports = { wrapWithSandbox, buildBwrapArgs, clearBwrapPathCache };
+module.exports = { wrapWithSandbox, buildBwrapArgs, clearBwrapPathCache, linkedWorktreeBinds };
