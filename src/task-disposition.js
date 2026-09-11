@@ -35,6 +35,8 @@
 
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
+const { appendHistoryEvent } = require('./task-history.js');
+const { classifyApplyOutcome } = require('./apply-outcome-classifiers.js');
 
 const TERMINAL_STAGES = new Set([
   'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded',
@@ -273,10 +275,12 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
     return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost` };
   }
 
-  // 7. Unclassifiable apply outcome from a non-branch source -- record it as a noop rather
-  //    than cry "abandoned" for what is almost certainly a doc/verdict source with an
-  //    unusual detail string.
-  return { stage: 'noop', detail: `apply outcome not classifiable, treated as no-op: ${detail || '(no detail)'}`.slice(0, 200) };
+  // 7. Unclassifiable apply outcome from a non-branch source -- delegate to the
+  //    apply-outcome classifier, record a 'apply' history event, then return the
+  //    classified terminal stage.
+  const classified = classifyApplyOutcome({ task: record, detail, taskId, mainBranch, shipCtx: ctx, applied });
+  appendHistoryEvent(record, 'apply', classified.detail);
+  return { stage: classified.stage, detail: classified.detail };
 }
 
 module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail };
