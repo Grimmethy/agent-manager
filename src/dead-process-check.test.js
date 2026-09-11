@@ -194,6 +194,58 @@ test('a reviewer stuck "working" the SAME task for review\'s real worst-case dur
   assert.deepEqual(actions, [], 'still comfortably within the real worst-case chain -- must not be treated as a hung/zombie process');
 });
 
+// 2026-09-11, root-caused live ("p40 is entirely blocked by ollama timeouts"): paired
+// with local-client.js's P40_PER_CALL_TIMEOUT_CEILING_MS (900s) -- draft's 4-call chain
+// at 900s/call is 3600s worst case for the P40 lane specifically, well past the general
+// 1680s threshold. Same failure mode this file's own header documents for the 240s/1200s
+// case: raising a lane's per-call ceiling without raising its zombie threshold in
+// lockstep means the watchdog SIGKILLs a legitimately still-generating worker mid-call.
+test('a worker-p40 stuck "working" the SAME task for the P40 lane\'s real worst-case duration (~3600s, 4 sequential 900s calls) is NOT flagged as a zombie', () => {
+  const dir = tempInstancesDir();
+  const stuckTime = new Date(Date.now() - 3600_000).toISOString(); // 60 min -- the P40 lane's real worst case
+  writeHeartbeat(dir, 'worker-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime });
+  const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  assert.deepEqual(actions, [], 'still within the P40 lane\'s real worst-case chain -- must not be treated as a hung/zombie process');
+});
+
+test('a worker-reasoning-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a zombie -- the exception is not unlimited', () => {
+  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
+  try {
+    const dir = tempInstancesDir();
+    const staleTime = new Date(Date.now() - 3900_000).toISOString(); // past 3840s
+    writeHeartbeat(dir, 'worker-reasoning-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: staleTime, stateSince: staleTime, pid: process.pid });
+    const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+    const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].instanceId, 'worker-reasoning-p40');
+    assert.equal(actions[0].action, 'restart-after-kill');
+  } finally {
+    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
+    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
+  }
+});
+
+// A non-P40 worker at the SAME 3600s age it takes to clear the P40's own longer threshold
+// must still be flagged -- confirms the exception is scoped to the two P40 instanceIds,
+// not a global change to WORKER_ZOMBIE_THRESHOLD_SECONDS.
+test('a worker-1 stuck for the P40 lane\'s worst-case duration (3600s) IS still flagged as a zombie -- the exception does not leak to other lanes', () => {
+  const dir = tempInstancesDir();
+  const stuckTime = new Date(Date.now() - 3600_000).toISOString();
+  writeHeartbeat(dir, 'worker-1', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime, pid: process.pid });
+  const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].instanceId, 'worker-1');
+  assert.equal(actions[0].action, 'restart-after-kill');
+});
+
 test('a healthy, recently-updated worker heartbeat produces no action', () => {
   const dir = tempInstancesDir();
   writeHeartbeat(dir, 'reviewer');
