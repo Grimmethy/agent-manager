@@ -97,6 +97,12 @@ function logHardFailureAudit(entry) {
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
+// 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"):
+// worker-p40/worker-reasoning-p40 set OLLAMA_URL to the P40 VM's Ollama instance
+// (AGENT_MANAGER_P40_OLLAMA_URL) -- when this process's OLLAMA_URL matches it, this IS
+// the P40 lane, confirmed by comparing the two resolved env vars directly rather than
+// guessing from a hostname pattern.
+const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
 // No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
 // should be fully interchangeable and their names should not be hardcoded anywhere") --
 // this used to fall back to the bare literal string 'ornith', which isn't a real Ollama
@@ -258,7 +264,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
     const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
-    localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration });
+    localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL });
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
     // own response already carries this exact breakdown (load_duration -- time spent
@@ -292,16 +298,39 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
 // LOCAL_TIMEOUT_MS (or the older ORNITH_TIMEOUT_MS name) still overrides everything below,
 // same as before this module existed.
 const PER_CALL_TIMEOUT_CEILING_MS = 240_000;
+
+// 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"): the
+// 240s ceiling above was sized for the local RTX 3090's throughput. Confirmed live via
+// pipeline-history.log: 100% of real worker-p40/worker-reasoning-p40 draft calls hit
+// OLLAMA_TIMEOUT at exactly 240000ms once a plan pass needed the 2800-token budget
+// (computePlanNumPredict) -- at the P40's real measured ~9.3 tok/s, 2800 tokens of
+// generation alone takes ~301s, already past this ceiling before the 2.5x safety
+// margin or prompt-eval time. This is structural, not intermittent: a fixed wall-clock
+// cap doesn't scale with hardware that is ~3.5x slower. Raised for the P40 endpoint
+// specifically (see IS_P40_ENDPOINT above) rather than for every caller, since a
+// generously long ceiling on the FAST local GPU would just let a genuinely hung call
+// sit for 15 minutes before anyone notices. dead-process-check.js's
+// WORKER_ZOMBIE_THRESHOLD_SECONDS has a matching P40-specific exception so a legitimately
+// still-generating P40 worker isn't SIGKILL'd mid-call by the watchdog -- the two values
+// must be changed together (see that file's own comment on the worst-case chain math).
+// A deliberate, named exception to docs/pipeline-incident-2026-07-19.md's formalized
+// "nothing in this pipeline should exceed 5 minutes" rule -- that rule was calibrated to
+// the local RTX 3090; the P40 VM is a categorically different, ~3.5x slower, physically
+// isolated endpoint (see gpu-capacity.js's resolveTimeoutMs hardCeilingMs param for the
+// mechanism this passes through). This is the "revisit this reasoning first" the
+// incident doc itself requires before exceeding its ceiling, not a silent bump.
+const P40_PER_CALL_TIMEOUT_CEILING_MS = 900_000;
 const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || null;
 
 function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
   if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
-  const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir);
+  const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir, OLLAMA_URL);
   return gpuCapacity.resolveTimeoutMs({
     promptTokens,
     numPredict,
     tokensPerSecond,
-    ceilingMs: PER_CALL_TIMEOUT_CEILING_MS,
+    ceilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
+    hardCeilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
   });
 }
 
@@ -524,7 +553,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

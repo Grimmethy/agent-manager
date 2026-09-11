@@ -157,3 +157,60 @@ test('logHardFailureAudit is advisory: a broken pipelineDir never throws or brea
   const mod = require('./local-client.js');
   assert.doesNotThrow(() => mod.logHardFailureAudit({ source: 'x' }));
 });
+
+// --- IS_P40_ENDPOINT / resolveRequestTimeoutMs (2026-09-11) -----------------------------
+// Root-caused live: "p40 is entirely blocked by ollama timeouts" -- 100% of real
+// worker-p40/worker-reasoning-p40 draft calls hit OLLAMA_TIMEOUT at exactly the standard
+// 240s ceiling once a plan pass needed the 2800-token budget, because at the P40's real
+// ~9.3 tok/s that generation alone needs ~301s. OLLAMA_URL/AGENT_MANAGER_P40_OLLAMA_URL
+// are both resolved once at module load from process.env (same pattern local-client.js
+// already uses for OLLAMA_URL itself), so each test re-requires the module fresh after
+// setting env, same discipline as this file's existing withFixtureRepo helper.
+function withEnv(envOverrides, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(envOverrides)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  delete require.cache[require.resolve('./local-client.js')];
+  try {
+    return fn(require('./local-client.js'));
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    delete require.cache[require.resolve('./local-client.js')];
+  }
+}
+
+test('IS_P40_ENDPOINT is true only when OLLAMA_URL matches AGENT_MANAGER_P40_OLLAMA_URL exactly', () => {
+  withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
+    assert.equal(mod.IS_P40_ENDPOINT, true);
+  });
+  withEnv({ OLLAMA_URL: 'http://localhost:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
+    assert.equal(mod.IS_P40_ENDPOINT, false, 'the local GPU lane must not be treated as the P40 lane');
+  });
+  withEnv({ OLLAMA_URL: 'http://localhost:11434', AGENT_MANAGER_P40_OLLAMA_URL: undefined }, (mod) => {
+    assert.equal(mod.IS_P40_ENDPOINT, false, 'no P40 configured at all must never match');
+  });
+});
+
+test('resolveRequestTimeoutMs gives the P40 endpoint its 900s exception, past the standard 240s ceiling, for a real large-plan-pass shaped call', () => {
+  withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-p40-timeout-'));
+    // Real observed P40 throughput (~9.3 tok/s) and the computePlanNumPredict 2800-token
+    // budget large-context sources now get (local-draft.js).
+    fs.writeFileSync(path.join(dir, '.local-throughput.http___192_168_122_29_11434.json'), JSON.stringify({ tokensPerSecond: 9.3 }));
+    const ms = mod.resolveRequestTimeoutMs({ promptTokens: 4000, numPredict: 2800, instancesDir: dir });
+    assert.ok(ms > mod.PER_CALL_TIMEOUT_CEILING_MS, `a real P40 large-plan call must get more than the standard 240s ceiling, got ${ms}`);
+    assert.ok(ms <= mod.P40_PER_CALL_TIMEOUT_CEILING_MS, `still bounded by the P40 exception itself, got ${ms}`);
+  });
+});
+
+test('resolveRequestTimeoutMs keeps the standard 240s-derived ceiling for the local (non-P40) endpoint, even for the same large numPredict', () => {
+  withEnv({ OLLAMA_URL: 'http://localhost:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-local-timeout-'));
+    const ms = mod.resolveRequestTimeoutMs({ promptTokens: 4000, numPredict: 2800, instancesDir: dir });
+    assert.ok(ms <= mod.PER_CALL_TIMEOUT_CEILING_MS, `the local GPU lane must stay within the documented 240s ceiling, got ${ms}`);
+  });
+});

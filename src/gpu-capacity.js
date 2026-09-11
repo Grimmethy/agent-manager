@@ -146,12 +146,27 @@ function resolveTimeoutMs({
 
   safetyFactor = 2.5,
   ceilingMs = HARD_TIMEOUT_CEILING_MS,
+  // 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"): the
+  // 300s HARD_TIMEOUT_CEILING_MS below is docs/pipeline-incident-2026-07-19.md's
+  // formalized, deliberately-never-silently-raised rule -- correct for the local RTX
+  // 3090 this pipeline was built around. It is NOT correct for a categorically
+  // different, ~3.5x slower, physically isolated endpoint (the P40 VM): at its real
+  // measured ~9.3 tok/s, a 2800-token plan-pass generation needs ~301s for generation
+  // ALONE, before this function's own 2.5x safety margin, so the 300s hard floor makes
+  // every such call fail 100% of the time, confirmed live via pipeline-history.log.
+  // hardCeilingMs is an explicit, named escape hatch for exactly this case -- a caller
+  // must deliberately pass it (default preserves the original hard-won 300s for every
+  // other caller unchanged); see local-client.js's P40_PER_CALL_TIMEOUT_CEILING_MS for
+  // the one caller that does, and its own comment for why 900s specifically. This is
+  // the "revisit this reasoning first" the incident doc itself asks for, not a silent
+  // bump of the shared constant.
+  hardCeilingMs = HARD_TIMEOUT_CEILING_MS,
 }) {
   const tps = tokensPerSecond > 0 ? tokensPerSecond : 15; // conservative floor for a cold/unmeasured machine -- replaced by real measurements after the first few calls (local-throughput.js).
   const prefillMs = (promptTokens / prefillTokensPerSecond) * 1000;
   const genMs = (numPredict / tps) * 1000;
   const computed = baseOverheadMs + (prefillMs + genMs) * safetyFactor;
-  return Math.min(Math.max(computed, MIN_TIMEOUT_MS), Math.min(ceilingMs, HARD_TIMEOUT_CEILING_MS));
+  return Math.min(Math.max(computed, MIN_TIMEOUT_MS), Math.min(ceilingMs, hardCeilingMs));
 }
 
 module.exports = {

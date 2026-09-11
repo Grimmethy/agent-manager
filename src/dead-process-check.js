@@ -46,6 +46,17 @@ const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above local-client.
 // draft's own worst case. Sized to the LARGER of the two chains (review's 1440s, not
 // draft's 960s) plus the same 240s slack margin the original value used.
 const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680; // 28 min -- comfortably above review's real ~1440s worst-case chain (the larger of the two), not a single call.
+// 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"): paired
+// with local-client.js's P40_PER_CALL_TIMEOUT_CEILING_MS (900s, a deliberate exception to
+// the 2026-07-19 5-minute-ceiling doctrine for this one categorically slower, physically
+// isolated endpoint -- see that file's own comment). Raising a lane's per-call ceiling
+// without raising its zombie threshold in lockstep reintroduces the exact SIGKILL-loop
+// failure mode documented above for the 240s case: draft's 4-call chain at 900s/call is
+// 3600s worst case, well past the general 1680s threshold, so the watchdog would kill a
+// legitimately still-generating P40 worker mid-call. Same slack-margin discipline as the
+// general value (+240s), applied only to the two P40 instanceIds.
+const WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
+const P40_INSTANCE_IDS = new Set(['worker-p40', 'worker-reasoning-p40']);
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
 // instanceId -> { script, args, pidfileName } -- mirrors launch.sh's own hardcoded
@@ -176,7 +187,8 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
 
       const pidAlive = isProcessAlive(hb.pid);
       const isWorker = hb.instanceId.startsWith('worker-');
-      const isZombie = pidAlive && isWorker && ageSeconds >= WORKER_ZOMBIE_THRESHOLD_SECONDS;
+      const zombieThreshold = P40_INSTANCE_IDS.has(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 : WORKER_ZOMBIE_THRESHOLD_SECONDS;
+      const isZombie = pidAlive && isWorker && ageSeconds >= zombieThreshold;
 
       if (pidAlive && !isZombie) continue; // still alive, just a slow single call (or a non-worker instance, which keeps the strict PID-gate).
 
