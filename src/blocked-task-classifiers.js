@@ -127,16 +127,27 @@ function buildFabricatedFilePathQuestion(task) {
 
 // Keyword categories over blockedReason text, same ones used by hand triaging this
 // session's blocked queue, same priority order. faultSide:'model' -- a keyword match on
-// the draft's own text/behavior -- and retryable:true for all five: no real evidence yet
+// the draft's own text/behavior -- and retryable:true for all six: no real evidence yet
 // that any of them are mis-classified, so this pass makes their fault-side visible
 // without changing any existing retry decision (see this file's own header for why that
 // caution matters -- Design option B was explicitly deferred for the same reason).
+//
+// json-parse-failure (2026-09-09, closing the deferred Design option B gap this file's
+// header named): the AC-45/AC-59-shaped block "Invalid JSON in Group B implementResponse:
+// <parse message>" (src/apply-group-b.js, stamped by recordApplyOutcome in
+// src/apply-task.js) and "false positive"-worded blocks contained none of the five
+// substrings above and fell through categorizeBlockedReason's null into classifyBlockedTask's
+// uncategorized bucket. Deliberately SCOPED, per the gap's own warning: each keyword is a
+// specific multi-word phrase a human would actually write in a blockedReason -- no bare
+// single tokens -- and nothing here is a generic word that could itself be mis-read as
+// evidence of a JSON failure (the failure the gap warned about re-introducing).
 const REASON_CATEGORIES = [
   { key: 'fabricated-ungrounded-claim', keywords: ['fabricat', 'hallucinat', 'unverified claim', 'ungrounded'] },
   { key: 'refusal-no-changes-needed', keywords: ['no-changes-needed', 'refus'] },
   { key: 'empty-degenerate-draft', keywords: ['empty', 'degenerate', 'no actual implementation', 'no implementation', 'no code'] },
   { key: 'truncated-draft', keywords: ['truncat'] },
   { key: 'inconclusive-review', keywords: ['inconclusive'] },
+  { key: 'json-parse-failure', keywords: ['invalid json', 'unexpected end of json', 'unexpected token', 'false positive'] },
 ];
 
 function categorizeBlockedReason(reason) {
