@@ -50,6 +50,38 @@ test('buildBwrapArgs silently skips a bind path that does not exist on disk', ()
   assert.equal(args.includes('--ro-bind'), false);
 });
 
+test('buildBwrapArgs mounts a linked-worktree .git: main .git as --ro-bind before worktree gitdir as --bind', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-worktree-'));
+  const mainGit = path.join(base, 'main-repo', '.git');
+  const worktreeGitdir = path.join(mainGit, 'worktrees', 'feature-branch');
+  fs.mkdirSync(worktreeGitdir, { recursive: true });
+
+  const workDir = path.join(base, 'worktree');
+  fs.mkdirSync(workDir, { recursive: true });
+  fs.writeFileSync(path.join(workDir, '.git'), `gitdir: ${worktreeGitdir}\n`);
+
+  const args = buildBwrapArgs({ workDir });
+
+  const roIdx = args.indexOf('--ro-bind');
+  const bindIdx = args.indexOf('--bind');
+  assert.ok(roIdx !== -1, 'must emit --ro-bind for the main .git');
+  assert.ok(bindIdx !== -1, 'must emit --bind for the worktree gitdir');
+  assert.ok(roIdx < bindIdx, 'main .git ro-bind must precede worktree gitdir bind');
+  assert.deepEqual(args.slice(roIdx, roIdx + 3), ['--ro-bind', mainGit, mainGit]);
+  assert.deepEqual(args.slice(bindIdx, bindIdx + 3), ['--bind', worktreeGitdir, worktreeGitdir]);
+});
+
+test('buildBwrapArgs skips the worktree gitdir --bind when the gitdir path does not exist', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-worktree-missing-'));
+  const workDir = path.join(base, 'worktree');
+  fs.mkdirSync(workDir, { recursive: true });
+  const missingGitdir = path.join(base, 'nowhere', '.git', 'worktrees', 'ghost');
+  fs.writeFileSync(path.join(workDir, '.git'), `gitdir: ${missingGitdir}\n`);
+
+  const args = buildBwrapArgs({ workDir });
+  assert.equal(args.includes(missingGitdir), false);
+});
+
 test('buildBwrapArgs clears the environment before setting explicit env entries -- no inherited secrets', () => {
   const args = buildBwrapArgs({ workDir: os.tmpdir(), env: { FOO: 'bar' } });
   const clearIndex = args.indexOf('--clearenv');
