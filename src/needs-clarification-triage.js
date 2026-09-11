@@ -77,6 +77,35 @@
 //      the script from scratch and this time actually execute it, rather than sitting on
 //      a human's queue for a decision that was never really needed. Bounded by the same
 //      MAX_REQUEUES counter every other requeue bucket uses.
+//
+//   H. DETERMINISTICALLY-CLASSIFIED INVALID-PREMISE (2026-09-11) -- src/blocked-task-
+//      classifiers.js escalates a blocked task straight to needs-clarification/ with
+//      reason:'invalid-premise' when its blockedReason matched /^invalid premise:/i --
+//      candidate-premise-check.js's own deterministic/model-vetted gate output, already
+//      confirmed before the task ever reached blocked/. This used to hit the
+//      `nc.reason !== 'design-decision'` gate below and be skipped entirely ("not ours"),
+//      so it sat in needs-clarification/ forever with no triage at all -- confirmed live
+//      2026-09-11: 9 pipeline_forensics_fix / arch_import_review tasks, all untouched
+//      since creation. Unlike bucket B (which infers "premise looks invalid" from a
+//      design-decision task's free-text openQuestions and needs a resolution signal or
+//      vote to act on that inference), the reason itself IS the confirmed signal here --
+//      but this still reuses bucket B's own archive-or-flag machinery (resolution-signal
+//      check, then a majority vote, then a medium-confidence flag) rather than archiving
+//      unconditionally, so a premise that was true when filed but has since been
+//      invalidated by other work still gets one more check before anything moves.
+//
+//   I. DETERMINISTICALLY-CLASSIFIED UNRELIABLE-GROUNDING (2026-09-11) -- same escalation
+//      path, reason:'unreliable-grounding' (blocked-task-classifiers.js's
+//      hasUnreliableGrounding: the candidate's fetched file had anchorConfidence:'none').
+//      That file's own comment explains why this is NOT a bucket-A/D/E/F/G-style requeue
+//      candidate: refreshCandidateFetchedFiles() re-derives the SAME deterministic anchor
+//      search against the SAME unchanged file on every retry, so a blind requeue can only
+//      ever reproduce the identical failure -- genuinely harness-side, not stochastic.
+//      Also hit the `nc.reason !== 'design-decision'` gate and sat untouched forever (11
+//      tasks, confirmed live 2026-09-11). Treated like bucket C's retry-exhausted shape:
+//      file ghost debt (no automated recovery exists), stamp it reviewed, leave it
+//      visible for a human to fix the grounding source or archive -- instead of the old
+//      silent, permanent drop.
 
 const fs = require('fs');
 const path = require('path');
@@ -240,7 +269,102 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     }
 
     const nc = task.needsClarification || {};
-    if (nc.reason !== 'design-decision') continue;                       // not ours
+    const reason = nc.reason;
+    if (reason !== 'design-decision' && reason !== 'invalid-premise' && reason !== 'unreliable-grounding') {
+      continue;                                                          // not ours
+    }
+
+    // --- Bucket H: deterministically-classified invalid-premise -------------------
+    if (reason === 'invalid-premise') {
+      if (task.ncTriageDecision === 'leave-for-human') continue;         // already reviewed
+      summary.checked += 1;
+      const id = task.id || name.replace(/\.json$/, '');
+      const oq = nc.openQuestions || '';
+
+      const archive = (decisionNote) => {
+        log(`${id}: bucket H (deterministic invalid-premise) -> archive (${decisionNote})`);
+        summary.archived += 1;
+        if (DRY_RUN) return;
+        appendHistoryEvent(task, 'archived',
+          `needs-clarification-triage: invalid-premise (candidate-premise-check.js, deterministic) -- ${decisionNote}`);
+        task.status = 'done';
+        const dest = path.join(archiveDir, `${id}.json`);
+        try {
+          if (fs.existsSync(dest)) { log(`${id}: archive dest exists -- already handled`); summary.archived -= 1; return; }
+          fs.mkdirSync(archiveDir, { recursive: true });
+          fs.writeFileSync(dest, JSON.stringify(task, null, 2));
+          fs.unlinkSync(file);
+        } catch (e) {
+          log(`${id}: archive move failed: ${e.message}`);
+          summary.archived -= 1;
+          summary.errors += 1;
+        }
+      };
+
+      let resolved = false;
+      try { resolved = hasResolutionSignal(task, oq); } catch (e) { log(`${id}: hasResolutionSignal threw: ${e.message} -- treating as unresolved`); resolved = false; }
+      if (resolved) { archive('verified resolution signal'); continue; }
+
+      if (VOTE_ENABLED && typeof majorityVote === 'function' && votesUsed < MAX_VOTES) {
+        votesUsed += 1;
+        let vote;
+        try {
+          vote = await majorityVote({
+            prompt: buildInvalidPremisePrompt(task),
+            classify: classifyVote(['CONFIRM', 'DENY'], 15),
+            n: 3, minAgreeing: 2, temperature: 0.2,
+            source: 'needs_clarification_triage', model: VOTE_MODEL,
+            taskId: task.id, stage: 'nc-triage-premise-vote',
+          });
+        } catch (e) {
+          appendHistoryEvent(task, 'advisory',
+            `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
+          writeInPlace(file, task);
+          summary.errors += 1;
+          continue;
+        }
+        if (vote && vote.confident && vote.verdict === 'CONFIRM') {
+          archive(`local vote: ${voteReason(vote, 'CONFIRM')}`);
+          continue;
+        }
+        // confident DENY or inconclusive -> fall through to flag
+      }
+
+      log(`${id}: bucket H but unverified -> flag + leave`);
+      summary.flagged += 1;
+      if (DRY_RUN) continue;
+      if (!task.stalenessFlag || task.stalenessFlag.reason !== 'nc-triage-invalid-premise') {
+        task.stalenessFlag = {
+          reason: 'nc-triage-invalid-premise', disposition: 'retire', confidence: 'medium',
+          at: now, evidence: [oq.slice(0, 300)],
+        };
+      }
+      task.ncTriageReviewedAt = now;
+      task.ncTriageDecision = 'leave-for-human';
+      appendHistoryEvent(task, 'advisory',
+        'needs-clarification-triage: invalid-premise (deterministic gate), unverified by a resolution signal or vote -- flagged for a human');
+      writeInPlace(file, task);
+      continue;
+    }
+
+    // --- Bucket I: deterministically-classified unreliable-grounding --------------
+    if (reason === 'unreliable-grounding') {
+      if (task.ncTriageDecision === 'leave-for-human') continue;         // already reviewed
+      summary.checked += 1;
+      const id = task.id || name.replace(/\.json$/, '');
+      const oq = nc.openQuestions || '';
+      log(`${id}: bucket I (unreliable-grounding, harness-side, blind retry reproduces identically) -> flag + leave for human`);
+      summary.leftForHuman += 1;
+      if (DRY_RUN) continue;
+      fileGhostDebt({ task, reasonText: oq || task.blockedReason, site: 'needs-clarification-triage:bucket-I-unreliable-grounding', pipelineDir });
+      task.ncTriageReviewedAt = now;
+      task.ncTriageDecision = 'leave-for-human';
+      appendHistoryEvent(task, 'advisory',
+        'needs-clarification-triage: unreliable-grounding (harness-side; a blind retry reproduces the same anchor-match failure) -- ghost debt filed, left for a human to fix the grounding source or archive');
+      writeInPlace(file, task);
+      continue;
+    }
+
     const decompLoop = !!(task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop');
     if (decompLoop && targetOversizedFile(task, oversizedFiles(pipelineDir))) continue; // autoroute owns it
     if (task.stalenessKeep && task.stalenessKeep.until && task.stalenessKeep.until > now) continue; // human said Keep
