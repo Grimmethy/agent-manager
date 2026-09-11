@@ -88,6 +88,24 @@ test('resolveTimeoutMs never exceeds ollama-http.js\'s documented 5-minute hard 
   assert.equal(ms, HARD_TIMEOUT_CEILING_MS);
 });
 
+// 2026-09-11, root-caused live ("p40 is entirely blocked by ollama timeouts"): the P40
+// VM's Ollama endpoint is ~3.5x slower than the local RTX 3090 this 300s hard ceiling was
+// calibrated to -- a 2800-token plan-pass generation alone needs ~301s at the P40's real
+// ~9.3 tok/s, already past 300s before this function's own safety margin, so every real
+// P40 call hit OLLAMA_TIMEOUT. hardCeilingMs is a deliberate, explicitly-named escape
+// hatch (local-client.js's one caller that passes it) -- the test just above still holds
+// for every caller that DOESN'T pass it, which is every other caller in this codebase.
+test('resolveTimeoutMs honors an explicit hardCeilingMs override past the documented 300s ceiling -- the deliberate P40 exception', () => {
+  const ms = resolveTimeoutMs({ promptTokens: 4000, numPredict: 2800, tokensPerSecond: 9.3, ceilingMs: 900_000, hardCeilingMs: 900_000 });
+  assert.ok(ms > HARD_TIMEOUT_CEILING_MS, `a real P40-shaped call should get more than the 300s hard ceiling, got ${ms}`);
+  assert.ok(ms <= 900_000, `still bounded by the explicit override, got ${ms}`);
+});
+
+test('resolveTimeoutMs defaults hardCeilingMs to the standard 300s ceiling when omitted -- every existing caller is unaffected', () => {
+  const ms = resolveTimeoutMs({ promptTokens: 100000, numPredict: 100000, tokensPerSecond: 5, ceilingMs: 10_000_000 });
+  assert.equal(ms, HARD_TIMEOUT_CEILING_MS);
+});
+
 test('resolveTimeoutMs falls back to a conservative floor tokens/sec when none is supplied', () => {
   const withMeasured = resolveTimeoutMs({ promptTokens: 1000, numPredict: 1000, tokensPerSecond: 100 });
   const withoutMeasured = resolveTimeoutMs({ promptTokens: 1000, numPredict: 1000, tokensPerSecond: undefined });
