@@ -138,4 +138,5 @@ module.exports = {
   checkFabricatedSymbols,
   buildGroundingCheckPrompt,
   parseGroundingVerdict,
+  realFilesOf,
 };
