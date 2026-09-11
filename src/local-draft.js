@@ -1569,9 +1569,6 @@ async function runCritiqueAndRevision(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
 }) {
   if (isAdvisoryProseSource(resolveSourceName(task))) {
-    task.critiqueOutcome = 'skipped-advisory-prose';
-    recordCritique(attempt, { outcome: task.critiqueOutcome });
-    appendHistoryEvent(task, 'critique-done', task.critiqueOutcome);
     return;
   }
 
