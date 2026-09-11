@@ -160,3 +160,43 @@ test('a task already auto-requeued for this signature is not requeued again', ()
   assert.deepEqual(requeuedIds, []);
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'adhoc-again-1.json')), true);
 });
+
+// --- retryPromptContext: carry priorRejectionFeedback onto the requeued task (2026-09-12) ---
+
+test('requeueBlockedTasksForSignature stamps retryPromptContext with non-empty priorRejectionFeedback', () => {
+  const dir = tempPipelineDir();
+  writeBlocked(dir, 'retry-ctx-1', {
+    source: 'arch_import', domain: 'default', title: 'RC-1',
+    promptContext: { itemId: '99' },
+    history: [{ stage: 'harness-search', detail: '0 quer(y/ies), 0 hit(s), 0 file(s)' }],
+    blockedReason: 'no grounding',
+    priorRejectionFeedback: ['too vague', 'wrong file', 'missing grounding'],
+  });
+
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'arch_import::harness-search-zero-results');
+  assert.deepEqual(requeuedIds, ['retry-ctx-1']);
+
+  const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'retry-ctx-1.json'), 'utf8'));
+  assert.equal(pending.retryPromptContext.mostRecentRejection, 'missing grounding');
+  assert.deepEqual(pending.retryPromptContext.allPriorRejections, ['too vague', 'wrong file', 'missing grounding']);
+  assert.equal(pending.blockedReason, undefined); // stripped shape -- context lives on retryPromptContext
+});
+
+test('requeueBlockedTasksForSignature stamps retryPromptContext.mostRecentRejection as null for empty priorRejectionFeedback', () => {
+  const dir = tempPipelineDir();
+  writeBlocked(dir, 'retry-ctx-2', {
+    source: 'arch_import', domain: 'default', title: 'RC-2',
+    promptContext: { itemId: '100' },
+    history: [{ stage: 'harness-search', detail: '0 quer(y/ies), 0 hit(s), 0 file(s)' }],
+    blockedReason: 'no grounding',
+    priorRejectionFeedback: [],
+  });
+
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'arch_import::harness-search-zero-results');
+  assert.deepEqual(requeuedIds, ['retry-ctx-2']);
+
+  const pending = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'retry-ctx-2.json'), 'utf8'));
+  assert.equal(pending.retryPromptContext.mostRecentRejection, null);
+  assert.deepEqual(pending.retryPromptContext.allPriorRejections, []);
+  assert.equal(pending.blockedReason, undefined);
+});
