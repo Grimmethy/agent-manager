@@ -263,6 +263,87 @@ test('applyAdhocDiff does not add premiumPriority to sub-tasks when the parent w
   assert.equal('premiumPriority' in queued[0], false);
 });
 
+// --- inferMissingAfterLinks: deterministic backstop for a missed `after` (2026-09-11, brain-dump #886) ---
+
+const { inferMissingAfterLinks } = require('./apply-adhoc-diff.js');
+
+test('inferMissingAfterLinks: reproduces the real draft-file-guard incident -- a later proposal require()ing an earlier one\'s exact created file gets linked', () => {
+  const subTasks = [
+    { title: 'Create src/draft-file-guard.js', rawText: 'Create a new module src/draft-file-guard.js exporting `missingFileCheck(draftText, repoRoot, extraRoots=[])`.' },
+    { title: 'Wire the guard into src/local-draft.js before runCritiqueAndRevision', rawText: "In src/local-draft.js, add `const { missingFileCheck } = require('./draft-file-guard.js');` to the top require block." },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[0].after, undefined);
+  assert.equal(linked[1].after, 0);
+});
+
+test('inferMissingAfterLinks: reproduces the real apply-outcome-classifiers incident', () => {
+  const subTasks = [
+    { title: 'Create src/apply-outcome-classifiers.js', rawText: 'Create a new module src/apply-outcome-classifiers.js exporting classifyApplyOutcome.' },
+    { title: 'Wire classifier into src/task-disposition.js:279', rawText: "replace the literal 'apply outcome not classifiable' noop return with a call to require('./apply-outcome-classifiers.js')'s classifyApplyOutcome" },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[1].after, 0);
+});
+
+test('inferMissingAfterLinks: never overrides an `after` the model already set', () => {
+  const subTasks = [
+    { title: 'Create src/foo.js', rawText: 'Create src/foo.js.' },
+    { title: 'Independent piece', rawText: "Mentions src/foo.js in passing but the model explicitly said after:0 for a different reason.", after: 0 },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[1].after, 0); // unchanged, not re-derived
+});
+
+test('inferMissingAfterLinks: no path mention -> no link added (the common, independent case)', () => {
+  const subTasks = [
+    { title: 'Piece one', rawText: 'Do the first independently-implementable piece.' },
+    { title: 'Piece two', rawText: 'Do the second independently-implementable piece.' },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[0].after, undefined);
+  assert.equal(linked[1].after, undefined);
+});
+
+test('inferMissingAfterLinks: a passing mention of a file NOT claimed as created by anyone does not link', () => {
+  const subTasks = [
+    { title: 'Investigate src/existing-file.js', rawText: 'Read src/existing-file.js to understand the current behavior.' },
+    { title: 'Edit src/existing-file.js', rawText: 'Now edit src/existing-file.js to add the new branch.' },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[1].after, undefined, 'neither proposal CREATES the file, so no created-file signal exists to link on');
+});
+
+test('inferMissingAfterLinks: only links to an EARLIER index, never a later one', () => {
+  const subTasks = [
+    { title: 'Wire it in', rawText: "Uses src/bar.js: require('./bar.js')." },
+    { title: 'Create src/bar.js', rawText: 'Create src/bar.js.' },
+  ];
+  const linked = inferMissingAfterLinks(subTasks);
+  assert.equal(linked[0].after, undefined, 'the creator comes AFTER this proposal in the array -- nothing to link to yet');
+});
+
+test('applyAdhocDiff end-to-end: the inferred `after` becomes a real dependsOn edge on the queued task', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-inferred-after',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Create src/widget.js', rawText: 'Create a new module src/widget.js exporting doWidget.' },
+      { title: 'Wire widget into src/app.js', rawText: "In src/app.js, add require('./widget.js') and call doWidget()." },
+    ],
+  };
+
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const creator = queued.find((t) => t.title === 'Create src/widget.js');
+  const wirer = queued.find((t) => t.title.startsWith('Wire widget'));
+  assert.deepEqual(wirer.dependsOn, [creator.id]);
+});
+
 test('applyAdhocDiff returns {skipped} without queuing anything when a decompose draft has no surviving sub-task proposals', () => {
   const repoDir = makeRepo();
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
