@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems } = require('./apply-group-a.js');
+const { dedupByCluster } = require('./cluster-dedup.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -1194,6 +1195,43 @@ function makeDebriefPipeline() {
   fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
   return dir;
 }
+
+// --- dedupByCluster: dismissal suppresses the whole cluster ---------------
+// Regression guard for the 15-observability_review-window debrief pattern above:
+// a silent-catch-block finding already dismissed as a false positive must not drag
+// its same-directory siblings into toDispatch -- nor should undischarged clusters
+// be wrongly suppressed.
+
+test('dedupByCluster: one dismissed-false-positive in a 5-finding cluster suppresses all 5', () => {
+  const dir = '/repo/src/services';
+  const findings = [1, 2, 3, 4, 5].map((i, idx) => ({
+    source: 'observability_review',
+    findingType: 'silent-catch-block',
+    directory: dir,
+    id: `oc-${i}`,
+    ...(idx === 0 ? { priorDisposition: 'dismissed-false-positive' } : {}),
+  }));
+
+  const { toDispatch, suppressed } = dedupByCluster(findings);
+
+  assert.equal(toDispatch.length, 0, 'no findings should be dispatched when the cluster is dismissed');
+  assert.equal(suppressed.length, 5, 'all 5 findings land in suppressed');
+});
+
+test('dedupByCluster: no dismissal in a 5-finding cluster dispatches all 5', () => {
+  const dir = '/repo/src/services';
+  const findings = [1, 2, 3, 4, 5].map((i) => ({
+    source: 'observability_review',
+    findingType: 'silent-catch-block',
+    directory: dir,
+    id: `oc-${i}`,
+  }));
+
+  const { toDispatch, suppressed } = dedupByCluster(findings);
+
+  assert.equal(toDispatch.length, 5, 'all 5 findings should be dispatched');
+  assert.equal(suppressed.length, 0, 'no findings should be suppressed');
+});
 
 test('applyDebriefReport: first pass holds the report for human confirmation', () => {
   const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task: { id: 't', title: 'Pipeline debrief: x', promptContext: { taskIds: ['d1'] } } });
