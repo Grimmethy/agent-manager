@@ -976,9 +976,25 @@ function bestPriorPlan(task) {
 // future evidence-bundling source gets this for free without needing its own carve-out
 // here). Extracted to its own pure function (mirrors computeImplementBudget) purely for
 // direct unit-testability.
+// 2026-09-11 (screaminggoatclubmt, from the biggest single blocked-task cluster found
+// live -- 21 of ~99 blocked tasks, all "Plan pass degenerate: truncated"): the two checks
+// above only ever fired for promptContext.brainDumpEntryId or a specifically-named
+// evidenceText field, so change_review/observability_fix/performance_fix/arch_discovery
+// -- none of which use either field -- never got the higher budget despite hitting the
+// EXACT same failure shape (0 visible chars, doneReason 'length', at the 1400 ceiling):
+// change_review's plan prompt embeds a full diff (up to change-review.js's own 22000-char
+// CHANGE_REVIEW_CONTEXT_BUDGET_CHARS) and asks the model to "walk EVERY changed hunk"
+// before writing anything -- the same "reason extensively before emitting visible text"
+// mechanism as the evidence-bundle case, just via a different field name. Checked live
+// against the 14 real blocked instances of this cluster: promptContext sizes ranged
+// 7170-21381 chars; the smallest observed failure was 7170, so 6000 leaves real margin
+// without needing to hardcode these source names (a future large-context source gets
+// this for free, same discipline as the evidenceText check already established here).
 function computePlanNumPredict(task) {
-  const hasLargeEvidenceBundle = !!(task.promptContext && task.promptContext.evidenceText && task.promptContext.evidenceText.length > 10000);
-  return (task.promptContext && task.promptContext.brainDumpEntryId) || hasLargeEvidenceBundle ? 2800 : 1400;
+  const ctx = task.promptContext;
+  const hasLargeEvidenceBundle = !!(ctx && ctx.evidenceText && ctx.evidenceText.length > 10000);
+  const hasLargePromptContext = !!(ctx && JSON.stringify(ctx).length > 6000);
+  return (ctx && ctx.brainDumpEntryId) || hasLargeEvidenceBundle || hasLargePromptContext ? 2800 : 1400;
 }
 
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
