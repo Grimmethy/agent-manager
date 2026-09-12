@@ -247,7 +247,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   const instancesDir = resolveInstancesDir();
   const lockModel = model || MODEL;
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
-  const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir });
+  const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model: lockModel });
   // Stable per-worker-lane session id (not per-call) so TokenFold sees these as a
   // continuing session instead of hashing each distinct prompt into its own one-off
   // session -- see postJson's extraHeaders doc for why that continuity is what lets its
@@ -264,7 +264,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
     const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
-    localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL });
+    localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL, model: lockModel });
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
     // own response already carries this exact breakdown (load_duration -- time spent
@@ -322,9 +322,9 @@ const PER_CALL_TIMEOUT_CEILING_MS = 240_000;
 const P40_PER_CALL_TIMEOUT_CEILING_MS = 900_000;
 const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || null;
 
-function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir }) {
+function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model }) {
   if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
-  const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir, OLLAMA_URL);
+  const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir, OLLAMA_URL, model);
   return gpuCapacity.resolveTimeoutMs({
     promptTokens,
     numPredict,
