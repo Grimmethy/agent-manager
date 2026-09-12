@@ -20,6 +20,7 @@ const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { isNoopApplyDetail } = require('./task-disposition.js');
+const { writeTaskLogFile, taskLogRelPath } = require('./task-log-store.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -491,13 +492,20 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // correctly regardless of which path produced the artifact.
     const filesToAdd = artifact.files || [artifact.file];
     assertStageableFiles(task, filesToAdd);
-    gitRunner.add(filesToAdd);
+
+    // The durable task log: a git-tracked snapshot of task.history (+ a few terminal
+    // fields) staged and committed in the SAME commit as the real change, named in the
+    // trailer below. See task-log-store.js's header for why this can't just be the
+    // queue/ file the rest of apply-task.js already works with.
+    const taskLogRel = writeTaskLogFile(repoRoot, task);
+    gitRunner.add([...filesToAdd, taskLogRel]);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
     const commitMessage = [
       task.title,
       '',
       `Task: ${task.id} (${task.domain}/${task.source})`,
+      `Task-Log: ${taskLogRel}`,
       '',
       coAuthorTrailer(task),
     ].join('\n');
@@ -706,8 +714,9 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
       }
       const files = artifact.files || [artifact.file];
       assertStageableFiles(task, files);
-      gitRunner.add(files);
-      staged.push({ task, files });
+      const taskLogRel = writeTaskLogFile(repoRoot, task);
+      gitRunner.add([...files, taskLogRel]);
+      staged.push({ task, files, taskLogRel });
     } catch (e) {
       // This task's append threw. Its file may carry a partial trailing line -- cosmetic
       // in an append-only markdown candidate doc and visible in review; not worth a
@@ -723,6 +732,8 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
     `Triage batch: ${staged.length} candidate-doc update(s)`,
     '',
     ...staged.map((s) => `- ${s.task.title} (task ${s.task.id})`),
+    '',
+    ...staged.map((s) => `Task-Log: ${s.taskLogRel}`),
     '',
     coAuthorTrailer(staged[0].task),
   ].join('\n');

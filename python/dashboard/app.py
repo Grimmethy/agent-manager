@@ -3097,6 +3097,27 @@ def api_task_requeue(state, task_id):
         abort(409, description=f"'{task_id}' already has a task in pending/")
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    # history must never be replaced -- it's the one append-only, complete log of
+    # everything that happened to this task (see task-history.js and AGENTS.md's task-log
+    # section), and a manual requeue is exactly the kind of step whose OWN reason (plus
+    # whatever blockedReason/priorRejectionFeedback drove it) needs to survive in that log,
+    # not vanish the moment the task starts its next draft cycle. Root-caused live
+    # 2026-09-12: this endpoint used to stamp a brand-new one-entry array here, discarding
+    # every prior event -- including the real blockedReason a `blocked` history event
+    # already carried -- for observability-fix-ac-158 and others, so the ONLY trace left
+    # of why a task ever blocked was this note's bare "manually requeued from blocked/".
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued",
+        "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        # The exact fields a fresh rebuild used to drop silently -- carried into the log
+        # entry itself so they're never lost even though the rebuilt task below won't
+        # carry them forward as live working state.
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
     fresh = {
         "id": data.get("id", task_id),
         "domain": data.get("domain"),
@@ -3104,8 +3125,8 @@ def api_task_requeue(state, task_id):
         "title": data.get("title"),
         "promptContext": data.get("promptContext"),
         "status": "pending",
-        "createdAt": now_iso,
-        "history": [{"status": "pending", "at": now_iso, "note": f"manually requeued from {state}/"}],
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
     }
     # Coordination fields (see this endpoint's own docstring) -- never part of the
     # drafting/review/apply history this reset is meant to clear, so always carried over
@@ -5953,6 +5974,20 @@ def _is_real_ship(rec):
     return False
 
 
+def _find_task_log_anywhere(repo_root, task_id):
+    """Fallback for _find_task_record_anywhere when a task's queue/ record is genuinely
+    gone -- not just archived (that's already covered by every branch above): the queue/
+    dir was never migrated to this host, or something outside this dashboard's own
+    archive sweep removed it. task-logs/<id>.json (src/task-log-store.js) is the one place
+    a shipped task's complete history is guaranteed to still exist, because apply-task.js
+    commits it -- tracked, not gitignored -- in the SAME commit as the real change. See
+    AGENTS.md's task-log section: 'available at a click, ever' has to survive this case,
+    not just the already-handled archive-bucket ones."""
+    if not repo_root or not task_id:
+        return None
+    return read_json_safe(Path(repo_root) / "task-logs" / f"{task_id}.json")
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the
@@ -5985,6 +6020,29 @@ def _find_task_record_anywhere(qdir, task_id):
     return None, None
 
 
+def _history_entry_detail_text(e):
+    """The visible line under a history entry's stage label in the Unmerged Branches
+    modal. Older/hand-written entries (the pre-task-history.js `{"status": "pending"}`
+    shape api_task_requeue used to write, still the shape of a `requeued` event's own
+    note today) carry their text in `note`, not `detail` -- confirmed live 2026-09-12:
+    observability-fix-ac-158's requeue entry rendered as a bare 'pending' label with
+    nothing beneath it, because this used to read ONLY `detail`. Also folds in the
+    blockedReasonAtRequeue/priorRejectionFeedbackAtRequeue api_task_requeue now stamps on
+    its own `requeued` entry (see that endpoint) -- without this, that data is captured in
+    the JSON but still invisible at a click, same failure mode this whole mechanism exists
+    to close."""
+    parts = []
+    if e.get("detail"):
+        parts.append(str(e["detail"]))
+    elif e.get("note"):
+        parts.append(str(e["note"]))
+    if e.get("blockedReasonAtRequeue"):
+        parts.append(f"(blocked for: {e['blockedReasonAtRequeue']})")
+    if e.get("priorRejectionFeedbackAtRequeue"):
+        parts.append(f"(prior rejections: {e['priorRejectionFeedbackAtRequeue']})")
+    return " ".join(parts) if parts else None
+
+
 def _summarize_task_record(data, state):
     """Compact pipeline log for one task, for the Unmerged Branches detail modal: the
     full `history[]` (created -> plan -> implement tiers -> review votes -> applied ->
@@ -6007,7 +6065,7 @@ def _summarize_task_record(data, state):
         "reviewVotes": review_votes,
         "decomposedFrom": (data.get("promptContext") or {}).get("decomposedFrom"),
         "history": [
-            {"stage": e.get("stage") or e.get("status"), "at": e.get("at"), "detail": e.get("detail")}
+            {"stage": e.get("stage") or e.get("status"), "at": e.get("at"), "detail": _history_entry_detail_text(e)}
             for e in history
         ],
     }
@@ -6067,13 +6125,14 @@ def _hub_for_branch(qdir, branch, commit_task_ids):
     return None
 
 
-def _label_for_branch(task_id, pipeline_dir, subject):
+def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     """Best-effort human label: the originating task's own title/domain/source (plus a
     plain-English description of what it actually changed, see _describe_change) if a
     matching queue file can still be found (checked across every terminal-ish state a
-    merge-worthy branch's task could be sitting in), else the branch tip's own commit
-    subject line -- never just the raw branch name, which is an opaque id nobody but this
-    pipeline can read at a glance."""
+    merge-worthy branch's task could be sitting in), else the git-tracked task log
+    (task-logs/<id>.json, see _find_task_log_anywhere) if THAT still exists, else the
+    branch tip's own commit subject line -- never just the raw branch name, which is an
+    opaque id nobody but this pipeline can read at a glance."""
     if pipeline_dir:
         qdir = pipeline_dir / "queue"
         for state in ("done", "blocked", "awaiting-confirm", "approved"):
@@ -6086,6 +6145,15 @@ def _label_for_branch(task_id, pipeline_dir, subject):
                     "matchedTaskState": state,
                     "description": _describe_change(data),
                 }
+        log_data = _find_task_log_anywhere(repo_root, task_id)
+        if log_data:
+            return {
+                "title": log_data.get("title") or subject or task_id,
+                "domain": log_data.get("domain"),
+                "source": log_data.get("source"),
+                "matchedTaskState": "task-log",
+                "description": _describe_change(log_data),
+            }
         # A stacked file-decompose branch (agent/decompose-<slug>) carries N tasks, not
         # one -- `task_id` here is "decompose-<slug>", which is no task's id. Its owning
         # coordinator hub IS findable, and is the right label + status source.
@@ -6151,7 +6219,7 @@ def _list_unmerged_branches_uncached():
 
         conflict = _check_merge_conflict(repo_root, main_branch, branch)
 
-        label = _label_for_branch(task_id, pipeline_dir, subject.strip())
+        label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = _hub_for_branch(qdir, branch, [task_id])
         branches.append({
@@ -6353,6 +6421,10 @@ def api_git_branch_commits(branch):
             if tid not in commit_task_ids:
                 commit_task_ids.append(tid)
             data, state = _find_task_record_anywhere(qdir, tid)
+            if data is None:
+                log_data = _find_task_log_anywhere(repo_root, tid)
+                if log_data is not None:
+                    data, state = log_data, "task-log"
             if data:
                 c["task"] = _summarize_task_record(data, state)
     hub = _hub_for_branch(qdir, branch, commit_task_ids)
@@ -6478,6 +6550,40 @@ def api_git_merge_branch(branch):
                         logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
                         raise
                 break
+
+        # Close out the GIT-TRACKED task log too (src/task-log-store.js), not just the
+        # queue/ working copy above -- that file is gitignored and gets archived/pruned,
+        # while task-logs/<id>.json is committed and this is the one moment (the task's
+        # branch just landed on main) its own log can record that fact durably. Without
+        # this, "the final unmerged-branches version should just be the whole task log,
+        # completed" (2026-09-12, Grimmethy) would be true right up until merge and then
+        # regress back to whatever the log said before -- the mergedAt/terminalDisposition
+        # a MERGED task's log needs to actually be more complete than an in-process one's.
+        # Best-effort and non-fatal by the same reasoning as the block above: the merge
+        # itself already fully succeeded, and a task not authored through apply-task.js
+        # (so it never got a task-logs/ entry in the first place) is a normal, expected
+        # case, not an error.
+        task_log_path = repo_root / "task-logs" / f"{task_id}.json"
+        if task_log_path.is_file():
+            log_data = read_json_safe(task_log_path)
+            if log_data is not None and log_data.get("terminalDisposition") != "merged":
+                merge_iso = datetime.now(timezone.utc).isoformat()
+                hist = log_data.get("history")
+                if not isinstance(hist, list):
+                    hist = log_data["history"] = []
+                hist.append({
+                    "stage": "merged",
+                    "at": merge_iso,
+                    "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                })
+                log_data["terminalDisposition"] = "merged"
+                try:
+                    task_log_path.write_text(json.dumps(log_data, indent=2) + "\n", encoding="utf-8")
+                    _run_git(["add", str(task_log_path.relative_to(repo_root))], repo_root)
+                    _run_git(["commit", "-m", f"Record merge disposition in task log for {task_id}"], repo_root)
+                    _run_git(["push", "origin", main_branch], repo_root)
+                except (RuntimeError, OSError) as exc:
+                    logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
 
