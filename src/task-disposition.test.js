@@ -5,11 +5,12 @@ const assert = require('node:assert/strict');
 const { resolveDisposition, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
 
 // A fake buildShipContext() result.
-function ctx({ onMain = {}, branches = {} } = {}) {
+function ctx({ onMain = {}, branches = {}, fetchConfirmed = true } = {}) {
   return {
     mainBranch: 'master',
     onMainIds: new Map(Object.entries(onMain)),
     branchAhead: new Map(Object.entries(branches)),
+    fetchConfirmed,
   };
 }
 const applied = (detail) => ({ history: [{ stage: 'created' }, { stage: 'applied', detail }] });

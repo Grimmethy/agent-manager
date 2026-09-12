@@ -77,7 +77,7 @@ function realGit(repoRoot, args) {
 // 5000-record backfill -- unusable. Instead: one `git log --format=%B` to harvest every
 // applied task id reachable from origin/<main> (both apply-commit shapes), and one
 // `git for-each-ref` for the agent/<id> branches and how far each is ahead.
-function buildShipContext(repoRoot, { git = realGit, mainBranch: mainOverride } = {}) {
+function buildShipContext(repoRoot, { git = realGit, mainBranch: mainOverride, fetchConfirmed } = {}) {
   const mainBranch = mainOverride || (repoRoot ? detectDefaultBranch(repoRoot) : 'master');
   const onMainIds = new Map(); // taskId -> short sha of the commit that carries it
 
@@ -105,7 +105,7 @@ function buildShipContext(repoRoot, { git = realGit, mainBranch: mainOverride } 
     branchAhead.set(id, Math.max(branchAhead.get(id) || 0, ahead));
   }
 
-  return { mainBranch, onMainIds, branchAhead };
+  return { mainBranch, onMainIds, branchAhead, fetchConfirmed };
 }
 
 // Fallbacks for the single-record path (e.g. app.py right after a merge) -- one id, so a
@@ -271,7 +271,20 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
 
   // 6. The apply detail names an agent/<id> branch, but it is gone AND not on <main>:
   //    the work was lost. The loud one.
+  //    Guards (2026-09-08 root-caused live): a stale local ref cache -- the reconcile
+  //    tick never fetched -- once stamped a genuinely still-open branch "gone, work
+  //    lost". So the ONLY path to `abandoned` now requires (a) the caller confirmed
+  //    the origin refs are freshly fetched (ctx.fetchConfirmed === true), and
+  //    (b) the branch is not ahead of <main> (a scalar ctx.branchAhead, if the caller
+  //    reduces the ctx.branchAhead map for this task; a raw Map compares > 0 as
+  //    false, i.e. the safe fall-through to the pre-guard behaviour).
   if (BRANCH_DETAIL_RE.test(detail)) {
+    if (!ctx || !ctx.fetchConfirmed) {
+      return { stage: 'pending-merge', detail: 'fetch unconfirmed, deferring terminal verdict' };
+    }
+    if (ctx.branchAhead && ctx.branchAhead > 0) {
+      return { stage: 'pending-merge', detail: 'branch ahead of main, pending merge' };
+    }
     return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost` };
   }
 
