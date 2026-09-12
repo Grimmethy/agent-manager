@@ -323,6 +323,115 @@ test('inferMissingAfterLinks: only links to an EARLIER index, never a later one'
   assert.equal(linked[0].after, undefined, 'the creator comes AFTER this proposal in the array -- nothing to link to yet');
 });
 
+// --- isVerificationOnlySubTask / fold-into-acceptanceCriteria (2026-09-12, real live
+// incident: "add a comment" + "run the test suite to confirm it" split into two
+// sub-tasks, the second had no diff of its own to offer any implementation tier and got
+// deadlocked on a dependency it never actually needed) ---
+
+const { isVerificationOnlySubTask, queueSubTasks } = require('./apply-adhoc-diff.js');
+
+test('isVerificationOnlySubTask flags the real incident\'s exact title', () => {
+  assert.equal(isVerificationOnlySubTask({ title: 'Run the reconcile test module to confirm' }), true);
+});
+
+test('isVerificationOnlySubTask flags other verification-leading titles with no code-change verb', () => {
+  assert.equal(isVerificationOnlySubTask({ title: 'Confirm the guard rejects a duplicate event' }), true);
+  assert.equal(isVerificationOnlySubTask({ title: 'Verify the migration is idempotent' }), true);
+  assert.equal(isVerificationOnlySubTask({ title: 'Check that the new endpoint returns 200' }), true);
+});
+
+test('isVerificationOnlySubTask does NOT flag a real code-change title even when it mentions "verification"', () => {
+  // The real incident's own sibling task -- must stay a real, independent task.
+  assert.equal(isVerificationOnlySubTask({ title: 'Add verification comment to task-log-reconcile test' }), false);
+});
+
+test('isVerificationOnlySubTask does NOT flag a title with a code-change verb anywhere, even alongside a verification lead-in', () => {
+  assert.equal(isVerificationOnlySubTask({ title: 'Run a check and fix the guard if it fails' }), false);
+});
+
+test('isVerificationOnlySubTask does not throw and returns false for a missing/blank title', () => {
+  assert.equal(isVerificationOnlySubTask({}), false);
+  assert.equal(isVerificationOnlySubTask({ title: '' }), false);
+  assert.equal(isVerificationOnlySubTask(null), false);
+});
+
+test('queueSubTasks folds a verification-only proposal into its `after` target\'s acceptanceCriteria instead of creating a standalone task', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Add verification comment to task-log-reconcile test', rawText: 'Add a comment documenting the noop-writer relationship.' },
+    { title: 'Run the reconcile test module to confirm', rawText: 'Run `node --test src/task-log-reconcile.test.js` and confirm it exits 0.', after: 0 },
+  ];
+
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-1', {});
+
+  assert.equal(queued.length, 1, 'the verification-only piece must not become its own task');
+  assert.equal(queued[0].title, 'Add verification comment to task-log-reconcile test');
+  const record = readQueuedAdhocTasks(pipelineDir)[0];
+  assert.deepEqual(record.acceptanceCriteria, ['Run `node --test src/task-log-reconcile.test.js` and confirm it exits 0.']);
+  assert.equal('dependsOn' in record, false, 'nothing left to depend on -- the dependency was folded away, not left dangling');
+});
+
+test('queueSubTasks folds onto the immediately PRECEDING proposal when no explicit `after` is given', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Add the new gate to src/foo.js', rawText: 'Add a deterministic gate.' },
+    { title: 'Verify the gate rejects a bad input', rawText: 'Feed it a known-bad input and confirm it is rejected.' },
+  ];
+
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-2', {});
+
+  assert.equal(queued.length, 1);
+  const record = readQueuedAdhocTasks(pipelineDir)[0];
+  assert.deepEqual(record.acceptanceCriteria, ['Feed it a known-bad input and confirm it is rejected.']);
+});
+
+test('queueSubTasks leaves a verification-only FIRST proposal (nothing earlier to fold onto) as its own task, unchanged', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Confirm the existing suite passes', rawText: 'Run the suite and report.' },
+    { title: 'Add the new feature to src/bar.js', rawText: 'Add the feature.' },
+  ];
+
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-3', {});
+
+  assert.equal(queued.length, 2, 'a verification-only piece with no earlier sibling cannot be folded -- left as-is');
+});
+
+test('queueSubTasks never folds a real code-change proposal, even one that happens to depend on an earlier one', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Create src/widget.js', rawText: 'Create a new module.' },
+    { title: 'Wire widget into src/app.js', rawText: "Add require('./widget.js') and call it." },
+  ];
+
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-4', {});
+
+  assert.equal(queued.length, 2, 'two real code-change pieces must both survive as independent tasks');
+  const wirer = readQueuedAdhocTasks(pipelineDir).find((t) => t.title.startsWith('Wire widget'));
+  assert.equal('acceptanceCriteria' in wirer, false);
+});
+
+test('applyAdhocDiff end-to-end: the real incident shape (comment + confirm) queues exactly ONE task with the confirmation folded in', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-verification-fold',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Add verification comment to task-log-reconcile test', rawText: 'Add a comment documenting the noop-writer relationship.' },
+      { title: 'Run the reconcile test module to confirm', rawText: 'Run `node --test src/task-log-reconcile.test.js` and confirm it exits 0.' },
+    ],
+  };
+
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].title, 'Add verification comment to task-log-reconcile test');
+  assert.ok(Array.isArray(queued[0].acceptanceCriteria) && queued[0].acceptanceCriteria.length === 1);
+});
+
 test('applyAdhocDiff end-to-end: the inferred `after` becomes a real dependsOn edge on the queued task', () => {
   const repoDir = makeRepo();
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));

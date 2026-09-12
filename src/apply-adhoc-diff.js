@@ -89,12 +89,79 @@ function inferMissingAfterLinks(subTasks) {
 // doing the work. Required a manual re-stamp on both children to keep the original
 // intent. A parent that was flagged premium clearly wants ITS descendants prioritized
 // too -- decomposition is supposed to be transparent to that intent, not reset it.
+// 2026-09-12 (screaminggoatclubmt, real live incident: a 2-piece decompose split "add a
+// comment" and "run the test suite to confirm it" into TWO separate sub-tasks -- the
+// second had no code delta of its own to offer any diff-producing tier, ever, and got
+// auto-linked via inferMissingAfterLinks to a dependsOn edge on the first that it didn't
+// actually need (a comment cannot change whether a pre-existing test suite passes),
+// producing a task that could structurally never complete and a dependency that could
+// deadlock an unsupervised run -- see softDependsOn's own header for that half of the
+// incident). Root cause: the decompose prompt only has vocabulary for code-change-shaped
+// pieces ("touch ONE file"), nothing for "this piece is a verification checkpoint on a
+// sibling's change, not new work of its own" -- so the model, following the ORIGINAL
+// brain-dump's own "should confirm" phrasing, made that checkpoint its own task instead
+// of folding it into the code-change piece's acceptance criteria.
+//
+// Deliberately conservative (high precision over high recall, same discipline
+// CREATED_FILE_RE above already uses): only classifies a proposal as verification-only
+// when its TITLE's leading verb is confirm/verify/check/etc. AND the title contains NO
+// code-change verb anywhere -- "Add verification comment to X" still correctly reads as
+// a real code-change task (leading verb "Add") even though the word "verification"
+// appears in it; only "Run X to confirm" / "Verify Y" / "Check Z" survive both filters.
+// Checked against the TITLE only, not the full rawText, since rawText commonly mentions
+// a code-change verb in passing ("...so a follow-up pass can fix the guard") without
+// this piece itself doing that work -- the title is the short, deliberately-imperative
+// summary the decompose prompt already asks for, a far more reliable intent signal.
+// "gate"/"guard" deliberately excluded: both are extremely common NOUNS in this
+// codebase's own vocabulary ("the guard", "the gate") -- caught live via
+// "Confirm the guard rejects a duplicate event" and "Verify the gate rejects a bad
+// input", two real verification-only titles this word-boundary match cannot tell apart
+// from an actual "Gate the review on X" code-change title (which doesn't start with a
+// verification lead verb anyway, so losing this one word costs no real precision on the
+// other side).
+const CODE_CHANGE_VERB_RE = /\b(add|modify|change|fix|implement|create|write|remove|refactor|update|replace|wire|extract|rename|delete|insert|adjust|tighten|expand|introduce|migrate|split|merge|patch|restructure|drop|disable|enable)\b/i;
+const VERIFICATION_LEAD_RE = /^(run|confirm|verify|check|validate|ensure|audit|test)\b/i;
+
+function isVerificationOnlySubTask(sub) {
+  const title = String((sub && sub.title) || '').trim();
+  if (!title) return false;
+  return VERIFICATION_LEAD_RE.test(title) && !CODE_CHANGE_VERB_RE.test(title);
+}
+
 function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
   const subTasks = inferMissingAfterLinks(rawSubTasks);
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
   const ids = subTasks.map((sub, i) => `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`);
-  return subTasks.map((sub, i) => {
+
+  // Fold targets computed BEFORE any file is written, so a surviving sub-task's own
+  // record already carries every criterion folded into it. A verification-only proposal
+  // folds onto its declared `after` target when it has one, else the immediately
+  // preceding proposal (both always point to an earlier, already-resolved index, so a
+  // single forward pass is enough -- no fold ever needs to look ahead). Walks through an
+  // already-folded target to the nearest SURVIVING one, so a chain of verification-only
+  // proposals in a row still lands on one real task rather than being silently dropped.
+  const foldTargets = new Map(); // sub-task index -> surviving target index it folds into
+  subTasks.forEach((sub, i) => {
+    if (!isVerificationOnlySubTask(sub)) return;
+    let targetIndex = Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i ? sub.after : (i > 0 ? i - 1 : null);
+    while (targetIndex !== null && foldTargets.has(targetIndex)) targetIndex = foldTargets.get(targetIndex);
+    if (targetIndex !== null && targetIndex !== i) foldTargets.set(i, targetIndex);
+    // targetIndex === null (a verification-only proposal with nothing earlier to fold
+    // onto, e.g. it's sub-task 0) is left un-folded on purpose -- it becomes its own
+    // task same as before this fix, the one case this mechanism cannot improve on.
+  });
+
+  const extraCriteria = new Map(); // surviving index -> string[] folded in from siblings
+  foldTargets.forEach((targetIndex, i) => {
+    const list = extraCriteria.get(targetIndex) || [];
+    list.push(subTasks[i].rawText);
+    extraCriteria.set(targetIndex, list);
+  });
+
+  const queued = [];
+  subTasks.forEach((sub, i) => {
+    if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
     const record = {
       id: ids[i],
       domain: 'adhoc',
@@ -102,13 +169,16 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
       title: sub.title,
       promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
     };
-    if (Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i) {
+    if (Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i && !foldTargets.has(sub.after)) {
       record.dependsOn = [ids[sub.after]];
     }
+    const extra = extraCriteria.get(i);
+    if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
-    return { id: ids[i], title: sub.title };
+    queued.push({ id: ids[i], title: sub.title });
   });
+  return queued;
 }
 
 const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
@@ -250,4 +320,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask };
