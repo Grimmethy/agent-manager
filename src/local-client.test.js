@@ -214,3 +214,25 @@ test('resolveRequestTimeoutMs keeps the standard 240s-derived ceiling for the lo
     assert.ok(ms <= mod.PER_CALL_TIMEOUT_CEILING_MS, `the local GPU lane must stay within the documented 240s ceiling, got ${ms}`);
   });
 });
+
+// 2026-09-12, root-caused live: worker-reasoning-p40 STILL hit OLLAMA_TIMEOUT after the
+// endpoint-keying fix above had landed and been verified working. The P40's own Ollama
+// instance serves TWO very differently-sized models over the SAME endpoint --
+// qwen3.8-p40:27b-q4_K_M (~10 tok/s real) for most tasks, and qwen2.5:3b (confirmed live
+// at 47-65 tok/s on the SAME physical GPU) for brain_dump_sort tasks, which
+// worker-p40/worker-reasoning-p40 also run. A prior sample recorded for the small model
+// must not calibrate the big model's own timeout on the same endpoint.
+test('resolveRequestTimeoutMs on the P40 endpoint is calibrated per MODEL, not just per endpoint -- a fast small-model sample must not speed up the big model\'s timeout', () => {
+  withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-p40-model-mix-'));
+    // A real recorded sample for the SMALL model (qwen2.5:3b, brain_dump_sort tasks) at
+    // its real fast speed -- must not affect the big model's own timeout calibration.
+    require('./local-throughput.js').recordSample(dir, { evalCount: 500, evalDurationNs: 10_000_000_000, endpoint: 'http://192.168.122.29:11434', model: 'qwen2.5:3b' });
+    const msBigModel = mod.resolveRequestTimeoutMs({ promptTokens: 4000, numPredict: 2800, instancesDir: dir, model: 'qwen3.8-p40:27b-q4_K_M' });
+    // No sample yet for the big model -> falls back to the conservative 15 tok/s floor,
+    // NOT the small model's 50 tok/s -- so the computed timeout must still land near/at
+    // the P40 ceiling for a large plan-pass shaped call, not the shorter time the small
+    // model's speed would imply.
+    assert.ok(msBigModel > mod.PER_CALL_TIMEOUT_CEILING_MS, `the big model's timeout must not be sped up by the small model's sample on the same endpoint, got ${msBigModel}`);
+  });
+});
