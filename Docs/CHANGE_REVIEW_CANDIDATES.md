@@ -89,3 +89,45 @@ index dcbd1caf..c98d61b6 100644
 Problem: [severity: low; regression shipped in 86b45ff] The test asserts the exact shape of the returned summary object; the diff added `errorDetails: []` to that object, so the deep-equality assertion now fails.  Failure scenario: Run `node --test src/apply-retry-check.test.js`. The test "applyRetryCheck returns an all-zero summary when queue/blocked/ does not exist at all" calls `applyRetryCheck` with a non-existent `blockedDir`. The function returns `{ checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] }`. The test then calls `assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 })`. Because `node:assert/strict` aliases `deepEqual` to `deepStrictEqual`, the extra own-enumerable property `errorDetails` causes the assertion to throw `AssertionError: Expected values to be strictly deep-equal`, and the test fails. Before this diff the returned object had exactly four keys and the test passed.
 Solution: In `src/apply-retry-check.test.js`, change the expected object to `{ checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] }`.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 86b45ff.
+
+### AC-49 · The function's own documented contract ("never let a missing/corrupt file break a caller") (e1fa402 concepts.js)
+Strength: Strong
+Source: change_review of e1fa402 "Add concepts.js registry: Part 1 of the Concept Chart feature"
+Files: src/concepts.js
+
+Snippet:
+```
+diff --git a/src/concepts.js b/src/concepts.js
+new file mode 100644
+index 00000000..4a12874e
++++ b/src/concepts.js
+@@ -0,0 +1,167 @@
++'use strict';
++
++// Concept registry (2026-09-06, Grimmethy: "break the existing project down into
++// concepts that can each be given this same kind of research treatment... give us a log
++// of the work done on these concepts... track how much of the concept we built from
++// scratch compared to using resources found in other repos").
++//
++// A "concept" is a named, narrow topic (e.g. "chat-context-trimming",
++// "web-search-capability") that gets the same treatment already run twice by hand this
++// session: a research fork surveys other projects, deep-dives them, and files findings
++// via writeSideFindingInbox()/side-finding-sweep.js. This module is just the registry
++// row + tally counters for that pattern -- the actual audit trail (which brain-dump
++// entries and tasks belong to a concept) is a query over existing data
++// (getConceptTimeline), not a duplicated log, so it can never drift from the source.
++//
++// v1 scope is deliberately narrow: concepts are created manually or organically (the
++// first research fork on a new topic creates its row), never by an autonomous
++// pipeline-driven task source -- see the plan's "explicitly out of scope" section for
++// why (mirrors the arch_import premise-check incident's risk shape).
++
++const fs = require('fs');
++const path = require('path');
++const crypto = require('crypto');
++const { write
+```
+
+Problem: [severity: low; regression shipped in e1fa402] The function's own documented contract ("never let a missing/corrupt file break a caller") is violated when the on-disk file contains a valid-JSON non-object value; the guard on line 41 dereferences `data` without checking it is an object, so the TypeError escapes the try/catch and reaches the caller.  Failure scenario: Write the 4-character string `null` to `<pipelineDir>/concepts.json` (e.g. `fs.writeFileSync(path.join(dir,'concepts.json'), 'null')`). Call `loadConcepts(dir)`. Line 36: `JSON.parse("null")` succeeds and returns the JS value `null` (no exception, so the catch on line 37 is never entered). Line 41: `data.concepts` evaluates `null.concepts` → throws `TypeError: Cannot read properties of null (reading 'concepts')`. The exception propagates to the caller, contradicting the contract stated in the comment on lines 30–31. The existing test on line 22 of concepts.test.js only covers a *syntactically invalid* file (`{not json`), which exercises the catch path and passes; the `null`-JSON case is untested and unhandled.
+Solution: Insert a guard between the try/catch and the `Array.isArray` check (i.e. before line 41): `if (!data || typeof data !== 'object') data = { concepts: [] };`. This covers `null`, numbers, strings, and booleans in one branch and restores the "always return an object with a `concepts` array" contract.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in e1fa402.
