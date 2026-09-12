@@ -24,6 +24,7 @@ Single-context repo:
 │   └── agents/
 │       ├── issue-tracker.md
 │       ├── triage-labels.md
+│       ├── codebase-map.md
 │       └── domain.md   (this file)
 └── src/
 ```
