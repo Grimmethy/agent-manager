@@ -1290,6 +1290,71 @@ test('nextAdhocTask requires EVERY dependency to be merged, not just one of seve
   assert.equal(nextAdhocTask(), null);
 });
 
+// softDependsOn (2026-09-12, screaminggoatclubmt: a real stuck hub -- subtask 1
+// dependsOn subtask 0, subtask 0's branch was deliberately left unmerged pending the
+// hub's own readiness, but the hub couldn't become ready until subtask 1 ran; nothing
+// could move without a human manually merging first, and premiumPriority did not help
+// since the dependency gate runs before priority is ever consulted). Satisfied once the
+// dependency reaches queue/done/ -- no merge required -- for a purely sequencing
+// relationship where the dependent task doesn't actually need the dependency's diff
+// present in its own worktree.
+
+test('nextAdhocTask skips a candidate whose soft dependency has not reached done/ at all', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-soft-blocked-1',
+    title: 'Soft-depends on a task that has not finished',
+    softDependsOn: ['adhoc-soft-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('nextAdhocTask claims a candidate once its soft dependency reaches done/, even completely UNMERGED', () => {
+  const dir = makeAdhocFixtureRepo();
+  // No mergedAt, no branch, no stacked field -- reaching done/ at all is the whole signal.
+  writeDoneFile(dir, 'adhoc-soft-prereq-1', { id: 'adhoc-soft-prereq-1', title: 'prereq' });
+  writeAdhocFile(dir, 'unblocked.json', {
+    id: 'adhoc-soft-unblocked-1',
+    title: 'Soft-depends on a task that is done but not merged',
+    softDependsOn: ['adhoc-soft-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'a soft dependency must not require a merge the way dependsOn does');
+  assert.equal(task.id, 'adhoc-soft-unblocked-1');
+});
+
+test('nextAdhocTask requires EVERY soft dependency to be done, not just one of several', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-soft-done-1', { id: 'adhoc-soft-done-1' });
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-soft-blocked-2',
+    title: 'One soft dependency done, one not',
+    softDependsOn: ['adhoc-soft-done-1', 'adhoc-soft-notdone-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('nextAdhocTask enforces BOTH dependsOn (hard, must be merged) and softDependsOn (soft, must be done) when a task declares both', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-hard-prereq', { id: 'adhoc-hard-prereq' }); // done, NOT merged -- fails the hard check
+  writeDoneFile(dir, 'adhoc-soft-prereq', { id: 'adhoc-soft-prereq' }); // done -- satisfies the soft check
+  writeAdhocFile(dir, 'mixed.json', {
+    id: 'adhoc-mixed-1',
+    title: 'One hard (unmerged) dependency, one soft (done) dependency',
+    dependsOn: ['adhoc-hard-prereq'],
+    softDependsOn: ['adhoc-soft-prereq'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'the unmet HARD dependency must still block the task even though the soft one is satisfied');
+});
+
 // pipeline_self_audit coverage-timing regression (2026-08-20, Grimmethy: "Last hours
 // report shows 0 tasks done... Has the self audit task been working?"): nextPipelineSelf
 // AuditTask() used to write self-audit-coverage.json unconditionally before returning,
