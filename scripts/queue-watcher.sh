@@ -162,6 +162,18 @@ while :; do
     coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
     printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
 
+    # Blocked-cluster sweep (2026-09-12, screaminggoatclubmt: "we have 4 separate instances
+    # with a bespoke solution each... a way to combine these patterns"): the concrete,
+    # buildable half of that question -- normalizes queue/blocked/'s blockedReason text
+    # (same fingerprinting this session did by hand, repeatedly) and files a side-finding
+    # when a cluster is new or has grown meaningfully since it was last reported, so a
+    # systemic gap surfaces proactively instead of waiting for a human to notice a pile-up
+    # (this session's own real clusters reached 21 and 31 tasks before anyone happened to
+    # go looking). Cheap (one small readdir over queue/blocked/, same cost class as
+    # coordinator-sweep above), runs every tick.
+    blocked_cluster_result="$(node "${PACKAGE_SRC_DIR}/blocked-cluster-sweep.js" 2>>"${HOME_LOGS}/blocked-cluster-sweep.log")"
+    printf '[watchdog] blocked-cluster-sweep: %s\n' "$blocked_cluster_result" >&2
+
     # Task-log reconcile: `applied` used to be the last event in a done task's history, so
     # an update audit could not tell from the log whether a task's code actually reached
     # origin/<main>, is still on an unmerged agent/<id> branch, or was applied to a branch
