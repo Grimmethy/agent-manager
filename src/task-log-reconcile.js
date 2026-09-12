@@ -176,13 +176,28 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
   // of being re-confirmed as lost by the same stale-ref bug that produced it.
   const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
 
+  let fetchOk = true;
   if (doFetch && repoRoot) {
     const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
-    try { fetch(); } catch { /* offline -- use local refs */ }
+    try { fetch(); } catch { fetchOk = false; }
   }
 
   const state = loadState(pipelineDir);
-  const ctx = repoRoot ? buildShipContext(repoRoot) : null;
+
+  // A failed fetch means buildShipContext() would resolve dispositions from whatever stale
+  // local refs happen to be cached -- exactly the condition that produced the false
+  // "abandoned -- branch gone, work lost" verdicts on 2026-09-08. Rather than risk a whole
+  // sweep of wrong terminal events, skip disposition updates for this cycle entirely
+  // (state is still persisted, so the incremental bookkeeping is not lost) and retry next
+  // tick when fetch can succeed. `--no-fetch` is the explicit, intentional opt-out that
+  // still trusts local refs on purpose, so it is unaffected (fetchOk stays true).
+  if (!fetchOk) {
+    console.warn('reconcile: git fetch failed, skipping disposition updates this cycle');
+    if (!dryRun) saveState(pipelineDir, state);
+    return { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0, fetchFailed: true };
+  }
+
+  const ctx = repoRoot ? buildShipContext(repoRoot, { fetchConfirmed: fetchOk }) : null;
 
   const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
   const pendingList = [];
