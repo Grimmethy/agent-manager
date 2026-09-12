@@ -734,15 +734,35 @@ while :; do                                                                     
       # already only contains tasks this instance may claim; nothing further to check here.)
 
       if "$claim_succeeded"; then                                               # actual claim action: rename pending/$name -> drafting/${INSTANCE_ID}/$name (use mv because we don't want to COPY — mv is atomic on same filesystem which prevents race where another loop picks up the same draft after we 'claimed' it). Bash's `mv` works for this; equivalent of PowerShell's `Move-Item -Force` which would do identical work under its file-system abstraction but bash doesn't need `-Force`.
-        printf '[worker-%s] claiming %s\n' "$INSTANCE_ID" "$name"               # log that we're about to attempt claim — same kind of status emit as PowerShell's `$null = Write-Host "Processing $draftName"` block which prints progress to operator console so they know daemon IS doing something (otherwise they'd wonder if it hung silently).
-        write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "claim" "$STARTED_AT"
-
         mkdir -p "${QUEUE_DIR}/drafting/${INSTANCE_ID}" >/dev/null 2>&1 # ensure destination exists before moving into it — bash's mv doesn't auto-create parent dirs; if we didn't mkdir we'd get 'No such file or directory' error on first claim attempt which would look like daemon failed but actually just meant the folder wasn't created yet (same issue PowerShell hits too and they handle with pre-creation pattern via -Force flag on New-Item).
 
         orig_name="$name"                                                         # captures current value of $name variable which bash would overwrite on next loop iteration's assignment, same trick PowerShell uses when it stores off the original path in a separate variable before mutating the input.
         new_wpath="${QUEUE_DIR}/drafting/${INSTANCE_ID}/${orig_name}"     # destination file path (same name but moved to drafting/ folder under this instance, matching task-sources.js's own "queue/drafting/<InstanceId>/<id>.json" convention -- was previously "$AGENT_MANAGER_REPO_ROOT/drafting/..." with no queue/ prefix at all, a path nothing else in the system reads from).
 
-        mv -n "$wpath" "$new_wpath"                                                # atomic move: -n flag prevents overwriting target if exists already (same behavior as PowerShell's `Move-Item -NoClobber` for same intent — don't clobber whatever's at destination because could be stale file from previous crashed run which operator would want to investigate before losing).
+        # 2026-09-12 (screaminggoatclubmt, real live race: worker-p40 and worker-1 both
+        # logged "claiming pipeline-debrief-...json" for the SAME pending file within the
+        # same tick, then worker-1's own draft call failed with ENOENT for its drafting/
+        # copy): `mv -n`'s no-clobber flag only guards the DESTINATION path -- useless as
+        # cross-lane protection here, since every instance claims into its own distinct
+        # drafting/<INSTANCE_ID>/ subdir, so two lanes racing for the same pending item
+        # never collide on the same target and -n has nothing to refuse. What DOES make
+        # this race-safe is mv's atomicity on the SOURCE: at most one lane's mv can ever
+        # actually find $wpath still there when it runs, and that one wins outright; every
+        # OTHER lane's mv fails with a real nonzero exit (source already gone) -- but this
+        # script used to never check that exit code, so the loser printed "claimed" and
+        # wrote a "working" heartbeat anyway, then process_drafting_file failed on a file
+        # that was never actually written to $new_wpath. The mv itself was already
+        # correct; only the missing check was the bug. Now: attempt the move FIRST, before
+        # announcing anything or touching heartbeat state, and skip this item cleanly (not
+        # an infra-shaped failure, not a real error -- just a race this lane legitimately
+        # lost) if it didn't land.
+        if ! mv -n "$wpath" "$new_wpath" 2>/dev/null || [[ ! -f "$new_wpath" ]]; then
+          printf '[worker-%s] lost claim race for %s (another lane claimed it first this tick) -- skipping\n' "$INSTANCE_ID" "$name" >&2
+          continue
+        fi
+
+        printf '[worker-%s] claiming %s\n' "$INSTANCE_ID" "$name"               # log that we're about to attempt claim — same kind of status emit as PowerShell's `$null = Write-Host "Processing $draftName"` block which prints progress to operator console so they know daemon IS doing something (otherwise they'd wonder if it hung silently).
+        write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "claim" "$STARTED_AT"
         # Stamp claimedAt (ISO) so the dashboard's chat-preempt age gate knows when THIS
         # lane actually started working the task (heartbeat startedAt is daemon uptime;
         # .model-locks startedAt is per model sub-call). Set-once: a resume keeps the
