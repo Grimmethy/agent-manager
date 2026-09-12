@@ -2607,6 +2607,27 @@ test('adhoc reviewGuidance/reviewCompletenessQuestion have a dedicated no-change
   assert.match(adhoc.reviewGuidance({ adhocResolution: 'decompose' }), /DECOMPOSE/);
 });
 
+// 2026-09-12, root-caused live from the single biggest sub-pattern in a 31-task
+// pipeline_debrief blocked cluster: the drafting prompt explicitly permits omitting the
+// NOW WHAT Files: line and recommending in prose when AVAILABLE FILES is empty or none
+// fit, but the review guidance's reject list never carried that same exception -- real
+// drafts that correctly followed the drafting instruction got rejected anyway for "no
+// real file cited."
+test('pipeline_debrief reviewGuidance/reviewCompletenessQuestion do NOT require a NOW WHAT file citation when AVAILABLE FILES was empty or none fit', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-debrief-guidance-'));
+  freshTaskSources(dir);
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  const debrief = getRegisteredSource('pipeline_debrief');
+
+  assert.match(debrief.reviewGuidance, /empty.*omitting the Files: line.*CORRECT|CORRECT, REQUIRED behavior/i);
+  assert.match(debrief.reviewGuidance, /only reject if a real, relevant file WAS available/i);
+  assert.match(debrief.reviewCompletenessQuestion, /omitting the Files: line in prose is correct and complete/i);
+
+  // The reject condition for a real, invented/skipped file citation must still stand --
+  // this is a narrowed exception, not a removal of the requirement.
+  assert.match(debrief.reviewGuidance, /invents a file\/symbol not in the evidence/);
+});
+
 test('product_spec_section: consumes the outline doc top-to-bottom, one Strong AC at a time, with the spec doc path and fetched code attached', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-section-test-'));
   fs.mkdirSync(path.join(dir, 'server'), { recursive: true });
