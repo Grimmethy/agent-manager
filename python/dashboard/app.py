@@ -5888,7 +5888,13 @@ def _describe_change(data: dict) -> str | None:
             f"{titles_text}"
         )[:_DESCRIPTION_MAX_CHARS]
 
-    implement = (data.get("implementResponse") or "").strip()
+    # agentic-draft-common.js appends the raw diff after a `=== DIFF ===` marker
+    # (`${summary}\n\n=== DIFF ===\n${task.rawDiff}`). Strip it before any strategy below
+    # touches the text -- otherwise a short plain-English summary right before the marker
+    # (e.g. "RESOLUTION: implemented\ndone" with nothing else) lets the 600-char slice run
+    # straight into the diff itself, showing raw `diff --git ...` hunks as the "What this
+    # changes" description instead of prose.
+    implement = (data.get("implementResponse") or "").split("=== DIFF ===")[0].strip()
 
     m = _RESOLUTION_LINE_RE.search(implement)
     if m:

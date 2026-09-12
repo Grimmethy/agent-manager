@@ -130,5 +130,36 @@ class TestBranchTaskLog(unittest.TestCase):
         self.assertFalse(app._is_real_ship({"id": "y", "terminalDisposition": "merged", "history": [{"stage": "applied", "detail": ""}]}))
 
 
+class TestDescribeChange(unittest.TestCase):
+    def test_strips_diff_after_resolution_line(self):
+        # The real shape agentic-draft-common.js produces: a short plain-English summary
+        # ending right at the RESOLUTION line, then `${summary}\n\n=== DIFF ===\n${rawDiff}`.
+        # Before the fix, everything after the RESOLUTION match (including the whole diff)
+        # was returned verbatim as the "What this changes" description.
+        implement = (
+            "RESOLUTION: implemented\ndone\n\n"
+            "=== DIFF ===\n"
+            "diff --git a/src/x.js b/src/x.js\n"
+            "index 111..222 100644\n"
+            "--- a/src/x.js\n"
+            "+++ b/src/x.js\n"
+        )
+        desc = app._describe_change({"implementResponse": implement})
+        self.assertEqual(desc, "done")
+        self.assertNotIn("diff --git", desc)
+        self.assertNotIn("=== DIFF ===", desc)
+
+    def test_no_diff_marker_still_returns_full_text(self):
+        desc = app._describe_change({"implementResponse": "RESOLUTION: no-changes-needed\nalready covered by existing tests"})
+        self.assertEqual(desc, "already covered by existing tests")
+
+    def test_fallback_strategy_also_excludes_diff(self):
+        # No RESOLUTION line at all (e.g. a verdict-only source) -- strategy 3 falls back
+        # to implementResponse directly, which must still have the diff stripped.
+        implement = "Plain prose verdict write-up.\n\n=== DIFF ===\ndiff --git a/y.js b/y.js\n"
+        desc = app._describe_change({"implementResponse": implement})
+        self.assertEqual(desc, "Plain prose verdict write-up.")
+
+
 if __name__ == "__main__":
     unittest.main()
