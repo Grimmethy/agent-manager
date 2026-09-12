@@ -23,6 +23,13 @@ test('classifyChildStatus maps queue state + mergedAt to a checklist status', ()
   assert.equal(classifyChildStatus({ state: 'done', task: {} }), 'done');
   assert.equal(classifyChildStatus({ state: 'done', task: { mergedAt: 'x' } }), 'merged');
   assert.equal(classifyChildStatus({ state: 'archived', task: {} }), 'merged');
+  // A record with an explicit non-merge terminalDisposition (e.g. its approved branch was
+  // deleted before merge, or a human dismissed it) must report that real status once it
+  // ages into a month bucket, not be reported as shipped just because it reached 'archived'.
+  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'abandoned' } }), 'abandoned');
+  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'dismissed' } }), 'dismissed');
+  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'merged' } }), 'merged');
+  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'abandoned', mergedAt: 'x' } }), 'merged');
   assert.equal(classifyChildStatus({ state: 'archived_no_action', task: {} }), 'abandoned');
   assert.equal(classifyChildStatus({ state: 'blocked', task: {} }), 'blocked');
   assert.equal(classifyChildStatus({ state: 'needs-clarification', task: {} }), 'needs-clarification');
