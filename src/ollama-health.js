@@ -25,7 +25,32 @@ const DEFAULT_TIMEOUT_MS = 5000; // 5s -- a healthy local endpoint answers in <1
  * (with a tagged error carrying one of ollama-http.js's OLLAMA_ERROR_CODES) on
  * an invalid URL, timeout, connection failure, or a non-200 status.
  *
- * @param {string} url - Ollama base URL, e.g. process.env.OLLAMA_URL || 'http://localhost:11434'.
+ * NORMATIVE URL SPEC (sub-task-2, corrected): the `url` argument MUST be the
+ * result of the env-var-first expression
+ *   process.env.OLLAMA_URL || 'http://localhost:11434'
+ * `http://localhost:11434` appears ONLY as the `||` fallback for when OLLAMA_URL
+ * is unset/empty -- it must NEVER be passed as a standalone hardcoded probe that
+ * bypasses the env-var check. A caller that ignores OLLAMA_URL and probes
+ * localhost directly would silently skip every deployment that routes its Ollama
+ * traffic elsewhere:
+ *
+ *  - src/dead-process-check.js:87 -- the P40 lane is wrapped in
+ *    `env OLLAMA_URL="$AGENT_MANAGER_P40_OLLAMA_URL"`, so inside that lane
+ *    process.env.OLLAMA_URL resolves to the lane host (e.g. 192.168.122.29:11434),
+ *    not the host's own localhost.
+ *  - scripts/launch.sh:117 -- TokenFold's healthy-start path exports
+ *    OLLAMA_URL=http://localhost:9339 (line 73 was unconfirmed; the real export
+ *    is at line 117).
+ *
+ * NEGATIVE CONSTRAINT: the endpoint URL is not sourced from any config-module
+ * field -- src/config.js defines no `ollamaUrl` key at all (verified: zero
+ * matches for either `ollamaUrl` or `ollama` in that file), so callers must not
+ * try to read the Ollama URL from that module; the env-var expression above is
+ * the single source of truth.
+ *
+ * @param {string} url - Ollama base URL, obtained via the normative env-var-first
+ *   expression `process.env.OLLAMA_URL || 'http://localhost:11434'`
+ *   (localhost:11434 only as the `||` fallback, never a standalone hardcoded probe).
  * @param {object} [opts]
  * @param {number} [opts.timeoutMs=5000] - Socket timeout for the probe.
  * @returns {Promise<{ok: true, url: string}>}
