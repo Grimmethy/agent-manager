@@ -227,6 +227,14 @@ source tree — grown incrementally, not exhaustive. See `docs/agents/codebase-m
 you had to grep, guess, or browser-search for a path that isn't listed there, add a row
 for it once you find it — that's the whole maintenance model; nothing else keeps it fresh.
 
+### Reviewing an unmerged branch
+
+Before judging any unmerged/`agent/<id>` branch for value or completeness, check whether
+it belongs to a coordinator hub and read the whole hub first — a sub-task reviewed in
+isolation can look broken (or look fine) when its sibling sub-task is actually the other
+half of the same fix, and the hub may already carry a review verdict about the
+decomposition's completeness. See `docs/agents/unmerged-branch-review.md`.
+
 ## Working directory: never edit this checkout directly
 
 This repo is self-hosting: `AGENT_MANAGER_REPO_ROOT` for the running pipeline points at
