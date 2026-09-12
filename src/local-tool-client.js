@@ -670,7 +670,18 @@ function turnLock(instancesDir, fn) {
 // docs/pipeline-incident-2026-07-19.md and queue-watchdog.ps1's $WorkerZombieThresholdSeconds)
 // -- repeated-failure downtime compounds fast, and no legitimate call needs longer than
 // this. Do not raise this again "to be safe" without revisiting that reasoning first.
-const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || 240_000;
+// 2026-09-12 (screaminggoatclubmt, real live failure: "local write-agentic draft failed:
+// Ollama request timed out after 240000ms" on the P40 lane): this constant is a SEPARATE,
+// independently-hardcoded copy of local-client.js's PER_CALL_TIMEOUT_CEILING_MS -- fixing
+// that file's timeout calibration for the P40 endpoint (see its own IS_P40_ENDPOINT/
+// P40_PER_CALL_TIMEOUT_CEILING_MS) did nothing for THIS file's tool-calling path, which
+// local-agentic-write-draft.js's adhoc write-agentic tier runs through. Same deliberate,
+// named exception to docs/pipeline-incident-2026-07-19.md's 5-minute-ceiling doctrine,
+// scoped only to the P40 endpoint -- every other caller (the local RTX 3090 lane, Chat)
+// keeps the original 240s value unchanged.
+const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+const P40_REQUEST_TIMEOUT_MS = 900_000;
+const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_P40_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
 
 const TOOLS = [
   {
@@ -1556,6 +1567,7 @@ module.exports = {
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
+  IS_P40_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
 };
 
 // CLI: node local-tool-client.js <request.json>

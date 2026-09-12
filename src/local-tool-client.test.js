@@ -1423,3 +1423,44 @@ test('runPlanWithTools with allowAmplification not set never extracts even if th
     assert.equal(sideFindingInboxFiles(dir).length, 0);
   });
 });
+
+// --- REQUEST_TIMEOUT_MS / IS_P40_ENDPOINT (2026-09-12) ----------------------------------
+// Root-caused live: "local write-agentic draft failed: Ollama request timed out after
+// 240000ms" on the P40 lane, AFTER local-client.js's own P40 timeout exception (PR #171)
+// had already landed -- this file has its own SEPARATE, independently-hardcoded copy of
+// that same 240s constant for the tool-calling path (local-agentic-write-draft.js's adhoc
+// write-agentic tier runs through here, not through local-client.js), so fixing one file
+// did nothing for the other. Same withEnv-style fresh-require discipline as
+// local-client.test.js's own IS_P40_ENDPOINT tests, since OLLAMA_URL/
+// AGENT_MANAGER_P40_OLLAMA_URL are both resolved once at module load.
+function withEnv(envOverrides, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(envOverrides)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  delete require.cache[require.resolve('./local-tool-client.js')];
+  try {
+    return fn(require('./local-tool-client.js'));
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    delete require.cache[require.resolve('./local-tool-client.js')];
+  }
+}
+
+test('local-tool-client REQUEST_TIMEOUT_MS gets the same P40 exception as local-client.js, scoped only to the P40 endpoint', () => {
+  withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434', LOCAL_TIMEOUT_MS: undefined, ORNITH_TIMEOUT_MS: undefined }, (mod) => {
+    assert.equal(mod.IS_P40_ENDPOINT, true);
+    assert.equal(mod.REQUEST_TIMEOUT_MS, mod.P40_REQUEST_TIMEOUT_MS);
+    assert.equal(mod.REQUEST_TIMEOUT_MS, 900_000);
+  });
+  withEnv({ OLLAMA_URL: 'http://localhost:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434', LOCAL_TIMEOUT_MS: undefined, ORNITH_TIMEOUT_MS: undefined }, (mod) => {
+    assert.equal(mod.IS_P40_ENDPOINT, false, 'the local GPU lane must not be treated as the P40 lane');
+    assert.equal(mod.REQUEST_TIMEOUT_MS, 240_000, 'every other caller keeps the original 240s ceiling unchanged');
+  });
+  withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434', LOCAL_TIMEOUT_MS: '30000', ORNITH_TIMEOUT_MS: undefined }, (mod) => {
+    assert.equal(mod.REQUEST_TIMEOUT_MS, 30_000, 'an explicit LOCAL_TIMEOUT_MS override still wins over the P40 exception');
+  });
+});
