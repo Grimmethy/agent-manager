@@ -117,9 +117,23 @@ function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById,
 function classifyChildStatus(rec) {
   if (!rec) return 'gone'; // not found anywhere -- completed and aged out, or hand-removed
   const state = rec.state;
-  const merged = rec.task && rec.task.mergedAt;
+  const task = rec.task || {};
+  const merged = task.mergedAt;
   if (state === 'done') return merged ? 'merged' : 'done';
-  if (state === 'archived') return 'merged'; // aged out of done/ into a month bucket -- it shipped
+  if (state === 'archived') {
+    // done-archive.js's monthly housekeeping moves EVERY done/ task into a dated bucket
+    // once it ages out, regardless of how it actually closed -- merged, abandoned,
+    // dismissed, noop, filed. "archived == shipped" was only ever true for the common
+    // case; a task whose terminalDisposition says otherwise must report that real
+    // status, not a manufactured 'merged' (caught live: a sub-task record aged into
+    // done/_archived/<month>/ with terminalDisposition:'abandoned' -- its branch was
+    // deleted before merge -- kept reporting 'merged' forever, so the hub sat at
+    // "2/3 done" while one of those two was actually dead work needing a redo).
+    if (merged) return 'merged';
+    const disp = task.terminalDisposition;
+    if (disp && disp !== 'merged') return disp;
+    return 'merged'; // no disposition recorded (pre-terminalDisposition-tracking record) -- fall back to the old default
+  }
   if (state === 'archived_no_action') return 'abandoned';
   if (state === 'blocked' || state === 'needs-clarification' || state === 'awaiting-confirm') return state;
   return 'in-progress'; // pending / adhoc / drafting / review / approved / coordinating
