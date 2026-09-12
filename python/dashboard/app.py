@@ -5053,10 +5053,15 @@ def _preempt_pipeline_for_chat() -> list:
                 except OSError:
                     pass
 
+            kill_denied = False
             try:
                 os.kill(kill_pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
+            except PermissionError:
+                kill_denied = True
+                print(f"[chat-preempt] {lane}: WARNING os.kill({kill_pid}) denied – process still alive",
+                      file=sys.stderr, flush=True)
             if lock:
                 for name in os.listdir(inst_dir / ".model-locks"):
                     try:
@@ -5067,9 +5072,12 @@ def _preempt_pipeline_for_chat() -> list:
                     except OSError:
                         pass
 
-            summary.append({"lane": lane, "action": "killed", "taskId": task_id, "ageSeconds": age_s})
-            print(f"[chat-preempt] killed {lane} pid={kill_pid} task={task_id} ({reason}) -> requeued",
-                  file=sys.stderr, flush=True)
+            if kill_denied:
+                summary.append({"lane": lane, "action": "kill_denied", "killed": False, "taskId": task_id, "ageSeconds": age_s})
+            else:
+                summary.append({"lane": lane, "action": "killed", "taskId": task_id, "ageSeconds": age_s})
+                print(f"[chat-preempt] killed {lane} pid={kill_pid} task={task_id} ({reason}) -> requeued",
+                      file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 -- best-effort, never block the chat turn
             print(f"[chat-preempt] {lane}: skipped ({e})", file=sys.stderr, flush=True)
     return summary
