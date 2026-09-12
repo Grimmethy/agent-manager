@@ -129,6 +129,35 @@ function detectExternalDependency(task) {
   return null;
 }
 
+// A task whose anchor-file list (promptContext.prefetchedPaths -- the source
+// taskAnchorFiles consumes first) includes python/dashboard/app.py AND whose text names
+// >=3 distinct endpoint paths (/api/... or /plugins/...) OR hits >=3 distinct subsystem
+// keywords (catalog/install/update/uninstall/ui/frontend) is a scope that has historically
+// blown a full tier-3 turn budget in one pass (a single app.py edit touching 3+ routes or
+// subsystems is a decompose candidate, not an atomic leaf). Pure, O(text) string work,
+// runs BEFORE the first model call.
+const SCOPING_SUBSYSTEM_KEYWORDS = ['catalog', 'install', 'update', 'uninstall', 'ui', 'frontend'];
+
+function scopeComplexityGate(task) {
+  const ctx = (task && task.promptContext) || {};
+  const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
+    .filter(Boolean).join(' ');
+  const prefetched = ctx.prefetchedPaths;
+  const hasAnchor = Array.isArray(prefetched) && prefetched.includes('python/dashboard/app.py');
+  if (!hasAnchor) return { shouldDecompose: false };
+  const endpointRe = /\/(?:api|plugins)\/[A-Za-z0-9_\-/]+/g;
+  const endpoints = new Set(text.match(endpointRe) || []);
+  const lower = text.toLowerCase();
+  const keywords = new Set(SCOPING_SUBSYSTEM_KEYWORDS.filter((k) => lower.includes(k)));
+  if (endpoints.size >= 3 || keywords.size >= 3) {
+    return {
+      shouldDecompose: true,
+      reason: `scope-complexity-gate: anchor python/dashboard/app.py present with ${endpoints.size} endpoint path(s) and ${keywords.size} subsystem keyword(s)`,
+    };
+  }
+  return { shouldDecompose: false };
+}
+
 // Same shared kill switch runPlanWithTools({allowWrite}) checks (queue/.chat-write-tools-
 // disabled). Checked here too so a disabled tier returns a clean decline instead of
 // letting runPlanWithTools silently drop to its no-tools fallback (a plain completion,
@@ -498,5 +527,5 @@ function modelStatsSafe(fn, args) {
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
   isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
-  detectExternalDependency, EXTERNAL_DEP_MARKERS,
+  detectExternalDependency, scopeComplexityGate, EXTERNAL_DEP_MARKERS,
 };
