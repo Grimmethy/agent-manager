@@ -36,6 +36,7 @@ const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = 
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 const { incrementJobTypeCounter } = require('./job-type-counters.js');
 const { runGroundingCheck: runDeepDiveGroundingCheck } = require('./deep-dive-grounding-check.js');
+const { runSoWhatCitationCheck: runPipelineDebriefSoWhatCheck } = require('./pipeline-debrief-so-what-check.js');
 const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js');
 
 function slugifyForId(str) {
@@ -2170,6 +2171,11 @@ registerTaskSource('pipeline_debrief', {
   reportClass: 'housekeeping',
   reviewGuidance: PIPELINE_DEBRIEF_REVIEW_GUIDANCE,
   reviewCompletenessQuestion: PIPELINE_DEBRIEF_COMPLETENESS_QUESTION,
+  // 2026-09-12: see pipeline-debrief-so-what-check.js's own header -- catches the
+  // "generic aggregate SO WHAT claim, zero citation" failure BEFORE it ever reaches a
+  // real review vote, with a closed-list of the real citation tokens available so the
+  // resulting priorRejectionFeedback retry has something concrete to act on.
+  postImplementCheck: runPipelineDebriefSoWhatCheck,
 });
 // doc_drift_fix (2026-09-06, "Project Documentation" concept -- see drift-fix.js's own
 // header). Priority 68: real, if low-urgency, value -- a doc actively claiming
