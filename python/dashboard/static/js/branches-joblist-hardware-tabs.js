@@ -31,10 +31,18 @@ async function renderBranchesTab() {
     // still missing its wiring commit + gate pass) -- merging it now ships an incomplete
     // decomposition. The merge endpoint 409s it without {force:true}.
     const hubMidFlight = b.hub && !b.hub.readyToMerge;
+    // Clickable straight from the list row (2026-09-12, screaminggoatclubmt: "I need
+    // links in the unmerged branches task log to the hub task associated with unmerged
+    // branches that are waiting on hubs to finish") -- before this, the ONLY way to see
+    // which hub a mid-flight branch was waiting on was the tooltip's plain text (hub id,
+    // no way to jump to it) or opening this row's own detail modal first. data-open-hub
+    // reuses task-detail-modal.js's existing openTaskAnywhere(), the same generic
+    // "look this task id up wherever it currently lives" opener every other tab already
+    // uses -- no new endpoint needed.
     const hubBadge = b.hub
       ? (hubMidFlight
-        ? `<span class="badge bad" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''}">⚠ hub mid-flight</span>`
-        : `<span class="badge ok" title="Coordinator hub complete">✓ hub complete</span>`)
+        ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
+        : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
       : '';
     return `
     <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
@@ -66,10 +74,19 @@ async function renderBranchesTab() {
     card.onclick = (e) => {
       // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
       // and confirm() flow below, opening the history modal underneath it would be
-      // surprising.
-      if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]')) return;
+      // surprising. Same reasoning for the hub badge (data-open-hub, below): it opens a
+      // DIFFERENT task's detail (the hub, not this branch), so it must win over the
+      // row's own "open this branch's detail" click.
+      if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]') || e.target.closest('[data-open-hub]')) return;
       const b = branches.find((x) => x.branch === card.dataset.openBranch);
       if (b) renderBranchDetailModal(b);
+    };
+  });
+
+  main.querySelectorAll('[data-open-hub]').forEach((badge) => {
+    badge.onclick = (e) => {
+      e.stopPropagation();
+      openTaskAnywhere(badge.dataset.openHub);
     };
   });
 
@@ -165,7 +182,7 @@ async function renderBranchDetailModal(b) {
     } else {
       html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
     }
-    html += `<div class="meta">${escapeHtmlBright(hub.title || hub.id)} · ${p.done}/${p.total} task(s) done`
+    html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${p.done}/${p.total} task(s) done`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
     html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
@@ -214,6 +231,12 @@ async function renderBranchDetailModal(b) {
     }).join('');
   }
   content.innerHTML = html;
+  content.querySelectorAll('[data-open-hub]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      openTaskAnywhere(el.dataset.openHub);
+    };
+  });
 }
 
 async function renderJobListTab() {
