@@ -59,6 +59,7 @@ async function renderBranchesTab() {
         ${b.domain ? `domain <strong>${escapeHtml(b.domain)}</strong>${b.source ? ' · source <strong>' + escapeHtml(b.source) + '</strong>' : ''} · ` : ''}
         pushed ${fmtAge((Date.now() - new Date(b.pushedAt).getTime()) / 1000)} ago
         ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
+        ${b.matchedTaskState === 'task-log' ? ' · <span title="No live queue/ record exists for this task anymore -- this came from the git-tracked task-logs/ file apply-task.js committed alongside the change, so it survives archival.">from committed task log</span>' : ''}
       </div>
       ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
