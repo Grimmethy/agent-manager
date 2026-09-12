@@ -167,6 +167,46 @@ function isDependencySatisfied(pipelineDir, depId) {
   return false;
 }
 
+// softDependsOn (2026-09-12, screaminggoatclubmt: "There really needs to be a better way
+// to communicate this in app" -> traced a real stuck hub to a genuine deadlock: subtask 1
+// dependsOn subtask 0, subtask 0's branch was deliberately left unmerged pending the
+// hub's own readiness -- but the hub can't become ready until subtask 1 runs, so nothing
+// can ever move without a human manually merging subtask 0 first. Confirmed live that a
+// premiumPriority override does NOT help: isDependencySatisfied()'s "must be merged"
+// check runs BEFORE priority is ever consulted, so a stuck dependsOn edge blocks a task
+// no matter how it's prioritized. "During an unsupervised run this can never resolve
+// itself" is the real failure mode dependsOn's OWN merge requirement doesn't distinguish
+// from -- that requirement exists for a real, different, already-fixed bug (a dependent
+// task's fresh-from-origin/<mainBranch> worktree drafting against code that doesn't have
+// the dependency's actual file change yet -- see dependsOn's own comment above). Not
+// every dependsOn edge is that kind: a purely SEQUENCING relationship ("confirm this
+// AFTER documenting it", not "this reads a file the dependency just changed") has no such
+// staleness risk -- the dependent task's own draft doesn't need the dependency's diff
+// present at all, only needs to know the dependency's own work is genuinely finished.
+// softDependsOn is that second kind: satisfied once the dependency reaches queue/done/ in
+// ANY terminal-success form (or the stacked/shared-branch exception above), with no merge
+// requirement -- the SAME "done is enough" reasoning the stacked-branch check above
+// already applies, generalized to non-file-decompose hubs. dependsOn's own semantics and
+// every existing caller are completely unchanged; this is a new, separate, opt-in field a
+// coordinator can choose per edge, not a loosening of the existing one.
+function isSoftDependencySatisfied(pipelineDir, depId) {
+  const trimmed = (depId || '').trim();
+  if (!trimmed) return true;
+  const candidates = [
+    path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
+    path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      if (data) return true; // reaching queue/done/ at all is the whole signal -- no mergedAt/stacked check needed
+    } catch {
+      // not found here, or unparseable -- try the next candidate location / fall through
+    }
+  }
+  return false;
+}
+
 // A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
 // directly (a per-instance claim subfolder) -- every task source shares this function, so a
 // task actively being drafted is correctly seen as already-queued, not regenerated.
@@ -422,6 +462,14 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // behind one that genuinely can't proceed yet.
     if (Array.isArray(parsed.dependsOn) && parsed.dependsOn.length > 0) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
+      if (unmet.length > 0) continue;
+    }
+    // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
+    // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
+    // required. A separate array from dependsOn so a coordinator can mix hard
+    // (file-content) and soft (sequencing-only) edges on the same task.
+    if (Array.isArray(parsed.softDependsOn) && parsed.softDependsOn.length > 0) {
+      const unmet = parsed.softDependsOn.filter((depId) => !isSoftDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
     }
 
@@ -2624,7 +2672,7 @@ module.exports = {
   nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
-  isTaskReady, pendingReadinessMap, isDependencySatisfied,
+  isTaskReady, pendingReadinessMap, isDependencySatisfied, isSoftDependencySatisfied,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
