@@ -148,6 +148,63 @@ test('logHardFailureAudit appends one well-formed NDJSON line per call, tagged t
   });
 });
 
+// --- computeLoadContext / systemLoadContext (2026-09-12, "The log needs to reflect the
+// CPU contention as the reason for the error"): a hard failure's message (ECONNREFUSED,
+// socket hang up, ...) only ever said WHAT happened at the socket, never WHY -- this
+// session repeatedly had to manually correlate a burst of these against `uptime`'s load
+// average by hand to notice the P40 VM and the local GPU lane were both saturating the
+// host's cores at the same moment. Pure threshold math, tested with controlled inputs
+// rather than the real live machine's own (unpredictable, test-environment-dependent)
+// load average. ---
+
+test('computeLoadContext reports the real numbers on every call, even below the contention threshold', () => {
+  const { computeLoadContext } = require('./local-client.js');
+  const ctx = computeLoadContext(1.0, 4);
+  assert.equal(ctx.loadAvg1m, 1.0);
+  assert.equal(ctx.cpuCount, 4);
+  assert.equal(ctx.loadRatio, 0.25);
+  assert.equal('likelySystemCause' in ctx, false, 'well below the threshold -- must not claim contention');
+});
+
+test('computeLoadContext sets likelySystemCause once loadRatio crosses the threshold -- calibrated against this session\'s own real confirmed incidents', () => {
+  const { computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD } = require('./local-client.js');
+  // Real observed values during confirmed live P40 connection failures on a 4-core host.
+  const ctx = computeLoadContext(7.7, 4);
+  assert.equal(ctx.loadRatio, 1.93);
+  assert.ok(ctx.loadRatio >= CPU_CONTENTION_LOAD_RATIO_THRESHOLD);
+  assert.match(ctx.likelySystemCause, /host CPU contention/);
+  assert.match(ctx.likelySystemCause, /7\.7/);
+  assert.match(ctx.likelySystemCause, /4 cores/);
+});
+
+test('computeLoadContext is a hard boundary at the threshold, not a loose one', () => {
+  const { computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD } = require('./local-client.js');
+  const justBelow = computeLoadContext(CPU_CONTENTION_LOAD_RATIO_THRESHOLD * 4 - 0.1, 4);
+  const justAt = computeLoadContext(CPU_CONTENTION_LOAD_RATIO_THRESHOLD * 4, 4);
+  assert.equal('likelySystemCause' in justBelow, false);
+  assert.equal('likelySystemCause' in justAt, true);
+});
+
+test('computeLoadContext never throws on invalid input and reports nothing rather than a garbage value', () => {
+  const { computeLoadContext } = require('./local-client.js');
+  assert.deepEqual(computeLoadContext(NaN, 4), {});
+  assert.deepEqual(computeLoadContext(1.0, 0), {});
+  assert.deepEqual(computeLoadContext(undefined, undefined), {});
+});
+
+test('logHardFailureAudit includes real system load fields on every entry, using the actual live host', () => {
+  withFixtureRepo((mod, dir) => {
+    mod.logHardFailureAudit({ source: 'pipeline_debrief', taskId: 't2', stage: 'plan', attempt: 1, code: 'OLLAMA_CONNECTION_ERROR' });
+    const lines = readAuditLog(dir, 'hard-failure');
+    assert.equal(lines.length, 1);
+    assert.equal(typeof lines[0].loadAvg1m, 'number');
+    assert.equal(typeof lines[0].cpuCount, 'number');
+    assert.equal(typeof lines[0].loadRatio, 'number');
+    // likelySystemCause is intentionally NOT asserted here either way -- it depends on
+    // the real load of whatever machine runs this test, which this test must not assume.
+  });
+});
+
 test('logHardFailureAudit is advisory: a broken pipelineDir never throws or breaks the caller', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-test-broken-hf-'));
   process.env.AGENT_MANAGER_REPO_ROOT = path.join(dir, 'does-not-exist-and-is-a-file');

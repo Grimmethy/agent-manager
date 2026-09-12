@@ -10,6 +10,7 @@
 // calls that are otherwise an invisible coin flip at default temperature.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
@@ -92,8 +93,49 @@ function logDegenerateAudit(entry) {
 // -- a call that never got a response at all and a call that got a real-but-bad response
 // are different failure classes with different fixes. 2026-09-08: now a thin wrapper over
 // pipeline-history.js's unified writer, same reasoning as logDegenerateAudit above.
+// 2026-09-12 (screaminggoatclubmt, "The log needs to reflect the CPU contention as the
+// reason for the error"): a hard failure's `message` (ECONNREFUSED, socket hang up, ...)
+// only ever said WHAT happened at the socket, never WHY -- this session repeatedly had to
+// manually correlate a burst of these against `uptime`'s load average by hand to notice
+// the P40 VM and the local GPU lane were both saturating this box's 4 physical cores at
+// the same moment. Capturing the REAL host load at the exact instant of failure, every
+// time, removes that manual correlation step for the next occurrence.
+//
+// Deliberately data-first, not a hardcoded claim: `likelySystemCause` is only set when
+// loadRatio (1-minute load average / core count) crosses a real oversubscription
+// threshold, calibrated against this session's own confirmed incidents (ratio ~2.0-2.5
+// during real P40 connection failures, on a 4-core host) -- comfortably above normal
+// light background load, so this doesn't fire on every failure and misattribute a
+// genuinely different cause (e.g. a VM reboot, an actual Ollama crash) to contention just
+// because SOME load happened to be present. loadAvg1m/cpuCount/loadRatio are logged on
+// EVERY hard failure regardless, so even a sub-threshold case still has the real numbers
+// for a human to judge, rather than only the boolean verdict.
+const CPU_CONTENTION_LOAD_RATIO_THRESHOLD = 1.5;
+
+// Pure threshold math, split out from the live os.loadavg()/os.cpus() reads below so it's
+// directly testable with controlled inputs instead of depending on whatever load happens
+// to be on the machine running the test suite.
+function computeLoadContext(loadAvg1m, cpuCount) {
+  if (!Number.isFinite(loadAvg1m) || !(cpuCount > 0)) return {};
+  const roundedLoad = Math.round(loadAvg1m * 100) / 100;
+  const loadRatio = Math.round((loadAvg1m / cpuCount) * 100) / 100;
+  const ctx = { loadAvg1m: roundedLoad, cpuCount, loadRatio };
+  if (loadRatio >= CPU_CONTENTION_LOAD_RATIO_THRESHOLD) {
+    ctx.likelySystemCause = `host CPU contention (load avg ${roundedLoad} on ${cpuCount} cores, ratio ${loadRatio})`;
+  }
+  return ctx;
+}
+
+function systemLoadContext() {
+  try {
+    return computeLoadContext(os.loadavg()[0], os.cpus().length || 1);
+  } catch {
+    return {}; // os.loadavg()/cpus() are POSIX-only and best-effort -- never break the real audit write over this
+  }
+}
+
 function logHardFailureAudit(entry) {
-  logPipelineEvent(resolvePipelineDir(), 'hard-failure', { ...entry, instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null });
+  logPipelineEvent(resolvePipelineDir(), 'hard-failure', { ...entry, ...systemLoadContext(), instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null });
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -553,7 +595,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
