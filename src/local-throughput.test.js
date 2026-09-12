@@ -75,3 +75,30 @@ test('getTokensPerSecond with no endpoint argument keeps today\'s unkeyed behavi
   recordSample(dir, { evalCount: 400, evalDurationNs: 10_000_000_000 }); // no endpoint -- the original shared-file shape
   assert.equal(getTokensPerSecond(dir), 40);
 });
+
+// 2026-09-12, root-caused live: STILL hit OLLAMA_TIMEOUT after the endpoint-keying fix
+// above had landed and been verified working. The P40's own Ollama instance serves TWO
+// very differently-sized models over the SAME endpoint -- qwen3.8-p40:27b-q4_K_M (~10
+// tok/s real) for most tasks, and qwen2.5:3b (confirmed live at 47-65 tok/s on the SAME
+// physical GPU) for brain_dump_sort tasks, which worker-p40/worker-reasoning-p40 also
+// run. Endpoint-only keying blended both into one EMA that read the small model's speed,
+// not the 27B's, so the 27B's timeout was still miscalibrated -- less severely than the
+// original bug, but the identical shape one level deeper: throughput depends on model
+// size, not just physical GPU, even on the exact same endpoint.
+test('recordSample/getTokensPerSecond are isolated per endpoint+model -- a fast small model never pollutes a slow large model\'s estimate on the SAME endpoint', () => {
+  const dir = tempInstancesDir();
+  const p40 = 'http://192.168.122.29:11434';
+  recordSample(dir, { evalCount: 500, evalDurationNs: 10_000_000_000, endpoint: p40, model: 'qwen2.5:3b' }); // 50 tok/s, small model
+  recordSample(dir, { evalCount: 100, evalDurationNs: 10_000_000_000, endpoint: p40, model: 'qwen3.8-p40:27b-q4_K_M' }); // 10 tok/s, the real 27B speed
+
+  const smallModelTps = getTokensPerSecond(dir, p40, 'qwen2.5:3b');
+  const bigModelTps = getTokensPerSecond(dir, p40, 'qwen3.8-p40:27b-q4_K_M');
+  assert.ok(Math.abs(smallModelTps - 50) < 0.01, `small model should read its own fast rate, got ${smallModelTps}`);
+  assert.ok(Math.abs(bigModelTps - 10) < 0.01, `big model on the SAME endpoint should read its own slow rate, unpolluted by the small model, got ${bigModelTps}`);
+});
+
+test('getTokensPerSecond with an endpoint but no model keeps the endpoint-only shape (backward compatible with the previous fix)', () => {
+  const dir = tempInstancesDir();
+  recordSample(dir, { evalCount: 400, evalDurationNs: 10_000_000_000, endpoint: 'http://localhost:11434' });
+  assert.equal(getTokensPerSecond(dir, 'http://localhost:11434'), 40);
+});

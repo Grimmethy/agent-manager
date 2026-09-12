@@ -28,20 +28,37 @@ const EMA_ALPHA = 0.25; // recent calls weighted more than old ones, but one slo
 // distinct GPU's throughput estimate is isolated -- also protects the local GPU's own
 // estimate from being dragged down by the P40's slower samples, an equally real
 // bidirectional harm the shared file caused.
-function statePath(instancesDir, endpoint) {
-  const key = endpoint ? `.${String(endpoint).replace(/[^A-Za-z0-9]/g, '_')}` : '';
-  return path.join(instancesDir, `.local-throughput${key}.json`);
+// 2026-09-12 (screaminggoatclubmt, real live recurrence: worker-reasoning-p40 STILL hit
+// OLLAMA_TIMEOUT after the endpoint-keying fix above had already landed and been verified
+// working): the P40's own Ollama instance serves TWO very differently-sized models over
+// the SAME endpoint -- qwen3.8-p40:27b-q4_K_M (the slow one, ~10 tok/s real) for most
+// tasks, and qwen2.5:3b (much smaller, confirmed live at 47-65 tok/s on the SAME physical
+// GPU) for brain_dump_sort tasks specifically, which worker-p40/worker-reasoning-p40 also
+// run. Endpoint-only keying blended both into one EMA that read ~48-65 tok/s -- the small
+// model's speed, not the 27B's -- so the 27B's own timeout was STILL being calibrated to
+// the wrong (too-fast) throughput, just less severely than the original single-shared-file
+// bug. Root cause is identical in shape to that fix and to should_yield_for_model_swap's
+// original bug: model, not just physical GPU, determines real throughput, and generation
+// speed varies by orders of magnitude with model size even on the SAME hardware. Keyed by
+// endpoint+model together now, mirroring gpu-arbiter.js's own model-vs-lockKey distinction
+// (its header note: "two DIFFERENT models were made to stop serializing... confirmed FALSE
+// under real sustained load" -- the same lesson applies here: never assume one endpoint
+// has one speed).
+function statePath(instancesDir, endpoint, model) {
+  const endpointKey = endpoint ? `.${String(endpoint).replace(/[^A-Za-z0-9]/g, '_')}` : '';
+  const modelKey = model ? `.${String(model).replace(/[^A-Za-z0-9]/g, '_')}` : '';
+  return path.join(instancesDir, `.local-throughput${endpointKey}${modelKey}.json`);
 }
 
 // evalCount/evalDurationNs come straight off Ollama's /api/generate response
 // (eval_count, eval_duration) -- the model's own report of how many tokens it generated and
 // how long that took, no separate measurement needed.
-function recordSample(instancesDir, { evalCount, evalDurationNs, endpoint } = {}) {
+function recordSample(instancesDir, { evalCount, evalDurationNs, endpoint, model } = {}) {
   if (!instancesDir || !(evalCount > 0) || !(evalDurationNs > 0)) return;
   const tps = evalCount / (evalDurationNs / 1e9);
   if (!Number.isFinite(tps) || tps <= 0) return;
 
-  const p = statePath(instancesDir, endpoint);
+  const p = statePath(instancesDir, endpoint, model);
   let prevTps = null;
   try {
     const prev = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -63,10 +80,10 @@ function recordSample(instancesDir, { evalCount, evalDurationNs, endpoint } = {}
   }
 }
 
-function getTokensPerSecond(instancesDir, endpoint) {
+function getTokensPerSecond(instancesDir, endpoint, model) {
   if (!instancesDir) return DEFAULT_TPS;
   try {
-    const data = JSON.parse(fs.readFileSync(statePath(instancesDir, endpoint), 'utf8'));
+    const data = JSON.parse(fs.readFileSync(statePath(instancesDir, endpoint, model), 'utf8'));
     if (Number.isFinite(data.tokensPerSecond) && data.tokensPerSecond > 0) return data.tokensPerSecond;
   } catch {
     // no samples yet, or unreadable -- fall back to the conservative floor.
