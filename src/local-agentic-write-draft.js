@@ -337,6 +337,11 @@ function buildWriteAgenticPrompt(task) {
     '[{"title": "short imperative title", "rawText": "a 2-4 sentence description of just this piece"}, ...]',
     'You MAY add "after": N to a sub-task, where N is the 0-based index of an EARLIER sub-task in this same array, ONLY when the piece genuinely cannot start until that earlier one is merged -- e.g. it edits a file the earlier one creates. Omit "after" for pieces that can proceed independently (the common case).',
     'Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.',
+    // 2026-09-12: a cheap complementary nudge, not the real enforcement -- see
+    // apply-adhoc-diff.js's queueSubTasks/isVerificationOnlySubTask for the deterministic
+    // backstop this pairs with (a task title's own leading verb still decides, regardless
+    // of what this line achieves).
+    'Every piece must be a real code change with its own diff. Do NOT create a separate piece whose only job is to run, confirm, verify, or check another piece\'s change -- that has no diff of its own and can never be completed by an implementation pass. Fold that check into the CODE-CHANGE piece\'s own rawText instead (e.g. "...then run `node --test X` and confirm it passes").',
     'Then a short (1-3 sentence) explanation of why you split it this way.',
     '',
     'If RESOLUTION: needs-human-decision -- the VERY NEXT line MUST be exactly one of these three (2026-09-08, root-caused live: free-text blocker descriptions were unreliably auto-classified by phrase-matching after the fact, so a real budget-exhaustion case worded differently than expected kept getting misrouted to a human as a "design question" -- this line removes the guesswork):',
