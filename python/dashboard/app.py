@@ -6020,6 +6020,29 @@ def _find_task_record_anywhere(qdir, task_id):
     return None, None
 
 
+def _history_entry_detail_text(e):
+    """The visible line under a history entry's stage label in the Unmerged Branches
+    modal. Older/hand-written entries (the pre-task-history.js `{"status": "pending"}`
+    shape api_task_requeue used to write, still the shape of a `requeued` event's own
+    note today) carry their text in `note`, not `detail` -- confirmed live 2026-09-12:
+    observability-fix-ac-158's requeue entry rendered as a bare 'pending' label with
+    nothing beneath it, because this used to read ONLY `detail`. Also folds in the
+    blockedReasonAtRequeue/priorRejectionFeedbackAtRequeue api_task_requeue now stamps on
+    its own `requeued` entry (see that endpoint) -- without this, that data is captured in
+    the JSON but still invisible at a click, same failure mode this whole mechanism exists
+    to close."""
+    parts = []
+    if e.get("detail"):
+        parts.append(str(e["detail"]))
+    elif e.get("note"):
+        parts.append(str(e["note"]))
+    if e.get("blockedReasonAtRequeue"):
+        parts.append(f"(blocked for: {e['blockedReasonAtRequeue']})")
+    if e.get("priorRejectionFeedbackAtRequeue"):
+        parts.append(f"(prior rejections: {e['priorRejectionFeedbackAtRequeue']})")
+    return " ".join(parts) if parts else None
+
+
 def _summarize_task_record(data, state):
     """Compact pipeline log for one task, for the Unmerged Branches detail modal: the
     full `history[]` (created -> plan -> implement tiers -> review votes -> applied ->
@@ -6042,7 +6065,7 @@ def _summarize_task_record(data, state):
         "reviewVotes": review_votes,
         "decomposedFrom": (data.get("promptContext") or {}).get("decomposedFrom"),
         "history": [
-            {"stage": e.get("stage") or e.get("status"), "at": e.get("at"), "detail": e.get("detail")}
+            {"stage": e.get("stage") or e.get("status"), "at": e.get("at"), "detail": _history_entry_detail_text(e)}
             for e in history
         ],
     }

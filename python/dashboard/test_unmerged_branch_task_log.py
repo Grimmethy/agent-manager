@@ -52,6 +52,36 @@ class TestBranchTaskLog(unittest.TestCase):
         self.assertEqual([h["stage"] for h in s["history"]], ["created", "approved", "applied"])
         self.assertEqual(s["terminalDisposition"], "merged")
 
+    def test_summarize_task_record_shows_note_text_when_detail_is_absent(self):
+        # The pre-task-history.js {"status": "pending", "note": ...} shape, and the
+        # requeued event api_task_requeue's history-append fix now writes -- both carry
+        # their text in `note`, not `detail`. Root-caused live 2026-09-12:
+        # observability-fix-ac-158's requeue entry rendered as a bare "pending" label with
+        # nothing visible beneath it before this fix.
+        rec = {
+            "id": "x", "history": [
+                {"status": "pending", "at": "1", "note": "manually requeued from blocked/"},
+            ],
+        }
+        s = app._summarize_task_record(rec, "done")
+        self.assertEqual(s["history"][0]["detail"], "manually requeued from blocked/")
+
+    def test_summarize_task_record_surfaces_blockedReasonAtRequeue_and_prior_feedback(self):
+        rec = {
+            "id": "x", "history": [
+                {
+                    "stage": "requeued", "at": "1", "note": "manually requeued from blocked/",
+                    "blockedReasonAtRequeue": "diff touches a forbidden file",
+                    "priorRejectionFeedbackAtRequeue": ["earlier rejection"],
+                },
+            ],
+        }
+        s = app._summarize_task_record(rec, "done")
+        detail = s["history"][0]["detail"]
+        self.assertIn("manually requeued from blocked/", detail)
+        self.assertIn("diff touches a forbidden file", detail)
+        self.assertIn("earlier rejection", detail)
+
     def test_hub_matched_by_branch_field_and_readiness(self):
         # stacked hub, 2/3 done, gate pending -> NOT ready to merge
         self._w("coordinating", {
