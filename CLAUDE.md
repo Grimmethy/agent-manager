@@ -31,3 +31,10 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context — one `CONTEXT.md` (to be created) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Codebase map
+
+Where a dashboard tab, backend route, or core pipeline mechanism actually lives in the
+source tree — grown incrementally, not exhaustive. See `docs/agents/codebase-map.md`. If
+you had to grep, guess, or browser-search for a path that isn't listed there, add a row
+for it once you find it — that's the whole maintenance model; nothing else keeps it fresh.
