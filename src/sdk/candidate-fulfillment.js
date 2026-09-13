@@ -83,23 +83,6 @@ const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
 // code, e.g. observability-fix-ac-26's paraphrased `catch (err)` vs the real bare `catch
 // {` -- that's a real, accepted gap (see windowFetchedFileContent's own header), not
 // something a formatting-only tolerance should try to paper over.
-function findFuzzyMatch(content, snippet) {
-  const trimmed = (snippet || '').trim();
-  if (!trimmed) return null;
-  const idx = content.indexOf(trimmed);
-  if (idx !== -1) return { index: idx, length: trimmed.length };
-
-  const strippedSnippet = stripWhitespace(trimmed);
-  if (!strippedSnippet) return null;
-  const strippedContent = stripWhitespace(content);
-  const strippedIdx = strippedContent.indexOf(strippedSnippet);
-  if (strippedIdx === -1) return null;
-
-  const realStart = realIndexForStrippedIndex(content, strippedIdx);
-  const realEnd = realIndexForStrippedIndex(content, strippedIdx + strippedSnippet.length);
-  return { index: realStart, length: Math.max(realEnd - realStart, 1) };
-}
-
 // Candidate prose reliably says "at line NNN" / "lines NNN-MMM" even when its own
 // backtick-quoted code snippet has drifted from the real file (paraphrased rather than
 // copy-pasted -- see windowFetchedFileContent's own header for why that quote match can
@@ -107,16 +90,6 @@ function findFuzzyMatch(content, snippet) {
 // to center a window on, and matches this doc format's own convention of citing the
 // start of a block ("lines 1255-1270" for a try, "line 1271" for its catch).
 const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
-
-function windowAroundIndex(content, idx, matchLen, maxChars) {
-  const half = Math.floor(maxChars / 2);
-  const from = Math.max(0, idx - half);
-  const to = Math.min(content.length, idx + matchLen + half);
-  const windowed = content.slice(from, to);
-  const prefix = from > 0 ? '...[truncated]...\n' : '';
-  const suffix = to < content.length ? '\n...[truncated]' : '';
-  return `${prefix}${windowed}${suffix}`;
-}
 
 // 2026-08-27 (Grimmethy, investigating a fresh round of blocked observability_fix/
 // arch_review tasks after the AC-3 grounding-staleness fix): a flat truncation from byte 0
