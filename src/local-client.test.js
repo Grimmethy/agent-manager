@@ -45,6 +45,20 @@ test('detectDegenerate does not false-positive on real short JSON containing quo
   assert.equal(detectDegenerate('{"a":1}'), null);
 });
 
+// 2026-09-13 (brain-dump bd-1788780905388): doneReason:'length' is unambiguous but not
+// exhaustive -- a real incident named a draft truncated mid-PLAN-table/IMPLEMENT-section
+// even though doneReason wasn't 'length'. See draft-truncation-guard.js/.test.js for the
+// full case set on the pure detector itself; this just proves the wiring.
+test('detectDegenerate flags a content-truncated draft (unclosed PLAN table row) as "truncated", even with no doneReason', () => {
+  const draft = '| Step | Action |\n|------|--------|\n| 1    | partial text';
+  assert.equal(detectDegenerate(draft), 'truncated');
+});
+
+test('detectDegenerate does not flag a well-formed draft as truncated', () => {
+  const draft = '| Step | Action |\n|------|--------|\n| 1    | Do A   |\n\n## IMPLEMENT\n\ndo thing B\n';
+  assert.equal(detectDegenerate(draft), null);
+});
+
 test('detectDegenerate still flags repeated-character garbage', () => {
   assert.equal(detectDegenerate('0'.repeat(30)), 'repeated-character');
 });
