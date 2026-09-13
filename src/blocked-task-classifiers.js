@@ -166,6 +166,24 @@ function categorizeBlockedReason(reason) {
 // classifyBlockedTask's own header).
 const CLASSIFIERS = [
   {
+    // Checked FIRST, before every other structural classifier and the REASON_CATEGORIES
+    // keyword spread: a task carrying the structured reviewInconclusive flag (stamped
+    // upstream by the gate in local-draft.js) is, by definition, an inconclusive-review
+    // block -- no free-text keyword match is needed or wanted. This makes the reliable
+    // structured flag take precedence over the fragile 'inconclusive' substring match on
+    // blockedReason, which is kept below as a fallback for legacy tasks that predate the
+    // flag. faultSide/retryable mirror the keyword entry's values exactly (model-side,
+    // still worth a blind redraft: an inconclusive review is a stochastic coin-flip, not
+    // a deterministic harness/environment fault).
+    name: 'inconclusive-review-flag',
+    classify(task) {
+      if (task && task.reviewInconclusive === true) {
+        return { category: 'inconclusive-review', faultSide: 'model', retryable: true };
+      }
+      return null;
+    },
+  },
+  {
     name: 'external-dependency',
     // Stamped at DRAFT time by local-agentic-write-draft.js's detectExternalDependency
     // (AC-13a) -- this classifier only RECOGNIZES it, never builds a fresh question;
