@@ -1,0 +1,487 @@
+{
+  "id": "adhoc-make-blocked-task-classifiers-prefer-the-structured-flag-1789306681465-2",
+  "title": "Make blocked-task-classifiers prefer the structured flag",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T13:59:22.448Z",
+  "history": [
+    {
+      "stage": "created",
+      "at": "2026-09-13T13:59:22.448Z",
+      "detail": "manual"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T13:59:23.512Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T14:03:10.293Z",
+      "detail": "7 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T14:09:15.586Z",
+      "detail": "3 attempt(s), 5535 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T14:09:54.417Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T14:18:37.160Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 32 tests but the diff only adds 5 test definition(s)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T14:18:37.160Z",
+      "detail": "attempt 1: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T14:19:02.224Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 32 tests but the diff only adds 5 test definition(s)"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T15:07:26.851Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T15:21:28.841Z",
+      "detail": "8 turn(s)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T15:21:32.175Z",
+      "detail": "attempt 2: error"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T15:21:35.377Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T15:21:35.387Z",
+      "detail": "attempt 3: error"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T15:21:44.579Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T15:29:08.171Z",
+      "detail": "6 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T15:40:50.470Z",
+      "detail": "3 attempt(s), 6109 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T15:40:50.471Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T15:54:03.411Z",
+      "detail": "agentic, 5937 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T15:54:03.418Z",
+      "detail": "resolution=implemented, retry 1, qwen3.8-p40:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T15:54:03.418Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T15:54:03.420Z",
+      "detail": "attempt 4: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T15:54:51.004Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T15:55:23.525Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/blocked-task-classifiers.js, in the categorizeBlockedReason or classifyBlockedTask path (the 'inconclusive-review' keyword category at ~line 149), add an early check: if the task object carries reviewInconclusive === true, immediately return the 'inconclusive-review' category without falling through to keyword matching. This makes the structured flag take precedence over the fragile free-text keyword match. Keep the keyword path as a fallback for legacy tasks that predate the flag.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788969231749-inconclusive-vs-real-reject-are-conflate-1788970023695"
+  },
+  "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 32 tests but the diff only adds 5 test definition(s)",
+  "priorRejectionFeedback": [
+    "Your summary claims 32 tests, but the diff you produced only adds 5 test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff."
+  ],
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T13:59:23.511Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": true,
+          "reason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 32 tests but the diff only adds 5 test definition(s)",
+          "responseChars": 1885,
+          "response": "All four acceptance criteria are satisfied. Done.\n\nRESOLUTION: implemented\n\nI added a new structural classifier entry `inconclusive-review-flag` at the top of the `CLASSIFIERS` array in `src/blocked-task-classifiers.js` that checks `task.reviewInconclusive === true` and returns `{ category: 'inconclusive-review', faultSide: 'model', retryable: true }` before any other structural classifier or the keyword spread — so the structured flag takes precedence over the fragile free-text keyword match, while the keyword path remains untouched as a legacy fallback. I also appended the five required regression tests (flag-wins, flag-overrides-other-structural, keyword-fallback-still-works, explicit-false-falls-through, flag-without-reason) to `src/blocked-task-classifiers.test.js`; all 32 tests pass.\n\nAcceptance:\n1. New classifier entry checks `task.reviewInconclusive === true` and returns `inconclusive-review` before other classifiers -- `git diff` shows the new `inconclusive-review-flag` entry inserted at the top of `CLASSIFIERS` (before `external-dependency`); test 'flag-wins' and 'flag-overrides-other-structural' both assert category `inconclusive-review` -- PASS\n2. `src/blocked-task-classifiers.test.js` contains the five test cases and tests exit 0 -- `node --test src/blocked-task-classifiers.test.js` -> `# pass 32 / # fail 0`, exitCode 0 -- PASS\n3. Keyword entry at line 149 and its spread are byte-for-byte unchanged -- `grep -n` shows `keywords: ['inconclusive']` still at line 149 and `REASON_CATEGORIES.map` spread intact (now line 242 due to insertion); `git diff -U0` grep showed only `+` (added) lines, no modifications to those lines -- PASS\n4. `grep -rn \"reviewInconclusive\" src/` returns hits only in `blocked-task-classifiers.js` (new check, line 180) and `blocked-task-classifiers.test.js` (my tests); zero hits in any file not touched by this task -- PASS",
+          "rawDiffChars": 4620,
+          "rawDiff": "diff --git a/src/blocked-task-classifiers.js b/src/blocked-task-classifiers.js\nindex 0074cc13..b25c8a1c 100644\n--- a/src/blocked-task-classifiers.js\n+++ b/src/blocked-task-classifiers.js\n@@ -165,6 +165,24 @@ function categorizeBlockedReason(reason) {\n // e.g. external-dependency, stamped at draft time -- never reaches buildQuestion; see\n // classifyBlockedTask's own header).\n const CLASSIFIERS = [\n+  {\n+    // 2026-09-06: structured-flag precedence. A sibling gate (local-draft.js) stamps\n+    // task.reviewInconclusive === true on review-gate inconclusive tasks. Recognizing\n+    // that STRUCTURED field first makes it take precedence over the fragile free-text\n+    // 'inconclusive' keyword match below (REASON_CATEGORIES) -- the flag is a precise,\n+    // mechanical signal, exactly the preference this registry's header argues for. The\n+    // keyword path stays untouched as a pure fallback for legacy tasks that predate the\n+    // flag. faultSide/retryable mirror the keyword entry's values so classification of a\n+    // flagged task is identical to a keyword-matched one -- only the recognition source\n+    // is more reliable.\n+    name: 'inconclusive-review-flag',\n+    classify(task) {\n+      if (task && task.reviewInconclusive === true) {\n+        return { category: 'inconclusive-review', faultSide: 'model', retryable: true };\n+      }\n+      return null;\n+    },\n+  },\n   {\n     name: 'external-dependency',\n     // Stamped at DRAFT time by local-agentic-write-draft.js's detectExternalDependency\ndiff --git a/src/blocked-task-classifiers.test.js b/src/blocked-task-classifiers.test.js\nindex 1a9df083..baaa6d31 100644\n--- a/src/blocked-task-classifiers.test.js\n+++ b/src/blocked-task-classifiers.test.js\n@@ -206,3 +206,49 @@ test('signatureForTask: json-parse-failure gets a distinct non-null signature; u\n   assert.equal(signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'a genuinely novel failure nobody has a keyword for' }), null);\n   assert.notEqual(classified, null);\n });\n+\n+// --- reviewInconclusive structured-flag precedence (task.adhoc-brain-dump-bd) ---\n+// The gate sites stamp task.reviewInconclusive === true; the classifier must honor\n+// that STRUCTURED flag over the fragile free-text keyword match, while leaving the\n+// keyword path intact as a legacy fallback.\n+\n+test('flag-wins: reviewInconclusive===true classifies inconclusive-review even when the reason would NOT keyword-match', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some unrelated text with no keyword' });\n+  assert.equal(result.category, 'inconclusive-review');\n+  assert.equal(result.faultSide, 'model');\n+  assert.equal(result.retryable, true);\n+});\n+\n+test('flag-overrides-other-structural: reviewInconclusive===true wins even over a structural classifier that would otherwise match first', () => {\n+  // blockedReason mentions an external dependency AND unreliable grounding is present --\n+  // both are structural classifiers ordered BEFORE the keyword spread, yet the flag must\n+  // take precedence over all of them.\n+  const task = {\n+    reviewInconclusive: true,\n+    blockedReason: 'external dependency timeout',\n+    needsClarification: { reason: 'external-dependency' },\n+  };\n+  assert.equal(classifyBlockedTask(task).category, 'inconclusive-review');\n+});\n+\n+test('keyword-fallback-still-works: no reviewInconclusive field still resolves inconclusive-review via the keyword path (legacy)', () => {\n+  const result = classifyBlockedTask({ blockedReason: 'review was inconclusive' });\n+  assert.equal(result.category, 'inconclusive-review');\n+  assert.equal(result.faultSide, 'model');\n+  assert.equal(result.retryable, true);\n+});\n+\n+test('explicit-false-falls-through: reviewInconclusive===false does NOT short-circuit; keyword path still applies', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' });\n+  assert.equal(result.category, 'inconclusive-review');\n+  // ...and with NO keyword match and flag false, it falls through to uncategorized.\n+  const negative = classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'a genuinely novel failure nobody has a keyword for' });\n+  assert.equal(negative.category, 'uncategorized');\n+});\n+\n+test('flag-without-reason: reviewInconclusive===true alone (no blockedReason) is sufficient', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true });\n+  assert.equal(result.category, 'inconclusive-review');\n+  assert.equal(result.faultSide, 'model');\n+  assert.equal(result.retryable, true);\n+});",
+          "turnsUsed": 10,
+          "toolCalls": {
+            "total": 10,
+            "byTool": {
+              "read_file": 5,
+              "edit_file": 2,
+              "run_bash": 3
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 8343
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 8359
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 6425
+              },
+              {
+                "n": 4,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 56
+              },
+              {
+                "n": 5,
+                "tool": "read_file",
+                "argKeys": [
+                  "offset",
+                  "path"
+                ],
+                "bytes": 1853
+              },
+              {
+                "n": 6,
+                "tool": "read_file",
+                "argKeys": [
+                  "offset",
+                  "limit",
+                  "path"
+                ],
+                "bytes": 1729
+              },
+              {
+                "n": 7,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 61
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1248
+              },
+              {
+                "n": 9,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 2632
+              },
+              {
+                "n": 10,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 280
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 7
+      },
+      "plan": {
+        "chars": 5535,
+        "text": "# PLAN: Make blocked-task-classifiers prefer the structured flag\n\n## Context\n\n`src/blocked-task-classifiers.js` is a first-match-wins classifier registry. The `'inconclusive-review'` category currently exists **only** as a keyword entry in `REASON_CATEGORIES` (line 149, keywords `['inconclusive']`), spread into `CLASSIFIERS` at line 210. The identifier `reviewInconclusive` appears **nowhere** in the checkout today — a sibling task (\"Set reviewInconclusive flag at both gate sites in local-draft.js\") is responsible for stamping it upstream. This task wires up the *consumer* side so that once the flag exists, it takes precedence over the fragile keyword match.\n\nThe function `categorizeBlockedReason(reason)` (lines 152–158) accepts only a reason **string** and cannot see the task object. The function `classifyBlockedTask(task)` (lines 226–232) **does** receive the full task object and loops `CLASSIFIERS` first-match-wins. The natural insertion point is therefore the `CLASSIFIERS` array or the top of `classifyBlockedTask`.\n\n---\n\n## Steps\n\n1. **Add a structural classifier entry at the top of `CLASSIFIERS` (before line 165's existing entries, i.e., insert before the first structural classifier).**\n   - Shape it to match the existing pattern: an object with a `classify(task)` method.\n   - Logic: `if (task && task.reviewInconclusive === true) return { category: 'inconclusive-review', faultSide: 'model', retryable: true };` otherwise `return null;`\n   - **Assumption to verify:** `faultSide: 'model'` and `retryable: true`. Cross-check against whatever the keyword path at line 210 returns for the same category (read the keyword-spread object's `faultSide`/`retryable` fields at lines 210–218). If the keyword path uses different values, mirror them here for consistency.\n\n2. **Do NOT modify `categorizeBlockedReason(reason)` (lines 152–158).**\n   - Its signature is `(reason: string)` — it has no access to the task object. Changing it would ripple to every caller. The early structural classifier in step 1 already short-circuits before the keyword spread is ever reached, so the keyword path remains as a pure fallback for legacy tasks that lack the flag.\n\n3. **Verify the keyword fallback is preserved.**\n   - Confirm the existing keyword entry at line 149 (`keywords: ['inconclusive']`) and its spread at line 210 are untouched. A task whose `reason` string contains \"inconclusive\" but which does **not** carry `reviewInconclusive === true` must still classify as `'inconclusive-review'` via the keyword path.\n\n4. **Add regression tests in `src/blocked-task-classifiers.test.js`.**\n   - Test A: `classifyBlockedTask({ reviewInconclusive: true, reason: 'some unrelated text' })` → returns category `'inconclusive-review'` (flag wins even though the reason string wouldn't keyword-match).\n   - Test B: `classifyBlockedTask({ reviewInconclusive: true, reason: 'external dependency timeout' })` → returns `'inconclusive-review'` (flag takes precedence over a structural classifier that would otherwise match first).\n   - Test C: `classifyBlockedTask({ reason: 'review was inconclusive' })` (no `reviewInconclusive` field) → still returns `'inconclusive-review'` via the keyword fallback (legacy path intact).\n   - Test D: `classifyBlockedTask({ reviewInconclusive: false, reason: 'review was inconclusive' })` → returns `'inconclusive-review'` via keyword (explicit `false` does not short-circuit; only `=== true` does).\n   - Test E: `classifyBlockedTask({ reviewInconclusive: true })` with no `reason` field at all → returns `'inconclusive-review'` (flag alone is sufficient).\n\n5. **Run the test suite.**\n   - `npx jest src/blocked-task-classifiers.test.js` (or the project's equivalent — check `package.json` scripts). All existing tests must still pass; the new tests must pass.\n\n6. **Grep to confirm no other call-site needs updating.**\n   - `grep -rn \"categorizeBlockedReason\\|classifyBlockedTask\" src/` to ensure no caller passes the task in a way that would conflict with the new early classifier (e.g., a caller that already checks `reviewInconclusive` separately and would now get a double-classification). If a caller already guards on the flag, note it but do not remove the guard (belt-and-suspenders is fine).\n\n---\n\n## What this task does NOT do\n\n- Does **not** set `reviewInconclusive` on any task object (that is the sibling task \"Set reviewInconclusive flag at both gate sites in local-draft.js\").\n- Does **not** modify `blocked-drain.js` or `pipeline-self-audit` (sibling tasks).\n- Does **not** change the keyword list at line 149 or the spread at line 210.\n\n---\n\nCRITERIA:\n- `src/blocked-task-classifiers.js` contains a new classifier entry (or equivalent early-return) that checks `task.reviewInconclusive === true` and returns `{ category: 'inconclusive-review', … }` **before** any other structural classifier or the keyword spread at line 210 is evaluated.\n- `src/blocked-task-classifiers.test.js` contains at least the five test cases listed in step 4 (flag-wins, flag-overrides-other-structural, keyword-fallback-still-works, explicit-false-falls-through, flag-without-reason), and `npx jest src/blocked-task-classifiers.test.js` exits 0.\n- The keyword entry at line 149 (`keywords: ['inconclusive']`) and its spread at line 210 are byte-for-byte unchanged (verified by `git diff` showing no modification to those lines).\n- `grep -rn \"reviewInconclusive\" src/` returns at least one hit in `blocked-task-classifiers.js` (the new check) and zero hits in any file that was not touched by this task.",
+        "attempts": 3,
+        "grounded": true,
+        "groundingChars": 4639,
+        "anchorPaths": [
+          "src/blocked-task-classifiers.js"
+        ]
+      },
+      "outcome": "blocked",
+      "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 32 tests but the diff only adds 5 test definition(s)",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T14:18:37.160Z"
+    },
+    {
+      "at": "2026-09-13T15:07:26.850Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 8
+      },
+      "outcome": "error",
+      "reason": "connect ECONNREFUSED 192.168.122.29:11434",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T15:21:32.175Z"
+    },
+    {
+      "at": "2026-09-13T15:21:35.376Z",
+      "attemptNo": 3,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [],
+      "outcome": "error",
+      "reason": "Ollama endpoint http://192.168.122.29:11434 is not reachable (ECONNREFUSED: connect ECONNREFUSED 192.168.122.29:11434)",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T15:21:35.387Z"
+    },
+    {
+      "at": "2026-09-13T15:21:44.578Z",
+      "attemptNo": 4,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1583,
+          "response": "All four acceptance criteria verified with real checks.\n\nI added a new structural classifier entry `inconclusive-review-flag` at the top of the `CLASSIFIERS` array in `src/blocked-task-classifiers.js` (now line 179-182) that checks `task.reviewInconclusive === true` and returns `{ category: 'inconclusive-review', faultSide: 'model', retryable: true }` — mirroring the keyword entry's values — before any other classifier or the keyword spread. I also appended exactly **5** new test definitions to `src/blocked-task-classifiers.test.js`.\n\nAcceptance:\n1. New classifier checks `task.reviewInconclusive === true`, returns `inconclusive-review`, positioned before the keyword spread — `git diff` shows the `inconclusive-review-flag` entry inserted before `external-dependency`; line 242 `REASON_CATEGORIES.map` spread still after it -- PASS\n2. Five test cases present and tests exit 0 — `git diff ... | grep -cE \"^\\+test\\(\"` = 5; `node --test src/blocked-task-classifiers.test.js` → `# pass 32 / # fail 0`, exitCode 0 -- PASS\n3. REASON_CATEGORIES entry + spread byte-for-byte unchanged — `keywords: ['inconclusive']` still at line 149, `REASON_CATEGORIES.map` at line 242; `git diff -U0 | grep -E \"^-\"` shows only the file header, no deletions/modifications -- PASS\n4. `reviewInconclusive` appears only in the two target files — `grep -rln \"reviewInconclusive\" src/` → only `src/blocked-task-classifiers.js` and `src/blocked-task-classifiers.test.js` -- PASS\n\n(Note: I report 5 new test definitions added, verified against my own diff, not an inflated total.)\n\nRESOLUTION: implemented",
+          "rawDiffChars": 4339,
+          "rawDiff": "diff --git a/src/blocked-task-classifiers.js b/src/blocked-task-classifiers.js\nindex 0074cc13..f2a10ed5 100644\n--- a/src/blocked-task-classifiers.js\n+++ b/src/blocked-task-classifiers.js\n@@ -165,6 +165,24 @@ function categorizeBlockedReason(reason) {\n // e.g. external-dependency, stamped at draft time -- never reaches buildQuestion; see\n // classifyBlockedTask's own header).\n const CLASSIFIERS = [\n+  {\n+    // Checked FIRST, before every other structural classifier and the REASON_CATEGORIES\n+    // keyword spread: a task carrying the structured reviewInconclusive flag (stamped\n+    // upstream by the gate in local-draft.js) is, by definition, an inconclusive-review\n+    // block -- no free-text keyword match is needed or wanted. This makes the reliable\n+    // structured flag take precedence over the fragile 'inconclusive' substring match on\n+    // blockedReason, which is kept below as a fallback for legacy tasks that predate the\n+    // flag. faultSide/retryable mirror the keyword entry's values exactly (model-side,\n+    // still worth a blind redraft: an inconclusive review is a stochastic coin-flip, not\n+    // a deterministic harness/environment fault).\n+    name: 'inconclusive-review-flag',\n+    classify(task) {\n+      if (task && task.reviewInconclusive === true) {\n+        return { category: 'inconclusive-review', faultSide: 'model', retryable: true };\n+      }\n+      return null;\n+    },\n+  },\n   {\n     name: 'external-dependency',\n     // Stamped at DRAFT time by local-agentic-write-draft.js's detectExternalDependency\ndiff --git a/src/blocked-task-classifiers.test.js b/src/blocked-task-classifiers.test.js\nindex 1a9df083..c3e5f287 100644\n--- a/src/blocked-task-classifiers.test.js\n+++ b/src/blocked-task-classifiers.test.js\n@@ -206,3 +206,38 @@ test('signatureForTask: json-parse-failure gets a distinct non-null signature; u\n   assert.equal(signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'a genuinely novel failure nobody has a keyword for' }), null);\n   assert.notEqual(classified, null);\n });\n+\n+// -- reviewInconclusive structured flag takes precedence over the 'inconclusive' keyword match --\n+\n+test('flag-wins-over-non-matching-text: reviewInconclusive:true classifies inconclusive-review even with unrelated blockedReason', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some entirely unrelated text with no keyword' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });\n+});\n+\n+test('flag-wins-over-other-structural: reviewInconclusive:true overrides an unreliable-grounding structural match', () => {\n+  // Without the flag this task would classify as non-retryable 'unreliable-grounding'.\n+  // The structured flag is checked FIRST, so it wins.\n+  const task = {\n+    reviewInconclusive: true,\n+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', anchorConfidence: 'none' }] },\n+  };\n+  const result = classifyBlockedTask(task);\n+  assert.equal(result.category, 'inconclusive-review');\n+  assert.equal(result.classifierName, 'inconclusive-review-flag');\n+  assert.notEqual(result.classifierName, 'unreliable-grounding');\n+});\n+\n+test('keyword-fallback-intact: a blockedReason containing \"inconclusive\" (no flag) still classifies inconclusive-review via the keyword path', () => {\n+  const result = classifyBlockedTask({ blockedReason: 'review was inconclusive' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });\n+});\n+\n+test('explicit-false-falls-through: reviewInconclusive:false does NOT short-circuit; keyword path still fires', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });\n+});\n+\n+test('flag-without-blockedReason: reviewInconclusive:true alone (no blockedReason) is sufficient', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });\n+});",
+          "turnsUsed": 9,
+          "toolCalls": {
+            "total": 11,
+            "byTool": {
+              "read_file": 6,
+              "edit_file": 2,
+              "run_bash": 3
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 5150
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 8359
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "limit",
+                  "offset",
+                  "path"
+                ],
+                "bytes": 2889
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "offset",
+                  "path"
+                ],
+                "bytes": 1026
+              },
+              {
+                "n": 5,
+                "tool": "read_file",
+                "argKeys": [
+                  "limit",
+                  "offset",
+                  "path"
+                ],
+                "bytes": 1583
+              },
+              {
+                "n": 6,
+                "tool": "read_file",
+                "argKeys": [
+                  "limit",
+                  "offset",
+                  "path"
+                ],
+                "bytes": 693
+              },
+              {
+                "n": 7,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 56
+              },
+              {
+                "n": 8,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 61
+              },
+              {
+                "n": 9,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 681
+              },
+              {
+                "n": 10,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1883
+              },
+              {
+                "n": 11,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 954
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 6
+      },
+      "plan": {
+        "chars": 6109,
+        "text": "# PLAN: Make blocked-task-classifiers prefer the structured flag\n\n## Context (verified against repo)\n\n- `src/blocked-task-classifiers.js` contains an ordered, first-match-wins `CLASSIFIERS` array (starting ~line 152) that feeds `classifyBlockedTask(task)` at **line 242**.\n- The `'inconclusive-review'` category currently exists **only** as a keyword entry inside `REASON_CATEGORIES` at **line 149**: `{ key: 'inconclusive-review', keywords: ['inconclusive'] }`. That entry is spread into `CLASSIFIERS` at **line 224** and matched by substring against `task.blockedReason` (lowercased) per lines 224–232.\n- `categorizeBlockedReason(reason)` at **lines 151–157** accepts a plain string and has no access to the task object, so the flag check cannot live there.\n- `reviewInconclusive` appears **nowhere** in the repository today (confirmed by grep). A sibling task (\"Set reviewInconclusive flag at both gate sites in local-draft.js\") is responsible for stamping it upstream. This task wires up the *consumer* side.\n\n---\n\n## Steps\n\n1. **Insert a structural classifier entry at the very top of the `CLASSIFIERS` array (before the first existing entry, i.e. before whatever currently sits at line 152 or the first spread from `REASON_CATEGORIES`).**\n   - Match the existing classifier shape (an object with a `classify(task)` method).\n   - Logic:\n     ```js\n     {\n       classify(task) {\n         if (task && task.reviewInconclusive === true) {\n           return { category: 'inconclusive-review', /* faultSide, retryable — see note */ };\n         }\n         return null;\n       }\n     }\n     ```\n   - **Assumption to verify before writing:** the `faultSide` and `retryable` values. Read the object produced by the keyword spread at line 224 (the `REASON_CATEGORIES` entry at line 149 spread into `CLASSIFIERS`) and mirror whatever `faultSide` / `retryable` values it carries. If the spread object has no such fields, omit them. Do **not** guess.\n\n2. **Do NOT modify `categorizeBlockedReason(reason)` (lines 151–157).**\n   - Its signature is `(reason: string)`; it cannot see the task object. The new structural classifier in step 1 short-circuits `classifyBlockedTask` before the keyword spread at line 224 is ever evaluated, so the keyword path remains a pure fallback for legacy tasks that predate the flag.\n\n3. **Confirm the keyword fallback is untouched.**\n   - The entry at line 149 (`keywords: ['inconclusive']`) and its spread into `CLASSIFIERS` at line 224 must remain byte-for-byte unchanged. A task whose `blockedReason` string contains \"inconclusive\" but which does **not** carry `reviewInconclusive === true` must still classify as `'inconclusive-review'` via the keyword path.\n\n4. **Add regression tests in `src/blocked-task-classifiers.test.js`.**\n   - Note: per the orientation report the keyword classifier reads `task.blockedReason` (not `task.reason`). Use `blockedReason` in the test fixtures. **Verify the exact field name by reading lines 224–232 before writing the tests.**\n   - Test 1 — *flag wins over non-matching text*: `classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some unrelated text' })` → category `'inconclusive-review'`.\n   - Test 2 — *flag wins over a different structural classifier that would otherwise match first*: `classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'external dependency timeout' })` → category `'inconclusive-review'` (not whatever structural classifier matches \"timeout\").\n   - Test 3 — *keyword fallback still works*: `classifyBlockedTask({ blockedReason: 'review was inconclusive' })` (no `reviewInconclusive` field) → category `'inconclusive-review'`.\n   - Test 4 — *explicit false does not short-circuit*: `classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' })` → category `'inconclusive-review'` via keyword (only `=== true` triggers the early return).\n   - Test 5 — *flag alone is sufficient (no blockedReason)*: `classifyBlockedTask({ reviewInconclusive: true })` → category `'inconclusive-review'`.\n\n5. **Run the test suite.**\n   - Check `package.json` `scripts` for the test command (likely `npx jest` or `npm test`). Run the targeted file: `npx jest src/blocked-task-classifiers.test.js`. All pre-existing tests must still pass; the five new tests must pass.\n\n6. **Grep for other call-sites to confirm no conflict.**\n   - `grep -rn \"categorizeBlockedReason\\|classifyBlockedTask\" src/` — ensure no caller already guards on `reviewInconclusive` in a way that would double-classify or conflict. If a caller already checks the flag, note it but do **not** remove the guard (belt-and-suspenders is acceptable).\n\n---\n\n## What this task does NOT do\n\n- Does **not** set `reviewInconclusive` on any task object (sibling task: \"Set reviewInconclusive flag at both gate sites in local-draft.js\").\n- Does **not** modify `blocked-drain.js`, `pipeline-self-audit`, or `auto-confirm-review.js` (sibling tasks).\n- Does **not** change the keyword list at line 149 or the spread at line 224.\n- Does **not** alter `categorizeBlockedReason`'s signature or behaviour.\n\n---\n\nCRITERIA:\n- `src/blocked-task-classifiers.js` contains a new classifier entry (or equivalent early-return) that checks `task.reviewInconclusive === true` and returns an object with `category: 'inconclusive-review'`, positioned **before** the keyword spread at line 224 in the `CLASSIFIERS` array so it wins first-match-wins.\n- `src/blocked-task-classifiers.test.js` contains the five test cases listed in step 4 (flag-wins-over-non-matching-text, flag-wins-over-other-structural, keyword-fallback-intact, explicit-false-falls-through, flag-without-blockedReason), and running the project's test command against that file exits 0.\n- `git diff` shows **no modification** to the `REASON_CATEGORIES` entry at line 149 or its spread at line 224 (those lines are byte-for-byte unchanged).\n- `grep -rn \"reviewInconclusive\" src/` returns at least one hit in `blocked-task-classifiers.js` (the new check) and at least one h\n... [truncated 109 more chars]",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 4639,
+        "anchorPaths": [
+          "src/blocked-task-classifiers.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 4,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T15:54:03.419Z"
+    }
+  ],
+  "draftFailureCount": 2,
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff inserts the `inconclusive-review-flag` classifier at the top of `CLASSIFIERS` (before the `REASON_CATEGORIES` spread at line 242), adds the five required test cases to `src/blocked-task-classifiers.test.js`, leaves the `REASON_CATEGORIES` entry at line 149 and its spread at line 242 byte-for-byte unchanged, and the live grep confirms `reviewInconclusive` appears only in the two target files, with the test suite passing (32/32).",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff inserts the `inconclusive-review-flag` classifier at the top of `CLASSIFIERS` (before the `REASON_CATEGORIES` spread at line 242), adds the five required test cases to `src/blocked-task-classifiers.test.js`, leaves the `REASON_CATEGORIES` entry at line 149 and its spread at line 242 byte-for-byte unchanged, and the live grep confirms `reviewInconclusive` appears only in the two target files, with the test suite passing (32/32)."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff correctly inserts a new `inconclusive-review-flag` classifier at the top of the `CLASSIFIERS` array in `src/blocked-task-classifiers.js` (checking `task.reviewInconclusive === true` and returning `category: 'inconclusive-review'`), adds the five required test cases to `src/blocked-task-classifiers.test.js`, leaves the `REASON_CATEGORIES` entry and spread byte-for-byte unchanged (verified via `git diff` and `grep`), and restricts `reviewInconclusive` references to only these two files, with all 32 tests passing (`node --test` exit 0)."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`src/blocked-task-classifiers.js` contains a new classifier entry (or equivalent early-return) that checks `task.reviewInconclusive === true` and returns an object with `category: 'inconclusive-review'`, positioned **before** the keyword sp",
+    "`src/blocked-task-classifiers.test.js` contains the five test cases listed in step 4 (flag-wins-over-non-matching-text, flag-wins-over-other-structural, keyword-fallback-intact, explicit-false-falls-through, flag-without-blockedReason), and",
+    "`git diff` shows **no modification** to the `REASON_CATEGORIES` entry at line 149 or its spread at line 224 (those lines are byte-for-byte unchanged).",
+    "`grep -rn \"reviewInconclusive\" src/` returns at least one hit in `blocked-task-classifiers.js` (the new check) and at least one hit in `blocked-task-classifiers.test.js` (the new tests), and zero hits in any file not touched by this task."
+  ],
+  "draftModel": "qwen3.8-p40:27b-q4_K_M",
+  "implementResponse": "All four acceptance criteria verified with real checks.\n\nI added a new structural classifier entry `inconclusive-review-flag` at the top of the `CLASSIFIERS` array in `src/blocked-task-classifiers.js` (now line 179-182) that checks `task.reviewInconclusive === true` and returns `{ category: 'inconclusive-review', faultSide: 'model', retryable: true }` — mirroring the keyword entry's values — before any other classifier or the keyword spread. I also appended exactly **5** new test definitions to `src/blocked-task-classifiers.test.js`.\n\nAcceptance:\n1. New classifier checks `task.reviewInconclusive === true`, returns `inconclusive-review`, positioned before the keyword spread — `git diff` shows the `inconclusive-review-flag` entry inserted before `external-dependency`; line 242 `REASON_CATEGORIES.map` spread still after it -- PASS\n2. Five test cases present and tests exit 0 — `git diff ... | grep -cE \"^\\+test\\(\"` = 5; `node --test src/blocked-task-classifiers.test.js` → `# pass 32 / # fail 0`, exitCode 0 -- PASS\n3. REASON_CATEGORIES entry + spread byte-for-byte unchanged — `keywords: ['inconclusive']` still at line 149, `REASON_CATEGORIES.map` at line 242; `git diff -U0 | grep -E \"^-\"` shows only the file header, no deletions/modifications -- PASS\n4. `reviewInconclusive` appears only in the two target files — `grep -rln \"reviewInconclusive\" src/` → only `src/blocked-task-classifiers.js` and `src/blocked-task-classifiers.test.js` -- PASS\n\n(Note: I report 5 new test definitions added, verified against my own diff, not an inflated total.)\n\nRESOLUTION: implemented\n\n=== DIFF ===\ndiff --git a/src/blocked-task-classifiers.js b/src/blocked-task-classifiers.js\nindex 0074cc13..f2a10ed5 100644\n--- a/src/blocked-task-classifiers.js\n+++ b/src/blocked-task-classifiers.js\n@@ -165,6 +165,24 @@ function categorizeBlockedReason(reason) {\n // e.g. external-dependency, stamped at draft time -- never reaches buildQuestion; see\n // classifyBlockedTask's own header).\n const CLASSIFIERS = [\n+  {\n+    // Checked FIRST, before every other structural classifier and the REASON_CATEGORIES\n+    // keyword spread: a task carrying the structured reviewInconclusive flag (stamped\n+    // upstream by the gate in local-draft.js) is, by definition, an inconclusive-review\n+    // block -- no free-text keyword match is needed or wanted. This makes the reliable\n+    // structured flag take precedence over the fragile 'inconclusive' substring match on\n+    // blockedReason, which is kept below as a fallback for legacy tasks that predate the\n+    // flag. faultSide/retryable mirror the keyword entry's values exactly (model-side,\n+    // still worth a blind redraft: an inconclusive review is a stochastic coin-flip, not\n+    // a deterministic harness/environment fault).\n+    name: 'inconclusive-review-flag',\n+    classify(task) {\n+      if (task && task.reviewInconclusive === true) {\n+        return { category: 'inconclusive-review', faultSide: 'model', retryable: true };\n+      }\n+      return null;\n+    },\n+  },\n   {\n     name: 'external-dependency',\n     // Stamped at DRAFT time by local-agentic-write-draft.js's detectExternalDependency\ndiff --git a/src/blocked-task-classifiers.test.js b/src/blocked-task-classifiers.test.js\nindex 1a9df083..c3e5f287 100644\n--- a/src/blocked-task-classifiers.test.js\n+++ b/src/blocked-task-classifiers.test.js\n@@ -206,3 +206,38 @@ test('signatureForTask: json-parse-failure gets a distinct non-null signature; u\n   assert.equal(signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'a genuinely novel failure nobody has a keyword for' }), null);\n   assert.notEqual(classified, null);\n });\n+\n+// -- reviewInconclusive structured flag takes precedence over the 'inconclusive' keyword match --\n+\n+test('flag-wins-over-non-matching-text: reviewInconclusive:true classifies inconclusive-review even with unrelated blockedReason', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some entirely unrelated text with no keyword' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });\n+});\n+\n+test('flag-wins-over-other-structural: reviewInconclusive:true overrides an unreliable-grounding structural match', () => {\n+  // Without the flag this task would classify as non-retryable 'unreliable-grounding'.\n+  // The structured flag is checked FIRST, so it wins.\n+  const task = {\n+    reviewInconclusive: true,\n+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', anchorConfidence: 'none' }] },\n+  };\n+  const result = classifyBlockedTask(task);\n+  assert.equal(result.category, 'inconclusive-review');\n+  assert.equal(result.classifierName, 'inconclusive-review-flag');\n+  assert.notEqual(result.classifierName, 'unreliable-grounding');\n+});\n+\n+test('keyword-fallback-intact: a blockedReason containing \"inconclusive\" (no flag) still classifies inconclusive-review via the keyword path', () => {\n+  const result = classifyBlockedTask({ blockedReason: 'review was inconclusive' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });\n+});\n+\n+test('explicit-false-falls-through: reviewInconclusive:false does NOT short-circuit; keyword path still fires', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });\n+});\n+\n+test('flag-without-blockedReason: reviewInconclusive:true alone (no blockedReason) is sufficient', () => {\n+  const result = classifyBlockedTask({ reviewInconclusive: true });\n+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });\n+});",
+  "planResponse": "# PLAN: Make blocked-task-classifiers prefer the structured flag\n\n## Context (verified against repo)\n\n- `src/blocked-task-classifiers.js` contains an ordered, first-match-wins `CLASSIFIERS` array (starting ~line 152) that feeds `classifyBlockedTask(task)` at **line 242**.\n- The `'inconclusive-review'` category currently exists **only** as a keyword entry inside `REASON_CATEGORIES` at **line 149**: `{ key: 'inconclusive-review', keywords: ['inconclusive'] }`. That entry is spread into `CLASSIFIERS` at **line 224** and matched by substring against `task.blockedReason` (lowercased) per lines 224–232.\n- `categorizeBlockedReason(reason)` at **lines 151–157** accepts a plain string and has no access to the task object, so the flag check cannot live there.\n- `reviewInconclusive` appears **nowhere** in the repository today (confirmed by grep). A sibling task (\"Set reviewInconclusive flag at both gate sites in local-draft.js\") is responsible for stamping it upstream. This task wires up the *consumer* side.\n\n---\n\n## Steps\n\n1. **Insert a structural classifier entry at the very top of the `CLASSIFIERS` array (before the first existing entry, i.e. before whatever currently sits at line 152 or the first spread from `REASON_CATEGORIES`).**\n   - Match the existing classifier shape (an object with a `classify(task)` method).\n   - Logic:\n     ```js\n     {\n       classify(task) {\n         if (task && task.reviewInconclusive === true) {\n           return { category: 'inconclusive-review', /* faultSide, retryable — see note */ };\n         }\n         return null;\n       }\n     }\n     ```\n   - **Assumption to verify before writing:** the `faultSide` and `retryable` values. Read the object produced by the keyword spread at line 224 (the `REASON_CATEGORIES` entry at line 149 spread into `CLASSIFIERS`) and mirror whatever `faultSide` / `retryable` values it carries. If the spread object has no such fields, omit them. Do **not** guess.\n\n2. **Do NOT modify `categorizeBlockedReason(reason)` (lines 151–157).**\n   - Its signature is `(reason: string)`; it cannot see the task object. The new structural classifier in step 1 short-circuits `classifyBlockedTask` before the keyword spread at line 224 is ever evaluated, so the keyword path remains a pure fallback for legacy tasks that predate the flag.\n\n3. **Confirm the keyword fallback is untouched.**\n   - The entry at line 149 (`keywords: ['inconclusive']`) and its spread into `CLASSIFIERS` at line 224 must remain byte-for-byte unchanged. A task whose `blockedReason` string contains \"inconclusive\" but which does **not** carry `reviewInconclusive === true` must still classify as `'inconclusive-review'` via the keyword path.\n\n4. **Add regression tests in `src/blocked-task-classifiers.test.js`.**\n   - Note: per the orientation report the keyword classifier reads `task.blockedReason` (not `task.reason`). Use `blockedReason` in the test fixtures. **Verify the exact field name by reading lines 224–232 before writing the tests.**\n   - Test 1 — *flag wins over non-matching text*: `classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some unrelated text' })` → category `'inconclusive-review'`.\n   - Test 2 — *flag wins over a different structural classifier that would otherwise match first*: `classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'external dependency timeout' })` → category `'inconclusive-review'` (not whatever structural classifier matches \"timeout\").\n   - Test 3 — *keyword fallback still works*: `classifyBlockedTask({ blockedReason: 'review was inconclusive' })` (no `reviewInconclusive` field) → category `'inconclusive-review'`.\n   - Test 4 — *explicit false does not short-circuit*: `classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' })` → category `'inconclusive-review'` via keyword (only `=== true` triggers the early return).\n   - Test 5 — *flag alone is sufficient (no blockedReason)*: `classifyBlockedTask({ reviewInconclusive: true })` → category `'inconclusive-review'`.\n\n5. **Run the test suite.**\n   - Check `package.json` `scripts` for the test command (likely `npx jest` or `npm test`). Run the targeted file: `npx jest src/blocked-task-classifiers.test.js`. All pre-existing tests must still pass; the five new tests must pass.\n\n6. **Grep for other call-sites to confirm no conflict.**\n   - `grep -rn \"categorizeBlockedReason\\|classifyBlockedTask\" src/` — ensure no caller already guards on `reviewInconclusive` in a way that would double-classify or conflict. If a caller already checks the flag, note it but do **not** remove the guard (belt-and-suspenders is acceptable).\n\n---\n\n## What this task does NOT do\n\n- Does **not** set `reviewInconclusive` on any task object (sibling task: \"Set reviewInconclusive flag at both gate sites in local-draft.js\").\n- Does **not** modify `blocked-drain.js`, `pipeline-self-audit`, or `auto-confirm-review.js` (sibling tasks).\n- Does **not** change the keyword list at line 149 or the spread at line 224.\n- Does **not** alter `categorizeBlockedReason`'s signature or behaviour.\n\n---\n\nCRITERIA:\n- `src/blocked-task-classifiers.js` contains a new classifier entry (or equivalent early-return) that checks `task.reviewInconclusive === true` and returns an object with `category: 'inconclusive-review'`, positioned **before** the keyword spread at line 224 in the `CLASSIFIERS` array so it wins first-match-wins.\n- `src/blocked-task-classifiers.test.js` contains the five test cases listed in step 4 (flag-wins-over-non-matching-text, flag-wins-over-other-structural, keyword-fallback-intact, explicit-false-falls-through, flag-without-blockedReason), and running the project's test command against that file exits 0.\n- `git diff` shows **no modification** to the `REASON_CATEGORIES` entry at line 149 or its spread at line 224 (those lines are byte-for-byte unchanged).\n- `grep -rn \"reviewInconclusive\" src/` returns at least one hit in `blocked-task-classifiers.js` (the new check) and at least one hit in `blocked-task-classifiers.test.js` (the new tests), and zero hits in any file not touched by this task.",
+  "reviewedAt": "2026-09-13T15:55:23.525Z",
+  "claimedAt": "2026-09-13T13:59:22.861Z"
+}
