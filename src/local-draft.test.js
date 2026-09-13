@@ -886,6 +886,101 @@ test('a research task runs its Claude implement pass when research_task IS in AG
   });
 });
 
+// 2026-09: routing regression tests for isResearchDomainTask (local-draft.js) -- the
+// title-prefix guard that decides whether a task enters draftResearchBranch BEFORE the
+// plan-stage localCall ever runs. Covers: a "Research: ..." title routes to
+// draftResearchImplementFn exactly once with the plan-stage localCall NEVER called; a
+// non-research title ("Fix: ...") does NOT route to it; and the match is trim +
+// case-insensitive.
+function makeResearchCounters() {
+  const counters = { researchCalls: 0, localCallCount: 0 };
+  counters.draftResearchImplementFn = async (t) => {
+    counters.researchCalls++;
+    t.implementResponse = 'research write-up';
+    return { succeeded: true, blocked: false };
+  };
+  counters.localCall = async () => {
+    counters.localCallCount++;
+    return { response: PLAN_STUB, degenerate: null, attempts: 1 };
+  };
+  return counters;
+}
+
+test('routing: "Research: current state of X" routes to draftResearchImplementFn (1 call), adhoc plan-stage localCall NOT called', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';
+    const c = makeResearchCounters();
+    const task = {
+      id: 'research-route-1', domain: 'research', source: 'research_task',
+      title: 'Research: current state of X',
+      promptContext: { rawText: 'x', tags: [] },
+    };
+    try {
+      await draftTask(task, {
+        localCall: c.localCall,
+        withLockFn: async (dir2, fn) => fn(),
+        draftResearchImplementFn: c.draftResearchImplementFn,
+        isClaudePausedFn: () => false,
+      });
+      assert.equal(c.researchCalls, 1, 'draftResearchImplementFn should be called exactly once');
+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called for a research-routed task');
+    } finally {
+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+  });
+});
+
+test('routing: "Fix: truncated plan handling" does NOT route to draftResearchImplementFn', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const c = makeResearchCounters();
+    const task = {
+      id: 'research-route-2', domain: 'adhoc', source: 'manual',
+      title: 'Fix: truncated plan handling',
+      promptContext: { rawText: 'handle truncated plans in local-draft.js' },
+    };
+    await draftTask(task, {
+      localCall: c.localCall,
+      withLockFn: async (dir2, fn) => fn(),
+      draftResearchImplementFn: c.draftResearchImplementFn,
+      draftAdhocViaLocalAgenticWriteFn: async (t) => {
+        t.adhocResolution = 'no-changes-needed';
+        t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+        return { succeeded: true, blocked: false };
+      },
+    });
+    assert.equal(c.researchCalls, 0, 'a non-research title must not enter the research branch');
+    assert.ok(c.localCallCount >= 1, `expected the plan path to call localCall at least once, got ${c.localCallCount}`);
+  });
+});
+
+test('routing: "  research: something  " (padded, lowercase) still routes to draftResearchImplementFn', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';
+    const c = makeResearchCounters();
+    const task = {
+      id: 'research-route-3', domain: 'research', source: 'research_task',
+      title: '  research: something  ',
+      promptContext: { rawText: 'something', tags: [] },
+    };
+    try {
+      await draftTask(task, {
+        localCall: c.localCall,
+        withLockFn: async (dir2, fn) => fn(),
+        draftResearchImplementFn: c.draftResearchImplementFn,
+        isClaudePausedFn: () => false,
+      });
+      assert.equal(c.researchCalls, 1, 'trimmed + lowercased "research:" title should still match');
+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called');
+    } finally {
+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+  });
+});
+
 test('an adhoc task with a real implemented resolution reaches the local write-agentic pass and lands in needs-review', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-test-write-tier', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };

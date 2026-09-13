@@ -1,0 +1,404 @@
+{
+  "id": "adhoc-add-routing-regression-tests-to-local-draft-test-js-1789291219763-1",
+  "title": "Add routing regression tests to local-draft.test.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T22:02:29.600Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T21:40:00.000Z",
+      "detail": "retrofitted stacked={branch:agent/adhoc-add-isresearchdomaintask-guard-research-routing-in-local-draft-js-1789291219763-0,seq:2,total:2} onto dependsOn:[adhoc-add-isresearchdomaintask-guard-research-routing-in-local-draft-js-1789291219763-0] -- adhoc-add-isresearchdomaintask-guard-research-routing-in-local-draft-js-1789291219763-0 was done-but-unmerged and never would have cleared without a human merging it (see [[hub-task-integration]]); this makes isDependencySatisfied treat its queue/done/ arrival as satisfied, same as any newly-filed decompose chain now gets automatically (PR #204). Operator retrofit, one-time, not a live worker action."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:02:30.153Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:02:32.932Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:04:49.296Z",
+      "detail": "2 attempt(s), 6011 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:05:07.864Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T22:09:26.211Z",
+      "detail": "agentic, 202 chars, resolution=decompose"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T22:09:26.211Z",
+      "detail": "resolution=decompose, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T22:09:26.236Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:09:26.237Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=decompose"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T22:09:43.244Z"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T22:12:12.983Z",
+      "detail": "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—and therefore fails to deliver any of the three required tests or the test execution verification mandated by the task."
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T22:12:37.152Z",
+      "detail": "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—and therefore fails to deliver any of the three required tests or the test execution verification mandated by the task."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:16:26.369Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:16:29.537Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:20:12.236Z",
+      "detail": "3 attempt(s), 7612 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:20:12.237Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T22:22:45.347Z",
+      "detail": "agentic, 5842 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T22:22:45.347Z",
+      "detail": "resolution=implemented, retry 1, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T22:22:45.348Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:22:45.348Z",
+      "detail": "attempt 2: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T22:22:56.640Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T22:25:33.949Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/local-draft.test.js (follow the existing fake `draftResearchImplementFn` pattern around lines 850–879), add three tests: (1) task `{title: 'Research: current state of X', promptContext:{rawText:'x'}}` routes to draftResearchImplementFn (called once) and the adhoc plan-stage localCall is NOT called; (2) `{title: 'Fix: truncated plan handling'}` does NOT route to draftResearchImplementFn; (3) `{title: '  research: something  '}` still routes to draftResearchImplementFn (trim + case-insensitive). Run `node --test src/local-draft.test.js` and confirm all pass.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788928197728-research-domain-task-routed-into-adhoc-p-1788929623151"
+  },
+  "blockedReason": "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—and therefore fails to deliver any of the three required tests or the test execution verification mandated by the task.",
+  "priorRejectionFeedback": [
+    "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—and therefore fails to deliver any of the three required tests or the test execution verification mandated by the task."
+  ],
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T22:02:30.152Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "decompose",
+          "blocked": false,
+          "responseChars": 2709,
+          "response": "I did the full orientation pass but was cut off before making the edit, so this is not implemented. Here is the verified map a fresh pass needs:\n\n**Routing logic (verified, `src/local-draft.js`):**\n- `isResearchDomainTask` (line 153): `/^Research:/i.test((task && task.title || '').trim())` — trim + case-insensitive, anchored prefix. So `'Research: current state of X'` → routes; `'Fix: truncated plan handling'` → does not; `'  research: something  '` → routes.\n- Dispatch (line ~2335): before `runPlanPass`, `if (isResearchDomainTask(task)) return await draftResearchBranch(...)` — so the plan-stage `localCall` is never reached for research-titled tasks.\n- `draftResearchBranch` (line 887) gates on `researchClaudeStatus` (line 129) BEFORE calling `draftResearchImplementFn` (line 898). Gate requires: `resolveSourceName(task)` (or `task.source` fallback `research_task`) ∈ `AGENT_MANAGER_CLAUDE_SOURCES`, `CLAUDE_CODE_OAUTH_TOKEN` set, `isClaudePausedFn()` false. So tests 1 & 3 must set `process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task'`, `process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token'`, pass `isClaudePausedFn: () => false`, and use `source: 'research_task'` (resolveSourceName at task-source-registry.js:89 maps `domain:'adhoc'||source:'manual'` → 'adhoc', so a 'manual' task would fail the gate).\n- Test 2 (`'Fix: truncated plan handling'`) should use `domain:'adhoc', source:'manual'` so it flows the normal adhoc path without touching the research branch; assert research counter === 0.\n\n**Pattern to mirror (verified, `src/local-draft.test.js` lines 840–889):** `withFixtureRepo(async (draftTask) => {...})`, `draftTask(task, { localCall, withLockFn: async (dir, fn) => fn(), draftResearchImplementFn, isClaudePausedFn })`. Existing research tests at 840/868 already set the env vars with a `finally { delete ... }` cleanup — copy that exactly.\n\n**What to do:** insert three `test(...)` blocks immediately after line 889 (before the `'an adhoc task with a real implemented resolution...'` test at 891): (1) title `'Research: current state of X'`, `promptContext:{rawText:'x'}`, count `draftResearchImplementFn` calls === 1 and `localCall` calls === 0; (2) title `'Fix: truncated plan handling'`, research calls === 0; (3) title `'  research: something  '`, research calls === 1, localCall === 0. Then run `node --test src/local-draft.test.js` and confirm exit 0.\n\nRESOLUTION: needs-human-decision\nBLOCKER-TYPE: budget-exhausted\nAll research is done and the edit is fully specified above — a fresh pass only needs to write the three test blocks after line 889 of src/local-draft.test.js (using the env-var gate setup from lines 868–889) and run `node --test src/local-draft.test.js`.",
+          "turnsUsed": 10,
+          "toolCalls": {
+            "total": 11,
+            "byTool": {
+              "read_file": 7,
+              "grep_codebase": 1,
+              "run_bash": 3
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 3185
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 2889
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1848
+              },
+              {
+                "n": 4,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 168
+              },
+              {
+                "n": 6,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 2525
+              },
+              {
+                "n": 7,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 7765
+              },
+              {
+                "n": 8,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 2506
+              },
+              {
+                "n": 9,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 803
+              },
+              {
+                "n": 10,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1173
+              },
+              {
+                "n": 11,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 293
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 6011,
+        "text": "# PLAN: Add routing regression tests to `src/local-draft.test.js`\n\n## Context from repo content\n\n- **Target file:** `src/local-draft.test.js` (confirmed on disk; 161 759 chars, head shown). Uses `node:test` + `node:assert/strict` (lines 1–14 of the shown head).\n- **Routing code under test:** `src/local-draft.js:887` defines `draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, … })`; line 898 calls `draftResearchImplementFn(task, { recordModelCall })`. The branch is invoked from the main entry at `src/local-draft.js:2384`. The injectable default is set at `src/local-draft.js:2240` (`draftResearchImplementFn = draftResearchImplement, …`).\n- **Existing fake pattern:** The task points to lines 850–879 of the test file (not visible in the truncated head, but explicitly referenced by the task author). I will read that range before writing new tests.\n- **Sibling dependency:** The hub lists \"Add isResearchDomainTask guard + research routing in local-draft.js\" as **done**. The grep confirms `draftResearchBranch` and its call-site already exist in `local-draft.js`, so the routing logic is present. This task only adds *tests* for it.\n\n---\n\n## Numbered steps\n\n1. **Read the existing fake pattern.**\n   Open `src/local-draft.test.js` and read lines ~840–890 (the task says 850–879). Identify:\n   - How the test imports the module under test (likely `require('./local-draft.js')`).\n   - How `draftResearchImplementFn` is faked (e.g., a `let calls = 0; const fakeImpl = async () => { calls++; return …; }` or a `sinon`-style stub — confirm which idiom is used).\n   - How `localCall` is faked in the same block (the test header at lines 1–14 confirms `localCall` is an injectable).\n   - The exact signature of the exported entry function the test calls (the file header calls it `draftTask()`; verify the `module.exports` name at the bottom of `local-draft.js` — *assuming* it is `draftTask`, verify).\n\n2. **Add Test 1 — research title routes to `draftResearchImplementFn`, `localCall` NOT called.**\n   Immediately after the existing block at ~line 879, add a `test('…', async (t) => { … })` that:\n   - Creates a call-counter for `draftResearchImplementFn` (e.g. `let researchCalls = 0; const fakeResearch = async () => { researchCalls++; return { ok: true }; };`).\n   - Creates a call-counter for `localCall` (e.g. `let localCallCount = 0; const fakeLocalCall = async () => { localCallCount++; return ''; };`).\n   - Calls the entry function with task `{ title: 'Research: current state of X', promptContext: { rawText: 'x' } }` and injects `{ localCall: fakeLocalCall, draftResearchImplementFn: fakeResearch, withLockFn: async (fn) => fn() }` (matching the injection shape seen at `src/local-draft.js:2240`).\n   - Asserts `researchCalls === 1` and `localCallCount === 0`.\n\n3. **Add Test 2 — non-research title does NOT route to `draftResearchImplementFn`.**\n   Same structure, but task is `{ title: 'Fix: truncated plan handling' }` (no `promptContext` needed, but include an empty one or omit — *assuming* the routing check only inspects `task.title`; verify by reading the guard at `src/local-draft.js` around line 2380–2384).\n   - Asserts `researchCalls === 0`.\n   - (Optionally assert `localCallCount >= 1` to confirm the normal path was taken — *assuming* the non-research path calls `localCall` at least once for the plan stage; verify against the code.)\n\n4. **Add Test 3 — trim + case-insensitive matching.**\n   Same structure, task is `{ title: '  research: something  ' }`.\n   - Asserts `researchCalls === 1` and `localCallCount === 0`.\n\n5. **Run the test suite.**\n   ```\n   node --test src/local-draft.test.js\n   ```\n   Confirm all tests pass (including the pre-existing ones). If any pre-existing test fails, investigate whether the new tests introduced a side-effect (e.g., a shared mutable stub) and fix.\n\n6. **Sanity-check the routing guard (read-only).**\n   Read `src/local-draft.js` around lines 2370–2390 to confirm the exact predicate that decides whether to call `draftResearchBranch` (the sibling task added an `isResearchDomainTask` guard). Verify the three titles above behave as the tests expect. If the guard uses a regex or `.startsWith()` on a trimmed/lowercased title, the tests are correct. If it uses a different mechanism (e.g., checks `promptContext`), adjust the test fixtures accordingly.\n\n---\n\n## Notes / assumptions to verify\n\n- **Export name:** The test file header says `draftTask()`. I am *assuming* `module.exports` in `local-draft.js` exposes a function named `draftTask` (or similar) that accepts the injection object. Verify before writing.\n- **`withLockFn` injection:** The test header (lines 1–14) confirms `withLockFn` is injectable. The fake should be a pass-through `async (fn) => fn()` to avoid touching a real lockfile.\n- **`recordModelCall`:** The signature at `src/local-draft.js:887` shows `recordModelCall` is a required param in the branch. The fake `draftResearchImplementFn` receives it as an argument (`src/local-draft.js:898`), so the test's fake just needs to accept and ignore it.\n- **Line numbers in the test file:** The task says \"around lines 850–879.\" The file is 161 k chars; those lines are well past the shown head. Step 1 will confirm the exact insertion point.\n\n---\n\nCRITERIA:\n- `node --test src/local-draft.test.js` exits with code 0 and reports all tests passing (including the three new ones).\n- `src/local-draft.test.js` contains a test whose title or description references a research-routing case with title `'Research: current state of X'` and asserts `draftResearchImplementFn` was called exactly once while `localCall` was called zero times.\n- `src/local-draft.test.js` contains a test with title `'Fix: truncated plan handling'` that asserts `draftResearchImplementFn` was called zero times.\n- `src/local-draft.test.js` contains a test with title `'  research: something  '` (leading/trailing spaces) that asserts `draftResearchImplementFn` was called exactly once, confirming trim + case-insensitiv\n... [truncated 11 more chars]",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 8506,
+        "anchorPaths": [
+          "src/local-draft.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "decompose",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T22:09:26.237Z"
+    },
+    {
+      "at": "2026-09-13T22:16:26.368Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1004,
+          "response": "The change is in place on the branch's working tree (95 lines added; the sandbox refuses git index writes, which the pipeline handles on commit). All three required routing regression tests are implemented in `src/local-draft.test.js` and verified: `node --test src/local-draft.test.js` exits 0 with 121/121 passing, including the three new tests (ok 37–39).\n\n- Test 1: task `{title: 'Research: current state of X', promptContext: {rawText: 'x'}}` (research domain/source, mirroring the existing opted-in research test) → `draftResearchImplementFn` called exactly once, plan-stage `localCall` count 0.\n- Test 2: `{title: 'Fix: truncated plan handling'}` (adhoc/manual) → research fn count 0, normal path called `localCall` ≥1.\n- Test 3: `{title: '  research: something  '}` → still routes, research fn 1, `localCall` 0.\n\nAll follow the existing fake `draftResearchImplementFn` pattern (lines ~868–889) with shared `makeResearchCounters()` helper and env-var cleanup in `finally`.\n\nRESOLUTION: implemented",
+          "rawDiffChars": 4823,
+          "rawDiff": "diff --git a/src/local-draft.test.js b/src/local-draft.test.js\nindex 6fc55bd5..5837f913 100644\n--- a/src/local-draft.test.js\n+++ b/src/local-draft.test.js\n@@ -886,6 +886,101 @@ test('a research task runs its Claude implement pass when research_task IS in AG\n   });\n });\n \n+// 2026-09: routing regression tests for isResearchDomainTask (local-draft.js) -- the\n+// title-prefix guard that decides whether a task enters draftResearchBranch BEFORE the\n+// plan-stage localCall ever runs. Covers: a \"Research: ...\" title routes to\n+// draftResearchImplementFn exactly once with the plan-stage localCall NEVER called; a\n+// non-research title (\"Fix: ...\") does NOT route to it; and the match is trim +\n+// case-insensitive.\n+function makeResearchCounters() {\n+  const counters = { researchCalls: 0, localCallCount: 0 };\n+  counters.draftResearchImplementFn = async (t) => {\n+    counters.researchCalls++;\n+    t.implementResponse = 'research write-up';\n+    return { succeeded: true, blocked: false };\n+  };\n+  counters.localCall = async () => {\n+    counters.localCallCount++;\n+    return { response: PLAN_STUB, degenerate: null, attempts: 1 };\n+  };\n+  return counters;\n+}\n+\n+test('routing: \"Research: current state of X\" routes to draftResearchImplementFn (1 call), adhoc plan-stage localCall NOT called', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';\n+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-1', domain: 'research', source: 'research_task',\n+      title: 'Research: current state of X',\n+      promptContext: { rawText: 'x', tags: [] },\n+    };\n+    try {\n+      await draftTask(task, {\n+        localCall: c.localCall,\n+        withLockFn: async (dir2, fn) => fn(),\n+        draftResearchImplementFn: c.draftResearchImplementFn,\n+        isClaudePausedFn: () => false,\n+      });\n+      assert.equal(c.researchCalls, 1, 'draftResearchImplementFn should be called exactly once');\n+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called for a research-routed task');\n+    } finally {\n+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;\n+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;\n+    }\n+  });\n+});\n+\n+test('routing: \"Fix: truncated plan handling\" does NOT route to draftResearchImplementFn', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-2', domain: 'adhoc', source: 'manual',\n+      title: 'Fix: truncated plan handling',\n+      promptContext: { rawText: 'handle truncated plans in local-draft.js' },\n+    };\n+    await draftTask(task, {\n+      localCall: c.localCall,\n+      withLockFn: async (dir2, fn) => fn(),\n+      draftResearchImplementFn: c.draftResearchImplementFn,\n+      draftAdhocViaLocalAgenticWriteFn: async (t) => {\n+        t.adhocResolution = 'no-changes-needed';\n+        t.implementResponse = 'RESOLUTION: no-changes-needed\\n\\nnothing to do';\n+        return { succeeded: true, blocked: false };\n+      },\n+    });\n+    assert.equal(c.researchCalls, 0, 'a non-research title must not enter the research branch');\n+    assert.ok(c.localCallCount >= 1, `expected the plan path to call localCall at least once, got ${c.localCallCount}`);\n+  });\n+});\n+\n+test('routing: \"  research: something  \" (padded, lowercase) still routes to draftResearchImplementFn', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';\n+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-3', domain: 'research', source: 'research_task',\n+      title: '  research: something  ',\n+      promptContext: { rawText: 'something', tags: [] },\n+    };\n+    try {\n+      await draftTask(task, {\n+        localCall: c.localCall,\n+        withLockFn: async (dir2, fn) => fn(),\n+        draftResearchImplementFn: c.draftResearchImplementFn,\n+        isClaudePausedFn: () => false,\n+      });\n+      assert.equal(c.researchCalls, 1, 'trimmed + lowercased \"research:\" title should still match');\n+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called');\n+    } finally {\n+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;\n+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;\n+    }\n+  });\n+});\n+\n test('an adhoc task with a real implemented resolution reaches the local write-agentic pass and lands in needs-review', async () => {\n   await withFixtureRepo(async (draftTask) => {\n     const task = { id: 'adhoc-test-write-tier', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };",
+          "turnsUsed": 7,
+          "toolCalls": {
+            "total": 7,
+            "byTool": {
+              "read_file": 2,
+              "edit_file": 1,
+              "run_bash": 4
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 5079
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1817
+              },
+              {
+                "n": 3,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 48
+              },
+              {
+                "n": 4,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1265
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1084
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 451
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 236
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 7612,
+        "text": "# PLAN: Add routing regression tests to `src/local-draft.test.js`\n\n## Grounding from repo content\n\n| Fact | Source |\n|------|--------|\n| Entry function is `draftTask(task, { localCall = call, … })` | `src/claude-client.js:6` comment |\n| `draftResearchImplementFn` is an injectable param (default `draftResearchImplement`) | `src/local-draft.js:2249` |\n| `withLockFn` is injectable (default `defaultWithLock`) | `src/local-draft.js:2249` |\n| `draftResearchBranch` calls `draftResearchImplementFn(task, { recordModelCall })` | `src/local-draft.js:907` |\n| `draftResearchBranch` is invoked at two sites (lines 2348, 2403) | `src/local-draft.js:2348`, `:2403` |\n| Test file uses `node:test` + `node:assert/strict` | `src/local-draft.test.js` lines 1–14 |\n| Test file already has a `registerHygieneStubs()` helper and multiple `test(…)` blocks | `src/local-draft.test.js` head shown |\n| Task says to follow the fake `draftResearchImplementFn` pattern at lines 850–879 | task prompt (content not shown in head; must read before inserting) |\n\n---\n\n## Numbered steps\n\n### 1. Read the existing fake pattern at lines 850–879\n\nOpen `src/local-draft.test.js` and read lines **840–890** (task says 850–879; give margin). Confirm:\n\n- The exact `require` for the module under test (expected: `const { draftTask } = require('./local-draft.js');` or `const draftTask = require('./local-draft.js');` — verify which).\n- How `draftResearchImplementFn` is faked in the existing block (a closure counter, a `sinon` stub, or a bare `async () => …`).\n- How `localCall` is faked in the same block.\n- Whether `withLockFn` is passed as `async (fn) => fn()` or omitted (relying on the default).\n- The exact insertion point: the line immediately after the existing block's closing `});`.\n\n> **Assumption to verify:** the existing block at 850–879 already demonstrates the injection shape. If it does, mirror it exactly. If it uses a different idiom (e.g., a shared `makeFake` helper), reuse that helper.\n\n### 2. Write and insert Test 1 — research title routes to `draftResearchImplementFn`, `localCall` NOT called\n\nInsert immediately after the existing block (line ~880). Code (adjust `require` name and helper idiom to match step 1 findings):\n\n```js\ntest('routing: \"Research: current state of X\" → draftResearchImplementFn (1 call), localCall NOT called', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: 'Research: current state of X', promptContext: { rawText: 'x' } };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 1, 'draftResearchImplementFn should be called exactly once');\n  assert.equal(localCallCount, 0, 'localCall (plan-stage) should NOT be called');\n});\n```\n\n### 3. Write and insert Test 2 — non-research title does NOT route to `draftResearchImplementFn`\n\nInsert after Test 1:\n\n```js\ntest('routing: \"Fix: truncated plan handling\" does NOT route to draftResearchImplementFn', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: 'Fix: truncated plan handling' };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 0, 'draftResearchImplementFn should NOT be called for non-research titles');\n  // The normal plan-stage path should have invoked localCall at least once:\n  assert.ok(localCallCount >= 1, `expected localCall ≥ 1, got ${localCallCount}`);\n});\n```\n\n> **Assumption to verify:** the non-research path calls `localCall` at least once (plan stage). If the code short-circuits before any `localCall` (e.g., an early `emptyApproval` skip), the `>= 1` assertion may need to be `>= 0` or removed. Read `src/local-draft.js` around lines 2340–2410 (the two `draftResearchBranch` call-sites at 2348 and 2403) to confirm the non-research path reaches `localCall`.\n\n### 4. Write and insert Test 3 — trim + case-insensitive matching\n\nInsert after Test 2:\n\n```js\ntest('routing: \"  research: something  \" (padded, lowercase) still routes to draftResearchImplementFn', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: '  research: something  ' };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 1, 'trimmed + lowercased title should still match the research guard');\n  assert.equal(localCallCount, 0, 'localCall should NOT be called');\n});\n```\n\n### 5. Run the full test file and confirm all tests pass\n\n```bash\nnode --test src/local-draft.test.js\n```\n\n- Expected: exit code 0, all pre-existing tests pass, and the three new tests report `pass`.\n- If a pre-existing test fails, check whether the new tests mutated shared state (e.g., a module-level counter in `local-draft.js`). Fix by ensuring each test creates its own local counters (as above) and does not rely on module-level mutable fakes.\n- If the `draftTask` call throws because of an unmet dependency (e.g., a required `recordModelCall` that is not injectable at the top level but only at the branch level), add `recordModelCall: () => {}` to the injection object.\n\n### 6. Verify the routing guard matches the three titles (read-only sanity check)\n\nRead `src/local-\n... [truncated 1612 more chars]",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 8645,
+        "anchorPaths": [
+          "src/local-draft.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "finishedAt": "2026-09-13T22:22:45.348Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds the three required routing regression tests to `src/local-draft.test.js` (verified present in live repo content), and the grounding confirms `isResearchDomainTask` uses `/^Research:/i.test((task && task.title || '').trim())` which correctly matches \"Research: current state of X\" and \"  research: something  \" (trimmed+lowercased) while rejecting \"Fix: truncated plan handling\", and the test run output shows all 121 tests passing including the three new ones (ok 37–39).",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds the three required routing regression tests to `src/local-draft.test.js` (verified present in live repo content), and the grounding confirms `isResearchDomainTask` uses `/^Research:/i.test((task && task.title || '').trim())` which correctly matches \"Research: current state of X\" and \"  research: something  \" (trimmed+lowercased) while rejecting \"Fix: truncated plan handling\", and the test run output shows all 121 tests passing including the three new ones (ok 37–39)."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The three required routing tests are present in the diff with the exact task fixtures (`{title: 'Research: current state of X', promptContext: {rawText: 'x'}}`, `{title: 'Fix: truncated plan handling'}`, `{title: '  research: something  '}`), the correct assertions (`researchCalls === 1`/`localCallCount === 0` for research, `researchCalls === 0` for non-research), and the live test run confirms 121/121 passing with the three new tests (ok 37–39) all marked pass, matching the `isResearchDomainTask` guard (`/^Research:/i.test((task && task.title || '').trim())`) in the real repo."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "The change is in place on the branch's working tree (95 lines added; the sandbox refuses git index writes, which the pipeline handles on commit). All three required routing regression tests are implemented in `src/local-draft.test.js` and verified: `node --test src/local-draft.test.js` exits 0 with 121/121 passing, including the three new tests (ok 37–39).\n\n- Test 1: task `{title: 'Research: current state of X', promptContext: {rawText: 'x'}}` (research domain/source, mirroring the existing opted-in research test) → `draftResearchImplementFn` called exactly once, plan-stage `localCall` count 0.\n- Test 2: `{title: 'Fix: truncated plan handling'}` (adhoc/manual) → research fn count 0, normal path called `localCall` ≥1.\n- Test 3: `{title: '  research: something  '}` → still routes, research fn 1, `localCall` 0.\n\nAll follow the existing fake `draftResearchImplementFn` pattern (lines ~868–889) with shared `makeResearchCounters()` helper and env-var cleanup in `finally`.\n\nRESOLUTION: implemented\n\n=== DIFF ===\ndiff --git a/src/local-draft.test.js b/src/local-draft.test.js\nindex 6fc55bd5..5837f913 100644\n--- a/src/local-draft.test.js\n+++ b/src/local-draft.test.js\n@@ -886,6 +886,101 @@ test('a research task runs its Claude implement pass when research_task IS in AG\n   });\n });\n \n+// 2026-09: routing regression tests for isResearchDomainTask (local-draft.js) -- the\n+// title-prefix guard that decides whether a task enters draftResearchBranch BEFORE the\n+// plan-stage localCall ever runs. Covers: a \"Research: ...\" title routes to\n+// draftResearchImplementFn exactly once with the plan-stage localCall NEVER called; a\n+// non-research title (\"Fix: ...\") does NOT route to it; and the match is trim +\n+// case-insensitive.\n+function makeResearchCounters() {\n+  const counters = { researchCalls: 0, localCallCount: 0 };\n+  counters.draftResearchImplementFn = async (t) => {\n+    counters.researchCalls++;\n+    t.implementResponse = 'research write-up';\n+    return { succeeded: true, blocked: false };\n+  };\n+  counters.localCall = async () => {\n+    counters.localCallCount++;\n+    return { response: PLAN_STUB, degenerate: null, attempts: 1 };\n+  };\n+  return counters;\n+}\n+\n+test('routing: \"Research: current state of X\" routes to draftResearchImplementFn (1 call), adhoc plan-stage localCall NOT called', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';\n+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-1', domain: 'research', source: 'research_task',\n+      title: 'Research: current state of X',\n+      promptContext: { rawText: 'x', tags: [] },\n+    };\n+    try {\n+      await draftTask(task, {\n+        localCall: c.localCall,\n+        withLockFn: async (dir2, fn) => fn(),\n+        draftResearchImplementFn: c.draftResearchImplementFn,\n+        isClaudePausedFn: () => false,\n+      });\n+      assert.equal(c.researchCalls, 1, 'draftResearchImplementFn should be called exactly once');\n+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called for a research-routed task');\n+    } finally {\n+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;\n+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;\n+    }\n+  });\n+});\n+\n+test('routing: \"Fix: truncated plan handling\" does NOT route to draftResearchImplementFn', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-2', domain: 'adhoc', source: 'manual',\n+      title: 'Fix: truncated plan handling',\n+      promptContext: { rawText: 'handle truncated plans in local-draft.js' },\n+    };\n+    await draftTask(task, {\n+      localCall: c.localCall,\n+      withLockFn: async (dir2, fn) => fn(),\n+      draftResearchImplementFn: c.draftResearchImplementFn,\n+      draftAdhocViaLocalAgenticWriteFn: async (t) => {\n+        t.adhocResolution = 'no-changes-needed';\n+        t.implementResponse = 'RESOLUTION: no-changes-needed\\n\\nnothing to do';\n+        return { succeeded: true, blocked: false };\n+      },\n+    });\n+    assert.equal(c.researchCalls, 0, 'a non-research title must not enter the research branch');\n+    assert.ok(c.localCallCount >= 1, `expected the plan path to call localCall at least once, got ${c.localCallCount}`);\n+  });\n+});\n+\n+test('routing: \"  research: something  \" (padded, lowercase) still routes to draftResearchImplementFn', async () => {\n+  await withFixtureRepo(async (draftTask) => {\n+    process.env.AGENT_MANAGER_CLAUDE_SOURCES = 'research_task';\n+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token';\n+    const c = makeResearchCounters();\n+    const task = {\n+      id: 'research-route-3', domain: 'research', source: 'research_task',\n+      title: '  research: something  ',\n+      promptContext: { rawText: 'something', tags: [] },\n+    };\n+    try {\n+      await draftTask(task, {\n+        localCall: c.localCall,\n+        withLockFn: async (dir2, fn) => fn(),\n+        draftResearchImplementFn: c.draftResearchImplementFn,\n+        isClaudePausedFn: () => false,\n+      });\n+      assert.equal(c.researchCalls, 1, 'trimmed + lowercased \"research:\" title should still match');\n+      assert.equal(c.localCallCount, 0, 'the plan-stage localCall must NOT be called');\n+    } finally {\n+      delete process.env.AGENT_MANAGER_CLAUDE_SOURCES;\n+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;\n+    }\n+  });\n+});\n+\n test('an adhoc task with a real implemented resolution reaches the local write-agentic pass and lands in needs-review', async () => {\n   await withFixtureRepo(async (draftTask) => {\n     const task = { id: 'adhoc-test-write-tier', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };",
+  "planResponse": "# PLAN: Add routing regression tests to `src/local-draft.test.js`\n\n## Grounding from repo content\n\n| Fact | Source |\n|------|--------|\n| Entry function is `draftTask(task, { localCall = call, … })` | `src/claude-client.js:6` comment |\n| `draftResearchImplementFn` is an injectable param (default `draftResearchImplement`) | `src/local-draft.js:2249` |\n| `withLockFn` is injectable (default `defaultWithLock`) | `src/local-draft.js:2249` |\n| `draftResearchBranch` calls `draftResearchImplementFn(task, { recordModelCall })` | `src/local-draft.js:907` |\n| `draftResearchBranch` is invoked at two sites (lines 2348, 2403) | `src/local-draft.js:2348`, `:2403` |\n| Test file uses `node:test` + `node:assert/strict` | `src/local-draft.test.js` lines 1–14 |\n| Test file already has a `registerHygieneStubs()` helper and multiple `test(…)` blocks | `src/local-draft.test.js` head shown |\n| Task says to follow the fake `draftResearchImplementFn` pattern at lines 850–879 | task prompt (content not shown in head; must read before inserting) |\n\n---\n\n## Numbered steps\n\n### 1. Read the existing fake pattern at lines 850–879\n\nOpen `src/local-draft.test.js` and read lines **840–890** (task says 850–879; give margin). Confirm:\n\n- The exact `require` for the module under test (expected: `const { draftTask } = require('./local-draft.js');` or `const draftTask = require('./local-draft.js');` — verify which).\n- How `draftResearchImplementFn` is faked in the existing block (a closure counter, a `sinon` stub, or a bare `async () => …`).\n- How `localCall` is faked in the same block.\n- Whether `withLockFn` is passed as `async (fn) => fn()` or omitted (relying on the default).\n- The exact insertion point: the line immediately after the existing block's closing `});`.\n\n> **Assumption to verify:** the existing block at 850–879 already demonstrates the injection shape. If it does, mirror it exactly. If it uses a different idiom (e.g., a shared `makeFake` helper), reuse that helper.\n\n### 2. Write and insert Test 1 — research title routes to `draftResearchImplementFn`, `localCall` NOT called\n\nInsert immediately after the existing block (line ~880). Code (adjust `require` name and helper idiom to match step 1 findings):\n\n```js\ntest('routing: \"Research: current state of X\" → draftResearchImplementFn (1 call), localCall NOT called', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: 'Research: current state of X', promptContext: { rawText: 'x' } };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 1, 'draftResearchImplementFn should be called exactly once');\n  assert.equal(localCallCount, 0, 'localCall (plan-stage) should NOT be called');\n});\n```\n\n### 3. Write and insert Test 2 — non-research title does NOT route to `draftResearchImplementFn`\n\nInsert after Test 1:\n\n```js\ntest('routing: \"Fix: truncated plan handling\" does NOT route to draftResearchImplementFn', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: 'Fix: truncated plan handling' };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 0, 'draftResearchImplementFn should NOT be called for non-research titles');\n  // The normal plan-stage path should have invoked localCall at least once:\n  assert.ok(localCallCount >= 1, `expected localCall ≥ 1, got ${localCallCount}`);\n});\n```\n\n> **Assumption to verify:** the non-research path calls `localCall` at least once (plan stage). If the code short-circuits before any `localCall` (e.g., an early `emptyApproval` skip), the `>= 1` assertion may need to be `>= 0` or removed. Read `src/local-draft.js` around lines 2340–2410 (the two `draftResearchBranch` call-sites at 2348 and 2403) to confirm the non-research path reaches `localCall`.\n\n### 4. Write and insert Test 3 — trim + case-insensitive matching\n\nInsert after Test 2:\n\n```js\ntest('routing: \"  research: something  \" (padded, lowercase) still routes to draftResearchImplementFn', async () => {\n  let researchCalls = 0;\n  let localCallCount = 0;\n\n  const fakeResearch = async (task, { recordModelCall }) => {\n    researchCalls++;\n    return { ok: true };\n  };\n  const fakeLocalCall = async (...args) => {\n    localCallCount++;\n    return '';\n  };\n\n  const task = { title: '  research: something  ' };\n\n  await draftTask(task, {\n    localCall: fakeLocalCall,\n    draftResearchImplementFn: fakeResearch,\n    withLockFn: async (fn) => fn(),\n  });\n\n  assert.equal(researchCalls, 1, 'trimmed + lowercased title should still match the research guard');\n  assert.equal(localCallCount, 0, 'localCall should NOT be called');\n});\n```\n\n### 5. Run the full test file and confirm all tests pass\n\n```bash\nnode --test src/local-draft.test.js\n```\n\n- Expected: exit code 0, all pre-existing tests pass, and the three new tests report `pass`.\n- If a pre-existing test fails, check whether the new tests mutated shared state (e.g., a module-level counter in `local-draft.js`). Fix by ensuring each test creates its own local counters (as above) and does not rely on module-level mutable fakes.\n- If the `draftTask` call throws because of an unmet dependency (e.g., a required `recordModelCall` that is not injectable at the top level but only at the branch level), add `recordModelCall: () => {}` to the injection object.\n\n### 6. Verify the routing guard matches the three titles (read-only sanity check)\n\nRead `src/local-draft.js` around lines **2340–2410** (the two `draftResearchBranch` call-sites at `:2348` and `:2403`). Identify the predicate that decides whether to enter the research branch (the sibling task \"Add isResearchDomainTask guard\" is marked merged). Confirm:\n\n- The predicate trims and lowercases `task.title` before matching.\n- It matches titles starting with `research:` (case-insensitive).\n- It does NOT match `Fix: …` or other non-research prefixes.\n\nIf the guard uses a different mechanism (regex, `promptContext` field, etc.), adjust the three test fixtures in steps 2–4 accordingly before running.\n\n---\n\n## CRITERIA:\n\n- `node --test src/local-draft.test.js` exits with code **0** and the output contains three new test names (one referencing `Research: current state of X`, one referencing `Fix: truncated plan handling`, one referencing `research: something`) all marked **pass**.\n- `src/local-draft.test.js` contains a test that constructs task `{ title: 'Research: current state of X', promptContext: { rawText: 'x' } }`, injects a counting fake for `draftResearchImplementFn` and `localCall`, and asserts `researchCalls === 1` and `localCallCount === 0`.\n- `src/local-draft.test.js` contains a test that constructs task `{ title: 'Fix: truncated plan handling' }` and asserts `researchCalls === 0`.\n- `src/local-draft.test.js` contains a test that constructs task `{ title: '  research: something  ' }` (with leading/trailing spaces, lowercase) and asserts `researchCalls === 1`.\n- No pre-existing test in `src/local-draft.test.js` regresses (all previously-passing tests still pass after the insertion).",
+  "reviewedAt": "2026-09-13T22:25:33.948Z",
+  "claimedAt": "2026-09-13T22:02:29.826Z"
+}
