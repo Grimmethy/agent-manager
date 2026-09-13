@@ -131,3 +131,39 @@ index 00000000..4a12874e
 Problem: [severity: low; regression shipped in e1fa402] The function's own documented contract ("never let a missing/corrupt file break a caller") is violated when the on-disk file contains a valid-JSON non-object value; the guard on line 41 dereferences `data` without checking it is an object, so the TypeError escapes the try/catch and reaches the caller.  Failure scenario: Write the 4-character string `null` to `<pipelineDir>/concepts.json` (e.g. `fs.writeFileSync(path.join(dir,'concepts.json'), 'null')`). Call `loadConcepts(dir)`. Line 36: `JSON.parse("null")` succeeds and returns the JS value `null` (no exception, so the catch on line 37 is never entered). Line 41: `data.concepts` evaluates `null.concepts` → throws `TypeError: Cannot read properties of null (reading 'concepts')`. The exception propagates to the caller, contradicting the contract stated in the comment on lines 30–31. The existing test on line 22 of concepts.test.js only covers a *syntactically invalid* file (`{not json`), which exercises the catch path and passes; the `null`-JSON case is untested and unhandled.
 Solution: Insert a guard between the try/catch and the `Array.isArray` check (i.e. before line 41): `if (!data || typeof data !== 'object') data = { concepts: [] };`. This covers `null`, numbers, strings, and booleans in one branch and restores the "always return an object with a `concepts` array" contract.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in e1fa402.
+
+### AC-50 · New helper `windowSectionText` (introduced in this diff; did not exist before) computes `n (7142ca5 local-tool-client.js)
+Strength: Strong
+Source: change_review of 7142ca5 "Merge pull request #107 from Grimmethy/chat-task-lookup-tools"
+Files: src/local-tool-client.js
+
+Snippet:
+```
+diff --git a/src/local-tool-client.js b/src/local-tool-client.js
+index defe710b..ec133942 100644
+--- a/src/local-tool-client.js
++++ b/src/local-tool-client.js
+@@ -2,24 +2,26 @@
+ 
+ // Multi-turn tool-calling loop for a plan pass, giving it a real, narrow, read-only
+ // codebase-search capability via grep-codebase-tool.js. Unlike local-client.js (which only
+ // ever calls Ollama's /api/generate -- a single prompt-in, text-out call with no structured
+ // tool support), this hits /api/chat, the endpoint that actually supports Ollama's tools
+ // array and tool_calls response field.
+ 
+ const path = require('path');
+ const os = require('os');
+ const fs = require('fs');
+ const { execFileSync } = require('child_process');
+ const { grepCodebase } = require('./grep-codebase-tool.js');
++const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
++const { lineMatches } = require('./text-match.js');
+ const { getConfig } = require('./config.js');
+ const { postJson, postJsonStream } = require('./ollama-http.js');
+ const { wrapWithSandbox 
+...[snippet truncated]
+```
+
+Problem: [severity: med; regression shipped in 7142ca5] New helper `windowSectionText` (introduced in this diff; did not exist before) computes `nextOffset` from the un-truncated line-window end, so after the character-limit truncation fires, a caller that pages forward with the returned `nextOffset` silently skips every line that was inside the window but cut off by the character limit; `returnedThrough` is also set to `off` (the start line) rather than the last line actually visible, making the paging notice factually wrong.  Failure scenario: A task JSON in `queue/done/` has `planResponse` = `"A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP"` (16 lines). The model calls `read_task` with `{ taskId: "abc123", section: "plan" }` (no offset/limit, so `off=1`, `lim=READ_FILE_DEFAULT_LINES`). `endLine = 16`. The joined slice is 31 chars. If `MAX_READ_FILE_CHARS` is, say, 10, the slice is cut to `"A\nB\nC\nD\nE\nF\nG\n...[truncated…]"`, `truncated=true`, `returnedThrough = off = 1`, `nextOffset = 16 < 16 → null` (no skip here because the window reaches the end). Now use a smaller window: `limit = 5`. `endLine = 5`, slice = `"A\nB\nC\nD\nE"` (9 chars). With `MAX_READ_FILE_CHARS = 5`, the slice is cut to `"A\nB\nC\n...[truncated…]"`, `truncated = true`, `returnedThrough = 1`, `nextOffset = 5 < 16 → 6`. The notice reads *"showing lines 1-1 of 16. Re-call with offset=6 for the next window."* The content actually contains parts of lines 1–3, but the notice claims only line 1 was shown, and the suggested next offset (6) skips lines 4 and 5 ("D" and "E"), which the caller will never retrieve by following the tool's own paging advice.
+Solution: When `truncated` is true, compute `returnedThrough` as the index of the last `\n` in the truncated `slice` (i.e. `slice.lastIndexOf('\n') + 1`, 1-based) and set `nextOffset` to `returnedThrough + 1` instead of `endLine + 1`, so the caller resumes at the first line that was actually cut off rather than jumping past the entire un-truncated window.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 7142ca5.
