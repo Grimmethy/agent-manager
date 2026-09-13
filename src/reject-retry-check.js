@@ -277,6 +277,30 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         continue;
       }
 
+      // 2026-09-06: candidate-premise-check.js's premise gate can reject a task whose
+      // premise the check itself later invalidated -- the block text carries the gate's
+      // verdict ("Invalid premise:"), not a real review signal, so a blind retry would
+      // only reproduce the same gate. Mirrors the forbidden-path re-admission above:
+      // clean slate exactly once (the predicate fires only while premiseReadmitCount is
+      // falsy; READMIT_CLEAN_SLATE_FIELDS strips it, so a task that somehow still fails
+      // this way after the fix is not re-admitted forever). Runs BEFORE classifyBlockedTask
+      // so the non-retryable verdict (-> needs-clarification + ghost debt) cannot intercept it.
+      if (invalidPremiseBeforeCheckExisted(task)) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.premiseReadmitCount = 1;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was an 'Invalid premise:' verdict from candidate-premise-check (the check itself later invalidated the premise) -- re-admitted with a clean slate, retry budget reset");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'invalid-premise-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+        if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+        summary.requeued++;
+        continue;
+      }
+
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
       // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
       // unreliable-grounding gate). Runs BEFORE the retry-cap check below and regardless
