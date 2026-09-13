@@ -97,3 +97,17 @@ test('buildAuditTask produces a task on the given domain with the evidence embed
   assert.equal(task.promptContext.signature, 'project_search::fabricated-ungrounded-claim');
   assert.equal(task.promptContext.taskCount, CLUSTER_THRESHOLD);
 });
+
+test('buildAuditRawText labels gate-inconclusive when any task carries reviewInconclusive', () => {
+  const tasks = Array.from({ length: 5 }, (_, i) => makeBlocked(`t${i}`, 'arch_import', 'Ornith review inconclusive'));
+  tasks[2].reviewInconclusive = true;
+  const text = buildAuditRawText({ signature: 'arch_import::inconclusive-review', tasks });
+  assert.match(text, /gate-inconclusive \(stochastic re-roll, not a genuine reviewer rejection\)/);
+});
+
+test('buildAuditRawText keeps the original fault-side wording when no task has reviewInconclusive', () => {
+  const tasks = Array.from({ length: 5 }, (_, i) => makeBlocked(`t${i}`, 'arch_import', 'Ornith review inconclusive'));
+  const text = buildAuditRawText({ signature: 'arch_import::inconclusive-review', tasks });
+  assert.doesNotMatch(text, /gate-inconclusive/);
+  assert.match(text, /Classified as:/);
+});
