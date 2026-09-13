@@ -252,6 +252,11 @@ function reviewBrainDumpSort(task, { secondBrainDir, trackedProjectLabels = [] }
   if (namingError) {
     return { ok: false, reason: `secondBrainPath "${parsed.secondBrainPath}": ${namingError}` };
   }
+  if (task.promptContext) {
+    const derived = deriveBelongsToProject(parsed, task.promptContext);
+    parsed.belongsToProject = derived.belongsToProject;
+    parsed.actionable = derived.actionable;
+  }
   if (parsed.belongsToProject && !trackedProjectLabels.includes(parsed.belongsToProject)) {
     return {
       ok: false,
