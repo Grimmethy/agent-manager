@@ -700,9 +700,59 @@ function renderSparkline(history, getValue, avg, label) {
     <div class="meta">&#8212; current &nbsp;&nbsp; &#8901;&#8901;&#8901; 24h average</div>`;
 }
 
+// Watch-category checkboxes (2026-09-12): lets an operator narrow down what the
+// hardware plugin's background sampler actually measures -- e.g. CPU stats only on a
+// CPU-constrained box, since the goatmon-backed plugin's own real probe call (skipped
+// entirely when nothing exclusive to it is checked, see that plugin's
+// goatmon_watch_config.py) is genuinely expensive, not just noisy in the UI. Not every
+// hardware-tab plugin supports this -- GET /api/hardware/watch-config degrades to `{}`
+// when it doesn't (or nothing's active at all), so this renders nothing in that case
+// rather than a checklist with no effect.
+const HARDWARE_WATCH_CATEGORY_LABELS = {
+  cpu: 'CPU', ram: 'RAM', disk: 'Disk', gpu: 'GPU',
+  power: 'Power', sensors: 'Sensors', processes: 'Top processes', filesystems: 'Filesystems',
+};
+
+async function toggleHardwareWatchCategory(checkboxEl, category, checked) {
+  checkboxEl.disabled = true;
+  try {
+    const resp = await fetch('/api/hardware/watch-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [category]: checked }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    if (activeTab === 'hardware') await renderHardwareTab();
+  } catch (e) {
+    alert('Could not update watch setting: ' + e.message);
+    checkboxEl.checked = !checked;
+    checkboxEl.disabled = false;
+  }
+}
+
+function renderWatchConfigChecklist(watchConfig) {
+  const categories = Object.keys(watchConfig);
+  if (!categories.length) return ''; // plugin doesn't support this -- render nothing.
+  const items = categories.map((cat) => `
+    <label style="display:inline-flex; align-items:center; gap:4px; margin-right:14px; cursor:pointer;">
+      <input type="checkbox" ${watchConfig[cat] ? 'checked' : ''}
+        onchange="toggleHardwareWatchCategory(this, '${cat}', this.checked)">
+      <span class="meta">${escapeHtml(HARDWARE_WATCH_CATEGORY_LABELS[cat] || cat)}</span>
+    </label>`).join('');
+  return `
+    <div class="field-label">Watching</div>
+    <div style="margin-bottom:10px;">${items}</div>
+    <div class="meta" style="margin-bottom:14px;">Unchecked categories stop being measured
+      each tick (not just hidden here) -- on a CPU-constrained box, checking only CPU
+      skips the plugin's own expensive probe call entirely.</div>`;
+}
+
 async function renderHardwareTab() {
   const main = document.getElementById('main');
-  const data = await fetchJson('/api/hardware/stats');
+  const [data, watchConfig] = await Promise.all([
+    fetchJson('/api/hardware/stats'),
+    fetchJson('/api/hardware/watch-config').catch(() => ({})),
+  ]);
   // Hardware is a swappable plugin slot (2026-09-05) -- "available: false" means no
   // plugin is currently active/running for it, distinct from a plugin running but
   // still warming up its first sample (which instead shows normally with nulls/no
@@ -713,6 +763,7 @@ async function renderHardwareTab() {
         <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
     return;
   }
+  const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});
   const cur = data.current || {};
   const avg = data.averages || {};
   const history = data.history || [];
@@ -753,6 +804,7 @@ async function renderHardwareTab() {
   `).join('') : `<div class="field-label">GPU</div><div class="meta">No GPU detected.</div>`;
 
   main.innerHTML = `
+    ${watchChecklistHtml}
     <div class="field-label">System</div>
     <div class="stat-row">
       <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization (24h avg ${fmtPercent(avg.cpuPercent)})</div>
