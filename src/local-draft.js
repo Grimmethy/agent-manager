@@ -1659,6 +1659,13 @@ async function runCritiqueAndRevision(task, {
     }
   }
 
+  // task.critiqueOutcome is a STRING enum, NOT an object: it has no `.facts` property.
+  // The only values it ever holds are the four outcome literals assigned just below
+  // ('no-issues' | 'grounding-failed' | 'critique-degenerate' | 'issues-flagged').
+  // Structured findings live in a SEPARATE field -- task.preFilterFlags (an
+  // Array<{ type: string, detail: string }>, populated by the pre-filter fact-check
+  // and the missingFileCheck advisory above) -- NOT on critiqueOutcome itself.
+  /** @type {'no-issues'|'grounding-failed'|'critique-degenerate'|'issues-flagged'} */
   if (critiqueResult.degenerate) {
     task.critiqueOutcome = 'critique-degenerate';
   } else if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
