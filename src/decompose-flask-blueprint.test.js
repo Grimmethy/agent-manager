@@ -162,3 +162,39 @@ test('spliceRegistrations: appends after the last existing app.register_blueprin
   assert.match(out, /app\.register_blueprint\(reports_bp\)\napp\.register_blueprint\(widget_bp\)/);
   assert.ok(out.indexOf('register_blueprint(widget_bp)') < out.indexOf('if __name__'));
 });
+
+// 2026-09-13 regression: a name used ONLY in a return/param type annotation (`-> Path`,
+// `x: Path`) lives on the FunctionDef's `returns`/`arg.annotation` nodes, not in its
+// `body` -- decompose-blueprint-extract.py's dependency walk only ever looked at `n.body`,
+// so the annotation's import line was silently dropped. Syntactically valid (py_compile
+// passes -- an annotation is just an expression node, never executed at compile time) but
+// crashes with a real NameError the moment app.py actually imports the new module, since
+// function annotations ARE evaluated at def-time. Root-caused live: python/dashboard/
+// routes/benchmark.py's `def _benchmark_run_dir(run_id: str) -> Path:` had no
+// `from pathlib import Path`.
+const APP3 = [
+  "from pathlib import Path",
+  "from flask import Flask, jsonify",
+  "",
+  "app = Flask(__name__)",
+  "",
+  "@app.route('/api/thing-dir')",
+  "def api_thing_dir() -> Path:",
+  "    return jsonify({'ok': True})",
+  "",
+  "@app.route('/api/other')",
+  "def api_other():",
+  "    return jsonify({'ok': True})",
+  "",
+  'if __name__ == "__main__":',
+  "    app.run()",
+  "",
+].join('\n');
+
+test('buildBlueprintExtraction: a return-type annotation naming a top-level import carries that import over (2026-09-13 regression)', { skip: !PY }, () => {
+  const r = buildBlueprintExtraction(APP3, 'python/dashboard/app.py', 'python/dashboard/routes/thing.py', 'thing_bp', ['api_thing_dir']);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  const create = r.changes[0];
+  assert.match(create.content, /from pathlib import Path/);
+  assert.match(create.content, /def api_thing_dir\(\) -> Path:/);
+});
