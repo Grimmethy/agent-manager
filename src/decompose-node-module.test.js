@@ -460,3 +460,47 @@ test('firstRuntimeError: null for a self-contained split that require()s + calls
   const err = firstRuntimeError(badChanges, 'src/m.js', repo);
   assert.ok(err && /GONE|not defined|ReferenceError/.test(err), String(err));
 });
+
+// 2026-09-13 regression: a move whose newFile sits in a SUBDIRECTORY of sourceFile's own
+// directory (e.g. sdk/candidate-fulfillment.js -> sdk/lib/candidate-lifecycle.js) used to
+// carry every require() path -- both top-level and lazily called inside a moved function
+// body -- over verbatim, and the back-require spliced into the reduced source always used
+// a bare './<newBase>.js' with no subdirectory prefix. Both silently pointed at the wrong
+// file the instant newFile's directory differed from sourceFile's. Root-caused live via
+// src/sdk/candidate-fulfillment.js -> src/sdk/lib/candidate-lifecycle.js: `require('../config.js')`
+// (correct from sdk/) copied unchanged into sdk/lib/ resolved to sdk/config.js, and
+// firstRuntimeError's own tmp copy scope (sourceFile's directory only) couldn't have found
+// the real target either way, since it never copies anything above that.
+test('buildNodeModuleOnePassChanges: newFile a directory deeper than sourceFile -- top-level AND lazy require() paths get depth-corrected, back-require gets the subdirectory prefix', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-depth-test-'));
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src', 'config.js'), "module.exports = { getConfig: () => ({ ok: true }) };\n");
+  fs.writeFileSync(path.join(repo, 'src', 'task-sources.js'), "module.exports = { helper: () => 'h' };\n");
+
+  const src = [
+    "'use strict';",
+    "const { getConfig } = require('../config.js');",
+    '',
+    'function useConfig() {',
+    "  const { helper } = require('../task-sources.js'); // lazy, inside the moved fn body",
+    '  return getConfig().ok && helper();',
+    '}',
+    '',
+    'module.exports = { useConfig };',
+    '',
+  ].join('\n');
+  fs.mkdirSync(path.join(repo, 'src', 'sdk'), { recursive: true });
+
+  const r = buildNodeModuleOnePassChanges(src, 'src/sdk/thing.js', [
+    { newFile: 'src/sdk/lib/thing-use.js', symbols: ['useConfig'] },
+  ], repo);
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+
+  const created = r.changes.find((c) => c.file === 'src/sdk/lib/thing-use.js').content;
+  assert.match(created, /require\('\.\.\/\.\.\/config\.js'\)/, 'top-level require depth-corrected');
+  assert.match(created, /require\('\.\.\/\.\.\/task-sources\.js'\)/, 'lazy in-body require depth-corrected too');
+  assert.doesNotThrow(() => new vm.Script(created));
+
+  const edit = r.changes.find((c) => c.mode === 'edit');
+  assert.match(edit.replace, /require\('\.\/lib\/thing-use\.js'\)/, 'back-require carries the lib/ subdirectory prefix');
+});
