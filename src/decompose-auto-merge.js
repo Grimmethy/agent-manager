@@ -18,10 +18,28 @@
 // auto-merge. Anything non-mechanical, a dirty merge, or a gate failure is left for a
 // human -- bounded and visible, the caller stamps `coordinatorBlocked`.
 //
+// 2026-09-13 -- generalized past file-decompose. Root-caused live: a PLAIN adhoc
+// `RESOLUTION: decompose` hub's ordered sub-tasks (an `after: N` proposal -> a hard
+// `dependsOn` edge, see task-sources.js's own header on why that edge requires a real
+// MERGE, not just `done`) have no auto-merge path at all -- coordinator-sweep's
+// reconcile/auto-merge call was gated to `decomposeHub === true` hubs only. Confirmed
+// across 6+ real hubs the same day: every one sat frozen at "1 of N sub-tasks done"
+// indefinitely, because nothing ever merges sub-task 0's branch, so sub-task 1's
+// `dependsOn` can never clear -- premiumPriority does not help (isDependencySatisfied's
+// merge check runs before priority is ever consulted). autoMergeVerifiedHubChild is the
+// SAME clean-merge-in-a-throwaway-worktree bar the dashboard's own manual "Merge" button
+// already trusts for ANY branch (see app.py's api_git_merge_branch) -- not the mechanical
+// move's stronger deterministic-relocation + integration-gate bar, since a plain hub
+// child's diff is real, potentially LLM-authored work with no equivalent oracle to
+// re-verify it against. A conflict is terminal for the machine (surfaced via
+// autoMergeBlocked, same as the mechanical path); it does not retry an already-vetted
+// diff against a model, it only re-tests the merge itself next tick.
+//
 // Every git call goes through an injectable `exec` (realExec signature: (file, args,
 // {cwd, timeout})) so coordinator-sweep's test drives this with canned output instead of a
-// real repo. On by default in coordinator-sweep; kill switch
-// AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false.
+// real repo. Both paths on by default in coordinator-sweep; separate kill switches:
+// AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false (mechanical moves),
+// AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN=false (plain hub children).
 
 const os = require('os');
 const path = require('path');
@@ -32,30 +50,26 @@ const BRANCH_REF = 'refs/decompose-automerge/branch';
 const MAIN_REF = 'refs/decompose-automerge/main';
 
 // A move child whose apply is a pure deterministic relocation -- never an LLM-authored
-// change. Only these auto-merge; a `flask-blueprint` / `module-extract` / drifted move
-// stays `pending-merge` for a human.
+// change. Only these auto-merge via the stronger (gated) path; a `flask-blueprint` /
+// `module-extract` / drifted move / plain adhoc child takes the weaker (no-gate) path.
 function isMechanicalMoveChild(task) {
   const pc = task && task.promptContext;
   return !!pc && (pc.deterministicApply === 'script-extract' || pc.deterministicApply === 'one-pass-decompose');
 }
 
 /**
+ * Fetch `agent/<childId>` + `mainBranch` into throwaway refs, clean-merge-test the branch
+ * into a detached worktree of current main, run `runGate` if given, and push on success.
+ * Shared by both auto-merge paths below -- they differ only in eligibility + whether a
+ * gate runs at all.
+ *
  * @returns {{merged:true, mergeCommit:string}
- *   | {merged:false, reason:'not-mechanical'|'no-branch'|'conflict'|'gate-failed'|'gate-errored'|'push-race'|'setup-failed', detail?:string, conflictFiles?:string[], checks?:Array}}
- *   `conflict` / `gate-failed` are terminal for the machine (hand it to a human);
- *   `no-branch` / `gate-errored` / `push-race` / `setup-failed` are transient -- retry next tick.
+ *   | {merged:false, reason:'no-branch'|'conflict'|'gate-failed'|'gate-errored'|'push-race'|'setup-failed', detail?:string, conflictFiles?:string[], checks?:Array}}
  */
-function autoMergeVerifiedMoveChild({
-  repoRoot, childId, childTask, mainBranch = 'master',
-  exec = realExec, runGate = runIntegrationGate,
+function mergeChildBranchClean({
+  repoRoot, childId, title, mainBranch, exec, runGate, sourceFile, mergeLabel,
 }) {
-  if (!repoRoot || !childId) return { merged: false, reason: 'setup-failed', detail: 'no repoRoot/childId' };
-  if (!isMechanicalMoveChild(childTask)) return { merged: false, reason: 'not-mechanical' };
-
   const branch = `agent/${childId}`;
-  const sourceFile = (childTask.promptContext && childTask.promptContext.sourceFile) || '';
-  const title = childTask.title || childId;
-
   const wtBase = fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-automerge-'));
   const wt = path.join(wtBase, 'main');
   const cleanup = () => {
@@ -86,8 +100,7 @@ function autoMergeVerifiedMoveChild({
       return { merged: false, reason: 'setup-failed', detail: `worktree: ${e.message}` };
     }
     try {
-      exec('git', ['merge', '--no-ff', BRANCH_REF, '-m',
-        `Merge ${title} (coordinator auto-merge: verified mechanical decompose move ${childId})`], { cwd: wt });
+      exec('git', ['merge', '--no-ff', BRANCH_REF, '-m', `Merge ${title} (${mergeLabel} ${childId})`], { cwd: wt });
     } catch (e) {
       let conflictFiles = [];
       try {
@@ -99,17 +112,20 @@ function autoMergeVerifiedMoveChild({
       return { merged: false, reason: 'conflict', detail: `${branch} no longer merges clean into ${mainBranch}`, conflictFiles };
     }
 
-    // 3. Integration gate: main vs branch (the branch IS main + this one move). Runs its
-    //    own fetch/worktree against origin; an HTML source returns `language: skip` (ok).
-    let gate;
-    try {
-      gate = runGate({ repoRoot, branch, mainBranch, sourceFile, exec });
-    } catch (e) {
-      cleanup();
-      return { merged: false, reason: 'gate-errored', detail: e.message };
+    // 3. Optional gate (mechanical-move path only): main vs branch (the branch IS main +
+    //    this one move). Runs its own fetch/worktree against origin; an HTML source
+    //    returns `language: skip` (ok).
+    if (runGate) {
+      let gate;
+      try {
+        gate = runGate({ repoRoot, branch, mainBranch, sourceFile, exec });
+      } catch (e) {
+        cleanup();
+        return { merged: false, reason: 'gate-errored', detail: e.message };
+      }
+      if (gate && gate.errored) { cleanup(); return { merged: false, reason: 'gate-errored', checks: gate.checks || [] }; }
+      if (!gate || !gate.ok) { cleanup(); return { merged: false, reason: 'gate-failed', checks: (gate && gate.checks) || [] }; }
     }
-    if (gate && gate.errored) { cleanup(); return { merged: false, reason: 'gate-errored', checks: gate.checks || [] }; }
-    if (!gate || !gate.ok) { cleanup(); return { merged: false, reason: 'gate-failed', checks: (gate && gate.checks) || [] }; }
 
     // 4. Push the merge commit to origin/<main>. A rejected (non-fast-forward) push means
     //    main moved under us between the fetch and now -- bail, the sweep retries next tick.
@@ -133,4 +149,48 @@ function autoMergeVerifiedMoveChild({
   }
 }
 
-module.exports = { autoMergeVerifiedMoveChild, isMechanicalMoveChild, BRANCH_REF, MAIN_REF };
+/**
+ * @returns {{merged:true, mergeCommit:string}
+ *   | {merged:false, reason:'not-mechanical'|'no-branch'|'conflict'|'gate-failed'|'gate-errored'|'push-race'|'setup-failed', detail?:string, conflictFiles?:string[], checks?:Array}}
+ *   `conflict` / `gate-failed` are terminal for the machine (hand it to a human);
+ *   `no-branch` / `gate-errored` / `push-race` / `setup-failed` are transient -- retry next tick.
+ */
+function autoMergeVerifiedMoveChild({
+  repoRoot, childId, childTask, mainBranch = 'master',
+  exec = realExec, runGate = runIntegrationGate,
+}) {
+  if (!repoRoot || !childId) return { merged: false, reason: 'setup-failed', detail: 'no repoRoot/childId' };
+  if (!isMechanicalMoveChild(childTask)) return { merged: false, reason: 'not-mechanical' };
+  return mergeChildBranchClean({
+    repoRoot, childId, title: childTask.title || childId, mainBranch, exec, runGate,
+    sourceFile: (childTask.promptContext && childTask.promptContext.sourceFile) || '',
+    mergeLabel: 'coordinator auto-merge: verified mechanical decompose move',
+  });
+}
+
+/**
+ * The weaker, ungated counterpart for a PLAIN (non-mechanical) hub child: no deterministic
+ * oracle exists to re-verify an arbitrary code change the way a mechanical move's
+ * `validatePlan` does, so this trusts the SAME bar a human clicking the dashboard's manual
+ * "Merge" button already relies on -- the task is `done` (drafted, reviewed, approved,
+ * applied to its own branch already) and that branch still merges clean into current main.
+ * No integration gate (there is no source-file-scoped invariant to check for an arbitrary
+ * diff). Never attempted on a mechanical move child -- that keeps the stronger gated path.
+ *
+ * @returns {{merged:true, mergeCommit:string}
+ *   | {merged:false, reason:'not-eligible'|'no-branch'|'conflict'|'push-race'|'setup-failed', detail?:string, conflictFiles?:string[]}}
+ */
+function autoMergeVerifiedHubChild({
+  repoRoot, childId, childTask, mainBranch = 'master', exec = realExec,
+}) {
+  if (!repoRoot || !childId) return { merged: false, reason: 'setup-failed', detail: 'no repoRoot/childId' };
+  if (isMechanicalMoveChild(childTask)) return { merged: false, reason: 'not-eligible' };
+  return mergeChildBranchClean({
+    repoRoot, childId, title: (childTask && childTask.title) || childId, mainBranch, exec, runGate: null,
+    mergeLabel: 'coordinator auto-merge: reviewed hub sub-task',
+  });
+}
+
+module.exports = {
+  autoMergeVerifiedMoveChild, autoMergeVerifiedHubChild, isMechanicalMoveChild, BRANCH_REF, MAIN_REF,
+};

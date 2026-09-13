@@ -266,6 +266,72 @@ test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: an unmergeable mechanic
   }
 });
 
+// 2026-09-13 regression: a PLAIN (non-file-decompose) hub -- no decomposeHub field -- had
+// NO reconcile/auto-merge path at all before this. Real incident: an ordered adhoc
+// RESOLUTION:decompose split's sub-task 1 carries a hard dependsOn on sub-task 0, which
+// only clears on a real merge (see task-sources.js) -- and nothing ever merged sub-task
+// 0's branch, so 6+ real hubs sat frozen at "1 of N done" indefinitely.
+test('PLAIN (non-decomposeHub) hub + AUTO_MERGE_HUB_CHILDREN=true: a done non-mechanical child is auto-merged via the weaker hub-child path, not the mechanical path', () => {
+  const dir = makePipeline();
+  const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;
+  const prevH = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN;
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = 'true';
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN = 'true';
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
+  try {
+    write(dir, 'coordinating', {
+      id: 'phub-am', status: 'coordinating', history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'ph-x', title: 'X', status: 'in-progress' }, { id: 'ph-y', title: 'Y', status: 'pending' }],
+    });
+    // No promptContext.deterministicApply -- an ordinary LLM-authored adhoc sub-task.
+    write(dir, 'done', { id: 'ph-x', promptContext: { rawText: 'add a helper' } });
+    write(dir, 'adhoc', { id: 'ph-y', promptContext: { rawText: 'use the helper' }, dependsOn: ['ph-x'] });
+
+    const mechSeen = [];
+    const hubSeen = [];
+    const runAutoMerge = (a) => { mechSeen.push(a.childId); return { merged: false, reason: 'not-mechanical' }; };
+    const runHubChildAutoMerge = (a) => { hubSeen.push(a.childId); return { merged: true, mergeCommit: 'deadbeef1234' }; };
+    const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge, runHubChildAutoMerge });
+
+    assert.deepEqual(mechSeen, [], 'the mechanical path is never attempted for a non-mechanical child');
+    assert.deepEqual(hubSeen, ['ph-x'], 'the hub-child path was attempted for the done child');
+    assert.equal(summary.completed, 0, 'ph-y is still pending -- hub not done yet');
+    const child = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'ph-x.json'), 'utf8'));
+    assert.ok(child.mergedAt);
+    assert.equal(child.mergedAtSource, 'coordinator-auto-merge-hub-child');
+    assert.equal(child.autoMergeCommit, 'deadbeef1234');
+  } finally {
+    if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
+    if (prevH === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN = prevH;
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
+test('PLAIN hub + AUTO_MERGE_HUB_CHILDREN=false: the hub-child path is never attempted', () => {
+  const dir = makePipeline();
+  const prevH = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN;
+  const prevR = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
+  process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN = 'false';
+  process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = 'false';
+  try {
+    write(dir, 'coordinating', {
+      id: 'phub-off', status: 'coordinating', history: [{ stage: 'coordinating', at: 'x' }],
+      subTasks: [{ id: 'poff-x', title: 'X', status: 'in-progress' }],
+    });
+    write(dir, 'done', { id: 'poff-x', promptContext: { rawText: 'add a helper' } });
+
+    const hubSeen = [];
+    const runHubChildAutoMerge = (a) => { hubSeen.push(a.childId); return { merged: true }; };
+    coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runHubChildAutoMerge });
+
+    assert.deepEqual(hubSeen, [], 'kill switch off -- never attempted');
+  } finally {
+    if (prevH === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN = prevH;
+    if (prevR === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE; else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prevR;
+  }
+});
+
 test('auto-merge is on by default: a done mechanical child IS attempted with no env set', () => {
   const dir = makePipeline();
   const prevA = process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES;

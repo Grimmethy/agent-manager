@@ -20,7 +20,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
 const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 const { taskCommitOnMain } = require('./task-disposition.js');
-const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
+const { autoMergeVerifiedMoveChild, autoMergeVerifiedHubChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -29,6 +29,19 @@ const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompo
 // Kill switch: AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false.
 function autoMergeEnabled() {
   return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES !== 'false';
+}
+
+// 2026-09-13: the plain-hub counterpart. A PLAIN adhoc decompose hub's ordered sub-tasks
+// (after:N -> dependsOn) have no auto-merge path at all today -- confirmed live across 6+
+// real hubs the same day, every one frozen at "1 of N done" indefinitely because nothing
+// ever merges sub-task 0's branch, so sub-task 1's dependsOn (which requires a real merge,
+// not just done -- see task-sources.js's own header) can never clear. See
+// decompose-auto-merge.js's autoMergeVerifiedHubChild for the weaker (no integration gate)
+// bar this uses instead of the mechanical-move path's stronger one. Separate kill switch
+// from the mechanical path since the risk profile differs (real, potentially LLM-authored
+// diffs vs a deterministic relocation): AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN=false.
+function hubChildAutoMergeEnabled() {
+  return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_HUB_CHILDREN !== 'false';
 }
 
 const writeChildDone = (pipelineDir, task) => {
@@ -54,10 +67,11 @@ const writeChildDone = (pipelineDir, task) => {
 // Memoised per process; env-gated.
 const _childMergeConfirmed = new Set();
 const _autoMergeGaveUp = new Set(); // child id -> conflict/gate-failed this process; don't re-attempt
-function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById, parent, runAutoMerge = autoMergeVerifiedMoveChild) {
+function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById, parent, runAutoMerge = autoMergeVerifiedMoveChild, runHubChildAutoMerge = autoMergeVerifiedHubChild) {
   const trailerDisabled = process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE === 'false';
   const autoMerge = autoMergeEnabled();
-  if (trailerDisabled && !autoMerge) return;
+  const hubChildAutoMerge = hubChildAutoMergeEnabled();
+  if (trailerDisabled && !autoMerge && !hubChildAutoMerge) return;
   let mainBranch;
   try { ({ mainBranch } = require('./git-runner.js').createRealGitRunner(repoRoot)); } catch { return; }
   const git = (root, args) => {
@@ -99,6 +113,32 @@ function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById,
         // fall through to the trailer check in case a human has since merged it
       }
       // transient (no-branch / gate-errored / push-race / setup-failed): fall through, retry next tick
+    } else if (hubChildAutoMerge && !_childMergeConfirmed.has(st.id) && !_autoMergeGaveUp.has(st.id)
+        && !rec.task.autoMergeBlocked && !isMechanicalMoveChild(rec.task)) {
+      // 1b. Auto-merge a plain (non-mechanical) hub child -- same shape, weaker bar (no
+      // integration gate, see autoMergeVerifiedHubChild's own header for why).
+      const r = runHubChildAutoMerge({ repoRoot, childId: st.id, childTask: rec.task, mainBranch });
+      if (r.merged) {
+        _childMergeConfirmed.add(st.id);
+        rec.task.mergedAt = new Date().toISOString();
+        rec.task.mergedAtSource = 'coordinator-auto-merge-hub-child';
+        if (r.mergeCommit) rec.task.autoMergeCommit = r.mergeCommit;
+        writeChildDone(pipelineDir, rec.task);
+        st.status = 'merged';
+        if (parent) appendHistoryEvent(parent, 'advisory', `auto-merged reviewed sub-task ${st.id}${r.mergeCommit ? ` (${r.mergeCommit.slice(0, 9)})` : ''}`);
+        continue;
+      }
+      if (r.reason === 'conflict') {
+        _autoMergeGaveUp.add(st.id);
+        rec.task.autoMergeBlocked = {
+          reason: r.reason,
+          at: new Date().toISOString(),
+          ...(r.conflictFiles && r.conflictFiles.length ? { conflictFiles: r.conflictFiles } : {}),
+        };
+        writeChildDone(pipelineDir, rec.task);
+        // fall through to the trailer check in case a human has since merged it
+      }
+      // transient (no-branch / push-race / setup-failed): fall through, retry next tick
     }
 
     // 2. Trailer reconcile.
@@ -231,7 +271,7 @@ function runStackedWiring(parent, repoRoot) {
   }
 }
 
-function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring, runAutoMerge = autoMergeVerifiedMoveChild } = {}) {
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring, runAutoMerge = autoMergeVerifiedMoveChild, runHubChildAutoMerge = autoMergeVerifiedHubChild } = {}) {
   const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
   const doneDir = path.join(pipelineDir, 'queue', 'done');
   let resolvedRepoRoot = repoRoot;
@@ -283,8 +323,13 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     // trailer and flip it to `merged` -- then the hub only completes on all-MERGED, so its
     // mergedAt stamp is honest and dependents don't unblock against a pre-split main.
     const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
-    if (strictMergeHub) {
-      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById, parent, runAutoMerge);
+    // 2026-09-13: run for every non-stacked hub, not just file-decompose ones -- a PLAIN
+    // adhoc decompose hub's ordered sub-tasks have a hard dependsOn edge (see
+    // task-sources.js) that ALSO only clears on a real merge, and had NO reconcile/
+    // auto-merge path at all before this. A stacked hub's children share one branch (no
+    // per-child agent/<id> branch exists at all), so it stays excluded.
+    if (parent.mode !== 'stacked') {
+      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById, parent, runAutoMerge, runHubChildAutoMerge);
     }
 
     let doneCount = 0;
