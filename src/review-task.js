@@ -320,6 +320,53 @@ function decodeGroupBContent(implementResponse) {
   }
 }
 
+// 2026-09-13 (screaminggoatclubmt investigation, pipeline-forensics-fix-ac-24): a Group B
+// implement response ([{mode:'edit',...}, {mode:'create',...}], the same shape
+// decodeGroupBContent above already knows how to read) reaches buildVerdictPrompt below as
+// task.implementResponse's RAW, compact JSON.stringify string -- real newlines inside
+// find/replace/content escaped to literal backslash-n, everything on one line. Root-caused
+// live: a draft that genuinely included both a correct edit AND a real, substantial new
+// test file (test/ac-24-duplicate-flag-acceptance.js, positive+negative assertions) was
+// REJECTED TWICE by the local reviewer model with the identical verdict "the draft omits
+// the acceptance test" -- reproducing the exact prompt sent confirmed the test file's full
+// content genuinely was present, verbatim, but buried as an escaped substring inside one
+// unbroken JSON line the quantized local reviewer failed to parse/attend to. This is a
+// legibility failure the pipeline itself induces, not the model being unreasonable given
+// what it was shown -- decodeGroupBContent already exists for exactly this shape, but is
+// wired up only to the narrow fixedLiterals byte-match gate, never to the prompt every
+// generic (non-deterministically-verified) review actually reads.
+// Renders each op as its own labeled section with REAL newlines restored, so the reviewer
+// sees legible before/after text instead of an escaped blob. Falls through to the raw
+// string unchanged for anything that isn't recognizably Group B (a single JSON object, a
+// non-array, an op missing the fields this checks, or plain free-text like a
+// local-agentic-write transcript) -- this must never change what the reviewer sees for the
+// far more common non-Group-B case.
+function renderImplementResponseForReview(implementResponse) {
+  let parsedRaw;
+  try {
+    parsedRaw = parseJsonMaybeFenced(implementResponse);
+  } catch (e) {
+    return implementResponse;
+  }
+  // A single edit/create op (no array wrapper) is a normal shape too -- decodeGroupBContent
+  // above already normalizes it the same way; matched here so a lone op also gets a
+  // legible label instead of a compact one-line JSON object.
+  const items = Array.isArray(parsedRaw) ? parsedRaw : [parsedRaw];
+  if (items.length === 0) return implementResponse;
+  const isGroupBOp = (item) => item && typeof item === 'object' && typeof item.mode === 'string'
+    && ((item.mode === 'create' && typeof item.file === 'string' && typeof item.content === 'string')
+      || (item.mode === 'edit' && typeof item.file === 'string' && typeof item.find === 'string' && typeof item.replace === 'string'));
+  if (!items.every(isGroupBOp)) return implementResponse;
+
+  const sections = items.map((item) => {
+    if (item.mode === 'create') {
+      return `--- NEW FILE: ${item.file} ---\n${item.content}`;
+    }
+    return `--- EDIT: ${item.file} ---\nFIND:\n${item.find}\nREPLACE:\n${item.replace}`;
+  });
+  return sections.join('\n\n');
+}
+
 // review-task.js reads each source's own review-gate guidance off the registry
 // (source.reviewGuidance / source.reviewCompletenessQuestion, set in src/task-sources.js
 // or by an AGENT_MANAGER_REGISTER_PATH plugin) instead of an if (task.source === ...) chain.
@@ -365,7 +412,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push(task.planResponse);
   lines.push('');
   lines.push('--- IMPLEMENT draft ---');
-  lines.push(task.implementResponse);
+  lines.push(renderImplementResponseForReview(task.implementResponse));
   lines.push('');
   // 2026-08-24 (pipeline hardening): only reaches here when critiqueOutcome ===
   // 'issues-flagged' AND revisionApplied is true -- the unaddressed-critique case
@@ -930,7 +977,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome };
+module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
