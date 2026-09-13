@@ -2103,10 +2103,6 @@ def _fetch_ollama_models() -> list:
         return []
 
 
-def _benchmark_run_dir(run_id: str) -> Path:
-    return BENCHMARK_STATE_DIR / run_id
-
-
 def _second_brain_bench_dir(run_id: str | None = None) -> Path | None:
     sb = second_brain_dir()
     if not sb:
@@ -2139,233 +2135,6 @@ def _case_result_score(result: dict) -> float | None:
     if grade.get("pass") is False:
         return 0.0
     return None
-
-
-def _compute_case_stats() -> dict:
-    """For each test case, the best- and worst-scoring model ACROSS EVERY SAVED RUN (not
-    just the most recently viewed one) -- Grimmethy, 2026-08-19: "each test needs to show
-    the current worst and best model scoring models in line on the main models page."
-    Scans every _summary.json's raw `results` (not the already-per-run `summary`, which is
-    grouped by category, not by individual case) and pools every response for a given
-    (caseId, model) pair across all runs into one average score. Returns
-    {caseId: {best: {model, score, sampleCount}, worst: {...}, modelCount}} -- a case with
-    fewer than 2 distinct scored models has no meaningful "worst" (nothing to contrast
-    against) and is simply omitted from the response for that case's key gaps."""
-    bench_root = _second_brain_bench_dir()
-    if not bench_root or not bench_root.is_dir():
-        return {}
-
-    # {caseId: {model: [scores...]}}
-    scores_by_case_model: dict = {}
-    for entry in bench_root.iterdir():
-        summary_path = entry / "_summary.json"
-        if not entry.is_dir() or not summary_path.is_file():
-            continue
-        data = read_json_safe(summary_path)
-        if not data:
-            continue
-        for result in data.get("results", []):
-            score = _case_result_score(result)
-            if score is None:
-                continue
-            case_id = result.get("caseId")
-            model = result.get("model")
-            if not case_id or not model:
-                continue
-            scores_by_case_model.setdefault(case_id, {}).setdefault(model, []).append(score)
-
-    stats = {}
-    for case_id, by_model in scores_by_case_model.items():
-        averages = [
-            {"model": model, "score": sum(vals) / len(vals), "sampleCount": len(vals)}
-            for model, vals in by_model.items()
-        ]
-        if len(averages) < 2:
-            continue  # nothing to contrast a single tested model against
-        averages.sort(key=lambda a: a["score"])
-        stats[case_id] = {"worst": averages[0], "best": averages[-1], "modelCount": len(averages)}
-    return stats
-
-
-@app.route("/api/benchmark/cases")
-def api_benchmark_cases():
-    """Case bank metadata (id/category/grader) for the Models tab's test picker -- read
-    live from reasoning-bench-cases.js via node rather than hand-duplicated here, so the
-    two can never drift out of sync with each other. Each case is annotated with `stats`
-    (best/worst scoring model pooled across every saved run, see _compute_case_stats) so
-    the picker can show it inline without a separate round-trip."""
-    script = (
-        "const {CASES} = require(process.argv[1]);"
-        "console.log(JSON.stringify(CASES.map(c => ({id: c.id, category: c.category, grader: c.grader, prompt: c.prompt, description: c.description}))));"
-    )
-    try:
-        result = subprocess.run(
-            ["node", "-e", script, str(SRC_DIR / "reasoning-bench-cases.js")],
-            capture_output=True, text=True, timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("reasoning-bench-cases node script timed out after 15s")
-        return jsonify([])
-    if result.returncode != 0:
-        logger.warning("reasoning-bench-cases node script exited with code %d: %s", result.returncode, result.stderr[:500])
-        return jsonify([])
-    try:
-        cases = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        logger.warning("case-list: subprocess output was not valid JSON (%s); returning empty list. Raw output (first 500 chars): %r", exc, result.stdout[:500])
-        return jsonify([])
-
-    stats = _compute_case_stats()
-    for c in cases:
-        c["stats"] = stats.get(c["id"])
-    return jsonify(cases)
-
-
-@app.route("/api/benchmark/models")
-def api_benchmark_models():
-    return jsonify({"ollamaModels": _fetch_ollama_models()})
-
-
-@app.route("/api/benchmark/run", methods=["POST"])
-def api_benchmark_run():
-    body = request.get_json(silent=True) or {}
-    models = [m.strip() for m in (body.get("models") or []) if m.strip()]
-    case_ids = [c.strip() for c in (body.get("caseIds") or []) if c.strip()]
-    runs = max(1, min(20, int(body.get("runs") or 1)))
-    include_judge = bool(body.get("includeJudge"))
-    if not models:
-        abort(400, description="at least one model is required")
-    if not case_ids:
-        abort(400, description="at least one test case is required")
-
-    # One benchmark run at a time -- a second concurrent run would double-claim the same
-    # Ollama model slot this box can only hold one of anyway (see model-inflight-lock.js's
-    # own header for why), and would silently interleave two runs' progress into the same
-    # "current" pointer.
-    BENCHMARK_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if BENCHMARK_CURRENT_POINTER.is_file():
-        current_id = BENCHMARK_CURRENT_POINTER.read_text(encoding="utf-8").strip()
-        progress_path = _benchmark_run_dir(current_id) / "progress.json"
-        if progress_path.is_file():
-            progress = json.loads(progress_path.read_text(encoding="utf-8"))
-            if progress.get("status") == "running":
-                abort(409, description=f"a benchmark run ('{current_id}') is already in progress")
-
-    run_id = f"run-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}-{os.getpid() % 10000}"
-    run_dir = _benchmark_run_dir(run_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    BENCHMARK_CURRENT_POINTER.write_text(run_id, encoding="utf-8")
-
-    env_overrides = read_env_file(ENV_FILE_PATH)
-    child_env = {**os.environ, **env_overrides}
-
-    args = [
-        "node", str(SRC_DIR / "reasoning-bench.js"),
-        "--models", ",".join(models),
-        "--cases", ",".join(case_ids),
-        "--runs", str(runs),
-        "--run-id", run_id,
-        "--progress-out", str(run_dir / "progress.json"),
-    ]
-    sb_dir = second_brain_dir()
-    if sb_dir:
-        args += ["--second-brain-dir", str(sb_dir)]
-    if not include_judge:
-        args.append("--no-judge")
-
-    log_path = run_dir / "run.log"
-    subprocess.Popen(
-        args,
-        env=child_env,
-        cwd=str(PACKAGE_ROOT),
-        stdout=log_path.open("w"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    return jsonify({"runId": run_id, "started": True, "models": models, "caseIds": case_ids, "runs": runs, "includeJudge": include_judge, "savedToSecondBrain": sb_dir is not None})
-
-
-@app.route("/api/benchmark/status")
-def api_benchmark_status():
-    """?runId=... for a specific run, else whichever run is/was most recently started."""
-    run_id = request.args.get("runId")
-    if not run_id:
-        if not BENCHMARK_CURRENT_POINTER.is_file():
-            return jsonify({"status": "idle"})
-        run_id = BENCHMARK_CURRENT_POINTER.read_text(encoding="utf-8").strip()
-    else:
-        run_id = _safe_run_id(run_id)
-    progress_path = _benchmark_run_dir(run_id) / "progress.json"
-    if not progress_path.is_file():
-        return jsonify({"status": "idle"})
-    try:
-        return jsonify(json.loads(progress_path.read_text(encoding="utf-8")))
-    except json.JSONDecodeError:
-        logger.warning(
-            "Progress file %s is not valid JSON; reporting status as idle",
-            progress_path,
-            exc_info=True,
-        )
-        return jsonify({"status": "idle"})
-
-
-@app.route("/api/benchmark/runs")
-def api_benchmark_runs():
-    """Past runs with a saved _summary.json, newest first -- the source of truth for
-    history is SECOND_BRAIN_DIR (reasoning-bench.js's real, durable output), not
-    BENCHMARK_STATE_DIR (which only ever holds transient progress/log files and is safe to
-    clear at any time). Empty if SECOND_BRAIN_DIR isn't configured -- same "nothing to show,
-    not an error" shape every other SECOND_BRAIN_DIR-gated endpoint in this file uses."""
-    bench_root = _second_brain_bench_dir()
-    if not bench_root or not bench_root.is_dir():
-        return jsonify([])
-    runs = []
-    for entry in bench_root.iterdir():
-        summary_path = entry / "_summary.json"
-        if not entry.is_dir() or not summary_path.is_file():
-            continue
-        data = read_json_safe(summary_path)
-        if not data:
-            continue
-        runs.append({
-            "runId": data.get("runId", entry.name),
-            "generatedAt": data.get("generatedAt"),
-            "models": data.get("models", []),
-            "caseIds": data.get("caseIds", []),
-            "runs": data.get("runs", 1),
-        })
-    runs.sort(key=lambda r: r.get("generatedAt") or "", reverse=True)
-    return jsonify(runs)
-
-
-@app.route("/api/benchmark/runs/<run_id>")
-def api_benchmark_run_detail(run_id):
-    run_id = _safe_run_id(run_id)
-    bench_dir = _second_brain_bench_dir(run_id)
-    if not bench_dir:
-        abort(404, description="SECOND_BRAIN_DIR is not configured")
-    data = read_json_safe(bench_dir / "_summary.json")
-    if not data:
-        abort(404)
-    return jsonify(data)
-
-
-@app.route("/api/benchmark/response/<run_id>/<response_id>")
-def api_benchmark_response(run_id, response_id):
-    """Serves one saved response as a task-shaped JSON -- the SAME shape
-    /api/task/<state>/<task_id> returns for a real pipeline task, so the frontend's
-    existing renderTaskDetailModal() renders it with zero new viewer code (see
-    reasoning-bench.js's writeResponseArtifact() for the field-name contract)."""
-    run_id = _safe_run_id(run_id)
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", response_id or ""):
-        abort(400, description="invalid response id")
-    bench_dir = _second_brain_bench_dir(run_id)
-    if not bench_dir:
-        abort(404, description="SECOND_BRAIN_DIR is not configured")
-    data = read_json_safe(bench_dir / f"{response_id}.json")
-    if not data:
-        abort(404)
-    return jsonify(data)
 
 
 _REPORT_PERIODS = ("hourly", "daily", "weekly")
@@ -4317,8 +4086,6 @@ def _ghost_telemetry(days: int = 30) -> dict:
     return out
 
 
-
-
 def write_concepts(concepts: list):
     path = concepts_path()
     if not path:
@@ -4331,10 +4098,6 @@ def slugify_concept_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:48] or "concept"
 
 
-
-
-
-
 CONCEPT_STABLE_STATUSES = ("shelved", "shipped")
 
 
@@ -4343,12 +4106,6 @@ def _find_concept_or_404(concepts: list, concept_id: str) -> dict:
     if not concept:
         abort(404, description=f"no concept with id {concept_id}")
     return concept
-
-
-
-
-
-
 
 
 CONCEPT_TASK_SCAN_BUDGET_SECONDS = 1.5
@@ -4416,8 +4173,6 @@ def _concept_task_history_rows(pipeline_dir: Path, concept_id: str) -> tuple:
     return rows, truncated
 
 
-
-
 @app.route("/api/task/needs-clarification/<task_id>/discuss/latest", methods=["GET"])
 def api_needs_clarification_discuss_latest(task_id):
     """Held-task counterpart to the brain-dump/second-brain discuss/latest checks above --
@@ -4462,12 +4217,6 @@ def api_needs_clarification_discuss_start(task_id):
 # **label**", with an optional ", held for clarification (...)" suffix after the closing
 # ** that this regex doesn't need to care about (it only needs the id/label pair).
 _TASK_REF_RE = re.compile(r"Queued as adhoc task `([^`]+)` in \*\*([^*]+)\*\*")
-
-
-
-
-
-
 
 
 def _resolve_discuss_session(session_id):
@@ -5247,22 +4996,6 @@ def _resolve_under_second_brain(root: Path, raw_path: str) -> Path:
     return candidate
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _slugify_project_name(stem: str) -> str:
     """Note filename (no .md) -> filesystem/repo-friendly name: spaces to hyphens, strip
     anything that isn't alphanumeric/hyphen/underscore. Deliberately NOT lowercased --
@@ -5271,10 +5004,6 @@ def _slugify_project_name(stem: str) -> str:
     name = stem.replace(" ", "-")
     name = re.sub(r"[^A-Za-z0-9_-]", "", name)
     return name.strip("-_") or "untitled-project"
-
-
-
-
 
 
 @app.route("/api/deep-dive/projects")
@@ -8147,11 +7876,13 @@ from routes.reports import reports_bp  # noqa: E402
 from routes.concepts import concepts_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
+from routes.benchmark import benchmark_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
+app.register_blueprint(benchmark_bp)
 
 
 def _active_hardware_plugin():
