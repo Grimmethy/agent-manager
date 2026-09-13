@@ -356,6 +356,27 @@ function extractTopLevelConsts(src, names) {
   return { ok: true, blocks, reducedSource };
 }
 
+// A carried-over require() statement's path is relative to sourceFile's own directory --
+// pasting it verbatim into newFile is only correct when newFile sits in that SAME
+// directory. Real incident, 2026-09-13: src/sdk/candidate-fulfillment.js's
+// `require('../config.js')` moved unchanged into src/sdk/lib/candidate-lifecycle.js (one
+// directory deeper) resolved to src/sdk/config.js instead of src/config.js --
+// firstRuntimeError correctly caught it ("Cannot find module '../config.js'") before
+// anything was applied, but the move itself was worth landing. Recomputes each relative
+// `require('./x')`/`require('../x')` path (never touches a bare package name) from
+// newFile's directory to the SAME real target sourceFile's copy pointed at.
+function rewriteRelativeRequirePaths(statementText, sourceFile, newFile) {
+  const sourceDir = path.dirname(sourceFile);
+  const newDir = path.dirname(newFile);
+  if (sourceDir === newDir) return statementText;
+  return statementText.replace(/require\((['"])(\.[^'"]*)\1\)/g, (whole, quote, reqPath) => {
+    const absTarget = path.resolve('/', sourceDir, reqPath);
+    let rel = path.relative(path.resolve('/', newDir), absTarget).split(path.sep).join('/');
+    if (!rel.startsWith('.')) rel = `./${rel}`;
+    return `require(${quote}${rel}${quote})`;
+  });
+}
+
 function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
   if (!/\.(js|mjs|cjs)$/.test(sourceFile || '')) return { ok: false, reason: 'source is not a .js/.mjs/.cjs file' };
   if (!/\.(js|mjs|cjs)$/.test(newFile || '')) return { ok: false, reason: 'target is not a .js/.mjs/.cjs file' };
@@ -406,7 +427,6 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
     };
   }
 
-  const newBase = path.basename(newFile).replace(/\.(js|mjs|cjs)$/, '');
   const hadUseStrict = /^\s*(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*['"]use strict['"]/.test(sourceText);
   // Carry over only the `require(...)` statements whose bound name(s) the moved code
   // actually references (plus any bare side-effect `require('./x')`). NOT the source's
@@ -417,17 +437,26 @@ function buildNodeModuleExtraction(sourceText, sourceFile, newFile, symbols) {
     if (bound.size === 0) return true; // bare `require('./side-effect')`
     for (const n of bound) if (refs.has(n)) return true;
     return false;
-  });
+  }).map((rl) => rewriteRelativeRequirePaths(rl, sourceFile, newFile));
   const parts = [];
   if (hadUseStrict) parts.push("'use strict';\n");
   parts.push(`// ${path.basename(newFile)} -- extracted from ${sourceFile} ([[hub-task-integration]] node-module decompose).\n`);
   if (requireLines.length) parts.push(requireLines.join('\n') + '\n');
-  if (constText.trim()) parts.push(constText.replace(/\s+$/, '') + '\n');
-  if (ex.newFileContent.trim()) parts.push(ex.newFileContent.replace(/\s+$/, '') + '\n');
+  // rewriteRelativeRequirePaths is a no-op when sourceFile/newFile share a directory, and
+  // otherwise fixes not just the carried-over top-level requireLines above but also any
+  // relative require() lazily called INSIDE a moved function body (e.g. a require deferred
+  // to avoid a load-time cycle) -- both point at the source file's original directory and
+  // need the same depth correction, or the moved copy resolves against the wrong base.
+  if (constText.trim()) parts.push(rewriteRelativeRequirePaths(constText, sourceFile, newFile).replace(/\s+$/, '') + '\n');
+  if (ex.newFileContent.trim()) parts.push(rewriteRelativeRequirePaths(ex.newFileContent, sourceFile, newFile).replace(/\s+$/, '') + '\n');
   parts.push(`module.exports = { ${symbols.join(', ')} };\n`);
   const newContent = parts.join('\n');
 
-  const backRequire = `const { ${symbols.join(', ')} } = require('./${newBase}.js');`;
+  // Relative to sourceFile's OWN directory, not always './<newBase>.js' -- newFile can sit
+  // in a subdirectory (e.g. sdk/lib/ under sdk/), same depth bug as the requires above.
+  let backRequirePath = path.relative(path.dirname(sourceFile), newFile).split(path.sep).join('/');
+  if (!backRequirePath.startsWith('.')) backRequirePath = `./${backRequirePath}`;
+  const backRequire = `const { ${symbols.join(', ')} } = require('${backRequirePath}');`;
   const reduced = insertBackRequire(constResult.reducedSource, backRequire);
 
   return {
@@ -520,16 +549,49 @@ function firstNodeCheckError(changes) {
 // (a dropped module-scope dependency), a load failure, or null. Side-effect-looking
 // exports (write/apply/save/generate/run/queue/commit/push/delete/sync/...) are NOT
 // invoked -- only their presence in module.exports is proven by the successful require().
+// The shallowest repo-relative ancestor directory that covers sourceFile, every changed
+// file, and every relative require() TARGET their bodies point at (e.g. a top-level
+// `require('../config.js')` that stays in the reduced source unchanged, or a carried-over
+// one now correctly re-pointed at a deeper newFile) -- srcDir alone (sourceFile's own
+// directory) is not enough the moment anything requires upward past it, which candidate-
+// fulfillment.js's real top-of-file imports do. Real incident, 2026-09-13: even with every
+// require() path correctly rewritten, the check still failed with "Cannot find module
+// '../config.js'" because config.js was never copied into the tmp dir at all.
+function relativeRequireTargetDirs(text, fileDir) {
+  const dirs = [];
+  const re = /require\((['"])(\.[^'"]*)\1\)/g;
+  let m;
+  while ((m = re.exec(text))) dirs.push(path.dirname(path.join(fileDir, m[2])));
+  return dirs;
+}
+
+function commonAncestorDir(repoRelDirs) {
+  const split = repoRelDirs.map((d) => (d === '.' ? [] : d.split(path.sep)));
+  let common = split[0] || [];
+  for (const parts of split.slice(1)) {
+    let i = 0;
+    while (i < common.length && i < parts.length && common[i] === parts[i]) i += 1;
+    common = common.slice(0, i);
+  }
+  return common.length ? common.join(path.sep) : '.';
+}
+
 function firstRuntimeError(changes, sourceFile, repoRoot) {
   const os = require('os');
   const fs = require('fs');
   const { execFileSync } = require('child_process');
-  const srcDir = path.join(repoRoot, path.dirname(sourceFile));
-  const base = path.basename(sourceFile);
+  const dirCandidates = [path.dirname(sourceFile)];
+  for (const ch of changes) {
+    dirCandidates.push(path.dirname(ch.file));
+    const body = ch.mode === 'create' ? ch.content : ch.replace;
+    if (typeof body === 'string') dirCandidates.push(...relativeRequireTargetDirs(body, path.dirname(ch.file)));
+  }
+  const ancestorRel = commonAncestorDir(dirCandidates);
+  const ancestorAbs = path.join(repoRoot, ancestorRel);
   let dir;
   try {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-runtime-'));
-    fs.cpSync(srcDir, dir, { recursive: true });
+    fs.cpSync(ancestorAbs, dir, { recursive: true });
   } catch (e) {
     try { if (dir) fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     return null; // can't stage a runnable copy -- fall back to the static + parse guards
@@ -538,11 +600,19 @@ function firstRuntimeError(changes, sourceFile, repoRoot) {
     for (const ch of changes) {
       const body = ch.mode === 'create' ? ch.content : ch.replace;
       if (typeof body !== 'string') continue;
-      fs.writeFileSync(path.join(dir, path.basename(ch.file)), body);
+      // Preserve ch.file's real position relative to the copied ancestor -- a basename-
+      // only write flattens a newFile that sits in a subdirectory (e.g.
+      // sdk/lib/candidate-lifecycle.js under sdk/candidate-fulfillment.js), so a
+      // correctly-relative-pathed require() from the reduced source can never resolve it
+      // here even though it would in the real repo.
+      const relPath = path.relative(ancestorRel, ch.file);
+      const dest = path.join(dir, relPath);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, body);
     }
     const probe = [
       'const path=require("path");',
-      `const m=require(${JSON.stringify(path.join(dir, base))});`,
+      `const m=require(${JSON.stringify(path.join(dir, path.relative(ancestorRel, sourceFile)))});`,
       'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build)/i;',
       'for(const [k,v] of Object.entries(m||{})){',
       '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
