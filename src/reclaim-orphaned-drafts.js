@@ -75,6 +75,14 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
     ids.push(task.id || name.replace(/\.json$/, ''));
   }
 
+  if (ids.length > 0) {
+    try {
+      fs.appendFileSync(path.join(pipelineDir, 'reclaim-log.jsonl'), JSON.stringify({ ts: new Date().toISOString(), instanceId, count: ids.length, ids }) + '\n');
+    } catch (logErr) {
+      console.warn('reclaimOrphanedDrafts: reclaim-log write failed -- ' + logErr.message);
+    }
+  }
+
   return { reclaimed: ids.length, ids };
 }
 
