@@ -159,6 +159,73 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     extraCriteria.set(targetIndex, list);
   });
 
+  // Stacked branches for an `after` chain (2026-09-13, screaminggoatclubmt: "build the
+  // hubs so they add to the worktree of the previously completed hub member"). Root cause
+  // this replaces: a hard dependsOn edge only clears once the predecessor is actually
+  // MERGED to main (see task-sources.js's own header on why -- the dependent's fresh
+  // worktree needs the predecessor's real file change present, not just "finished").
+  // Nothing ever merged a plain hub sub-task's branch on its own, so every ordered split
+  // sat frozen at "step 1 of N done" indefinitely -- confirmed across 6+ real hubs the
+  // same day. file-decompose-to-hub.js already solved this exact shape for file-decompose
+  // hubs: every step commits onto ONE shared branch instead of its own, so step N's draft
+  // worktree is built FROM the branch that already carries step N-1's real commit
+  // (agentic-draft-common.js's resolveGroundingRef / apply-task.js's own stacked handling
+  // -- both keyed only on task.stacked.branch, already fully generic, untouched here).
+  // isDependencySatisfied() already treats a stacked predecessor's mere queue/done/ arrival
+  // as satisfied (no merge needed) -- see its own header. dependsOn is still stamped too
+  // (unchanged ordering signal); stacked is what actually unblocks the next step.
+  //
+  // Grouped by weakly-connected component of the `after` graph, in case one decompose
+  // produces more than one independent chain -- each component gets its own branch, and
+  // within a component nodes are ordered by a simple Kahn's-algorithm topological sort
+  // (a node's seq exceeds its `after` parent's), ties broken by original proposal index. A
+  // real fan-out (two children of the same parent) serializes onto one branch rather than
+  // running in parallel -- correct, if conservative; every real hub seen so far is a
+  // simple 2-3 step linear chain anyway.
+  const survivingIndices = subTasks.map((_, i) => i).filter((i) => !foldTargets.has(i));
+  const afterOf = new Map(); // surviving index -> surviving parent index (after resolving through folds)
+  survivingIndices.forEach((i) => {
+    const raw = subTasks[i].after;
+    if (!Number.isInteger(raw) || raw < 0 || raw >= i) return;
+    let parent = foldTargets.has(raw) ? foldTargets.get(raw) : raw;
+    if (parent !== i && survivingIndices.includes(parent)) afterOf.set(i, parent);
+  });
+  const componentOf = new Map(); // surviving index -> component root index
+  const findRoot = (i) => {
+    let cur = i;
+    while (afterOf.has(cur)) cur = afterOf.get(cur);
+    return cur;
+  };
+  survivingIndices.forEach((i) => { if (afterOf.has(i)) componentOf.set(i, findRoot(i)); });
+  const componentMembers = new Map(); // root index -> [indices] (root itself + every descendant), in seq order
+  survivingIndices.forEach((i) => {
+    const root = componentOf.get(i);
+    if (root === undefined) return;
+    if (!componentMembers.has(root)) componentMembers.set(root, [root]);
+    if (i !== root) componentMembers.get(root).push(i);
+  });
+  // Kahn's-algorithm order within each component: repeatedly take the lowest-index node
+  // whose `after` parent (if any, within this component) already has a seq assigned.
+  const seqOf = new Map(); // surviving index -> 1-based seq within its component
+  const branchOf = new Map(); // surviving index -> shared branch name
+  let componentCounter = 0;
+  componentMembers.forEach((members, root) => {
+    componentCounter += 1;
+    const branch = `agent/decompose-${slugify(parentTaskId)}${componentCounter > 1 ? `-c${componentCounter}` : ''}`;
+    const remaining = new Set(members);
+    let seq = 0;
+    while (remaining.size) {
+      const ready = [...remaining].filter((i) => !afterOf.has(i) || !remaining.has(afterOf.get(i))).sort((a, b) => a - b);
+      if (!ready.length) break; // a cycle -- should not happen (after always points to an earlier index), leave the rest unstacked
+      for (const i of ready) {
+        seq += 1;
+        seqOf.set(i, seq);
+        branchOf.set(i, branch);
+        remaining.delete(i);
+      }
+    }
+  });
+
   const queued = [];
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
@@ -171,6 +238,9 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     };
     if (Number.isInteger(sub.after) && sub.after >= 0 && sub.after < i && !foldTargets.has(sub.after)) {
       record.dependsOn = [ids[sub.after]];
+    }
+    if (branchOf.has(i)) {
+      record.stacked = { branch: branchOf.get(i), seq: seqOf.get(i), total: componentMembers.get(componentOf.has(i) ? componentOf.get(i) : i).length };
     }
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
