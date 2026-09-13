@@ -1,0 +1,399 @@
+{
+  "id": "adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1",
+  "title": "Add spec comment at call site in src/local-draft.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T00:47:15.247Z",
+  "history": [
+    {
+      "stage": "created",
+      "at": "2026-09-13T00:47:15.247Z",
+      "detail": "manual"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T01:11:15.425Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T01:11:18.620Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T01:15:02.573Z",
+      "detail": "3 attempt(s), 5221 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T01:23:02.330Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T01:30:54.914Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/local-draft.js (matches forbidden \"src/\") -- the task explicitly says not to"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T01:30:54.916Z",
+      "detail": "attempt 1: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T01:31:08.414Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/local-draft.js (matches forbidden \"src/\") -- the task explicitly says not to"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T02:31:30.988Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T02:31:32.308Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T02:35:56.305Z",
+      "detail": "3 attempt(s), 4826 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T02:35:56.307Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T02:39:20.855Z",
+      "detail": "agentic, 1893 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T02:39:20.855Z",
+      "detail": "resolution=implemented, retry 1, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T02:39:20.856Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T02:39:20.856Z",
+      "detail": "attempt 2: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T02:39:28.891Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T02:40:34.378Z",
+      "detail": "votes: 2/3 real"
+    },
+    {
+      "stage": "applied",
+      "at": "2026-09-13T02:40:43.981Z",
+      "detail": "agent/adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1"
+    },
+    {
+      "stage": "pending-merge",
+      "at": "2026-09-13T02:41:02.813Z",
+      "detail": "agent/adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1 is 1 commit(s) ahead of master, not merged"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T03:11:41.198769+00:00",
+      "note": "manually requeued from done/",
+      "blockedReasonAtRequeue": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/local-draft.js (matches forbidden \"src/\") -- the task explicitly says not to",
+      "priorRejectionFeedbackAtRequeue": [
+        "Your diff modified src/local-draft.js, which the task EXPLICITLY forbids (\"src/\"). Discard those changes entirely. Implement the actual change in the file(s) the plan/task names, and nowhere else."
+      ]
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T03:15:28.497Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T03:15:28.508Z",
+      "detail": "attempt 1: error"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T03:42:31.381Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T03:42:33.786Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T03:55:35.158Z",
+      "detail": "2 attempt(s), 4574 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T03:58:47.026Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T04:03:20.920Z",
+      "detail": "attempt 2: error, tiers: local-agentic-write=declined"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T04:38:35.871Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T04:38:39.327Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T04:48:07.374Z",
+      "detail": "2 attempt(s), 5011 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T04:48:32.643Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T04:55:44.847Z",
+      "detail": "agentic, 2895 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T04:55:44.848Z",
+      "detail": "resolution=implemented, qwen3.8-p40:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T04:55:44.855Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T04:55:44.856Z",
+      "detail": "attempt 3: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T04:56:28.704Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T04:57:00.254Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "Insert two spec-referencing comment lines immediately above the `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call in src/local-draft.js (around lines 2248-2249). The comments must reference the sub-task-2 spec in src/ollama-health.js and warn against replacing the env-var-first expression with a bare 'http://localhost:11434' literal, since the P40 lane and TokenFold reroute set OLLAMA_URL. Leave the call expression itself unchanged.",
+    "decomposedFrom": "adhoc-write-corrected-sub-task-2-spec-env-var-first-ollama-url-1789183938051-0"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T03:15:28.496Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [],
+      "outcome": "error",
+      "reason": "Ollama endpoint http://192.168.122.29:11434 is not reachable (ECONNREFUSED: connect ECONNREFUSED 192.168.122.29:11434)",
+      "finishedAt": "2026-09-13T03:15:28.508Z"
+    },
+    {
+      "at": "2026-09-13T03:42:31.379Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "reason": "local write-agentic draft failed: Ollama HTTP 500: {\"error\":\"model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details\"}"
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 4574,
+        "text": "## PLAN\n\n1. **Locate the exact call site in `src/local-draft.js`.**\n   Open `src/local-draft.js` and search (e.g. `grep -n 'await checkOllamaReachable' src/local-draft.js`) for the line matching:\n   ```js\n   await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n   ```\n   The task description places this at approximately lines 2248–2249. The provided content window shows only the file's header (imports through `RETRY_TEMPERATURE`), so the exact line number must be confirmed by the grep above. Record the line number as `N`.\n\n2. **Compose the two comment lines.**\n   Draft exactly two `//`-prefixed comment lines that:\n   - Reference the **sub-task-2 normative spec** documented in `src/ollama-health.js` (the JSDoc block beginning \"NORMATIVE URL SPEC (sub-task-2, corrected)\" visible in the provided content of that file).\n   - State that the URL argument **MUST** be the env-var-first expression `process.env.OLLAMA_URL || 'http://localhost:11434'`.\n   - **Warn against** replacing that expression with a bare `'http://localhost:11434'` literal.\n   - Cite the two concrete deployments that set `OLLAMA_URL` to a non-localhost value:\n     - **P40 lane** — `src/dead-process-check.js:87` (wraps the lane in `env OLLAMA_URL=\"$AGENT_MANAGER_P40_OLLAMA_URL\"`, per the spec comment in `ollama-health.js` and the grep hit at `dead-process-check.js:70`).\n     - **TokenFold reroute** — `scripts/launch.sh:117` (exports `OLLAMA_URL=http://localhost:9339`, per the spec comment in `ollama-health.js`).\n\n   Suggested wording (adjust to fit the file's existing comment style, which uses `//` with a date/author prefix in some places — see the `localOllamaLockKey` comment block in the visible content):\n   ```js\n   // SPEC (sub-task-2, src/ollama-health.js): URL MUST be the env-var-first expression\n   // process.env.OLLAMA_URL || 'http://localhost:11434'. Do NOT replace with a bare\n   // 'http://localhost:11434' literal — the P40 lane (src/dead-process-check.js:87)\n   // and TokenFold (scripts/launch.sh:117) set OLLAMA_URL to a different host/port.\n   ```\n   *Note:* The task says \"two comment lines.\" If the reviewer interprets that strictly as two physical lines, collapse the above into two lines (e.g. split at the sentence boundary after \"expression\"). Verify the count matches the task's \"two\" requirement before committing.\n\n3. **Insert the comments immediately above line `N`.**\n   Place the two comment lines on the lines directly preceding the `await checkOllamaReachable(...)` call. Do **not** modify the call expression itself — it must remain exactly:\n   ```js\n   await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n   ```\n   Do not add, remove, or reformat any other line in the vicinity.\n\n4. **Verify the edit.**\n   - Run `node --check src/local-draft.js` (or the project's equivalent syntax check) to confirm the file still parses.\n   - Run `grep -n -A2 'SPEC (sub-task-2' src/local-draft.js` to confirm the two comment lines appear immediately above the `checkOllamaReachable` call.\n   - Run `grep -n \"checkOllamaReachable(process.env.OLLAMA_URL\" src/local-draft.js` to confirm the call expression is byte-for-byte unchanged.\n   - If the project has a lint step (e.g. `npx eslint src/local-draft.js`), run it to catch any line-length or style violations introduced by the comment.\n\n5. **Confirm no other call sites were touched.**\n   Run `grep -n 'checkOllamaReachable' src/local-draft.js` and verify the only change relative to the pre-edit state is the two new comment lines above the single target call. (The import at the top of the file, `const { checkOllamaReachable } = require('./ollama-health.js');`, must be untouched.)\n\nCRITERIA:\n- `grep -c 'SPEC (sub-task-2, src/ollama-health.js)' src/local-draft.js` returns **1** (exactly one occurrence of the spec reference comment).\n- `grep -n 'await checkOllamaReachable(process.env.OLLAMA_URL || .http://localhost:11434.)' src/local-draft.js` still matches the original call expression unchanged, and the two comment lines appear on the lines immediately above it (line numbers N-2 and N-1 if the call is on line N).\n- `node --check src/local-draft.js` exits 0 (valid syntax).\n- The two comment lines together mention: (a) \"sub-task-2\" and `src/ollama-health.js`, (b) a warning against a bare `'http://localhost:11434'` literal, (c) the P40 lane, and (d) TokenFold.\n- No other lines in `src/local-draft.js` differ from their pre-edit state (e.g. `git diff --stat src/local-draft.js` shows only the two added lines, zero deletions, zero modifications).",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 11740,
+        "anchorPaths": [
+          "src/local-draft.js",
+          "src/ollama-health.js"
+        ]
+      },
+      "outcome": "error",
+      "reason": "local write-agentic draft failed: Ollama HTTP 500: {\"error\":\"model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details\"}",
+      "acceptance": {
+        "criteriaCount": 5,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T04:03:20.919Z"
+    },
+    {
+      "at": "2026-09-13T04:38:35.870Z",
+      "attemptNo": 3,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 2071,
+          "response": "All criteria verified:\n\n- `git diff --stat src/local-draft.js` → `1 file changed, 2 insertions(+)` — exactly 2 insertions, 0 deletions.\n- `sed -n '2247,2255p' src/local-draft.js` shows the two new `//` comment lines immediately above the `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call, and the call expression is byte-for-byte unchanged (also confirmed by the `git diff` hunk showing only `+` lines).\n- All four required references present: \"sub-task-2\", `src/ollama-health.js`, warning against the bare `'http://localhost:11434'` literal, \"P40 lane\" + `src/dead-process-check.js`, \"TokenFold\" + `scripts/launch.sh` (each verified with `grep -nF` → FOUND).\n- `node --check src/local-draft.js` → exit 0 (NODE-OK).\n\nI inserted exactly two `//` comment lines above the call site in `src/local-draft.js` (inside the `if (localCall === null && resolvedCallIsLocal)` block, matching its 6-space indent) referencing the sub-task-2 normative URL spec in `src/ollama-health.js` and warning that the env-var-first `process.env.OLLAMA_URL || 'http://localhost:11434'` expression must not be replaced with a bare localhost literal, citing the P40 lane (`src/dead-process-check.js`) and TokenFold (`scripts/launch.sh`) deployments that set `OLLAMA_URL`. The call expression and every surrounding line are untouched.\n\nAcceptance:\n1. `git diff --stat` reports 2 insertions, 0 deletions -- `git diff --stat src/local-draft.js` -- PASS (`1 file changed, 2 insertions(+)`)\n2. Call expression unchanged and two comment lines immediately above -- `sed -n '2247,2255p' src/local-draft.js` -- PASS (two `//` lines directly above the intact `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` line)\n3. All four references present -- `grep -nF` for each phrase -- PASS (sub-task-2, src/ollama-health.js, \"do NOT replace with a bare 'http://localhost:11434'\", \"P40 lane src/dead-process-check.js\", \"TokenFold scripts/launch.sh\" all FOUND)\n4. `node --check src/local-draft.js` exits 0 -- PASS (NODE-OK)\n\nRESOLUTION: implemented",
+          "rawDiffChars": 809,
+          "rawDiff": "diff --git a/src/local-draft.js b/src/local-draft.js\nindex 65fdfad1..5d898059 100644\n--- a/src/local-draft.js\n+++ b/src/local-draft.js\n@@ -2247,6 +2247,8 @@ async function runDraftPasses(task, attempt, {\n     // diagnostic in ~5s instead of stalling on the first generate call's 4-minute\n     // socket timeout with the identical, less actionable symptom.\n     if (localCall === null && resolvedCallIsLocal) {\n+      // sub-task-2 normative URL spec (src/ollama-health.js): URL MUST stay env-var-first process.env.OLLAMA_URL ||\n+      // 'http://localhost:11434' -- do NOT replace with a bare 'http://localhost:11434' literal (P40 lane src/dead-process-check.js and TokenFold scripts/launch.sh both set OLLAMA_URL).\n       await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n     }",
+          "turnsUsed": 9,
+          "toolCalls": {
+            "total": 8,
+            "byTool": {
+              "read_file": 1,
+              "edit_file": 4,
+              "run_bash": 3
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1953
+              },
+              {
+                "n": 2,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 3,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 4,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1466
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1010
+              },
+              {
+                "n": 7,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 717
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 5011,
+        "text": "## PLAN\n\n1. **Locate the exact call site in `src/local-draft.js`.**\n   The provided content window covers only the file header (imports through `RETRY_TEMPERATURE`); the target call sits ~155 k chars further in. Run:\n   ```bash\n   grep -n 'await checkOllamaReachable' src/local-draft.js\n   ```\n   Expect exactly one hit (the import line `const { checkOllamaReachable } = require('./ollama-health.js');` is a separate `require`, not an `await` call). Record the line number as **N** (task description says ≈ 2248–2249). Confirm the line reads exactly:\n   ```js\n   await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n   ```\n\n2. **Compose exactly two `//` comment lines matching the file's existing style.**\n   The file's comment convention (visible in the `localOllamaLockKey` and `RETRY_TEMPERATURE` blocks) is:\n   ```\n   // YYYY-MM-DD, <author/context>: <description>\n   // <continuation>\n   ```\n   Draft two lines that satisfy every requirement in the task:\n\n   - Reference the **sub-task-2 normative spec** in `src/ollama-health.js` (the JSDoc block titled \"NORMATIVE URL SPEC (sub-task-2, corrected)\").\n   - State the URL argument **MUST** remain the env-var-first expression `process.env.OLLAMA_URL || 'http://localhost:11434'`.\n   - **Warn against** replacing it with a bare `'http://localhost:11434'` literal.\n   - Name the two deployments that override `OLLAMA_URL`:\n     - **P40 lane** — `src/dead-process-check.js:87` wraps the lane in `env OLLAMA_URL=\"$AGENT_MANAGER_P40_OLLAMA_URL\"` (confirmed by grep at `dead-process-check.js:70` and `:87`).\n     - **TokenFold reroute** — `scripts/launch.sh:117` exports `OLLAMA_URL=http://localhost:9339` (per the spec comment in `ollama-health.js`; the file itself is not in the provided content, so trust the spec's citation).\n   - Optionally note the in-file precedent: `localOllamaLockKey()` (visible in the header window) already uses the identical `process.env.OLLAMA_URL || 'http://localhost:11434'` expression.\n\n   Concrete two-line draft (adjust date/author to match the committer's convention):\n   ```js\n   // 2026-09-13, spec: sub-task-2 normative URL spec (src/ollama-health.js) -- URL MUST stay\n   // process.env.OLLAMA_URL || 'http://localhost:11434'; do NOT replace with a bare literal (P40 lane src/dead-process-check.js:87 and TokenFold scripts/launch.sh:117 both set OLLAMA_URL).\n   ```\n   *If the reviewer counts physical lines strictly, this is exactly two `//` lines. If the team prefers a date+author prefix like the surrounding comments, prepend the author name after the date.*\n\n3. **Insert the two comment lines immediately above line N.**\n   - Place them on lines **N-2** and **N-1** (i.e. the two lines directly preceding the `await checkOllamaReachable(...)` call).\n   - Do **not** modify the call expression on line N — it must remain byte-for-byte:\n     ```js\n     await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n     ```\n   - Do not add, remove, reformat, or re-indent any other line in the vicinity.\n   - Ensure the two comment lines use the same indentation as the surrounding code (the call is at the function-body indent level; match it).\n\n4. **Verify the edit.**\n   ```bash\n   # Syntax check\n   node --check src/local-draft.js\n\n   # Confirm the two comment lines are immediately above the call\n   grep -n -B2 'await checkOllamaReachable' src/local-draft.js\n\n   # Confirm the call expression is unchanged\n   grep -nF \"checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434')\" src/local-draft.js\n\n   # Confirm no other call sites were touched\n   grep -n 'checkOllamaReachable' src/local-draft.js\n   # Expect: the import line + the single call line (now with two comment lines above it).\n   ```\n   If the project has a lint step (e.g. `npx eslint src/local-draft.js`), run it to catch line-length or style violations. (No eslint config is visible in the provided content; run only if `package.json` or a `.eslintrc*` exists.)\n\n5. **Confirm the diff is minimal.**\n   ```bash\n   git diff --stat src/local-draft.js\n   # Expect: 1 file changed, 2 insertions(+), 0 deletions(-)\n   git diff src/local-draft.js\n   # Expect: exactly two added `//` lines, zero modified or deleted lines.\n   ```\n\nCRITERIA:\n- `git diff --stat src/local-draft.js` reports **2 insertions, 0 deletions, 0 modifications** — no other line in the file changed.\n- `grep -nF \"await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\" src/local-draft.js` still matches the original call expression unchanged, and `grep -n -B2 'await checkOllamaReachable' src/local-draft.js` shows the two new comment lines on the two lines immediately above it.\n- The two added comment lines together contain all four required references: (a) \"sub-task-2\" and `src/ollama-health.js`, (b) a warning against a bare `'http://localhost:11434'` literal, (c) \"P40\" (or \"P40 lane\") with `dead-process-check.js`, (d) \"TokenFold\" with `launch.sh`.\n- `node --check src/local-draft.js` exits 0.",
+        "attempts": 2,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 11740,
+        "anchorPaths": [
+          "src/local-draft.js",
+          "src/ollama-health.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 4,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T04:55:44.856Z"
+    }
+  ],
+  "draftFailureCount": 2,
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff in src/local-draft.js adds exactly two comment lines (2 insertions, 0 deletions) immediately above the unchanged `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call, and those two lines contain all four required references (sub-task-2 + src/ollama-health.js, the bare-localhost warning, P40 lane + dead-process-check.js, and TokenFold + launch.sh), with `node --check` passing.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff in src/local-draft.js adds exactly two comment lines (2 insertions, 0 deletions) immediately above the unchanged `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call, and those two lines contain all four required references (sub-task-2 + src/ollama-health.js, the bare-localhost warning, P40 lane + dead-process-check.js, and TokenFold + launch.sh), with `node --check` passing."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds exactly two comment lines (2 insertions, 0 deletions) immediately above the unchanged `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call, and those two lines contain all four required references (\"sub-task-2\" + `src/ollama-health.js`, the \"do NOT replace with a bare 'http://localhost:11434' literal\" warning, \"P40 lane src/dead-process-check.js\", and \"TokenFold scripts/launch.sh\"), with `node --check` passing."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`git diff --stat src/local-draft.js` reports **2 insertions, 0 deletions, 0 modifications** — no other line in the file changed.",
+    "`grep -nF \"await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\" src/local-draft.js` still matches the original call expression unchanged, and `grep -n -B2 'await checkOllamaReachable' src/local-draft.js` shows th",
+    "The two added comment lines together contain all four required references: (a) \"sub-task-2\" and `src/ollama-health.js`, (b) a warning against a bare `'http://localhost:11434'` literal, (c) \"P40\" (or \"P40 lane\") with `dead-process-check.js`,",
+    "`node --check src/local-draft.js` exits 0."
+  ],
+  "draftModel": "qwen3.8-p40:27b-q4_K_M",
+  "implementResponse": "All criteria verified:\n\n- `git diff --stat src/local-draft.js` → `1 file changed, 2 insertions(+)` — exactly 2 insertions, 0 deletions.\n- `sed -n '2247,2255p' src/local-draft.js` shows the two new `//` comment lines immediately above the `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` call, and the call expression is byte-for-byte unchanged (also confirmed by the `git diff` hunk showing only `+` lines).\n- All four required references present: \"sub-task-2\", `src/ollama-health.js`, warning against the bare `'http://localhost:11434'` literal, \"P40 lane\" + `src/dead-process-check.js`, \"TokenFold\" + `scripts/launch.sh` (each verified with `grep -nF` → FOUND).\n- `node --check src/local-draft.js` → exit 0 (NODE-OK).\n\nI inserted exactly two `//` comment lines above the call site in `src/local-draft.js` (inside the `if (localCall === null && resolvedCallIsLocal)` block, matching its 6-space indent) referencing the sub-task-2 normative URL spec in `src/ollama-health.js` and warning that the env-var-first `process.env.OLLAMA_URL || 'http://localhost:11434'` expression must not be replaced with a bare localhost literal, citing the P40 lane (`src/dead-process-check.js`) and TokenFold (`scripts/launch.sh`) deployments that set `OLLAMA_URL`. The call expression and every surrounding line are untouched.\n\nAcceptance:\n1. `git diff --stat` reports 2 insertions, 0 deletions -- `git diff --stat src/local-draft.js` -- PASS (`1 file changed, 2 insertions(+)`)\n2. Call expression unchanged and two comment lines immediately above -- `sed -n '2247,2255p' src/local-draft.js` -- PASS (two `//` lines directly above the intact `await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');` line)\n3. All four references present -- `grep -nF` for each phrase -- PASS (sub-task-2, src/ollama-health.js, \"do NOT replace with a bare 'http://localhost:11434'\", \"P40 lane src/dead-process-check.js\", \"TokenFold scripts/launch.sh\" all FOUND)\n4. `node --check src/local-draft.js` exits 0 -- PASS (NODE-OK)\n\nRESOLUTION: implemented\n\n=== DIFF ===\ndiff --git a/src/local-draft.js b/src/local-draft.js\nindex 65fdfad1..5d898059 100644\n--- a/src/local-draft.js\n+++ b/src/local-draft.js\n@@ -2247,6 +2247,8 @@ async function runDraftPasses(task, attempt, {\n     // diagnostic in ~5s instead of stalling on the first generate call's 4-minute\n     // socket timeout with the identical, less actionable symptom.\n     if (localCall === null && resolvedCallIsLocal) {\n+      // sub-task-2 normative URL spec (src/ollama-health.js): URL MUST stay env-var-first process.env.OLLAMA_URL ||\n+      // 'http://localhost:11434' -- do NOT replace with a bare 'http://localhost:11434' literal (P40 lane src/dead-process-check.js and TokenFold scripts/launch.sh both set OLLAMA_URL).\n       await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n     }",
+  "planResponse": "## PLAN\n\n1. **Locate the exact call site in `src/local-draft.js`.**\n   The provided content window covers only the file header (imports through `RETRY_TEMPERATURE`); the target call sits ~155 k chars further in. Run:\n   ```bash\n   grep -n 'await checkOllamaReachable' src/local-draft.js\n   ```\n   Expect exactly one hit (the import line `const { checkOllamaReachable } = require('./ollama-health.js');` is a separate `require`, not an `await` call). Record the line number as **N** (task description says ≈ 2248–2249). Confirm the line reads exactly:\n   ```js\n   await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n   ```\n\n2. **Compose exactly two `//` comment lines matching the file's existing style.**\n   The file's comment convention (visible in the `localOllamaLockKey` and `RETRY_TEMPERATURE` blocks) is:\n   ```\n   // YYYY-MM-DD, <author/context>: <description>\n   // <continuation>\n   ```\n   Draft two lines that satisfy every requirement in the task:\n\n   - Reference the **sub-task-2 normative spec** in `src/ollama-health.js` (the JSDoc block titled \"NORMATIVE URL SPEC (sub-task-2, corrected)\").\n   - State the URL argument **MUST** remain the env-var-first expression `process.env.OLLAMA_URL || 'http://localhost:11434'`.\n   - **Warn against** replacing it with a bare `'http://localhost:11434'` literal.\n   - Name the two deployments that override `OLLAMA_URL`:\n     - **P40 lane** — `src/dead-process-check.js:87` wraps the lane in `env OLLAMA_URL=\"$AGENT_MANAGER_P40_OLLAMA_URL\"` (confirmed by grep at `dead-process-check.js:70` and `:87`).\n     - **TokenFold reroute** — `scripts/launch.sh:117` exports `OLLAMA_URL=http://localhost:9339` (per the spec comment in `ollama-health.js`; the file itself is not in the provided content, so trust the spec's citation).\n   - Optionally note the in-file precedent: `localOllamaLockKey()` (visible in the header window) already uses the identical `process.env.OLLAMA_URL || 'http://localhost:11434'` expression.\n\n   Concrete two-line draft (adjust date/author to match the committer's convention):\n   ```js\n   // 2026-09-13, spec: sub-task-2 normative URL spec (src/ollama-health.js) -- URL MUST stay\n   // process.env.OLLAMA_URL || 'http://localhost:11434'; do NOT replace with a bare literal (P40 lane src/dead-process-check.js:87 and TokenFold scripts/launch.sh:117 both set OLLAMA_URL).\n   ```\n   *If the reviewer counts physical lines strictly, this is exactly two `//` lines. If the team prefers a date+author prefix like the surrounding comments, prepend the author name after the date.*\n\n3. **Insert the two comment lines immediately above line N.**\n   - Place them on lines **N-2** and **N-1** (i.e. the two lines directly preceding the `await checkOllamaReachable(...)` call).\n   - Do **not** modify the call expression on line N — it must remain byte-for-byte:\n     ```js\n     await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\n     ```\n   - Do not add, remove, reformat, or re-indent any other line in the vicinity.\n   - Ensure the two comment lines use the same indentation as the surrounding code (the call is at the function-body indent level; match it).\n\n4. **Verify the edit.**\n   ```bash\n   # Syntax check\n   node --check src/local-draft.js\n\n   # Confirm the two comment lines are immediately above the call\n   grep -n -B2 'await checkOllamaReachable' src/local-draft.js\n\n   # Confirm the call expression is unchanged\n   grep -nF \"checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434')\" src/local-draft.js\n\n   # Confirm no other call sites were touched\n   grep -n 'checkOllamaReachable' src/local-draft.js\n   # Expect: the import line + the single call line (now with two comment lines above it).\n   ```\n   If the project has a lint step (e.g. `npx eslint src/local-draft.js`), run it to catch line-length or style violations. (No eslint config is visible in the provided content; run only if `package.json` or a `.eslintrc*` exists.)\n\n5. **Confirm the diff is minimal.**\n   ```bash\n   git diff --stat src/local-draft.js\n   # Expect: 1 file changed, 2 insertions(+), 0 deletions(-)\n   git diff src/local-draft.js\n   # Expect: exactly two added `//` lines, zero modified or deleted lines.\n   ```\n\nCRITERIA:\n- `git diff --stat src/local-draft.js` reports **2 insertions, 0 deletions, 0 modifications** — no other line in the file changed.\n- `grep -nF \"await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');\" src/local-draft.js` still matches the original call expression unchanged, and `grep -n -B2 'await checkOllamaReachable' src/local-draft.js` shows the two new comment lines on the two lines immediately above it.\n- The two added comment lines together contain all four required references: (a) \"sub-task-2\" and `src/ollama-health.js`, (b) a warning against a bare `'http://localhost:11434'` literal, (c) \"P40\" (or \"P40 lane\") with `dead-process-check.js`, (d) \"TokenFold\" with `launch.sh`.\n- `node --check src/local-draft.js` exits 0.",
+  "reviewedAt": "2026-09-13T04:57:00.253Z",
+  "claimedAt": "2026-09-13T03:15:27.879Z"
+}

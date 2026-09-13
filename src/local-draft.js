@@ -2247,6 +2247,8 @@ async function runDraftPasses(task, attempt, {
     // diagnostic in ~5s instead of stalling on the first generate call's 4-minute
     // socket timeout with the identical, less actionable symptom.
     if (localCall === null && resolvedCallIsLocal) {
+      // sub-task-2 normative URL spec (src/ollama-health.js): URL MUST stay env-var-first process.env.OLLAMA_URL ||
+      // 'http://localhost:11434' -- do NOT replace with a bare 'http://localhost:11434' literal (P40 lane src/dead-process-check.js and TokenFold scripts/launch.sh both set OLLAMA_URL).
       await checkOllamaReachable(process.env.OLLAMA_URL || 'http://localhost:11434');
     }
 
