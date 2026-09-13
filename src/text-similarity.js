@@ -38,6 +38,14 @@ function jaccardSimilarity(a, b) {
 // which specific fix each one suggested) while still reliably sharing a distinctive
 // phrase from their titles. Jaccard alone is a bag-of-words signal that dilutes on any
 // elaboration; a shared multi-word phrase is a much more precise "same topic" signal.
+//
+// FIRST-LINE-ONLY by design: the split('\n')[0] below inspects ONLY the first line of the
+// input. That matches every current caller -- src/side-finding-sweep.js:113 and
+// src/staleness-audit-signals.js:108 each slice to their own first line before delegating,
+// so this is redundant defense-in-depth today. But if a future caller passes a multi-line
+// string (e.g. a multi-line blockedReason from src/agentic-draft-common.js), everything
+// after the first \n is silently ignored by the phrase short-circuit. Revisit (either
+// inspect all lines or drop the split) if multi-line inputs become common. (bd-1788775461913)
 function distinctivePhrases(text) {
   const line = String(text || '').split('\n')[0].toLowerCase();
   const words = line.replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
@@ -52,6 +60,8 @@ function distinctivePhrases(text) {
   return [...phrases].slice(0, 8);
 }
 
+// Inherits distinctivePhrases()'s first-line-only semantics (see its FIRST-LINE-ONLY
+// note above) -- a multi-line argument is truncated to its first line here too.
 function sharesDistinctivePhrase(a, b) {
   const phrasesA = distinctivePhrases(a);
   if (phrasesA.length === 0) return false;
