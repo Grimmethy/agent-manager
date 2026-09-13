@@ -24,14 +24,6 @@ const { computePremiseEvidence } = require('../candidate-premise-check.js');
 const { signatureForClarificationTask } = require('../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../task-history.js');
 
-function readIfExists(filePath) {
-  try {
-    return fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return null;
-  }
-}
-
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
 const MAX_FETCHED_FILE_CHARS = 8000;
@@ -66,10 +58,6 @@ const MIN_ANCHOR_SYMBOL_CHARS = 4;
 // of it.
 const QUOTED_SYMBOL_RE = /`([^`]{3,80})`/g;
 
-function quotedSymbolsFromSection(section) {
-  return [...(section || '').matchAll(QUOTED_SYMBOL_RE)].map((m) => m[1]).filter(Boolean);
-}
-
 // 2026-08-27 (Grimmethy: "we should be looking for code content instead of the line
 // itself"): a `Snippet:` field, when present, is a deterministic pass-through of the
 // REAL code text observability-review.js/performance-review.js/function-length-review.js
@@ -80,28 +68,10 @@ function quotedSymbolsFromSection(section) {
 // between the fence markers.
 const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
 
-function snippetFromSection(section) {
-  const m = (section || '').match(SNIPPET_FIELD_RE);
-  return m ? m[1] : null;
-}
-
-function stripWhitespace(s) {
-  return s.replace(/\s+/g, '');
-}
-
 // Maps an index into stripWhitespace(content) back to the corresponding index in the
 // real content, by walking content and counting non-whitespace chars until reaching
 // targetStrippedCount of them. O(content.length); fine at this pipeline's file sizes
 // (low hundreds of KB at most).
-function realIndexForStrippedIndex(content, targetStrippedCount) {
-  let count = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (count === targetStrippedCount) return i;
-    if (!/\s/.test(content[i])) count++;
-  }
-  return content.length;
-}
-
 // Exact match first (fast path, the common case for a snippet that hasn't been touched
 // since it was captured). Falls back to a whitespace-tolerant match -- real code
 // reformatted by an unrelated change (re-indented, re-wrapped, a stray space added or
