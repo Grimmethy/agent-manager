@@ -17,6 +17,15 @@ function searchPreflight(pipelineDir) {
   const batchCap = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;
   const jsonNames = names.filter((n) => n.endsWith('.json')).slice(0, batchCap);
 
+  // 2026-09-13 regression, caught in review before merge: a genuinely EMPTY inbox (the
+  // normal, common case between sweeps -- nothing new to process, not a backend problem)
+  // fell through to the same 'no-parseable-results' reason as an inbox full of malformed
+  // records, so sweep()'s preflight call reported errors:1 on every routine empty-inbox
+  // tick even though sweep() ITSELF already has a correct, non-error early return for
+  // zero items. Distinguishing "nothing to check yet" from "checked some records, none
+  // usable" restores that distinction instead of collapsing it.
+  if (jsonNames.length === 0) return { ok: true, sample: null };
+
   for (const name of jsonNames) {
     let record;
     try {

@@ -53,3 +53,19 @@ test('ok=false, reason=no-parseable-results when the inbox has only malformed fi
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'no-parseable-results');
 });
+
+// 2026-09-13 regression, caught in review before merge: a genuinely empty inbox (nothing
+// new since the last sweep -- the normal, common case) must NOT be classified the same as
+// an inbox full of malformed records. sweep() has its own correct non-error early return
+// for zero items; collapsing "nothing yet" into 'no-parseable-results' made every routine
+// empty-inbox tick report a false error.
+test('ok=true, sample=null when the inbox is genuinely empty (no .json files at all)', () => {
+  const dir = inboxDir(pipelineDir);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const f of fs.readdirSync(dir)) {
+    fs.unlinkSync(path.join(dir, f));
+  }
+  const result = searchPreflight(pipelineDir);
+  assert.equal(result.ok, true);
+  assert.equal(result.sample, null);
+});

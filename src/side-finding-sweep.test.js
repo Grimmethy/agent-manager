@@ -173,6 +173,21 @@ test('sweep is a cheap no-op when the inbox does not exist at all', async () => 
   assert.equal(s.created, 0);
 });
 
+// 2026-09-13 regression, caught in review before merge: the search-preflight check wired
+// in ahead of the main scan collapsed "inbox dir exists but is genuinely empty" (the
+// normal, common case between sweeps) into the same error path as a malformed/unreachable
+// inbox -- every routine empty-inbox tick reported errors:1 even though nothing was
+// actually wrong. This is distinct from the "does not exist at all" test above (that hits
+// inbox-unreachable, a real error); here the directory exists, just has zero files in it.
+test('sweep reports errors:0 on a genuinely empty (but existing) inbox directory, not a false preflight failure', async () => {
+  const dir = tmpPipeline();
+  fs.mkdirSync(require('./side-finding.js').inboxDir(dir), { recursive: true });
+  const s = await sweep({ pipelineDir: dir });
+  assert.equal(s.errors, 0);
+  assert.equal(s.scanned, 0);
+  assert.equal(s.preflight, undefined, 'no preflight-failure marker on the normal empty case');
+});
+
 test('batch cap: only up to BATCH_CAP items are processed in one tick', async () => {
   const { BATCH_CAP } = require('./side-finding-sweep.js');
   const dir = tmpPipeline();
