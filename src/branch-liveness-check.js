@@ -29,6 +29,26 @@ const { GIT_ENV, GIT_TIMEOUT_MS } = require('./agentic-draft-common');
 /**
  * Default git runner. `repoRoot` is passed per-call so the same default works for
  * any repository. Signature: (repoRoot, args) => stdout string (throws on non-zero exit).
+ *
+ * stdio[2] is explicitly set to 'pipe' (not left to inherit the parent's stderr, and
+ * not 'ignore' either): every call site here is a probe-and-catch -- an expected-to-fail
+ * lookup (no local/origin ref, no `main` branch in a master-only repo, etc.) is normal
+ * control flow, not a real error, and git writes a `fatal: ...` line to stderr on each
+ * one. Left inherited, that line leaked into whatever redirected THIS process's own
+ * stderr -- concretely, a caller capturing combined output via
+ * `$(node branch-liveness-check.js ... 2>&1)` (the exact pattern this guard's own
+ * intended call site uses) got that fatal line PREPENDED to the JSON result, breaking
+ * JSON.parse() on it. Reproduced live: checking a branch that was deleted after being
+ * merged into master (this repo has no `main` ref at all) always hits the
+ * `merge-base --is-ancestor sha main` probe first, which always fails with
+ * `fatal: Not a valid object name main` before falling back to `master` -- i.e. this
+ * fired on every single "already merged" check, not a rare edge case.
+ * 'pipe' (rather than 'ignore') still captures the child's stderr into the thrown
+ * error's own `.message`/`.stderr` -- just privately, without ever touching this
+ * process's own stdio streams. That capture is NOT noise everywhere: the one operational-
+ * error path below (`repo error: ' + err.message`) deliberately surfaces it as the actual
+ * diagnostic reason (e.g. "fatal: not a git repository...") -- 'ignore' would have
+ * silently degraded that to a useless generic "Command failed: git rev-parse --git-dir".
  */
 function defaultGit(repoRoot, args) {
   return execFileSync('git', args, {
@@ -36,6 +56,7 @@ function defaultGit(repoRoot, args) {
     cwd: repoRoot,
     env: GIT_ENV,
     timeout: GIT_TIMEOUT_MS,
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
 
