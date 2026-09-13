@@ -1,0 +1,264 @@
+{
+  "id": "adhoc-add-isresearchdomaintask-guard-research-routing-in-local-draft-js-1789291219763-0",
+  "title": "Add isResearchDomainTask guard + research routing in local-draft.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T09:27:12.959Z",
+  "history": [
+    {
+      "stage": "created",
+      "at": "2026-09-13T09:27:12.959Z",
+      "detail": "manual"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T09:27:15.920Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T09:38:03.685Z",
+      "detail": "7 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T09:39:57.178Z",
+      "detail": "2 attempt(s), 4949 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T09:40:15.322Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T09:43:23.878Z",
+      "detail": "agentic, 5714 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T09:43:23.878Z",
+      "detail": "resolution=implemented, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T09:43:23.879Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T09:43:23.879Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T09:43:40.472Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T09:47:22.283Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/local-draft.js, add `function isResearchDomainTask(task)` returning true iff `(task && task.title || '').trim()` matches `/^Research:/i` (same pre-model-call string-gate style as detectExternalDependency in src/local-agentic-write-draft.js). In draftTask's dispatch fork (search for the existing draftResearchBranch call site near line 2377 / the draftTask options around line 2233), short-circuit before ANY adhoc plan-stage code: if isResearchDomainTask(task), route through draftResearchBranch (which calls draftResearchImplement) so a Research:-titled task never reaches the adhoc tier ladder or a plan-stage model call. draftResearchImplement is already exported from src/research-agentic-draft.js — do not change that file or src/local-agentic-write-draft.js. Then run `node --test src/local-draft.test.js` and confirm existing tests still pass.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788928197728-research-domain-task-routed-into-adhoc-p-1788929623151"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T09:27:15.917Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 2470,
+          "response": "All checks pass. Summary of the change:\n\n1. **Added `isResearchDomainTask(task)`** (line 153 of `src/local-draft.js`): returns `/^Research:/i.test((task && task.title || '').trim())`, matching the pre-model-call string-gate style of `detectExternalDependency`.\n2. **Pre-check extended** (the `researchClaudeStatus` guard before `runPlanPass`): now `task.domain === 'research' || isResearchDomainTask(task)`, so an unopted/paused Claude still blocks cleanly for Research:-titled tasks.\n3. **Early short-circuit added** right after that pre-check: `if (isResearchDomainTask(task)) return await draftResearchBranch(...)` — this fires **before** `runPlanPass` (plan-stage model call) and **before** the `resolveSourceName(task) === 'adhoc'` branch whose tier ladder would otherwise swallow a Research:-titled adhoc task. (The real code had the adhoc dispatch *before* the research dispatch, which the plan's assumption didn't account for — the actual structure won, hence the explicit early return.)\n4. **Defence-in-depth OR** also added to the later `draftResearchBranch` dispatch condition (~line 2395).\n5. `src/research-agentic-draft.js` and `src/local-agentic-write-draft.js` untouched; no test file changes.\n\nRESOLUTION: implemented\nAdded `isResearchDomainTask` guard in src/local-draft.js and routed Research:-titled tasks through `draftResearchBranch` via an early short-circuit placed before the plan-stage model call and the adhoc tier-ladder dispatch, plus OR-branches at both existing research dispatch points. All 118 existing tests in src/local-draft.test.js pass.\n\nAcceptance:\n- `grep -n 'isResearchDomainTask' src/local-draft.js` ≥ 2 lines with `/^Research:/i` and `(task && task.title || '').trim()` -- `grep -cn` -- PASS (4 hits: definition at line 153 with both required fragments, 3 call sites at ~2326/~2340/~2395, verified in `git diff`)\n- Dispatch condition includes `isResearchDomainTask(task)` as OR-branch and `draftResearchBranch` reachable for \"Research: ...\" title regardless of domain -- `git diff src/local-draft.js` inspection -- PASS (early `if (isResearchDomainTask(task)) { return await draftResearchBranch(...) }` fires before `runPlanPass` and before the adhoc branch; both domain checks extended with the OR)\n- `node --test src/local-draft.test.js` exits 0 -- ran it -- PASS (`# tests 118`, `# pass 118`, `# fail 0`, exitCode 0)\n- `git diff --name-only` lists only src/local-draft.js -- ran it -- PASS (single line: `src/local-draft.js`)",
+          "rawDiffChars": 3229,
+          "rawDiff": "diff --git a/src/local-draft.js b/src/local-draft.js\nindex 5d898059..c8cd43f7 100644\n--- a/src/local-draft.js\n+++ b/src/local-draft.js\n@@ -145,6 +145,15 @@ function researchClaudeStatus(task, isClaudePausedFn) {\n   return { ok: true };\n }\n \n+// 2026-09: routing into the research branch was keyed only on task.domain === 'research',\n+// so a task titled \"Research: ...\" that arrived through a different domain (e.g. an\n+// adhoc-sourced brain-dump spawn) fell straight into the adhoc tier ladder / plan-stage\n+// model call instead of draftResearchBranch. Same pre-model-call string-gate style as\n+// detectExternalDependency in local-agentic-write-draft.js: cheap, O(title), deterministic.\n+function isResearchDomainTask(task) {\n+  return /^Research:/i.test((task && task.title || '').trim());\n+}\n+\n // A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft\n // branch already stamped on the task (adhoc resolution, retry count, model). Returns\n // undefined when there's nothing worth showing -- appendHistoryEvent then omits `detail`.\n@@ -2314,7 +2323,7 @@ async function runDraftPasses(task, attempt, {\n       // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research\n       // can't run on Claude (not opted in / no token / paused) block BEFORE the plan\n       // pass rather than run a webless plan that produces nothing usable.\n-      if (task.domain === 'research') {\n+      if (task.domain === 'research' || isResearchDomainTask(task)) {\n         const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);\n         if (!claudeStatus.ok) {\n           appendHistoryEvent(task, 'blocked', claudeStatus.reason);\n@@ -2322,6 +2331,16 @@ async function runDraftPasses(task, attempt, {\n         }\n       }\n \n+      // 2026-09: a Research:-titled task is a research task no matter what domain/source\n+      // it arrived with. Short-circuit HERE -- before runPlanPass (a plan-stage model\n+      // call) and before the adhoc branch below whose tier ladder would otherwise swallow\n+      // it -- so it always routes through draftResearchBranch (which internally re-checks\n+      // the same researchClaudeStatus gate, so an unopted/paused Claude still blocks\n+      // cleanly instead of wedging).\n+      if (isResearchDomainTask(task)) {\n+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });\n+      }\n+\n       const planOutcome = await runPlanPass(task, {\n         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn, recordModelCall,\n       });\n@@ -2373,7 +2392,7 @@ async function runDraftPasses(task, attempt, {\n       // research_task implements via a real agentic Claude (WebSearch/WebFetch) call -- see\n       // draftResearchBranch(). Same \"the agentic pass already produced the final artifact,\n       // skip the local plan/critique/revision loop\" reasoning as the adhoc branch.\n-      if (task.domain === 'research') {\n+      if (task.domain === 'research' || isResearchDomainTask(task)) {\n         return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });\n       }",
+          "turnsUsed": 10,
+          "toolCalls": {
+            "total": 13,
+            "byTool": {
+              "read_file": 3,
+              "grep_codebase": 2,
+              "edit_file": 4,
+              "run_bash": 4
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 6691
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 502
+              },
+              {
+                "n": 3,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 107
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1731
+              },
+              {
+                "n": 5,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 2355
+              },
+              {
+                "n": 6,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 7,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 8,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 9,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 43
+              },
+              {
+                "n": 10,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 228
+              },
+              {
+                "n": 11,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 282
+              },
+              {
+                "n": 12,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 3386
+              },
+              {
+                "n": 13,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 826
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 7
+      },
+      "plan": {
+        "chars": 4949,
+        "text": "# PLAN: Add `isResearchDomainTask` guard + research routing in `src/local-draft.js`\n\n## Context (from orientation report)\n\n- `src/local-draft.js` already imports `draftResearchImplement` (line 64) and defines `draftResearchBranch` (line 887).\n- Current research routing is keyed **only** on `task.domain === 'research'`: a pre-check at **line 2317** and the dispatch call at **lines 2376–2377**.\n- A `Research:`-titled task whose `domain` is *not* `'research'` (e.g. adhoc-sourced) currently falls through to the adhoc tier ladder / `runPlan` model call.\n- `isResearchDomainTask` does **not** exist anywhere in the repo (grep confirmed empty).\n- Style reference: `detectExternalDependency` in `src/local-agentic-write-draft.js` (4 hits) — a simple pre-model-call string-gate function.\n- `src/local-draft.test.js` already contains 3 hits for `title: 'Research` and 6 hits for \"Research\", so existing tests exercise research-titled tasks.\n\n---\n\n## Steps\n\n1. **Add the `isResearchDomainTask` function to `src/local-draft.js`.**\n   - Insert a module-level function (before `draftTask`, e.g. near the other utility/guard functions or just above `draftResearchBranch` at line 887 — exact placement is a style choice; the key constraint is that it is defined before `draftTask` references it).\n   - Implementation (matching the `detectExternalDependency` string-gate style):\n     ```js\n     function isResearchDomainTask(task) {\n       return /^Research:/i.test((task && task.title || '').trim());\n     }\n     ```\n   - Do **not** export it (it is internal to this module, same as `detectExternalDependency` is internal to its own file).\n   - Verify: `grep -n 'isResearchDomainTask' src/local-draft.js` returns at least 2 hits (definition + call site).\n\n2. **Modify the dispatch condition in `draftTask` to include the title-based gate.**\n   - Locate the pre-check at **line 2317** (currently something like `if (task.domain === 'research')` or an equivalent guard that sets a routing flag).\n   - Extend the condition to also fire when the title matches:\n     ```js\n     if (task.domain === 'research' || isResearchDomainTask(task)) {\n     ```\n   - Confirm the dispatch call at **lines 2376–2377** (the `draftResearchBranch(...)` invocation) is inside this branch and is reached for *both* the domain-based and title-based cases.\n   - Ensure this check executes **before** any adhoc plan-stage code (the tier-ladder / `runPlan` path). If the existing structure has the domain check as a pre-check that short-circuits the adhoc path, the title check must be in the same short-circuit position — not after the adhoc code has already started.\n   - Do **not** modify `src/research-agentic-draft.js` or `src/local-agentic-write-draft.js`.\n\n3. **Sanity-check the call-site wiring.**\n   - Confirm `draftResearchBranch` (line 887) internally calls `draftResearchImplement` (imported at line 64) — this is already the case per the orientation report; just verify the call chain is intact after the edit.\n   - Confirm no other code path in `draftTask` can intercept a `Research:`-titled task before the new guard fires (e.g., no earlier `if (task.domain === 'adhoc')` that would swallow it first). If such an earlier branch exists, the new guard must be positioned before it. *Assuming the current structure has the domain check at line 2317 as the first routing fork — verify by reading lines 2300–2380.*\n\n4. **Run the existing test suite.**\n   - Execute: `node --test src/local-draft.test.js`\n   - All existing tests must pass (the 3 `title: 'Research` cases and 6 \"Research\" references in the test file should still be green).\n   - If any test was asserting that a `Research:`-titled task with a non-research domain falls to the adhoc path, that test's expectation is now intentionally changed by this task — flag it but do not modify the test file (that is the sibling task \"Add routing regression tests to local-draft.test.js\").\n\n5. **Final grep / diff review.**\n   - `git diff src/local-draft.js` should show: (a) the new function definition, (b) the modified condition at ~line 2317. Nothing else.\n   - `git diff src/research-agentic-draft.js` and `git diff src/local-agentic-write-draft.js` should be empty.\n\n---\n\nCRITERIA:\n- `grep -n 'isResearchDomainTask' src/local-draft.js` returns ≥ 2 lines (one definition, one call-site), and the function body contains `/^Research:/i` and `(task && task.title || '').trim()`.\n- The dispatch condition in `draftTask` (around line 2317) now includes `isResearchDomainTask(task)` as an OR-branch alongside `task.domain === 'research'`, and the `draftResearchBranch` call (lines 2376–2377) is reachable for a task whose title is `\"Research: something\"` regardless of its `domain` value.\n- `node --test src/local-draft.test.js` exits 0 with no failing test cases.\n- `git diff --name-only` for this change lists only `src/local-draft.js` (no changes to `src/research-agentic-draft.js` or `src/local-agentic-write-draft.js`).",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 9931,
+        "anchorPaths": [
+          "src/local-draft.js",
+          "src/local-draft.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 3,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T09:43:23.879Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds `isResearchDomainTask` with the required `/^Research:/i` and `(task && task.title || '').trim()` body, extends both research dispatch conditions with the OR-branch, and the live grounding confirms `node --test` passes 118/118 with `git diff --name-only` listing only `src/local-draft.js`, satisfying all four acceptance criteria.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds `isResearchDomainTask` with the required `/^Research:/i` and `(task && task.title || '').trim()` body, extends both research dispatch conditions with the OR-branch, and the live grounding confirms `node --test` passes 118/118 with `git diff --name-only` listing only `src/local-draft.js`, satisfying all four acceptance criteria."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds `isResearchDomainTask` with the exact required regex `/^Research:/i` and `(task && task.title || '').trim()` at line 153, extends both research dispatch conditions with the OR-branch, and the live grounding confirms `git diff --name-only` lists only `src/local-draft.js` while `node --test` reports 118 pass / 0 fail."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`grep -n 'isResearchDomainTask' src/local-draft.js` returns ≥ 2 lines (one definition, one call-site), and the function body contains `/^Research:/i` and `(task && task.title || '').trim()`.",
+    "The dispatch condition in `draftTask` (around line 2317) now includes `isResearchDomainTask(task)` as an OR-branch alongside `task.domain === 'research'`, and the `draftResearchBranch` call (lines 2376–2377) is reachable for a task whose ti",
+    "`node --test src/local-draft.test.js` exits 0 with no failing test cases.",
+    "`git diff --name-only` for this change lists only `src/local-draft.js` (no changes to `src/research-agentic-draft.js` or `src/local-agentic-write-draft.js`)."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "All checks pass. Summary of the change:\n\n1. **Added `isResearchDomainTask(task)`** (line 153 of `src/local-draft.js`): returns `/^Research:/i.test((task && task.title || '').trim())`, matching the pre-model-call string-gate style of `detectExternalDependency`.\n2. **Pre-check extended** (the `researchClaudeStatus` guard before `runPlanPass`): now `task.domain === 'research' || isResearchDomainTask(task)`, so an unopted/paused Claude still blocks cleanly for Research:-titled tasks.\n3. **Early short-circuit added** right after that pre-check: `if (isResearchDomainTask(task)) return await draftResearchBranch(...)` — this fires **before** `runPlanPass` (plan-stage model call) and **before** the `resolveSourceName(task) === 'adhoc'` branch whose tier ladder would otherwise swallow a Research:-titled adhoc task. (The real code had the adhoc dispatch *before* the research dispatch, which the plan's assumption didn't account for — the actual structure won, hence the explicit early return.)\n4. **Defence-in-depth OR** also added to the later `draftResearchBranch` dispatch condition (~line 2395).\n5. `src/research-agentic-draft.js` and `src/local-agentic-write-draft.js` untouched; no test file changes.\n\nRESOLUTION: implemented\nAdded `isResearchDomainTask` guard in src/local-draft.js and routed Research:-titled tasks through `draftResearchBranch` via an early short-circuit placed before the plan-stage model call and the adhoc tier-ladder dispatch, plus OR-branches at both existing research dispatch points. All 118 existing tests in src/local-draft.test.js pass.\n\nAcceptance:\n- `grep -n 'isResearchDomainTask' src/local-draft.js` ≥ 2 lines with `/^Research:/i` and `(task && task.title || '').trim()` -- `grep -cn` -- PASS (4 hits: definition at line 153 with both required fragments, 3 call sites at ~2326/~2340/~2395, verified in `git diff`)\n- Dispatch condition includes `isResearchDomainTask(task)` as OR-branch and `draftResearchBranch` reachable for \"Research: ...\" title regardless of domain -- `git diff src/local-draft.js` inspection -- PASS (early `if (isResearchDomainTask(task)) { return await draftResearchBranch(...) }` fires before `runPlanPass` and before the adhoc branch; both domain checks extended with the OR)\n- `node --test src/local-draft.test.js` exits 0 -- ran it -- PASS (`# tests 118`, `# pass 118`, `# fail 0`, exitCode 0)\n- `git diff --name-only` lists only src/local-draft.js -- ran it -- PASS (single line: `src/local-draft.js`)\n\n=== DIFF ===\ndiff --git a/src/local-draft.js b/src/local-draft.js\nindex 5d898059..c8cd43f7 100644\n--- a/src/local-draft.js\n+++ b/src/local-draft.js\n@@ -145,6 +145,15 @@ function researchClaudeStatus(task, isClaudePausedFn) {\n   return { ok: true };\n }\n \n+// 2026-09: routing into the research branch was keyed only on task.domain === 'research',\n+// so a task titled \"Research: ...\" that arrived through a different domain (e.g. an\n+// adhoc-sourced brain-dump spawn) fell straight into the adhoc tier ladder / plan-stage\n+// model call instead of draftResearchBranch. Same pre-model-call string-gate style as\n+// detectExternalDependency in local-agentic-write-draft.js: cheap, O(title), deterministic.\n+function isResearchDomainTask(task) {\n+  return /^Research:/i.test((task && task.title || '').trim());\n+}\n+\n // A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft\n // branch already stamped on the task (adhoc resolution, retry count, model). Returns\n // undefined when there's nothing worth showing -- appendHistoryEvent then omits `detail`.\n@@ -2314,7 +2323,7 @@ async function runDraftPasses(task, attempt, {\n       // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research\n       // can't run on Claude (not opted in / no token / paused) block BEFORE the plan\n       // pass rather than run a webless plan that produces nothing usable.\n-      if (task.domain === 'research') {\n+      if (task.domain === 'research' || isResearchDomainTask(task)) {\n         const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);\n         if (!claudeStatus.ok) {\n           appendHistoryEvent(task, 'blocked', claudeStatus.reason);\n@@ -2322,6 +2331,16 @@ async function runDraftPasses(task, attempt, {\n         }\n       }\n \n+      // 2026-09: a Research:-titled task is a research task no matter what domain/source\n+      // it arrived with. Short-circuit HERE -- before runPlanPass (a plan-stage model\n+      // call) and before the adhoc branch below whose tier ladder would otherwise swallow\n+      // it -- so it always routes through draftResearchBranch (which internally re-checks\n+      // the same researchClaudeStatus gate, so an unopted/paused Claude still blocks\n+      // cleanly instead of wedging).\n+      if (isResearchDomainTask(task)) {\n+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });\n+      }\n+\n       const planOutcome = await runPlanPass(task, {\n         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn, recordModelCall,\n       });\n@@ -2373,7 +2392,7 @@ async function runDraftPasses(task, attempt, {\n       // research_task implements via a real agentic Claude (WebSearch/WebFetch) call -- see\n       // draftResearchBranch(). Same \"the agentic pass already produced the final artifact,\n       // skip the local plan/critique/revision loop\" reasoning as the adhoc branch.\n-      if (task.domain === 'research') {\n+      if (task.domain === 'research' || isResearchDomainTask(task)) {\n         return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });\n       }",
+  "planResponse": "# PLAN: Add `isResearchDomainTask` guard + research routing in `src/local-draft.js`\n\n## Context (from orientation report)\n\n- `src/local-draft.js` already imports `draftResearchImplement` (line 64) and defines `draftResearchBranch` (line 887).\n- Current research routing is keyed **only** on `task.domain === 'research'`: a pre-check at **line 2317** and the dispatch call at **lines 2376–2377**.\n- A `Research:`-titled task whose `domain` is *not* `'research'` (e.g. adhoc-sourced) currently falls through to the adhoc tier ladder / `runPlan` model call.\n- `isResearchDomainTask` does **not** exist anywhere in the repo (grep confirmed empty).\n- Style reference: `detectExternalDependency` in `src/local-agentic-write-draft.js` (4 hits) — a simple pre-model-call string-gate function.\n- `src/local-draft.test.js` already contains 3 hits for `title: 'Research` and 6 hits for \"Research\", so existing tests exercise research-titled tasks.\n\n---\n\n## Steps\n\n1. **Add the `isResearchDomainTask` function to `src/local-draft.js`.**\n   - Insert a module-level function (before `draftTask`, e.g. near the other utility/guard functions or just above `draftResearchBranch` at line 887 — exact placement is a style choice; the key constraint is that it is defined before `draftTask` references it).\n   - Implementation (matching the `detectExternalDependency` string-gate style):\n     ```js\n     function isResearchDomainTask(task) {\n       return /^Research:/i.test((task && task.title || '').trim());\n     }\n     ```\n   - Do **not** export it (it is internal to this module, same as `detectExternalDependency` is internal to its own file).\n   - Verify: `grep -n 'isResearchDomainTask' src/local-draft.js` returns at least 2 hits (definition + call site).\n\n2. **Modify the dispatch condition in `draftTask` to include the title-based gate.**\n   - Locate the pre-check at **line 2317** (currently something like `if (task.domain === 'research')` or an equivalent guard that sets a routing flag).\n   - Extend the condition to also fire when the title matches:\n     ```js\n     if (task.domain === 'research' || isResearchDomainTask(task)) {\n     ```\n   - Confirm the dispatch call at **lines 2376–2377** (the `draftResearchBranch(...)` invocation) is inside this branch and is reached for *both* the domain-based and title-based cases.\n   - Ensure this check executes **before** any adhoc plan-stage code (the tier-ladder / `runPlan` path). If the existing structure has the domain check as a pre-check that short-circuits the adhoc path, the title check must be in the same short-circuit position — not after the adhoc code has already started.\n   - Do **not** modify `src/research-agentic-draft.js` or `src/local-agentic-write-draft.js`.\n\n3. **Sanity-check the call-site wiring.**\n   - Confirm `draftResearchBranch` (line 887) internally calls `draftResearchImplement` (imported at line 64) — this is already the case per the orientation report; just verify the call chain is intact after the edit.\n   - Confirm no other code path in `draftTask` can intercept a `Research:`-titled task before the new guard fires (e.g., no earlier `if (task.domain === 'adhoc')` that would swallow it first). If such an earlier branch exists, the new guard must be positioned before it. *Assuming the current structure has the domain check at line 2317 as the first routing fork — verify by reading lines 2300–2380.*\n\n4. **Run the existing test suite.**\n   - Execute: `node --test src/local-draft.test.js`\n   - All existing tests must pass (the 3 `title: 'Research` cases and 6 \"Research\" references in the test file should still be green).\n   - If any test was asserting that a `Research:`-titled task with a non-research domain falls to the adhoc path, that test's expectation is now intentionally changed by this task — flag it but do not modify the test file (that is the sibling task \"Add routing regression tests to local-draft.test.js\").\n\n5. **Final grep / diff review.**\n   - `git diff src/local-draft.js` should show: (a) the new function definition, (b) the modified condition at ~line 2317. Nothing else.\n   - `git diff src/research-agentic-draft.js` and `git diff src/local-agentic-write-draft.js` should be empty.\n\n---\n\nCRITERIA:\n- `grep -n 'isResearchDomainTask' src/local-draft.js` returns ≥ 2 lines (one definition, one call-site), and the function body contains `/^Research:/i` and `(task && task.title || '').trim()`.\n- The dispatch condition in `draftTask` (around line 2317) now includes `isResearchDomainTask(task)` as an OR-branch alongside `task.domain === 'research'`, and the `draftResearchBranch` call (lines 2376–2377) is reachable for a task whose title is `\"Research: something\"` regardless of its `domain` value.\n- `node --test src/local-draft.test.js` exits 0 with no failing test cases.\n- `git diff --name-only` for this change lists only `src/local-draft.js` (no changes to `src/research-agentic-draft.js` or `src/local-agentic-write-draft.js`).",
+  "reviewedAt": "2026-09-13T09:47:22.283Z",
+  "claimedAt": "2026-09-13T09:27:14.953Z"
+}
