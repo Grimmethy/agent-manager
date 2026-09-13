@@ -153,3 +153,36 @@ test('reclaims multiple orphaned tasks in one pass', () => {
   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));
   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));
 });
+
+test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {
+  const dir = tempPipelineDir();
+  writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });
+
+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
+
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));
+  assert.equal(result.reclaimed, 1);
+  assert.deepEqual(result.ids, ['task-a']);
+
+  const logPath = path.join(dir, 'reclaim-log.jsonl');
+  assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');
+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1, 'exactly one JSON line');
+  const entry = JSON.parse(lines[0]);
+  assert.equal(entry.count, 1);
+  assert.deepEqual(entry.ids, ['task-a']);
+  assert.equal(entry.instanceId, 'worker-1');
+  assert.ok(entry.ts, 'ts must be set');
+  assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');
+});
+
+test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {
+  const dir = tempPipelineDir();
+
+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
+
+  assert.equal(result.reclaimed, 0);
+  assert.deepEqual(result.ids, []);
+  assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),
+    'reclaim-log.jsonl must NOT exist when nothing was reclaimed');
+});

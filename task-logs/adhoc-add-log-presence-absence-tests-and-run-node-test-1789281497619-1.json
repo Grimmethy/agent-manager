@@ -1,0 +1,475 @@
+{
+  "id": "adhoc-add-log-presence-absence-tests-and-run-node-test-1789281497619-1",
+  "title": "Add log presence/absence tests and run node --test",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T21:56:02.820Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T21:40:00.000Z",
+      "detail": "retrofitted stacked={branch:agent/adhoc-add-reclaim-log-jsonl-append-to-reclaimorphaneddrafts-1789281497619-0,seq:2,total:2} onto dependsOn:[adhoc-add-reclaim-log-jsonl-append-to-reclaimorphaneddrafts-1789281497619-0] -- adhoc-add-reclaim-log-jsonl-append-to-reclaimorphaneddrafts-1789281497619-0 was done-but-unmerged and never would have cleared without a human merging it (see [[hub-task-integration]]); this makes isDependencySatisfied treat its queue/done/ arrival as satisfied, same as any newly-filed decompose chain now gets automatically (PR #204). Operator retrofit, one-time, not a live worker action."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T21:56:03.376Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T21:56:07.657Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:00:02.333Z",
+      "detail": "3 attempt(s), 6442 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:00:23.240Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T22:02:27.814Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:02:27.814Z",
+      "detail": "attempt 1: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T22:02:44.626Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:09:28.897Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:09:32.058Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:14:06.178Z",
+      "detail": "3 attempt(s), 6686 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:14:06.179Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T22:16:21.468Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:16:21.468Z",
+      "detail": "attempt 2: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T22:17:15.535Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:28:20.882Z",
+      "detail": "retry 2"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:28:23.453Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:32:16.923Z",
+      "detail": "3 attempt(s), 7653 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:32:16.926Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T22:34:11.520Z",
+      "detail": "agentic, 4050 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T22:34:11.523Z",
+      "detail": "resolution=implemented, retry 2, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T22:34:11.523Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:34:11.524Z",
+      "detail": "attempt 3: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T22:34:41.678Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T22:35:06.544Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/reclaim-orphaned-drafts.test.js add two tests (skip if equivalent ones already exist): (1) temp pipelineDir with queue/drafting/worker-1/task-a.json ({id:'task-a',domain:'adhoc',title:'t',history:[]}), call reclaimOrphanedDrafts({pipelineDir,instanceId:'worker-1'}), assert queue/pending/task-a.json exists, result is {reclaimed:1,ids:['task-a']}, and reclaim-log.jsonl has exactly one JSON line with count===1, ids ['task-a'], instanceId 'worker-1', ts set; (2) fresh empty temp pipelineDir, call the function, assert result {reclaimed:0,ids:[]} and reclaim-log.jsonl does NOT exist. Verify appendHistoryEvent in src/task-history.js doesn't require external state, then run `node --test src/reclaim-orphaned-drafts.test.js` and confirm exit 0 with all tests passing.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788766978102-orphaned-claim-requeue-cost-1788861952966"
+  },
+  "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)",
+  "priorRejectionFeedback": [
+    "Your summary claims 12 tests, but the diff you produced only adds 2 test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff.",
+    "Your summary claims 12 tests, but the diff you produced only adds 2 test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff."
+  ],
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T21:56:03.375Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": true,
+          "reason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)",
+          "responseChars": 1854,
+          "response": "All 12 tests pass, exit code 0. Verification summary:\n\n1. **Implementation check**: `src/reclaim-orphaned-drafts.js` already appends `reclaim-log.jsonl` (the sibling \"Add reclaim-log.jsonl append\" work genuinely landed — the earlier plan's grep miss was spurious). It writes `{ts, instanceId, count, ids}` via `fs.appendFileSync` at `<pipelineDir>/reclaim-log.jsonl`, only when `ids.length > 0` — matching both new assertions exactly.\n2. **No equivalent tests existed** — the test file had 10 tests, none referencing the log file. Added two:\n   - *\"a reclaim appends exactly one reclaim-log.jsonl line with the right fields\"* — temp pipelineDir with `queue/drafting/worker-1/task-a.json` ({id:'task-a',domain:'adhoc',title:'t',history:[]}), asserts `queue/pending/task-a.json` exists, result `{reclaimed:1,ids:['task-a']}`, and the log file has exactly one JSON line with `count===1`, `ids ['task-a']`, `instanceId 'worker-1'`, and a parseable `ts`.\n   - *\"a no-op reclaim (nothing to reclaim) does NOT create reclaim-log.jsonl\"* — fresh empty pipelineDir, asserts `{reclaimed:0,ids:[]}` and the log file does not exist.\n3. **appendHistoryEvent check**: `src/task-history.js`'s function only takes `(task, stage, detail)`, mutates `task.history` in memory, and its `persistHook` is a module-level optional hook defaulting to `null` wrapped in try/catch — no external state, I/O, or network required. Safe in tests.\n4. **Ran** `node --test src/reclaim-orphaned-drafts.test.js`: 12 pass, 0 fail, exit 0.\n\nRESOLUTION: implemented\nAdded the two requested log presence/absence tests to src/reclaim-orphaned-drafts.test.js (they did not already exist), verified the sibling's reclaim-log.jsonl write and appendHistoryEvent's statelessness against the real code, and confirmed `node --test src/reclaim-orphaned-drafts.test.js` exits 0 with all 12 tests passing.",
+          "rawDiffChars": 1934,
+          "rawDiff": "diff --git a/src/reclaim-orphaned-drafts.test.js b/src/reclaim-orphaned-drafts.test.js\nindex 7ad41cf6..b20e812c 100644\n--- a/src/reclaim-orphaned-drafts.test.js\n+++ b/src/reclaim-orphaned-drafts.test.js\n@@ -153,3 +153,35 @@ test('reclaims multiple orphaned tasks in one pass', () => {\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));\n });\n+\n+test('a reclaim appends exactly one reclaim-log.jsonl line with the right fields', () => {\n+  const dir = tempPipelineDir();\n+  writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n+  assert.equal(result.reclaimed, 1);\n+  assert.deepEqual(result.ids, ['task-a']);\n+\n+  const logPath = path.join(dir, 'reclaim-log.jsonl');\n+  assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n+  assert.equal(lines.length, 1, 'exactly one JSON line');\n+  const entry = JSON.parse(lines[0]);\n+  assert.equal(entry.count, 1);\n+  assert.deepEqual(entry.ids, ['task-a']);\n+  assert.equal(entry.instanceId, 'worker-1');\n+  assert.ok(entry.ts, 'ts must be set');\n+  assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable as a date');\n+});\n+\n+test('a no-op reclaim (nothing to reclaim) does NOT create reclaim-log.jsonl', () => {\n+  const dir = tempPipelineDir(); // fresh, empty pipelineDir\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.equal(result.reclaimed, 0);\n+  assert.deepEqual(result.ids, []);\n+  assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')), 'no log file when nothing was reclaimed');\n+});",
+          "turnsUsed": 5,
+          "toolCalls": {
+            "total": 6,
+            "byTool": {
+              "read_file": 2,
+              "grep_codebase": 2,
+              "edit_file": 1,
+              "run_bash": 1
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 5055
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 3,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset"
+                ],
+                "bytes": 2102
+              },
+              {
+                "n": 5,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 60
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 3252
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 6442,
+        "text": "# PLAN: Add log presence/absence tests and run `node --test`\n\n## Context from the repo\n\n- `src/reclaim-orphaned-drafts.test.js` already contains 4+ tests covering `destinationDirFor` routing and basic reclaim (file moved to `pending/`, result shape). **None of them assert on `reclaim-log.jsonl`.**\n- `src/reclaim-orphaned-drafts.js` is 92 lines; grep shows `reclaimOrphanedDrafts` at line 42, `module.exports` at line 92. **No grep hit for `reclaim-log.jsonl` appears in that file**, despite the hub marking the sibling task \"Add reclaim-log.jsonl append to reclaimOrphanedDrafts\" as *done*.\n- `src/task-history.js` exports `appendHistoryEvent(task, stage, detail)` (line visible in the window). It mutates `task.history` in place and optionally calls a module-level `persistHook` (defaults to `null`). No I/O, no external service, no required global state.\n\n---\n\n## Steps\n\n1. **Verify the sibling's log-writing code actually landed.**\n   Open `src/reclaim-orphaned-drafts.js` in full (all 92 lines). Search for the string `reclaim-log.jsonl` (or `reclaim-log` or `JSONL`). The grep provided to me does **not** show a hit, which contradicts the hub's \"done\" status.\n   - *If the log-append code is present*: confirm the exact shape it writes (field names: `count`, `ids`, `instanceId`, `ts`) so the test assertions match.\n   - *If it is absent*: the two new tests will fail by design. Flag this to the orchestrator and **stop**—do not write tests that assert behavior the implementation doesn't have. (Alternatively, if the task explicitly authorises adding the implementation, add a minimal `fs.appendFileSync` / `fs.writeFileSync` of a single JSON line to `<pipelineDir>/reclaim-log.jsonl` inside `reclaimOrphanedDrafts` before returning, then proceed.)\n\n2. **Confirm no equivalent tests already exist.**\n   Re-read the full test file (the head was truncated at ~8 228 chars). Grep for `reclaim-log` inside `src/reclaim-orphaned-drafts.test.js`. The visible portion has zero references to that filename, so the two new tests are genuinely additive. (If the truncated tail already contains them, skip to step 5.)\n\n3. **Add Test 1 – \"reclaim writes exactly one reclaim-log.jsonl line\".**\n   Append to `src/reclaim-orphaned-drafts.test.js` (after the last existing `test(...)` block, before any trailing comments):\n\n   ```js\n   test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n     const dir = tempPipelineDir();\n     writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     // File moved to pending/\n     assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n     // Result shape\n     assert.equal(result.reclaimed, 1);\n     assert.deepEqual(result.ids, ['task-a']);\n     // reclaim-log.jsonl: exactly one line\n     const logPath = path.join(dir, 'reclaim-log.jsonl');\n     assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n     const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n     assert.equal(lines.length, 1, 'exactly one JSON line');\n     const entry = JSON.parse(lines[0]);\n     assert.equal(entry.count, 1);\n     assert.deepEqual(entry.ids, ['task-a']);\n     assert.equal(entry.instanceId, 'worker-1');\n     assert.ok(entry.ts, 'ts must be set');\n     assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable as a date');\n   });\n   ```\n\n   > **Assuming** the log file lives at `<pipelineDir>/reclaim-log.jsonl` (not a sub-directory). Verify against the implementation in step 1. If the path differs, adjust `logPath`.\n\n4. **Add Test 2 – \"no-op: empty pipelineDir produces no log file\".**\n   Append immediately after Test 1:\n\n   ```js\n   test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n     const dir = tempPipelineDir(); // fresh, empty temp dir\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.equal(result.reclaimed, 0);\n     assert.deepEqual(result.ids, []);\n     assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n       'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n   });\n   ```\n\n5. **Verify `appendHistoryEvent` requires no external state.**\n   Read `src/task-history.js` (the window provided shows the full function body). Confirm:\n   - Signature: `appendHistoryEvent(task, stage, detail)` — all three are parameters; no closure over a DB handle, socket, or global config.\n   - `persistHook` is a module-level `let` defaulting to `null`; the call is wrapped in `try/catch` and is **optional** (only fires if a caller registered one via `setHistoryPersistHook`).\n   - No `require` of network, filesystem, or process-specific singletons inside the function body.\n   - Conclusion: it is a pure in-memory mutation of `task.history` with an optional best-effort hook. **No external state required.** Record this in a brief comment or just note it in the PR/commit message.\n\n6. **Run the test suite and confirm green.**\n   ```bash\n   cd <repo-root>\n   node --test src/reclaim-orphaned-drafts.test.js\n   echo \"exit code: $?\"\n   ```\n   Expected: all tests (existing + 2 new) pass, exit code **0**. If any existing test was relying on the old (no-log) behaviour and now conflicts, investigate and fix the test, not the implementation.\n\n7. **Clean up temp dirs (optional hygiene).**\n   `node --test` with `fs.mkdtempSync` leaves temp dirs under `os.tmpdir()`. They are OS-managed and will be reaped; no action needed unless CI enforces a clean tmp.\n\n---\n\n## CRITERIA:\n\n- `node --test src/reclaim-orphaned-drafts.test.js` exits **0** with **all** tests passing (the pre-existing tests plus the two new ones).\n- `src/reclaim-orphaned-drafts.test.js` contains a test that asserts `reclaim-log.jsonl` exists, contains exactly one JSON line, and that line has `count === 1`, `ids` deep-equal to `['task-a']`, `instanceId === \n... [truncated 442 more chars]",
+        "attempts": 3,
+        "grounded": true,
+        "groundingChars": 11555,
+        "anchorPaths": [
+          "src/reclaim-orphaned-drafts.test.js",
+          "src/task-history.js"
+        ]
+      },
+      "outcome": "blocked",
+      "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)",
+      "finishedAt": "2026-09-13T22:02:27.814Z"
+    },
+    {
+      "at": "2026-09-13T22:09:28.896Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": true,
+          "reason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)",
+          "responseChars": 1820,
+          "response": "Done. Everything verified against the real code and my own diff:\n\n1. **Implementation already present** — `src/reclaim-orphaned-drafts.js` (`reclaimOrphanedDrafts`) already appends one JSON line `{ts, instanceId, count, ids}` to `<pipelineDir>/reclaim-log.jsonl` via `fs.appendFileSync`, and only when `ids.length > 0` — so a no-op naturally leaves no file. (The hub's sibling \"done\" status was correct; the earlier plan's grep miss was spurious.)\n2. **`appendHistoryEvent` verified stateless** — `src/task-history.js`: takes only `(task, stage, detail)`, mutates `task.history` in memory; its `persistHook` is an optional module-level hook defaulting to `null` wrapped in try/catch. No I/O, network, or required external state — safe in tests.\n3. **No equivalent tests existed** — the full test file (156 lines) had zero references to `reclaim-log.jsonl`.\n4. **Diff verified** — `git diff` shows exactly 32 insertions in `src/reclaim-orphaned-drafts.test.js`, exactly **2** new `test(...)` definitions: one asserting the log file exists after a reclaim with exactly one JSON line (`count===1`, `ids:['task-a']`, `instanceId==='worker-1'`, parseable `ts`), and one asserting it does NOT exist on a no-op reclaim (`{reclaimed:0, ids:[]}`).\n5. **`node --test src/reclaim-orphaned-drafts.test.js`**: 12 pass, 0 fail, exit code 0 (10 pre-existing + 2 new).\n\nRESOLUTION: implemented\nAdded 2 new tests to src/reclaim-orphaned-drafts.test.js (log presence with exact field assertions after a reclaim; log absence on a no-op reclaim), verified the implementation's existing reclaim-log.jsonl write and appendHistoryEvent's statelessness against the real code, and confirmed `node --test src/reclaim-orphaned-drafts.test.js` exits 0 with all 12 tests passing — the diff adds exactly 2 test definitions, as verified by `git diff`.",
+          "rawDiffChars": 1903,
+          "rawDiff": "diff --git a/src/reclaim-orphaned-drafts.test.js b/src/reclaim-orphaned-drafts.test.js\nindex 7ad41cf6..75182dc0 100644\n--- a/src/reclaim-orphaned-drafts.test.js\n+++ b/src/reclaim-orphaned-drafts.test.js\n@@ -153,3 +153,35 @@ test('reclaims multiple orphaned tasks in one pass', () => {\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));\n });\n+\n+test('a reclaim appends exactly one reclaim-log.jsonl line with the right fields', () => {\n+  const dir = tempPipelineDir();\n+  writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n+  assert.equal(result.reclaimed, 1);\n+  assert.deepEqual(result.ids, ['task-a']);\n+\n+  const logPath = path.join(dir, 'reclaim-log.jsonl');\n+  assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n+  assert.equal(lines.length, 1, 'exactly one JSON line');\n+  const entry = JSON.parse(lines[0]);\n+  assert.equal(entry.count, 1);\n+  assert.deepEqual(entry.ids, ['task-a']);\n+  assert.equal(entry.instanceId, 'worker-1');\n+  assert.ok(entry.ts, 'ts must be set');\n+  assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n+});\n+\n+test('a no-op reclaim (nothing to reclaim) does NOT create reclaim-log.jsonl', () => {\n+  const dir = tempPipelineDir();\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.deepEqual(result, { reclaimed: 0, ids: [] });\n+  assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n+    'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n+});",
+          "turnsUsed": 6,
+          "toolCalls": {
+            "total": 6,
+            "byTool": {
+              "read_file": 2,
+              "grep_codebase": 1,
+              "edit_file": 1,
+              "run_bash": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 5055
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset"
+                ],
+                "bytes": 3288
+              },
+              {
+                "n": 4,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 60
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 787
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 252
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 6686,
+        "text": "# PLAN: Add log presence/absence tests and run `node --test`\n\n## What the provided content confirms\n\n- **Test file** (`src/reclaim-orphaned-drafts.test.js`, 8 228 chars, truncated): uses `node:test` + `node:assert/strict`; helpers `tempPipelineDir()` (line ~19) and `writeDraftingTask(pipelineDir, instanceId, task)` (line ~23) are already defined. Four `test(...)` blocks are visible (the 4th is cut off mid-body). **No reference to `reclaim-log.jsonl` appears in the visible portion.**\n- **Implementation** (`src/reclaim-orphaned-drafts.js`, 92 lines): grep shows `reclaimOrphanedDrafts` at line 42, `module.exports` at line 92. **No grep hit for `reclaim-log.jsonl` or `reclaim-log` in this file.** The hub marks the sibling \"Add reclaim-log.jsonl append\" as *done*, but the grep does not corroborate it.\n- **`src/task-history.js`**: `appendHistoryEvent(task, stage, detail)` (visible in full) mutates `task.history` in place; `persistHook` is a module-level `let` defaulting to `null`, called in a `try/catch`. No I/O, no network, no required external state. Exports: `{ appendHistoryEvent, setHistoryPersistHook, COLLAPSIBLE_REPEAT_STAGES }`.\n\n---\n\n## Steps\n\n1. **Read the full implementation to confirm (or deny) the log-write code.**\n   Open `src/reclaim-orphaned-drafts.js` (all 92 lines). Search for `reclaim-log`, `jsonl`, `appendFileSync`, `writeFileSync` (beyond the draft-file writes already visible at lines 51/62).\n   - **If a `reclaim-log.jsonl` write is present**: note the exact path it writes to (expected `<pipelineDir>/reclaim-log.jsonl`) and the JSON field names it emits. The tests in step 3 must match those field names exactly.\n   - **If it is absent** (consistent with the grep): the two new tests will fail. Since the task requires `exit 0`, add the minimal log-write inside `reclaimOrphanedDrafts` just before the `return` statement (after the reclaim loop, before line 92's `module.exports`). Write a single JSON line to `path.join(pipelineDir, 'reclaim-log.jsonl')` with fields `{ count, ids, instanceId, ts }` using `fs.appendFileSync` (so repeated calls append, not clobber). Only write the file when `reclaimed > 0` (i.e., inside the `if (reclaimed > 0)` guard or equivalent), so the no-op case in Test 2 naturally produces no file.\n\n2. **Confirm no equivalent log-asserting tests already exist.**\n   Grep `src/reclaim-orphaned-drafts.test.js` for `reclaim-log`. The visible 8 228-char head contains zero hits. If the truncated tail (beyond the 4th test) already contains a test asserting on `reclaim-log.jsonl`, skip to step 5. Otherwise proceed.\n\n3. **Add Test 1 – reclaim writes exactly one `reclaim-log.jsonl` line.**\n   Append after the last existing `test(...)` block in `src/reclaim-orphaned-drafts.test.js`:\n\n   ```js\n   test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n     const dir = tempPipelineDir();\n     writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n     assert.equal(result.reclaimed, 1);\n     assert.deepEqual(result.ids, ['task-a']);\n\n     const logPath = path.join(dir, 'reclaim-log.jsonl');\n     assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n     const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n     assert.equal(lines.length, 1, 'exactly one JSON line');\n     const entry = JSON.parse(lines[0]);\n     assert.equal(entry.count, 1);\n     assert.deepEqual(entry.ids, ['task-a']);\n     assert.equal(entry.instanceId, 'worker-1');\n     assert.ok(entry.ts, 'ts must be set');\n     assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n   });\n   ```\n\n   > The log path is assumed to be `<pipelineDir>/reclaim-log.jsonl` (top-level, not in a sub-directory). Verify against the implementation in step 1; adjust `logPath` if it differs.\n\n4. **Add Test 2 – no-op: empty pipelineDir produces no log file.**\n   Append immediately after Test 1:\n\n   ```js\n   test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n     const dir = tempPipelineDir();\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.equal(result.reclaimed, 0);\n     assert.deepEqual(result.ids, []);\n     assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n       'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n   });\n   ```\n\n5. **Verify `appendHistoryEvent` requires no external state.**\n   From the provided `src/task-history.js` content (full function body visible):\n   - Signature `appendHistoryEvent(task, stage, detail)` — all three are parameters; no closure over a DB handle, socket, or global config.\n   - `persistHook` is a module-level `let` defaulting to `null` (line visible in the window). The call is wrapped in `try/catch` and is **optional** (only fires if a caller registered one via `setHistoryPersistHook`).\n   - No `require` of network, filesystem, or process-specific singletons inside the function body.\n   - **Conclusion: pure in-memory mutation of `task.history` with an optional best-effort hook. No external state required.** Note this in the commit message.\n\n6. **Run the test suite and confirm green.**\n   ```bash\n   cd <repo-root>\n   node --test src/reclaim-orphaned-drafts.test.js\n   echo \"exit code: $?\"\n   ```\n   Expected: **all** tests in the file (the pre-existing ones plus the 2 new ones) pass, exit code **0**. If a pre-existing test conflicts with the new log-write behaviour, fix the test, not the implementation.\n\n7. **Temp-dir hygiene (optional).**\n   `fs.mkdtempSync` under `os.tmpdir()` is OS-managed; no cleanup needed unless CI enforces a clean tmp.\n\n---\n\n## CRITERIA:\n\n- `node --test src/reclaim-orphaned-drafts.test.js` exits **0** with **every** test in the file passing (pre-existing + the 2 new ones).\n-\n... [truncated 686 more chars]",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 11555,
+        "anchorPaths": [
+          "src/reclaim-orphaned-drafts.test.js",
+          "src/task-history.js"
+        ]
+      },
+      "outcome": "blocked",
+      "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 12 tests but the diff only adds 2 test definition(s)",
+      "finishedAt": "2026-09-13T22:16:21.468Z"
+    },
+    {
+      "at": "2026-09-13T22:28:20.879Z",
+      "attemptNo": 3,
+      "source": "manual",
+      "localRejectCount": 2,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 2127,
+          "response": "Everything is verified against the real code and my own diff.\n\n- The implementation in `src/reclaim-orphaned-drafts.js` **already** writes `reclaim-log.jsonl` via `fs.appendFileSync` (fields `ts, instanceId, count, ids`), gated on `ids.length > 0` — so a no-op leaves no file. No implementation change was needed.\n- I added **exactly 2** new `test(...)` definitions to `src/reclaim-orphaned-drafts.test.js` (git diff: 33 insertions, `grep -c '^+test('` = 2): one asserting the log exists with exactly one JSON line after a reclaim (`count===1`, `ids:['task-a']`, `instanceId==='worker-1'`, parseable `ts`), and one asserting the log does NOT exist on a no-op (`{reclaimed:0, ids:[]}`).\n- `appendHistoryEvent` in `src/task-history.js` confirmed: pure in-memory mutation of `task.history`; `persistHook` is an optional module-level `let` defaulting to `null`, wrapped in try/catch — no required I/O, network, or external state.\n- `node --test src/reclaim-orphaned-drafts.test.js`: 12 pass (10 pre-existing + 2 new), 0 fail, exit code 0.\n\nRESOLUTION: implemented\nI added exactly 2 new tests to src/reclaim-orphaned-drafts.test.js asserting reclaim-log.jsonl presence (with exact field/count/ts assertions after a reclaim) and absence (on a no-op reclaim), confirmed the implementation's existing log-write and appendHistoryEvent's statelessness against the real code, and verified the suite passes.\n\nAcceptance:\n- node --test src/reclaim-orphaned-drafts.test.js exits 0 with all tests passing -- `node --test ...` -> `# pass 12, # fail 0, exit: 0` -- PASS\n- diff adds exactly 2 new test(...) definitions referencing reclaim-log.jsonl -- `git diff | grep -c '^+test('` = 2; both bodies reference `reclaim-log.jsonl` -- PASS\n- src/reclaim-orphaned-drafts.js writes one JSON line to <pipelineDir>/reclaim-log.jsonl (count/ids/instanceId/ts) only when reclaimed>0 -- present in read_file (fs.appendFileSync inside `if (ids.length > 0)`) -- PASS\n- appendHistoryEvent in src/task-history.js confirmed pure in-memory mutation, no required external state -- read_file: only mutates task.history; persistHook optional & best-effort -- PASS",
+          "rawDiffChars": 1908,
+          "rawDiff": "diff --git a/src/reclaim-orphaned-drafts.test.js b/src/reclaim-orphaned-drafts.test.js\nindex 7ad41cf6..1eabf5e9 100644\n--- a/src/reclaim-orphaned-drafts.test.js\n+++ b/src/reclaim-orphaned-drafts.test.js\n@@ -153,3 +153,36 @@ test('reclaims multiple orphaned tasks in one pass', () => {\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));\n });\n+\n+test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n+  const dir = tempPipelineDir();\n+  writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n+  assert.equal(result.reclaimed, 1);\n+  assert.deepEqual(result.ids, ['task-a']);\n+\n+  const logPath = path.join(dir, 'reclaim-log.jsonl');\n+  assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n+  assert.equal(lines.length, 1, 'exactly one JSON line');\n+  const entry = JSON.parse(lines[0]);\n+  assert.equal(entry.count, 1);\n+  assert.deepEqual(entry.ids, ['task-a']);\n+  assert.equal(entry.instanceId, 'worker-1');\n+  assert.ok(entry.ts, 'ts must be set');\n+  assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n+});\n+\n+test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n+  const dir = tempPipelineDir();\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.equal(result.reclaimed, 0);\n+  assert.deepEqual(result.ids, []);\n+  assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n+    'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n+});",
+          "turnsUsed": 6,
+          "toolCalls": {
+            "total": 6,
+            "byTool": {
+              "read_file": 3,
+              "edit_file": 1,
+              "run_bash": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 5055
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 8357
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 989
+              },
+              {
+                "n": 4,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 60
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 646
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 358
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 7653,
+        "text": "# PLAN: Add log presence/absence tests and run `node --test`\n\n## What the repository content confirms\n\n- **Test file** (`src/reclaim-orphaned-drafts.test.js`, 8 228 chars, head shown): imports `node:test`, `node:assert/strict`, `fs`, `os`, `path`; requires `{ reclaimOrphanedDrafts, destinationDirFor }` from `./reclaim-orphaned-drafts.js`. Helpers `tempPipelineDir()` (~line 19) and `writeDraftingTask(pipelineDir, instanceId, task)` (~line 23) are already defined. **Four** `test(...)` blocks are visible (the 4th is truncated mid-body). **No reference to `reclaim-log.jsonl` appears anywhere in the visible portion.**\n- **Implementation** (`src/reclaim-orphaned-drafts.js`, 92 lines): `reclaimOrphanedDrafts` at line 42, `module.exports` at line 92. **No grep hit for `reclaim-log`, `jsonl`, `appendFileSync`, or `writeFileSync` (beyond the draft-file writes at lines 51/62) in this file.** The hub marks the sibling \"Add reclaim-log.jsonl append\" as *done*, but the grep does not corroborate it.\n- **`src/task-history.js`**: `appendHistoryEvent(task, stage, detail)` mutates `task.history` in place. `persistHook` is a module-level `let` defaulting to `null`, called inside a `try/catch`. No I/O, no network, no required external state. Exports: `{ appendHistoryEvent, setHistoryPersistHook, COLLAPSIBLE_REPEAT_STAGES }`.\n\n---\n\n## Steps\n\n1. **Read the full implementation to confirm (or deny) the log-write code.**\n   Open `src/reclaim-orphaned-drafts.js` (all 92 lines). Search for `reclaim-log`, `jsonl`, `appendFileSync`, `writeFileSync` beyond the draft-file writes already visible at lines 51 and 62.\n   - **If a `reclaim-log.jsonl` write is present**: note the exact path it writes to (expected `path.join(pipelineDir, 'reclaim-log.jsonl')`) and the JSON field names it emits. The tests in step 3 must match those field names exactly.\n   - **If it is absent** (consistent with the grep): the two new tests will fail. Since the task requires `exit 0`, add the minimal log-write inside `reclaimOrphanedDrafts` just before the `return` statement (after the reclaim loop, before line 92's `module.exports`). Write a single JSON line to `path.join(pipelineDir, 'reclaim-log.jsonl')` with fields `{ count, ids, instanceId, ts }` using `fs.appendFileSync` (so repeated calls append, not clobber). Only write the file when `reclaimed > 0` (inside the `if (reclaimed > 0)` guard or equivalent), so the no-op case in Test 2 naturally produces no file.\n\n2. **Confirm no equivalent log-asserting tests already exist.**\n   Grep `src/reclaim-orphaned-drafts.test.js` for `reclaim-log`. The visible 8 228-char head contains zero hits. If the truncated tail (beyond the 4th test) already contains a test asserting on `reclaim-log.jsonl`, skip to step 5. Otherwise proceed.\n\n3. **Add Test 1 – reclaim writes exactly one `reclaim-log.jsonl` line.**\n   Append after the last existing `test(...)` block in `src/reclaim-orphaned-drafts.test.js`:\n\n   ```js\n   test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n     const dir = tempPipelineDir();\n     writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n     assert.equal(result.reclaimed, 1);\n     assert.deepEqual(result.ids, ['task-a']);\n\n     const logPath = path.join(dir, 'reclaim-log.jsonl');\n     assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n     const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n     assert.equal(lines.length, 1, 'exactly one JSON line');\n     const entry = JSON.parse(lines[0]);\n     assert.equal(entry.count, 1);\n     assert.deepEqual(entry.ids, ['task-a']);\n     assert.equal(entry.instanceId, 'worker-1');\n     assert.ok(entry.ts, 'ts must be set');\n     assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n   });\n   ```\n\n   > The log path is assumed to be `<pipelineDir>/reclaim-log.jsonl` (top-level). Verify against the implementation in step 1; adjust `logPath` if it differs.\n\n4. **Add Test 2 – no-op: empty pipelineDir produces no log file.**\n   Append immediately after Test 1:\n\n   ```js\n   test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n     const dir = tempPipelineDir();\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.equal(result.reclaimed, 0);\n     assert.deepEqual(result.ids, []);\n     assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n       'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n   });\n   ```\n\n   **Total new test definitions added in this task: exactly 2.** The file already contains at least 4 existing `test(...)` blocks (the 4th is truncated in the provided content; there may be more in the tail). Do not claim a specific grand total unless you have read the entire file.\n\n5. **Verify `appendHistoryEvent` requires no external state.**\n   From the provided `src/task-history.js` content (full function body visible):\n   - Signature `appendHistoryEvent(task, stage, detail)` — all three are parameters; no closure over a DB handle, socket, or global config.\n   - `persistHook` is a module-level `let` defaulting to `null`. The call is wrapped in `try/catch` and is **optional** (only fires if a caller registered one via `setHistoryPersistHook`).\n   - No `require` of network, filesystem, or process-specific singletons inside the function body.\n   - **Conclusion: pure in-memory mutation of `task.history` with an optional best-effort hook. No external state required.** Note this in the commit message.\n\n6. **Run the test suite and confirm green.**\n   ```bash\n   cd <repo-root>\n   node --test src/reclaim-orphaned-drafts.test.js\n   echo \"exit code: $?\"\n   ```\n   Expected: **every** test in the file (the pre-existing ones plus the **2** new ones) passes\n... [truncated 1653 more chars]",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 11555,
+        "anchorPaths": [
+          "src/reclaim-orphaned-drafts.test.js",
+          "src/task-history.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 4,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T22:34:11.524Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds exactly 2 new `test(...)` blocks to `src/reclaim-orphaned-drafts.test.js` (verified via `git diff | grep -c '^+test('` = 2) that assert `reclaim-log.jsonl` presence/absence, and the live test run confirms `# pass 12, # fail 0, exit: 0`, satisfying all four acceptance criteria including the implementation's existing log-write logic and `appendHistoryEvent` statelessness.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds exactly 2 new `test(...)` blocks to `src/reclaim-orphaned-drafts.test.js` (verified via `git diff | grep -c '^+test('` = 2) that assert `reclaim-log.jsonl` presence/absence, and the live test run confirms `# pass 12, # fail 0, exit: 0`, satisfying all four acceptance criteria including the implementation's existing log-write logic and `appendHistoryEvent` statelessness."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds exactly 2 new `test(...)` blocks to `src/reclaim-orphaned-drafts.test.js` (confirmed by `git diff | grep -c '^+test('` = 2 and the visible diff content), both referencing `reclaim-log.jsonl`, and the live test run shows `# pass 12, # fail 0, exit code: 0`, satisfying all four acceptance criteria including the implementation's existing `fs.appendFileSync` log-write (visible in the truncated `src/reclaim-orphaned-drafts.js` live content) and `appendHistoryEvent`'s stateless in-memory mutation (confirmed in `src/task-history.js` live content)."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`node --test src/reclaim-orphaned-drafts.test.js` exits 0 with all tests passing (pre-existing + the 2 new ones).",
+    "The diff adds exactly 2 new `test(...)` definitions to `src/reclaim-orphaned-drafts.test.js`, both referencing `reclaim-log.jsonl`.",
+    "`src/reclaim-orphaned-drafts.js` writes a single JSON line to `<pipelineDir>/reclaim-log.jsonl` (fields `count`, `ids`, `instanceId`, `ts`) only when `reclaimed > 0`.",
+    "`appendHistoryEvent` in `src/task-history.js` is confirmed to be a pure in-memory mutation with no required external state."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "Everything is verified against the real code and my own diff.\n\n- The implementation in `src/reclaim-orphaned-drafts.js` **already** writes `reclaim-log.jsonl` via `fs.appendFileSync` (fields `ts, instanceId, count, ids`), gated on `ids.length > 0` — so a no-op leaves no file. No implementation change was needed.\n- I added **exactly 2** new `test(...)` definitions to `src/reclaim-orphaned-drafts.test.js` (git diff: 33 insertions, `grep -c '^+test('` = 2): one asserting the log exists with exactly one JSON line after a reclaim (`count===1`, `ids:['task-a']`, `instanceId==='worker-1'`, parseable `ts`), and one asserting the log does NOT exist on a no-op (`{reclaimed:0, ids:[]}`).\n- `appendHistoryEvent` in `src/task-history.js` confirmed: pure in-memory mutation of `task.history`; `persistHook` is an optional module-level `let` defaulting to `null`, wrapped in try/catch — no required I/O, network, or external state.\n- `node --test src/reclaim-orphaned-drafts.test.js`: 12 pass (10 pre-existing + 2 new), 0 fail, exit code 0.\n\nRESOLUTION: implemented\nI added exactly 2 new tests to src/reclaim-orphaned-drafts.test.js asserting reclaim-log.jsonl presence (with exact field/count/ts assertions after a reclaim) and absence (on a no-op reclaim), confirmed the implementation's existing log-write and appendHistoryEvent's statelessness against the real code, and verified the suite passes.\n\nAcceptance:\n- node --test src/reclaim-orphaned-drafts.test.js exits 0 with all tests passing -- `node --test ...` -> `# pass 12, # fail 0, exit: 0` -- PASS\n- diff adds exactly 2 new test(...) definitions referencing reclaim-log.jsonl -- `git diff | grep -c '^+test('` = 2; both bodies reference `reclaim-log.jsonl` -- PASS\n- src/reclaim-orphaned-drafts.js writes one JSON line to <pipelineDir>/reclaim-log.jsonl (count/ids/instanceId/ts) only when reclaimed>0 -- present in read_file (fs.appendFileSync inside `if (ids.length > 0)`) -- PASS\n- appendHistoryEvent in src/task-history.js confirmed pure in-memory mutation, no required external state -- read_file: only mutates task.history; persistHook optional & best-effort -- PASS\n\n=== DIFF ===\ndiff --git a/src/reclaim-orphaned-drafts.test.js b/src/reclaim-orphaned-drafts.test.js\nindex 7ad41cf6..1eabf5e9 100644\n--- a/src/reclaim-orphaned-drafts.test.js\n+++ b/src/reclaim-orphaned-drafts.test.js\n@@ -153,3 +153,36 @@ test('reclaims multiple orphaned tasks in one pass', () => {\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-2.json')));\n   assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'multi-3.json')));\n });\n+\n+test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n+  const dir = tempPipelineDir();\n+  writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n+  assert.equal(result.reclaimed, 1);\n+  assert.deepEqual(result.ids, ['task-a']);\n+\n+  const logPath = path.join(dir, 'reclaim-log.jsonl');\n+  assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n+  assert.equal(lines.length, 1, 'exactly one JSON line');\n+  const entry = JSON.parse(lines[0]);\n+  assert.equal(entry.count, 1);\n+  assert.deepEqual(entry.ids, ['task-a']);\n+  assert.equal(entry.instanceId, 'worker-1');\n+  assert.ok(entry.ts, 'ts must be set');\n+  assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n+});\n+\n+test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n+  const dir = tempPipelineDir();\n+\n+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n+\n+  assert.equal(result.reclaimed, 0);\n+  assert.deepEqual(result.ids, []);\n+  assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n+    'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n+});",
+  "planResponse": "# PLAN: Add log presence/absence tests and run `node --test`\n\n## What the repository content confirms\n\n- **Test file** (`src/reclaim-orphaned-drafts.test.js`, 8 228 chars, head shown): imports `node:test`, `node:assert/strict`, `fs`, `os`, `path`; requires `{ reclaimOrphanedDrafts, destinationDirFor }` from `./reclaim-orphaned-drafts.js`. Helpers `tempPipelineDir()` (~line 19) and `writeDraftingTask(pipelineDir, instanceId, task)` (~line 23) are already defined. **Four** `test(...)` blocks are visible (the 4th is truncated mid-body). **No reference to `reclaim-log.jsonl` appears anywhere in the visible portion.**\n- **Implementation** (`src/reclaim-orphaned-drafts.js`, 92 lines): `reclaimOrphanedDrafts` at line 42, `module.exports` at line 92. **No grep hit for `reclaim-log`, `jsonl`, `appendFileSync`, or `writeFileSync` (beyond the draft-file writes at lines 51/62) in this file.** The hub marks the sibling \"Add reclaim-log.jsonl append\" as *done*, but the grep does not corroborate it.\n- **`src/task-history.js`**: `appendHistoryEvent(task, stage, detail)` mutates `task.history` in place. `persistHook` is a module-level `let` defaulting to `null`, called inside a `try/catch`. No I/O, no network, no required external state. Exports: `{ appendHistoryEvent, setHistoryPersistHook, COLLAPSIBLE_REPEAT_STAGES }`.\n\n---\n\n## Steps\n\n1. **Read the full implementation to confirm (or deny) the log-write code.**\n   Open `src/reclaim-orphaned-drafts.js` (all 92 lines). Search for `reclaim-log`, `jsonl`, `appendFileSync`, `writeFileSync` beyond the draft-file writes already visible at lines 51 and 62.\n   - **If a `reclaim-log.jsonl` write is present**: note the exact path it writes to (expected `path.join(pipelineDir, 'reclaim-log.jsonl')`) and the JSON field names it emits. The tests in step 3 must match those field names exactly.\n   - **If it is absent** (consistent with the grep): the two new tests will fail. Since the task requires `exit 0`, add the minimal log-write inside `reclaimOrphanedDrafts` just before the `return` statement (after the reclaim loop, before line 92's `module.exports`). Write a single JSON line to `path.join(pipelineDir, 'reclaim-log.jsonl')` with fields `{ count, ids, instanceId, ts }` using `fs.appendFileSync` (so repeated calls append, not clobber). Only write the file when `reclaimed > 0` (inside the `if (reclaimed > 0)` guard or equivalent), so the no-op case in Test 2 naturally produces no file.\n\n2. **Confirm no equivalent log-asserting tests already exist.**\n   Grep `src/reclaim-orphaned-drafts.test.js` for `reclaim-log`. The visible 8 228-char head contains zero hits. If the truncated tail (beyond the 4th test) already contains a test asserting on `reclaim-log.jsonl`, skip to step 5. Otherwise proceed.\n\n3. **Add Test 1 – reclaim writes exactly one `reclaim-log.jsonl` line.**\n   Append after the last existing `test(...)` block in `src/reclaim-orphaned-drafts.test.js`:\n\n   ```js\n   test('reclaim writes exactly one reclaim-log.jsonl line with correct fields', () => {\n     const dir = tempPipelineDir();\n     writeDraftingTask(dir, 'worker-1', { id: 'task-a', domain: 'adhoc', title: 't', history: [] });\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.ok(fs.existsSync(path.join(dir, 'queue', 'pending', 'task-a.json')));\n     assert.equal(result.reclaimed, 1);\n     assert.deepEqual(result.ids, ['task-a']);\n\n     const logPath = path.join(dir, 'reclaim-log.jsonl');\n     assert.ok(fs.existsSync(logPath), 'reclaim-log.jsonl should exist after a reclaim');\n     const lines = fs.readFileSync(logPath, 'utf8').trim().split('\\n');\n     assert.equal(lines.length, 1, 'exactly one JSON line');\n     const entry = JSON.parse(lines[0]);\n     assert.equal(entry.count, 1);\n     assert.deepEqual(entry.ids, ['task-a']);\n     assert.equal(entry.instanceId, 'worker-1');\n     assert.ok(entry.ts, 'ts must be set');\n     assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts must be parseable');\n   });\n   ```\n\n   > The log path is assumed to be `<pipelineDir>/reclaim-log.jsonl` (top-level). Verify against the implementation in step 1; adjust `logPath` if it differs.\n\n4. **Add Test 2 – no-op: empty pipelineDir produces no log file.**\n   Append immediately after Test 1:\n\n   ```js\n   test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {\n     const dir = tempPipelineDir();\n\n     const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });\n\n     assert.equal(result.reclaimed, 0);\n     assert.deepEqual(result.ids, []);\n     assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),\n       'reclaim-log.jsonl must NOT exist when nothing was reclaimed');\n   });\n   ```\n\n   **Total new test definitions added in this task: exactly 2.** The file already contains at least 4 existing `test(...)` blocks (the 4th is truncated in the provided content; there may be more in the tail). Do not claim a specific grand total unless you have read the entire file.\n\n5. **Verify `appendHistoryEvent` requires no external state.**\n   From the provided `src/task-history.js` content (full function body visible):\n   - Signature `appendHistoryEvent(task, stage, detail)` — all three are parameters; no closure over a DB handle, socket, or global config.\n   - `persistHook` is a module-level `let` defaulting to `null`. The call is wrapped in `try/catch` and is **optional** (only fires if a caller registered one via `setHistoryPersistHook`).\n   - No `require` of network, filesystem, or process-specific singletons inside the function body.\n   - **Conclusion: pure in-memory mutation of `task.history` with an optional best-effort hook. No external state required.** Note this in the commit message.\n\n6. **Run the test suite and confirm green.**\n   ```bash\n   cd <repo-root>\n   node --test src/reclaim-orphaned-drafts.test.js\n   echo \"exit code: $?\"\n   ```\n   Expected: **every** test in the file (the pre-existing ones plus the **2** new ones) passes, exit code **0**. If a pre-existing test conflicts with the new log-write behaviour, fix the test, not the implementation.\n\n7. **Temp-dir hygiene (optional).**\n   `fs.mkdtempSync` under `os.tmpdir()` is OS-managed; no cleanup needed unless CI enforces a clean tmp.\n\n---\n\n## CRITERIA:\n\n- `node --test src/reclaim-orphaned-drafts.test.js` exits **0** with **every** test in the file passing (all pre-existing tests plus the **2** new test definitions added by this task).\n- `src/reclaim-orphaned-drafts.test.js` contains **exactly 2** new `test(...)` blocks that reference `reclaim-log.jsonl` (one asserting the file exists with correct fields after a reclaim; one asserting the file does **not** exist after a no-op).\n- `src/reclaim-orphaned-drafts.js` contains a `reclaim-log.jsonl` write (via `fs.appendFileSync` or equivalent) that fires only when `reclaimed > 0`, emitting a single JSON line with fields `count`, `ids`, `instanceId`, `ts`.\n- `src/task-history.js`'s `appendHistoryEvent` is confirmed to require no external state (no I/O, no network, `persistHook` is optional and best-effort).\n\nCRITERIA:\n- `node --test src/reclaim-orphaned-drafts.test.js` exits 0 with all tests passing (pre-existing + the 2 new ones).\n- The diff adds exactly 2 new `test(...)` definitions to `src/reclaim-orphaned-drafts.test.js`, both referencing `reclaim-log.jsonl`.\n- `src/reclaim-orphaned-drafts.js` writes a single JSON line to `<pipelineDir>/reclaim-log.jsonl` (fields `count`, `ids`, `instanceId`, `ts`) only when `reclaimed > 0`.\n- `appendHistoryEvent` in `src/task-history.js` is confirmed to be a pure in-memory mutation with no required external state.",
+  "reviewedAt": "2026-09-13T22:35:06.544Z",
+  "claimedAt": "2026-09-13T21:56:03.043Z"
+}
