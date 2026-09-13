@@ -145,6 +145,15 @@ function researchClaudeStatus(task, isClaudePausedFn) {
   return { ok: true };
 }
 
+// 2026-09: routing into the research branch was keyed only on task.domain === 'research',
+// so a task titled "Research: ..." that arrived through a different domain (e.g. an
+// adhoc-sourced brain-dump spawn) fell straight into the adhoc tier ladder / plan-stage
+// model call instead of draftResearchBranch. Same pre-model-call string-gate style as
+// detectExternalDependency in local-agentic-write-draft.js: cheap, O(title), deterministic.
+function isResearchDomainTask(task) {
+  return /^Research:/i.test((task && task.title || '').trim());
+}
+
 // A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft
 // branch already stamped on the task (adhoc resolution, retry count, model). Returns
 // undefined when there's nothing worth showing -- appendHistoryEvent then omits `detail`.
@@ -2314,12 +2323,22 @@ async function runDraftPasses(task, attempt, {
       // research_task's plan pass grants Claude-only WebSearch/WebFetch. If research
       // can't run on Claude (not opted in / no token / paused) block BEFORE the plan
       // pass rather than run a webless plan that produces nothing usable.
-      if (task.domain === 'research') {
+      if (task.domain === 'research' || isResearchDomainTask(task)) {
         const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);
         if (!claudeStatus.ok) {
           appendHistoryEvent(task, 'blocked', claudeStatus.reason);
           return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
         }
+      }
+
+      // 2026-09: a Research:-titled task is a research task no matter what domain/source
+      // it arrived with. Short-circuit HERE -- before runPlanPass (a plan-stage model
+      // call) and before the adhoc branch below whose tier ladder would otherwise swallow
+      // it -- so it always routes through draftResearchBranch (which internally re-checks
+      // the same researchClaudeStatus gate, so an unopted/paused Claude still blocks
+      // cleanly instead of wedging).
+      if (isResearchDomainTask(task)) {
+        return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });
       }
 
       const planOutcome = await runPlanPass(task, {
@@ -2373,7 +2392,7 @@ async function runDraftPasses(task, attempt, {
       // research_task implements via a real agentic Claude (WebSearch/WebFetch) call -- see
       // draftResearchBranch(). Same "the agentic pass already produced the final artifact,
       // skip the local plan/critique/revision loop" reasoning as the adhoc branch.
-      if (task.domain === 'research') {
+      if (task.domain === 'research' || isResearchDomainTask(task)) {
         return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });
       }
 
