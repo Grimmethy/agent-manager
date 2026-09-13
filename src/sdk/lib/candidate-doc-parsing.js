@@ -1,3 +1,12 @@
+'use strict';
+
+const fs = require('fs');
+
+// Same literals as src/sdk/candidate-fulfillment.js (the source these were moved out of)
+// -- duplicated here rather than required back, so this module stays self-contained.
+const QUOTED_SYMBOL_RE = /`([^`]{3,80})`/g;
+const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
+
 function readIfExists(filePath) {
   try {
     return fs.readFileSync(filePath, 'utf8');
@@ -27,3 +36,7 @@ function realIndexForStrippedIndex(content, targetStrippedCount) {
   }
   return content.length;
 }
+
+module.exports = {
+  readIfExists, quotedSymbolsFromSection, snippetFromSection, stripWhitespace, realIndexForStrippedIndex,
+};
