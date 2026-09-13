@@ -206,3 +206,38 @@ test('signatureForTask: json-parse-failure gets a distinct non-null signature; u
   assert.equal(signatureForTask({ source: 'pipeline_forensics_fix', blockedReason: 'a genuinely novel failure nobody has a keyword for' }), null);
   assert.notEqual(classified, null);
 });
+
+// -- reviewInconclusive structured flag takes precedence over the 'inconclusive' keyword match --
+
+test('flag-wins-over-non-matching-text: reviewInconclusive:true classifies inconclusive-review even with unrelated blockedReason', () => {
+  const result = classifyBlockedTask({ reviewInconclusive: true, blockedReason: 'some entirely unrelated text with no keyword' });
+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });
+});
+
+test('flag-wins-over-other-structural: reviewInconclusive:true overrides an unreliable-grounding structural match', () => {
+  // Without the flag this task would classify as non-retryable 'unreliable-grounding'.
+  // The structured flag is checked FIRST, so it wins.
+  const task = {
+    reviewInconclusive: true,
+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', anchorConfidence: 'none' }] },
+  };
+  const result = classifyBlockedTask(task);
+  assert.equal(result.category, 'inconclusive-review');
+  assert.equal(result.classifierName, 'inconclusive-review-flag');
+  assert.notEqual(result.classifierName, 'unreliable-grounding');
+});
+
+test('keyword-fallback-intact: a blockedReason containing "inconclusive" (no flag) still classifies inconclusive-review via the keyword path', () => {
+  const result = classifyBlockedTask({ blockedReason: 'review was inconclusive' });
+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });
+});
+
+test('explicit-false-falls-through: reviewInconclusive:false does NOT short-circuit; keyword path still fires', () => {
+  const result = classifyBlockedTask({ reviewInconclusive: false, blockedReason: 'review was inconclusive' });
+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review' });
+});
+
+test('flag-without-blockedReason: reviewInconclusive:true alone (no blockedReason) is sufficient', () => {
+  const result = classifyBlockedTask({ reviewInconclusive: true });
+  assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });
+});
