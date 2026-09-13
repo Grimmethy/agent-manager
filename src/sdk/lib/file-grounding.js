@@ -1,3 +1,23 @@
+'use strict';
+
+const { snippetFromSection, quotedSymbolsFromSection } = require('./candidate-doc-parsing.js');
+const { findFuzzyMatch, windowAroundIndex } = require('./fuzzy-matching.js');
+
+// Same literals as src/sdk/candidate-fulfillment.js (the source these were moved out of)
+// -- duplicated here rather than required back, so this module stays self-contained.
+const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
+const MIN_ANCHOR_SYMBOL_CHARS = 4;
+const MAX_ANCHOR_OCCURRENCES = 5;
+const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
+const MAX_FETCHED_FILE_CHARS = 8000;
+const MAX_ANCHOR_REGIONS = 5;
+const MAX_FETCHED_FILE_TOTAL_CHARS = 22000;
+const MIN_REGION_CHARS = 1400;
+const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable anchor found '
+  + "for this candidate's cited code -- this window is a best-effort guess and may not "
+  + 'contain the real target. If you cannot find the described code here, respond with a '
+  + 'clarification request rather than guessing.]\n';
+
 function collectAnchorHits(content, section) {
   const hits = [];
   const seen = new Set();
@@ -115,3 +135,5 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
   });
   return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
 }
+
+module.exports = { collectAnchorHits, windowFetchedFileContent };

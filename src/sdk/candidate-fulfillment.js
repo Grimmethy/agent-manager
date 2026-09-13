@@ -23,6 +23,9 @@ const candidateDocs = require('../candidate-docs.js');
 const { computePremiseEvidence } = require('../candidate-premise-check.js');
 const { signatureForClarificationTask } = require('../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../task-history.js');
+const { readIfExists, quotedSymbolsFromSection, snippetFromSection } = require('./lib/candidate-doc-parsing.js');
+const { findFuzzyMatch, windowAroundIndex } = require('./lib/fuzzy-matching.js');
+const { collectAnchorHits, windowFetchedFileContent } = require('./lib/file-grounding.js');
 
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
