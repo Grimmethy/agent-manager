@@ -3090,6 +3090,51 @@ def api_task_requeue(state, task_id):
                 "again to proceed anyway."
             ))
 
+    # If this task was already applied to a branch that never merged (task-disposition.js's
+    # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
+    # about to redo the same work from scratch on a FRESH branch, so the old one is now
+    # abandoned, not merely forgotten. Without this, api_task_requeue silently orphaned the
+    # prior branch: it stayed pushed to GitHub, unmerged, with no PR and no record anywhere
+    # that a later attempt superseded it. Confirmed live 2026-09-13:
+    # adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1's
+    # forbidden-path-gate-blocked branch sat dangling until a human noticed and deleted it
+    # by hand. Guarded on terminalDisposition != 'merged' so a task record that (rarely)
+    # reached done/ with its branch already merged is never touched.
+    if data.get("terminalDisposition") != "merged":
+        applied_branch = None
+        for ev in reversed(data.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+                applied_branch = ev["detail"]
+                break
+        if applied_branch:
+            repo_root = get_active_repo_root()
+            repo_root = Path(repo_root) if repo_root else None
+            if repo_root:
+                try:
+                    _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+                except RuntimeError as e:
+                    # Non-fatal, same reasoning as api_git_merge_branch's own post-merge
+                    # branch delete -- already gone, never actually pushed, or a transient
+                    # network error are all fine; the requeue itself must not fail here.
+                    logger.warning(
+                        "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
+                        applied_branch, task_id, e,
+                    )
+                _invalidate_branch_cache()
+            abandon_iso = datetime.now(timezone.utc).isoformat()
+            abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
+            data.setdefault("history", []).append({
+                "stage": "abandoned", "at": abandon_iso, "detail": abandon_detail,
+            })
+            data["terminalDisposition"] = "abandoned"
+            # NOT closing out task-logs/<id>.json here (contrast api_git_merge_branch's
+            # 'merged' handling): that file is committed only on the task's OWN branch, and
+            # for an unmerged branch it was never on <main> to begin with -- there is
+            # nothing on disk in this checkout to update. task-log-reconcile.js's own
+            # 'abandoned' disposition (see task-disposition.js's header) has the identical
+            # scope: it marks the queue/ record, it does not retroactively rescue a
+            # never-merged branch's task-log onto main.
+
     pending_dir = qdir / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
     dest = pending_dir / f"{task_id}.json"
