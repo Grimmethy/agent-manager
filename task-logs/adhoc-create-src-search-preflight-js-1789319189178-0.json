@@ -1,0 +1,272 @@
+{
+  "id": "adhoc-create-src-search-preflight-js-1789319189178-0",
+  "title": "Create src/search-preflight.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T17:09:24.676Z",
+  "history": [
+    {
+      "stage": "created",
+      "at": "2026-09-13T17:09:24.677Z",
+      "detail": "manual"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T17:23:46.467Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T17:32:30.811Z",
+      "detail": "4 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T17:37:25.249Z",
+      "detail": "2 attempt(s), 3769 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T17:41:13.792Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T17:44:06.016Z",
+      "detail": "agentic, 2876 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T17:44:06.017Z",
+      "detail": "resolution=implemented, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T17:44:06.017Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T17:44:06.018Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T17:44:26.309Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T17:47:39.709Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "Create a new file src/search-preflight.js exporting one function searchPreflight(pipelineDir). It requires fs, path, inboxDir from ./side-finding.js, and normalizeTokens from ./text-similarity.js. Step 1: resolve dir = inboxDir(pipelineDir) and try fs.readdirSync(dir) in a try/catch; on any error return { ok:false, reason:'inbox-unreachable' }. Step 2: filter names to .json, cap at Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH)||50, and for each attempt JSON.parse(fs.readFileSync); if the record has truthy .title and .body, run normalizeTokens(title+' '+body) and if the Set.size>0 return { ok:true, sample:{ title, tokenCount:set.size } }. Step 3: if no item passed, return { ok:false, reason:'no-parseable-results' }. Deterministic, no network, no LLM. Verify with node -e \"require('./src/search-preflight.js')\".",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788725054994-add-a-deterministic-pre-flight-that-veri-1788803062331"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T17:23:46.466Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1412,
+          "response": "All acceptance criteria verified. Here's the final summary:\n\nRESOLUTION: implemented\n\nCreated `src/search-preflight.js` exporting a single function `searchPreflight(pipelineDir)` that performs a deterministic pre-flight check on the side-findings inbox: it resolves the inbox directory via `inboxDir`, lists `.json` files (capped by `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` or 50), parses each record, and returns a success sample with the first record that has a truthy `title`+`body` whose `normalizeTokens` output is non-empty — or one of two structured failure objects.\n\nAcceptance:\n- `src/search-preflight.js` exists and `node -e \"require('./src/search-preflight.js')\"` exits 0 with no error output -- ran the command -- PASS (exit 0, printed \"loaded ok\")\n- The file exports exactly one function `searchPreflight` -- `Object.keys(m)` returned `['searchPreflight']`, `typeof m.searchPreflight` is `'function'` -- PASS\n- The function body references `inboxDir`, `normalizeTokens`, `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` with fallback 50, and literals `'inbox-unreachable'` / `'no-parseable-results'` -- grep showed all 5 tokens at lines 3, 4, 13, 17, 28, 36 -- PASS\n- Success return shape is `{ ok: true, sample: { title: record.title, tokenCount: tokenSet.size } }` -- confirmed at line 29 -- PASS\n- No `fetch`, `http`, `https`, `axios`, or network/LLM call in the file -- `grep -c` returned 0 hits -- PASS",
+          "rawDiffChars": 1449,
+          "rawDiff": "diff --git a/src/search-preflight.js b/src/search-preflight.js\nnew file mode 100644\nindex 00000000..325ccef6\n--- /dev/null\n+++ b/src/search-preflight.js\n@@ -0,0 +1,39 @@\n+const fs = require('fs');\n+const path = require('path');\n+const { inboxDir } = require('./side-finding.js');\n+const { normalizeTokens } = require('./text-similarity.js');\n+\n+function searchPreflight(pipelineDir) {\n+  // Step 1 – resolve inbox dir and list it\n+  const dir = inboxDir(pipelineDir);\n+  let names;\n+  try {\n+    names = fs.readdirSync(dir);\n+  } catch (_err) {\n+    return { ok: false, reason: 'inbox-unreachable' };\n+  }\n+\n+  // Step 2 – filter .json, cap, parse, and test each record\n+  const batchCap = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n+  const jsonNames = names.filter((n) => n.endsWith('.json')).slice(0, batchCap);\n+\n+  for (const name of jsonNames) {\n+    let record;\n+    try {\n+      record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));\n+    } catch (_err) {\n+      continue; // skip unparseable file\n+    }\n+    if (record && record.title && record.body) {\n+      const tokenSet = normalizeTokens(record.title + ' ' + record.body);\n+      if (tokenSet.size > 0) {\n+        return { ok: true, sample: { title: record.title, tokenCount: tokenSet.size } };\n+      }\n+    }\n+  }\n+\n+  // Step 3 – nothing passed\n+  return { ok: false, reason: 'no-parseable-results' };\n+}\n+\n+module.exports = { searchPreflight };",
+          "turnsUsed": 15,
+          "toolCalls": {
+            "total": 16,
+            "byTool": {
+              "grep_codebase": 2,
+              "write_file": 1,
+              "run_bash": 12,
+              "read_file": 1
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2357
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 3594
+              },
+              {
+                "n": 3,
+                "tool": "write_file",
+                "argKeys": [
+                  "path",
+                  "content"
+                ],
+                "bytes": 49
+              },
+              {
+                "n": 4,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 176
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 251
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 160
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 181
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 121
+              },
+              {
+                "n": 9,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 119
+              },
+              {
+                "n": 10,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 2317
+              },
+              {
+                "n": 11,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 208
+              },
+              {
+                "n": 12,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 147
+              },
+              {
+                "n": 13,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 324
+              },
+              {
+                "n": 14,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 244
+              },
+              {
+                "n": 15,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 647
+              },
+              {
+                "n": 16,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 1402
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 4
+      },
+      "plan": {
+        "chars": 3769,
+        "text": "# PLAN: Create `src/search-preflight.js`\n\n## 1. Create the file and declare the module header\n\nCreate `src/search-preflight.js` (confirmed absent from the current `src/` listing). Open with the required imports:\n\n```js\nconst fs = require('fs');\nconst path = require('path');\nconst { inboxDir } = require('./side-finding.js');\nconst { normalizeTokens } = require('./text-similarity.js');\n```\n\n- `inboxDir` is exported at `src/side-finding.js:153` (defined at line 112, returns `path.join(pipelineDir, 'queue', 'side-findings-inbox')`).\n- `normalizeTokens` is exported at `src/text-similarity.js:73` (defined at line 17, returns a `Set`).\n- `fs` and `path` are Node built-ins; `path` is included per the task spec even though the function body may not reference it directly (it is used internally by `inboxDir`).\n\n## 2. Define and export the single function `searchPreflight(pipelineDir)`\n\n```js\nfunction searchPreflight(pipelineDir) {\n  // Step 1 – resolve inbox dir and list it\n  const dir = inboxDir(pipelineDir);\n  let names;\n  try {\n    names = fs.readdirSync(dir);\n  } catch (_err) {\n    return { ok: false, reason: 'inbox-unreachable' };\n  }\n\n  // Step 2 – filter, cap, parse, and test each record\n  const batchCap = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n  const jsonNames = names.filter((n) => n.endsWith('.json')).slice(0, batchCap);\n\n  for (const name of jsonNames) {\n    let record;\n    try {\n      record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));\n    } catch (_err) {\n      continue; // skip unparseable file\n    }\n    if (record && record.title && record.body) {\n      const tokenSet = normalizeTokens(record.title + ' ' + record.body);\n      if (tokenSet.size > 0) {\n        return { ok: true, sample: { title: record.title, tokenCount: tokenSet.size } };\n      }\n    }\n  }\n\n  // Step 3 – nothing passed\n  return { ok: false, reason: 'no-parseable-results' };\n}\n\nmodule.exports = { searchPreflight };\n```\n\nKey details grounded in the repo:\n\n| Concern | Source |\n|---|---|\n| Env-var name `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH`, default `50` | `src/side-finding-sweep.js:32` (only occurrence in `src/`) |\n| `.json` filter + cap pattern | `src/side-finding-sweep.js:45` (`readInboxItems`) |\n| `normalizeTokens` returns a `Set` (so `.size` is valid) | `src/text-similarity.js:17` |\n| `inboxDir` returns a `path.join(...)` string | `src/side-finding.js:112` |\n\n## 3. Verify the module loads without error\n\nRun from the repository root:\n\n```bash\nnode -e \"require('./src/search-preflight.js')\"\n```\n\nExpected: no output, exit code 0. This confirms all four `require` calls resolve and there are no syntax errors.\n\n## 4. (Optional smoke check) Confirm the exported shape\n\n```bash\nnode -e \"const m=require('./src/search-preflight.js'); console.log(typeof m.searchPreflight)\"\n```\n\nExpected output: `function`.\n\n---\n\nCRITERIA:\n- `src/search-preflight.js` exists and `node -e \"require('./src/search-preflight.js')\"` exits 0 with no error output.\n- The file exports exactly one function `searchPreflight` (verified via `typeof require('./src/search-preflight.js').searchPreflight === 'function'`).\n- The function body references `inboxDir` (from `./side-finding.js`), `normalizeTokens` (from `./text-similarity.js`), the env var `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` with fallback `50`, and the literal strings `'inbox-unreachable'` and `'no-parseable-results'` as the two failure `reason` values.\n- The success return shape is exactly `{ ok: true, sample: { title: <string>, tokenCount: <number> } }` where `tokenCount` equals the `.size` of the `Set` returned by `normalizeTokens`.\n- No `fetch`, `http`, `https`, `axios`, or any network/LLM call appears anywhere in the file (grep for those tokens returns zero hits).",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 5902
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 5,
+        "resultCount": 5,
+        "passCount": 5,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T17:44:06.017Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff creates `src/search-preflight.js` with the exact required structure, and the grounding source confirms `inboxDir` is exported from `src/side-finding.js` (line 153) and `normalizeTokens` from `src/text-similarity.js`, while the implement draft's acceptance block cites concrete passing checks (e.g., `node -e \"require('./src/search-preflight.js')\"` → \"loaded ok\", `grep -c \"fetch\\|http\\|https\\|axios\"` → 0) that satisfy all five criteria.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff creates `src/search-preflight.js` with the exact required structure, and the grounding source confirms `inboxDir` is exported from `src/side-finding.js` (line 153) and `normalizeTokens` from `src/text-similarity.js`, while the implement draft's acceptance block cites concrete passing checks (e.g., `node -e \"require('./src/search-preflight.js')\"` → \"loaded ok\", `grep -c \"fetch\\|http\\|https\\|axios\"` → 0) that satisfy all five criteria."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff creates `src/search-preflight.js` with the exact required exports and function body, and the grounding source confirms the real repo state (e.g., `src/side-finding.js:112` defines `inboxDir`, `src/side-finding-sweep.js:26` imports `normalizeTokens` from `./text-similarity.js`), while the acceptance block cites concrete passing checks (e.g., `grep -c \"fetch\\|http\\|https\\|axios\"` returned 0, `typeof m.searchPreflight` is `function`, and `node -e \"require('./src/search-preflight.js')\"` exited 0 with \"loaded ok\") that satisfy all five criteria."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`src/search-preflight.js` exists and `node -e \"require('./src/search-preflight.js')\"` exits 0 with no error output.",
+    "The file exports exactly one function `searchPreflight` (verified via `typeof require('./src/search-preflight.js').searchPreflight === 'function'`).",
+    "The function body references `inboxDir` (from `./side-finding.js`), `normalizeTokens` (from `./text-similarity.js`), the env var `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` with fallback `50`, and the literal strings `'inbox-unreachable'` and ",
+    "The success return shape is exactly `{ ok: true, sample: { title: <string>, tokenCount: <number> } }` where `tokenCount` equals the `.size` of the `Set` returned by `normalizeTokens`.",
+    "No `fetch`, `http`, `https`, `axios`, or any network/LLM call appears anywhere in the file (grep for those tokens returns zero hits)."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "All acceptance criteria verified. Here's the final summary:\n\nRESOLUTION: implemented\n\nCreated `src/search-preflight.js` exporting a single function `searchPreflight(pipelineDir)` that performs a deterministic pre-flight check on the side-findings inbox: it resolves the inbox directory via `inboxDir`, lists `.json` files (capped by `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` or 50), parses each record, and returns a success sample with the first record that has a truthy `title`+`body` whose `normalizeTokens` output is non-empty — or one of two structured failure objects.\n\nAcceptance:\n- `src/search-preflight.js` exists and `node -e \"require('./src/search-preflight.js')\"` exits 0 with no error output -- ran the command -- PASS (exit 0, printed \"loaded ok\")\n- The file exports exactly one function `searchPreflight` -- `Object.keys(m)` returned `['searchPreflight']`, `typeof m.searchPreflight` is `'function'` -- PASS\n- The function body references `inboxDir`, `normalizeTokens`, `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` with fallback 50, and literals `'inbox-unreachable'` / `'no-parseable-results'` -- grep showed all 5 tokens at lines 3, 4, 13, 17, 28, 36 -- PASS\n- Success return shape is `{ ok: true, sample: { title: record.title, tokenCount: tokenSet.size } }` -- confirmed at line 29 -- PASS\n- No `fetch`, `http`, `https`, `axios`, or network/LLM call in the file -- `grep -c` returned 0 hits -- PASS\n\n=== DIFF ===\ndiff --git a/src/search-preflight.js b/src/search-preflight.js\nnew file mode 100644\nindex 00000000..325ccef6\n--- /dev/null\n+++ b/src/search-preflight.js\n@@ -0,0 +1,39 @@\n+const fs = require('fs');\n+const path = require('path');\n+const { inboxDir } = require('./side-finding.js');\n+const { normalizeTokens } = require('./text-similarity.js');\n+\n+function searchPreflight(pipelineDir) {\n+  // Step 1 – resolve inbox dir and list it\n+  const dir = inboxDir(pipelineDir);\n+  let names;\n+  try {\n+    names = fs.readdirSync(dir);\n+  } catch (_err) {\n+    return { ok: false, reason: 'inbox-unreachable' };\n+  }\n+\n+  // Step 2 – filter .json, cap, parse, and test each record\n+  const batchCap = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n+  const jsonNames = names.filter((n) => n.endsWith('.json')).slice(0, batchCap);\n+\n+  for (const name of jsonNames) {\n+    let record;\n+    try {\n+      record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));\n+    } catch (_err) {\n+      continue; // skip unparseable file\n+    }\n+    if (record && record.title && record.body) {\n+      const tokenSet = normalizeTokens(record.title + ' ' + record.body);\n+      if (tokenSet.size > 0) {\n+        return { ok: true, sample: { title: record.title, tokenCount: tokenSet.size } };\n+      }\n+    }\n+  }\n+\n+  // Step 3 – nothing passed\n+  return { ok: false, reason: 'no-parseable-results' };\n+}\n+\n+module.exports = { searchPreflight };",
+  "planResponse": "# PLAN: Create `src/search-preflight.js`\n\n## 1. Create the file and declare the module header\n\nCreate `src/search-preflight.js` (confirmed absent from the current `src/` listing). Open with the required imports:\n\n```js\nconst fs = require('fs');\nconst path = require('path');\nconst { inboxDir } = require('./side-finding.js');\nconst { normalizeTokens } = require('./text-similarity.js');\n```\n\n- `inboxDir` is exported at `src/side-finding.js:153` (defined at line 112, returns `path.join(pipelineDir, 'queue', 'side-findings-inbox')`).\n- `normalizeTokens` is exported at `src/text-similarity.js:73` (defined at line 17, returns a `Set`).\n- `fs` and `path` are Node built-ins; `path` is included per the task spec even though the function body may not reference it directly (it is used internally by `inboxDir`).\n\n## 2. Define and export the single function `searchPreflight(pipelineDir)`\n\n```js\nfunction searchPreflight(pipelineDir) {\n  // Step 1 – resolve inbox dir and list it\n  const dir = inboxDir(pipelineDir);\n  let names;\n  try {\n    names = fs.readdirSync(dir);\n  } catch (_err) {\n    return { ok: false, reason: 'inbox-unreachable' };\n  }\n\n  // Step 2 – filter, cap, parse, and test each record\n  const batchCap = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n  const jsonNames = names.filter((n) => n.endsWith('.json')).slice(0, batchCap);\n\n  for (const name of jsonNames) {\n    let record;\n    try {\n      record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));\n    } catch (_err) {\n      continue; // skip unparseable file\n    }\n    if (record && record.title && record.body) {\n      const tokenSet = normalizeTokens(record.title + ' ' + record.body);\n      if (tokenSet.size > 0) {\n        return { ok: true, sample: { title: record.title, tokenCount: tokenSet.size } };\n      }\n    }\n  }\n\n  // Step 3 – nothing passed\n  return { ok: false, reason: 'no-parseable-results' };\n}\n\nmodule.exports = { searchPreflight };\n```\n\nKey details grounded in the repo:\n\n| Concern | Source |\n|---|---|\n| Env-var name `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH`, default `50` | `src/side-finding-sweep.js:32` (only occurrence in `src/`) |\n| `.json` filter + cap pattern | `src/side-finding-sweep.js:45` (`readInboxItems`) |\n| `normalizeTokens` returns a `Set` (so `.size` is valid) | `src/text-similarity.js:17` |\n| `inboxDir` returns a `path.join(...)` string | `src/side-finding.js:112` |\n\n## 3. Verify the module loads without error\n\nRun from the repository root:\n\n```bash\nnode -e \"require('./src/search-preflight.js')\"\n```\n\nExpected: no output, exit code 0. This confirms all four `require` calls resolve and there are no syntax errors.\n\n## 4. (Optional smoke check) Confirm the exported shape\n\n```bash\nnode -e \"const m=require('./src/search-preflight.js'); console.log(typeof m.searchPreflight)\"\n```\n\nExpected output: `function`.\n\n---\n\nCRITERIA:\n- `src/search-preflight.js` exists and `node -e \"require('./src/search-preflight.js')\"` exits 0 with no error output.\n- The file exports exactly one function `searchPreflight` (verified via `typeof require('./src/search-preflight.js').searchPreflight === 'function'`).\n- The function body references `inboxDir` (from `./side-finding.js`), `normalizeTokens` (from `./text-similarity.js`), the env var `AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH` with fallback `50`, and the literal strings `'inbox-unreachable'` and `'no-parseable-results'` as the two failure `reason` values.\n- The success return shape is exactly `{ ok: true, sample: { title: <string>, tokenCount: <number> } }` where `tokenCount` equals the `.size` of the `Set` returned by `normalizeTokens`.\n- No `fetch`, `http`, `https`, `axios`, or any network/LLM call appears anywhere in the file (grep for those tokens returns zero hits).",
+  "reviewedAt": "2026-09-13T17:47:39.709Z",
+  "claimedAt": "2026-09-13T17:23:46.150Z"
+}

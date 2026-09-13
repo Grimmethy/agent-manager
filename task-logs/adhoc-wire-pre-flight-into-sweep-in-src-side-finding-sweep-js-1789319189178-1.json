@@ -1,0 +1,233 @@
+{
+  "id": "adhoc-wire-pre-flight-into-sweep-in-src-side-finding-sweep-js-1789319189178-1",
+  "title": "Wire pre-flight into sweep() in src/side-finding-sweep.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T21:37:00.087Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T21:40:00.000Z",
+      "detail": "retrofitted stacked={branch:agent/adhoc-create-src-search-preflight-js-1789319189178-0,seq:2,total:2} onto dependsOn:[adhoc-create-src-search-preflight-js-1789319189178-0] -- adhoc-create-src-search-preflight-js-1789319189178-0 was done-but-unmerged and never would have cleared without a human merging it (see [[hub-task-integration]]); this makes isDependencySatisfied treat its queue/done/ arrival as satisfied, same as any newly-filed decompose chain now gets automatically (PR #204). Operator retrofit, one-time, not a live worker action."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T21:37:01.846Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T21:43:19.492Z",
+      "detail": "5 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T21:45:17.082Z",
+      "detail": "2 attempt(s), 5535 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T21:45:29.880Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T21:47:07.561Z",
+      "detail": "agentic, 2693 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T21:47:07.562Z",
+      "detail": "resolution=implemented, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T21:47:07.564Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T21:47:07.565Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T21:47:49.782Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T21:48:07.072Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "Edit src/side-finding-sweep.js: add const { searchPreflight } = require('./search-preflight.js'); to the require block (after the existing requires). Inside sweep(), after the kill-switch early-return (if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;) and before const items = readInboxItems(pipelineDir);, insert: const pf = searchPreflight(pipelineDir); if (!pf.ok) { summary.errors = 1; summary.preflight = { ok: false, reason: pf.reason }; return summary; }. Do not modify src/text-similarity.js. Verify with node -e \"require('./src/side-finding-sweep.js')\".",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788725054994-add-a-deterministic-pre-flight-that-veri-1788803062331"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T21:37:01.845Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1494,
+          "response": "All acceptance criteria verified against the real checkout. The require line sits immediately after the `inboxDir` require (line 30) with the rest of the require block untouched, and the pre-flight guard is correctly positioned between the kill-switch and `readInboxItems` (lines 76–81).\n\nRESOLUTION: implemented\nI wired the `searchPreflight` pre-flight into `sweep()` in `src/side-finding-sweep.js`: added `const { searchPreflight } = require('./search-preflight.js');` right after the existing require block, and inserted the 4-line guard (setting `summary.errors = 1` and `summary.preflight = { ok:false, reason: pf.reason }`, then returning) between the kill-switch early-return and `readInboxItems`. I did not touch `src/text-similarity.js`.\n\nAcceptance:\n- Require line after `inboxDir` require, block otherwise unchanged -- `grep -n search-preflight` shows line 30; read of lines 23-32 confirms lines 24-29 unchanged -- PASS\n- 4-line guard between kill-switch and `readInboxItems` -- read of lines 73-84 shows lines 76-81 in correct position -- PASS\n- `node -e \"require('./src/side-finding-sweep.js')\"` exits 0, no error -- output `LOAD-OK`, exitCode 0 -- PASS\n- `src/text-similarity.js` not in modified files -- `git diff --name-only` shows only `src/side-finding-sweep.js` -- PASS\n- `src/search-preflight.js` exists and exports callable `searchPreflight` -- `test -f` = EXISTS; `module.exports = { searchPreflight }` at line 39, `function searchPreflight(pipelineDir)` at line 6 -- PASS",
+          "rawDiffChars": 1184,
+          "rawDiff": "diff --git a/src/side-finding-sweep.js b/src/side-finding-sweep.js\nindex 73be592e..05c1a3e8 100644\n--- a/src/side-finding-sweep.js\n+++ b/src/side-finding-sweep.js\n@@ -27,6 +27,7 @@ const { normalizeTokens, jaccardSimilarity, sharesDistinctivePhrase } = require(\n const { writeJsonAtomicSync } = require('./atomic-write.js');\n const { loadBrainDump } = require('./apply-group-a.js');\n const { inboxDir } = require('./side-finding.js');\n+const { searchPreflight } = require('./search-preflight.js');\n \n const MAX_SEEN_IN = 20;\n const BATCH_CAP = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n@@ -72,6 +73,13 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {\n   const summary = { scanned: 0, merged: 0, created: 0, errors: 0, wouldMerge: [], wouldCreate: [] };\n   if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;\n \n+  const pf = searchPreflight(pipelineDir);\n+  if (!pf.ok) {\n+    summary.errors = 1;\n+    summary.preflight = { ok: false, reason: pf.reason };\n+    return summary;\n+  }\n+\n   const items = readInboxItems(pipelineDir);\n   summary.scanned = items.length;\n   if (items.length === 0) return summary;",
+          "turnsUsed": 8,
+          "toolCalls": {
+            "total": 10,
+            "byTool": {
+              "run_bash": 4,
+              "grep_codebase": 1,
+              "read_file": 3,
+              "edit_file": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1422
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 3,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 322
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "path"
+                ],
+                "bytes": 1402
+              },
+              {
+                "n": 5,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 50
+              },
+              {
+                "n": 6,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 50
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 266
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 346
+              },
+              {
+                "n": 9,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 633
+              },
+              {
+                "n": 10,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 643
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 5
+      },
+      "plan": {
+        "chars": 5535,
+        "text": "# PLAN: Wire pre-flight into `sweep()` in `src/side-finding-sweep.js`\n\n## Context & Discrepancy\n\nThe orientation report **confirms** (via directory listing, two greps) that `src/search-preflight.js` does **not** exist on disk. The hub status for the sibling task \"Create src/search-preflight.js\" says *done*, but the VERIFIED line could not parse a target path and therefore did not actually confirm the file. This is a direct disagreement. The plan below resolves it before touching `side-finding-sweep.js`.\n\n---\n\n## Steps\n\n1. **Resolve the `search-preflight.js` existence question.**\n   - Run `ls src/search-preflight.js` (or `test -f src/search-preflight.js && echo OK`).\n   - If the file is **absent**, also try `find . -name 'search-preflight*'` in case the sibling task landed it at a different path (e.g. `lib/`, `src/preflight/`).\n   - **If still absent:** the task as written cannot be completed — the `require('./search-preflight.js')` will throw `MODULE_NOT_FOUND` at load time, and the mandated verification command will fail. **Stop and report** that the prerequisite sibling task did not actually produce the file. Do NOT create `search-preflight.js` yourself (that is a separate task's scope).\n   - **If present:** confirm it exports a `searchPreflight` function (grep for `module.exports` or `exports.searchPreflight` in that file) and that it accepts a `pipelineDir` argument and returns an object with at least `{ ok, reason }`. Proceed to step 2.\n\n2. **Add the require line (after line 29).**\n   - Open `src/side-finding-sweep.js`. The require block currently ends at **line 29** with `const { inboxDir } = require('./side-finding.js');`.\n   - Insert **one new line** immediately after line 29 (before whatever blank line or comment follows):\n     ```js\n     const { searchPreflight } = require('./search-preflight.js');\n     ```\n   - Do **not** reorder or modify any existing require lines (lines 23–29).\n   - Do **not** touch `src/text-similarity.js` (referenced at line 24).\n\n3. **Insert the pre-flight guard inside `sweep()`.**\n   - Locate the kill-switch early-return at **line 73**:\n     `if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;`\n   - The next line (74) is blank; the line after that (75) is:\n     `const items = readInboxItems(pipelineDir);`\n   - Between line 74 (the blank line after the kill-switch) and line 75, insert the following block (preserving the blank line as a separator before the new code):\n     ```js\n     const pf = searchPreflight(pipelineDir);\n     if (!pf.ok) {\n       summary.errors = 1;\n       summary.preflight = { ok: false, reason: pf.reason };\n       return summary;\n     }\n     ```\n   - After insertion, line 75 (`const items = readInboxItems(pipelineDir);`) shifts down by 5 lines. All subsequent line numbers in the file shift accordingly — this is expected and fine.\n   - Verify the `summary` object (line 72) already has an `errors` field (the orientation report shows `const summary = { scanned: 0, merged: 0, created: 0, errors` …) so the assignment `summary.errors = 1` is valid. The `preflight` key is new; that is intentional per the spec.\n\n4. **Sanity-check the edited file (no test run, just syntax + load).**\n   - Run:\n     ```bash\n     node -e \"require('./src/side-finding-sweep.js')\"\n     ```\n   - Expected: no output, exit code 0. (The CLI tail at lines 185–199 is gated on `require.main === module`, which is `false` under `node -e`, so `sweep()` is not invoked — the file simply loads and exports.)\n   - If this throws `MODULE_NOT_FOUND` for `search-preflight.js`, return to step 1.\n   - If it throws a `SyntaxError`, re-check the inserted block for missing braces/semicolons.\n\n5. **Confirm `src/text-similarity.js` is untouched.**\n   - Run `git diff --name-only` (or `git status`) and verify `src/text-similarity.js` does **not** appear in the changed-files list.\n\n6. **Optional (if a test file exists): run the existing sweep test.**\n   - The orientation report notes `src/side-finding-sweep.test.js` was read. If the project has a test runner configured (`npm test`, `npx jest`, etc.), run it to confirm no regressions. If the pre-flight guard causes a test to fail because the test's fixture `pipelineDir` doesn't satisfy `searchPreflight`, that is a test-fixture issue to flag, not a code bug.\n\n---\n\n## What this plan does NOT do\n\n- Does **not** create or modify `src/search-preflight.js` (sibling task's scope).\n- Does **not** modify `src/text-similarity.js`.\n- Does **not** add new tests (the sibling \"Create src/search-preflight.test.js\" covers that).\n- Does **not** change the `sweep()` signature, the `BATCH_CAP`/`MAX_SEEN_IN` exports, or the CLI tail.\n\n---\n\nCRITERIA:\n- `src/side-finding-sweep.js` contains the line `const { searchPreflight } = require('./search-preflight.js');` immediately after the existing require block (after the `inboxDir` require), and the file's require block is otherwise unchanged.\n- `src/side-finding-sweep.js` contains the 4-line pre-flight guard (`const pf = searchPreflight(pipelineDir);` … `return summary;`) positioned between the kill-switch `return summary;` and `const items = readInboxItems(pipelineDir);` inside `sweep()`.\n- `node -e \"require('./src/side-finding-sweep.js')\"` exits with code 0 and produces no error output.\n- `git diff --name-only` (or equivalent) shows `src/text-similarity.js` is **not** among the modified files.\n- `src/search-preflight.js` exists on disk and exports a callable `searchPreflight` (prerequisite verified in step 1 before any edits are made).",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 5817,
+        "anchorPaths": [
+          "src/side-finding-sweep.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 5,
+        "resultCount": 5,
+        "passCount": 5,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T21:47:07.565Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff correctly adds the `searchPreflight` require line immediately after the `inboxDir` require and inserts the 4-line pre-flight guard between the kill-switch and `readInboxItems`, satisfying all acceptance criteria as verified by the grounding source showing `src/search-preflight.js` exists with the correct export and the `node -e` load test passing.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff correctly adds the `searchPreflight` require line immediately after the `inboxDir` require and inserts the 4-line pre-flight guard between the kill-switch and `readInboxItems`, satisfying all acceptance criteria as verified by the grounding source showing `src/search-preflight.js` exists with the correct export and the `node -e` load test passing."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff correctly adds the `searchPreflight` require after the `inboxDir` require and inserts the 4-line guard between the kill-switch and `readInboxItems`, and the grounding source confirms `src/search-preflight.js` exists with the expected export, `node -e` load succeeds, and `git diff --name-only` shows only `src/side-finding-sweep.js` modified."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`src/side-finding-sweep.js` contains the line `const { searchPreflight } = require('./search-preflight.js');` immediately after the existing require block (after the `inboxDir` require), and the file's require block is otherwise unchanged.",
+    "`src/side-finding-sweep.js` contains the 4-line pre-flight guard (`const pf = searchPreflight(pipelineDir);` … `return summary;`) positioned between the kill-switch `return summary;` and `const items = readInboxItems(pipelineDir);` inside `",
+    "`node -e \"require('./src/side-finding-sweep.js')\"` exits with code 0 and produces no error output.",
+    "`git diff --name-only` (or equivalent) shows `src/text-similarity.js` is **not** among the modified files.",
+    "`src/search-preflight.js` exists on disk and exports a callable `searchPreflight` (prerequisite verified in step 1 before any edits are made)."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "All acceptance criteria verified against the real checkout. The require line sits immediately after the `inboxDir` require (line 30) with the rest of the require block untouched, and the pre-flight guard is correctly positioned between the kill-switch and `readInboxItems` (lines 76–81).\n\nRESOLUTION: implemented\nI wired the `searchPreflight` pre-flight into `sweep()` in `src/side-finding-sweep.js`: added `const { searchPreflight } = require('./search-preflight.js');` right after the existing require block, and inserted the 4-line guard (setting `summary.errors = 1` and `summary.preflight = { ok:false, reason: pf.reason }`, then returning) between the kill-switch early-return and `readInboxItems`. I did not touch `src/text-similarity.js`.\n\nAcceptance:\n- Require line after `inboxDir` require, block otherwise unchanged -- `grep -n search-preflight` shows line 30; read of lines 23-32 confirms lines 24-29 unchanged -- PASS\n- 4-line guard between kill-switch and `readInboxItems` -- read of lines 73-84 shows lines 76-81 in correct position -- PASS\n- `node -e \"require('./src/side-finding-sweep.js')\"` exits 0, no error -- output `LOAD-OK`, exitCode 0 -- PASS\n- `src/text-similarity.js` not in modified files -- `git diff --name-only` shows only `src/side-finding-sweep.js` -- PASS\n- `src/search-preflight.js` exists and exports callable `searchPreflight` -- `test -f` = EXISTS; `module.exports = { searchPreflight }` at line 39, `function searchPreflight(pipelineDir)` at line 6 -- PASS\n\n=== DIFF ===\ndiff --git a/src/side-finding-sweep.js b/src/side-finding-sweep.js\nindex 73be592e..05c1a3e8 100644\n--- a/src/side-finding-sweep.js\n+++ b/src/side-finding-sweep.js\n@@ -27,6 +27,7 @@ const { normalizeTokens, jaccardSimilarity, sharesDistinctivePhrase } = require(\n const { writeJsonAtomicSync } = require('./atomic-write.js');\n const { loadBrainDump } = require('./apply-group-a.js');\n const { inboxDir } = require('./side-finding.js');\n+const { searchPreflight } = require('./search-preflight.js');\n \n const MAX_SEEN_IN = 20;\n const BATCH_CAP = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;\n@@ -72,6 +73,13 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {\n   const summary = { scanned: 0, merged: 0, created: 0, errors: 0, wouldMerge: [], wouldCreate: [] };\n   if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;\n \n+  const pf = searchPreflight(pipelineDir);\n+  if (!pf.ok) {\n+    summary.errors = 1;\n+    summary.preflight = { ok: false, reason: pf.reason };\n+    return summary;\n+  }\n+\n   const items = readInboxItems(pipelineDir);\n   summary.scanned = items.length;\n   if (items.length === 0) return summary;",
+  "planResponse": "# PLAN: Wire pre-flight into `sweep()` in `src/side-finding-sweep.js`\n\n## Context & Discrepancy\n\nThe orientation report **confirms** (via directory listing, two greps) that `src/search-preflight.js` does **not** exist on disk. The hub status for the sibling task \"Create src/search-preflight.js\" says *done*, but the VERIFIED line could not parse a target path and therefore did not actually confirm the file. This is a direct disagreement. The plan below resolves it before touching `side-finding-sweep.js`.\n\n---\n\n## Steps\n\n1. **Resolve the `search-preflight.js` existence question.**\n   - Run `ls src/search-preflight.js` (or `test -f src/search-preflight.js && echo OK`).\n   - If the file is **absent**, also try `find . -name 'search-preflight*'` in case the sibling task landed it at a different path (e.g. `lib/`, `src/preflight/`).\n   - **If still absent:** the task as written cannot be completed — the `require('./search-preflight.js')` will throw `MODULE_NOT_FOUND` at load time, and the mandated verification command will fail. **Stop and report** that the prerequisite sibling task did not actually produce the file. Do NOT create `search-preflight.js` yourself (that is a separate task's scope).\n   - **If present:** confirm it exports a `searchPreflight` function (grep for `module.exports` or `exports.searchPreflight` in that file) and that it accepts a `pipelineDir` argument and returns an object with at least `{ ok, reason }`. Proceed to step 2.\n\n2. **Add the require line (after line 29).**\n   - Open `src/side-finding-sweep.js`. The require block currently ends at **line 29** with `const { inboxDir } = require('./side-finding.js');`.\n   - Insert **one new line** immediately after line 29 (before whatever blank line or comment follows):\n     ```js\n     const { searchPreflight } = require('./search-preflight.js');\n     ```\n   - Do **not** reorder or modify any existing require lines (lines 23–29).\n   - Do **not** touch `src/text-similarity.js` (referenced at line 24).\n\n3. **Insert the pre-flight guard inside `sweep()`.**\n   - Locate the kill-switch early-return at **line 73**:\n     `if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;`\n   - The next line (74) is blank; the line after that (75) is:\n     `const items = readInboxItems(pipelineDir);`\n   - Between line 74 (the blank line after the kill-switch) and line 75, insert the following block (preserving the blank line as a separator before the new code):\n     ```js\n     const pf = searchPreflight(pipelineDir);\n     if (!pf.ok) {\n       summary.errors = 1;\n       summary.preflight = { ok: false, reason: pf.reason };\n       return summary;\n     }\n     ```\n   - After insertion, line 75 (`const items = readInboxItems(pipelineDir);`) shifts down by 5 lines. All subsequent line numbers in the file shift accordingly — this is expected and fine.\n   - Verify the `summary` object (line 72) already has an `errors` field (the orientation report shows `const summary = { scanned: 0, merged: 0, created: 0, errors` …) so the assignment `summary.errors = 1` is valid. The `preflight` key is new; that is intentional per the spec.\n\n4. **Sanity-check the edited file (no test run, just syntax + load).**\n   - Run:\n     ```bash\n     node -e \"require('./src/side-finding-sweep.js')\"\n     ```\n   - Expected: no output, exit code 0. (The CLI tail at lines 185–199 is gated on `require.main === module`, which is `false` under `node -e`, so `sweep()` is not invoked — the file simply loads and exports.)\n   - If this throws `MODULE_NOT_FOUND` for `search-preflight.js`, return to step 1.\n   - If it throws a `SyntaxError`, re-check the inserted block for missing braces/semicolons.\n\n5. **Confirm `src/text-similarity.js` is untouched.**\n   - Run `git diff --name-only` (or `git status`) and verify `src/text-similarity.js` does **not** appear in the changed-files list.\n\n6. **Optional (if a test file exists): run the existing sweep test.**\n   - The orientation report notes `src/side-finding-sweep.test.js` was read. If the project has a test runner configured (`npm test`, `npx jest`, etc.), run it to confirm no regressions. If the pre-flight guard causes a test to fail because the test's fixture `pipelineDir` doesn't satisfy `searchPreflight`, that is a test-fixture issue to flag, not a code bug.\n\n---\n\n## What this plan does NOT do\n\n- Does **not** create or modify `src/search-preflight.js` (sibling task's scope).\n- Does **not** modify `src/text-similarity.js`.\n- Does **not** add new tests (the sibling \"Create src/search-preflight.test.js\" covers that).\n- Does **not** change the `sweep()` signature, the `BATCH_CAP`/`MAX_SEEN_IN` exports, or the CLI tail.\n\n---\n\nCRITERIA:\n- `src/side-finding-sweep.js` contains the line `const { searchPreflight } = require('./search-preflight.js');` immediately after the existing require block (after the `inboxDir` require), and the file's require block is otherwise unchanged.\n- `src/side-finding-sweep.js` contains the 4-line pre-flight guard (`const pf = searchPreflight(pipelineDir);` … `return summary;`) positioned between the kill-switch `return summary;` and `const items = readInboxItems(pipelineDir);` inside `sweep()`.\n- `node -e \"require('./src/side-finding-sweep.js')\"` exits with code 0 and produces no error output.\n- `git diff --name-only` (or equivalent) shows `src/text-similarity.js` is **not** among the modified files.\n- `src/search-preflight.js` exists on disk and exports a callable `searchPreflight` (prerequisite verified in step 1 before any edits are made).",
+  "reviewedAt": "2026-09-13T21:48:07.072Z",
+  "claimedAt": "2026-09-13T21:37:00.976Z"
+}

@@ -27,6 +27,7 @@ const { normalizeTokens, jaccardSimilarity, sharesDistinctivePhrase } = require(
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { loadBrainDump } = require('./apply-group-a.js');
 const { inboxDir } = require('./side-finding.js');
+const { searchPreflight } = require('./search-preflight.js');
 
 const MAX_SEEN_IN = 20;
 const BATCH_CAP = Number(process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP_BATCH) || 50;
@@ -71,6 +72,13 @@ function readInboxItems(pipelineDir) {
 async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
   const summary = { scanned: 0, merged: 0, created: 0, errors: 0, wouldMerge: [], wouldCreate: [] };
   if (process.env.AGENT_MANAGER_SIDE_FINDING_SWEEP === 'false') return summary;
+
+  const pf = searchPreflight(pipelineDir);
+  if (!pf.ok) {
+    summary.errors = 1;
+    summary.preflight = { ok: false, reason: pf.reason };
+    return summary;
+  }
 
   const items = readInboxItems(pipelineDir);
   summary.scanned = items.length;
