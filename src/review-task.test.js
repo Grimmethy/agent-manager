@@ -57,7 +57,7 @@ require('./task-sources.js');
   }
 }
 
-const { reviewTask, buildVerdictPrompt } = require('./review-task.js');
+const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview } = require('./review-task.js');
 
 // A generic reviewable task that DOES go through the LLM majority vote. (brain_dump_sort
 // stopped doing that in 2026-09-03 -- it uses deterministicReview now, see
@@ -1341,4 +1341,77 @@ test('empty draft for a NON-emptyApproval source is unaffected (falls through, n
   const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]) });
   assert.notEqual(task.reviewProvider, 'deterministic-empty-fail');
   assert.notEqual(task.reviewProvider, 'deterministic-empty-approve');
+});
+
+// renderImplementResponseForReview (2026-09-13, screaminggoatclubmt investigation,
+// pipeline-forensics-fix-ac-24) -----------------------------------------------------------
+// Root-caused live: a Group B draft ([{mode:'edit',...},{mode:'create',...}]) that
+// genuinely included a correct edit AND a real, substantial new test file was rejected
+// TWICE by the local reviewer with "the draft omits the acceptance test" -- the test file's
+// full content really was in the prompt, but buried as an escaped substring inside one
+// unbroken compact-JSON line (real newlines shown as literal backslash-n) that the
+// quantized local reviewer failed to parse/attend to.
+
+test('renderImplementResponseForReview: a Group B edit+create array is rendered as labeled sections with real newlines', () => {
+  const implementResponse = JSON.stringify([
+    { mode: 'edit', file: 'src/blocked-drain.js', find: 'const isDesignDecision = x;', replace: 'const isDesignDecision = y;' },
+    { mode: 'create', file: 'test/ac-24-duplicate-flag-acceptance.js', content: "assert.strictEqual(after.status, 'pending');\nconsole.log('PASS positive');" },
+  ]);
+  const rendered = renderImplementResponseForReview(implementResponse);
+  // Real newlines, not the escaped `\n` two-character sequence JSON.stringify produced.
+  assert.ok(rendered.includes('\n'));
+  assert.ok(!rendered.includes('\\n'));
+  assert.match(rendered, /--- EDIT: src\/blocked-drain\.js ---/);
+  assert.match(rendered, /--- NEW FILE: test\/ac-24-duplicate-flag-acceptance\.js ---/);
+  // The exact regression: the test file's real content must be present and legible.
+  assert.ok(rendered.includes("assert.strictEqual(after.status, 'pending');"));
+  assert.ok(rendered.includes("console.log('PASS positive');"));
+});
+
+test('renderImplementResponseForReview: a lone edit op (no array wrapper) still gets a legible label', () => {
+  const implementResponse = JSON.stringify({ mode: 'edit', file: 'a.js', find: 'x', replace: 'y' });
+  const rendered = renderImplementResponseForReview(implementResponse);
+  assert.match(rendered, /--- EDIT: a\.js ---/);
+  assert.match(rendered, /FIND:\nx/);
+  assert.match(rendered, /REPLACE:\ny/);
+});
+
+test('renderImplementResponseForReview: a lone create op (no array wrapper) still gets a legible label', () => {
+  const implementResponse = JSON.stringify({ mode: 'create', file: 'new.js', content: 'module.exports = {};' });
+  const rendered = renderImplementResponseForReview(implementResponse);
+  assert.match(rendered, /--- NEW FILE: new\.js ---/);
+  assert.ok(rendered.includes('module.exports = {};'));
+});
+
+test('renderImplementResponseForReview: non-Group-B free text (e.g. a local-agentic-write transcript) passes through unchanged', () => {
+  const implementResponse = 'Investigated and the real bug was in bar.js, not foo.js.\n\n=== DIFF ===\ndiff --git a/bar.js b/bar.js\nRESOLUTION: implemented';
+  assert.equal(renderImplementResponseForReview(implementResponse), implementResponse);
+});
+
+test('renderImplementResponseForReview: a split-proposal array (title/rawText shape, not Group B) passes through unchanged', () => {
+  const implementResponse = JSON.stringify([{ title: 'Add config plumbing', rawText: 'do the thing' }]);
+  assert.equal(renderImplementResponseForReview(implementResponse), implementResponse);
+});
+
+test('renderImplementResponseForReview: malformed JSON is returned unchanged, never throws', () => {
+  const implementResponse = 'not valid json {[';
+  assert.equal(renderImplementResponseForReview(implementResponse), implementResponse);
+});
+
+test('renderImplementResponseForReview: an empty array passes through unchanged', () => {
+  assert.equal(renderImplementResponseForReview('[]'), '[]');
+});
+
+test('buildVerdictPrompt renders a Group B implementResponse through the legible formatter, not as raw escaped JSON', () => {
+  const implementResponse = JSON.stringify([
+    { mode: 'edit', file: 'src/blocked-drain.js', find: 'old', replace: 'new' },
+    { mode: 'create', file: 'test/x.test.js', content: "it('works', () => { assert.ok(true); });" },
+  ]);
+  const task = baseTask({ implementResponse });
+  const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+  assert.match(prompt, /--- NEW FILE: test\/x\.test\.js ---/);
+  assert.ok(prompt.includes("it('works', () => { assert.ok(true); });"));
+  // The old raw-string behavior would have put the whole implementResponse on one line
+  // inside the "--- IMPLEMENT draft ---" section with literal backslash-n sequences.
+  assert.ok(!prompt.includes(implementResponse));
 });
