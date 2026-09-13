@@ -45,7 +45,7 @@ const READMIT_CLEAN_SLATE_FIELDS = [
   'infraErrorRetry', 'infraErrorNote', 'adhocResolution', 'subTaskProposals',
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage', 'claimedAt',
   'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
-  'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback',
+  'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback', 'premiseReadmitCount',
 ];
 
 // A prior forbidden-path block whose named path is actually one of the task's OWN declared
@@ -73,6 +73,24 @@ function forbiddenPathBlockNamesOwnTarget(task) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, task.planResponse || task.lastGoodPlan || ''); } catch { return false; }
   return [...named].some((n) => targets.some((t) => pathsRefEqual(n, t)));
+}
+
+// 2026-09-06: candidate-premise-check.js's premise gate (the "Invalid premise:" block
+// producer at local-draft.js's premiseCheck hook; root cause documented in
+// blocked-task-classifiers.js) can reject a task whose premise the check itself later
+// invalidated -- the block text carries the gate's verdict, not a real review signal.
+// Mirrors forbiddenPathBlockNamesOwnTarget's one-shot re-admission pattern: this
+// predicate fires ONLY while task.premiseReadmitCount is falsy; the re-admission branch
+// sets the count and READMIT_CLEAN_SLATE_FIELDS (which lists 'premiseReadmitCount')
+// strips the guard on any subsequent clean-slate pass, so the bound is one-shot per
+// task lifecycle and a task that somehow still fails this way is not re-admitted forever.
+function invalidPremiseBeforeCheckExisted(task) {
+  const reason = (task.blockedReason || '') + ' ' + (task.priorRejectionFeedback || '');
+  return (
+    /Invalid premise:/i.test(reason) &&
+    task.blockedStage === 'review' &&
+    !task.premiseReadmitCount
+  );
 }
 
 function isReviewRejection(task) {
@@ -441,7 +459,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted };
 
 if (require.main === module) {
   main();
