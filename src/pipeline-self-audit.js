@@ -98,11 +98,14 @@ function buildAuditRawText(cluster) {
   // cheap, direct context for whoever investigates this next (human or the audit task's
   // own drafting pass) about WHERE to look before they start reading code.
   const { faultSide } = classifyBlockedTask(tasks[0]);
-  const faultSideNote = {
-    harness: 'Classified as: harness-side (a tool/fetch/scaffolding bug, not a bad model attempt).',
-    environment: 'Classified as: environment-side (an external resource/dependency this sandbox cannot provide).',
-    model: 'Classified as: model-side (the draft itself is wrong -- targeted feedback may fix it on redraft).',
-  }[faultSide] || '';
+  const hasInconclusive = tasks.some(t => t.reviewInconclusive === true);
+  const faultSideNote = hasInconclusive
+    ? 'gate-inconclusive (stochastic re-roll, not a genuine reviewer rejection)'
+    : ({
+        harness: 'Classified as: harness-side (a tool/fetch/scaffolding bug, not a bad model attempt).',
+        environment: 'Classified as: environment-side (an external resource/dependency this sandbox cannot provide).',
+        model: 'Classified as: model-side (the draft itself is wrong -- targeted feedback may fix it on redraft).',
+      }[faultSide] || '');
 
   return [
     `A deterministic scan of this pipeline's own queue/blocked/ found ${tasks.length} tasks (source="${source}") all failing the SAME way: ${category}.`,
