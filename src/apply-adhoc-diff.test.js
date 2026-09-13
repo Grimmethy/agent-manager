@@ -411,6 +411,76 @@ test('queueSubTasks never folds a real code-change proposal, even one that happe
   assert.equal('acceptanceCriteria' in wirer, false);
 });
 
+// 2026-09-13 (screaminggoatclubmt: "build the hubs so that they add to the worktree of
+// the previously completed hub member"). Root cause this replaces: a hard dependsOn edge
+// only clears once the predecessor is actually MERGED to main, and nothing ever merges a
+// plain hub sub-task's branch on its own -- confirmed across 6+ real hubs the same day,
+// every one frozen at "1 of N done" forever. Fix: an `after` chain now ALSO gets a shared
+// `stacked` branch (the same mechanism file-decompose-to-hub.js already uses), so the next
+// step's draft worktree is built from the branch that already carries the predecessor's
+// real commit -- isDependencySatisfied() treats a stacked predecessor's `done` arrival as
+// satisfied, no merge required (see task-sources.js's own header).
+test('queueSubTasks: a 2-step `after` chain gets a shared stacked branch + seq 1/2, dependsOn unchanged', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Add predicate field', rawText: 'add X' },
+    { title: 'Insert sweep loop requeue branch', rawText: 'use X', after: 0 },
+  ];
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-stack-1', {});
+  const tasks = readQueuedAdhocTasks(pipelineDir);
+  const first = tasks.find((t) => t.title === 'Add predicate field');
+  const second = tasks.find((t) => t.title === 'Insert sweep loop requeue branch');
+
+  assert.equal(first.dependsOn, undefined);
+  assert.ok(first.stacked && first.stacked.branch, 'root of the chain is stacked too');
+  assert.equal(first.stacked.seq, 1);
+  assert.equal(first.stacked.total, 2);
+
+  assert.deepEqual(second.dependsOn, [queued.find((q) => q.title === first.title).id]);
+  assert.equal(second.stacked.branch, first.stacked.branch, 'same shared branch');
+  assert.equal(second.stacked.seq, 2);
+  assert.equal(second.stacked.total, 2);
+});
+
+test('queueSubTasks: a 3-step chain gets seq 1/2/3 in order; an unrelated standalone proposal is left un-stacked', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Step A', rawText: 'a' },
+    { title: 'Step B', rawText: 'b', after: 0 },
+    { title: 'Step C', rawText: 'c', after: 1 },
+    { title: 'Unrelated', rawText: 'u' },
+  ];
+  queueSubTasks(subTasks, pipelineDir, 'parent-stack-2', {});
+  const tasks = readQueuedAdhocTasks(pipelineDir);
+  const byTitle = (t) => tasks.find((x) => x.title === t);
+
+  assert.equal(byTitle('Step A').stacked.seq, 1);
+  assert.equal(byTitle('Step B').stacked.seq, 2);
+  assert.equal(byTitle('Step C').stacked.seq, 3);
+  assert.equal(byTitle('Step A').stacked.branch, byTitle('Step C').stacked.branch);
+  assert.equal(byTitle('Step A').stacked.total, 3);
+  assert.equal(byTitle('Unrelated').stacked, undefined, 'a proposal with no after link stays un-stacked');
+});
+
+test('queueSubTasks: two independent chains in one hub get two separate stacked branches', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const subTasks = [
+    { title: 'Chain1 Step A', rawText: 'a1' },
+    { title: 'Chain1 Step B', rawText: 'b1', after: 0 },
+    { title: 'Chain2 Step A', rawText: 'a2' },
+    { title: 'Chain2 Step B', rawText: 'b2', after: 2 },
+  ];
+  queueSubTasks(subTasks, pipelineDir, 'parent-stack-3', {});
+  const tasks = readQueuedAdhocTasks(pipelineDir);
+  const byTitle = (t) => tasks.find((x) => x.title === t);
+
+  const branch1 = byTitle('Chain1 Step A').stacked.branch;
+  const branch2 = byTitle('Chain2 Step A').stacked.branch;
+  assert.notEqual(branch1, branch2, 'each independent chain gets its own branch');
+  assert.equal(byTitle('Chain1 Step B').stacked.branch, branch1);
+  assert.equal(byTitle('Chain2 Step B').stacked.branch, branch2);
+});
+
 test('applyAdhocDiff end-to-end: the real incident shape (comment + confirm) queues exactly ONE task with the confirmation folded in', () => {
   const repoDir = makeRepo();
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
