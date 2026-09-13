@@ -271,3 +271,26 @@ test('reviewBrainDumpSort still rejects a genuinely off-taxonomy folder even tho
   const task = { implementResponse: JSON.stringify({ secondBrainPath: 'errands/x.md' }) };
   assert.match(reviewBrainDumpSort(task, { trackedProjectLabels: [] }).reason, /not one of the allowed/);
 });
+
+test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {
+  const task = {
+    implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),
+    promptContext: {
+      rawText: 'Fix the queue worker in PromptForge so drafts persist',
+      projectLabels: ['PromptForge', 'agent-manager'],
+      selfProjectLabel: 'agent-manager',
+    },
+  };
+  assert.deepEqual(
+    reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),
+    { ok: true },
+  );
+});
+
+test('reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)', () => {
+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }) };
+  const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });
+  // Rejection shape is { ok:false, reason } (no belongsToProject leaked into the result).
+  assert.match(result.reason, /not a tracked project label/);
+  assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');
+});
