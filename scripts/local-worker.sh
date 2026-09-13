@@ -233,6 +233,41 @@ process_drafting_file() {
   # local-draft.js's own require()s even finish loading) and as the fallback for any
   # domain/branch that never calls maybeLocked at all (e.g. a fully-deterministic
   # short-circuit).
+  # Branch-liveness guard (decomposed task: wire guard into local-worker.sh before
+  # local-draft.js): if this task carries a branch field and that branch is DEAD (src/
+  # branch-liveness-check.js -- no local ref, no origin ref, tip never merged into the
+  # default branch), the draft call would run against a phantom target with unrecoverable
+  # work attached. Skip the entire local-draft.js / localCall chain -- no model spend --
+  # and stamp the task terminal-disposition instead. Exit 2 from the guard is an
+  # OPERATIONAL error (git unavailable, bad repo path, ...) and must NOT skip the draft:
+  # log a warning and continue exactly as if the guard were absent.
+  task_branch="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.branch||"")}catch(e){}' "$wpath" 2>/dev/null)"
+  if [[ -n "$task_branch" ]]; then
+    liveness_rc=0
+    node "${PACKAGE_SRC_DIR}/branch-liveness-check.js" --branch "$task_branch" --repo "$AGENT_MANAGER_REPO_ROOT" 2>>"$LOG_FILE" || liveness_rc=$?
+    if [[ "$liveness_rc" -eq 1 ]]; then
+      printf '%s [worker-%s] branch-liveness-check: branch %s is DEAD -- abandoning task %s, skipping draft (no model spend)\n' "$(date -u +%FT%TZ)" "$INSTANCE_ID" "$task_branch" "$task_id" >> "$LOG_FILE"
+      printf '[worker-%s] branch-liveness-check: branch %s is dead -- abandoning task %s, draft skipped\n' "$INSTANCE_ID" "$task_branch" "$task_id" >&2
+      node -e '
+        try {
+          const fs = require("fs");
+          const p = process.argv[1];
+          const o = JSON.parse(fs.readFileSync(p, "utf8"));
+          const reason = `branch-liveness-check: branch ${process.argv[2]} is dead (no local ref, no origin ref, never merged) -- draft skipped, task abandoned`;
+          o.terminalDisposition = "abandoned";
+          o.blockedStage = "draft";
+          o.blockedReason = reason;
+          o.history = o.history || [];
+          o.history.push({ stage: "abandoned", at: new Date().toISOString(), detail: reason });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+        } catch (e) { /* best-effort stamp -- the skip+return below still happens */ }
+      ' "$wpath" "$task_branch" 2>/dev/null || true
+      return 0
+    elif [[ "$liveness_rc" -eq 2 ]]; then
+      printf '%s [worker-%s] WARN branch-liveness-check operational error (rc=2) for branch %s -- continuing with draft as before\n' "$(date -u +%FT%TZ)" "$INSTANCE_ID" "$task_branch" >> "$LOG_FILE"
+      printf '[worker-%s] WARN: branch-liveness-check operational error (rc=2) for branch %s -- continuing with draft\n' "$INSTANCE_ID" "$task_branch" >&2
+    fi
+  fi
   write_heartbeat_file "$INSTANCE_ID" "working" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
