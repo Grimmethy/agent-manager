@@ -1,3 +1,7 @@
+'use strict';
+
+const { stripWhitespace, realIndexForStrippedIndex } = require('./candidate-doc-parsing.js');
+
 function findFuzzyMatch(content, snippet) {
   const trimmed = (snippet || '').trim();
   if (!trimmed) return null;
@@ -24,3 +28,5 @@ function windowAroundIndex(content, idx, matchLen, maxChars) {
   const suffix = to < content.length ? '\n...[truncated]' : '';
   return `${prefix}${windowed}${suffix}`;
 }
+
+module.exports = { findFuzzyMatch, windowAroundIndex };
