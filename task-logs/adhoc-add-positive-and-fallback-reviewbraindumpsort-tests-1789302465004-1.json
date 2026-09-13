@@ -1,0 +1,268 @@
+{
+  "id": "adhoc-add-positive-and-fallback-reviewbraindumpsort-tests-1789302465004-1",
+  "title": "Add positive and fallback reviewBrainDumpSort tests",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T22:00:14.834Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T21:40:00.000Z",
+      "detail": "retrofitted stacked={branch:agent/adhoc-wire-derivebelongstoproject-into-reviewbraindumpsort-1789302465001-0,seq:2,total:2} onto dependsOn:[adhoc-wire-derivebelongstoproject-into-reviewbraindumpsort-1789302465001-0] -- adhoc-wire-derivebelongstoproject-into-reviewbraindumpsort-1789302465001-0 was done-but-unmerged and never would have cleared without a human merging it (see [[hub-task-integration]]); this makes isDependencySatisfied treat its queue/done/ arrival as satisfied, same as any newly-filed decompose chain now gets automatically (PR #204). Operator retrofit, one-time, not a live worker action."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:00:15.595Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:00:25.776Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:11:43.137Z",
+      "detail": "3 attempt(s), 5331 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:12:27.207Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:12:49.941Z",
+      "detail": "attempt 1: error, tiers: local-agentic-write=declined"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:12:52.977Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:12:58.473Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T22:28:03.173Z",
+      "detail": "3 attempt(s), 6044 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T22:28:36.182Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T22:37:11.148Z",
+      "detail": "agentic, 3421 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T22:37:11.149Z",
+      "detail": "resolution=implemented, qwen3.8-p40:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T22:37:11.152Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:37:11.153Z",
+      "detail": "attempt 2: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T22:38:38.035Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-13T22:39:57.150Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/brain-dump-sort-classify.test.js, in the reviewBrainDumpSort section (~line 239+), add two tests: (1) positive — task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }), promptContext: { rawText: 'Fix the queue worker in PromptForge so drafts persist', projectLabels: ['PromptForge', 'agent-manager'], selfProjectLabel: 'agent-manager' } }; assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }), { ok: true }) — proving the derived PromptForge label replaced the bogus one instead of triggering a rejection. (2) fallback — same task with NO promptContext; assert the result matches /not a tracked project label/ and assert !('belongsToProject' in result), i.e. the function returns its original shape. Then run `node --test src/brain-dump-sort-classify.test.js` and confirm it exits green.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788851639961-reviewbraindumpsort-lacks-rawtext-access-1788881854319"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-13T22:00:15.593Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "reason": "local write-agentic draft failed: Ollama HTTP 500: {\"error\":\"model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details\"}"
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 5331,
+        "text": "# PLAN: Add positive and fallback `reviewBrainDumpSort` tests\n\n1. **Locate the existing `reviewBrainDumpSort` test section in the test file.**\n   Open `src/brain-dump-sort-classify.test.js` and scroll to approximately line 239+ (the task states the section is there). The 8 107 characters after the visible window in the file dump almost certainly contain this section. Confirm that `reviewBrainDumpSort` is already imported at the top of the file (the first 1 326 characters, which are truncated, should include the `import { …, reviewBrainDumpSort, … } from './brain-dump-sort-classify.js'` line — the function is exported at `src/brain-dump-sort-classify.js:271`). If it is *not* yet imported, add it to the existing import list.\n\n2. **Add the positive test (derived-label replacement).**\n   At the end of the `reviewBrainDumpSort` section (after the last existing test in that block, before any closing comment or next section), insert:\n\n   ```js\n   test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       promptContext: {\n         rawText: 'Fix the queue worker in PromptForge so drafts persist',\n         projectLabels: ['PromptForge', 'agent-manager'],\n         selfProjectLabel: 'agent-manager',\n       },\n     };\n     assert.deepEqual(\n       reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),\n       { ok: true },\n     );\n   });\n   ```\n\n   This exercises the path where `deriveBelongsToProject` (called inside `reviewBrainDumpSort`, per the sibling \"Wire deriveBelongsToProject into reviewBrainDumpSort\" task marked done) recovers `PromptForge` from `rawText` and overwrites the untracked `ghost-proj`, so the function returns `{ ok: true }` instead of a rejection.\n\n3. **Add the fallback test (no promptContext → original error shape).**\n   Immediately after the positive test, insert:\n\n   ```js\n   test('reviewBrainDumpSort: without promptContext, untracked label still rejected (original shape)', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       // no promptContext\n     };\n     const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });\n     assert.match(result, /not a tracked project label/);\n     assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');\n   });\n   ```\n\n   This confirms that when `promptContext` is absent the function cannot derive a label and falls through to the original rejection path, returning a string (or object whose string form matches the regex) that does **not** include a `belongsToProject` key.\n\n   > **Note / assumption to verify:** The task says \"assert the result matches `/not a tracked project label/`\" and \"assert `!('belongsToProject' in result)`\". This implies the rejection path returns a *string* (or a plain object without `belongsToProject`). If `reviewBrainDumpSort` actually returns an object like `{ ok: false, error: '…not a tracked project label…' }`, the assertions need to target `result.error` instead. Read the function body at `src/brain-dump-sort-classify.js:245` (the ~26 lines between the function signature and the export at line 271) to confirm the exact return shape before finalising the assertions. Adjust `assert.match(result, …)` → `assert.match(result.error, …)` if needed.\n\n4. **Run the test suite and confirm green.**\n   ```bash\n   node --test src/brain-dump-sort-classify.test.js\n   ```\n   Verify the exit code is `0` and that both new tests appear as passing in the output. If either test fails, inspect the actual return value of `reviewBrainDumpSort` (add a temporary `console.log` or read the source at `src/brain-dump-sort-classify.js:245–270`) and correct the assertion shape.\n\n5. **Sanity-check that no other tests were disturbed.**\n   The command in step 4 runs the *entire* file. Confirm the pre-existing tests (`parseBrainDumpSortResult`, `validateSecondBrainPath`, `deriveBelongsToProject`, and any other `reviewBrainDumpSort` tests already in the 8 107-char tail) still pass. If any pre-existing test fails, the new tests may have inadvertently mutated shared state (unlikely for pure-function tests, but check for `fs.mkdtempSync` cleanup or module-level caches).\n\nCRITERIA:\n- `node --test src/brain-dump-sort-classify.test.js` exits with code 0 (all tests pass, zero failures).\n- The file `src/brain-dump-sort-classify.test.js` contains a test whose title includes \"derived PromptForge label replaces bogus belongsToProject\" and whose body calls `reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] })` with `belongsToProject: 'ghost-proj'` in the JSON and asserts the result deep-equals `{ ok: true }`.\n- The same file contains a test whose title includes \"without promptContext\" (or equivalent) that calls `reviewBrainDumpSort` with a task lacking `promptContext`, asserts the result matches `/not a tracked project label/`, and asserts `!('belongsToProject' in result)`.\n- No existing test in `src/brain-dump-sort-classify.test.js` was removed or modified (diff shows only additions in the `reviewBrainDumpSort` section).",
+        "attempts": 3,
+        "grounded": true,
+        "groundingChars": 9691,
+        "anchorPaths": [
+          "src/brain-dump-sort-classify.test.js"
+        ]
+      },
+      "outcome": "error",
+      "reason": "local write-agentic draft failed: Ollama HTTP 500: {\"error\":\"model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details\"}",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T22:12:49.941Z"
+    },
+    {
+      "at": "2026-09-13T22:12:52.976Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1740,
+          "response": "All checks pass. The diff is 23 insertions, 0 deletions — pure additions at the end of the `reviewBrainDumpSort` section.\n\nRESOLUTION: implemented\n\nAdded the two requested tests to the `reviewBrainDumpSort` section of `src/brain-dump-sort-classify.test.js`: (1) the positive test where `promptContext.rawText` names PromptForge, so `deriveBelongsToProject` (already wired into `reviewBrainDumpSort`) replaces the bogus `ghost-proj` and the gate returns `{ ok: true }`; (2) the fallback test with no `promptContext`, which verifies the rejection still matches `/not a tracked project label/` (asserted against `result.reason`, since the real rejection shape is `{ ok: false, reason }` per the function body at `src/brain-dump-sort-classify.js:245`) and that no `belongsToProject` leaks into the result.\n\nAcceptance:\n- `node --test src/brain-dump-sort-classify.test.js` exits 0, zero failing tests -- `node --test src/brain-dump-sort-classify.test.js` -- PASS (`# pass 39`, `# fail 0`, `EXIT: 0`)\n- Test titled \"derived PromptForge label replaces bogus belongsToProject\" with ghost-proj JSON, PromptForge rawText, tracked labels, `deepEqual(…, { ok: true })` -- diff + test run -- PASS (visible in diff, part of the 39 passing)\n- Test titled \"without promptContext\" asserting match on `/not a tracked project label/` and `!('belongsToProject' in result)` -- diff + test run -- PASS (`ok 39 - reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)`); match is on `result.reason` because the function's actual rejection shape is `{ ok:false, reason }`\n- `git diff` shows additions only within the reviewBrainDumpSort section -- `git diff --stat` -- PASS (`23 insertions(+), 0 deletions`, no removed/renamed lines)",
+          "rawDiffChars": 1666,
+          "rawDiff": "diff --git a/src/brain-dump-sort-classify.test.js b/src/brain-dump-sort-classify.test.js\nindex d04231a6..fa067a78 100644\n--- a/src/brain-dump-sort-classify.test.js\n+++ b/src/brain-dump-sort-classify.test.js\n@@ -271,3 +271,26 @@ test('reviewBrainDumpSort still rejects a genuinely off-taxonomy folder even tho\n   const task = { implementResponse: JSON.stringify({ secondBrainPath: 'errands/x.md' }) };\n   assert.match(reviewBrainDumpSort(task, { trackedProjectLabels: [] }).reason, /not one of the allowed/);\n });\n+\n+test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {\n+  const task = {\n+    implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n+    promptContext: {\n+      rawText: 'Fix the queue worker in PromptForge so drafts persist',\n+      projectLabels: ['PromptForge', 'agent-manager'],\n+      selfProjectLabel: 'agent-manager',\n+    },\n+  };\n+  assert.deepEqual(\n+    reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),\n+    { ok: true },\n+  );\n+});\n+\n+test('reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)', () => {\n+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }) };\n+  const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });\n+  // Rejection shape is { ok:false, reason } (no belongsToProject leaked into the result).\n+  assert.match(result.reason, /not a tracked project label/);\n+  assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');\n+});",
+          "turnsUsed": 7,
+          "toolCalls": {
+            "total": 7,
+            "byTool": {
+              "read_file": 3,
+              "grep_codebase": 1,
+              "edit_file": 1,
+              "run_bash": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 2270
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2555
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "limit",
+                  "offset",
+                  "path"
+                ],
+                "bytes": 7898
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "offset",
+                  "path"
+                ],
+                "bytes": 464
+              },
+              {
+                "n": 5,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 61
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 526
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 363
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 6044,
+        "text": "# PLAN: Add positive and fallback `reviewBrainDumpSort` tests\n\n1. **Confirm the import and locate the insertion point.**\n   Open `src/brain-dump-sort-classify.test.js`. The first ~1 326 characters (truncated in the dump) contain the import block; verify that `reviewBrainDumpSort` is already in the `import { … } from './brain-dump-sort-classify.js'` list. (The function is defined at `src/brain-dump-sort-classify.js:245` and exported at `:271`, so it is available from the module.) If it is missing, add it to the existing named-import list.\n\n   The visible test sections in order are: `parseBrainDumpSortResult` → `validateSecondBrainPath` → `deriveBelongsToProject`. The `reviewBrainDumpSort` test section is in the ~8 107-character tail that follows the `deriveBelongsToProject` block (the task places it at roughly line 239+). Scroll past the last `deriveBelongsToProject` test (the \"New Plugin >\" one) to find the `// --- reviewBrainDumpSort` comment header or the first `test('reviewBrainDumpSort…')` call. Insert the two new tests at the **end** of that section, before any subsequent section header or end-of-file.\n\n2. **Add the positive test (derived-label replacement).**\n\n   ```js\n   test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       promptContext: {\n         rawText: 'Fix the queue worker in PromptForge so drafts persist',\n         projectLabels: ['PromptForge', 'agent-manager'],\n         selfProjectLabel: 'agent-manager',\n       },\n     };\n     assert.deepEqual(\n       reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),\n       { ok: true },\n     );\n   });\n   ```\n\n   This exercises the path where `deriveBelongsToProject` (already wired into `reviewBrainDumpSort` per the sibling task marked done) recovers `PromptForge` from `rawText` and overwrites the untracked `ghost-proj`, so the function returns `{ ok: true }` rather than a rejection string.\n\n   *Note:* The call signature matches `src/brain-dump-sort-classify.js:245`:\n   `function reviewBrainDumpSort(task, { secondBrainDir, trackedProjectLabels = [] } = {})`.\n   We omit `secondBrainDir` (defaults to `undefined`), which is fine for a label-validation check that doesn't touch the filesystem.\n\n3. **Add the fallback test (no `promptContext` → original rejection shape).**\n\n   ```js\n   test('reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       // deliberately no promptContext\n     };\n     const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });\n     assert.match(result, /not a tracked project label/);\n     assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');\n   });\n   ```\n\n   **Before finalising, verify the rejection return shape.** Read the body of `reviewBrainDumpSort` at `src/brain-dump-sort-classify.js:245–270` (the ~25 lines between the signature and the export at `:271`). Two possibilities:\n\n   - **String return** (consistent with `validateSecondBrainPath` returning a string on error, as seen in the test file): `assert.match(result, /…/)` works directly; `'belongsToProject' in result` is `false` on a string, so the second assertion passes trivially. No change needed.\n   - **Object return** (e.g. `{ ok: false, error: '…not a tracked project label…' }`): change to `assert.match(result.error, /not a tracked project label/)` and the `in` check already targets the object. Adjust accordingly.\n\n   The task instruction says \"the function returns its original shape,\" implying the pre-`deriveBelongsToProject` rejection path is unchanged. Whichever shape it is, the two assertions above (or their `.error`-targeted equivalents) must pass.\n\n4. **Run the full test file and confirm green.**\n\n   ```bash\n   node --test src/brain-dump-sort-classify.test.js\n   ```\n\n   Expected: exit code 0, all pre-existing tests (`parseBrainDumpSortResult`, `validateSecondBrainPath`, `deriveBelongsToProject`, and any existing `reviewBrainDumpSort` tests in the tail) still pass, plus the two new tests pass. If the fallback test fails on the `assert.match` line, the return shape is an object — apply the adjustment from step 3 and re-run.\n\n5. **Confirm no other tests were disturbed.**\n   The command in step 4 runs the entire file. Visually scan the output for any `failing` or `not ok` lines. The new tests are pure-function calls with no filesystem or module-level state, so cross-test contamination is unlikely, but confirm the `fs.mkdtempSync` test (`validateSecondBrainPath flags a different-case duplicate`) still passes (it creates a temp dir; ensure no leftover state affects ordering).\n\nCRITERIA:\n- `node --test src/brain-dump-sort-classify.test.js` exits with code 0 and the output shows zero failing tests.\n- `src/brain-dump-sort-classify.test.js` contains a test whose title includes \"derived PromptForge label replaces bogus belongsToProject\"; its body constructs a task with `belongsToProject: 'ghost-proj'` in the JSON and `promptContext.rawText` mentioning \"PromptForge\", calls `reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] })`, and asserts `deepEqual(…, { ok: true })`.\n- `src/brain-dump-sort-classify.test.js` contains a test whose title includes \"without promptContext\" (or equivalent); its body constructs a task with the same `implementResponse` but **no** `promptContext` key, calls `reviewBrainDumpSort` with the same options, asserts the result matches `/not a tracked project label/`, and asserts `!('belongsToProject' in result)`.\n- A `git diff` (or equivalent) on `src/brain-dump-sort-classify.test.js` shows only additions within the `reviewBrainDumpSort` test section; no exis\n... [truncated 44 more chars]",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 9691,
+        "anchorPaths": [
+          "src/brain-dump-sort-classify.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 3,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-13T22:37:11.152Z"
+    }
+  ],
+  "draftFailureCount": 1,
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds exactly the two required tests (positive \"derived PromptForge label replaces bogus belongsToProject\" and fallback \"without promptContext\") with the specified assertions, the live test run shows `# pass 39` / `# fail 0` / `EXIT: 0`, and `git diff --stat` confirms 23 insertions with 0 deletions, satisfying all four acceptance criteria.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds exactly the two required tests (positive \"derived PromptForge label replaces bogus belongsToProject\" and fallback \"without promptContext\") with the specified assertions, the live test run shows `# pass 39` / `# fail 0` / `EXIT: 0`, and `git diff --stat` confirms 23 insertions with 0 deletions, satisfying all four acceptance criteria."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds exactly the two required tests (positive \"derived PromptForge label replaces bogus belongsToProject\" and fallback \"without promptContext\") to the reviewBrainDumpSort section, the test run shows `# pass 39`, `# fail 0`, `EXIT: 0`, and `git diff --stat` confirms 23 insertions with 0 deletions, satisfying all four acceptance criteria."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`node --test src/brain-dump-sort-classify.test.js` exits with code 0 and the output shows zero failing tests.",
+    "`src/brain-dump-sort-classify.test.js` contains a test whose title includes \"derived PromptForge label replaces bogus belongsToProject\"; its body constructs a task with `belongsToProject: 'ghost-proj'` in the JSON and `promptContext.rawText",
+    "`src/brain-dump-sort-classify.test.js` contains a test whose title includes \"without promptContext\" (or equivalent); its body constructs a task with the same `implementResponse` but **no** `promptContext` key, calls `reviewBrainDumpSort` wi",
+    "A `git diff` (or equivalent) on `src/brain-dump-sort-classify.test.js` shows only additions within the `reviewBrainDumpSort` test section; no existing test was removed, renamed, or modified."
+  ],
+  "draftModel": "qwen3.8-p40:27b-q4_K_M",
+  "implementResponse": "All checks pass. The diff is 23 insertions, 0 deletions — pure additions at the end of the `reviewBrainDumpSort` section.\n\nRESOLUTION: implemented\n\nAdded the two requested tests to the `reviewBrainDumpSort` section of `src/brain-dump-sort-classify.test.js`: (1) the positive test where `promptContext.rawText` names PromptForge, so `deriveBelongsToProject` (already wired into `reviewBrainDumpSort`) replaces the bogus `ghost-proj` and the gate returns `{ ok: true }`; (2) the fallback test with no `promptContext`, which verifies the rejection still matches `/not a tracked project label/` (asserted against `result.reason`, since the real rejection shape is `{ ok: false, reason }` per the function body at `src/brain-dump-sort-classify.js:245`) and that no `belongsToProject` leaks into the result.\n\nAcceptance:\n- `node --test src/brain-dump-sort-classify.test.js` exits 0, zero failing tests -- `node --test src/brain-dump-sort-classify.test.js` -- PASS (`# pass 39`, `# fail 0`, `EXIT: 0`)\n- Test titled \"derived PromptForge label replaces bogus belongsToProject\" with ghost-proj JSON, PromptForge rawText, tracked labels, `deepEqual(…, { ok: true })` -- diff + test run -- PASS (visible in diff, part of the 39 passing)\n- Test titled \"without promptContext\" asserting match on `/not a tracked project label/` and `!('belongsToProject' in result)` -- diff + test run -- PASS (`ok 39 - reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)`); match is on `result.reason` because the function's actual rejection shape is `{ ok:false, reason }`\n- `git diff` shows additions only within the reviewBrainDumpSort section -- `git diff --stat` -- PASS (`23 insertions(+), 0 deletions`, no removed/renamed lines)\n\n=== DIFF ===\ndiff --git a/src/brain-dump-sort-classify.test.js b/src/brain-dump-sort-classify.test.js\nindex d04231a6..fa067a78 100644\n--- a/src/brain-dump-sort-classify.test.js\n+++ b/src/brain-dump-sort-classify.test.js\n@@ -271,3 +271,26 @@ test('reviewBrainDumpSort still rejects a genuinely off-taxonomy folder even tho\n   const task = { implementResponse: JSON.stringify({ secondBrainPath: 'errands/x.md' }) };\n   assert.match(reviewBrainDumpSort(task, { trackedProjectLabels: [] }).reason, /not one of the allowed/);\n });\n+\n+test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {\n+  const task = {\n+    implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n+    promptContext: {\n+      rawText: 'Fix the queue worker in PromptForge so drafts persist',\n+      projectLabels: ['PromptForge', 'agent-manager'],\n+      selfProjectLabel: 'agent-manager',\n+    },\n+  };\n+  assert.deepEqual(\n+    reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),\n+    { ok: true },\n+  );\n+});\n+\n+test('reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)', () => {\n+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }) };\n+  const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });\n+  // Rejection shape is { ok:false, reason } (no belongsToProject leaked into the result).\n+  assert.match(result.reason, /not a tracked project label/);\n+  assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');\n+});",
+  "planResponse": "# PLAN: Add positive and fallback `reviewBrainDumpSort` tests\n\n1. **Confirm the import and locate the insertion point.**\n   Open `src/brain-dump-sort-classify.test.js`. The first ~1 326 characters (truncated in the dump) contain the import block; verify that `reviewBrainDumpSort` is already in the `import { … } from './brain-dump-sort-classify.js'` list. (The function is defined at `src/brain-dump-sort-classify.js:245` and exported at `:271`, so it is available from the module.) If it is missing, add it to the existing named-import list.\n\n   The visible test sections in order are: `parseBrainDumpSortResult` → `validateSecondBrainPath` → `deriveBelongsToProject`. The `reviewBrainDumpSort` test section is in the ~8 107-character tail that follows the `deriveBelongsToProject` block (the task places it at roughly line 239+). Scroll past the last `deriveBelongsToProject` test (the \"New Plugin >\" one) to find the `// --- reviewBrainDumpSort` comment header or the first `test('reviewBrainDumpSort…')` call. Insert the two new tests at the **end** of that section, before any subsequent section header or end-of-file.\n\n2. **Add the positive test (derived-label replacement).**\n\n   ```js\n   test('reviewBrainDumpSort: derived PromptForge label replaces bogus belongsToProject', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       promptContext: {\n         rawText: 'Fix the queue worker in PromptForge so drafts persist',\n         projectLabels: ['PromptForge', 'agent-manager'],\n         selfProjectLabel: 'agent-manager',\n       },\n     };\n     assert.deepEqual(\n       reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] }),\n       { ok: true },\n     );\n   });\n   ```\n\n   This exercises the path where `deriveBelongsToProject` (already wired into `reviewBrainDumpSort` per the sibling task marked done) recovers `PromptForge` from `rawText` and overwrites the untracked `ghost-proj`, so the function returns `{ ok: true }` rather than a rejection string.\n\n   *Note:* The call signature matches `src/brain-dump-sort-classify.js:245`:\n   `function reviewBrainDumpSort(task, { secondBrainDir, trackedProjectLabels = [] } = {})`.\n   We omit `secondBrainDir` (defaults to `undefined`), which is fine for a label-validation check that doesn't touch the filesystem.\n\n3. **Add the fallback test (no `promptContext` → original rejection shape).**\n\n   ```js\n   test('reviewBrainDumpSort: without promptContext, untracked label rejected (original shape)', () => {\n     const task = {\n       implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'ghost-proj' }),\n       // deliberately no promptContext\n     };\n     const result = reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] });\n     assert.match(result, /not a tracked project label/);\n     assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');\n   });\n   ```\n\n   **Before finalising, verify the rejection return shape.** Read the body of `reviewBrainDumpSort` at `src/brain-dump-sort-classify.js:245–270` (the ~25 lines between the signature and the export at `:271`). Two possibilities:\n\n   - **String return** (consistent with `validateSecondBrainPath` returning a string on error, as seen in the test file): `assert.match(result, /…/)` works directly; `'belongsToProject' in result` is `false` on a string, so the second assertion passes trivially. No change needed.\n   - **Object return** (e.g. `{ ok: false, error: '…not a tracked project label…' }`): change to `assert.match(result.error, /not a tracked project label/)` and the `in` check already targets the object. Adjust accordingly.\n\n   The task instruction says \"the function returns its original shape,\" implying the pre-`deriveBelongsToProject` rejection path is unchanged. Whichever shape it is, the two assertions above (or their `.error`-targeted equivalents) must pass.\n\n4. **Run the full test file and confirm green.**\n\n   ```bash\n   node --test src/brain-dump-sort-classify.test.js\n   ```\n\n   Expected: exit code 0, all pre-existing tests (`parseBrainDumpSortResult`, `validateSecondBrainPath`, `deriveBelongsToProject`, and any existing `reviewBrainDumpSort` tests in the tail) still pass, plus the two new tests pass. If the fallback test fails on the `assert.match` line, the return shape is an object — apply the adjustment from step 3 and re-run.\n\n5. **Confirm no other tests were disturbed.**\n   The command in step 4 runs the entire file. Visually scan the output for any `failing` or `not ok` lines. The new tests are pure-function calls with no filesystem or module-level state, so cross-test contamination is unlikely, but confirm the `fs.mkdtempSync` test (`validateSecondBrainPath flags a different-case duplicate`) still passes (it creates a temp dir; ensure no leftover state affects ordering).\n\nCRITERIA:\n- `node --test src/brain-dump-sort-classify.test.js` exits with code 0 and the output shows zero failing tests.\n- `src/brain-dump-sort-classify.test.js` contains a test whose title includes \"derived PromptForge label replaces bogus belongsToProject\"; its body constructs a task with `belongsToProject: 'ghost-proj'` in the JSON and `promptContext.rawText` mentioning \"PromptForge\", calls `reviewBrainDumpSort(task, { trackedProjectLabels: ['PromptForge', 'agent-manager'] })`, and asserts `deepEqual(…, { ok: true })`.\n- `src/brain-dump-sort-classify.test.js` contains a test whose title includes \"without promptContext\" (or equivalent); its body constructs a task with the same `implementResponse` but **no** `promptContext` key, calls `reviewBrainDumpSort` with the same options, asserts the result matches `/not a tracked project label/`, and asserts `!('belongsToProject' in result)`.\n- A `git diff` (or equivalent) on `src/brain-dump-sort-classify.test.js` shows only additions within the `reviewBrainDumpSort` test section; no existing test was removed, renamed, or modified.",
+  "reviewedAt": "2026-09-13T22:39:57.150Z",
+  "claimedAt": "2026-09-13T22:00:15.193Z"
+}
