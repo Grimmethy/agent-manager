@@ -18,6 +18,7 @@ const gpuCapacity = require('./gpu-capacity.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
+const { isDraftTruncated } = require('./draft-truncation-guard.js');
 const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
@@ -186,6 +187,16 @@ function detectDegenerate(text, { allowEmpty = false, doneReason } = {}) {
   // existing retry-on-degenerate loop callOnce()'s caller already runs for every other
   // degenerate reason -- no new mechanism, just closing a blind spot in this one.
   if (doneReason === 'length') return 'truncated';
+
+  // 2026-09-13 (brain-dump bd-1788780905388): doneReason:'length' is unambiguous but not
+  // exhaustive -- a real incident named a draft whose PLAN table or IMPLEMENT section was
+  // cut off mid-content even though Ollama's own doneReason wasn't 'length', costing a
+  // full requeue cycle that ended in the same false-positive dismissal. isDraftTruncated
+  // (draft-truncation-guard.js) catches that shape directly from the text itself: an
+  // unclosed markdown table row, a missing IMPLEMENT body, or an odd code-fence count.
+  // Silent (false) on empty/whitespace input, so this is safe to check before the
+  // empty-response check below.
+  if (isDraftTruncated(text)) return 'truncated';
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
   // The local model sometimes writes the literal two-character JSON-style empty-string
