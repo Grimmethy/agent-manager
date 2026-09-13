@@ -938,6 +938,37 @@ test('verifyDeterministicScriptExtractDraft: a byte-exact re-derivation -> ok:tr
   assert.deepEqual(verifyDeterministicScriptExtractDraft(task, repoRoot), { ok: true });
 });
 
+// 2026-09-13: real incident. `moveTemplateFor` (file-decompose-plan-pass.js, 2026-09-08)
+// extended kind:'script-extract' to plain .js/.mjs/.cjs sources, and the draft-side
+// short-circuit (local-draft.js's tryDeterministicScriptExtractEdit) was updated to pass
+// isHtml:false for them -- but this gate's own buildExtraction call was never updated,
+// so it always defaulted to isHtml:true. For a real .js source (no <script> block at
+// all) that made locateFunctions fail outright with an EMPTY problems array, hard-
+// rejecting a byte-correct draft 3 times running until the task escalated to
+// needs-clarification (src/sdk/candidate-fulfillment.js -> candidate-doc-parsing.js).
+function writeJsWithFn(repoRoot, relPath, body) {
+  const abs = path.join(repoRoot, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `'use strict';\n\n${body}`);
+}
+
+test('verifyDeterministicScriptExtractDraft: a plain .js source (no <script> block) byte-exact re-derivation -> ok:true', () => {
+  const { repoRoot } = makeFixture();
+  writeJsWithFn(repoRoot, 'src/thing.js', 'function a() { return 1; }\nfunction b() { return 2; }\n');
+  const source = fs.readFileSync(path.join(repoRoot, 'src/thing.js'), 'utf8');
+  const { buildExtraction } = require('./script-extract.js');
+  const extraction = buildExtraction(source, ['a'], { isHtml: false });
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'src/thing.js', newFile: 'src/lib/a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'src/lib/a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'src/thing.js', find: source, replace: extraction.newSource },
+    ]),
+  };
+  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+  assert.deepEqual(verifyDeterministicScriptExtractDraft(task, repoRoot), { ok: true });
+});
+
 test('verifyDeterministicScriptExtractDraft: tampered content (does not byte-match a fresh re-derivation) -> ok:false', () => {
   const { repoRoot } = makeFixture();
   writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');

@@ -236,14 +236,26 @@ function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
     }
   }
   const { buildExtraction } = require('./script-extract.js');
-  const fresh = buildExtraction(html, ctx.symbols);
+  // isHtml must match the draft side's own detection (file-decompose-to-hub.js:130) --
+  // a plain .js/.mjs/.cjs source has no <script> block, so the default isHtml:true here
+  // made locateFunctions fail outright (0 problems, since there's no per-symbol result to
+  // report) and hard-rejected every real, correct .js-source script-extract move. Confirmed
+  // live 2026-09-13: src/sdk/candidate-fulfillment.js decompose stuck in needs-clarification
+  // after 3 identical "symbols no longer resolve against current repo state: " (blank)
+  // rejections, even though the draft's extraction was byte-correct each time.
+  const isHtml = /\.html?$/.test(ctx.sourceFile);
+  const fresh = buildExtraction(html, ctx.symbols, { isHtml });
   if (!fresh.ok) {
     return { ok: false, reason: `symbols no longer resolve against current repo state: ${fresh.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}` };
   }
   if (createChange.content !== fresh.newFileContent) {
     return { ok: false, reason: 'create content does not byte-match a fresh re-derivation of the same extraction' };
   }
-  if (editChange.find !== html || editChange.replace !== fresh.newHtml) {
+  // isHtml:false -> buildExtraction returns `newSource` (whole rewritten file), not
+  // `newHtml` (there is no <script>-tag insertion point to rewrite) -- matches the
+  // draft-side ternary in local-draft.js's tryDeterministicScriptExtractEdit exactly.
+  const freshReplace = isHtml ? fresh.newHtml : fresh.newSource;
+  if (editChange.find !== html || editChange.replace !== freshReplace) {
     return { ok: false, reason: 'edit find/replace does not byte-match a fresh re-derivation of the same extraction' };
   }
   return { ok: true };
