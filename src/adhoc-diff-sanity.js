@@ -180,6 +180,18 @@ function pathsRefEqual(a, b) {
   if (!na || !nb) return false;
   if (na === nb) return true;
   const hasExt = (s) => /\.\w+$/.test(s);
+  // Directory-shaped forbidden entry ("src/", from extractForbiddenPaths' bare-"src"
+  // normalization) reconciles against any target file it contains ("src/local-draft.js")
+  // -- same "declared target wins" rule the extensionless-prefix checks below already
+  // give a bare-name restriction, just for the trailing-slash directory spelling. Without
+  // this, a task whose own plan says e.g. "don't touch other files under src/" produces a
+  // forbidden "src/" entry that this function can never reconcile against the task's own
+  // declared target (it only handled "src/foo" vs "src/foo.js", not "src/" vs
+  // "src/foo.js") -- so the gate blocked the task from editing the exact file it was told
+  // to edit. Confirmed live 2026-09-13 on adhoc-add-spec-comment-at-call-site-in-src-
+  // local-draft-js-1789232601161-1.
+  if (na.endsWith('/') && nb.startsWith(na)) return true;
+  if (nb.endsWith('/') && na.startsWith(nb)) return true;
   if (na.includes('/') && !hasExt(na) && (nb === na || nb.startsWith(`${na}.`))) return true;
   if (nb.includes('/') && !hasExt(nb) && (na === nb || na.startsWith(`${nb}.`))) return true;
   // Same basename when BOTH sides are concrete files with a known extension -- covers the

@@ -147,6 +147,24 @@ test('forbidden-path: a decompose/wire-up task is NOT locked out of the file nam
   assert.equal(adhocDiffSubstanceProblem(t, editDiff('python/dashboard/templates/index.html')), null);
 });
 
+test('forbidden-path: a directory-wide restriction ("under src/") does not lock out the declared target file inside that directory', () => {
+  // Live regression 2026-09-13 (adhoc-add-spec-comment-at-call-site-in-src-local-draft-js
+  // -1789232601161-1): a retry plan's generic scope-discipline line ("do not touch other
+  // files under src/") got extracted as a bare directory-wide forbidden path "src/" (see
+  // extractForbiddenPaths' bare-"src" normalization). pathsRefEqual only reconciled an
+  // extensionless FILE-shaped forbidden entry ("src/foo") against a target, never a
+  // directory-shaped one ("src/"), so the gate blocked the task from editing
+  // src/local-draft.js -- the exact file its own title named as the edit target -- and a
+  // retry landed a redundant, off-target comment in a different file instead.
+  const t = adhoc(
+    'Add spec comment at call site in src/local-draft.js.\n'
+      + 'Files: src/local-draft.js\n'
+      + 'Do not touch other files under src/.',
+    '# PLAN\nEdit `src/local-draft.js` only.',
+  );
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/local-draft.js')), null);
+});
+
 test('forbidden-path: a genuine "do not touch X" for a NON-target file is still enforced', () => {
   const t = adhoc(
     'Implement the guard in src/a.js.\nFiles: src/a.js\nDo NOT touch src/b.js — it is out of scope.',
